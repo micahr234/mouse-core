@@ -26,16 +26,8 @@ The policy is never stored in fixed weights — it emerges from the transformer 
 
 ## Install
 
-**From GitHub:**
-
 ```bash
-pip install "git+https://github.com/micahr234/mouse-core.git"
-```
-
-**For development** (creates a Python 3.12 venv via `uv`, installs all extras):
-
-```bash
-source scripts/install.sh
+pip install mouse-core
 ```
 
 ---
