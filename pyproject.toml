@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=80.9.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mouse"
+version = "0.1.0"
+description = "Meta-Optimization Using Sequential Experiences — core ICRL library"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "torch>=2.11.0",
+    "numpy>=2.4.2",
+    "transformers>=5.5.0",
+    "tensordict>=0.11.0",
+    "datasets>=4.6.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pyright",
+    "pytest",
+]
+
+[tool.uv.pip]
+extra-index-url = ["https://download.pytorch.org/whl/cu128"]
+
+[tool.uv]
+environments = ["sys_platform == 'linux'"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mouse*"]
