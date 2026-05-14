@@ -1,0 +1,1518 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="Meta-Optimization Using Sequential Experiences — core ICRL library">
+      
+      
+      
+        <link rel="canonical" href="https://micahr234.github.io/mouse-core/architecture/">
+      
+      
+        <link rel="prev" href="./..">
+      
+      
+        <link rel="next" href="../data/">
+      
+      
+        
+      
+      
+      <link rel="icon" href="../assets/images/favicon.png">
+      <meta name="generator" content="zensical-0.0.41">
+    
+    
+      
+        <title>Architecture - mouse-core</title>
+      
+    
+    
+      
+        
+      
+      <link rel="stylesheet" href="../assets/stylesheets/modern/main.fba56155.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Inter:300,300i,400,400i,500,500i,700,700i%7CJetBrains+Mono:400,400i,700,700i&amp;display=fallback">
+        <style>:root{--md-text-font:"Inter";--md-code-font:"JetBrains Mono"}</style>
+      
+    
+    
+    <script>__md_scope=new URL("..",location),__md_scope.pathname.endsWith("/")||(__md_scope=new URL(__md_scope.pathname+"/",location)),__md_hash=e=>[...e].reduce(((e,t)=>(e<<5)-e+t.charCodeAt(0)),0),__md_get=(e,t=localStorage,_=__md_scope)=>JSON.parse(t.getItem(_.pathname+"."+e)),__md_set=(e,t,_=localStorage,a=__md_scope)=>{try{_.setItem(a.pathname+"."+e,JSON.stringify(t))}catch(e){}},document.documentElement.setAttribute("data-platform",navigator.platform)</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    <body dir="ltr">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer" aria-label="Navigation"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#architecture" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+<header class="md-header" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href="./.." title="mouse-core" class="md-header__button md-logo" aria-label="mouse-core" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" class="lucide lucide-book-open" viewBox="0 0 24 24"><path d="M12 7v14M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3z"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer" aria-label="Navigation">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" class="lucide lucide-menu" viewBox="0 0 24 24"><path d="M4 5h16M4 12h16M4 19h16"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            mouse-core
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Architecture
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search" aria-label="Search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" class="lucide lucide-search" viewBox="0 0 24 24"><path d="m21 21-4.34-4.34"/><circle cx="11" cy="11" r="8"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog" aria-label="Search">
+  <button type="button" class="md-search__button">
+    Search
+  </button>
+</div>
+      
+    
+    <div class="md-header__source">
+      
+        <a href="https://github.com/micahr234/mouse-core" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2026 Fonticons, Inc.--><path fill="currentColor" d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    micahr234/mouse-core
+  </div>
+</a>
+      
+    </div>
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+            
+<nav class="md-tabs" aria-label="Tabs" data-md-component="tabs">
+  <div class="md-grid">
+    <ul class="md-tabs__list">
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="./.." class="md-tabs__link">
+        
+  
+  Home
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+    
+  
+  
+    
+      
+    
+    
+    
+      <li class="md-tabs__item md-tabs__item--active">
+        <a href="././" class="md-tabs__link">
+          
+  
+  Guides
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+      
+    
+    
+    
+      
+  
+  
+  
+  
+    
+      
+    
+    
+    
+      <li class="md-tabs__item">
+        <a href="../api/model/" class="md-tabs__link">
+          
+  
+  API Reference
+
+        </a>
+      </li>
+    
+  
+
+    
+  
+
+      
+    </ul>
+  </div>
+</nav>
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+  
+
+
+<nav class="md-nav md-nav--primary md-nav--lifted" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="./.." title="mouse-core" class="md-nav__button md-logo" aria-label="mouse-core" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" class="lucide lucide-book-open" viewBox="0 0 24 24"><path d="M12 7v14M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3z"/></svg>
+
+    </a>
+    mouse-core
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/micahr234/mouse-core" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2026 Fonticons, Inc.--><path fill="currentColor" d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    micahr234/mouse-core
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="./.." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Home
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2" checked>
+        
+          
+          <label class="md-nav__link" for="__nav_2" id="__nav_2_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Guides
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+  Guides
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Model Architecture
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="././" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Model Architecture
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+
+<nav class="md-nav md-nav--secondary" aria-label="On this page">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      On this page
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#stepembedder-mousemodelsembeddingembedding" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        StepEmbedder (<code>mouse.models.embedding.embedding</code>)
+      </span>
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="StepEmbedder (mouse.models.embedding.embedding)">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#modalities" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Modalities
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#token-types" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Token types
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#initialisation-scaling" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Initialisation scaling
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#backbone" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Backbone
+      </span>
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Backbone">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#llama-mousemodelsbackbonellamamodelllama" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Llama (<code>mouse.models.backbone.llama.ModelLlama</code>)
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#qwen3-mousemodelsbackboneqwen3modelqwen3" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Qwen3 (<code>mouse.models.backbone.qwen3.ModelQwen3</code>)
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#none-mousemodelsbackbonenonemodelnone" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        None (<code>mouse.models.backbone.none.ModelNone</code>)
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#auto-detection" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Auto-detection
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#kv-cache" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        KV-cache
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#last-token-pooling" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Last-token pooling
+      </span>
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#output-heads" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Output heads
+      </span>
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Output heads">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#swigluhead-mousemodelsheadsswiglu" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        SwiGLUHead (<code>mouse.models.heads.swiglu</code>)
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#dqnhead-mousemodelsheadsdqn" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        DQNHead (<code>mouse.models.heads.dqn</code>)
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#vecdqnhead-mousemodelsheadsvec_dqn" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        VecDQNHead (<code>mouse.models.heads.vec_dqn</code>)
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#modelget_action" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Model.get_action
+      </span>
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#modelpolyak_update" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Model.polyak_update
+      </span>
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#config-layout-configjson" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Config layout (<code>config.json</code>)
+      </span>
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../data/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Data pipeline
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../losses/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Losses
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../examples/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Examples
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" >
+        
+          
+          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  API Reference
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+  API Reference
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3_1" >
+        
+          
+          <label class="md-nav__link" for="__nav_3_1" id="__nav_3_1_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Models
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_3_1_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3_1">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+  Models
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../api/model/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Base
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../api/backbone/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Backbone
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../api/embedding/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Embedding
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../api/heads/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Heads
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../api/losses/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Losses
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../api/data/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Data
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  
+                    
+                    
+                    
+                      
+                    
+                    
+                      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+                      <div class="md-sidebar-button__wrapper">
+                        <label class="md-sidebar-button" for="__toc"></label>
+                      </div>
+                    
+                  
+                  <div class="md-sidebar__inner">
+                    
+
+
+<nav class="md-nav md-nav--secondary" aria-label="On this page">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      On this page
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#stepembedder-mousemodelsembeddingembedding" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        StepEmbedder (<code>mouse.models.embedding.embedding</code>)
+      </span>
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="StepEmbedder (mouse.models.embedding.embedding)">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#modalities" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Modalities
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#token-types" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Token types
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#initialisation-scaling" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Initialisation scaling
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#backbone" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Backbone
+      </span>
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Backbone">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#llama-mousemodelsbackbonellamamodelllama" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Llama (<code>mouse.models.backbone.llama.ModelLlama</code>)
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#qwen3-mousemodelsbackboneqwen3modelqwen3" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Qwen3 (<code>mouse.models.backbone.qwen3.ModelQwen3</code>)
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#none-mousemodelsbackbonenonemodelnone" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        None (<code>mouse.models.backbone.none.ModelNone</code>)
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#auto-detection" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Auto-detection
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#kv-cache" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        KV-cache
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#last-token-pooling" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Last-token pooling
+      </span>
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#output-heads" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Output heads
+      </span>
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Output heads">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#swigluhead-mousemodelsheadsswiglu" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        SwiGLUHead (<code>mouse.models.heads.swiglu</code>)
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#dqnhead-mousemodelsheadsdqn" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        DQNHead (<code>mouse.models.heads.dqn</code>)
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#vecdqnhead-mousemodelsheadsvec_dqn" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        VecDQNHead (<code>mouse.models.heads.vec_dqn</code>)
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#modelget_action" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Model.get_action
+      </span>
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#modelpolyak_update" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Model.polyak_update
+      </span>
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#config-layout-configjson" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Config layout (<code>config.json</code>)
+      </span>
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+  
+  
+
+
+<h1 id="architecture">Architecture<a class="headerlink" href="#architecture" title="Permanent link">&para;</a></h1>
+<p>MOUSE is a context-conditioned sequence model. The full forward pass has three stages:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>TensorDict[B, S]
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>       │
+<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>       ▼
+<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>  StepEmbedder          → [B, S*T, D]   (multi-modal per-step tokens)
+<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>       │
+<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>       ▼
+<a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>   Backbone             → [B, S*T, D]   (Llama / Qwen3 / identity)
+<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>       │
+<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a>  last-token pool
+<a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a>       │
+<a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a>       ▼
+<a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a>  Output heads          → TensorDict[B, S]
+</code></pre></div>
+<p><code>B</code> = batch size, <code>S</code> = sequence length (steps), <code>T</code> = tokens per step, <code>D</code> = hidden dimension.</p>
+<hr />
+<h2 id="stepembedder-mousemodelsembeddingembedding">StepEmbedder (<code>mouse.models.embedding.embedding</code>)<a class="headerlink" href="#stepembedder-mousemodelsembeddingembedding" title="Permanent link">&para;</a></h2>
+<p>Each environment step is represented as <code>T</code> tokens (<code>token_data_len</code> in the config). Every enabled modality contributes a flat <code>T*D</code> vector; all contributions are <strong>summed</strong> so the output is always exactly <code>T</code> tokens per step regardless of which modalities are present:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>token[i] = Σ_modality  type_embed(modality) + content_embed(modality, i)
+</code></pre></div>
+<p>After summing, the embedder reshapes the result to <code>[B, S*T, D]</code> for the backbone.</p>
+<h3 id="modalities">Modalities<a class="headerlink" href="#modalities" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Type</th>
+<th>Embedder</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>action</code></td>
+<td><code>int64</code></td>
+<td><code>ActionEmbedder</code> — learned embedding table</td>
+</tr>
+<tr>
+<td><code>reward</code></td>
+<td><code>float32</code></td>
+<td><code>RewardEmbedder</code> — Random Fourier Features</td>
+</tr>
+<tr>
+<td><code>done</code></td>
+<td><code>int64</code> {0,1,2}</td>
+<td><code>DoneEmbedder</code> — 3-entry embedding table</td>
+</tr>
+<tr>
+<td><code>time</code></td>
+<td><code>int64</code></td>
+<td><code>TimeEmbedder</code> — learned embedding table</td>
+</tr>
+<tr>
+<td><code>obs_continuous</code></td>
+<td><code>float32[C]</code></td>
+<td><code>ObsContinuousEmbedder</code> — per-dim position-indexed RFF; or <code>ObsContinuousLinearEmbedder</code> — learned per-dim linear</td>
+</tr>
+<tr>
+<td><code>obs_discrete</code></td>
+<td><code>int64</code></td>
+<td><code>ObsDiscreteEmbedder</code> — learned embedding table</td>
+</tr>
+<tr>
+<td><code>obs_image</code></td>
+<td><code>int64[P]</code></td>
+<td><code>ObsImageEmbedder</code> — per-pixel position-indexed linear on normalised pixel values</td>
+</tr>
+</tbody>
+</table>
+<p>Each modality is independently optional. Set the corresponding <code>include_*</code> flag to <code>False</code> in <code>embedding_kwargs</code> to omit it. The corresponding field is then not required in <code>step_stream</code>.</p>
+<h3 id="token-types">Token types<a class="headerlink" href="#token-types" title="Permanent link">&para;</a></h3>
+<p><code>TokenType</code> (IntEnum) labels each token position. The backbone currently masks only <code>PAD</code> tokens; other token types flow through unmasked.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="k">class</span><span class="w"> </span><span class="nc">TokenType</span><span class="p">(</span><span class="n">IntEnum</span><span class="p">):</span>
+<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>    <span class="n">PAD</span> <span class="o">=</span> <span class="mi">0</span>
+<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>    <span class="n">ACTION</span> <span class="o">=</span> <span class="mi">1</span>
+<a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a>    <span class="n">REWARD</span> <span class="o">=</span> <span class="mi">2</span>
+<a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a>    <span class="n">DONE</span> <span class="o">=</span> <span class="mi">3</span>
+<a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a>    <span class="n">OBS_IMAGE</span> <span class="o">=</span> <span class="mi">4</span>
+<a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a>    <span class="n">OBS_CONTINUOUS</span> <span class="o">=</span> <span class="mi">5</span>
+<a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a>    <span class="n">TIME</span> <span class="o">=</span> <span class="mi">6</span>
+<a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a>    <span class="n">OBS_DISCRETE</span> <span class="o">=</span> <span class="mi">7</span>
+</code></pre></div>
+<h3 id="initialisation-scaling">Initialisation scaling<a class="headerlink" href="#initialisation-scaling" title="Permanent link">&para;</a></h3>
+<p>Embedding tables use <code>ScaledEmbedding</code> initialised at <code>std = embedding_std</code> (default 0.02). RFF-based embedders are scaled so each modality contributes roughly the same output variance regardless of its dimension count (sums over <code>max_num_obs</code> dims are divided by <code>√max_num_obs</code>).</p>
+<hr />
+<h2 id="backbone">Backbone<a class="headerlink" href="#backbone" title="Permanent link">&para;</a></h2>
+<p>The backbone runs a standard transformer over the <code>[B, S*T, D]</code> token sequence and returns <code>[B, S*T, D]</code> hidden states.</p>
+<h3 id="llama-mousemodelsbackbonellamamodelllama">Llama (<code>mouse.models.backbone.llama.ModelLlama</code>)<a class="headerlink" href="#llama-mousemodelsbackbonellamamodelllama" title="Permanent link">&para;</a></h3>
+<p>Uses <code>transformers.LlamaModel</code> (SDPA attention, no embedding layer, <code>vocab_size=1</code>). The final layer norm is replaced with <code>nn.Identity</code> so the model outputs raw hidden states. The cuDNN SDPA backend is disabled to avoid known numerical issues.</p>
+<h3 id="qwen3-mousemodelsbackboneqwen3modelqwen3">Qwen3 (<code>mouse.models.backbone.qwen3.ModelQwen3</code>)<a class="headerlink" href="#qwen3-mousemodelsbackboneqwen3modelqwen3" title="Permanent link">&para;</a></h3>
+<p>Same approach using <code>transformers.Qwen3Model</code>. Supports an explicit <code>head_dim</code> for grouped-query attention.</p>
+<h3 id="none-mousemodelsbackbonenonemodelnone">None (<code>mouse.models.backbone.none.ModelNone</code>)<a class="headerlink" href="#none-mousemodelsbackbonenonemodelnone" title="Permanent link">&para;</a></h3>
+<p><code>nn.Identity</code> backbone — useful for ablations where no temporal context is needed. Does not support KV-cache.</p>
+<h3 id="auto-detection">Auto-detection<a class="headerlink" href="#auto-detection" title="Permanent link">&para;</a></h3>
+<p><code>load_model</code> inspects <code>backbone_kwargs</code> in <code>config.json</code> and instantiates the right class:</p>
+<ul>
+<li>empty <code>backbone_kwargs</code> → <code>ModelNone</code></li>
+<li><code>head_dim</code> present → <code>ModelQwen3</code></li>
+<li>otherwise → <code>ModelLlama</code></li>
+</ul>
+<h3 id="kv-cache">KV-cache<a class="headerlink" href="#kv-cache" title="Permanent link">&para;</a></h3>
+<p>Pass <code>use_cache=True</code> to enable incremental decoding. The <code>cache</code> dict returned from one call is passed back as input to the next. Only meaningful for <code>ModelLlama</code> and <code>ModelQwen3</code>; <code>ModelNone</code> always returns <code>None</code>.</p>
+<hr />
+<h2 id="last-token-pooling">Last-token pooling<a class="headerlink" href="#last-token-pooling" title="Permanent link">&para;</a></h2>
+<p>After the backbone, <code>Model.forward</code> reshapes hidden states to <code>[B, S, T, D]</code> and takes the <strong>last token of each step</strong>:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="n">h_step</span> <span class="o">=</span> <span class="n">h</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">T</span><span class="p">,</span> <span class="n">D</span><span class="p">)[:,</span> <span class="p">:,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="p">:]</span>   <span class="c1"># [B, S, D]</span>
+</code></pre></div>
+<p>This <code>[B, S, D]</code> tensor is the step-level representation fed to every output head.</p>
+<hr />
+<h2 id="output-heads">Output heads<a class="headerlink" href="#output-heads" title="Permanent link">&para;</a></h2>
+<p>All heads take <code>[B, S, D]</code> and return <code>[B, S, ...]</code>.</p>
+<h3 id="swigluhead-mousemodelsheadsswiglu">SwiGLUHead (<code>mouse.models.heads.swiglu</code>)<a class="headerlink" href="#swigluhead-mousemodelsheadsswiglu" title="Permanent link">&para;</a></h3>
+<p>Shared building block for <code>sp</code> and <code>sv</code> heads:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>RMSNorm (optional) → [ Linear (2D) → SiLU × Linear (D) ] × num_layers → ScaledLinear
+</code></pre></div>
+<h3 id="dqnhead-mousemodelsheadsdqn">DQNHead (<code>mouse.models.heads.dqn</code>)<a class="headerlink" href="#dqnhead-mousemodelsheadsdqn" title="Permanent link">&para;</a></h3>
+<p>Two <code>SwiGLUHead</code> copies — <strong>online</strong> and <strong>target</strong> — with the same architecture. <code>target_forward</code> runs the target head with no gradient tracking. Call <code>polyak_update(tau)</code> after each optimiser step:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>θ_target ← τ·θ_online + (1−τ)·θ_target
+</code></pre></div>
+<h3 id="vecdqnhead-mousemodelsheadsvec_dqn">VecDQNHead (<code>mouse.models.heads.vec_dqn</code>)<a class="headerlink" href="#vecdqnhead-mousemodelsheadsvec_dqn" title="Permanent link">&para;</a></h3>
+<p>Like <code>DQNHead</code> but each action produces a <code>vec_dim</code>-dimensional vector. Output shape: <code>[B, S, A, vec_dim]</code>.</p>
+<p><strong>Scoring.</strong> Convert vectors to scalar Q-scores with <code>vec_dqn_scores(vecs)</code>. For each action pair <code>(i, a)</code> the function computes the full signed angle <code>φ_a − φ_i</code> via <code>atan2(sin, cos)</code> and sums over all <code>i</code>. Using <code>atan2</code> rather than a raw dot product avoids aliasing above 90° and gives a score that is monotone over the full <code>(−π, +π)</code> range.</p>
+<p><strong>Rotation.</strong> <code>rope_rotate(x, theta)</code> rotates each consecutive pair of dimensions in <code>x</code> by <code>theta</code> (standard RoPE). For <code>D=2</code> this is geometrically exact; for <code>D&gt;2</code> each pair of dimensions is an independent rotation plane.</p>
+<hr />
+<h2 id="modelget_action">Model.get_action<a class="headerlink" href="#modelget_action" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="n">action</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">get_action</span><span class="p">(</span><span class="n">out</span><span class="p">,</span> <span class="n">temperature</span><span class="o">=</span><span class="mf">0.0</span><span class="p">)</span>  <span class="c1"># [B]</span>
+</code></pre></div>
+<p>Reads from <code>model.action_head</code>, set at construction time and saved in <code>config.json</code>. Auto-detected from enabled heads if not specified: <code>vec_dqn</code> &gt; <code>dqn</code> &gt; <code>sp</code> &gt; <code>sv</code>.</p>
+<ul>
+<li><code>temperature=0.0</code> → greedy argmax.</li>
+<li><code>temperature&gt;0</code> → softmax sampling with numerical stability (max subtraction).</li>
+<li><code>vec_dqn</code> head → <code>vec_dqn_scores</code> applied automatically before argmax/sampling.</li>
+<li><code>num_actions</code> → trim score tensor to the first N actions (useful when the environment has fewer actions than the model maximum).</li>
+</ul>
+<hr />
+<h2 id="modelpolyak_update">Model.polyak_update<a class="headerlink" href="#modelpolyak_update" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="n">model</span><span class="o">.</span><span class="n">polyak_update</span><span class="p">(</span><span class="n">dqn_tau</span><span class="o">=</span><span class="mf">0.005</span><span class="p">,</span> <span class="n">vec_dqn_tau</span><span class="o">=</span><span class="mf">0.005</span><span class="p">)</span>
+</code></pre></div>
+<p>Delegates to each enabled twin-head. Call once per optimiser step.</p>
+<hr />
+<h2 id="config-layout-configjson">Config layout (<code>config.json</code>)<a class="headerlink" href="#config-layout-configjson" title="Permanent link">&para;</a></h2>
+<p>When saved via <code>push_to_hub</code> or <code>save_pretrained</code> (HuggingFace Hub mixin), the model writes its constructor kwargs as JSON. <code>load_model</code> reads this file to select the right class and instantiate it.</p>
+<p>Key fields:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="p">{</span>
+<a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a><span class="w">  </span><span class="nt">&quot;hidden_dim&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">512</span><span class="p">,</span>
+<a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a><span class="w">  </span><span class="nt">&quot;backbone_kwargs&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;num_hidden_layers&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">8</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;num_attention_heads&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">8</span><span class="p">,</span><span class="w"> </span><span class="err">...</span><span class="w"> </span><span class="p">},</span>
+<a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a><span class="w">  </span><span class="nt">&quot;embedding_kwargs&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-8-5" name="__codelineno-8-5" href="#__codelineno-8-5"></a><span class="w">    </span><span class="nt">&quot;max_num_actions&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">18</span><span class="p">,</span>
+<a id="__codelineno-8-6" name="__codelineno-8-6" href="#__codelineno-8-6"></a><span class="w">    </span><span class="nt">&quot;include_action_token&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<a id="__codelineno-8-7" name="__codelineno-8-7" href="#__codelineno-8-7"></a><span class="w">    </span><span class="nt">&quot;include_reward_token&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<a id="__codelineno-8-8" name="__codelineno-8-8" href="#__codelineno-8-8"></a><span class="w">    </span><span class="nt">&quot;include_done_token&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<a id="__codelineno-8-9" name="__codelineno-8-9" href="#__codelineno-8-9"></a><span class="w">    </span><span class="nt">&quot;include_time_token&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<a id="__codelineno-8-10" name="__codelineno-8-10" href="#__codelineno-8-10"></a><span class="w">    </span><span class="nt">&quot;include_obs_continuous&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<a id="__codelineno-8-11" name="__codelineno-8-11" href="#__codelineno-8-11"></a><span class="w">    </span><span class="nt">&quot;max_num_obs_continuous&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">8</span><span class="p">,</span>
+<a id="__codelineno-8-12" name="__codelineno-8-12" href="#__codelineno-8-12"></a><span class="w">    </span><span class="nt">&quot;token_data_len&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">4</span><span class="p">,</span>
+<a id="__codelineno-8-13" name="__codelineno-8-13" href="#__codelineno-8-13"></a><span class="w">    </span><span class="err">...</span>
+<a id="__codelineno-8-14" name="__codelineno-8-14" href="#__codelineno-8-14"></a><span class="w">  </span><span class="p">},</span>
+<a id="__codelineno-8-15" name="__codelineno-8-15" href="#__codelineno-8-15"></a><span class="w">  </span><span class="nt">&quot;sp_head_kwargs&quot;</span><span class="p">:</span><span class="w">      </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;num_layers&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;hidden_dim&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">256</span><span class="w"> </span><span class="p">},</span>
+<a id="__codelineno-8-16" name="__codelineno-8-16" href="#__codelineno-8-16"></a><span class="w">  </span><span class="nt">&quot;dqn_head_kwargs&quot;</span><span class="p">:</span><span class="w">     </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;num_layers&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;hidden_dim&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">256</span><span class="w"> </span><span class="p">},</span>
+<a id="__codelineno-8-17" name="__codelineno-8-17" href="#__codelineno-8-17"></a><span class="w">  </span><span class="nt">&quot;vec_dqn_head_kwargs&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;num_layers&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;hidden_dim&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">256</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;vec_dim&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">2</span><span class="w"> </span><span class="p">},</span>
+<a id="__codelineno-8-18" name="__codelineno-8-18" href="#__codelineno-8-18"></a><span class="w">  </span><span class="nt">&quot;sv_head_kwargs&quot;</span><span class="p">:</span><span class="w">      </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;num_layers&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="w"> </span><span class="p">}</span>
+<a id="__codelineno-8-19" name="__codelineno-8-19" href="#__codelineno-8-19"></a><span class="p">}</span>
+</code></pre></div>
+<p>A head is disabled when its <code>num_layers</code> is 0 (or the key is absent).</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" class="lucide lucide-circle-arrow-up" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="m16 12-4-4-4 4M12 16V8"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+  
+    Made with
+    <a href="https://zensical.org/" target="_blank" rel="noopener">
+      Zensical
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate":null,"base":"..","features":["navigation.tabs","navigation.sections","navigation.top","search.suggest","search.highlight","content.code.copy"],"search":"../assets/javascripts/workers/search.e2d2d235.min.js","tags":null,"translations":{"clipboard.copied":"Copied to clipboard","clipboard.copy":"Copy to clipboard","search.result.more.one":"1 more on this page","search.result.more.other":"# more on this page","search.result.none":"No matching documents","search.result.one":"1 matching document","search.result.other":"# matching documents","search.result.placeholder":"Type to start searching","search.result.term.missing":"Missing","select.version":"Select version"},"version":null}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.dbc0afdc.min.js"></script>
+      
+    
+  </body>
+</html>

@@ -27,8 +27,8 @@ class ScaledLinear(nn.Linear):
         out_features: int,
         scale: float,
         bias: bool = True,
-        device=None,
-        dtype=None,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__(in_features, out_features, bias=bias, device=device, dtype=dtype)
         sc = float(scale)
@@ -41,15 +41,28 @@ class ScaledLinear(nn.Linear):
 
 
 class PosLinear(nn.Module):
-    """Position-conditioned linear projection."""
+    """Position-conditioned linear projection.
+
+    Stores one independent ``(weight, bias)`` pair per position index.  At
+    forward time, each element selects its projection via an integer position
+    index, enabling per-dimension embeddings without separate ``nn.Linear``
+    instances.
+
+    Args:
+        num_positions: Number of distinct positions (embedding table size).
+        in_features: Input feature dimension.
+        out_features: Output feature dimension.
+        device: Tensor device for parameters.
+        dtype: Tensor dtype for parameters.
+    """
 
     def __init__(
         self,
         num_positions: int,
         in_features: int,
         out_features: int,
-        device=None,
-        dtype=None,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
         self.in_features = in_features
@@ -61,6 +74,15 @@ class PosLinear(nn.Module):
         nn.init.zeros_(self.bias)
 
     def forward(self, x: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+        """Apply the position-specific projection.
+
+        Args:
+            x: Input tensor ``[*batch, in_features]``.
+            pos: Integer position indices ``[*batch]``; same leading shape as ``x``.
+
+        Returns:
+            Output tensor ``[*batch, out_features]``.
+        """
         x_flat = x.reshape(-1, x.shape[-1])
         pos_flat = pos.reshape(-1)
         w = self.weight[pos_flat]
@@ -82,8 +104,8 @@ class ScaledPosLinear(PosLinear):
         in_features: int,
         out_features: int,
         scale: float = 1.0,
-        device=None,
-        dtype=None,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__(
             num_positions=num_positions,

@@ -7,13 +7,15 @@ name = "mouse"
 version = "0.1.0"
 description = "Meta-Optimization Using Sequential Experiences — core ICRL library"
 readme = "README.md"
-requires-python = ">=3.12,<3.13"
+requires-python = ">=3.12"
 dependencies = [
-    "torch>=2.11.0",
-    "numpy>=2.4.2",
-    "transformers>=5.5.0",
-    "tensordict>=0.11.0",
-    "datasets>=4.6.1",
+    "torch>=2.12.0",
+    "numpy>=2.4.4",
+    "transformers>=5.8.0",
+    "tensordict>=0.12.1",
+    "datasets>=4.8.5",
+    "huggingface_hub>=0.30.0",
+    "pillow>=11.0.0",
 ]
 
 [project.optional-dependencies]
@@ -21,13 +23,33 @@ dev = [
     "pyright",
     "pytest",
 ]
-
-[tool.uv.pip]
-extra-index-url = ["https://download.pytorch.org/whl/cu128"]
+docs = [
+    "zensical>=0.0.11",
+    "mkdocstrings-python>=1.16",
+]
 
 [tool.uv]
 environments = ["sys_platform == 'linux'"]
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["mouse*"]
+# Source lives under src/ but is exposed as the "mouse" namespace.
+# package-dir tells setuptools that "mouse" maps to src/, so
+# src/models/ → mouse.models, src/data/ → mouse.data, etc.
+[tool.setuptools]
+packages = [
+    "mouse",
+    "mouse.models",
+    "mouse.models.backbone",
+    "mouse.models.embedding",
+    "mouse.models.heads",
+    "mouse.data",
+    "mouse.losses",
+]
+
+[tool.setuptools.package-dir]
+"mouse" = "src"
+"mouse.models" = "src/models"
+"mouse.models.backbone" = "src/models/backbone"
+"mouse.models.embedding" = "src/models/embedding"
+"mouse.models.heads" = "src/models/heads"
+"mouse.data" = "src/data"
+"mouse.losses" = "src/losses"

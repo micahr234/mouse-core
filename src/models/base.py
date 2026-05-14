@@ -9,8 +9,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tensordict import TensorDict
 
-from mouse.models.heads import DQNHead, SwiGLUHead, VecDQNHead, vec_dqn_scores
-from mouse.models.embedding import StepEmbedder, TokenType
+from mouse.models.heads.dqn import DQNHead
+from mouse.models.heads.swiglu import SwiGLUHead
+from mouse.models.heads.vec_dqn import VecDQNHead, vec_dqn_scores
+from mouse.models.embedding.embedding import StepEmbedder, TokenType
 
 
 MODEL_CARD_TEMPLATE = """\
@@ -26,7 +28,7 @@ history of environment transitions and outputs action logits.
 ## Install (requires private repo access)
 
 ```bash
-pip install "git+https://github.com/micahr234/MOUSE.git"
+pip install "git+https://github.com/micahr234/mouse-core.git"
 ```
 
 ## Load
@@ -109,19 +111,11 @@ with torch.no_grad():
 | `sv` | `[B, S, A]` | Q-star regression logits |
 {%- endif %}
 
-Select an action from the last timestep (works for all heads, handles temperature):
+Select an action from the last timestep (uses ``model.action_head``, handles temperature):
 
 ```python
 # greedy (temperature=0) or stochastic (temperature>0)
-{%- if vec_dqn_head_kwargs is not defined or vec_dqn_head_kwargs.num_layers > 0 %}
-action = model.get_action(out, head="vec_dqn", temperature=0.0)  # [B]
-{%- elif dqn_head_kwargs is not defined or dqn_head_kwargs.num_layers > 0 %}
-action = model.get_action(out, head="dqn", temperature=0.0)      # [B]
-{%- elif sp_head_kwargs is not defined or sp_head_kwargs.num_layers > 0 %}
-action = model.get_action(out, head="sp", temperature=0.0)       # [B]
-{%- elif sv_head_kwargs is not defined or sv_head_kwargs.num_layers > 0 %}
-action = model.get_action(out, head="sv", temperature=0.0)       # [B]
-{%- endif %}
+action = model.get_action(out, temperature=0.0)  # [B]
 ```
 
 ## Online rollouts with KV-cache
@@ -167,15 +161,7 @@ while not done:
     with torch.no_grad():
         out, cache = model(step_stream.to(device), cache=cache, use_cache=True)
 
-{%- if vec_dqn_head_kwargs is not defined or vec_dqn_head_kwargs.num_layers > 0 %}
-    action = model.get_action(out, head="vec_dqn", temperature=0.0)
-{%- elif dqn_head_kwargs is not defined or dqn_head_kwargs.num_layers > 0 %}
-    action = model.get_action(out, head="dqn", temperature=0.0)
-{%- elif sp_head_kwargs is not defined or sp_head_kwargs.num_layers > 0 %}
-    action = model.get_action(out, head="sp", temperature=0.0)
-{%- else %}
-    action = model.get_action(out, head="sv", temperature=0.0)
-{%- endif %}
+    action = model.get_action(out, temperature=0.0)
     step_idx += 1
 ```
 
@@ -235,12 +221,12 @@ def load_model(
     backbone_kwargs = config.get("backbone_kwargs", {})
 
     if not backbone_kwargs:
-        from mouse.models.none import ModelNone
+        from mouse.models.backbone.none import ModelNone
         return ModelNone.from_pretrained(repo_id_or_path, **kwargs)
     if "head_dim" in backbone_kwargs:
-        from mouse.models.qwen3 import ModelQwen3
+        from mouse.models.backbone.qwen3 import ModelQwen3
         return ModelQwen3.from_pretrained(repo_id_or_path, **kwargs)
-    from mouse.models.llama import ModelLlama
+    from mouse.models.backbone.llama import ModelLlama
     return ModelLlama.from_pretrained(repo_id_or_path, **kwargs)
 
 
@@ -261,11 +247,17 @@ class Model(nn.Module):
                      use ``get_action`` or ``vec_dqn_scores`` to get scalar scores
     - ``sv``       — SwiGLU MLP → logits ``[B, S, A]``
 
-    Use ``get_action(out, head, temperature, num_actions)`` to sample or
-    greedily select actions from any head without manual score conversion.
+    ``action_head`` selects which head ``get_action`` reads.  It is stored in
+    ``config.json`` and loaded automatically.  If omitted, the most expressive
+    enabled head is chosen: ``vec_dqn`` > ``dqn`` > ``sp`` > ``sv``.
+
+    Use ``get_action(out, temperature, num_actions)`` to sample or greedily
+    select actions without manual score conversion.
     """
 
     backbone: nn.Module  # Set by subclasses (ModelLlama, ModelQwen3)
+
+    _VALID_HEADS = ("sp", "dqn", "vec_dqn", "sv")
 
     def __init__(
         self,
@@ -276,6 +268,7 @@ class Model(nn.Module):
         dqn_head_kwargs: dict,
         sv_head_kwargs: dict,
         vec_dqn_head_kwargs: dict,
+        action_head: str | None = None,
     ):
         super().__init__()
 
@@ -308,6 +301,25 @@ class Model(nn.Module):
             SwiGLUHead(in_features=hidden_dim, out_features=self.max_num_actions, **sv_head_kwargs)
             if sv_head_kwargs.get("num_layers", 0) > 0 else None
         )
+
+        if action_head is not None:
+            if action_head not in self._VALID_HEADS:
+                raise ValueError(
+                    f"action_head must be one of {self._VALID_HEADS}, got {action_head!r}."
+                )
+            self.action_head: str = action_head
+        else:
+            # Auto-detect: most expressive enabled head wins.
+            if self.vec_dqn_head is not None:
+                self.action_head = "vec_dqn"
+            elif self.dqn_head is not None:
+                self.action_head = "dqn"
+            elif self.sp_head is not None:
+                self.action_head = "sp"
+            elif self.sv_head is not None:
+                self.action_head = "sv"
+            else:
+                raise ValueError("No output head is enabled; cannot determine action_head.")
 
         self._init_backbone(backbone_kwargs)
 
@@ -407,17 +419,16 @@ class Model(nn.Module):
     def get_action(
         self,
         out: TensorDict,
-        head: str,
         temperature: float = 1.0,
         num_actions: int | None = None,
     ) -> torch.Tensor:
         """Select an action from model output at the last step position.
 
+        Uses ``self.action_head``, which is set at construction time (or
+        auto-detected from enabled heads).
+
         Args:
             out: Model output TensorDict ``[B, S, ...]``.
-            head: Which head to read — ``'sp'``, ``'dqn'``, ``'sv'`` produce
-                  logits ``[B, S, A]``; ``'vec_dqn'`` produces vectors
-                  ``[B, S, A, D]`` that are converted to scores automatically.
             temperature: Sampling temperature. ``0.0`` → greedy argmax;
                          ``> 0`` → softmax sampling.
             num_actions: If given, trim scores to the first ``num_actions``
@@ -427,8 +438,8 @@ class Model(nn.Module):
         Returns:
             ``[B]`` int64 tensor of selected actions.
         """
-        raw = out[head][:, -1]  # [B, A] or [B, A, D] for vec_dqn
-        scores: torch.Tensor = vec_dqn_scores(raw) if head == "vec_dqn" else raw  # [B, A]
+        raw = out[self.action_head][:, -1]  # [B, A] or [B, A, D] for vec_dqn
+        scores: torch.Tensor = vec_dqn_scores(raw) if self.action_head == "vec_dqn" else raw  # [B, A]
         if num_actions is not None:
             scores = scores[:, :num_actions]
         if temperature == 0.0:

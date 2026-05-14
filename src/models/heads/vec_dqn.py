@@ -1,4 +1,4 @@
-"""Activation, feed-forward, and MLP head modules."""
+"""VecDQNHead: vector-valued DQN head with RoPE-based angular scoring."""
 
 from __future__ import annotations
 
@@ -8,46 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from mouse.models.linear import ScaledLinear
-
-
-class SwiGLU(nn.Module):
-    """Gated linear unit with SiLU on the gate: ``silu(x @ W1) * (x @ W2)`` via one fused ``Linear`` to ``2 * dim``."""
-
-    def __init__(self, in_features: int, hidden_dim: int) -> None:
-        super().__init__()
-        self.linear = nn.Linear(in_features, 2 * hidden_dim)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        a, b = self.linear(x).chunk(2, dim=-1)
-        return F.silu(a) * b
-
-
-class SwiGLUHead(nn.Module):
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        hidden_dim: int,
-        num_layers: int,
-        scale: float = 1.0,
-        use_norm: bool = True,
-    ):
-        super().__init__()
-        if use_norm:
-            self.norm = nn.RMSNorm(in_features, elementwise_affine=True, eps=1e-5)
-        else:
-            self.norm = None
-        dims = [in_features] + [hidden_dim] * (num_layers - 1) + [out_features]
-        self.layers = nn.Sequential(
-            *[SwiGLU(in_features=dims[i], hidden_dim=dims[i+1]) for i in range(num_layers - 1)],
-            ScaledLinear(in_features=dims[-2], out_features=dims[-1], scale=scale),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.norm is not None:
-            x = self.norm(x)
-        return self.layers(x)
+from mouse.models.heads.swiglu import SwiGLUHead
 
 
 def rope_rotate(x: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
@@ -101,53 +62,6 @@ def vec_dqn_scores(vecs: torch.Tensor) -> torch.Tensor:
     sin_ia = torch.einsum("...id,...ad->...ia", rot90, vecs_norm)      # [..., A, A]  sin(φ_a − φ_i)
     cos_ia = torch.einsum("...id,...ad->...ia", vecs_norm, vecs_norm)  # [..., A, A]  cos(φ_a − φ_i)
     return torch.atan2(sin_ia, cos_ia).sum(dim=-2)                     # [..., A]
-
-
-
-class DQNHead(nn.Module):
-    """SwiGLUHead paired with an EMA target copy and Polyak averaging.
-
-    ``forward`` runs the online head. ``target_forward`` runs the target head
-    (no gradient tracking). Call ``polyak_update(tau)`` after each optimizer
-    step to soft-update the target:  θ_target ← τ·θ_online + (1−τ)·θ_target.
-    Initialize with ``tau=1.0`` to copy online weights into the target.
-    """
-
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        hidden_dim: int,
-        num_layers: int,
-        scale: float = 1.0,
-        use_norm: bool = True,
-    ):
-        super().__init__()
-        head_kwargs = dict(
-            in_features=in_features,
-            out_features=out_features,
-            hidden_dim=hidden_dim,
-            num_layers=num_layers,
-            scale=scale,
-            use_norm=use_norm,
-        )
-        self.online = SwiGLUHead(**head_kwargs)
-        self.target = SwiGLUHead(**head_kwargs)
-        self.target.requires_grad_(False)
-        self.polyak_update(tau=1.0)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.online(x)
-
-    def target_forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.target(x)
-
-    def polyak_update(self, tau: float) -> None:
-        """Soft-update target toward online: θ_target ← τ·θ_online + (1−τ)·θ_target."""
-        if tau <= 0.0:
-            return
-        for online_p, target_p in zip(self.online.parameters(), self.target.parameters()):
-            target_p.data.copy_(tau * online_p.data + (1.0 - tau) * target_p.data)
 
 
 class VecDQNHead(nn.Module):

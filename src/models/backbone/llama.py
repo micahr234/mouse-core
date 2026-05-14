@@ -1,4 +1,4 @@
-"""ModelQwen3: single-backbone model that processes all tokens in one pass."""
+"""ModelLlama: single-backbone model that processes all tokens in one pass."""
 
 from __future__ import annotations
 
@@ -8,18 +8,22 @@ import torch
 from huggingface_hub import PyTorchModelHubMixin
 
 from mouse.models.base import Model, MODEL_CARD_TEMPLATE
-from mouse.models.backbone import Qwen3BackboneConfig
+from mouse.models.backbone.configs import LlamaBackboneConfig
 from mouse.models.base import TokenType
 
 
-class ModelQwen3(Model, PyTorchModelHubMixin, library_name="MOUSE", tags=["backbone:qwen3"], model_card_template=MODEL_CARD_TEMPLATE):
-    """SAL model with a single Qwen3 backbone that attends over the full token sequence."""
+class ModelLlama(Model, PyTorchModelHubMixin, library_name="MOUSE", tags=["backbone:llama"], model_card_template=MODEL_CARD_TEMPLATE):
+    """MOUSE model with a Llama transformer backbone.
+
+    Attends over the full ``[B, S*T, D]`` token sequence with causal SDPA.
+    Supports KV-cache for incremental rollouts (``use_cache=True``).
+    """
 
     def _init_backbone(self, backbone_kwargs: dict) -> None:
-        cfg = Qwen3BackboneConfig(**backbone_kwargs)
+        """Build and assign ``self.backbone`` from ``backbone_kwargs``."""
+        cfg = LlamaBackboneConfig(**backbone_kwargs)
         self.num_layers = cfg.num_layers
         self.num_heads = cfg.num_heads
-        self.head_dim = cfg.head_dim
         self.max_position_embeddings = cfg.max_position_embeddings
         self.expand = cfg.expand
         self.backbone = cfg.build(self.hidden_dim)
@@ -33,7 +37,21 @@ class ModelQwen3(Model, PyTorchModelHubMixin, library_name="MOUSE", tags=["backb
         cache_position: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, dict[str, Any] | None]:
-        """Run the single backbone over all tokens and return hidden states."""
+        """Run the Llama backbone over the token sequence.
+
+        Args:
+            embeds: ``[B, T_total, D]`` embedding tensor from ``StepEmbedder``.
+            token_type: ``[B, T_total]`` int64 ``TokenType`` ids; ``PAD`` positions
+                are masked out from attention.
+            cache: KV-cache dict from a previous call, or ``None`` for full prefill.
+                Reads and writes the ``"backbone"`` key.
+            use_cache: If ``True``, return an updated KV-cache dict.
+            cache_position: Unused; present for interface compatibility.
+            **kwargs: Forwarded to the underlying ``LlamaModel``.
+
+        Returns:
+            Tuple of ``(hidden_states [B, T_total, D], cache_dict | None)``.
+        """
         cache = cache or {}
 
         has_padding = bool((token_type == TokenType.PAD).any())

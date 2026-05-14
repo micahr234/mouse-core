@@ -30,8 +30,8 @@ import torch
 import torch.nn as nn
 from tensordict import TensorDict
 
-from mouse.models.encoding import NormalizedPixel, RandomFourierFeatures
-from mouse.models.linear import ScaledEmbedding, ScaledPosLinear
+from mouse.models.embedding.encoding import NormalizedPixel, RandomFourierFeatures
+from mouse.models.embedding.linear import ScaledEmbedding, ScaledPosLinear
 
 
 class TokenType(IntEnum):

@@ -25,6 +25,25 @@ def _disable_cudnn_sdp_attention_backend() -> None:
 
 @dataclass
 class LlamaBackboneConfig:
+    """Configuration for a Llama transformer backbone.
+
+    Builds a HuggingFace ``LlamaModel`` with SDPA attention and no token embedding
+    or final layer norm (norm is replaced with ``nn.Identity``).
+
+    Args:
+        num_layers: Number of transformer decoder layers.
+        num_heads: Number of query attention heads.
+        num_key_value_heads: Number of key/value heads for grouped-query attention.
+            Defaults to ``num_heads`` (standard multi-head attention).
+        max_position_embeddings: Maximum sequence length for RoPE; should be at
+            least ``sequence_length * tokens_per_step``.
+        expand: FFN intermediate size multiplier: ``intermediate_size = hidden_dim * expand``.
+        rope_parameters: Optional dict forwarded to ``LlamaConfig.rope_parameters``
+            for custom RoPE variants (e.g. ``{"rope_type": "llama3"}``).
+        rms_norm_eps: Epsilon for RMSNorm layers.
+        attention_bias: Whether to add bias to the QKV and output projections.
+    """
+
     num_layers: int
     num_heads: int
     num_key_value_heads: int | None = None
@@ -44,6 +63,14 @@ class LlamaBackboneConfig:
             self.num_key_value_heads = int(self.num_key_value_heads)
 
     def build(self, hidden_dim: int) -> LlamaModel:
+        """Instantiate a ``LlamaModel`` from this config.
+
+        Args:
+            hidden_dim: Model hidden dimension ``D``; must be divisible by ``num_heads``.
+
+        Returns:
+            Configured ``LlamaModel`` with the final norm replaced by ``nn.Identity``.
+        """
         _disable_cudnn_sdp_attention_backend()
         if hidden_dim % self.num_heads != 0:
             raise ValueError(
@@ -72,6 +99,27 @@ class LlamaBackboneConfig:
 
 @dataclass
 class Qwen3BackboneConfig:
+    """Configuration for a Qwen3 transformer backbone.
+
+    Builds a HuggingFace ``Qwen3Model`` with SDPA attention and no token embedding
+    or final layer norm (norm is replaced with ``nn.Identity``).
+
+    Args:
+        num_layers: Number of transformer decoder layers.
+        num_heads: Number of query attention heads.
+        num_key_value_heads: Number of key/value heads for grouped-query attention.
+            Defaults to ``num_heads`` (standard multi-head attention).
+        head_dim: Per-head attention dimension. When ``None``, defaults to
+            ``hidden_dim // num_heads``. Set explicitly to decouple model width
+            from attention head size (useful for GQA with small ``num_key_value_heads``).
+        max_position_embeddings: Maximum sequence length for RoPE.
+        expand: FFN intermediate size multiplier: ``intermediate_size = hidden_dim * expand``.
+        rope_parameters: Optional dict forwarded to ``Qwen3Config.rope_parameters``.
+        rms_norm_eps: Epsilon for RMSNorm layers.
+        attention_bias: Whether to add bias to the QKV and output projections.
+        use_sliding_window: Enable sliding-window attention (Qwen3 feature).
+    """
+
     num_layers: int
     num_heads: int
     num_key_value_heads: int | None = None
@@ -93,6 +141,15 @@ class Qwen3BackboneConfig:
             self.num_key_value_heads = int(self.num_key_value_heads)
 
     def build(self, hidden_dim: int) -> Qwen3Model:
+        """Instantiate a ``Qwen3Model`` from this config.
+
+        Args:
+            hidden_dim: Model hidden dimension ``D``.  When ``head_dim`` is ``None``,
+                must be divisible by ``num_heads``.
+
+        Returns:
+            Configured ``Qwen3Model`` with the final norm replaced by ``nn.Identity``.
+        """
         _disable_cudnn_sdp_attention_backend()
         if self.head_dim is None:
             if hidden_dim % self.num_heads != 0:
