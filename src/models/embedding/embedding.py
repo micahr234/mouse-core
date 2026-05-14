@@ -1,25 +1,38 @@
 """StepEmbedder — converts a batch of enriched step records into the per-token
 embedding sequence consumed by the sequence backbone.
 
-Each environment transition (step) produces exactly ``T = token_data_len`` embedding
-vectors.  Every active modality maps its data to a flat ``T * D`` vector, which is
-reshaped into ``T`` tokens of dimension ``D`` and added to the running sum:
+Each environment transition (step) produces exactly ``tokens_per_step`` embedding
+vectors.  Two modes are supported:
 
-    token[i] = Σ_modality  ( type_embed(modality)[D] + content_embed(modality)[T*D].view(T,D)[i] )
+**Sum mode** (default, ``concat_modalities=False``):
 
-After the backbone runs over the full [B, S*T, D] sequence, the last of the T
-tokens within each step is used to produce one [D]-vector per step.
+    Every active modality maps its data to a flat ``T * D`` vector, reshaped into
+    ``T`` tokens of dimension ``D`` and **added** to the running sum:
 
-Per-modality embedder classes
-------------------------------
-Each class maps its raw data to a flat ``[N, T*D]`` vector:
+        token[i] = Σ_modality  ( type_embed(modality) + content_embed(modality, i) )
 
-    - Scalar/discrete modalities: embedding table of size ``T*D``.
-    - Vector modalities (obs): one ``T*D`` contribution per element, summed over
-      valid elements.
+    ``tokens_per_step = T + K`` where ``K = num_compute_tokens``.
 
-``StepEmbedder.forward`` adds the shared ``[N, D]`` type embedding (broadcast across
-all T positions) and accumulates into ``[N, T, D]``.
+**Concat mode** (``concat_modalities=True``):
+
+    Each active modality gets its own dedicated block of ``T`` tokens in the
+    sequence, laid out sequentially rather than summed:
+
+        [modality_A × T | modality_B × T | ... | compute × K]
+
+    ``tokens_per_step = M * T + K`` where ``M`` is the number of active modalities
+    and ``K = num_compute_tokens``.
+
+**Compute tokens** (``num_compute_tokens > 0``):
+
+    ``K`` learned scratch tokens are appended after the data tokens within every
+    step block.  They carry no input data — their embedding is a shared
+    ``nn.Parameter`` of shape ``[K, D]`` broadcast across ``(B, S)``.  The
+    backbone can use them as working memory.  The step representation is always
+    taken from the **last** token (the last compute token when ``K > 0``).
+
+After the backbone runs over the full ``[B, S*tokens_per_step, D]`` sequence, the
+last token within each step is used to produce one ``[D]``-vector per step.
 """
 
 from __future__ import annotations
@@ -37,21 +50,15 @@ from mouse.models.embedding.linear import ScaledEmbedding, ScaledPosLinear
 class TokenType(IntEnum):
     """Token type identifiers used by StepEmbedder when building the embedding sequence."""
 
-    PAD = 0             # unused / padding
-    ACTION = 1          # int64 action index (discrete)
-    REWARD = 2          # float64 reward (continuous)
-    DONE = 3            # int64 done flag: 0=not done, 1=terminal, 2=truncated
-    OBS_IMAGE = 4       # image obs pixel
+    PAD          = 0  # unused / padding
+    ACTION       = 1  # int64 action index (discrete)
+    REWARD       = 2  # float64 reward (continuous)
+    DONE         = 3  # int64 done flag: 0=not done, 1=terminal, 2=truncated
+    OBS_IMAGE    = 4  # image obs pixel
     OBS_CONTINUOUS = 5  # continuous vector obs dimension
-    TIME = 6            # int64 episode_step index
-    OBS_DISCRETE = 7    # discrete vector obs dimension
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
+    TIME         = 6  # int64 episode_step index
+    OBS_DISCRETE = 7  # discrete vector obs dimension
+    COMPUTE      = 8  # learned scratch token; carries no input data
 
 
 # ---------------------------------------------------------------------------
@@ -318,24 +325,34 @@ class ObsImageEmbedder(nn.Module):
 class StepEmbedder(nn.Module):
     """Converts a batch of step records ``[B, S]`` into embedding sequences ``[B, S*T, D]``.
 
-    ``T = token_data_len`` is fixed at construction time so that the backbone always
+    ``tokens_per_step`` is fixed at construction time so that the backbone always
     receives a consistently-shaped input.
 
-    Every modality contributes ``T`` tokens; contributions are **summed** at each
-    position so the output is always exactly ``T`` tokens per step regardless of which
-    modalities are active:
+    Two embedding modes are available:
 
-        token[i] = Σ_modality  type_embed(modality) + content_embed(modality, i)
+    **Sum mode** (``concat_modalities=False``, default):
+        Every modality contributes ``token_data_len`` tokens; contributions are
+        **summed** at each position so the output is always exactly
+        ``token_data_len`` data tokens per step regardless of which modalities
+        are active.
 
-    After the backbone, ``Model.forward`` takes the last of the T outputs per step
-    to obtain one ``[D]`` vector per step.
+    **Concat mode** (``concat_modalities=True``):
+        Each active modality occupies its own dedicated block of ``token_data_len``
+        tokens, laid out sequentially.
+        ``tokens_per_step = num_active_modalities * token_data_len + num_compute_tokens``.
+
+    **Compute tokens** (``num_compute_tokens > 0``):
+        ``K`` learned scratch tokens are appended after the data tokens in every
+        step block.  The backbone can attend to and write into them as working
+        memory.  The step representation is always pooled from the **last** token
+        (the last compute token when ``K > 0``).
 
     Args:
         hidden_dim: Model hidden dimension ``D``.
         max_num_actions: Size of the action embedding table.
-        max_num_obs_continuous: Continuous obs vector length (embedding table size); must be > 0 when include_obs_continuous is True.
-        max_num_obs_discrete: Discrete obs vector length (embedding table size); must be > 0 when include_obs_discrete is True.
-        max_num_obs_image: Total pixel count per image (embedding table size); must be > 0 when include_obs_image is True.
+        max_num_obs_continuous: Continuous obs vector length; must be > 0 when include_obs_continuous is True.
+        max_num_obs_discrete: Discrete obs vector length; must be > 0 when include_obs_discrete is True.
+        max_num_obs_image: Total pixel count per image; must be > 0 when include_obs_image is True.
         max_num_time_steps: TIME embedding table size; must be > 0 when include_time_token is True.
         include_action_token: Emit an ACTION token per step.
         include_done_token: Emit a DONE token per step.
@@ -344,10 +361,15 @@ class StepEmbedder(nn.Module):
         include_obs_discrete: Emit an OBS_DISCRETE token per step.
         include_obs_image: Emit an OBS_IMAGE token per step.
         include_time_token: Emit a TIME token per step.
-        include_type_token: Add the learned type embedding to every token (gates TypeEmbedder).
-        token_data_len: Number of tokens ``T`` produced per step; all modalities map to ``T*D`` and are summed.
-        fourier_in_min: Smallest input value the RFF resolves (one cycle spans this many units at the high-frequency end).
-        fourier_in_max: Largest input value the RFF covers (one cycle spans this many units at the low-frequency end).
+        include_type_token: Add the learned type embedding to every token.
+        token_data_len: Number of tokens ``T`` produced per modality.
+        num_compute_tokens: Number of learned scratch tokens ``K`` appended after
+            the data tokens within each step block.  ``0`` disables compute tokens.
+        concat_modalities: When ``True``, modality embeddings are concatenated
+            sequentially rather than summed.  Each active modality occupies its
+            own ``token_data_len`` slots.
+        fourier_in_min: Smallest input value the RFF resolves.
+        fourier_in_max: Largest input value the RFF covers.
         std: Initialisation std for embedding tables.
     """
 
@@ -368,9 +390,11 @@ class StepEmbedder(nn.Module):
         include_time_token: bool,
         include_type_token: bool,
         token_data_len: int,
-        fourier_in_min: float,
-        fourier_in_max: float,
-        std: float,
+        num_compute_tokens: int = 0,
+        concat_modalities: bool = False,
+        fourier_in_min: float = -1.0,
+        fourier_in_max: float = 1.0,
+        std: float = 0.02,
     ) -> None:
         super().__init__()
 
@@ -385,6 +409,9 @@ class StepEmbedder(nn.Module):
             if inc_val and int(size_val) <= 0:
                 raise ValueError(f"{inc_name} is True but {size_name} is {size_val} (must be > 0).")
 
+        if int(num_compute_tokens) < 0:
+            raise ValueError(f"num_compute_tokens must be >= 0, got {num_compute_tokens}.")
+
         self.hidden_dim = int(hidden_dim)
         self.include_action_token = bool(include_action_token)
         self.include_time_token = bool(include_time_token)
@@ -394,40 +421,61 @@ class StepEmbedder(nn.Module):
         self.include_obs_discrete = bool(include_obs_discrete)
         self.include_obs_image = bool(include_obs_image)
         self.include_type_token = bool(include_type_token)
+        self.num_compute_tokens = int(num_compute_tokens)
+        self.concat_modalities = bool(concat_modalities)
+        self.token_data_len = int(token_data_len)
 
-        # Shared type embedding
-        self.type_embedder = TypeEmbedder(hidden_dim=hidden_dim, token_data_len=int(token_data_len), embedding_std=std)
+        # Count active data modalities (determines tokens_per_step in concat mode).
+        self._num_data_modalities: int = sum([
+            include_time_token,
+            include_action_token,
+            include_obs_continuous,
+            include_obs_discrete,
+            include_obs_image,
+            include_reward_token,
+            include_done_token,
+        ])
+
+        # Compute tokens_per_step.
+        T = self.token_data_len
+        K = self.num_compute_tokens
+        if concat_modalities:
+            data_slots = self._num_data_modalities * T
+        else:
+            data_slots = T
+        self.tokens_per_step: int = data_slots + K
+
+        # Shared type embedding (only used internally, not in returned token_types).
+        self.type_embedder = TypeEmbedder(hidden_dim=hidden_dim, token_data_len=T, embedding_std=std)
 
         # Action (optional)
         self.action_embedder = (
-            ActionEmbedder(hidden_dim=hidden_dim, token_data_len=int(token_data_len), max_num_actions=int(max_num_actions), embedding_std=std)
-            if include_action_token
-            else None
+            ActionEmbedder(hidden_dim=hidden_dim, token_data_len=T, max_num_actions=int(max_num_actions), embedding_std=std)
+            if include_action_token else None
         )
 
         # Time (optional)
         self.time_embedder = (
-            TimeEmbedder(hidden_dim=hidden_dim, token_data_len=int(token_data_len), max_num_time_steps=int(max_num_time_steps), embedding_std=std)
-            if include_time_token
-            else None
+            TimeEmbedder(hidden_dim=hidden_dim, token_data_len=T, max_num_time_steps=int(max_num_time_steps), embedding_std=std)
+            if include_time_token else None
         )
 
         # Done (optional)
         self.done_embedder = (
-            DoneEmbedder(hidden_dim=hidden_dim, token_data_len=int(token_data_len), embedding_std=std) if include_done_token else None
+            DoneEmbedder(hidden_dim=hidden_dim, token_data_len=T, embedding_std=std)
+            if include_done_token else None
         )
 
         # Reward (optional)
         self.reward_embedder = (
-            RewardEmbedder(hidden_dim=hidden_dim, token_data_len=int(token_data_len), in_min=fourier_in_min, in_max=fourier_in_max, embedding_std=std)
-            if include_reward_token
-            else None
+            RewardEmbedder(hidden_dim=hidden_dim, token_data_len=T, in_min=fourier_in_min, in_max=fourier_in_max, embedding_std=std)
+            if include_reward_token else None
         )
 
         # Continuous obs (optional)
         if include_obs_continuous:
             self.obs_continuous_embedder = ObsContinuousEmbedder(
-                hidden_dim=hidden_dim, max_num_obs=int(max_num_obs_continuous), token_data_len=int(token_data_len),
+                hidden_dim=hidden_dim, max_num_obs=int(max_num_obs_continuous), token_data_len=T,
                 in_min=fourier_in_min, in_max=fourier_in_max, embedding_std=std,
             )
         else:
@@ -436,23 +484,25 @@ class StepEmbedder(nn.Module):
         # Discrete obs (optional)
         self.obs_discrete_embedder = (
             ObsDiscreteEmbedder(
-                hidden_dim=hidden_dim, max_num_obs=int(max_num_obs_discrete), token_data_len=int(token_data_len), embedding_std=std
+                hidden_dim=hidden_dim, max_num_obs=int(max_num_obs_discrete), token_data_len=T, embedding_std=std
             )
-            if include_obs_discrete
-            else None
+            if include_obs_discrete else None
         )
 
         # Image obs (optional)
         self.obs_image_embedder = (
             ObsImageEmbedder(
-                hidden_dim=hidden_dim, max_num_obs=int(max_num_obs_image), token_data_len=int(token_data_len), embedding_std=std
+                hidden_dim=hidden_dim, max_num_obs=int(max_num_obs_image), token_data_len=T, embedding_std=std
             )
-            if include_obs_image
-            else None
+            if include_obs_image else None
         )
 
-        self.token_data_len: int = int(token_data_len)
-        self.tokens_per_step: int = self.token_data_len
+        # Compute tokens — one shared learned embedding per compute slot, broadcast over (B, S).
+        if K > 0:
+            self.compute_embed = nn.Parameter(torch.empty(K, int(hidden_dim)))
+            nn.init.normal_(self.compute_embed, std=std)
+        else:
+            self.compute_embed = None  # type: ignore[assignment]
 
     # ------------------------------------------------------------------
     # Forward
@@ -464,16 +514,16 @@ class StepEmbedder(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Embed a batch of steps.
 
-        For each token position the embedding is:
-
-            type_embedder(token_type) + content_embedder(data)
-
         Args:
             step_stream: TensorDict of shape ``[B, S]``.
 
         Returns:
-            embeds:      ``[B, S*T, D]`` — per-position embedding vectors.
-            token_types: ``[B, S*T]`` int64 — TokenType id at each position.
+            embeds:      ``[B, S*tokens_per_step, D]`` — per-position embedding vectors.
+            token_types: ``[B, S*tokens_per_step]`` int64 — ``TokenType`` id at each
+                         position (used by the backbone to build the attention mask).
+                         Data positions carry their modality's ``TokenType``; compute
+                         positions carry ``TokenType.COMPUTE``; unused padding positions
+                         carry ``TokenType.PAD`` (0).
         """
         device = next(self.parameters()).device
         step_stream = step_stream.to(device)
@@ -481,45 +531,136 @@ class StepEmbedder(nn.Module):
         B, S = int(step_stream.batch_size[0]), int(step_stream.batch_size[1])
         T, D = self.token_data_len, self.hidden_dim
 
-        action   = step_stream["action"] if self.include_action_token else None
-        reward   = step_stream["reward"] if self.include_reward_token else None
-        done     = step_stream["done"]   if self.include_done_token   else None
-        time_idx = step_stream["time"]   if self.include_time_token   else None
-        obs_cont = step_stream["obs_continuous"] if self.include_obs_continuous else None
-        obs_disc = step_stream["obs_discrete"]   if self.include_obs_discrete   else None
-        obs_img  = step_stream["obs_image"]      if self.include_obs_image      else None
+        # Fetch each active modality from the step stream.
+        action   = step_stream["action"]          if self.include_action_token   else None
+        reward   = step_stream["reward"]          if self.include_reward_token   else None
+        done     = step_stream["done"]            if self.include_done_token     else None
+        time_idx = step_stream["time"]            if self.include_time_token     else None
+        obs_cont = step_stream["obs_continuous"]  if self.include_obs_continuous else None
+        obs_disc = step_stream["obs_discrete"]    if self.include_obs_discrete   else None
+        obs_img  = step_stream["obs_image"]       if self.include_obs_image      else None
 
-        # Accumulator [B, S, T*D] — modality contributions are summed in-place
-        total = torch.zeros(B, S, T * D, device=device, dtype=torch.get_default_dtype())
+        dtype = torch.get_default_dtype()
+
+        if self.concat_modalities:
+            data_embeds, data_types = self._forward_concat(
+                B, S, T, D, device, dtype,
+                action, reward, done, time_idx, obs_cont, obs_disc, obs_img,
+            )
+        else:
+            data_embeds, data_types = self._forward_sum(
+                B, S, T, D, device, dtype,
+                action, reward, done, time_idx, obs_cont, obs_disc, obs_img,
+            )
+
+        # Append compute tokens.
+        K = self.num_compute_tokens
+        if K > 0:
+            c = self.compute_embed.to(dtype=dtype)          # [K, D]
+            c = c.view(1, 1, K, D).expand(B, S, K, D)
+            embeds = torch.cat([data_embeds, c], dim=2)     # [B, S, data_slots+K, D]
+
+            c_types = torch.full((B, S, K), int(TokenType.COMPUTE), device=device, dtype=torch.long)
+            token_types = torch.cat([data_types, c_types], dim=2)  # [B, S, total]
+        else:
+            embeds = data_embeds
+            token_types = data_types
+
+        total_T = embeds.shape[2]
+        return embeds.reshape(B, S * total_T, D), token_types.reshape(B, S * total_T)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _embed_modality(
+        self,
+        flat: torch.Tensor,
+        ttype: TokenType,
+        B: int,
+        S: int,
+        T: int,
+        D: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Apply optional type embedding and return ``[B, S, T, D]``."""
+        flat = flat.to(dtype=dtype)
+        if self.include_type_token:
+            flat = flat + self.type_embedder(ttype, (B, S), device).to(dtype=dtype)
+        return flat.view(B, S, T, D)
+
+    def _forward_sum(
+        self,
+        B: int, S: int, T: int, D: int,
+        device: torch.device, dtype: torch.dtype,
+        action, reward, done, time_idx, obs_cont, obs_disc, obs_img,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sum mode: all modalities accumulated into T slots. Returns ([B,S,T,D], [B,S,T])."""
+
+        total = torch.zeros(B, S, T * D, device=device, dtype=dtype)
 
         def _add(flat: torch.Tensor, ttype: TokenType) -> None:
-            flat = flat.to(dtype=total.dtype)
+            flat = flat.to(dtype=dtype)
             if self.include_type_token:
-                total.add_(flat + self.type_embedder(ttype, (B, S), device))
+                total.add_(flat + self.type_embedder(ttype, (B, S), device).to(dtype=dtype))
             else:
                 total.add_(flat)
 
         if self.include_time_token:
             _add(self.time_embedder(time_idx), TokenType.TIME)
-
         if self.include_action_token:
             _add(self.action_embedder(action), TokenType.ACTION)
-
         if self.include_obs_continuous:
             _add(self.obs_continuous_embedder(obs_cont), TokenType.OBS_CONTINUOUS)
-
         if self.include_obs_discrete:
             _add(self.obs_discrete_embedder(obs_disc), TokenType.OBS_DISCRETE)
-
         if self.include_obs_image:
             _add(self.obs_image_embedder(obs_img), TokenType.OBS_IMAGE)
-
         if self.include_reward_token:
             _add(self.reward_embedder(reward), TokenType.REWARD)
-
         if self.include_done_token:
             _add(self.done_embedder(done), TokenType.DONE)
 
-        embeds = total.view(B, S * T, D)
-        token_types = torch.zeros(B, S * T, device=device, dtype=torch.long)
-        return embeds, token_types
+        data_embeds = total.view(B, S, T, D)
+        # All data positions are valid (non-PAD); use ACTION=1 as a generic non-zero label.
+        data_types = torch.ones(B, S, T, device=device, dtype=torch.long)
+        return data_embeds, data_types
+
+    def _forward_concat(
+        self,
+        B: int, S: int, T: int, D: int,
+        device: torch.device, dtype: torch.dtype,
+        action, reward, done, time_idx, obs_cont, obs_disc, obs_img,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Concat mode: each modality gets its own T slots. Returns ([B,S,M*T,D], [B,S,M*T])."""
+
+        parts: list[torch.Tensor] = []
+        type_parts: list[torch.Tensor] = []
+
+        def _push(flat: torch.Tensor, ttype: TokenType) -> None:
+            block = self._embed_modality(flat, ttype, B, S, T, D, device, dtype)  # [B, S, T, D]
+            parts.append(block)
+            type_parts.append(
+                torch.full((B, S, T), int(ttype), device=device, dtype=torch.long)
+            )
+
+        # Fixed canonical order (matches sum-mode _add order for consistency).
+        if self.include_time_token:
+            _push(self.time_embedder(time_idx), TokenType.TIME)
+        if self.include_action_token:
+            _push(self.action_embedder(action), TokenType.ACTION)
+        if self.include_obs_continuous:
+            _push(self.obs_continuous_embedder(obs_cont), TokenType.OBS_CONTINUOUS)
+        if self.include_obs_discrete:
+            _push(self.obs_discrete_embedder(obs_disc), TokenType.OBS_DISCRETE)
+        if self.include_obs_image:
+            _push(self.obs_image_embedder(obs_img), TokenType.OBS_IMAGE)
+        if self.include_reward_token:
+            _push(self.reward_embedder(reward), TokenType.REWARD)
+        if self.include_done_token:
+            _push(self.done_embedder(done), TokenType.DONE)
+
+        data_embeds = torch.cat(parts, dim=2)       # [B, S, M*T, D]
+        data_types  = torch.cat(type_parts, dim=2)  # [B, S, M*T]
+        return data_embeds, data_types

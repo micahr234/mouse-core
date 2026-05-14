@@ -23,13 +23,27 @@ TensorDict[B, S]
 
 ## StepEmbedder (`mouse.models.embedding.embedding`)
 
-Each environment step is represented as `T` tokens (`token_data_len` in the config). Every enabled modality contributes a flat `T*D` vector; all contributions are **summed** so the output is always exactly `T` tokens per step regardless of which modalities are present:
+Each environment step is embedded into a block of `tokens_per_step` vectors. Two modes control how modalities map to tokens:
+
+**Sum mode** (`concat_modalities=False`, default) — every active modality contributes a flat `T*D` vector that is **added** to a shared `T`-token accumulator:
 
 ```
 token[i] = Σ_modality  type_embed(modality) + content_embed(modality, i)
+
+tokens_per_step = T + K
 ```
 
-After summing, the embedder reshapes the result to `[B, S*T, D]` for the backbone.
+**Concat mode** (`concat_modalities=True`) — each modality gets its own dedicated block of `T` tokens laid out sequentially:
+
+```
+[time×T | action×T | obs_cont×T | ... | compute×K]
+
+tokens_per_step = M*T + K    (M = number of active modalities)
+```
+
+**Compute tokens** (`num_compute_tokens=K`) — `K` learned scratch tokens are appended after the data tokens in every step block. They carry no input data; their embedding is a shared `[K, D]` parameter broadcast over `(B, S)`. The backbone can use them as working memory. The step representation is always pooled from the **last** token (i.e. the last compute token when `K > 0`).
+
+After embedding, the full sequence `[B, S*tokens_per_step, D]` is passed to the backbone.
 
 ### Modalities
 
@@ -51,15 +65,18 @@ Each modality is independently optional. Set the corresponding `include_*` flag 
 
 ```python
 class TokenType(IntEnum):
-    PAD = 0
-    ACTION = 1
-    REWARD = 2
-    DONE = 3
-    OBS_IMAGE = 4
+    PAD          = 0  # padding / unused
+    ACTION       = 1
+    REWARD       = 2
+    DONE         = 3
+    OBS_IMAGE    = 4
     OBS_CONTINUOUS = 5
-    TIME = 6
+    TIME         = 6
     OBS_DISCRETE = 7
+    COMPUTE      = 8  # learned scratch token (no input data)
 ```
+
+In sum mode all data positions carry type `1` (generic non-PAD). In concat mode each modality block carries its own type. Compute positions always carry `COMPUTE = 8`. The backbone uses these labels only to build the attention mask (non-zero = real token, zero = pad).
 
 ### Initialisation scaling
 
@@ -69,7 +86,7 @@ Embedding tables use `ScaledEmbedding` initialised at `std = embedding_std` (def
 
 ## Backbone
 
-The backbone runs a standard transformer over the `[B, S*T, D]` token sequence and returns `[B, S*T, D]` hidden states.
+The backbone runs a standard transformer over the `[B, S*tokens_per_step, D]` token sequence and returns hidden states of the same shape.
 
 ### Llama (`mouse.models.backbone.llama.ModelLlama`)
 

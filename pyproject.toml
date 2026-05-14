@@ -3,11 +3,19 @@ requires = ["setuptools>=80.9.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mouse"
+name = "mouse-core"
 version = "0.1.0"
 description = "Meta-Optimization Using Sequential Experiences — core ICRL library"
 readme = "README.md"
 requires-python = ">=3.12"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+]
 dependencies = [
     "torch>=2.12.0",
     "numpy>=2.4.4",
@@ -22,6 +30,8 @@ dependencies = [
 dev = [
     "pyright",
     "pytest",
+    "build>=1.2",
+    "twine>=6.1",
 ]
 docs = [
     "zensical>=0.0.11",

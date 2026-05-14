@@ -1,14 +1,16 @@
-# MOUSE
+# Meta-Optimization Using Sequential Experiences
 
 <p align="center"><img src="mouse.png" alt="MOUSE" width="400"/></p>
 
-**Meta-Optimization Using Sequential Experiences** — a PyTorch library for in-context meta-reinforcement learning.
+**MOUSE** is a modular PyTorch library for in-context reinforcement learning. It provides the building blocks — embeddings, transformer backbones, output heads, losses, and data utilities — for training and deploying agents that adapt their behaviour by attending over their own transition history, with no weight updates at inference time.
+
+Use MOUSE when you want to build or experiment with in-context RL agents: whether training from an offline dataset, collecting online rollouts, or combining both.
 
 ---
 
 ## What is in-context meta-RL?
 
-In standard reinforcement learning, an agent's policy is encoded in its weights — learning happens through gradient updates over many environment interactions. In **meta-reinforcement learning**, the goal is to produce an agent that can adapt its behavior rapidly to new tasks, ideally without any weight updates at all.
+In standard reinforcement learning, an agent's policy is encoded in its weights — learning happens through gradient updates over many environment interactions. In **meta-reinforcement learning**, the goal is to produce an agent that can adapt its behavior rapidly to new tasks.
 
 **In-context meta-RL** takes this further: instead of adapting through gradient steps, the agent adapts purely through its *context* — the sequence of transitions it has observed so far in the current episode or trial. The policy is not a fixed mapping from state to action; it is an emergent property of the transformer's attention over the history.
 

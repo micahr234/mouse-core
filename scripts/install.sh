@@ -22,17 +22,21 @@ success() {
 setup_git() {
     log "Setting up git configuration..."
 
-    if [ -z "$(git config --global user.email)" ]; then
-        git config --global user.email "user@example.com"
-        log "Set default git email (none was configured)"
+    # Resolve the effective identity (local → global → system fallback).
+    effective_email="$(git config user.email 2>/dev/null || true)"
+    effective_name="$(git config user.name 2>/dev/null || true)"
+
+    if [ -z "$effective_email" ]; then
+        git config --local user.email "user@example.com"
+        warn "No git email configured — set repo-local placeholder. Update with: git config user.email 'you@example.com'"
     fi
 
-    if [ -z "$(git config --global user.name)" ]; then
-        git config --global user.name "User"
-        log "Set default git name (none was configured)"
+    if [ -z "$effective_name" ]; then
+        git config --local user.name "User"
+        warn "No git name configured — set repo-local placeholder. Update with: git config user.name 'Your Name'"
     fi
 
-    success "Git configured: $(git config --global user.name) <$(git config --global user.email)>"
+    success "Git configured: $(git config user.name) <$(git config user.email)>"
 }
 
 # Install uv package manager

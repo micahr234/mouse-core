@@ -91,8 +91,38 @@ cmd_deploy() {
         exit 1
     fi
 
+    # If the origin remote uses HTTPS, we need credentials.
+    # Prefer an explicit token (GH_TOKEN or GITHUB_TOKEN) so the script works
+    # on new machines and in CI without interactive prompts.
+    # SSH remotes work as-is (key-based auth).
+    ORIGIN_URL="$(git remote get-url origin 2>/dev/null || true)"
+    if echo "$ORIGIN_URL" | grep -q "^https://"; then
+        TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+        if [ -z "$TOKEN" ]; then
+            error "Remote is HTTPS but no credentials are configured."
+            log  "Fix with one of:"
+            log  "  export GH_TOKEN=<your-github-pat>   # then re-run"
+            log  "  git remote set-url origin git@github.com:micahr234/mouse-core.git  # switch to SSH"
+            exit 1
+        fi
+        # Inject the token via a temporary push URL so it never touches ~/.gitconfig.
+        AUTHED_URL="${ORIGIN_URL/https:\/\//https:\/\/__token__:${TOKEN}@}"
+        git config --local remote.origin.pushurl "$AUTHED_URL"
+        log "Using token-authenticated HTTPS for push."
+    fi
+
     log "Pushing site/ to gh-pages branch ..."
+    DEPLOY_OK=0
     if "$GHP_BIN" -n -p -f site; then
+        DEPLOY_OK=1
+    fi
+
+    # Always restore the original push URL, even on failure.
+    if echo "$ORIGIN_URL" | grep -q "^https://"; then
+        git config --local --unset remote.origin.pushurl 2>/dev/null || true
+    fi
+
+    if [ "$DEPLOY_OK" -eq 1 ]; then
         success "Docs deployed to gh-pages."
     else
         error "ghp-import failed."
