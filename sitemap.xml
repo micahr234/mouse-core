@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+      <url>
+        <loc>https://micahr234.github.io/mouse-core/</loc>
+      </url>
+      <url>
+        <loc>https://micahr234.github.io/mouse-core/architecture/</loc>
+      </url>
+      <url>
+        <loc>https://micahr234.github.io/mouse-core/data/</loc>
+      </url>
+      <url>
+        <loc>https://micahr234.github.io/mouse-core/losses/</loc>
+      </url>
+      <url>
+        <loc>https://micahr234.github.io/mouse-core/examples/</loc>
+      </url>
+      <url>
+        <loc>https://micahr234.github.io/mouse-core/api/model/</loc>
+      </url>
+      <url>
+        <loc>https://micahr234.github.io/mouse-core/api/backbone/</loc>
+      </url>
+      <url>
+        <loc>https://micahr234.github.io/mouse-core/api/embedding/</loc>
+      </url>
+      <url>
+        <loc>https://micahr234.github.io/mouse-core/api/heads/</loc>
+      </url>
+      <url>
+        <loc>https://micahr234.github.io/mouse-core/api/losses/</loc>
+      </url>
+      <url>
+        <loc>https://micahr234.github.io/mouse-core/api/data/</loc>
+      </url>
+</urlset>
