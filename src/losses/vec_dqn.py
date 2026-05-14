@@ -1,4 +1,4 @@
-"""One-step offline two-head vector DQN cosine-similarity loss over PREDICTION logits."""
+"""One-step two-head vector DQN cosine-similarity loss."""
 
 from __future__ import annotations
 
@@ -9,11 +9,12 @@ import torch
 import torch.nn.functional as F
 from tensordict import TensorDict
 
+from mouse.losses.base import LossConfig
 from mouse.models.heads.vec_dqn import rope_rotate, vec_dqn_scores
 
 
 @dataclass(frozen=True)
-class VecDqnLossConfig:
+class VecDqnLossConfig(LossConfig):
     """Vector-DQN cosine-similarity loss at PREDICTION (see ``vec_dqn_loss``)."""
 
     weight: float = 0.0  # omit ``loop.vec_dqn.weight`` or set 0 = do not compute (YAML default)
@@ -42,8 +43,15 @@ def vec_dqn_loss(
         raise ValueError("Not enough valid vec_dqn vectors in data.")
 
     action = step_stream["action"].to(dtype=torch.long)
-    reward_key = "xformed_reward" if cfg.use_xformed_reward else "reward"
-    reward = step_stream[reward_key].to(dtype=dtype)
+    if cfg.use_xformed_reward:
+        if "xformed_reward" not in step_stream.keys():
+            raise KeyError(
+                "use_xformed_reward=True but 'xformed_reward' is not in the batch. "
+                "Ensure your dataset includes the 'xformed_reward' column."
+            )
+        reward = step_stream["xformed_reward"].to(dtype=dtype)
+    else:
+        reward = step_stream["reward"].to(dtype=dtype)
     online_vecs = online_vecs.to(dtype=dtype)
     target_vecs = target_vecs.to(dtype=dtype)
 

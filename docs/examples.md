@@ -47,7 +47,7 @@ sp_cfg  = SpLossConfig(weight=0.5, loss_type="ce-soft-fwd", temperature=1.0)
 # ── Training ──────────────────────────────────────────────────────────────────
 num_steps = 100_000
 
-with PrefetchBatchifier(
+bf = PrefetchBatchifier(
     store,
     sequence_length=64,
     batch_size=32,
@@ -55,28 +55,30 @@ with PrefetchBatchifier(
     prefetch=4,
     num_workers=2,
     pin_memory=True,
-) as bf:
-    for step in range(num_steps):
-        step_stream = bf.next_batch().to(device)
+)
 
-        out, _ = model(step_stream)
+for step in range(num_steps):
+    step_stream = bf.next_batch().to(device)
 
-        loss = torch.tensor(0.0, device=device)
+    out, _ = model(step_stream)
 
-        if dqn_cfg.weight > 0:
-            l, _ = dqn_loss(step_stream, out, dqn_cfg)
-            loss = loss + dqn_cfg.weight * l
+    loss = torch.tensor(0.0, device=device)
 
-        if sp_cfg.weight > 0:
-            l, _ = sp_loss(step_stream, out["sp"], sp_cfg)
-            loss = loss + sp_cfg.weight * l
+    if dqn_cfg.weight > 0:
+        l, _ = dqn_loss(step_stream, out, dqn_cfg)
+        loss = loss + dqn_cfg.weight * l
 
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
+    if sp_cfg.weight > 0:
+        l, _ = sp_loss(step_stream, out["sp"], sp_cfg)
+        loss = loss + sp_cfg.weight * l
 
-        model.polyak_update(dqn_tau=dqn_cfg.tau)
+    optimizer.zero_grad()
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    optimizer.step()
+    model.polyak_update(dqn_tau=dqn_cfg.tau)
+
+bf.close()
 ```
 
 ---
@@ -98,16 +100,18 @@ augmenter = TokenAugmenter(
     device=device,
 )
 
-with PrefetchBatchifier(store, sequence_length=64, batch_size=32) as bf:
-    for step in range(num_steps):
-        step_stream = bf.next_batch().to(device)
+bf = PrefetchBatchifier(store, sequence_length=64, batch_size=32)
 
-        # Sample new permutations/scalars for this batch
-        augmenter.update_augmentations(step_stream)
-        aug_stream = augmenter(step_stream)   # cloned; original unchanged
+for step in range(num_steps):
+    step_stream = bf.next_batch().to(device)
 
-        out, _ = model(aug_stream)
-        # ... compute losses on aug_stream ...
+    augmenter.update_augmentations(step_stream)
+    aug_stream = augmenter(step_stream)   # cloned; original unchanged
+
+    out, _ = model(aug_stream)
+    # ... compute losses on aug_stream ...
+
+bf.close()
 ```
 
 ---

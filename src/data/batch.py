@@ -25,8 +25,9 @@ Usage
     store = DatasetStore(...)
     store.from_dataset(ds)
 
-    with PrefetchBatchifier(store, sequence_length=64, batch_size=8) as bf:
-        td = bf.next_batch()   # TensorDict, instant once warm
+    bf = PrefetchBatchifier(store, sequence_length=64, batch_size=8)
+    td = bf.next_batch()   # TensorDict[B, S], instant once warm
+    bf.close()
 """
 
 from __future__ import annotations
@@ -36,17 +37,7 @@ import threading
 from typing import TYPE_CHECKING
 
 import numpy as np
-import torch
 from tensordict import TensorDict
-
-
-def to_tensor_dict(raw: np.ndarray) -> TensorDict:
-    """Convert a structured numpy step array to a TensorDict (zero-copy via torch.from_numpy)."""
-    assert raw.dtype.names is not None
-    return TensorDict(
-        {name: torch.from_numpy(np.ascontiguousarray(raw[name])) for name in raw.dtype.names},
-        batch_size=raw.shape,
-    )
 
 if TYPE_CHECKING:
     from mouse.data.dataset_store import DatasetStore
@@ -242,8 +233,7 @@ class PrefetchBatchifier:
         S = self.sequence_length
         seqs = [self._dataset[int(s) : int(s) + S] for s in starts]
         merged = {k: [v for seq in seqs for v in seq[k]] for k in seqs[0]}
-        encoded = self.store.encode_hf_rows(merged)
-        td = to_tensor_dict(encoded.reshape(len(starts), S))
+        td = self.store.encode_hf_rows(merged).reshape(len(starts), S)
         if self._pin_memory:
             td = td.pin_memory()
         return td

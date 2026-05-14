@@ -22,10 +22,10 @@ Concrete `Model` subclasses and the config dataclasses that build HuggingFace tr
 
 ## LlamaBackboneConfig
 
-::: mouse.models.backbone.configs.LlamaBackboneConfig
+::: mouse.models.backbone.llama.LlamaBackboneConfig
 
 ---
 
 ## Qwen3BackboneConfig
 
-::: mouse.models.backbone.configs.Qwen3BackboneConfig
+::: mouse.models.backbone.qwen3.Qwen3BackboneConfig

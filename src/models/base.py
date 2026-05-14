@@ -170,6 +170,201 @@ while not done:
 """
 
 
+def save_model(model: "Model", path: str | Path) -> None:
+    """Save a MOUSE model to a local directory.
+
+    Writes ``pytorch_model.bin`` (weights) and ``config.json`` (constructor
+    kwargs) into *path*, creating the directory if it does not exist.  The
+    saved directory can be passed back to :func:`load_model` to reload the
+    model.
+
+    Args:
+        model: The model instance to save.
+        path: Destination directory (created if absent).
+
+    Example::
+
+        save_model(model, "./checkpoints/step-10000")
+        model2 = load_model("./checkpoints/step-10000")
+    """
+    model.save_pretrained(Path(path))
+
+
+def push_model_to_hub(
+    model: "Model",
+    repo_id: str,
+    *,
+    commit_message: str = "Upload MOUSE model",
+    private: bool = False,
+    **kwargs: Any,
+) -> str:
+    """Push a MOUSE model to the Hugging Face Hub.
+
+    Creates the repository if it does not exist, then uploads weights and
+    config.  Returns the Hub URL of the uploaded model.
+
+    Args:
+        model: The model instance to upload.
+        repo_id: Hub repository ID, e.g. ``"your-org/your-model"``.
+        commit_message: Commit message written to the Hub.
+        private: Create a private repository if it does not already exist.
+        **kwargs: Forwarded verbatim to ``PyTorchModelHubMixin.push_to_hub``
+            (e.g. ``token``, ``revision``).
+
+    Returns:
+        The Hub URL string for the uploaded repository.
+
+    Example::
+
+        url = push_model_to_hub(model, "your-org/your-model")
+        print(url)
+    """
+    return model.push_to_hub(
+        repo_id,
+        commit_message=commit_message,
+        private=private,
+        **kwargs,
+    )
+
+
+def _load_backbone_weights(model: "Model", repo_id_or_path: str, **hub_kwargs: Any) -> None:
+    """Copy transformer layer weights from a pretrained HF model into ``model.backbone``.
+
+    The embedding table (``embed_tokens``) is intentionally skipped — our backbone
+    uses ``vocab_size=1`` which would cause a shape mismatch.  The final norm is
+    also skipped because it has been replaced with ``nn.Identity``.  All other keys
+    (attention projections, FFN, layer norms) must match exactly; unmatched keys
+    produce a ``RuntimeError``.
+    """
+    import warnings
+    from transformers import AutoModel
+
+    pretrained = AutoModel.from_pretrained(repo_id_or_path, **hub_kwargs)
+
+    # Filter keys that would cause shape mismatches or are genuinely absent.
+    filtered = {
+        k: v for k, v in pretrained.state_dict().items()
+        if not k.startswith("embed_tokens")  # vocab_size mismatch
+        and k not in ("norm.weight", "norm.bias")  # replaced with nn.Identity
+    }
+
+    missing, unexpected = model.backbone.load_state_dict(filtered, strict=False)
+
+    # After filtering, unexpected should be empty.  Missing will include
+    # embed_tokens.weight (vocab_size=1 in our model, intentionally not loaded)
+    # and nothing else if the architectures match.
+    ignorable_missing = {k for k in missing if k.startswith("embed_tokens")}
+    real_missing = [k for k in missing if k not in ignorable_missing]
+    if real_missing:
+        warnings.warn(
+            f"Backbone weight loading from {repo_id_or_path!r} left "
+            f"{len(real_missing)} key(s) uninitialised: {real_missing}",
+            stacklevel=3,
+        )
+    if unexpected:
+        warnings.warn(
+            f"Backbone weight loading from {repo_id_or_path!r} had "
+            f"{len(unexpected)} unexpected key(s): {unexpected}",
+            stacklevel=3,
+        )
+
+    del pretrained  # release memory promptly
+
+
+def init_from_pretrained_backbone(
+    backbone_repo_id: str,
+    *,
+    embedding_kwargs: dict[str, Any],
+    sp_head_kwargs: dict[str, Any] | None = None,
+    dqn_head_kwargs: dict[str, Any] | None = None,
+    vec_dqn_head_kwargs: dict[str, Any] | None = None,
+    sv_head_kwargs: dict[str, Any] | None = None,
+    action_head: str | None = None,
+    backbone_kwargs_overrides: dict[str, Any] | None = None,
+    load_weights: bool = True,
+    **hub_kwargs: Any,
+) -> "Model":
+    """Create a MOUSE model whose backbone is initialised from a pretrained HF model.
+
+    Architecture defaults (layer count, head count, hidden dim, FFN size, …) are
+    read directly from the pretrained model's ``config.json`` so you don't have to
+    copy them by hand.  Any field can be overridden via ``backbone_kwargs_overrides``
+    — e.g. pass ``num_layers=8`` to use only the first 8 layers of a larger model
+    (weights for those layers are still loaded from the checkpoint).
+
+    The embedding table and final norm are not loaded — MOUSE replaces them with its
+    own ``StepEmbedder`` and an ``nn.Identity`` norm.
+
+    Args:
+        backbone_repo_id: HF Hub repo id or local path for the pretrained backbone
+            (e.g. ``"meta-llama/Llama-3.2-1B"`` or ``"Qwen/Qwen3-0.6B"``).
+        embedding_kwargs: Passed to ``StepEmbedder`` (required — defines which
+            modalities and action/obs dimensions to use).
+        sp_head_kwargs: Config for the supervised-policy head; ``{"num_layers": 0}``
+            disables it.  Defaults to disabled.
+        dqn_head_kwargs: Config for the DQN head.  Defaults to disabled.
+        vec_dqn_head_kwargs: Config for the VecDQN head.  Defaults to disabled.
+        sv_head_kwargs: Config for the supervised-value head.  Defaults to disabled.
+        action_head: Which head ``get_action`` reads.  Auto-detected when ``None``.
+        backbone_kwargs_overrides: Dict of field overrides applied on top of the
+            pretrained config (e.g. ``{"num_layers": 8}``).
+        load_weights: If ``False``, build the architecture without loading pretrained
+            weights (useful for testing or when you only want the config).
+        **hub_kwargs: Forwarded to ``AutoModel.from_pretrained`` (e.g. ``token``,
+            ``revision``, ``torch_dtype``).
+
+    Returns:
+        Initialised ``Model`` instance with pretrained backbone weights loaded.
+
+    Example::
+
+        from mouse.models import init_from_pretrained_backbone
+
+        model = init_from_pretrained_backbone(
+            "meta-llama/Llama-3.2-1B",
+            embedding_kwargs=dict(
+                max_num_actions=18,
+                include_obs_continuous=True,
+                max_num_obs_continuous=8,
+                include_action_token=True,
+                include_reward_token=True,
+                include_done_token=True,
+                token_data_len=4,
+            ),
+            dqn_head_kwargs=dict(num_layers=2, hidden_dim=256),
+        )
+    """
+    from mouse.models.backbone import backbone_kwargs_from_pretrained
+
+    backbone_kwargs, hidden_dim = backbone_kwargs_from_pretrained(
+        backbone_repo_id, **(backbone_kwargs_overrides or {})
+    )
+
+    _disabled: dict[str, Any] = {"num_layers": 0}
+    uses_qwen3 = "head_dim" in backbone_kwargs
+
+    if uses_qwen3:
+        from mouse.models.backbone.qwen3 import ModelQwen3 as _Cls
+    else:
+        from mouse.models.backbone.llama import ModelLlama as _Cls  # type: ignore[assignment]
+
+    model = _Cls(
+        hidden_dim=hidden_dim,
+        backbone_kwargs=backbone_kwargs,
+        embedding_kwargs=embedding_kwargs,
+        sp_head_kwargs=sp_head_kwargs or _disabled,
+        dqn_head_kwargs=dqn_head_kwargs or _disabled,
+        vec_dqn_head_kwargs=vec_dqn_head_kwargs or _disabled,
+        sv_head_kwargs=sv_head_kwargs or _disabled,
+        action_head=action_head,
+    )
+
+    if load_weights:
+        _load_backbone_weights(model, backbone_repo_id, **hub_kwargs)
+
+    return model
+
+
 def load_model(
     repo_id_or_path: str,
     force_download: bool = False,

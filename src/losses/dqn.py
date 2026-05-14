@@ -1,16 +1,17 @@
-"""One-step offline two-head DQN TD loss over PREDICTION logits."""
+"""One-step two-head DQN TD loss."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
 import torch
+from mouse.losses.base import LossConfig
 import torch.nn.functional as F
 from tensordict import TensorDict
 
 
 @dataclass(frozen=True)
-class DqnLossConfig:
+class DqnLossConfig(LossConfig):
     """Symmetric two-head one-step TD at PREDICTION (see ``dqn_loss``)."""
 
     weight: float = 0.0  # omit ``loop.dqn.weight`` or set 0 = do not compute DQN loss (YAML default)
@@ -46,8 +47,15 @@ def dqn_loss(
         raise ValueError("Not enough valid q values in data.")
 
     action = step_stream["action"].to(dtype=torch.long)
-    reward_key = "xformed_reward" if cfg.use_xformed_reward else "reward"
-    reward = step_stream[reward_key].to(dtype=value_dtype)
+    if cfg.use_xformed_reward:
+        if "xformed_reward" not in step_stream.keys():
+            raise KeyError(
+                "use_xformed_reward=True but 'xformed_reward' is not in the batch. "
+                "Ensure your dataset includes the 'xformed_reward' column."
+            )
+        reward = step_stream["xformed_reward"].to(dtype=value_dtype)
+    else:
+        reward = step_stream["reward"].to(dtype=value_dtype)
     terminals = (step_stream["done"] == 1).to(dtype=value_dtype)
     truncateds = (step_stream["done"] == 2).to(dtype=value_dtype)
 

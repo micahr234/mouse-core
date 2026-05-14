@@ -164,6 +164,94 @@ Delegates to each enabled twin-head. Call once per optimiser step.
 
 ---
 
+## Saving and loading models
+
+### Local checkpoint
+
+```python
+from mouse.models import save_model, load_model
+
+save_model(model, "./checkpoints/step-10000")
+model = load_model("./checkpoints/step-10000")
+```
+
+### Hugging Face Hub
+
+```python
+from mouse.models import push_model_to_hub, load_model
+
+# Upload weights + config + auto-generated model card
+push_model_to_hub(model, "your-org/your-model")
+
+# Download and instantiate — class is inferred automatically
+model = load_model("your-org/your-model")
+```
+
+`push_model_to_hub` is a thin wrapper around `PyTorchModelHubMixin.push_to_hub` and accepts the same keyword arguments (e.g. `token`, `revision`, `private`).
+
+---
+
+## Initialising from a pretrained backbone
+
+`init_from_pretrained_backbone` builds a MOUSE model whose backbone architecture and weights come from any Llama- or Qwen3-family checkpoint on the Hub. Architecture defaults (layer count, head count, hidden dim, FFN size) are read from the pretrained `config.json` automatically — you only need to specify the MOUSE-specific parts (embedding config and output heads).
+
+```python
+from mouse.models import init_from_pretrained_backbone
+
+model = init_from_pretrained_backbone(
+    "meta-llama/Llama-3.2-1B",
+    embedding_kwargs=dict(
+        max_num_actions=18,
+        include_obs_continuous=True,
+        max_num_obs_continuous=8,
+        include_action_token=True,
+        include_reward_token=True,
+        include_done_token=True,
+        token_data_len=4,
+    ),
+    dqn_head_kwargs=dict(num_layers=2, hidden_dim=256),
+)
+```
+
+Individual backbone settings can be overridden via `backbone_kwargs_overrides` — for example, to use only the first 8 layers of a 16-layer model (the pretrained weights for those 8 layers are still loaded):
+
+```python
+model = init_from_pretrained_backbone(
+    "Qwen/Qwen3-0.6B",
+    backbone_kwargs_overrides={"num_layers": 8},
+    embedding_kwargs=...,
+    dqn_head_kwargs=...,
+)
+```
+
+If you only need the architecture (no weight loading), pass `load_weights=False`.
+
+### What is and isn't loaded
+
+| Component | Loaded |
+|---|---|
+| Transformer layers (attention, FFN, layer norms) | ✅ |
+| Embedding table (`embed_tokens`) | ❌ — vocab size mismatch; MOUSE uses its own `StepEmbedder` |
+| Final norm | ❌ — replaced with `nn.Identity` |
+| Output heads, `StepEmbedder` | ❌ — always randomly initialised |
+
+### Inspecting backbone kwargs without building a model
+
+`backbone_kwargs_from_pretrained` returns the raw kwargs dict and hidden dim, letting you inspect or further customise before passing them to a model constructor:
+
+```python
+from mouse.models.backbone import backbone_kwargs_from_pretrained
+
+backbone_kwargs, hidden_dim = backbone_kwargs_from_pretrained(
+    "meta-llama/Llama-3.2-1B",
+    num_layers=8,   # override: use 8 layers instead of 16
+)
+print(hidden_dim)       # 2048
+print(backbone_kwargs)  # {num_layers: 8, num_heads: 32, ...}
+```
+
+---
+
 ## Config layout (`config.json`)
 
 When saved via `push_to_hub` or `save_pretrained` (HuggingFace Hub mixin), the model writes its constructor kwargs as JSON. `load_model` reads this file to select the right class and instantiate it.

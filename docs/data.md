@@ -20,7 +20,7 @@ Every batch delivered by `PrefetchBatchifier` is a `TensorDict` of shape `[B, S]
 | `obs_discrete` | `int64` | `[B, S]` | Discrete state index |
 | `obs_image` | `int64` | `[B, S, P]` | Flattened pixel values in `[0, 255]` |
 
-Only the fields whose dimensions were declared at `DatasetStore` construction are present.
+Optional fields are only present as keys when the source dataset contains the corresponding column — absent fields are simply not in the TensorDict rather than being zero-filled.
 
 ### Transition alignment
 
@@ -38,17 +38,25 @@ A step buffer backed by a HuggingFace `Dataset` (Arrow format). Designed so the 
 from datasets import load_dataset
 from mouse.data.dataset_store import DatasetStore
 
-store = DatasetStore(
-    max_action_dim=18,
-    max_obs_continuous_dim=8,   # set 0 to omit
-    max_obs_discrete_dim=0,
-    max_obs_image_pixels=0,
-)
-ds = load_dataset("your-org/your-dataset", split="train")
-store.from_dataset(ds)          # O(1) reference assignment
+store = DatasetStore(max_action_dim=18, max_obs_continuous_dim=8)
+
+# Single split
+store.from_dataset(load_dataset("your-org/your-dataset", split="train"))
+
+# All splits from a DatasetDict (concatenated in order)
+store.from_dataset(load_dataset("your-org/your-dataset"))
+
+# Selected splits by exact name
+store.from_dataset(load_dataset("your-org/your-dataset"), splits=["train", "test"])
+
+# Glob patterns — all splits matching "train_*" or "eval_*"
+store.from_dataset(load_dataset("your-org/your-dataset"), split_pattern=["train_*", "eval_*"])
+
+# Single pattern
+store.from_dataset(load_dataset("your-org/your-dataset"), split_pattern="test_*")
 ```
 
-Calling `from_dataset` multiple times concatenates the datasets.
+Calling `from_dataset` more than once concatenates onto what is already loaded. Each call is O(1) — no data is copied.
 
 ### Expected HuggingFace Dataset columns
 
@@ -56,17 +64,17 @@ Calling `from_dataset` multiple times concatenates the datasets.
 |---|---|
 | `action` | `action` |
 | `reward` | `reward` |
-| `xformed_reward` | `xformed_reward` (falls back to `reward` if absent) |
+| `xformed_reward` | `xformed_reward` (required if `use_xformed_reward=True`; omitting it raises a `KeyError`) |
 | `done` | `done` |
-| `episode_step` | `time` (set to −1 if absent) |
-| `metadata_q_star` | `q_star` (set to −inf if absent or None) |
+| `episode_step` | `time` (absent from TensorDict if column is not in dataset) |
+| `metadata_q_star` | `q_star` (absent from TensorDict if column is not in dataset or all values are None) |
 | `observation` | `obs_continuous` |
 | `observation_discrete` | `obs_discrete` |
 | `observation_image` | `obs_image` (accepts PIL image, bytes dict, or numpy array) |
 
 ### Appending rollout steps
 
-For online data collection, `append` stores single transitions in a growable numpy ring buffer:
+For online data collection, `append` stores single transitions in an in-memory list buffer:
 
 ```python
 store.append({
@@ -87,6 +95,33 @@ ds.push_to_hub("your-org/your-rollout-dataset")
 
 ---
 
+## Pushing stores to the Hub (`mouse.data.hub`)
+
+`push_to_hub` and `push_stores_to_hub` combine one or more `DatasetStore` objects and push them as a `DatasetDict` to the Hugging Face Hub. Stale parquet shards are wiped before each push so the result is always a clean upload — no leftover split names from previous runs.
+
+**Single split** (most common case):
+
+```python
+from mouse.data.hub import push_stores_to_hub
+
+push_stores_to_hub([store], repo_id="your-org/your-dataset", split="train")
+```
+
+**Multiple splits** (e.g. train + eval):
+
+```python
+from mouse.data.hub import push_to_hub
+
+push_to_hub(
+    {"train": [train_store1, train_store2], "eval": [eval_store]},
+    repo_id="your-org/your-dataset",
+)
+```
+
+Columns that are absent from one split but present in another are filled with typed placeholders so the `DatasetDict` schema is consistent across splits.
+
+---
+
 ## PrefetchBatchifier (`mouse.data.batch`)
 
 Background-thread batchifier. Worker threads continuously fetch sequences, encode them via `DatasetStore.encode_hf_rows`, and park them in a bounded queue. `next_batch()` pops from the queue — instant once the queue is warm.
@@ -96,7 +131,7 @@ The full dataset is never held in memory; only `prefetch × batch_size × sequen
 ```python
 from mouse.data.batch import PrefetchBatchifier
 
-with PrefetchBatchifier(
+bf = PrefetchBatchifier(
     store,
     sequence_length=64,
     batch_size=32,
@@ -104,8 +139,9 @@ with PrefetchBatchifier(
     prefetch=4,
     num_workers=2,
     pin_memory=True,     # enable for CUDA training
-) as bf:
-    step_stream = bf.next_batch()   # TensorDict[32, 64]
+)
+step_stream = bf.next_batch()   # TensorDict[32, 64]
+bf.close()
 ```
 
 ### Sampling modes
@@ -122,21 +158,9 @@ with PrefetchBatchifier(
 Pass `num_workers=0` to disable background threads. `next_batch()` blocks on the calling thread. Useful for debugging or environments where threading is undesirable.
 
 ```python
-with PrefetchBatchifier(store, sequence_length=64, batch_size=32, num_workers=0) as bf:
-    step_stream = bf.next_batch()
-```
-
----
-
-## to_tensor_dict
-
-Low-level helper that converts a structured numpy array (from `DatasetStore.__getitem__`) to a `TensorDict` with no data copy:
-
-```python
-from mouse.data.batch import to_tensor_dict
-
-raw = store[np.array([0, 1, 2, ...])]   # np.ndarray of shape [N], structured dtype
-td = to_tensor_dict(raw)                # TensorDict[N]
+bf = PrefetchBatchifier(store, sequence_length=64, batch_size=32, num_workers=0)
+step_stream = bf.next_batch()
+bf.close()
 ```
 
 ---

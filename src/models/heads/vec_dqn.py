@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from mouse.models.heads.base import BaseHeadWithTarget
 from mouse.models.heads.swiglu import SwiGLUHead
 
 
@@ -64,7 +65,7 @@ def vec_dqn_scores(vecs: torch.Tensor) -> torch.Tensor:
     return torch.atan2(sin_ia, cos_ia).sum(dim=-2)                     # [..., A]
 
 
-class VecDQNHead(nn.Module):
+class VecDQNHead(BaseHeadWithTarget):
     """SwiGLUHead paired with an EMA target copy and Polyak averaging.
 
     Like ``DQNHead`` but each action produces a ``vec_dim``-dimensional vector
@@ -104,19 +105,12 @@ class VecDQNHead(nn.Module):
             if out_bias is not None:
                 with torch.no_grad():
                     out_bias.fill_(float(bias_scale))
-        self.target = SwiGLUHead(**head_kwargs)
-        self.target.requires_grad_(False)
-        self.polyak_update(tau=1.0)
+        self._init_target(self.online)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.online(x).unflatten(-1, (self.A, self.D))
 
     def target_forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.target(x).unflatten(-1, (self.A, self.D))
+        with torch.no_grad():
+            return self.target(x).unflatten(-1, (self.A, self.D))
 
-    def polyak_update(self, tau: float) -> None:
-        """Soft-update target toward online: θ_target ← τ·θ_online + (1−τ)·θ_target."""
-        if tau <= 0.0:
-            return
-        for online_p, target_p in zip(self.online.parameters(), self.target.parameters()):
-            target_p.data.copy_(tau * online_p.data + (1.0 - tau) * target_p.data)

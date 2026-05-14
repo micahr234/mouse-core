@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from mouse.models.embedding.linear import ScaledLinear
+from mouse.models.heads.base import BaseHead
 
 
 class SwiGLU(nn.Module):
@@ -21,7 +22,7 @@ class SwiGLU(nn.Module):
         return F.silu(a) * b
 
 
-class SwiGLUHead(nn.Module):
+class SwiGLUHead(BaseHead):
     """MLP head built from stacked ``SwiGLU`` blocks with a scaled output projection.
 
     Architecture::

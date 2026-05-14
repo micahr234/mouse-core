@@ -38,6 +38,72 @@ source scripts/install.sh
 
 ---
 
+## Creating and Uploading a Dataset
+
+```python
+import gymnasium as gym
+import torch
+from mouse.data.dataset_store import DatasetStore
+from mouse.data.hub import push_stores_to_hub
+
+env = gym.make("FrozenLake-v1", is_slippery=True)
+
+# max_obs_discrete_dim=1 for a single integer observation (grid cell index)
+store = DatasetStore(max_action_dim=4, max_obs_discrete_dim=1)
+
+for episode in range(500):
+    obs, _ = env.reset()
+    action    = 0
+    reward    = 0.0
+    done_flag = 0
+
+    for step_idx in range(200):
+        store.append({
+            "observation_discrete": [obs],
+            "action":               action,
+            "reward":               reward,
+            "done":                 done_flag,
+            "episode_step":         step_idx,
+        })
+
+        action = env.action_space.sample()
+        obs, reward, terminated, truncated, _ = env.step(action)
+        done_flag = 1 if terminated else (2 if truncated else 0)
+
+        if terminated or truncated:
+            # Append the terminal transition before moving to the next episode
+            store.append({
+                "observation_discrete": [obs],
+                "action":               action,
+                "reward":               reward,
+                "done":                 done_flag,
+                "episode_step":         step_idx + 1,
+            })
+            break
+
+print(store)  # DatasetStore(steps=...)
+
+# Push to the Hugging Face Hub — creates the repo if it doesn't exist yet
+push_stores_to_hub(
+    [store],
+    repo_id="your-org/your-dataset",
+    split="train",
+    private=True,
+)
+```
+
+> **Multiple splits** — use `push_to_hub` directly if you want separate train/eval splits:
+> ```python
+> from mouse.data.hub import push_to_hub
+>
+> push_to_hub(
+>     {"train": [train_store], "eval": [eval_store]},
+>     repo_id="your-org/your-dataset",
+> )
+> ```
+
+---
+
 ## Offline Training Example
 
 ```python

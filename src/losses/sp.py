@@ -6,13 +6,15 @@ import math
 from dataclasses import dataclass
 from typing import Literal
 
+from mouse.losses.base import LossConfig
+
 import torch
 import torch.nn.functional as F
 from tensordict import TensorDict
 
 
 @dataclass(frozen=True)
-class SpLossConfig:
+class SpLossConfig(LossConfig):
     """Supervised action loss at PREDICTION (see ``sp_loss``)."""
 
     weight: float = 0.0  # omit ``loop.sp.weight`` or set 0 = do not compute SP loss (YAML default)

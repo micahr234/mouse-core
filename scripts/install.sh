@@ -1,9 +1,7 @@
 #!/bin/bash
-# Installation script for project dependencies
-# Run with: source install.sh
+# Install dependencies and set up the dev environment.
+# Run with: source scripts/install.sh
 
-
-# Logging function
 log() {
     echo "[INFO] $1"
 }

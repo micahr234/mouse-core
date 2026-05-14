@@ -5,13 +5,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
+from mouse.losses.base import LossConfig
+
 import torch
 import torch.nn.functional as F
 from tensordict import TensorDict
 
 
 @dataclass(frozen=True)
-class SvLossConfig:
+class SvLossConfig(LossConfig):
     """Supervised q_star loss at PREDICTION (see ``sv_loss``)."""
 
     weight: float = 0.0  # omit ``loop.sv.weight`` or set 0 = do not compute SV loss (YAML default)

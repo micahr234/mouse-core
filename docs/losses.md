@@ -191,5 +191,5 @@ if sp_cfg.weight > 0:
 
 total_loss.backward()
 optimizer.step()
-model.polyak_update(dqn_tau=dqn_cfg.tau, vec_dqn_tau=vec_dqn_cfg.tau)
+model.polyak_update(dqn_tau=dqn_cfg.tau)
 ```

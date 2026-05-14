@@ -12,12 +12,6 @@
 
 ---
 
-## to_tensor_dict
-
-::: mouse.data.batch.to_tensor_dict
-
----
-
 ## TokenAugmenter
 
 ::: mouse.data.augment.TokenAugmenter
