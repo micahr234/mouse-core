@@ -31,10 +31,12 @@ class DqnLossConfig:
 
 def dqn_loss(
     step_stream: TensorDict,
-    q: torch.Tensor,
-    q_target: torch.Tensor,
+    out: TensorDict,
     cfg: DqnLossConfig,
 ) -> tuple[torch.Tensor, dict[str, float]]:
+
+    q: torch.Tensor = out["dqn"]
+    q_target: torch.Tensor = out["dqn_target"]
 
     B, S, A = q.shape
     device = q.device

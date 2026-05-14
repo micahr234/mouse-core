@@ -40,7 +40,7 @@ cfg = DqnLossConfig(
     use_xformed_reward=False,
 )
 
-loss, metrics = dqn_loss(step_stream, out["dqn"], out["dqn_target"], cfg)
+loss, metrics = dqn_loss(step_stream, out, cfg)
 ```
 
 ### TD target
@@ -180,7 +180,7 @@ Loss functions are designed to be composed freely. A typical multi-head update:
 total_loss = torch.tensor(0.0, device=device)
 
 if dqn_cfg.weight > 0:
-    l, m = dqn_loss(step_stream, out["dqn"], out["dqn_target"], dqn_cfg)
+    l, m = dqn_loss(step_stream, out, dqn_cfg)
     total_loss = total_loss + dqn_cfg.weight * l
     log(m)
 

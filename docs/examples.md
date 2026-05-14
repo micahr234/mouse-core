@@ -64,7 +64,7 @@ with PrefetchBatchifier(
         loss = torch.tensor(0.0, device=device)
 
         if dqn_cfg.weight > 0:
-            l, _ = dqn_loss(step_stream, out["dqn"], out["dqn_target"], dqn_cfg)
+            l, _ = dqn_loss(step_stream, out, dqn_cfg)
             loss = loss + dqn_cfg.weight * l
 
         if sp_cfg.weight > 0:
