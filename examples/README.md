@@ -1,14 +1,11 @@
 # Examples
 
-Runnable scripts for common MOUSE workflows. Run from the repository root after installing:
+Run from the repository root after `source scripts/install.sh` and `source .venv/bin/activate`.
 
-```bash
-source scripts/install.sh
-source .venv/bin/activate
-```
+| Script | Description |
+|--------|-------------|
+| `01_collect_dataset.py` | Gymnasium rollouts → `DatasetStore` (`pip install -e ".[examples]"`) |
+| `02_train_offline.py` | Train tiny model on synthetic data (no Hub) |
+| `03_inference.py` | Inference skeleton — set `MODEL_ID` |
 
-| Script | Description | Extra dependencies |
-|--------|-------------|-------------------|
-| `01_collect_dataset.py` | Collect rollouts and optionally push to the Hub | `pip install -e ".[examples]"` |
-| `02_train_offline.py` | Train a tiny model on synthetic in-memory data | (core only) |
-| `03_inference.py` | Inference loop skeleton | Set `MODEL_ID` env var |
+See [docs/examples.md](../docs/examples.md) for copy-paste training loops.

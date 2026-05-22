@@ -2,6 +2,8 @@
 
 MOUSE reads offline RL data from HuggingFace Datasets and delivers batches as `TensorDict[B, S]` tensors. The two core classes are `DatasetStore` and `PrefetchBatchifier`.
 
+For the v1 rollout schema (`env_id`, nested action/observation/reward dicts), see [mouse-env rollout_contract.md](https://github.com/micahr234/mouse-env/blob/main/docs/rollout_contract.md) and [mouse_env.md](mouse_env.md).
+
 ---
 
 ## TensorDict layout

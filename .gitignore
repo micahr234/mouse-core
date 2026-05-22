@@ -1,6 +1,9 @@
 # Symlink for pyright (created by scripts/install.sh)
 /mouse
 
+# Local clone of sibling repo (optional dev)
+mouse-env/
+
 __pycache__/
 *.pyc
 *.pyo

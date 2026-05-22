@@ -8,25 +8,19 @@ while pre-1.0 APIs may change without notice.
 
 ## [Unreleased]
 
+### Changed
+
+- Repo layout aligned with [mouse-env](https://github.com/micahr234/mouse-env): flat `docs/` (guide, architecture, data, losses, examples, mouse_env), README doc table, no doc build.
+- Removed `docs/api/`, `docs/index.md`, and separate getting-started page; content consolidated into `docs/guide.md`.
+
 ### Removed
 
-- Zensical / mkdocstrings docs build; documentation is plain Markdown in `docs/`
-- GitHub Pages docs workflow and `scripts/docs.sh`
+- Zensical / mkdocstrings docs build; GitHub Pages docs workflow.
 
 ### Added
 
-- Runnable `examples/` scripts for dataset collection, offline training, and inference.
-- `docs/getting-started.md` quick-start guide.
-- `tests/` suite with CI (pyright, pytest, strict docs build).
-- Public exports from `mouse.data`.
-- `py.typed` marker for type checkers.
-- GitHub issue and pull request templates.
-
-### Changed
-
-- Expanded README with quick start, naming note, and navigation links.
-- Fixed `scripts/install.sh` (removed undefined `setup_git` call).
-- Renamed `scripts/test_docs.sh` to `scripts/docs.sh`.
+- `docs/guide.md`, `docs/mouse_env.md`, runnable `examples/`, `tests/`, CI workflow.
+- Public exports from `mouse.data`, `py.typed`, PyPI publish version check.
 
 ## [0.1.0] - 2025-01-01
 

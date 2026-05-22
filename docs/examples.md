@@ -1,6 +1,8 @@
 # Examples
 
-Copy-paste examples for common use cases, plus **runnable scripts** in the repository [`examples/`](https://github.com/micahr234/mouse-core/tree/main/examples) directory.
+Training loop patterns and dataset collection. Overview: [guide.md](guide.md).
+
+Runnable scripts live in [`examples/`](../examples/) at the repo root.
 
 ---
 

@@ -96,8 +96,6 @@ main() {
     echo ""
     log "Activate the virtual environment:"
     echo "  source .venv/bin/activate"
-    log "Documentation (Markdown):"
-    echo "  docs/README.md"
 }
 
 # Run main function
