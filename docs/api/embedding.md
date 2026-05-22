@@ -1,57 +1,35 @@
 # Embedding
 
-The embedding layer converts a `TensorDict[B, S]` of step records into the flat token sequence `[B, S*T, D]` consumed by the backbone.
+Step and token embeddings are built in [`mouse.models.embedding`](../../src/models/embedding/).
 
-## StepEmbedder
+## Step embedder
 
-::: mouse.models.embedding.embedding.StepEmbedder
-
----
-
-## TokenType
-
-::: mouse.models.embedding.embedding.TokenType
-
----
+| Name | Source |
+|------|--------|
+| [`StepEmbedder`](../../src/models/embedding/embedding.py) | Converts `TensorDict[B, S]` steps into a token sequence for the backbone |
+| [`TokenType`](../../src/models/embedding/embedding.py) | Enum of modality / compute token ids |
 
 ## Per-modality embedders
 
-These are constructed and owned by `StepEmbedder`. They are documented here for reference.
+| Name | Source |
+|------|--------|
+| [`ActionEmbedder`](../../src/models/embedding/embedding.py) | Discrete actions |
+| [`RewardEmbedder`](../../src/models/embedding/embedding.py) | Scalar rewards (RFF) |
+| [`DoneEmbedder`](../../src/models/embedding/embedding.py) | Done flags |
+| [`TimeEmbedder`](../../src/models/embedding/embedding.py) | Episode step index |
+| [`ObsContinuousEmbedder`](../../src/models/embedding/embedding.py) | Continuous observations (RFF) |
+| [`ObsContinuousLinearEmbedder`](../../src/models/embedding/embedding.py) | Continuous observations (linear) |
+| [`ObsDiscreteEmbedder`](../../src/models/embedding/embedding.py) | Discrete state indices |
+| [`ObsImageEmbedder`](../../src/models/embedding/embedding.py) | Image pixels |
+| [`TypeEmbedder`](../../src/models/embedding/embedding.py) | Shared token-type table |
 
-::: mouse.models.embedding.embedding.ActionEmbedder
+## Encoding and linear layers
 
-::: mouse.models.embedding.embedding.RewardEmbedder
-
-::: mouse.models.embedding.embedding.DoneEmbedder
-
-::: mouse.models.embedding.embedding.TimeEmbedder
-
-::: mouse.models.embedding.embedding.ObsContinuousEmbedder
-
-::: mouse.models.embedding.embedding.ObsContinuousLinearEmbedder
-
-::: mouse.models.embedding.embedding.ObsDiscreteEmbedder
-
-::: mouse.models.embedding.embedding.ObsImageEmbedder
-
-::: mouse.models.embedding.embedding.TypeEmbedder
-
----
-
-## Encoding
-
-::: mouse.models.embedding.encoding.RandomFourierFeatures
-
-::: mouse.models.embedding.encoding.NormalizedPixel
-
----
-
-## Linear layers
-
-::: mouse.models.embedding.linear.ScaledEmbedding
-
-::: mouse.models.embedding.linear.ScaledLinear
-
-::: mouse.models.embedding.linear.PosLinear
-
-::: mouse.models.embedding.linear.ScaledPosLinear
+| Name | Source |
+|------|--------|
+| [`RandomFourierFeatures`](../../src/models/embedding/encoding.py) | Fourier features for continuous scalars |
+| [`NormalizedPixel`](../../src/models/embedding/encoding.py) | Normalised pixel projection |
+| [`ScaledEmbedding`](../../src/models/embedding/linear.py) | Scaled embedding table |
+| [`ScaledLinear`](../../src/models/embedding/linear.py) | Scaled linear layer |
+| [`PosLinear`](../../src/models/embedding/linear.py) | Position-specific linear maps |
+| [`ScaledPosLinear`](../../src/models/embedding/linear.py) | Scaled position-specific linear maps |

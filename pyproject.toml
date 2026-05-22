@@ -28,7 +28,7 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://github.com/micahr234/mouse-core"
-Documentation = "https://micahr234.github.io/mouse-core/"
+Documentation = "https://github.com/micahr234/mouse-core/tree/main/docs"
 Repository = "https://github.com/micahr234/mouse-core"
 Issues = "https://github.com/micahr234/mouse-core/issues"
 
@@ -38,11 +38,6 @@ dev = [
     "pytest",
     "build>=1.2",
     "twine>=6.1",
-]
-docs = [
-    "zensical>=0.0.11",
-    "mkdocstrings-python>=1.16",
-    "ghp-import>=2.1",
 ]
 examples = [
     "gymnasium>=1.0.0",

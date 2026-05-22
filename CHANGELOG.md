@@ -8,6 +8,11 @@ while pre-1.0 APIs may change without notice.
 
 ## [Unreleased]
 
+### Removed
+
+- Zensical / mkdocstrings docs build; documentation is plain Markdown in `docs/`
+- GitHub Pages docs workflow and `scripts/docs.sh`
+
 ### Added
 
 - Runnable `examples/` scripts for dataset collection, offline training, and inference.

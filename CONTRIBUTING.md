@@ -19,7 +19,7 @@ cd mouse-core
 source scripts/install.sh
 ```
 
-This installs the package in editable mode along with dev and docs extras. Activate the venv with `source .venv/bin/activate`, then serve docs with `./scripts/docs.sh`.
+This installs the package in editable mode with dev extras. Activate the venv with `source .venv/bin/activate`. Documentation is plain Markdown under `docs/` — edit those files directly; no build step.
 
 ## Pull request workflow
 
@@ -29,7 +29,6 @@ This installs the package in editable mode along with dev and docs extras. Activ
    ```bash
    pyright src/ tests/
    pytest
-   ./scripts/docs.sh   # optional: preview docs locally
    ```
    `scripts/install.sh` creates a `mouse -> src` symlink so Pyright can resolve `import mouse` (the symlink is gitignored).
 4. Open a pull request against `main` with a clear description of what changed and why.

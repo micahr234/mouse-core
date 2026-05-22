@@ -1,37 +1,16 @@
 # Heads
 
-Output heads are constructed and owned by `Model`. They are documented here for reference when building custom training loops.
+Output heads map pooled step representations to logits, Q-values, or action vectors.
 
-## DQNHead
+| Name | Source |
+|------|--------|
+| [`DQNHead`](../../src/models/heads/dqn.py) | Q-values with EMA target and Polyak update |
+| [`VecDQNHead`](../../src/models/heads/vec_dqn.py) | Per-action vector outputs |
+| [`vec_dqn_scores`](../../src/models/heads/vec_dqn.py) | Score candidate actions from vector head outputs |
+| [`rope_rotate`](../../src/models/heads/vec_dqn.py) | RoPE rotation helper for vector DQN |
+| [`SwiGLUHead`](../../src/models/heads/swiglu.py) | MLP head (policy / SV) |
+| [`SwiGLU`](../../src/models/heads/swiglu.py) | SwiGLU activation block |
 
-::: mouse.models.heads.dqn.DQNHead
+Base classes: [`BaseHead`](../../src/models/heads/base.py), [`BaseHeadWithTarget`](../../src/models/heads/base.py).
 
----
-
-## VecDQNHead
-
-::: mouse.models.heads.vec_dqn.VecDQNHead
-
----
-
-## vec_dqn_scores
-
-::: mouse.models.heads.vec_dqn.vec_dqn_scores
-
----
-
-## rope_rotate
-
-::: mouse.models.heads.vec_dqn.rope_rotate
-
----
-
-## SwiGLUHead
-
-::: mouse.models.heads.swiglu.SwiGLUHead
-
----
-
-## SwiGLU
-
-::: mouse.models.heads.swiglu.SwiGLU
+Package exports: [`mouse.models.heads`](../../src/models/heads/__init__.py).

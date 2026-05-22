@@ -41,9 +41,12 @@ python examples/02_train_offline.py
 
 ## Documentation
 
-- **[Getting started](https://micahr234.github.io/mouse-core/getting-started/)** — install, concepts, and first steps
-- **[Full docs](https://micahr234.github.io/mouse-core/)** — architecture, data pipeline, losses, API reference
-- **[Examples](examples/)** — runnable scripts in this repository
+Markdown guides live in [`docs/`](docs/README.md):
+
+- [Getting started](docs/getting-started.md)
+- [Architecture](docs/architecture.md), [data](docs/data.md), [losses](docs/losses.md), [examples](docs/examples.md)
+- [API reference](docs/api/model.md) (links to source)
+- [Runnable examples](examples/) in this repository
 
 ## Requirements
 

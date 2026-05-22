@@ -207,4 +207,4 @@ while True:
 
 ---
 
-The full API reference is available [here](api/model.md).
+Browse the [documentation index](README.md) or jump to the [API reference](api/model.md) (source links).

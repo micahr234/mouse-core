@@ -68,7 +68,7 @@ setup_venv() {
     
     # Install project dependencies (core + all optional extras).
     log "Installing project dependencies..."
-    if ! uv pip install -e ".[dev,docs]" --python .venv/bin/python --index-strategy unsafe-best-match; then
+    if ! uv pip install -e ".[dev]" --python .venv/bin/python --index-strategy unsafe-best-match; then
         error "Failed to install project dependencies"
         exit 1
     fi
@@ -96,8 +96,8 @@ main() {
     echo ""
     log "Activate the virtual environment:"
     echo "  source .venv/bin/activate"
-    log "Serve docs locally:"
-    echo "  ./scripts/docs.sh"
+    log "Documentation (Markdown):"
+    echo "  docs/README.md"
 }
 
 # Run main function

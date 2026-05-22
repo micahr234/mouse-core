@@ -10,6 +10,4 @@ MOUSE is organized as a small library with three main Python packages under `src
 
 Each environment step is embedded into tokens, processed by a causal backbone, pooled to one vector per step, then passed to heads (policy logits, Q-values, etc.). The policy is not fixed in weights alone; it emerges from attention over the step history.
 
-For diagrams, design rationale, and API details, see the published docs:
-
-**https://micahr234.github.io/mouse-core/architecture/**
+For design rationale and diagrams, see [docs/architecture.md](docs/architecture.md). API pages under [docs/api/](docs/api/) link to source files.
