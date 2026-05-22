@@ -19,16 +19,22 @@ cd mouse-core
 source scripts/install.sh
 ```
 
-This installs the package in editable mode along with all dev and docs extras.
+This installs the package in editable mode along with dev and docs extras. Activate the venv with `source .venv/bin/activate`, then serve docs with `./scripts/docs.sh`.
 
 ## Pull request workflow
 
 1. Fork the repository and create a branch from `main`.
 2. Make your changes. Keep commits focused — one logical change per commit.
-3. Check for linter errors (`pyright src/`) before opening a PR.
+3. Before opening a PR, run:
+   ```bash
+   pyright src/ tests/
+   pytest
+   ./scripts/docs.sh   # optional: preview docs locally
+   ```
+   `scripts/install.sh` creates a `mouse -> src` symlink so Pyright can resolve `import mouse` (the symlink is gitignored).
 4. Open a pull request against `main` with a clear description of what changed and why.
 
-There are no formal tests yet — if you add a new feature, a short usage example in the PR description or in the relevant `docs/` page is sufficient.
+If you add a new feature, include a short usage example in the PR description or in `docs/` / `examples/`.
 
 ## Code style
 

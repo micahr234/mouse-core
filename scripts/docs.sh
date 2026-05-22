@@ -4,7 +4,6 @@
 # Usage:
 #   ./scripts/docs.sh    # live-reload dev server at http://127.0.0.1:8000
 
-
 log() {
     echo "[INFO] $1"
 }
@@ -37,7 +36,7 @@ ZENSICAL_BIN=$(find_zensical)
 if [ -z "$ZENSICAL_BIN" ]; then
     error "zensical not found."
     log  "Install the docs extras first:"
-    log  "  uv pip install -e '.[docs]' --python .venv/bin/python"
+    log  "  source scripts/install.sh"
     exit 1
 fi
 

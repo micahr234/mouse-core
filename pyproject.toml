@@ -26,6 +26,12 @@ dependencies = [
     "pillow>=11.0.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/micahr234/mouse-core"
+Documentation = "https://micahr234.github.io/mouse-core/"
+Repository = "https://github.com/micahr234/mouse-core"
+Issues = "https://github.com/micahr234/mouse-core/issues"
+
 [project.optional-dependencies]
 dev = [
     "pyright",
@@ -38,6 +44,16 @@ docs = [
     "mkdocstrings-python>=1.16",
     "ghp-import>=2.1",
 ]
+examples = [
+    "gymnasium>=1.0.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.setuptools.package-data]
+mouse = ["py.typed"]
 
 [tool.uv]
 environments = ["sys_platform == 'linux'"]

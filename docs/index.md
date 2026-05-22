@@ -30,6 +30,8 @@ The policy is never stored in fixed weights — it emerges from the transformer 
 pip install mouse-core
 ```
 
+New here? See **[Getting started](getting-started.md)** for a short guided path and runnable repo examples.
+
 ---
 
 ## Creating and Uploading a Dataset

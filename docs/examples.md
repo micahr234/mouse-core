@@ -1,6 +1,22 @@
 # Examples
 
-Copy-paste examples for common use cases. Training scripts live in a separate repo; this library supplies the model, losses, and data utilities.
+Copy-paste examples for common use cases, plus **runnable scripts** in the repository [`examples/`](https://github.com/micahr234/mouse-core/tree/main/examples) directory.
+
+---
+
+## Runnable scripts
+
+| Script | Description |
+|--------|-------------|
+| `examples/01_collect_dataset.py` | Gymnasium rollouts → `DatasetStore` (optional Hub upload) |
+| `examples/02_train_offline.py` | Train a tiny model on synthetic data (no Hub) |
+| `examples/03_inference.py` | Inference skeleton (`MODEL_ID` env var) |
+
+```bash
+source scripts/install.sh
+source .venv/bin/activate
+python examples/02_train_offline.py
+```
 
 ---
 
@@ -8,6 +24,7 @@ Copy-paste examples for common use cases. Training scripts live in a separate re
 
 ```bash
 source scripts/install.sh
+source .venv/bin/activate
 ```
 
 This installs `uv`, creates a Python 3.12 venv at `.venv/`, and installs the package in editable mode with dev dependencies.

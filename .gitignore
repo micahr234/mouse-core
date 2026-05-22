@@ -1,3 +1,6 @@
+# Symlink for pyright (created by scripts/install.sh)
+/mouse
+
 __pycache__/
 *.pyc
 *.pyo
