@@ -8,11 +8,11 @@ version = "0.1.0"
 description = "Meta-Optimization Using Sequential Experiences — core ICRL library"
 readme = "README.md"
 requires-python = ">=3.12"
+license = "GPL-3.0-or-later"
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
-    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",
 ]
@@ -26,6 +26,12 @@ dependencies = [
     "pillow>=11.0.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/micahr234/mouse-core"
+Documentation = "https://github.com/micahr234/mouse-core/tree/main/docs"
+Repository = "https://github.com/micahr234/mouse-core"
+Issues = "https://github.com/micahr234/mouse-core/issues"
+
 [project.optional-dependencies]
 dev = [
     "pyright",
@@ -33,11 +39,16 @@ dev = [
     "build>=1.2",
     "twine>=6.1",
 ]
-docs = [
-    "zensical>=0.0.11",
-    "mkdocstrings-python>=1.16",
-    "ghp-import>=2.1",
+examples = [
+    "gymnasium>=1.0.0",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.setuptools.package-data]
+mouse = ["py.typed"]
 
 [tool.uv]
 environments = ["sys_platform == 'linux'"]

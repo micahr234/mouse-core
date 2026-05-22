@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install package and dev extras
+        run: |
+          uv venv --python 3.12
+          uv pip install -e ".[dev]" --python .venv/bin/python
+          ln -sf src mouse
+
+      - name: Type check
+        run: .venv/bin/pyright src/ tests/
+
+      - name: Run tests
+        run: .venv/bin/pytest -q

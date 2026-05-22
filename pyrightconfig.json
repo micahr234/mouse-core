@@ -1,0 +1,21 @@
+{
+  "venvPath": ".",
+  "venv": ".venv",
+  "include": ["src", "tests"],
+  "extraPaths": ["."],
+  "typeCheckingMode": "basic",
+  "reportPrivateImportUsage": false,
+  "reportIncompatibleMethodOverride": false,
+  "reportOptionalCall": false,
+  "reportOptionalSubscript": false,
+  "reportOptionalMemberAccess": false,
+  "reportAttributeAccessIssue": false,
+  "reportArgumentType": false,
+  "reportAssignmentType": false,
+  "reportCallIssue": false,
+  "reportGeneralTypeIssues": false,
+  "reportOperatorIssue": false,
+  "reportPossiblyUnboundVariable": false,
+  "reportReturnType": false,
+  "reportOptionalOperand": false
+}
