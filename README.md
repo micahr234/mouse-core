@@ -1,6 +1,6 @@
 # Meta-Optimization Using Sequential Experiences
 
-<p align="center"><img src="docs/mouse.png" width="400"/></p>
+<p align="center"><img src="docs/mouse-core.png" width="400"/></p>
 
 > **Warning:** MOUSE is in early development and is not yet ready for use. APIs will change without notice.
 
