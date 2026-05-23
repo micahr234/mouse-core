@@ -1,0 +1,148 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    // ── CartPole ──────────────────────────────────────────────────────────────
+    {
+      "name": "Play: NS-CartPole",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "mouse.runner",
+      "args": ["configs/ns_gym/cartpole/play_ns_cartpole.yaml"],
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": false
+    },
+    {
+      "name": "Play: NS-CartPole (Big)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "mouse.runner",
+      "args": ["configs/ns_gym/cartpole/play_ns_cartpole_big.yaml"],
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": false
+    },
+    {
+      "name": "Train: NS-CartPole (with backbone)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "mouse.runner",
+      "args": ["configs/ns_gym/cartpole/train_ns_cartpole_with_bb.yaml"],
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": false
+    },
+    {
+      "name": "Train: NS-CartPole (no backbone)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "mouse.runner",
+      "args": ["configs/ns_gym/cartpole/train_ns_cartpole_without_bb.yaml"],
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": false
+    },
+    {
+      "name": "Train: NS-CartPole DQN (with backbone)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "mouse.runner",
+      "args": ["configs/ns_gym/cartpole/train_ns_cartpole_dqn_with_bb.yaml"],
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": false
+    },
+    {
+      "name": "Train: NS-CartPole DQN (no backbone)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "mouse.runner",
+      "args": ["configs/ns_gym/cartpole/train_ns_cartpole_dqn_without_bb.yaml"],
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": false
+    },
+    // ── FrozenLake ────────────────────────────────────────────────────────────
+    {
+      "name": "Play: NS-FrozenLake",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "mouse.runner",
+      "args": ["configs/ns_gym/frozenlake/play_ns_frozenlake.yaml"],
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": false
+    },
+    {
+      "name": "Play: NS-FrozenLake (Random, Big)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "mouse.runner",
+      "args": ["configs/ns_gym/frozenlake/play_ns_frozenlake_random_big.yaml"],
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": false
+    },
+    {
+      "name": "Train: NS-FrozenLake (with backbone)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "mouse.runner",
+      "args": ["configs/ns_gym/frozenlake/train_ns_frozenlake_with_bb.yaml"],
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": false
+    },
+    {
+      "name": "Train: NS-FrozenLake (no backbone)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "mouse.runner",
+      "args": ["configs/ns_gym/frozenlake/train_ns_frozenlake_without_bb.yaml"],
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": false
+    },
+    // ── Flexible / dev ────────────────────────────────────────────────────────
+    {
+      "name": "Run: Custom Config (prompt)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "mouse.runner",
+      "args": ["${input:configPath}"],
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": false
+    },
+    {
+      "name": "Run: Pytest",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "pytest",
+      "args": ["-x", "-v", "tests/"],
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "envFile": "${workspaceFolder}/.env",
+      "justMyCode": false
+    }
+  ],
+  "inputs": [
+    {
+      "id": "configPath",
+      "type": "promptString",
+      "description": "Path to experiment YAML config (absolute, or relative to configs/)",
+      "default": "configs/ns_gym/default.yaml"
+    }
+  ]
+}

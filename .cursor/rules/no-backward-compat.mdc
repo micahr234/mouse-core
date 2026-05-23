@@ -1,0 +1,13 @@
+---
+description: Do not preserve backward compatibility
+alwaysApply: true
+---
+
+# No Backward Compatibility
+
+This project is in early development. **Do not** add legacy shims, deprecation warnings, migration guides, or compatibility layers.
+
+- Delete old code outright — do not keep it "for compatibility"
+- Rename fields, functions, and files freely without aliasing the old names
+- Do not add `# deprecated` comments or `DeprecationWarning` calls
+- Do not hedge edits with "for backwards compat" — just make the clean change

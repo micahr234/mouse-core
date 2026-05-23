@@ -1,0 +1,29 @@
+---
+description: Always use the project virtual environment for Python and package commands
+alwaysApply: true
+---
+
+# Python Virtual Environment
+
+This project uses `uv` with a `.venv` at the repo root (`/home/user/Repos/mouse-env/.venv`).
+
+## Rules
+
+- **Never** run bare `pip install`. Always use `uv pip install` or `.venv/bin/pip install`.
+- **Never** run bare `python`. Use `.venv/bin/python` or `uv run python`.
+- To add a new dependency: add it to `pyproject.toml` first, then run `uv pip install -e ".[dev]" --python .venv/bin/python`.
+- To verify the environment: `.venv/bin/python -c "import <pkg>"`.
+
+## Examples
+
+```bash
+# ❌ BAD
+pip install tensordict
+python -c "import mouse"
+jupyter lab examples/
+
+# ✅ GOOD
+uv pip install tensordict --python .venv/bin/python
+.venv/bin/python -c "import mouse"
+.venv/bin/jupyter lab examples/
+```
