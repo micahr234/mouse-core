@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-from mouse.losses.base import LossConfig
+from mouse_core.losses.base import LossConfig
 import torch.nn.functional as F
 from tensordict import TensorDict
 
@@ -90,13 +90,15 @@ def dqn_loss(
 
     loss = (q_values - td_target.detach()) ** 2
 
+    cql_penalty_mean: torch.Tensor | None = None
     if cfg.cql_weight > 0.0:
         # CQL penalty ∝ Q while TD loss ∝ Q², so a fixed weight becomes ineffective
         # as Q grows.  Multiplying by q_scale brings CQL up to Q² so the ratio
         # cfg.cql_weight stays constant throughout training.
         q_scale = (td_target.abs() + cfg.cql_scale_q_eps).detach()
-        cql_penalty = curr_q.logsumexp(dim=-1) - q_values
+        cql_penalty = torch.logsumexp(curr_q, dim=-1) - q_values
         loss = loss + cfg.cql_weight * q_scale * cql_penalty
+        cql_penalty_mean = cql_penalty.detach().mean()
 
     loss = loss.mean()
 
@@ -109,8 +111,8 @@ def dqn_loss(
         "q_values_target": td_target.detach().mean(),
         "dqn_loss":      loss.detach(),
     }
-    if cfg.cql_weight > 0.0:
-        named["cql_penalty"] = cql_penalty.detach().mean()
+    if cql_penalty_mean is not None:
+        named["cql_penalty"] = cql_penalty_mean
 
     metrics: dict[str, float] = dict(zip(named, torch.stack(list(named.values())).tolist()))
 

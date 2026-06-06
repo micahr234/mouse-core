@@ -2,22 +2,22 @@
 
 Training loop patterns and dataset collection. Overview: [guide.md](guide.md).
 
-Runnable scripts live in [`examples/`](../examples/) at the repo root.
+Runnable notebooks live in [`examples/`](../examples/) at the repo root.
 
 ---
 
-## Runnable scripts
+## Runnable notebooks
 
-| Script | Description |
-|--------|-------------|
-| `examples/01_collect_dataset.py` | Gymnasium rollouts → `DatasetStore` (optional Hub upload) |
-| `examples/02_train_offline.py` | Train a tiny model on synthetic data (no Hub) |
-| `examples/03_inference.py` | Inference skeleton (`MODEL_ID` env var) |
+| Notebook | Description |
+|----------|-------------|
+| [`examples/01_collect_dataset.ipynb`](../examples/01_collect_dataset.ipynb) | Gymnasium rollouts → `DatasetStore` (optional Hub upload) |
+| [`examples/02_train_offline.ipynb`](../examples/02_train_offline.ipynb) | Train a tiny model on synthetic data (no Hub) |
+| [`examples/03_inference.ipynb`](../examples/03_inference.ipynb) | Inference skeleton (`MODEL_ID` env var) |
 
 ```bash
 source scripts/install.sh
 source .venv/bin/activate
-python examples/02_train_offline.py
+jupyter lab examples/
 ```
 
 ---
@@ -35,16 +35,18 @@ This installs `uv`, creates a Python 3.12 venv at `.venv/`, and installs the pac
 
 ## Minimal training loop
 
+A self-contained, runnable version (no Hub required) is in [`examples/02_train_offline.ipynb`](../examples/02_train_offline.ipynb).
+
 ```python
 import torch
 from datasets import load_dataset
 from tensordict import TensorDict
 
-from mouse.models.base import load_model
-from mouse.data.dataset_store import DatasetStore
-from mouse.data.batch import PrefetchBatchifier
-from mouse.losses.dqn import DqnLossConfig, dqn_loss
-from mouse.losses.sp import SpLossConfig, sp_loss
+from mouse_core.models.base import load_model
+from mouse_core.data.dataset_store import DatasetStore
+from mouse_core.data.batch import PrefetchBatchifier
+from mouse_core.losses.dqn import DqnLossConfig, dqn_loss
+from mouse_core.losses.sp import SpLossConfig, sp_loss
 
 # ── Device ────────────────────────────────────────────────────────────────────
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -105,7 +107,7 @@ bf.close()
 ## Data-augmented loop
 
 ```python
-from mouse.data.augment import TokenAugmenter, AugmentTokensConfig, AugmentScalarSpec
+from mouse_core.data.augment import TokenAugmenter, AugmentTokensConfig, AugmentScalarSpec
 
 aug_cfg = AugmentTokensConfig(
     scale_reward=AugmentScalarSpec(mean=1.0, low=0.5, high=2.0),
@@ -147,7 +149,7 @@ model.save_pretrained("./my-checkpoint")
 model.push_to_hub("your-org/your-model")
 
 # Load (auto-detects backbone class)
-from mouse.models.base import load_model
+from mouse_core.models.base import load_model
 model = load_model("your-org/your-model")
 ```
 
@@ -155,13 +157,13 @@ model = load_model("your-org/your-model")
 
 ## Model cards
 
-`MODEL_CARD_TEMPLATE` in `mouse.models.base` is a Jinja-style template. When you call `push_to_hub`, HuggingFace Hub renders it automatically using the stored `config.json` fields, producing a formatted README with code examples tailored to your model's modalities and heads.
+`MODEL_CARD_TEMPLATE` in `mouse_core.models.base` is a Jinja-style template. When you call `push_to_hub`, HuggingFace Hub renders it automatically using the stored `config.json` fields, producing a formatted README with code examples tailored to your model's modalities and heads.
 
 ---
 
 ## Inference / evaluation
 
-Use `model.eval()` and `torch.no_grad()` for evaluation. For online rollouts with minimal recomputation use the KV-cache:
+A minimal single-step version is in [`examples/03_inference.ipynb`](../examples/03_inference.ipynb). Use `model.eval()` and `torch.no_grad()` for evaluation. For online rollouts with minimal recomputation use the KV-cache:
 
 ```python
 model.eval()
@@ -208,4 +210,4 @@ with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
 
 **Sequence length.** Keep `sequence_length` close to the value the model was trained with. Too-short sequences under-utilise the context; too-long sequences are out-of-distribution for the positional encodings.
 
-**`xformed_reward`.** If your dataset includes a pre-computed transformed reward (e.g. clipped or log-scaled), set `use_xformed_reward=True` in `DqnLossConfig` to use `xformed_reward` instead of `reward` as the TD signal. The raw `reward` field is still available for logging.
+**`xformed_reward`.** If your dataset includes the `reward_episodic` column (a pre-computed transformed reward, e.g. clipped or log-scaled), it is encoded into the `xformed_reward` field. Set `use_xformed_reward=True` in `DqnLossConfig` to use it instead of `reward` as the TD signal. The raw `reward` field is still available for logging.

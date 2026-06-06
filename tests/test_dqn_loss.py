@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 from tensordict import TensorDict
 
-from mouse.losses import DqnLossConfig, dqn_loss
+from mouse_core.losses import DqnLossConfig, dqn_loss
 
 
 def test_dqn_loss_runs() -> None:

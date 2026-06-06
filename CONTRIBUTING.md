@@ -19,9 +19,11 @@ cd mouse-core
 source scripts/install.sh
 ```
 
-This installs the package in editable mode with dev dependencies. Activate with `source .venv/bin/activate`.
+This installs the package in editable mode with the `dev` and `all` extras (`all` bundles every feature extra — currently `examples`, which adds Gymnasium for the [`examples/`](examples/) notebooks). Activate with `source .venv/bin/activate`.
 
-`scripts/install.sh` creates a `mouse -> src` symlink so Pyright can resolve `import mouse` (gitignored).
+The package lives at `src/mouse_core/` (standard src layout) and is imported as `mouse_core`.
+
+Notebooks under [`examples/`](examples/) are committed **without** cell outputs. Clear outputs before committing, e.g. `jupyter nbconvert --clear-output --inplace examples/*.ipynb`.
 
 ## Pull request workflow
 

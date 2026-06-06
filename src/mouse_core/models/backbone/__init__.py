@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from mouse.models.backbone.llama import ModelLlama, LlamaBackboneConfig
-from mouse.models.backbone.qwen3 import ModelQwen3, Qwen3BackboneConfig
-from mouse.models.backbone.none import ModelNone
+from mouse_core.models.backbone.llama import ModelLlama, LlamaBackboneConfig
+from mouse_core.models.backbone.qwen3 import ModelQwen3, Qwen3BackboneConfig
+from mouse_core.models.backbone.none import ModelNone
 
 
 def backbone_kwargs_from_pretrained(
@@ -29,7 +29,7 @@ def backbone_kwargs_from_pretrained(
 
     Returns:
         ``(backbone_kwargs, hidden_dim)`` — pass these directly to
-        :func:`~mouse.models.base.init_from_pretrained_backbone` or to a
+        :func:`~mouse_core.models.base.init_from_pretrained_backbone` or to a
         ``Model`` subclass constructor.
 
     Example::

@@ -19,12 +19,12 @@ Step records store the observation at step `t` together with the action, reward,
 
 ---
 
-## DQN loss (`mouse.losses.dqn`)
+## DQN loss (`mouse_core.losses.dqn`)
 
 One-step TD loss with twin (online / target) Q-heads.
 
 ```python
-from mouse.losses.dqn import DqnLossConfig, dqn_loss
+from mouse_core.losses.dqn import DqnLossConfig, dqn_loss
 
 cfg = DqnLossConfig(
     weight=1.0,
@@ -75,12 +75,12 @@ The penalty is scaled by `|td_target| + cql_scale_q_eps` to keep its magnitude i
 
 ---
 
-## Vector DQN loss (`mouse.losses.vec_dqn`)
+## Vector DQN loss (`mouse_core.losses.vec_dqn`)
 
 Geometric loss for the `VecDQNHead`. Instead of scalar Q-values, each action is represented as a unit vector in `ℝ^D`. The loss trains the online action vector to point in the direction of a **reward-rotated** bootstrap target vector.
 
 ```python
-from mouse.losses.vec_dqn import VecDqnLossConfig, vec_dqn_loss
+from mouse_core.losses.vec_dqn import VecDqnLossConfig, vec_dqn_loss
 
 cfg = VecDqnLossConfig(
     weight=1.0,
@@ -115,12 +115,12 @@ The rotation encodes the reward directly into the geometry of the representation
 
 ---
 
-## Supervised policy loss (`mouse.losses.sp`)
+## Supervised policy loss (`mouse_core.losses.sp`)
 
 Distils `q_star` annotations into the `sp` head logits. Six loss variants are available.
 
 ```python
-from mouse.losses.sp import SpLossConfig, sp_loss
+from mouse_core.losses.sp import SpLossConfig, sp_loss
 
 cfg = SpLossConfig(
     weight=1.0,
@@ -151,12 +151,12 @@ All soft variants use `softmax(q_star / temperature)` as the teacher distributio
 
 ---
 
-## Supervised value loss (`mouse.losses.sv`)
+## Supervised value loss (`mouse_core.losses.sv`)
 
 Directly regresses the `sv` head onto `q_star` values. Only finite entries in `q_star` participate; `-inf` padding never contributes gradients.
 
 ```python
-from mouse.losses.sv import SvLossConfig, sv_loss
+from mouse_core.losses.sv import SvLossConfig, sv_loss
 
 cfg = SvLossConfig(
     weight=1.0,
@@ -174,7 +174,7 @@ loss, metrics = sv_loss(step_stream, out["sv"], cfg)
 
 ## Combining losses
 
-Loss functions are designed to be composed freely. A typical multi-head update:
+A runnable single-loss training loop is in [`examples/02_train_offline.ipynb`](../examples/02_train_offline.ipynb). Loss functions are designed to be composed freely. A typical multi-head update:
 
 ```python
 total_loss = torch.tensor(0.0, device=device)

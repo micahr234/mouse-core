@@ -10,8 +10,8 @@ import torch.nn as nn
 from huggingface_hub import PyTorchModelHubMixin
 from transformers import Qwen3Config, Qwen3Model
 
-from mouse.models.base import Model, MODEL_CARD_TEMPLATE
-from mouse.models.base import TokenType
+from mouse_core.models.base import Model, MODEL_CARD_TEMPLATE
+from mouse_core.models.base import TokenType
 
 
 def _disable_cudnn_sdp() -> None:

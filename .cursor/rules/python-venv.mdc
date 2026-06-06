@@ -19,11 +19,11 @@ This project uses `uv` with a `.venv` at the repo root (`/home/user/Repos/mouse-
 ```bash
 # ❌ BAD
 pip install tensordict
-python -c "import mouse"
+python -c "import mouse_core"
 jupyter lab examples/
 
 # ✅ GOOD
 uv pip install tensordict --python .venv/bin/python
-.venv/bin/python -c "import mouse"
+.venv/bin/python -c "import mouse_core"
 .venv/bin/jupyter lab examples/
 ```

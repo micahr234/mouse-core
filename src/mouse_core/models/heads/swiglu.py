@@ -6,8 +6,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from mouse.models.embedding.linear import ScaledLinear
-from mouse.models.heads.base import BaseHead
+from mouse_core.models.embedding.linear import ScaledLinear
+from mouse_core.models.heads.base import BaseHead
 
 
 class SwiGLU(nn.Module):
@@ -62,7 +62,7 @@ class SwiGLUHead(BaseHead):
             ScaledLinear(in_features=dims[-2], out_features=dims[-1], scale=scale),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
         if self.norm is not None:
-            x = self.norm(x)
-        return self.layers(x)
+            h = self.norm(h)
+        return self.layers(h)

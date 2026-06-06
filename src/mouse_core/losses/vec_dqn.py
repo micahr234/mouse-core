@@ -9,8 +9,8 @@ import torch
 import torch.nn.functional as F
 from tensordict import TensorDict
 
-from mouse.losses.base import LossConfig
-from mouse.models.heads.vec_dqn import rope_rotate, vec_dqn_scores
+from mouse_core.losses.base import LossConfig
+from mouse_core.models.heads.vec_dqn import rope_rotate, vec_dqn_scores
 
 
 @dataclass(frozen=True)

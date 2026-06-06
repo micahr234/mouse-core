@@ -40,7 +40,7 @@ import numpy as np
 from tensordict import TensorDict
 
 if TYPE_CHECKING:
-    from mouse.data.dataset_store import DatasetStore
+    from mouse_core.data.dataset_store import DatasetStore
 
 
 class PrefetchBatchifier:
@@ -81,7 +81,7 @@ class PrefetchBatchifier:
         num_workers: int = 1,
         pin_memory: bool = False,
     ) -> None:
-        from mouse.data.dataset_store import DatasetStore as _DS
+        from mouse_core.data.dataset_store import DatasetStore as _DS
 
         if not isinstance(store, _DS) or store._source is None:
             raise TypeError(

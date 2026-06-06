@@ -12,7 +12,6 @@ prefetch queue in RAM rather than materialising the entire dataset.
 
 from __future__ import annotations
 
-from io import BytesIO
 from typing import Any
 
 import numpy as np
@@ -23,6 +22,16 @@ import datasets
 from datasets import Dataset, concatenate_datasets
 
 datasets.disable_progress_bar()
+
+# Typed-dict keys shared with the mouse-env rollout contract. ``action`` and
+# ``observation`` columns are HuggingFace struct features whose sub-keys select
+# the modality (see https://github.com/micahr234/mouse-env docs/guide.md).
+ACTION_KEY_DISCRETE = "discrete"
+ACTION_KEY_CONTINUOUS = "continuous"
+
+OBS_KEY_DISCRETE = "discrete"
+OBS_KEY_CONTINUOUS = "continuous"
+OBS_KEY_IMAGE = "image"
 
 
 def _rows_to_hf_dict(rows: list[dict]) -> dict[str, list]:
@@ -43,9 +52,9 @@ def _interleave_tds(
     """Interleave two TensorDicts at specified positions into a single TensorDict[n]."""
     keys: set[str] = set()
     if src_td is not None:
-        keys |= set(src_td.keys())
+        keys |= {str(k) for k in src_td.keys()}
     if buf_td is not None:
-        keys |= set(buf_td.keys())
+        keys |= {str(k) for k in buf_td.keys()}
 
     result: dict[str, torch.Tensor] = {}
     for key in keys:
@@ -72,6 +81,8 @@ class DatasetStore:
     ----------
     max_action_dim :
         Maximum number of discrete actions; used to clip q_star columns.
+    max_action_continuous_dim :
+        Number of continuous action dimensions to retain; 0 = no continuous action.
     max_obs_continuous_dim :
         Number of continuous observation dimensions to retain; 0 = no continuous obs.
     max_obs_discrete_dim :
@@ -83,6 +94,7 @@ class DatasetStore:
     def __init__(
         self,
         max_action_dim: int = 1000,
+        max_action_continuous_dim: int = 0,
         max_obs_continuous_dim: int = 0,
         max_obs_discrete_dim: int = 0,
         max_obs_image_pixels: int = 0,
@@ -90,6 +102,7 @@ class DatasetStore:
         if int(max_action_dim) <= 0:
             raise ValueError(f"max_action_dim must be positive, got {max_action_dim}")
         self._max_action_dim = int(max_action_dim)
+        self._max_action_continuous_dim = int(max_action_continuous_dim)
         self._max_obs_continuous_dim = int(max_obs_continuous_dim)
         self._max_obs_discrete_dim = int(max_obs_discrete_dim)
         self._max_obs_image_pixels = int(max_obs_image_pixels)
@@ -136,6 +149,7 @@ class DatasetStore:
         src_positions = np.where(src_mask)[0]
         buf_positions = np.where(buf_mask)[0]
 
+        assert self._source is not None  # src_len != 0 in the mixed branch
         src_td = (
             self.encode_hf_rows(self._source[idx[src_mask].tolist()])
             if src_mask.any() else None
@@ -162,56 +176,81 @@ class DatasetStore:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _image_to_uint8(value: Any) -> np.ndarray:
-        """Convert an HF Dataset observation_image value to a uint8 ndarray."""
-        if value is None:
-            raise ValueError("observation_image is None")
-        if isinstance(value, np.ndarray):
-            return np.asarray(value, dtype=np.uint8)
-        try:
-            import PIL.Image
-        except ImportError:
-            raise ImportError("PIL required to load observation_image from dataset") from None
-        if hasattr(value, "size") and not isinstance(value, dict):
-            return np.asarray(value, dtype=np.uint8)
-        if isinstance(value, dict):
-            raw = value.get("bytes") or value.get("path")
-            if raw is None:
-                raise ValueError("observation_image dict has no 'bytes' or 'path'")
-            img = PIL.Image.open(BytesIO(raw) if isinstance(raw, bytes) else raw)
-            return np.asarray(img, dtype=np.uint8)
-        return np.asarray(value, dtype=np.uint8)
+    def _modality_column(struct_rows: list[Any], key: str) -> list[Any]:
+        """Pull one modality (``key``) out of a struct column.
+
+        ``action`` and ``observation`` are always dicts; ``key`` may be any
+        sub-key name. Rows lacking the sub-key yield ``None``.
+        """
+        return [r.get(key) for r in struct_rows]
+
+    @staticmethod
+    def _vector_buffer(col: list[Any], dim: int, dtype: Any) -> np.ndarray | None:
+        """Pack a modality column of per-row vectors into ``[n, dim]``, zero-filled.
+
+        Each row's value is raveled and written into a zero row, truncated to
+        ``dim``. Rows whose value is ``None`` (modality absent for that step)
+        stay zero. Returns ``None`` when the modality is absent from every row.
+        """
+        if not any(v is not None for v in col):
+            return None
+        buf = np.zeros((len(col), dim), dtype=dtype)
+        for i, v in enumerate(col):
+            if v is not None:
+                arr = np.asarray(v, dtype=dtype).ravel()
+                d = min(arr.size, dim)
+                buf[i, :d] = arr[:d]
+        return buf
 
     def encode_hf_rows(self, rows: dict[str, Any]) -> TensorDict:
         """Encode a HF Dataset batch (dict-of-lists) into a TensorDict[N].
 
-        Required fields (``action``, ``reward``, ``done``) are always present.
-        Optional fields (``xformed_reward``, ``q_star``, ``time``, ``obs_*``)
-        are only included as keys when present in ``rows`` — no zero-fill
-        fallbacks, no silent substitutions.
+        Columns follow the mouse-env rollout contract. ``action`` and
+        ``observation`` are always dict (struct) columns; any sub-key name is
+        valid. This encoder maps the modality sub-keys the model understands
+        (``discrete`` / ``continuous`` / ``image``) onto flat tensors and leaves
+        every other sub-key untouched in the stored dataset. The discrete
+        ``action`` index is always emitted (0 placeholder for continuous-only
+        rows); the continuous action vector is emitted as ``action_continuous``
+        when ``max_action_continuous_dim > 0`` and present in the rows. Other
+        optional fields (``reward_episodic``, ``q_star``, ``time``, observation
+        modalities) are only included as keys when present in ``rows`` — no
+        zero-fill fallbacks, no silent substitutions.
         """
         cols = set(rows.keys())
         n = len(rows[next(iter(cols))]) if cols else 0
         tensors: dict[str, torch.Tensor] = {}
 
-        # Required fields
-        tensors["action"] = torch.from_numpy(np.asarray(rows["action"], dtype=np.int64))
+        # Required fields. ``action`` is a struct column whose sub-key selects the
+        # modality (``discrete`` index and/or ``continuous`` vector). The discrete
+        # index is always emitted; 0 placeholder where a step has no discrete action.
+        disc_actions = self._modality_column(rows["action"], ACTION_KEY_DISCRETE)
+        action_arr = np.array([0 if a is None else a for a in disc_actions], dtype=np.int64)
+        tensors["action"] = torch.from_numpy(action_arr)
         tensors["reward"] = torch.from_numpy(np.asarray(rows["reward"], dtype=np.float32))
         tensors["done"]   = torch.from_numpy(np.asarray(rows["done"],   dtype=np.int64))
 
-        # Optional scalar fields
-        if "xformed_reward" in cols:
-            tensors["xformed_reward"] = torch.from_numpy(
-                np.asarray(rows["xformed_reward"], dtype=np.float32)
+        if self._max_action_continuous_dim > 0:
+            buf = self._vector_buffer(
+                self._modality_column(rows["action"], ACTION_KEY_CONTINUOUS),
+                self._max_action_continuous_dim, np.float32,
             )
-        if "episode_step" in cols:
+            if buf is not None:
+                tensors["action_continuous"] = torch.from_numpy(buf)
+
+        # Optional scalar fields
+        if "reward_episodic" in cols:
+            tensors["xformed_reward"] = torch.from_numpy(
+                np.asarray(rows["reward_episodic"], dtype=np.float32)
+            )
+        if "time" in cols:
             tensors["time"] = torch.from_numpy(
-                np.asarray(rows["episode_step"], dtype=np.int64)
+                np.asarray(rows["time"], dtype=np.int64)
             )
 
         # q_star — only if data has it and at least the first entry is not None
-        if "metadata_q_star" in cols:
-            q_list = rows["metadata_q_star"]
+        if "q_star" in cols:
+            q_list = rows["q_star"]
             if q_list[0] is not None:
                 q_dim = self._max_action_dim
                 q_buf = np.full((n, q_dim), -np.inf, dtype=np.float32)
@@ -227,35 +266,33 @@ class DatasetStore:
                             q_buf[i, :qdim] = qa[:qdim]
                 tensors["q_star"] = torch.from_numpy(q_buf)
 
-        # Continuous observation
-        if "observation" in cols and self._max_obs_continuous_dim > 0:
-            obs_list = rows["observation"]
-            if obs_list[0] is not None:
-                obs = np.asarray(obs_list, dtype=np.float64)
-                max_dim = self._max_obs_continuous_dim
-                odim = min(obs.shape[-1], max_dim)
-                out = np.zeros((n, max_dim), dtype=np.float64)
-                out[:, :odim] = obs[:, :odim]
-                tensors["obs_continuous"] = torch.from_numpy(out)
+        # Observation modalities live under the ``observation`` struct column.
+        if "observation" in cols:
+            obs_rows = rows["observation"]
 
-        # Discrete observation
-        if "observation_discrete" in cols and self._max_obs_discrete_dim > 0:
-            obs_list = rows["observation_discrete"]
-            if obs_list[0] is not None:
-                tensors["obs_discrete"] = torch.from_numpy(
-                    np.asarray(obs_list, dtype=np.int64)
+            if self._max_obs_continuous_dim > 0:
+                buf = self._vector_buffer(
+                    self._modality_column(obs_rows, OBS_KEY_CONTINUOUS),
+                    self._max_obs_continuous_dim, np.float64,
                 )
+                if buf is not None:
+                    tensors["obs_continuous"] = torch.from_numpy(buf)
 
-        # Image observation
-        if "observation_image" in cols and self._max_obs_image_pixels > 0:
-            img_dim = self._max_obs_image_pixels
-            img_buf = np.zeros((n, img_dim), dtype=np.int64)
-            for i, img_val in enumerate(rows["observation_image"]):
-                if img_val is not None:
-                    arr = self._image_to_uint8(img_val).ravel().astype(np.int64)
-                    d = min(arr.size, img_dim)
-                    img_buf[i, :d] = arr[:d]
-            tensors["obs_image"] = torch.from_numpy(img_buf)
+            if self._max_obs_discrete_dim > 0:
+                disc = self._modality_column(obs_rows, OBS_KEY_DISCRETE)
+                if any(d is not None for d in disc):
+                    # 0 placeholder for rows whose observation has no discrete modality.
+                    tensors["obs_discrete"] = torch.from_numpy(
+                        np.array([0 if d is None else d for d in disc], dtype=np.int64)
+                    )
+
+            if self._max_obs_image_pixels > 0:
+                buf = self._vector_buffer(
+                    self._modality_column(obs_rows, OBS_KEY_IMAGE),
+                    self._max_obs_image_pixels, np.int64,
+                )
+                if buf is not None:
+                    tensors["obs_image"] = torch.from_numpy(buf)
 
         return TensorDict(tensors, batch_size=[n])
 
@@ -320,7 +357,7 @@ class DatasetStore:
                         )
             elif split_pattern is not None:
                 patterns = [split_pattern] if isinstance(split_pattern, str) else list(split_pattern)
-                keys = [k for k in ds.keys() if any(fnmatch.fnmatch(k, p) for p in patterns)]
+                keys = [k for k in ds.keys() if any(fnmatch.fnmatch(str(k), p) for p in patterns)]
                 if not keys:
                     raise KeyError(
                         f"No splits match pattern(s) {patterns!r}. "
@@ -361,24 +398,7 @@ class DatasetStore:
 
     @staticmethod
     def _build_dataset(rows: list[dict]) -> Dataset:
-        ds = Dataset.from_list(rows)
-        if "observation_image" not in ds.column_names:
-            return ds
-        from datasets.features import Image as HFImage
-
-        image_feature = HFImage()
-
-        def _encode_img(example: dict[str, Any]) -> dict[str, Any]:
-            arr = np.asarray(example["observation_image"])
-            if np.issubdtype(arr.dtype, np.floating):
-                arr = np.clip(arr * 255.0, 0, 255).astype(np.uint8)
-            else:
-                arr = np.asarray(arr, dtype=np.uint8)
-            example["observation_image"] = image_feature.encode_example(arr)
-            return example
-
-        ds = ds.map(_encode_img, desc=None)
-        return ds.cast_column("observation_image", HFImage())
+        return Dataset.from_list(rows)
 
     # ------------------------------------------------------------------
     # Reset

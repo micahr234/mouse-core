@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import torch
 
-from mouse.models.heads.base import BaseHeadWithTarget
-from mouse.models.heads.swiglu import SwiGLUHead
+from mouse_core.models.heads.base import BaseHeadWithTarget
+from mouse_core.models.heads.swiglu import SwiGLUHead
 
 
 class DQNHead(BaseHeadWithTarget):
@@ -27,7 +27,7 @@ class DQNHead(BaseHeadWithTarget):
         use_norm: bool = True,
     ):
         super().__init__()
-        head_kwargs = dict(
+        self.online = SwiGLUHead(
             in_features=in_features,
             out_features=out_features,
             hidden_dim=hidden_dim,
@@ -35,9 +35,8 @@ class DQNHead(BaseHeadWithTarget):
             scale=scale,
             use_norm=use_norm,
         )
-        self.online = SwiGLUHead(**head_kwargs)
         self._init_target(self.online)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
         """Run the online head; returns Q-value logits ``[B, S, A]``."""
-        return self.online(x)
+        return self.online(h)

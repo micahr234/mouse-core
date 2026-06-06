@@ -17,7 +17,7 @@ jobs:
       url: https://pypi.org/project/mouse-core/
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - uses: actions/setup-python@v6
         with:
@@ -34,7 +34,7 @@ jobs:
           fi
 
       - name: Install build tools
-        run: pip install "build>=1.2" "twine>=6.1"
+        run: pip install "build>=1.2" "twine>=6.2"
 
       - name: Build
         run: python -m build

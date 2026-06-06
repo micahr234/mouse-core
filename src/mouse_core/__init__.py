@@ -1,6 +1,6 @@
-from mouse.models import Model, load_model
-from mouse.models.heads import BaseHead, BaseHeadWithTarget
-from mouse.losses import LossConfig, LossFunction
+from mouse_core.models import Model, load_model
+from mouse_core.models.heads import BaseHead, BaseHeadWithTarget
+from mouse_core.losses import LossConfig, LossFunction
 
 __all__ = [
     "Model",

@@ -7,7 +7,7 @@ provided automatically; only ``forward`` needs to be implemented.
 
 Example — simple head::
 
-    from mouse.models.heads.base import BaseHead
+    from mouse_core.models.heads.base import BaseHead
 
     class MyHead(BaseHead):
         def __init__(self, in_features: int, out_features: int) -> None:
@@ -19,7 +19,7 @@ Example — simple head::
 
 Example — head with target network::
 
-    from mouse.models.heads.base import BaseHeadWithTarget
+    from mouse_core.models.heads.base import BaseHeadWithTarget
 
     class MyTwinHead(BaseHeadWithTarget):
         def __init__(self, in_features: int, out_features: int) -> None:

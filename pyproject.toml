@@ -23,7 +23,6 @@ dependencies = [
     "tensordict>=0.12.1",
     "datasets>=4.8.5",
     "huggingface_hub>=0.30.0",
-    "pillow>=11.0.0",
 ]
 
 [project.urls]
@@ -33,14 +32,26 @@ Repository = "https://github.com/micahr234/mouse-core"
 Issues = "https://github.com/micahr234/mouse-core/issues"
 
 [project.optional-dependencies]
+examples = [
+    "mouse-env @ git+https://github.com/micahr234/mouse-env.git@main",
+    "gymnasium[atari]>=1.2.3",
+    "opencv-python>=4.9",
+]
+atari = [
+    "gymnasium[atari]>=1.0.0",
+    "ale-py>=0.10.0",
+    "opencv-python>=4.9",
+]
+all = [
+    "mouse-core[examples,atari]",
+]
 dev = [
     "pyright",
     "pytest",
     "build>=1.2",
     "twine>=6.1",
-]
-examples = [
-    "gymnasium>=1.0.0",
+    "jupyter>=1.1.1",
+    "ipykernel>=6.29.5",
 ]
 
 [tool.pytest.ini_options]
@@ -48,30 +59,21 @@ testpaths = ["tests"]
 pythonpath = ["src"]
 
 [tool.setuptools.package-data]
-mouse = ["py.typed"]
+mouse_core = ["py.typed"]
 
 [tool.uv]
 environments = ["sys_platform == 'linux'"]
 
-# Source lives under src/ but is exposed as the "mouse" namespace.
-# package-dir tells setuptools that "mouse" maps to src/, so
-# src/models/ → mouse.models, src/data/ → mouse.data, etc.
 [tool.setuptools]
 packages = [
-    "mouse",
-    "mouse.models",
-    "mouse.models.backbone",
-    "mouse.models.embedding",
-    "mouse.models.heads",
-    "mouse.data",
-    "mouse.losses",
+    "mouse_core",
+    "mouse_core.models",
+    "mouse_core.models.backbone",
+    "mouse_core.models.embedding",
+    "mouse_core.models.heads",
+    "mouse_core.data",
+    "mouse_core.losses",
 ]
 
 [tool.setuptools.package-dir]
-"mouse" = "src"
-"mouse.models" = "src/models"
-"mouse.models.backbone" = "src/models/backbone"
-"mouse.models.embedding" = "src/models/embedding"
-"mouse.models.heads" = "src/models/heads"
-"mouse.data" = "src/data"
-"mouse.losses" = "src/losses"
+"" = "src"

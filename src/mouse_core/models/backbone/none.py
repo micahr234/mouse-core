@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from huggingface_hub import PyTorchModelHubMixin
 
-from mouse.models.base import Model, MODEL_CARD_TEMPLATE
+from mouse_core.models.base import Model, MODEL_CARD_TEMPLATE
 
 
 class ModelNone(Model, PyTorchModelHubMixin, library_name="MOUSE", tags=["backbone:none"], model_card_template=MODEL_CARD_TEMPLATE):

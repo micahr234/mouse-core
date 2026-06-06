@@ -21,7 +21,7 @@ TensorDict[B, S]
 
 ---
 
-## StepEmbedder (`mouse.models.embedding.embedding`)
+## StepEmbedder (`mouse_core.models.embedding.embedding`)
 
 Each environment step is embedded into a block of `tokens_per_step` vectors. Two modes control how modalities map to tokens:
 
@@ -88,15 +88,15 @@ Embedding tables use `ScaledEmbedding` initialised at `std = embedding_std` (def
 
 The backbone runs a standard transformer over the `[B, S*tokens_per_step, D]` token sequence and returns hidden states of the same shape.
 
-### Llama (`mouse.models.backbone.llama.ModelLlama`)
+### Llama (`mouse_core.models.backbone.llama.ModelLlama`)
 
 Uses `transformers.LlamaModel` (SDPA attention, no embedding layer, `vocab_size=1`). The final layer norm is replaced with `nn.Identity` so the model outputs raw hidden states. The cuDNN SDPA backend is disabled to avoid known numerical issues.
 
-### Qwen3 (`mouse.models.backbone.qwen3.ModelQwen3`)
+### Qwen3 (`mouse_core.models.backbone.qwen3.ModelQwen3`)
 
 Same approach using `transformers.Qwen3Model`. Supports an explicit `head_dim` for grouped-query attention.
 
-### None (`mouse.models.backbone.none.ModelNone`)
+### None (`mouse_core.models.backbone.none.ModelNone`)
 
 `nn.Identity` backbone — useful for ablations where no temporal context is needed. Does not support KV-cache.
 
@@ -110,7 +110,7 @@ Same approach using `transformers.Qwen3Model`. Supports an explicit `head_dim` f
 
 ### KV-cache
 
-Pass `use_cache=True` to enable incremental decoding. The `cache` dict returned from one call is passed back as input to the next. Only meaningful for `ModelLlama` and `ModelQwen3`; `ModelNone` always returns `None`.
+Pass `use_cache=True` to enable incremental decoding. The `cache` dict returned from one call is passed back as input to the next. Only meaningful for `ModelLlama` and `ModelQwen3`; `ModelNone` always returns `None`. See [`examples/03_inference.ipynb`](../examples/03_inference.ipynb) for a single-step cached forward pass.
 
 ---
 
@@ -130,7 +130,7 @@ This `[B, S, D]` tensor is the step-level representation fed to every output hea
 
 All heads take `[B, S, D]` and return `[B, S, ...]`.
 
-### SwiGLUHead (`mouse.models.heads.swiglu`)
+### SwiGLUHead (`mouse_core.models.heads.swiglu`)
 
 Shared building block for `sp` and `sv` heads:
 
@@ -138,7 +138,7 @@ Shared building block for `sp` and `sv` heads:
 RMSNorm (optional) → [ Linear (2D) → SiLU × Linear (D) ] × num_layers → ScaledLinear
 ```
 
-### DQNHead (`mouse.models.heads.dqn`)
+### DQNHead (`mouse_core.models.heads.dqn`)
 
 Two `SwiGLUHead` copies — **online** and **target** — with the same architecture. `target_forward` runs the target head with no gradient tracking. Call `polyak_update(tau)` after each optimiser step:
 
@@ -146,7 +146,7 @@ Two `SwiGLUHead` copies — **online** and **target** — with the same architec
 θ_target ← τ·θ_online + (1−τ)·θ_target
 ```
 
-### VecDQNHead (`mouse.models.heads.vec_dqn`)
+### VecDQNHead (`mouse_core.models.heads.vec_dqn`)
 
 Like `DQNHead` but each action produces a `vec_dim`-dimensional vector. Output shape: `[B, S, A, vec_dim]`.
 
@@ -186,7 +186,7 @@ Delegates to each enabled twin-head. Call once per optimiser step.
 ### Local checkpoint
 
 ```python
-from mouse.models import save_model, load_model
+from mouse_core.models import save_model, load_model
 
 save_model(model, "./checkpoints/step-10000")
 model = load_model("./checkpoints/step-10000")
@@ -195,7 +195,7 @@ model = load_model("./checkpoints/step-10000")
 ### Hugging Face Hub
 
 ```python
-from mouse.models import push_model_to_hub, load_model
+from mouse_core.models import push_model_to_hub, load_model
 
 # Upload weights + config + auto-generated model card
 push_model_to_hub(model, "your-org/your-model")
@@ -213,7 +213,7 @@ model = load_model("your-org/your-model")
 `init_from_pretrained_backbone` builds a MOUSE model whose backbone architecture and weights come from any Llama- or Qwen3-family checkpoint on the Hub. Architecture defaults (layer count, head count, hidden dim, FFN size) are read from the pretrained `config.json` automatically — you only need to specify the MOUSE-specific parts (embedding config and output heads).
 
 ```python
-from mouse.models import init_from_pretrained_backbone
+from mouse_core.models import init_from_pretrained_backbone
 
 model = init_from_pretrained_backbone(
     "meta-llama/Llama-3.2-1B",
@@ -257,7 +257,7 @@ If you only need the architecture (no weight loading), pass `load_weights=False`
 `backbone_kwargs_from_pretrained` returns the raw kwargs dict and hidden dim, letting you inspect or further customise before passing them to a model constructor:
 
 ```python
-from mouse.models.backbone import backbone_kwargs_from_pretrained
+from mouse_core.models.backbone import backbone_kwargs_from_pretrained
 
 backbone_kwargs, hidden_dim = backbone_kwargs_from_pretrained(
     "meta-llama/Llama-3.2-1B",

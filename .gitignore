@@ -1,6 +1,3 @@
-# Symlink for pyright (created by scripts/install.sh)
-/mouse
-
 # Local clone of sibling repo (optional dev)
 mouse-env/
 
@@ -14,3 +11,4 @@ build/
 uv.lock
 site/
 .cache/
+.ipynb_checkpoints/

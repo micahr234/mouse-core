@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from mouse.losses.base import LossConfig
+from mouse_core.losses.base import LossConfig
 
 import torch
 import torch.nn.functional as F

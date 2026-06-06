@@ -7,7 +7,7 @@ custom config dataclasses, and :class:`LossFunction` as the typing interface.
 Example — custom loss::
 
     from dataclasses import dataclass
-    from mouse.losses.base import LossConfig, LossFunction
+    from mouse_core.losses.base import LossConfig, LossFunction
     from tensordict import TensorDict
     import torch
 
@@ -60,9 +60,9 @@ class LossFunction(Protocol):
 
         Args:
             step_stream: Batch of step records ``[B, S]`` from
-                :class:`~mouse.data.batch.PrefetchBatchifier`.
+                :class:`~mouse_core.data.batch.PrefetchBatchifier`.
             out: Model output TensorDict ``[B, S]`` from
-                :meth:`~mouse.models.base.Model.forward`.
+                :meth:`~mouse_core.models.base.Model.forward`.
             cfg: Frozen config dataclass (subclass of :class:`LossConfig`).
 
         Returns:

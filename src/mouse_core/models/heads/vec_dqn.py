@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import math
+from typing import cast
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from mouse.models.heads.base import BaseHeadWithTarget
-from mouse.models.heads.swiglu import SwiGLUHead
+from mouse_core.models.heads.base import BaseHeadWithTarget
+from mouse_core.models.heads.swiglu import SwiGLUHead
 
 
 def rope_rotate(x: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
@@ -91,7 +92,7 @@ class VecDQNHead(BaseHeadWithTarget):
         super().__init__()
         self.A = max_num_actions
         self.D = vec_dim
-        head_kwargs = dict(
+        self.online = SwiGLUHead(
             in_features=in_features,
             out_features=max_num_actions * vec_dim,
             hidden_dim=hidden_dim,
@@ -99,18 +100,17 @@ class VecDQNHead(BaseHeadWithTarget):
             scale=scale,
             use_norm=use_norm,
         )
-        self.online = SwiGLUHead(**head_kwargs)
         if bias_scale is not None:
-            out_bias = self.online.layers[-1].bias
-            if out_bias is not None:
+            out_layer = cast(nn.Linear, self.online.layers[-1])
+            if out_layer.bias is not None:
                 with torch.no_grad():
-                    out_bias.fill_(float(bias_scale))
+                    out_layer.bias.fill_(float(bias_scale))
         self._init_target(self.online)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.online(x).unflatten(-1, (self.A, self.D))
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        return self.online(h).unflatten(-1, (self.A, self.D))
 
-    def target_forward(self, x: torch.Tensor) -> torch.Tensor:
+    def target_forward(self, h: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
-            return self.target(x).unflatten(-1, (self.A, self.D))
+            return self.target(h).unflatten(-1, (self.A, self.D))
 

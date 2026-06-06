@@ -24,7 +24,7 @@ from huggingface_hub.errors import HfHubHTTPError, RepositoryNotFoundError
 from huggingface_hub.hf_api import CommitOperationDelete
 
 if TYPE_CHECKING:
-    from mouse.data.dataset_store import DatasetStore
+    from mouse_core.data.dataset_store import DatasetStore
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +185,7 @@ def push_to_hub(
     *,
     private: bool = False,
     commit_message: str = "New rollout data",
-) -> None:
+) -> str | None:
     """Combine stores by split and push to the Hugging Face Hub.
 
     Parameters
@@ -197,17 +197,24 @@ def push_to_hub(
         Hub repository ID (``"user/dataset"`` or an unscoped name which is
         assigned to the logged-in user).
     private :
-        Create the repository as private if it does not already exist.
+        Repository visibility. Applied on every push: creating it as private,
+        and updating an existing repository's visibility to match.
     commit_message :
         Commit message written to the Hub.
+
+    Returns
+    -------
+    The canonical dataset URL on the Hub (e.g.
+    ``"https://huggingface.co/datasets/user/dataset"``), or ``None`` if there
+    was nothing to push.
 
     Examples
     --------
     ::
 
-        from mouse.data.hub import push_to_hub
+        from mouse_core.data.hub import push_to_hub
 
-        push_to_hub(
+        url = push_to_hub(
             {"train": [train_store], "eval": [eval_store]},
             repo_id="your-org/your-dataset",
         )
@@ -215,7 +222,7 @@ def push_to_hub(
     for split_name in splits:
         _validate_split_name(split_name)
 
-    from mouse.data.dataset_store import DatasetStore as _DS
+    from mouse_core.data.dataset_store import DatasetStore as _DS
 
     resolved: dict[str, Dataset] = {}
     for split_name, stores in splits.items():
@@ -226,7 +233,7 @@ def push_to_hub(
 
     if not resolved:
         print(f"push_to_hub: nothing to push to {repo_id!r}")
-        return
+        return None
 
     resolved = _align_splits(resolved)
     dataset_dict = DatasetDict(list(resolved.items()))
@@ -235,10 +242,12 @@ def push_to_hub(
         api = HfApi()
         repo_url = api.create_repo(repo_id, repo_type="dataset", private=private, exist_ok=True)
         hub_repo_id = repo_url.repo_id
+        # create_repo only sets visibility on creation; enforce it on every push so
+        # re-pushing an existing repo with a different ``private`` value takes effect.
+        api.update_repo_settings(repo_id=hub_repo_id, repo_type="dataset", private=private)
         _wipe_hub_repo_data(api=api, repo_id=hub_repo_id)
         dataset_dict.push_to_hub(
             repo_id=hub_repo_id,
-            private=private,
             commit_message=commit_message,
             data_dir="data",
             config_name="default",
@@ -257,6 +266,7 @@ def push_to_hub(
 
     parts_str = ", ".join(f"{k}: {len(v)}" for k, v in resolved.items())
     print(f"Pushed to {hub_repo_id} ({parts_str} steps)")
+    return str(repo_url)
 
 
 def push_stores_to_hub(
@@ -266,7 +276,7 @@ def push_stores_to_hub(
     split: str = "train",
     private: bool = False,
     commit_message: str = "New rollout data",
-) -> None:
+) -> str | None:
     """Push a list of ``DatasetStore`` objects to the Hub as a single split.
 
     Convenience wrapper around :func:`push_to_hub` for the common case where
@@ -281,16 +291,21 @@ def push_stores_to_hub(
     split :
         Split name to push under (default ``"train"``).
     private :
-        Create the repository as private if it does not already exist.
+        Repository visibility. Applied on every push: creating it as private,
+        and updating an existing repository's visibility to match.
     commit_message :
         Commit message written to the Hub.
+
+    Returns
+    -------
+    The canonical dataset URL on the Hub, or ``None`` if there was nothing to push.
 
     Examples
     --------
     ::
 
-        from mouse.data.hub import push_stores_to_hub
+        from mouse_core.data.hub import push_stores_to_hub
 
-        push_stores_to_hub([store], repo_id="your-org/your-dataset", split="train")
+        url = push_stores_to_hub([store], repo_id="your-org/your-dataset", split="train")
     """
-    push_to_hub({split: stores}, repo_id=repo_id, private=private, commit_message=commit_message)
+    return push_to_hub({split: stores}, repo_id=repo_id, private=private, commit_message=commit_message)

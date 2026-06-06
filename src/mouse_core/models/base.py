@@ -2,17 +2,18 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from huggingface_hub import PyTorchModelHubMixin
 from tensordict import TensorDict
 
-from mouse.models.heads.dqn import DQNHead
-from mouse.models.heads.swiglu import SwiGLUHead
-from mouse.models.heads.vec_dqn import VecDQNHead, vec_dqn_scores
-from mouse.models.embedding.embedding import StepEmbedder, TokenType
+from mouse_core.models.heads.dqn import DQNHead
+from mouse_core.models.heads.swiglu import SwiGLUHead
+from mouse_core.models.heads.vec_dqn import VecDQNHead, vec_dqn_scores
+from mouse_core.models.embedding.embedding import StepEmbedder, TokenType
 
 
 MODEL_CARD_TEMPLATE = """\
@@ -34,7 +35,7 @@ pip install "git+https://github.com/micahr234/mouse-core.git"
 ## Load
 
 ```python
-from mouse.models.base import load_model
+from mouse_core.models.base import load_model
 
 model = load_model("{{ model_id if model_id else 'your-org/your-model' }}")
 model.eval()
@@ -187,7 +188,7 @@ def save_model(model: "Model", path: str | Path) -> None:
         save_model(model, "./checkpoints/step-10000")
         model2 = load_model("./checkpoints/step-10000")
     """
-    model.save_pretrained(Path(path))
+    cast(PyTorchModelHubMixin, model).save_pretrained(Path(path))
 
 
 def push_model_to_hub(
@@ -219,7 +220,7 @@ def push_model_to_hub(
         url = push_model_to_hub(model, "your-org/your-model")
         print(url)
     """
-    return model.push_to_hub(
+    return cast(PyTorchModelHubMixin, model).push_to_hub(
         repo_id,
         commit_message=commit_message,
         private=private,
@@ -318,7 +319,7 @@ def init_from_pretrained_backbone(
 
     Example::
 
-        from mouse.models import init_from_pretrained_backbone
+        from mouse_core.models import init_from_pretrained_backbone
 
         model = init_from_pretrained_backbone(
             "meta-llama/Llama-3.2-1B",
@@ -334,7 +335,7 @@ def init_from_pretrained_backbone(
             dqn_head_kwargs=dict(num_layers=2, hidden_dim=256),
         )
     """
-    from mouse.models.backbone import backbone_kwargs_from_pretrained
+    from mouse_core.models.backbone import backbone_kwargs_from_pretrained
 
     backbone_kwargs, hidden_dim = backbone_kwargs_from_pretrained(
         backbone_repo_id, **(backbone_kwargs_overrides or {})
@@ -344,9 +345,9 @@ def init_from_pretrained_backbone(
     uses_qwen3 = "head_dim" in backbone_kwargs
 
     if uses_qwen3:
-        from mouse.models.backbone.qwen3 import ModelQwen3 as _Cls
+        from mouse_core.models.backbone.qwen3 import ModelQwen3 as _Cls
     else:
-        from mouse.models.backbone.llama import ModelLlama as _Cls  # type: ignore[assignment]
+        from mouse_core.models.backbone.llama import ModelLlama as _Cls  # type: ignore[assignment]
 
     model = _Cls(
         hidden_dim=hidden_dim,
@@ -416,12 +417,12 @@ def load_model(
     backbone_kwargs = config.get("backbone_kwargs", {})
 
     if not backbone_kwargs:
-        from mouse.models.backbone.none import ModelNone
+        from mouse_core.models.backbone.none import ModelNone
         return ModelNone.from_pretrained(repo_id_or_path, **kwargs)
     if "head_dim" in backbone_kwargs:
-        from mouse.models.backbone.qwen3 import ModelQwen3
+        from mouse_core.models.backbone.qwen3 import ModelQwen3
         return ModelQwen3.from_pretrained(repo_id_or_path, **kwargs)
-    from mouse.models.backbone.llama import ModelLlama
+    from mouse_core.models.backbone.llama import ModelLlama
     return ModelLlama.from_pretrained(repo_id_or_path, **kwargs)
 
 
@@ -633,7 +634,7 @@ class Model(nn.Module):
         Returns:
             ``[B]`` int64 tensor of selected actions.
         """
-        raw = out[self.action_head][:, -1]  # [B, A] or [B, A, D] for vec_dqn
+        raw = cast(torch.Tensor, out[self.action_head])[:, -1]  # [B, A] or [B, A, D] for vec_dqn
         scores: torch.Tensor = vec_dqn_scores(raw) if self.action_head == "vec_dqn" else raw  # [B, A]
         if num_actions is not None:
             scores = scores[:, :num_actions]

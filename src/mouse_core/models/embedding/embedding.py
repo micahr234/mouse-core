@@ -43,8 +43,8 @@ import torch
 import torch.nn as nn
 from tensordict import TensorDict
 
-from mouse.models.embedding.encoding import NormalizedPixel, RandomFourierFeatures
-from mouse.models.embedding.linear import ScaledEmbedding, ScaledPosLinear
+from mouse_core.models.embedding.encoding import NormalizedPixel, RandomFourierFeatures
+from mouse_core.models.embedding.linear import ScaledEmbedding, ScaledPosLinear
 
 
 class TokenType(IntEnum):
@@ -56,7 +56,7 @@ class TokenType(IntEnum):
     DONE         = 3  # int64 done flag: 0=not done, 1=terminal, 2=truncated
     OBS_IMAGE    = 4  # image obs pixel
     OBS_CONTINUOUS = 5  # continuous vector obs dimension
-    TIME         = 6  # int64 episode_step index
+    TIME         = 6  # int64 episode step index (the `time` field)
     OBS_DISCRETE = 7  # discrete vector obs dimension
     COMPUTE      = 8  # learned scratch token; carries no input data
 
@@ -556,6 +556,7 @@ class StepEmbedder(nn.Module):
         # Append compute tokens.
         K = self.num_compute_tokens
         if K > 0:
+            assert self.compute_embed is not None
             c = self.compute_embed.to(dtype=dtype)          # [K, D]
             c = c.view(1, 1, K, D).expand(B, S, K, D)
             embeds = torch.cat([data_embeds, c], dim=2)     # [B, S, data_slots+K, D]
@@ -608,18 +609,25 @@ class StepEmbedder(nn.Module):
                 total.add_(flat)
 
         if self.include_time_token:
+            assert self.time_embedder is not None
             _add(self.time_embedder(time_idx), TokenType.TIME)
         if self.include_action_token:
+            assert self.action_embedder is not None
             _add(self.action_embedder(action), TokenType.ACTION)
         if self.include_obs_continuous:
+            assert self.obs_continuous_embedder is not None
             _add(self.obs_continuous_embedder(obs_cont), TokenType.OBS_CONTINUOUS)
         if self.include_obs_discrete:
+            assert self.obs_discrete_embedder is not None
             _add(self.obs_discrete_embedder(obs_disc), TokenType.OBS_DISCRETE)
         if self.include_obs_image:
+            assert self.obs_image_embedder is not None
             _add(self.obs_image_embedder(obs_img), TokenType.OBS_IMAGE)
         if self.include_reward_token:
+            assert self.reward_embedder is not None
             _add(self.reward_embedder(reward), TokenType.REWARD)
         if self.include_done_token:
+            assert self.done_embedder is not None
             _add(self.done_embedder(done), TokenType.DONE)
 
         data_embeds = total.view(B, S, T, D)
@@ -647,18 +655,25 @@ class StepEmbedder(nn.Module):
 
         # Fixed canonical order (matches sum-mode _add order for consistency).
         if self.include_time_token:
+            assert self.time_embedder is not None
             _push(self.time_embedder(time_idx), TokenType.TIME)
         if self.include_action_token:
+            assert self.action_embedder is not None
             _push(self.action_embedder(action), TokenType.ACTION)
         if self.include_obs_continuous:
+            assert self.obs_continuous_embedder is not None
             _push(self.obs_continuous_embedder(obs_cont), TokenType.OBS_CONTINUOUS)
         if self.include_obs_discrete:
+            assert self.obs_discrete_embedder is not None
             _push(self.obs_discrete_embedder(obs_disc), TokenType.OBS_DISCRETE)
         if self.include_obs_image:
+            assert self.obs_image_embedder is not None
             _push(self.obs_image_embedder(obs_img), TokenType.OBS_IMAGE)
         if self.include_reward_token:
+            assert self.reward_embedder is not None
             _push(self.reward_embedder(reward), TokenType.REWARD)
         if self.include_done_token:
+            assert self.done_embedder is not None
             _push(self.done_embedder(done), TokenType.DONE)
 
         data_embeds = torch.cat(parts, dim=2)       # [B, S, M*T, D]
