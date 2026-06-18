@@ -1,28 +1,28 @@
-"""Base types for MOUSE loss functions.
+"""Base types for MOUSE objective functions.
 
-All loss functions share the same call signature — take a batch and model output,
-return a scalar loss and a metrics dict.  Use :class:`LossConfig` as the base for
-custom config dataclasses, and :class:`LossFunction` as the typing interface.
+All objective functions share the same call signature — take a batch and model output,
+return a scalar loss and a metrics dict.  Use :class:`ObjectiveConfig` as the base for
+custom config dataclasses, and :class:`ObjectiveFunction` as the typing interface.
 
-Example — custom loss::
+Example — custom objective::
 
     from dataclasses import dataclass
-    from mouse_core.losses.base import LossConfig, LossFunction
+    from mouse_core.objectives.base import ObjectiveConfig, ObjectiveFunction
     from tensordict import TensorDict
     import torch
 
     @dataclass(frozen=True)
-    class MyLossConfig(LossConfig):
+    class MyObjectiveConfig(ObjectiveConfig):
         weight: float = 1.0
         temperature: float = 1.0
 
-    def my_loss(
+    def my_objective(
         step_stream: TensorDict,
         out: TensorDict,
-        cfg: MyLossConfig,
+        cfg: MyObjectiveConfig,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         ...
-        return loss, {"my_loss": loss.item()}
+        return loss, {"my_objective": loss.item()}
 """
 
 from __future__ import annotations
@@ -35,19 +35,19 @@ from tensordict import TensorDict
 
 
 @dataclass(frozen=True)
-class LossConfig:
-    """Base dataclass for loss configurations.
+class ObjectiveConfig:
+    """Base dataclass for objective configurations.
 
     Subclass this and add your own hyperparameters.  Use ``frozen=True`` to keep
     configs immutable and safe to share across training steps.
     """
 
 
-class LossFunction(Protocol):
-    """Protocol describing the expected signature of all MOUSE loss functions.
+class ObjectiveFunction(Protocol):
+    """Protocol describing the expected signature of all MOUSE objective functions.
 
     Any callable matching this signature can be used interchangeably with the
-    built-in losses (``dqn_loss``, ``sp_loss``, etc.).
+    built-in objectives (``dqn_objective``, ``sp_objective``, etc.).
     """
 
     def __call__(
@@ -63,7 +63,7 @@ class LossFunction(Protocol):
                 :class:`~mouse_core.data.batch.PrefetchBatchifier`.
             out: Model output TensorDict ``[B, S]`` from
                 :meth:`~mouse_core.models.base.Model.forward`.
-            cfg: Frozen config dataclass (subclass of :class:`LossConfig`).
+            cfg: Frozen config dataclass (subclass of :class:`ObjectiveConfig`).
 
         Returns:
             Tuple of ``(scalar_loss, metrics)`` where ``metrics`` is a

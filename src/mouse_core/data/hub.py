@@ -1,13 +1,29 @@
 """Hugging Face Hub utilities for pushing DatasetStore data.
 
+Pushes write the raw rows (mouse-env contract records) using standard
+``DatasetDict.push_to_hub`` with ``config_name`` for subsets/bins.
+
+Before each push we wipe previous parquet shards, ``dataset_infos.json``,
+and the README (dataset card). This ensures that ``push_to_hub`` writes a
+fresh README whose leading ``dataset_info:`` (features, splits, sizes, etc.)
+exactly matches the dataset being uploaded right now.
+
+This is required when uploading a brand new dataset or when the schema,
+configs, or split structure has changed.
+
+If you want a custom ``configs:`` YAML block (per the HF repository structure
+guide) in addition to the auto-generated info, add or restore it after the
+push (e.g. by editing on the Hub) or manage the card separately.
+
+See https://huggingface.co/docs/datasets/repository_structure
+
 Public API
 ----------
-``push_to_hub(splits, repo_id)``
-    Push one or more splits (each a list of DatasetStores) to the Hub,
-    wiping any stale shards first so the result is always a clean upload.
+``push_to_hub(splits, repo_id, config_name=...)``
+    Push splits under a named config (subset/bin).
 
-``push_stores_to_hub(stores, repo_id, split="train")``
-    Convenience wrapper for the common single-split case.
+``push_stores_to_hub(stores, repo_id, split=..., config_name=...)``
+    Single-split convenience.
 """
 
 from __future__ import annotations
@@ -18,28 +34,12 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 from datasets import Dataset, DatasetDict, Features, Value, concatenate_datasets
 from datasets import config as datasets_config
-from datasets.naming import _split_re
 from huggingface_hub import HfApi
 from huggingface_hub.errors import HfHubHTTPError, RepositoryNotFoundError
 from huggingface_hub.hf_api import CommitOperationDelete
 
 if TYPE_CHECKING:
     from mouse_core.data.dataset_store import DatasetStore
-
-
-# ---------------------------------------------------------------------------
-# Validation
-# ---------------------------------------------------------------------------
-
-def _validate_split_name(split: str) -> None:
-    """Raise ``ValueError`` if *split* is not a legal Hugging Face split name."""
-    if not re.match(_split_re, split):
-        raise ValueError(
-            f"Invalid split name {split!r} for Hugging Face Hub. "
-            f"Must match pattern {_split_re!r} (word characters and optional dotted "
-            "segments). Use e.g. 'id_eval' rather than 'id-eval'. "
-            "See https://huggingface.co/docs/hub/datasets-file-names-and-splits"
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -50,11 +50,19 @@ _HUB_PARQUET_SHARD_RE = re.compile(r"^data/([^/]+)-\d{5}-of-\d{5}\.parquet$")
 
 
 def _wipe_hub_repo_data(api: HfApi, repo_id: str) -> None:
-    """Delete all parquet shards and the README so ``push_to_hub`` starts fresh.
+    """Delete previous data shards, dataset infos, and the README card.
 
-    ``DatasetDict.push_to_hub`` merges ``data_files`` from an existing README,
-    so stale split names survive across uploads.  Deleting them first lets the
-    library generate a correct card from scratch.
+    We remove the README (``README.md``) so that the subsequent
+    ``DatasetDict.push_to_hub`` call generates a brand new dataset card.
+    The leading ``dataset_info:`` section (features, splits, sizes, etc.)
+    in that card must reflect the exact data being uploaded now.
+
+    This matters when:
+    - Uploading to a brand new dataset repository, or
+    - The columns, configs, or split layout have changed since the last push.
+
+    We also clean stale parquet shards and ``dataset_infos.json`` so old
+    split/config metadata does not leak into the new card.
     """
     try:
         files = list(api.list_repo_files(repo_id=repo_id, repo_type="dataset"))
@@ -71,7 +79,7 @@ def _wipe_hub_repo_data(api: HfApi, repo_id: str) -> None:
             repo_id=repo_id,
             repo_type="dataset",
             operations=[CommitOperationDelete(path_in_repo=f) for f in to_delete],
-            commit_message="chore: wipe stale shards before fresh push",
+            commit_message="chore: wipe stale shards + card before fresh push",
         )
 
 
@@ -185,6 +193,7 @@ def push_to_hub(
     *,
     private: bool = False,
     commit_message: str = "New rollout data",
+    config_name: str = "default",
 ) -> str | None:
     """Combine stores by split and push to the Hugging Face Hub.
 
@@ -201,6 +210,12 @@ def push_to_hub(
         and updating an existing repository's visibility to match.
     commit_message :
         Commit message written to the Hub.
+    config_name :
+        Hugging Face dataset configuration / subset name (also called "config").
+        Use this to organize your data into different "bins" (e.g. different
+        collection runs, different environment families, different policies).
+        Default is ``"default"``. When loading later use
+        ``load_dataset(repo, config_name, split=...)``.
 
     Returns
     -------
@@ -218,10 +233,14 @@ def push_to_hub(
             {"train": [train_store], "eval": [eval_store]},
             repo_id="your-org/your-dataset",
         )
-    """
-    for split_name in splits:
-        _validate_split_name(split_name)
 
+        # Using a config/subset as a "bin"
+        url = push_to_hub(
+            {"train": [store]},
+            repo_id="your-org/your-dataset",
+            config_name="cartpole_ppo_expert",
+        )
+    """
     from mouse_core.data.dataset_store import DatasetStore as _DS
 
     resolved: dict[str, Dataset] = {}
@@ -250,7 +269,7 @@ def push_to_hub(
             repo_id=hub_repo_id,
             commit_message=commit_message,
             data_dir="data",
-            config_name="default",
+            config_name=config_name,
         )
     except HfHubHTTPError as e:
         code = getattr(getattr(e, "response", None), "status_code", None)
@@ -276,11 +295,18 @@ def push_stores_to_hub(
     split: str = "train",
     private: bool = False,
     commit_message: str = "New rollout data",
+    config_name: str = "default",
 ) -> str | None:
-    """Push a list of ``DatasetStore`` objects to the Hub as a single split.
+    """Push a list of ``DatasetStore`` objects to the Hub as a single split (inside a config/subset).
 
     Convenience wrapper around :func:`push_to_hub` for the common case where
     all stores belong to one split.
+
+    Use ``config_name`` to put the data under a named "bin"/configuration
+    (e.g. a particular experiment, policy, or environment family). You can
+    later load it with the standard HF loader::
+
+        load_dataset(repo_id, config_name, split=split)
 
     Parameters
     ----------
@@ -295,6 +321,9 @@ def push_stores_to_hub(
         and updating an existing repository's visibility to match.
     commit_message :
         Commit message written to the Hub.
+    config_name :
+        Configuration / subset name (default ``"default"``). This is the HF
+        "bin" for your data.
 
     Returns
     -------
@@ -307,5 +336,19 @@ def push_stores_to_hub(
         from mouse_core.data.hub import push_stores_to_hub
 
         url = push_stores_to_hub([store], repo_id="your-org/your-dataset", split="train")
+
+        # Save this collection under a named subset/bin
+        url = push_stores_to_hub(
+            [store],
+            repo_id="your-org/your-dataset",
+            split="train",
+            config_name="cartpole_v1_ppo_202406",
+        )
     """
-    return push_to_hub({split: stores}, repo_id=repo_id, private=private, commit_message=commit_message)
+    return push_to_hub(
+        {split: stores},
+        repo_id=repo_id,
+        private=private,
+        commit_message=commit_message,
+        config_name=config_name,
+    )

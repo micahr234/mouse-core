@@ -1,4 +1,4 @@
-# Architecture
+# Models
 
 MOUSE is a context-conditioned sequence model. The full forward pass has three stages:
 

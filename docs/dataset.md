@@ -1,143 +1,298 @@
-# Data pipeline
+# Dataset pipeline
 
-MOUSE reads offline RL data from HuggingFace Datasets and delivers batches as `TensorDict[B, S]` tensors. The two core classes are `DatasetStore` and `PrefetchBatchifier`.
+`DatasetStore` is a **sequential** container for step data.
 
-The dataset column schema follows the [mouse-env rollout contract](https://github.com/micahr234/mouse-env/blob/main/docs/guide.md) — `action` and `observation` are typed-dict (struct) columns, with renamed scalar fields (`time`, `reward_episodic`, `q_star`).
+It stores rows in the exact order they were added or loaded (Arrow-backed Hugging Face `Dataset`). 
+
+The **native** row layout is the mouse-env contract (`MouseEnvRecord`): nested `observation`/`action` + the rollout scalars (`reward`, `done`, `time`, `group_id`, `episode_index`, `reward_episodic`, `q_star`, ...). The store accepts any extra columns too; nothing is stripped.
+
+All I/O (load via `load_dataset`, push via `push_to_hub` with `config_name`, raw `to_dataset().push_to_hub`) deals in these rows directly. The only transformation is the on-demand encoding to model batches.
+
+When you train, you ask for batches of contiguous steps (e.g. 64 steps in a row). Because the data is sequential, those are just slices of the stored sequence. The shape of the tensors you get in each batch is driven by:
+- the dimension sizes you pass to `PrefetchBatchifier` (or `encode_hf_rows`), and
+- whatever matching data actually exists in your rows.
+
+The model defines what it wants to see. The environment defines what actually gets written. The store just keeps the ordered history and makes single appends and long contiguous reads fast.
+
+`PrefetchBatchifier` repeatedly takes such slices and turns them into ready `TensorDict[B, S]` batches. Everything else (saving, loading, pushing to the Hub) is just moving the same sequential rows around using normal Hugging Face dataset tools.
+
+The two important classes are `DatasetStore` and `PrefetchBatchifier`.
 
 ---
 
-## TensorDict layout
+## Sequential storage
 
-Every batch delivered by `PrefetchBatchifier` is a `TensorDict` of shape `[B, S]` where `B` is the batch size and `S` is the sequence length. The fields present depend on which observation modalities are configured:
+The data is stored in the exact order it was appended or loaded. It is just a flat sequence of rows. No built-in episode indexing, no automatic train/test split, no reordering.
 
-| Field | dtype | Shape | Description |
-|---|---|---|---|
-| `action` | `int64` | `[B, S]` | Discrete action index (0 placeholder for continuous-only steps) |
-| `action_continuous` | `float32` | `[B, S, Ac]` | Continuous action vector; present when `max_action_continuous_dim > 0` |
-| `reward` | `float32` | `[B, S]` | Transition reward |
-| `xformed_reward` | `float32` | `[B, S]` | Episodically-corrected reward (used by DQN loss when `use_xformed_reward=True`) |
-| `done` | `int64` | `[B, S]` | Episode end flag: 0=alive, 1=terminal, 2=truncated |
-| `q_star` | `float32` | `[B, S, A]` | Per-action Q* annotation; `-inf` = unavailable/invalid action |
-| `time` | `int64` | `[B, S]` | Episode step index; −1 if unavailable |
-| `obs_continuous` | `float64` | `[B, S, C]` | Continuous observation vector |
-| `obs_discrete` | `int64` | `[B, S]` | Discrete state index |
-| `obs_image` | `int64` | `[B, S, P]` | Flattened pixel values in `[0, 255]` |
+Because it is sequential, the two operations that must be fast are cheap:
 
-Optional fields are only present as keys when the source dataset contains the corresponding column — absent fields are simply not in the TensorDict rather than being zero-filled. When a struct column carries a modality for only *some* steps (e.g. a dataset mixing discrete- and continuous-action environments), the missing steps are zero-filled per row (and the discrete `action` index falls back to a `0` placeholder).
+- Append new single records quickly (while an environment is running).
+- Sample large continuous batches quickly (e.g. grab 64 steps at a time for a training batch).
 
-### Transition alignment
+Concretely:
+- `append(row)` is a plain Python list append.
+- A sequence of length `S` is the slice `dataset[start:start+S]`.
 
-Each step record at position `t` stores the **observation at step t** alongside the **action, reward, and done that arrived at step t** (i.e. the transition that *produced* `obs_t`). Consequently, the action, reward, and done for the transition *out of* `obs_t` live one step ahead at `t+1`. Both `dqn_loss` and `vec_dqn_loss` account for this offset internally.
+The entire history does not need to live in RAM. Only the active prefetch window of encoded batches is materialized while training.
+
+## Batches come from contiguous slices
+
+A training sequence of length `S` is just:
+
+```python
+rows = dataset[start : start + S]
+```
+
+`PrefetchBatchifier` repeatedly takes slices like this (workers when useful), projects pieces into tensors according to the sizes you pass it, and yields `TensorDict[B, S]` batches.
+
+### What ends up in the TensorDict
+
+You pass the target tensor sizes to `PrefetchBatchifier` (or directly to `encode_hf_rows`):
+
+```python
+bf = PrefetchBatchifier(
+    store,
+    sequence_length=64,
+    batch_size=32,
+    max_action_dim=18,
+    max_obs_continuous_dim=8,
+    # ...
+)
+```
+
+These sizes come from your model (action head size, obs feature dims, etc). The encoder looks in each row for matching data under the conventional keys and produces the tensors at those widths (padding or truncating as needed). Non-matching content in the rows is ignored for the batch tensors but kept in the dataset.
+
+The dataset contains whatever the environment wrote. The batch contains the shaped view the model asked for. No fixed contract between them.
+
+### Note on ordering (for objective authors)
+
+Because the store is strictly sequential, step `t` contains whatever your environment wrote for that step. If your collection convention is "observation at t plus the transition that produced it", then the "next" quantities live at `t+1`. Objectives that need the next-step target simply index accordingly. The store itself does not enforce or know about this convention.
 
 ---
 
 ## DatasetStore (`mouse_core.data.dataset_store`)
 
-A step buffer backed by a HuggingFace `Dataset` (Arrow format). Designed so the full dataset is **never** loaded into RAM — only the active prefetch queue and any appended rollout steps are held.
+A sequential store backed by a Hugging Face `Dataset`. The full history stays in Arrow form; only the small prefetch window of encoded batches is materialized during training.
 
-### Loading from a HuggingFace Dataset
+### Loading data (use the real `load_dataset`)
+
+`DatasetStore.from_dataset` is intentionally thin. All the power for selecting *what* to load lives in the standard Hugging Face `load_dataset`:
+
+- configs / subsets (your "bins")
+- splits
+- file patterns / globs
+- unions of splits, streaming, etc.
+
+Do your selection first, then hand the resulting `Dataset` (or a prepared slice) to the store.
 
 ```python
 from datasets import load_dataset
 from mouse_core.data.dataset_store import DatasetStore
 
-store = DatasetStore(max_action_dim=18, max_obs_continuous_dim=8)
+store = DatasetStore()
 
-# Single split
-store.from_dataset(load_dataset("your-org/your-dataset", split="train"))
+# Specific config (subset/bin) + split
+ds = load_dataset("your-org/your-dataset", "cartpole_ppo_expert", split="train")
+store.from_dataset(ds)
 
-# All splits from a DatasetDict (concatenated in order)
-store.from_dataset(load_dataset("your-org/your-dataset"))
+# Another bin
+ds2 = load_dataset("your-org/your-dataset", "lunar_random", split="train")
+store.from_dataset(ds2)
 
-# Selected splits by exact name
-store.from_dataset(load_dataset("your-org/your-dataset"), splits=["train", "test"])
-
-# Glob patterns — all splits matching "train_*" or "eval_*"
-store.from_dataset(load_dataset("your-org/your-dataset"), split_pattern=["train_*", "eval_*"])
-
-# Single pattern
-store.from_dataset(load_dataset("your-org/your-dataset"), split_pattern="test_*")
+# You can combine however you like before ingesting
+# (or keep separate stores if you prefer logical separation)
 ```
 
-Calling `from_dataset` more than once concatenates onto what is already loaded. Each call is O(1) — no data is copied.
+`from_dataset` mainly exists so the *store* can:
+- mix loaded data with later `append()` calls (the live collection buffer), and
+- participate in `PrefetchBatchifier` + our encoding to `TensorDict`.
 
-### Expected HuggingFace Dataset columns
+It does not try to replicate or wrap the rich selection features of `datasets.load_dataset`. Use the real thing.
 
-Columns follow the [mouse-env rollout contract](https://github.com/micahr234/mouse-env/blob/main/docs/guide.md). `action` and `observation` are always **dict** (struct) columns, and any sub-key name is valid. The encoder maps the modality sub-keys the model understands (`discrete` / `continuous` / `image`) onto flat tensors; every other sub-key is preserved verbatim in the stored dataset (and survives the `to_dataset` / `from_dataset` round-trip) but is not encoded into the training `TensorDict`.
+If you pass a `DatasetDict` it will concatenate the splits inside it (the store is a flat sequence). Prefer selecting exactly what you want via `load_dataset(..., config, split=...)` first.
 
-| Column | Sub-key | Mapped to |
-|---|---|---|
-| `action` | `discrete` | `action` |
-| `action` | `continuous` | `action_continuous` (present when `max_action_continuous_dim > 0`) |
-| `reward` | — | `reward` |
-| `reward_episodic` | — | `xformed_reward` (required if `use_xformed_reward=True`; omitting it raises a `KeyError`) |
-| `done` | — | `done` |
-| `time` | — | `time` (absent from TensorDict if column is not in dataset) |
-| `q_star` | — | `q_star` (absent from TensorDict if column is not in dataset or all values are None) |
-| `observation` | `continuous` | `obs_continuous` |
-| `observation` | `discrete` | `obs_discrete` |
-| `observation` | `image` | `obs_image` (native-shape array, flattened to pixels) |
+Call `from_dataset` as many times as you like; each extends the sequential history with zero-copy reference where possible.
 
-Extra mouse-env columns (`group_id`, `episode_index`, `ns_params`) are carried in the dataset for filtering/analysis but are not encoded into the training `TensorDict`.
+## Structuring your dataset repository on the Hub (configs + splits in YAML)
 
-### Appending rollout steps
+Hugging Face recommends declaring your splits and subsets (configs) explicitly in the dataset card using a YAML front-matter block. This is the generic, first-class way to organize data into "bins" and named splits without custom code.
 
-A runnable Gymnasium collection loop is in [`examples/01_collect_dataset.ipynb`](../examples/01_collect_dataset.ipynb). For online data collection, `append` stores single transitions in an in-memory list buffer:
+See the official guide: https://huggingface.co/docs/datasets/repository_structure#define-your-splits-and-subsets-in-yaml
+
+Example for a mouse-core dataset with two experiment bins (configs), each with train/eval splits:
+
+```yaml
+---
+configs:
+- config_name: cartpole_ppo_expert
+  data_files:
+  - split: train
+    path: "data/cartpole_ppo_expert/train/*.parquet"
+  - split: eval
+    path: "data/cartpole_ppo_expert/eval/*.parquet"
+- config_name: lunar_random
+  data_files:
+  - split: train
+    path: "data/lunar_random/train/*.parquet"
+---
+```
+
+You load exactly as you would with any HF dataset:
+
+```python
+from datasets import load_dataset
+
+ds = load_dataset("your-org/your-dataset", "cartpole_ppo_expert", split="train")
+store.from_dataset(ds)
+```
+
+Our `push_to_hub` / `push_stores_to_hub` (and raw `ds.push_to_hub(..., config_name=...)`) write parquet under `data/<config>/...` (or the layout produced by the HF pusher). The resulting files are compatible with the YAML `data_files` declarations above.
+
+Pushing data through our helpers **deletes the previous README** (and stale shards/infos) before the push. This ensures that `DatasetDict.push_to_hub` writes a fresh dataset card whose `dataset_info:` header (features, splits, sizes, etc.) accurately describes the data you are uploading right now. This is especially important for a brand new dataset or when the schema or split structure changes.
+
+If you also maintain a declarative `configs:` / `data_files:` block (see the HF repository structure guide), you can add or restore it after the push by editing the README on the Hub. Subsequent data pushes will again regenerate the card from the current data.
+
+You can use globs, lists, or the automatic patterns (train/ directories, *-00000-of-00003 naming, etc.). `config_name` is the "subset/bin"; split names inside follow the usual rules.
+
+This keeps mouse-core's data layer as a thin user of the standard HF repository structure.
+
+### What goes into a row (mouse-env contract)
+
+The **native row format** for a `DatasetStore` in the mouse ecosystem is the structure emitted by mouse-env rollouts, plus the action that produced each transition.
+
+Stored rows (both in-memory, in the Arrow `Dataset`, and in the Parquet you push to the Hub) contain the mouse-env contract directly:
+
+```python
+{
+    "time": int,
+    "observation": {
+        "discrete":  int | None,
+        "continuous": array | None,
+        "image":      array | None,   # native shape
+    },
+    "action": {
+        "discrete": int | None,
+        "continuous": array | None,
+    },
+    "reward": float,
+    "done": int,                 # 0=running, 1=terminated, 2=truncated
+    "group_id": str,
+    "episode_index": int,
+    "reward_episodic": float,    # shaped reward used by objectives
+    "q_star": array | None,      # optional target values (width = action dim)
+    "ns_params": dict | None,
+    # ... plus any extra columns your collection adds
+}
+```
+
+- The `action` stored at step `t` is the action you fed to produce the `result` at `t`.
+- The store and HF Dataset keep this nested struct layout exactly. The only place the nested form becomes flat tensors is inside `encode_hf_rows` / `PrefetchBatchifier` when you ask for a model batch.
+- This contract is defined as the public `MouseEnvRecord` TypedDict and the exported `*_KEY_*` constants.
+
+All examples, tests, objectives that reference `reward_episodic`, `q_star`, `group_id`, etc. are written against this layout. The conversion to training tensors is just a view; the source of truth throughout the repo is the mouse-env record.
+
+### Appending single records (the collection path)
+
+Append follows the mouse-env contract directly:
 
 ```python
 store.append({
-    "action": {"discrete": 3},
-    "reward": 1.0,
-    "reward_episodic": 0.04,
-    "done": 0,
-    "time": 42,
-    "observation": {"continuous": [0.1, 0.2, ..., 0.8]},
+    "observation": result["observation"],   # the dict with discrete/continuous/image
+    "action": action_dict,                  # the modality dict you passed to step()
+    "reward": float(result["reward"]),
+    "done": int(result["done"]),
+    "time": int(result["time"]),
+    "group_id": result.get("group_id"),
+    "episode_index": result.get("episode_index"),
+    "reward_episodic": float(result.get("reward_episodic", result["reward"])),
+    "q_star": result.get("q_star"),
+    # ns_params, or any extra per-step metadata
 })
 ```
 
-### Exporting to a HuggingFace Dataset
+Because the stored rows *are* the contract, there is no separate "front-end conversion" step for collection or I/O — only the batch encoding for training materializes the flat `TensorDict`.
+
+See `examples/01_collect_dataset.ipynb` for a full loop (action pairing, reset frame, multi-env).
+
+### Exporting to a HuggingFace Dataset (raw)
+
+You can always drop down to the plain HF object:
 
 ```python
 ds = store.to_dataset()
-ds.push_to_hub("your-org/your-rollout-dataset")
+
+# Push under a specific config/subset ("bin") and split
+ds.push_to_hub(
+    "your-org/your-rollout-dataset",
+    config_name="my_experiment",
+    split="train",
+)
 ```
+
+This is completely standard `datasets.Dataset.push_to_hub` — no wrapper. Use it when you want full control (or when you only have one store).
 
 ---
 
 ## Pushing stores to the Hub (`mouse_core.data.hub`)
 
-`push_to_hub` and `push_stores_to_hub` combine one or more `DatasetStore` objects and push them as a `DatasetDict` to the Hugging Face Hub. Stale parquet shards are wiped before each push so the result is always a clean upload — no leftover split names from previous runs.
+`push_to_hub` and `push_stores_to_hub` combine `DatasetStore`s and delegate to ordinary `DatasetDict.push_to_hub(..., config_name=...)`. 
 
-**Single split** (most common case):
+What gets written to the Hub *is* the mouse-env record rows (nested `action`/`observation` structs + scalars). There is no mouse-core-specific wrapper format — downstream users (or you) can consume the dataset with plain `datasets` or even non-Python tools.
+
+Before the push we delete previous parquet shards, `dataset_infos.json`, **and the README**. This guarantees that the dataset card written by the push has a `dataset_info:` header that matches the freshly uploaded data (critical when uploading a brand new dataset or when columns/splits/configs change).
+
+### Configs (subsets) as bins + splits
+
+Hugging Face datasets support two levels:
+
+- **config** (also called subset or configuration name) — this is a great way to organize different "bins" of data inside one repo (different runs, different envs, different policies, etc.).
+- **split** — inside a config (train / test / eval / whatever you like, as long as it matches the HF split name rules).
+
+You keep using normal split names (`train`, `eval`, `my_eval`, ...), and additionally choose a `config_name` for the bin.
+
+Loading the data later is pure HF:
 
 ```python
-from mouse_core.data.hub import push_stores_to_hub
-
-push_stores_to_hub([store], repo_id="your-org/your-dataset", split="train")
+ds = load_dataset("your-org/your-dataset", "cartpole_ppo_expert", split="train")
+store.from_dataset(ds)
 ```
 
-**Multiple splits** (e.g. train + eval):
+Pushing:
 
 ```python
-from mouse_core.data.hub import push_to_hub
+from mouse_core.data.hub import push_stores_to_hub, push_to_hub
 
-push_to_hub(
-    {"train": [train_store1, train_store2], "eval": [eval_store]},
+# One bin, one split (very common)
+push_stores_to_hub(
+    [store],
     repo_id="your-org/your-dataset",
+    split="train",
+    config_name="cartpole_ppo_expert",
+)
+
+# Multiple splits inside one bin
+push_to_hub(
+    {"train": [train_store], "eval": [eval_store]},
+    repo_id="your-org/your-dataset",
+    config_name="lunar_v2_random",
 )
 ```
 
-Columns that are absent from one split but present in another are filled with typed placeholders so the `DatasetDict` schema is consistent across splits.
+When you later call the raw `to_dataset().push_to_hub(...)` you can also pass `config_name` directly to the HF method.
 
-Pass `private=True`/`private=False` to control repository visibility. It is applied on every push, so re-pushing an existing repo with a different value updates its visibility (not only at creation time).
+Split names must still satisfy HF's `^\w+(\.\w+)*$` rule (we forward the error). Config names have similar restrictions.
+
+Columns that differ across the things you push in one call are aligned with placeholders (same as before).
+
+`private=...` is applied on every push.
 
 ---
 
 ## PrefetchBatchifier (`mouse_core.data.batch`)
 
-Background-thread batchifier. Worker threads continuously fetch sequences, encode them via `DatasetStore.encode_hf_rows`, and park them in a bounded queue. `next_batch()` pops from the queue — instant once the queue is warm.
+Its only job is to keep pulling contiguous slices out of the sequential store, encode the parts you care about, and hand you ready `TensorDict[B, S]` batches as fast as possible.
 
-The full dataset is never held in memory; only `prefetch × batch_size × sequence_length` encoded steps exist at any time.
+Background threads (when enabled) do the slice + encode work so that `next_batch()` is usually immediate. Only a small number of pre-encoded batches are held in memory.
 
 ```python
 from mouse_core.data.batch import PrefetchBatchifier
@@ -146,10 +301,12 @@ bf = PrefetchBatchifier(
     store,
     sequence_length=64,
     batch_size=32,
-    sampling="random",   # "random" | "last" | "sequential" | "batch"
+    sampling="random",
     prefetch=4,
     num_workers=2,
-    pin_memory=True,     # enable for CUDA training
+    pin_memory=True,
+    max_action_dim=18,            # sizes come from the model you will train
+    max_obs_continuous_dim=8,
 )
 step_stream = bf.next_batch()   # TensorDict[32, 64]
 bf.close()

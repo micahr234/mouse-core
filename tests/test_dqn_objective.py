@@ -1,14 +1,14 @@
-"""Tests for DQN loss on synthetic tensors."""
+"""Tests for DQN objective on synthetic tensors."""
 
 from __future__ import annotations
 
 import torch
 from tensordict import TensorDict
 
-from mouse_core.losses import DqnLossConfig, dqn_loss
+from mouse_core.objectives import DqnObjectiveConfig, dqn_objective
 
 
-def test_dqn_loss_runs() -> None:
+def test_dqn_objective_runs() -> None:
     b, s, a = 2, 4, 3
     step_stream = TensorDict(
         {
@@ -25,14 +25,14 @@ def test_dqn_loss_runs() -> None:
         },
         batch_size=(b, s),
     )
-    cfg = DqnLossConfig(weight=1.0, gamma=0.99)
-    loss, metrics = dqn_loss(step_stream, out, cfg)
+    cfg = DqnObjectiveConfig(weight=1.0, gamma=0.99)
+    loss, metrics = dqn_objective(step_stream, out, cfg)
     assert loss.ndim == 0
-    assert "dqn_loss" in metrics
-    assert metrics["dqn_loss"] >= 0.0
+    assert "dqn" in metrics
+    assert metrics["dqn"] >= 0.0
 
 
-def test_dqn_loss_requires_min_sequence() -> None:
+def test_dqn_objective_requires_min_sequence() -> None:
     step_stream = TensorDict(
         {
             "action": torch.zeros(1, 1, dtype=torch.long),
@@ -46,7 +46,7 @@ def test_dqn_loss_requires_min_sequence() -> None:
         batch_size=(1, 1),
     )
     try:
-        dqn_loss(step_stream, out, DqnLossConfig(weight=1.0))
+        dqn_objective(step_stream, out, DqnObjectiveConfig(weight=1.0))
     except ValueError as e:
         assert "Not enough" in str(e)
     else:

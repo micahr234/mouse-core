@@ -1,4 +1,4 @@
-"""Supervised policy loss over action predictions at PREDICTION positions."""
+"""Supervised policy objective over action predictions at PREDICTION positions."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import math
 from dataclasses import dataclass
 from typing import Literal
 
-from mouse_core.losses.base import LossConfig
+from mouse_core.objectives.base import ObjectiveConfig
 
 import torch
 import torch.nn.functional as F
@@ -14,16 +14,16 @@ from tensordict import TensorDict
 
 
 @dataclass(frozen=True)
-class SpLossConfig(LossConfig):
-    """Supervised action loss at PREDICTION (see ``sp_loss``)."""
+class SpObjectiveConfig(ObjectiveConfig):
+    """Supervised action objective at PREDICTION (see ``sp_objective``)."""
 
-    weight: float = 0.0  # omit ``loop.sp.weight`` or set 0 = do not compute SP loss (YAML default)
+    weight: float = 0.0  # omit ``loop.sp.weight`` or set 0 = do not compute SP objective (YAML default)
     label_smoothing: float = 0.0
     loss_type: Literal["ce", "ce-soft-fwd", "ce-soft-bwd", "js", "kl-fwd", "kl-bwd"] = "ce"
     temperature: float = 1.0  # used when ``loss_type != "ce"`` (must be > 0)
 
 
-def sp_js_loss(
+def sp_js(
     q_targets: torch.Tensor,
     logits: torch.Tensor,
     temperature: float,
@@ -42,7 +42,7 @@ def sp_js_loss(
     """
     temp = float(temperature)
     if temp <= 0.0:
-        raise ValueError(f"sp_js_loss temperature must be > 0, got {temp}.")
+        raise ValueError(f"sp_js temperature must be > 0, got {temp}.")
     log_teacher = F.log_softmax(q_targets / temp, dim=-1)
     log_student = F.log_softmax(logits, dim=-1)
     if label_smoothing > 0.0:
@@ -64,7 +64,7 @@ def sp_js_loss(
     return js.mean()
 
 
-def sp_kl_loss(
+def sp_kl(
     q_targets: torch.Tensor,
     logits: torch.Tensor,
     temperature: float,
@@ -83,9 +83,9 @@ def sp_kl_loss(
     """
     temp = float(temperature)
     if temp <= 0.0:
-        raise ValueError(f"sp_kl_loss temperature must be > 0, got {temp}.")
+        raise ValueError(f"sp_kl temperature must be > 0, got {temp}.")
     if direction not in ("fwd", "bwd"):
-        raise ValueError(f"sp_kl_loss direction must be 'fwd' or 'bwd', got {direction!r}.")
+        raise ValueError(f"sp_kl direction must be 'fwd' or 'bwd', got {direction!r}.")
     log_teacher = F.log_softmax(q_targets / temp, dim=-1)
     log_student = F.log_softmax(logits, dim=-1)
     if label_smoothing > 0.0:
@@ -105,7 +105,7 @@ def sp_kl_loss(
     return kl.mean()
 
 
-def sp_soft_ce_loss(
+def sp_soft_ce(
     q_targets: torch.Tensor,
     logits: torch.Tensor,
     temperature: float,
@@ -122,9 +122,9 @@ def sp_soft_ce_loss(
     """
     temp = float(temperature)
     if temp <= 0.0:
-        raise ValueError(f"sp_soft_ce_loss temperature must be > 0, got {temp}.")
+        raise ValueError(f"sp_soft_ce temperature must be > 0, got {temp}.")
     if direction not in ("fwd", "bwd"):
-        raise ValueError(f"sp_soft_ce_loss direction must be 'fwd' or 'bwd', got {direction!r}.")
+        raise ValueError(f"sp_soft_ce direction must be 'fwd' or 'bwd', got {direction!r}.")
     log_teacher = F.log_softmax(q_targets / temp, dim=-1)
     if label_smoothing > 0.0:
         num_actions = q_targets.shape[-1]
@@ -139,17 +139,17 @@ def sp_soft_ce_loss(
     return per_row.mean()
 
 
-def sp_loss(
+def sp_objective(
     step_stream: TensorDict,
     logits: torch.Tensor,
-    cfg: SpLossConfig,
+    cfg: SpObjectiveConfig,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    """Supervised policy loss over all ``[B, S]`` step positions.
+    """Supervised policy objective over all ``[B, S]`` step positions.
 
     Args:
         step_stream: TensorDict of shape ``[B, S]`` containing ``q_star`` targets.
         logits: ``[B, S, A]`` action logits.
-        cfg: SP loss configuration (loss_type, temperature, label_smoothing).
+        cfg: SP objective configuration (loss_type, temperature, label_smoothing).
     Returns:
         Scalar loss and scalar metrics for logging (e.g. W&B).
     """
@@ -160,16 +160,16 @@ def sp_loss(
     q_targets = step_stream["q_star"].reshape(-1, A).to(dtype=logits.dtype)
 
     if q_targets.shape[0] == 0:
-        raise ValueError("sp_loss: batch is empty (no tokens).")
+        raise ValueError("sp_objective: batch is empty (no tokens).")
 
     if not torch.isfinite(q_targets).all():
-        raise ValueError("sp_loss: q_star contains non-finite values (NaN or inf).")
+        raise ValueError("sp_objective: q_star contains non-finite values (NaN or inf).")
 
     if cfg.loss_type == "ce":
         target_actions = q_targets.argmax(dim=-1).to(dtype=torch.long)
         loss = F.cross_entropy(logits, target_actions, label_smoothing=cfg.label_smoothing)
     elif cfg.loss_type == "ce-soft-fwd":
-        loss = sp_soft_ce_loss(
+        loss = sp_soft_ce(
             q_targets=q_targets,
             logits=logits,
             temperature=temp,
@@ -177,7 +177,7 @@ def sp_loss(
             direction="fwd",
         )
     elif cfg.loss_type == "ce-soft-bwd":
-        loss = sp_soft_ce_loss(
+        loss = sp_soft_ce(
             q_targets=q_targets,
             logits=logits,
             temperature=temp,
@@ -185,14 +185,14 @@ def sp_loss(
             direction="bwd",
         )
     elif cfg.loss_type == "js":
-        loss = sp_js_loss(
+        loss = sp_js(
             q_targets=q_targets,
             logits=logits,
             temperature=temp,
             label_smoothing=cfg.label_smoothing,
         )
     elif cfg.loss_type == "kl-fwd":
-        loss = sp_kl_loss(
+        loss = sp_kl(
             q_targets=q_targets,
             logits=logits,
             temperature=temp,
@@ -200,7 +200,7 @@ def sp_loss(
             direction="fwd",
         )
     elif cfg.loss_type == "kl-bwd":
-        loss = sp_kl_loss(
+        loss = sp_kl(
             q_targets=q_targets,
             logits=logits,
             temperature=temp,
@@ -209,10 +209,10 @@ def sp_loss(
         )
     else:
         raise ValueError(
-            f"Invalid SP loss loss_type: {cfg.loss_type!r} "
+            f"Invalid SP objective loss_type: {cfg.loss_type!r} "
             "(expected 'ce', 'ce-soft-fwd', 'ce-soft-bwd', 'js', 'kl-fwd', or 'kl-bwd')."
         )
 
-    metrics: dict[str, float] = {"sp_loss": float(loss.detach().item())}
+    metrics: dict[str, float] = {"sp": float(loss.detach().item())}
 
     return loss, metrics

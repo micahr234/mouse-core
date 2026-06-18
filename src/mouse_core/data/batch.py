@@ -1,32 +1,29 @@
 """PrefetchBatchifier — background-thread batch prefetching from a DatasetStore.
 
-``num_workers`` daemon threads continuously fetch batches from the Arrow-backed
-Dataset, encode them, and park them in a bounded queue.  ``next_batch()`` pops
-from that queue — instant once the queue is warm.
+A ``DatasetStore`` holds a flat sequential stream of steps (conventionally
+``MouseEnvRecord`` rows: mouse-env results + the paired action).
 
-When ``num_workers=0`` the class operates in **synchronous mode**: no threads
-or queue are created, and ``next_batch()`` fetches directly on the calling
-thread.  This is useful for debugging (no background threads competing for the
-debugger) and for environments where threading is undesirable.
+Training sequences are therefore just contiguous slices of that sequence.
+``PrefetchBatchifier`` repeatedly takes slices, encodes the mouse-env contract
+fields (via ``encode_hf_rows``) into the flat tensors the model pipeline needs,
+and yields ready ``TensorDict[B, S]`` batches.
 
-The full dataset is never materialised in RAM; only
-``prefetch × batch_size × sequence_length`` steps are held at any time.
-
-Concurrency
------------
-Arrow reads and NumPy operations both release the GIL, so ``threading`` gives
-genuine parallelism for data-loading work.  Multiple workers help for
-``random``/``last`` sampling.  ``sequential``/``batch`` are always single-worker
-to preserve epoch order.
+Workers (when enabled) do the slice+encode work in the background so
+``next_batch()`` is usually immediate.
 
 Usage
 -----
 ::
-    store = DatasetStore(...)
-    store.from_dataset(ds)
+    store = DatasetStore()
+    store.from_dataset(ds)   # ds from load_dataset (config, split, ...)
 
-    bf = PrefetchBatchifier(store, sequence_length=64, batch_size=8)
-    td = bf.next_batch()   # TensorDict[B, S], instant once warm
+    bf = PrefetchBatchifier(
+        store,
+        sequence_length=64,
+        batch_size=8,
+        max_action_dim=...,   # model sizes
+    )
+    td = bf.next_batch()   # TensorDict[B, S]
     bf.close()
 """
 
@@ -44,31 +41,34 @@ if TYPE_CHECKING:
 
 
 class PrefetchBatchifier:
-    """Background-thread batchifier for a ``DatasetStore`` source.
+    """Background batch prefetcher over a sequential ``DatasetStore``.
+
+    Because storage is sequential, every training sequence is a contiguous
+    slice of the store.  This class just keeps a few such encoded slices ready.
 
     Parameters
     ----------
     store :
-        ``DatasetStore`` with ``from_dataset`` already called.
+        ``DatasetStore`` after you have called ``from_dataset``. Rows are
+        expected to follow the mouse-env contract (see ``MouseEnvRecord``).
     sequence_length :
-        Number of consecutive steps per sequence.
+        Length of each contiguous slice (in steps).
     batch_size :
-        Number of sequences per batch.
+        How many such slices per batch.
     sampling :
-        How start indices are chosen; see ``_sample_starts``.
+        Policy for choosing the starting positions of the slices.
     prefetch : int
-        Pre-encoded batches to keep ready.  Higher values smooth over slow
-        Arrow reads; each batch costs ``batch_size × sequence_length`` encoded
-        steps in memory.
+        How many batches to keep pre-encoded.
     num_workers : int
-        Background threads.  ``sequential``/``batch`` modes ignore this and
-        always use one worker to preserve epoch order.  Pass ``0`` to skip
-        threading entirely and fetch synchronously on the calling thread.
+        Background workers (0 = synchronous).
     pin_memory : bool
-        If True, workers call ``.pin_memory()`` on each batch before queuing
-        it.  Pinned CPU tensors enable DMA-backed, non-blocking H2D copies on
-        the main thread.  Only effective when the training device is CUDA.
-        Ignored in synchronous mode (``num_workers=0``).
+        Pin the CPU tensors (CUDA only).
+    max_action_dim :
+        Width for discrete action index and q_star (model side).
+    max_action_continuous_dim :
+        Continuous action vector size for batches (0 disables).
+    max_obs_continuous_dim, max_obs_discrete_dim, max_obs_image_pixels :
+        Observation feature sizes for the projected batch tensors.
     """
 
     def __init__(
@@ -80,13 +80,26 @@ class PrefetchBatchifier:
         prefetch: int = 4,
         num_workers: int = 1,
         pin_memory: bool = False,
+        *,
+        max_action_dim: int = 1000,
+        max_action_continuous_dim: int = 0,
+        max_obs_continuous_dim: int = 0,
+        max_obs_discrete_dim: int = 0,
+        max_obs_image_pixels: int = 0,
     ) -> None:
         from mouse_core.data.dataset_store import DatasetStore as _DS
 
+        # Set teardown attrs early so __del__/close are safe even if later validation fails
+        self._stop = None
+        self._result_queue = None
+        self._workers = []
+        self._sync_rng = None
+        self._worker_error = None
+
         if not isinstance(store, _DS) or store._source is None:
             raise TypeError(
-                "PrefetchBatchifier requires a DatasetStore with a loaded source dataset. "
-                "Call store.from_dataset(ds) first."
+                "PrefetchBatchifier requires a DatasetStore that has data loaded via from_dataset(). "
+                "After pure append, do store.from_dataset(store.to_dataset()) first, or load via from_dataset."
             )
         if sampling not in ("batch", "random", "sequential", "last"):
             raise ValueError(f"sampling must be one of batch/random/sequential/last, got {sampling!r}")
@@ -98,6 +111,13 @@ class PrefetchBatchifier:
 
         self._dataset = store._source
         self._n = len(self._dataset)
+
+        # Target shapes for encode (owned here, not by the store).
+        self._max_action_dim = int(max_action_dim)
+        self._max_action_continuous_dim = int(max_action_continuous_dim)
+        self._max_obs_continuous_dim = int(max_obs_continuous_dim)
+        self._max_obs_discrete_dim = int(max_obs_discrete_dim)
+        self._max_obs_image_pixels = int(max_obs_image_pixels)
 
         # Epoch-order state for sequential / batch / synchronous modes.
         self._lock = threading.Lock()
@@ -233,7 +253,14 @@ class PrefetchBatchifier:
         S = self.sequence_length
         seqs = [self._dataset[int(s) : int(s) + S] for s in starts]
         merged = {k: [v for seq in seqs for v in seq[k]] for k in seqs[0]}
-        td = self.store.encode_hf_rows(merged).reshape(len(starts), S)
+        td = self.store.encode_hf_rows(
+            merged,
+            max_action_dim=self._max_action_dim,
+            max_action_continuous_dim=self._max_action_continuous_dim,
+            max_obs_continuous_dim=self._max_obs_continuous_dim,
+            max_obs_discrete_dim=self._max_obs_discrete_dim,
+            max_obs_image_pixels=self._max_obs_image_pixels,
+        ).reshape(len(starts), S)
         if self._pin_memory:
             td = td.pin_memory()
         return td

@@ -72,7 +72,7 @@ packages = [
     "mouse_core.models.embedding",
     "mouse_core.models.heads",
     "mouse_core.data",
-    "mouse_core.losses",
+    "mouse_core.objectives",
 ]
 
 [tool.setuptools.package-dir]

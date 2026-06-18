@@ -1,20 +1,20 @@
-"""One-step two-head DQN TD loss."""
+"""One-step two-head DQN TD objective."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
 import torch
-from mouse_core.losses.base import LossConfig
+from mouse_core.objectives.base import ObjectiveConfig
 import torch.nn.functional as F
 from tensordict import TensorDict
 
 
 @dataclass(frozen=True)
-class DqnLossConfig(LossConfig):
-    """Symmetric two-head one-step TD at PREDICTION (see ``dqn_loss``)."""
+class DqnObjectiveConfig(ObjectiveConfig):
+    """Symmetric two-head one-step TD at PREDICTION (see ``dqn_objective``)."""
 
-    weight: float = 0.0  # omit ``loop.dqn.weight`` or set 0 = do not compute DQN loss (YAML default)
+    weight: float = 0.0  # omit ``loop.dqn.weight`` or set 0 = do not compute DQN objective (YAML default)
     gamma: float = 0.99
     gamma_terminal: float = 0.0  # discount on max Q(s') when episode terminates naturally
     gamma_truncated: float = 0.0  # discount on max Q(s') when episode is truncated (time limit)
@@ -30,10 +30,10 @@ class DqnLossConfig(LossConfig):
     reward_shift: float = 0.0  # additive offset applied after scaling in TD target
 
 
-def dqn_loss(
+def dqn_objective(
     step_stream: TensorDict,
     out: TensorDict,
-    cfg: DqnLossConfig,
+    cfg: DqnObjectiveConfig,
 ) -> tuple[torch.Tensor, dict[str, float]]:
 
     q: torch.Tensor = out["dqn"]
@@ -109,7 +109,7 @@ def dqn_loss(
         "q_values_min":  q_det.min(),
         "q_values_max":  q_det.max(),
         "q_values_target": td_target.detach().mean(),
-        "dqn_loss":      loss.detach(),
+        "dqn":           loss.detach(),
     }
     if cql_penalty_mean is not None:
         named["cql_penalty"] = cql_penalty_mean

@@ -1,4 +1,4 @@
-"""One-step two-head vector DQN cosine-similarity loss."""
+"""One-step two-head vector DQN cosine-similarity objective."""
 
 from __future__ import annotations
 
@@ -9,13 +9,13 @@ import torch
 import torch.nn.functional as F
 from tensordict import TensorDict
 
-from mouse_core.losses.base import LossConfig
+from mouse_core.objectives.base import ObjectiveConfig
 from mouse_core.models.heads.vec_dqn import rope_rotate, vec_dqn_scores
 
 
 @dataclass(frozen=True)
-class VecDqnLossConfig(LossConfig):
-    """Vector-DQN cosine-similarity loss at PREDICTION (see ``vec_dqn_loss``)."""
+class VecDqnObjectiveConfig(ObjectiveConfig):
+    """Vector-DQN cosine-similarity objective at PREDICTION (see ``vec_dqn_objective``)."""
 
     weight: float = 0.0  # omit ``loop.vec_dqn.weight`` or set 0 = do not compute (YAML default)
     tau: float = 0.01  # Polyak toward target head; θ_target ← τ·θ_online + (1−τ)·θ_target
@@ -28,11 +28,11 @@ class VecDqnLossConfig(LossConfig):
     use_xformed_reward: bool = False  # use xformed_reward instead of reward as the rotation signal
 
 
-def vec_dqn_loss(
+def vec_dqn_objective(
     step_stream: TensorDict,
     online_vecs: torch.Tensor,
     target_vecs: torch.Tensor,
-    cfg: VecDqnLossConfig,
+    cfg: VecDqnObjectiveConfig,
 ) -> tuple[torch.Tensor, dict[str, float]]:
 
     B, S, A, D = online_vecs.shape
@@ -83,13 +83,13 @@ def vec_dqn_loss(
     theta = next_rewards * cfg.reward_scale + cfg.reward_shift                     # [B, S-1]
     rotated = rope_rotate(x=next_action_vecs, theta=theta)                         # [B, S-1, D]
 
-    # Cosine similarity loss — detach target mirrors td_target.detach() in dqn_loss
+    # Cosine similarity objective — detach target mirrors td_target.detach() in dqn_objective
     cosine_sim = F.cosine_similarity(curr_action_vecs, rotated.detach(), dim=-1)  # [B, S-1]
     loss = (1.0 - cosine_sim).mean()
 
     abs_scores = vec_dqn_scores(online_vecs[:, -1].float()).abs() / (math.pi)  # [B, A]
     named: dict[str, torch.Tensor] = {
-        "vec_dqn_loss": loss.detach(),
+        "vec_dqn": loss.detach(),
         "vec_dqn_score_abs_min": abs_scores.min().detach(),
         "vec_dqn_score_abs_max": abs_scores.max().detach(),
         "vec_dqn_score_abs_mean": abs_scores.mean().detach(),
