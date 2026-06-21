@@ -188,12 +188,21 @@ class ObsContinuousEmbedder(nn.Module):
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
         """Args:
-            obs: ``[*batch, max_num_obs]`` float32 observations.
+            obs: ``[*batch, d]`` float32 observations, ``d`` may be <= ``max_num_obs``.
+                 Extra capacity is zero-padded internally.
         Returns:
             ``[*batch, T*D]`` content embedding.
         """
-        positions = torch.arange(self.max_num_obs, device=obs.device).expand_as(obs)
-        return self.rff(obs.float(), positions).sum(dim=-2)
+        obs = obs.float()
+        d = obs.shape[-1]
+        m = self.max_num_obs
+        if d >= m:
+            obs_use = obs[..., :m]
+        else:
+            pad = torch.zeros((*obs.shape[:-1], m - d), device=obs.device, dtype=obs.dtype)
+            obs_use = torch.cat([obs, pad], dim=-1)
+        positions = torch.arange(m, device=obs.device).expand_as(obs_use)
+        return self.rff(obs_use, positions).sum(dim=-2)
 
 
 class ObsContinuousLinearEmbedder(nn.Module):
@@ -237,12 +246,21 @@ class ObsContinuousLinearEmbedder(nn.Module):
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
         """Args:
-            obs: ``[*batch, max_num_obs]`` float32 observations.
+            obs: ``[*batch, d]`` float32 observations, ``d`` may be <= ``max_num_obs``.
+                 Extra capacity is zero-padded internally.
         Returns:
             ``[*batch, T*D]`` content embedding.
         """
-        positions = torch.arange(self.max_num_obs, device=obs.device).expand_as(obs)
-        return self.projs(obs.float().unsqueeze(-1), positions).sum(dim=-2)
+        obs = obs.float()
+        d = obs.shape[-1]
+        m = self.max_num_obs
+        if d >= m:
+            obs_use = obs[..., :m]
+        else:
+            pad = torch.zeros((*obs.shape[:-1], m - d), device=obs.device, dtype=obs.dtype)
+            obs_use = torch.cat([obs, pad], dim=-1)
+        positions = torch.arange(m, device=obs.device).expand_as(obs_use)
+        return self.projs(obs_use.unsqueeze(-1), positions).sum(dim=-2)
 
 
 class ObsDiscreteEmbedder(nn.Module):
@@ -308,12 +326,21 @@ class ObsImageEmbedder(nn.Module):
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
         """Args:
-            obs: ``[*batch, max_num_obs]`` int64/float pixel values.
+            obs: ``[*batch, d]`` int64/float pixel values, ``d`` may be <= ``max_num_obs``.
+                 Extra capacity is zero-padded internally.
         Returns:
             ``[*batch, T*D]`` content embedding.
         """
-        positions = torch.arange(self.max_num_obs, device=obs.device).expand_as(obs)
-        normalized = self.norm(obs.float()).unsqueeze(-1)            # [*batch, max_num_obs, 1]
+        obs = obs.float()
+        d = obs.shape[-1]
+        m = self.max_num_obs
+        if d >= m:
+            obs_use = obs[..., :m]
+        else:
+            pad = torch.zeros((*obs.shape[:-1], m - d), device=obs.device, dtype=obs.dtype)
+            obs_use = torch.cat([obs, pad], dim=-1)
+        positions = torch.arange(m, device=obs.device).expand_as(obs_use)
+        normalized = self.norm(obs_use).unsqueeze(-1)            # [*batch, m, 1]
         return self.projs(normalized, positions).sum(dim=-2)
 
 
@@ -532,13 +559,48 @@ class StepEmbedder(nn.Module):
         T, D = self.token_data_len, self.hidden_dim
 
         # Fetch each active modality from the step stream.
-        action   = step_stream["action"]          if self.include_action_token   else None
-        reward   = step_stream["reward"]          if self.include_reward_token   else None
-        done     = step_stream["done"]            if self.include_done_token     else None
-        time_idx = step_stream["time"]            if self.include_time_token     else None
-        obs_cont = step_stream["obs_continuous"]  if self.include_obs_continuous else None
-        obs_disc = step_stream["obs_discrete"]    if self.include_obs_discrete   else None
-        obs_img  = step_stream["obs_image"]       if self.include_obs_image      else None
+        # For included modalities, synthesize a canonical "absent" value (full-size
+        # zero vector for vectors; 0 or -1 for scalars) when the key is missing from
+        # this particular batch. This makes the loader's data-driven emission robust
+        # even if a window contains none of a modality.
+        action   = step_stream["action"] if self.include_action_token else None
+        reward   = step_stream["reward"] if self.include_reward_token else None
+        done     = step_stream["done"]   if self.include_done_token else None
+        time_idx = step_stream["time"]   if self.include_time_token else None
+
+        obs_cont = None
+        if self.include_obs_continuous:
+            if "obs_continuous" in step_stream.keys():
+                obs_cont = step_stream["obs_continuous"]
+            else:
+                m = int(self.obs_continuous_embedder.max_num_obs)  # type: ignore[union-attr]
+                obs_cont = torch.zeros(B, S, m, device=device, dtype=torch.get_default_dtype())
+
+        obs_disc = None
+        if self.include_obs_discrete:
+            if "obs_discrete" in step_stream.keys():
+                obs_disc = step_stream["obs_discrete"]
+            else:
+                obs_disc = torch.zeros(B, S, device=device, dtype=torch.long)
+
+        obs_img = None
+        if self.include_obs_image:
+            if "obs_image" in step_stream.keys():
+                obs_img = step_stream["obs_image"]
+            else:
+                m = int(self.obs_image_embedder.max_num_obs)  # type: ignore[union-attr]
+                obs_img = torch.zeros(B, S, m, device=device, dtype=torch.get_default_dtype())
+
+        # For time, use the "absent" marker when include but key missing.
+        if self.include_time_token and time_idx is None:
+            time_idx = torch.full((B, S), -1, device=device, dtype=torch.long)
+
+        if self.include_reward_token and reward is None:
+            reward = torch.zeros(B, S, device=device, dtype=torch.get_default_dtype())
+        if self.include_done_token and done is None:
+            done = torch.zeros(B, S, device=device, dtype=torch.long)
+        if self.include_action_token and action is None:
+            action = torch.zeros(B, S, device=device, dtype=torch.long)
 
         dtype = torch.get_default_dtype()
 

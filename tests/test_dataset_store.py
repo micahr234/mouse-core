@@ -35,7 +35,7 @@ def test_encode_single_row() -> None:
         "done": 1,
         "time": 4,
     })
-    td = store.__getitem__(0, max_action_dim=4, max_obs_discrete_dim=1)
+    td = store.__getitem__(0)
     assert td["action"].item() == 2
     assert td["reward"].item() == -1.0
     assert td["done"].item() == 1
@@ -54,7 +54,7 @@ def test_encode_optional_fields() -> None:
         "time": 0,
         "q_star": [1.0, 2.0, 3.0, 4.0],
     })
-    td = store.__getitem__(0, max_action_dim=4, max_obs_continuous_dim=2)
+    td = store.__getitem__(0)
     assert td["xformed_reward"].item() == 0.25
     assert td["obs_continuous"].shape[-1] == 2
     assert td["q_star"].shape[-1] == 4
@@ -80,7 +80,7 @@ def test_dataset_roundtrip() -> None:
 
     reloaded = DatasetStore()
     reloaded.from_dataset(ds)
-    td = reloaded.__getitem__([0, 1, 2], max_action_dim=4, max_obs_continuous_dim=2)
+    td = reloaded.__getitem__([0, 1, 2])
     assert td["action"].tolist() == [0, 1, 0]
     assert td["obs_continuous"].shape == (3, 2)
     assert abs(td["xformed_reward"][2].item() - 0.2) < 1e-6
@@ -95,7 +95,7 @@ def test_encode_continuous_action() -> None:
         "done": 0,
         "time": 0,
     })
-    td = store.__getitem__(0, max_action_dim=4, max_action_continuous_dim=2, max_obs_continuous_dim=3)
+    td = store.__getitem__(0)
     assert td["action_continuous"].shape[-1] == 2
     assert td["action_continuous"][0].tolist() == pytest.approx([0.5, -0.5])
     # Discrete action index is still emitted (0 placeholder for continuous-only rows).
@@ -121,13 +121,7 @@ def test_encode_mixed_modalities() -> None:
         "reward": 0.0, "done": 1, "time": 2,
     })
 
-    td = store.__getitem__([0, 1, 2],
-        max_action_dim=6,
-        max_action_continuous_dim=1,
-        max_obs_continuous_dim=4,
-        max_obs_discrete_dim=1,
-        max_obs_image_pixels=4,
-    )
+    td = store.__getitem__([0, 1, 2])
     assert td["action"].tolist() == [3, 0, 5]
     assert td["action_continuous"].shape == (3, 1)
     assert td["action_continuous"][:, 0].tolist() == pytest.approx([0.0, 0.9, 0.0])

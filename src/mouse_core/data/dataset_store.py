@@ -1,32 +1,25 @@
-"""DatasetStore — ordered sequence of step records backed by Hugging Face Dataset.
+"""DatasetStore — ordered sequence of arbitrary step records backed by a Hugging Face Dataset.
 
-A thin sequential container. Rows are stored in insertion order. The
-recommended row layout is ``MouseEnvRecord`` (the structure produced by
-mouse-env rollouts plus the paired action that produced each step). The store
-itself accepts any row shape; only the encoder and downstream pipeline
-conventionally interpret the mouse-env contract fields.
+A thin sequential container. It stores rows (plain dicts) in the order they
+were appended or loaded. There is no required schema or "contract" — a row can
+contain whatever fields your data source or collection produces.
 
-Two operations are fast by design:
+Two operations are fast:
 
-- ``append(one_row)`` — cheap for live collection from an environment
-- contiguous slices — for large training sequences of length S
+- ``append(one_row)`` for cheap live collection
+- contiguous slices for training sequences
 
-Loading and selection use the real Hugging Face loader (including YAML-defined
-configs/subsets and splits per the repository structure guide). You call
-``load_dataset(repo, config_name, split=...)`` (or any of its rich selection
-features), then pass the result to ``from_dataset``.
+You select and load data with the real ``datasets.load_dataset`` (configs,
+splits, globs, etc.) and hand the resulting Dataset to ``from_dataset``.
 
-The store only adds the ability to mix loaded history with new appends and to
-produce model-ready ``TensorDict`` batches via ``PrefetchBatchifier`` (or
-``encode_hf_rows``).
-
-All other operations (push, versioning, splitting, filtering) are ordinary
-Hugging Face ``Dataset`` / ``DatasetDict`` calls.
+The store's main added value is mixing loaded history with new appends and
+feeding slices to ``DataLoader`` (or ``encode_hf_rows``) so they can be turned
+into model batches. All other I/O is standard Hugging Face Dataset / DatasetDict.
 """
 
 from __future__ import annotations
 
-from typing import Any, TypedDict
+from typing import Any
 
 import numpy as np
 import torch
@@ -37,44 +30,15 @@ from datasets import Dataset, concatenate_datasets
 
 datasets.disable_progress_bar()
 
-# Modality sub-keys used by the encoder when present in struct columns.
-# Any sub-key name is valid in source data; only these are interpreted.
+# Modality sub-keys used by the current default encoder when present in
+# nested "observation" / "action" columns. Any sub-key name is valid in
+# source data; only these names are interpreted by encode_hf_rows.
 ACTION_KEY_DISCRETE = "discrete"
 ACTION_KEY_CONTINUOUS = "continuous"
 
 OBS_KEY_DISCRETE = "discrete"
 OBS_KEY_CONTINUOUS = "continuous"
 OBS_KEY_IMAGE = "image"
-
-
-class MouseEnvRecord(TypedDict, total=False):
-    """Canonical step record produced by mouse-env (plus the paired action).
-
-    This layout is the native / recommended format for rows stored in a
-    ``DatasetStore`` when working with the mouse ecosystem.
-
-    - ``observation`` and ``action`` are dicts containing modality sub-keys
-      (``discrete``, ``continuous``, ``image`` as applicable).
-    - Top-level scalars and metadata come directly from mouse-env's
-      ``RolloutResult`` (``reward``, ``done``, ``time``, ``group_id``,
-      ``episode_index``, ``reward_episodic``, ``q_star``, ``ns_params``).
-    - The ``action`` at a row is the one that produced the observation/reward/done
-      for that step.
-
-    The store itself is schema-agnostic and will hold anything, but the
-    batch encoder, collection examples, documentation, and objectives all
-    assume (and document) this contract.
-    """
-    time: int
-    observation: dict[str, Any]
-    action: dict[str, Any]
-    reward: float
-    done: int
-    group_id: str
-    episode_index: int
-    reward_episodic: float
-    q_star: Any | None
-    ns_params: dict[str, Any] | None
 
 
 def _rows_to_hf_dict(rows: list[dict]) -> dict[str, list]:
@@ -118,18 +82,14 @@ def _interleave_tds(
 
 
 class DatasetStore:
-    """Ordered sequence of step records, backed by a Hugging Face Dataset.
+    """Ordered sequence of arbitrary rows, backed by a Hugging Face Dataset.
 
-    Rows are typically ``MouseEnvRecord`` instances (mouse-env contract +
-    paired action). The store is intentionally schema-agnostic and will
-    preserve any extra columns or structures you add.
+    The store does not care what is inside the rows. Each row is just a dict
+    you give it. It only provides fast append and fast contiguous slicing.
 
-    Optimized paths:
-    - ``append`` for fast single-record collection
-    - contiguous slices for fast contiguous training sequences
-
-    Dimension parameters for encoding live in ``PrefetchBatchifier`` /
-    ``encode_hf_rows`` (model/batch concerns), not the store.
+    Field extraction and tensorization happen in ``DataLoader`` / ``encode_hf_rows``;
+    the resulting shapes come from the data (with per-slice max for vectors).
+    Model embedders are sized for the capacities they need and adapt on input.
     """
 
     def __init__(self) -> None:
@@ -161,8 +121,8 @@ class DatasetStore:
     def __getitem__(self, indices: Any, **encode_kwargs) -> TensorDict:
         """Return encoded step records for the given indices as a TensorDict[N].
 
-        Pass encode kwargs (max_action_dim etc.) to control the projection
-        shapes. Most training code goes through PrefetchBatchifier instead.
+        Extra kwargs are ignored (dimensions are derived from the data itself).
+        Most training code goes through DataLoader instead.
         """
         src_len = self._src_len
         idx = np.asarray(indices).ravel()
@@ -220,14 +180,19 @@ class DatasetStore:
         return [r.get(key) for r in struct_rows]
 
     @staticmethod
-    def _vector_buffer(col: list[Any], dim: int, dtype: Any) -> np.ndarray | None:
-        """Pack a modality column of per-row vectors into ``[n, dim]``, zero-filled.
+    def _vector_buffer(col: list[Any], dtype: Any) -> np.ndarray | None:
+        """Pack a modality column of per-row vectors into ``[n, D]``, zero-filled.
 
-        Each row's value is raveled and written into a zero row, truncated to
-        ``dim``. Rows whose value is ``None`` (modality absent for that step)
-        stay zero. Returns ``None`` when the modality is absent from every row.
+        D is the largest length present among non-None values in *this* column.
+        Shorter values are right-padded with zeros; absent (None) rows are zero.
+        Returns ``None`` when the modality is absent from every row.
         """
-        if not any(v is not None for v in col):
+        present = [v for v in col if v is not None]
+        if not present:
+            return None
+        dims = [np.asarray(v, dtype=dtype).ravel().size for v in present]
+        dim = max(dims) if dims else 0
+        if dim == 0:
             return None
         buf = np.zeros((len(col), dim), dtype=dtype)
         for i, v in enumerate(col):
@@ -240,25 +205,28 @@ class DatasetStore:
     def encode_hf_rows(
         self,
         rows: dict[str, Any],
-        *,
-        max_action_dim: int = 1000,
-        max_action_continuous_dim: int = 0,
-        max_obs_continuous_dim: int = 0,
-        max_obs_discrete_dim: int = 0,
-        max_obs_image_pixels: int = 0,
+        **kwargs: Any,
     ) -> TensorDict:
-        """Project stored rows (MouseEnvRecord layout) into a TensorDict.
+        """Project a batch of rows into a TensorDict for the model.
 
-        Input rows are expected in the mouse-env rollout contract:
-        nested ``observation`` and ``action`` dicts (with discrete/continuous/image
-        sub-keys) plus top-level scalars (reward, done, time, reward_episodic,
-        q_star, group_id, episode_index, ...). Any other columns are ignored
-        for the batch but preserved in the underlying dataset.
+        This (default) encoder extracts conventional fields the models are
+        wired to consume and stacks them as tensors.
 
-        The dimension arguments are *target* sizes from your model, not stored
-        properties of the data. Missing modalities are zero-filled to the
-        requested width; q_star uses -inf padding for invalid slots.
+        Vector fields (continuous obs/action, images, q_star) have their width
+        taken from the data: D is the max length present in *this* slice; rows
+        lacking the value or having shorter are zero (or -inf for q_star) padded
+        on the right to that D. No external target sizes are required.
+
+        Any other content in the rows is ignored for the batch but stays in
+        the underlying data. The shapes the model receives come from your data;
+        configure your model's embedders with capacities large enough for them.
         """
+        # Legacy size kwargs (max_*_dim etc.) are ignored; dimensions are data-driven.
+        for legacy in ("max_action_dim", "max_action_continuous_dim",
+                       "max_obs_continuous_dim", "max_obs_discrete_dim",
+                       "max_obs_image_pixels"):
+            kwargs.pop(legacy, None)
+
         cols = set(rows.keys())
         n = len(rows[next(iter(cols))]) if cols else 0
         tensors: dict[str, torch.Tensor] = {}
@@ -270,13 +238,13 @@ class DatasetStore:
         tensors["reward"] = torch.from_numpy(np.asarray(rows["reward"], dtype=np.float32))
         tensors["done"]   = torch.from_numpy(np.asarray(rows["done"],   dtype=np.int64))
 
-        if max_action_continuous_dim > 0:
-            buf = self._vector_buffer(
-                self._modality_column(rows["action"], ACTION_KEY_CONTINUOUS),
-                max_action_continuous_dim, np.float32,
-            )
-            if buf is not None:
-                tensors["action_continuous"] = torch.from_numpy(buf)
+        # Continuous action (if any row in *this* slice has it)
+        buf = self._vector_buffer(
+            self._modality_column(rows["action"], ACTION_KEY_CONTINUOUS),
+            np.float32,
+        )
+        if buf is not None:
+            tensors["action_continuous"] = torch.from_numpy(buf)
 
         # Optional scalar fields
         if "reward_episodic" in cols:
@@ -288,50 +256,43 @@ class DatasetStore:
                 np.asarray(rows["time"], dtype=np.int64)
             )
 
-        # q_star — width controlled by max_action_dim
+        # q_star — width comes from the data in this slice.
         if "q_star" in cols:
             q_list = rows["q_star"]
-            if q_list[0] is not None:
-                q_dim = max_action_dim
+            ref = next((np.asarray(v, dtype=np.float32).ravel() for v in q_list if v is not None), None)
+            if ref is not None:
+                q_dim = ref.size
                 q_buf = np.full((n, q_dim), -np.inf, dtype=np.float32)
-                if all(v is not None for v in q_list):
-                    q_arr = np.asarray(q_list, dtype=np.float32)
-                    qdim = min(q_arr.shape[-1], q_dim)
-                    q_buf[:, :qdim] = q_arr[:, :qdim]
-                else:
-                    for i, v in enumerate(q_list):
-                        if v is not None:
-                            qa = np.asarray(v, dtype=np.float32).ravel()
-                            qdim = min(qa.size, q_dim)
-                            q_buf[i, :qdim] = qa[:qdim]
+                for i, v in enumerate(q_list):
+                    if v is not None:
+                        qa = np.asarray(v, dtype=np.float32).ravel()
+                        d = min(qa.size, q_dim)
+                        q_buf[i, :d] = qa[:d]
                 tensors["q_star"] = torch.from_numpy(q_buf)
 
-        # Observation modalities
+        # Observation modalities — emitted only when at least one row in the slice has the sub-modality.
         if "observation" in cols:
             obs_rows = rows["observation"]
 
-            if max_obs_continuous_dim > 0:
-                buf = self._vector_buffer(
-                    self._modality_column(obs_rows, OBS_KEY_CONTINUOUS),
-                    max_obs_continuous_dim, np.float64,
-                )
-                if buf is not None:
-                    tensors["obs_continuous"] = torch.from_numpy(buf)
+            buf = self._vector_buffer(
+                self._modality_column(obs_rows, OBS_KEY_CONTINUOUS),
+                np.float64,
+            )
+            if buf is not None:
+                tensors["obs_continuous"] = torch.from_numpy(buf)
 
-            if max_obs_discrete_dim > 0:
-                disc = self._modality_column(obs_rows, OBS_KEY_DISCRETE)
-                if any(d is not None for d in disc):
-                    tensors["obs_discrete"] = torch.from_numpy(
-                        np.array([0 if d is None else d for d in disc], dtype=np.int64)
-                    )
-
-            if max_obs_image_pixels > 0:
-                buf = self._vector_buffer(
-                    self._modality_column(obs_rows, OBS_KEY_IMAGE),
-                    max_obs_image_pixels, np.int64,
+            disc = self._modality_column(obs_rows, OBS_KEY_DISCRETE)
+            if any(d is not None for d in disc):
+                tensors["obs_discrete"] = torch.from_numpy(
+                    np.array([0 if d is None else d for d in disc], dtype=np.int64)
                 )
-                if buf is not None:
-                    tensors["obs_image"] = torch.from_numpy(buf)
+
+            buf = self._vector_buffer(
+                self._modality_column(obs_rows, OBS_KEY_IMAGE),
+                np.int64,
+            )
+            if buf is not None:
+                tensors["obs_image"] = torch.from_numpy(buf)
 
         return TensorDict(tensors, batch_size=[n])
 
@@ -340,18 +301,18 @@ class DatasetStore:
     # ------------------------------------------------------------------
 
     def from_dataset(self, ds: "Dataset | datasets.DatasetDict") -> None:
-        """Ingest an already-loaded Hugging Face ``Dataset`` (MouseEnvRecord rows).
+        """Ingest an already-loaded Hugging Face ``Dataset`` into the store.
 
-        All rich selection (configs/subsets as bins, splits, globs, YAML-defined
-        repository structure, streaming, etc.) is performed with the real
-        ``datasets.load_dataset``. ``from_dataset`` is a thin hand-off that lets
-        the selected rows participate in append mixing and batch encoding.
+        All selection (which config/subset, which split, globs, etc.) is done
+        with the real ``datasets.load_dataset``. This method just takes ownership
+        of the rows so they can be mixed with later appends and fed to the
+        batch encoder.
 
-        Pass a ``DatasetDict`` only if you want its splits concatenated into one
-        flat sequence. For separate logical bins, load each (config, split) into
-        its own store.
+        If you pass a DatasetDict its contents are concatenated (the store is
+        a flat sequence). Use separate stores if you want to keep logical
+        separation.
 
-        Calling repeatedly extends the sequential history.
+        Calling repeatedly extends the history.
 
         Examples::
 

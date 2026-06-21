@@ -60,7 +60,7 @@ class ObjectiveFunction(Protocol):
 
         Args:
             step_stream: Batch of step records ``[B, S]`` from
-                :class:`~mouse_core.data.batch.PrefetchBatchifier`.
+                :class:`~mouse_core.data.dataloader.DataLoader`.
             out: Model output TensorDict ``[B, S]`` from
                 :meth:`~mouse_core.models.base.Model.forward`.
             cfg: Frozen config dataclass (subclass of :class:`ObjectiveConfig`).

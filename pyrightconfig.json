@@ -2,7 +2,10 @@
   "pythonVersion": "3.12",
   "venvPath": ".",
   "venv": ".venv",
-  "include": ["src", "tests"],
-  "extraPaths": ["src"],
+  "include": ["src", "tests", "examples"],
+  "extraPaths": [
+    "src",
+    ".venv/lib/python3.12/site-packages"
+  ],
   "reportPrivateImportUsage": false
 }

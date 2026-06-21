@@ -32,7 +32,7 @@ Import as **`mouse_core`** (PyPI package name is **`mouse-core`**).
 
 mouse-core gives you the building blocks for in-context RL rather than a monolithic trainer — you compose them in your own loop:
 
-- **Data** (`mouse_core.data`) — `DatasetStore` is a sequential container whose native row format is the mouse-env contract (`MouseEnvRecord`). You load/append mouse-env style records (nested observation/action + rollout scalars). `PrefetchBatchifier` (given model sizes) turns contiguous slices into `TensorDict[B, S]` batches. Push uses plain HF `Dataset`/`DatasetDict` with `config_name` for bins.
+- **Data** (`mouse_core.data`) — `DatasetStore` is a generic sequential container for arbitrary rows (whatever your collection or dataset produces). `DataLoader` (configured with your model's dimension sizes) turns contiguous slices into `TensorDict[B, S]` batches by projecting fields from those rows. Push uses plain HF `Dataset`/`DatasetDict` with `config_name` for bins.
 - **Models** (`mouse_core.models`) — a MOUSE `Model` is a pipeline of per-modality step embedders, a transformer backbone (LLaMA, Qwen3, or none), and output heads (DQN, VecDQN, SwiGLU). `load_model` / `save_model` / `push_model_to_hub` handle Hub I/O, and `init_from_pretrained_backbone` bootstraps from a pretrained language model.
 - **Objectives** (`mouse_core.objectives`) — composable objective functions with configs (`dqn_objective`, `vec_dqn_objective`, `sp_objective`, `sv_objective`) that you weight and sum in your training loop.
 
@@ -46,7 +46,7 @@ A compact training loop using all three components — **Data**, **Models**, and
 
 ```python
 import torch
-from mouse_core.data import DatasetStore, PrefetchBatchifier
+from mouse_core.data import DataLoader, DatasetStore
 from mouse_core.objectives import DqnObjectiveConfig, dqn_objective
 from mouse_core.models.backbone.none import ModelNone
 
@@ -55,8 +55,8 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # Data: build or load a DatasetStore, then batchify
 store = DatasetStore()
 # ... store.append(...) or store.from_dataset(...)
-# (pass target tensor sizes to PrefetchBatchifier, not the store)
-bf = PrefetchBatchifier(store, sequence_length=16, batch_size=8, num_workers=0, max_action_dim=4)
+# (pass target tensor sizes to DataLoader, not the store)
+loader = DataLoader(store, sequence_length=16, batch_size=8, num_workers=0)
 
 # Model (see the notebook for complete embedding/head kwargs)
 model = ModelNone(
@@ -72,7 +72,7 @@ cfg = DqnObjectiveConfig(weight=1.0, gamma=0.99, tau=0.005)
 
 # Training: Data → Model → Objective
 for step in range(100):
-    batch = bf.next_batch().to(device)
+    batch = loader.next_batch().to(device)
     out, _ = model(batch)
     loss, metrics = dqn_objective(batch, out, cfg)
 
@@ -82,7 +82,7 @@ for step in range(100):
     optimizer.step()
     model.polyak_update(dqn_tau=cfg.tau)
 
-bf.close()
+loader.close()
 ```
 
 The complete self-contained version (synthetic data, no Hub) is in

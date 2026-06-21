@@ -6,7 +6,7 @@ All four objective functions share the same call signature pattern:
 loss, metrics = xxx_objective(step_stream, model_output_tensor, cfg)
 ```
 
-- `step_stream` — `TensorDict[B, S]` batch from `PrefetchBatchifier`.
+- `step_stream` — `TensorDict[B, S]` batch from `DataLoader`.
 - model output tensor — sliced from `model(step_stream)`.
 - `cfg` — frozen dataclass with hyperparameters.
 - Returns `(scalar_loss, dict[str, float])` — the dict is ready for direct logging to W&B / TensorBoard.
@@ -15,7 +15,7 @@ loss, metrics = xxx_objective(step_stream, model_output_tensor, cfg)
 
 ## Transition alignment
 
-The source of truth is the mouse-env contract in the `DatasetStore` (see docs/dataset.md). A row at `t` contains the observation that resulted from the action/reward/done at that position. Consequently, the quantities for the *next* transition live at `t+1`. The objectives read the flat `step_stream` (produced by encoding the contract rows) and use `[:, :-1]` / `[:, 1:]` slicing to align targets.
+A row at step `t` in your data normally contains the observation that resulted from the action/reward/done at that position (this is a convention of how the data was collected). The "next" quantities therefore live at `t+1`. The objectives consume the flat `step_stream` produced by the `DataLoader` and use `[:, :-1]` / `[:, 1:]` slicing to line up targets. The store itself does not enforce any particular alignment.
 
 ---
 

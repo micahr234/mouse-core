@@ -1,6 +1,6 @@
 """Hugging Face Hub utilities for pushing DatasetStore data.
 
-Pushes write the raw rows (mouse-env contract records) using standard
+Pushes write the raw rows (whatever shape you stored) using standard
 ``DatasetDict.push_to_hub`` with ``config_name`` for subsets/bins.
 
 Before each push we wipe previous parquet shards, ``dataset_infos.json``,

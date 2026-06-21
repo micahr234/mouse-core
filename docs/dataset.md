@@ -2,21 +2,17 @@
 
 `DatasetStore` is a **sequential** container for step data.
 
-It stores rows in the exact order they were added or loaded (Arrow-backed Hugging Face `Dataset`). 
+It stores rows (plain Python dicts) in the exact order they were added or loaded. The backing storage is a Hugging Face `Dataset` (Arrow). There is no required schema or contract — each row contains whatever your collection script, rollout, or external dataset produced. Extra columns and nested structures are preserved as-is.
 
-The **native** row layout is the mouse-env contract (`MouseEnvRecord`): nested `observation`/`action` + the rollout scalars (`reward`, `done`, `time`, `group_id`, `episode_index`, `reward_episodic`, `q_star`, ...). The store accepts any extra columns too; nothing is stripped.
+All I/O uses ordinary Hugging Face tools (`load_dataset`, `push_to_hub`, `DatasetDict`, etc.). The only mouse-core-specific step is turning slices of rows into model batches.
 
-All I/O (load via `load_dataset`, push via `push_to_hub` with `config_name`, raw `to_dataset().push_to_hub`) deals in these rows directly. The only transformation is the on-demand encoding to model batches.
+When training you ask for contiguous sequences of steps (e.g. 64 steps). Because the data is stored sequentially these are just slices. The tensors in the resulting batch are produced by `DataLoader` (or `encode_hf_rows`) according to the sizes you pass it and whatever fields happen to be present in the rows.
 
-When you train, you ask for batches of contiguous steps (e.g. 64 steps in a row). Because the data is sequential, those are just slices of the stored sequence. The shape of the tensors you get in each batch is driven by:
-- the dimension sizes you pass to `PrefetchBatchifier` (or `encode_hf_rows`), and
-- whatever matching data actually exists in your rows.
+The store and the data on disk/Hub are just the raw rows. The model (via its embedders / tokenizer / encoder) decides how to interpret them.
 
-The model defines what it wants to see. The environment defines what actually gets written. The store just keeps the ordered history and makes single appends and long contiguous reads fast.
+`DataLoader` repeatedly takes slices and yields ready `TensorDict[B, S]` batches. Everything else (loading, saving, pushing) is standard Hugging Face Dataset machinery.
 
-`PrefetchBatchifier` repeatedly takes such slices and turns them into ready `TensorDict[B, S]` batches. Everything else (saving, loading, pushing to the Hub) is just moving the same sequential rows around using normal Hugging Face dataset tools.
-
-The two important classes are `DatasetStore` and `PrefetchBatchifier`.
+The two important classes are `DatasetStore` and `DataLoader`.
 
 ---
 
@@ -43,26 +39,15 @@ A training sequence of length `S` is just:
 rows = dataset[start : start + S]
 ```
 
-`PrefetchBatchifier` repeatedly takes slices like this (workers when useful), projects pieces into tensors according to the sizes you pass it, and yields `TensorDict[B, S]` batches.
+`DataLoader` repeatedly takes slices like this (workers when useful), projects the conventional fields present in those rows into tensors (vector widths taken from the max present in the slice), and yields `TensorDict[B, S]` batches.
 
 ### What ends up in the TensorDict
 
-You pass the target tensor sizes to `PrefetchBatchifier` (or directly to `encode_hf_rows`):
+`DataLoader` (and `encode_hf_rows`) look for a few conventional fields (`action`, `reward`, `done`, `observation.*`, `q_star`, ...) and stack them. For vector-valued sub-fields the width `D` of the emitted tensor is the largest length that appears in the rows of *that particular slice*; shorter or absent entries are zero-padded (or -inf-padded for `q_star`) to that D within the slice.
 
-```python
-bf = PrefetchBatchifier(
-    store,
-    sequence_length=64,
-    batch_size=32,
-    max_action_dim=18,
-    max_obs_continuous_dim=8,
-    # ...
-)
-```
+The resulting shapes are therefore driven by your data. Your model declares capacities (`max_num_obs_continuous`, `max_num_actions`, ...) when you build the embedders; those embedders internally adapt incoming vectors (pad or truncate) to their configured size.
 
-These sizes come from your model (action head size, obs feature dims, etc). The encoder looks in each row for matching data under the conventional keys and produces the tensors at those widths (padding or truncating as needed). Non-matching content in the rows is ignored for the batch tensors but kept in the dataset.
-
-The dataset contains whatever the environment wrote. The batch contains the shaped view the model asked for. No fixed contract between them.
+Other content in the rows is ignored for the batch but remains in the stored data. The store and loader are generic; interpretation lives in the model.
 
 ### Note on ordering (for objective authors)
 
@@ -105,7 +90,7 @@ store.from_dataset(ds2)
 
 `from_dataset` mainly exists so the *store* can:
 - mix loaded data with later `append()` calls (the live collection buffer), and
-- participate in `PrefetchBatchifier` + our encoding to `TensorDict`.
+- participate in `DataLoader` + our encoding to `TensorDict`.
 
 It does not try to replicate or wrap the rich selection features of `datasets.load_dataset`. Use the real thing.
 
@@ -156,63 +141,11 @@ You can use globs, lists, or the automatic patterns (train/ directories, *-00000
 
 This keeps mouse-core's data layer as a thin user of the standard HF repository structure.
 
-### What goes into a row (mouse-env contract)
+### Rows are opaque to the store
 
-The **native row format** for a `DatasetStore` in the mouse ecosystem is the structure emitted by mouse-env rollouts, plus the action that produced each transition.
+The store does not look inside rows or impose structure. A row is whatever dictionary you append or load. The store only keeps them in order and gives fast contiguous slices.
 
-Stored rows (both in-memory, in the Arrow `Dataset`, and in the Parquet you push to the Hub) contain the mouse-env contract directly:
-
-```python
-{
-    "time": int,
-    "observation": {
-        "discrete":  int | None,
-        "continuous": array | None,
-        "image":      array | None,   # native shape
-    },
-    "action": {
-        "discrete": int | None,
-        "continuous": array | None,
-    },
-    "reward": float,
-    "done": int,                 # 0=running, 1=terminated, 2=truncated
-    "group_id": str,
-    "episode_index": int,
-    "reward_episodic": float,    # shaped reward used by objectives
-    "q_star": array | None,      # optional target values (width = action dim)
-    "ns_params": dict | None,
-    # ... plus any extra columns your collection adds
-}
-```
-
-- The `action` stored at step `t` is the action you fed to produce the `result` at `t`.
-- The store and HF Dataset keep this nested struct layout exactly. The only place the nested form becomes flat tensors is inside `encode_hf_rows` / `PrefetchBatchifier` when you ask for a model batch.
-- This contract is defined as the public `MouseEnvRecord` TypedDict and the exported `*_KEY_*` constants.
-
-All examples, tests, objectives that reference `reward_episodic`, `q_star`, `group_id`, etc. are written against this layout. The conversion to training tensors is just a view; the source of truth throughout the repo is the mouse-env record.
-
-### Appending single records (the collection path)
-
-Append follows the mouse-env contract directly:
-
-```python
-store.append({
-    "observation": result["observation"],   # the dict with discrete/continuous/image
-    "action": action_dict,                  # the modality dict you passed to step()
-    "reward": float(result["reward"]),
-    "done": int(result["done"]),
-    "time": int(result["time"]),
-    "group_id": result.get("group_id"),
-    "episode_index": result.get("episode_index"),
-    "reward_episodic": float(result.get("reward_episodic", result["reward"])),
-    "q_star": result.get("q_star"),
-    # ns_params, or any extra per-step metadata
-})
-```
-
-Because the stored rows *are* the contract, there is no separate "front-end conversion" step for collection or I/O — only the batch encoding for training materializes the flat `TensorDict`.
-
-See `examples/01_collect_dataset.ipynb` for a full loop (action pairing, reset frame, multi-env).
+The only place mouse-core looks at row contents is inside the row encoder used by `DataLoader` (see "What ends up in the TensorDict" above).
 
 ### Exporting to a HuggingFace Dataset (raw)
 
@@ -237,7 +170,7 @@ This is completely standard `datasets.Dataset.push_to_hub` — no wrapper. Use i
 
 `push_to_hub` and `push_stores_to_hub` combine `DatasetStore`s and delegate to ordinary `DatasetDict.push_to_hub(..., config_name=...)`. 
 
-What gets written to the Hub *is* the mouse-env record rows (nested `action`/`observation` structs + scalars). There is no mouse-core-specific wrapper format — downstream users (or you) can consume the dataset with plain `datasets` or even non-Python tools.
+What gets written to the Hub are the exact rows you stored. There is no mouse-core-specific wrapper format — downstream users (or you) can consume the dataset with plain `datasets` or even non-Python tools.
 
 Before the push we delete previous parquet shards, `dataset_infos.json`, **and the README**. This guarantees that the dataset card written by the push has a `dataset_info:` header that matches the freshly uploaded data (critical when uploading a brand new dataset or when columns/splits/configs change).
 
@@ -288,16 +221,14 @@ Columns that differ across the things you push in one call are aligned with plac
 
 ---
 
-## PrefetchBatchifier (`mouse_core.data.batch`)
+## DataLoader (`mouse_core.data`)
 
-Its only job is to keep pulling contiguous slices out of the sequential store, encode the parts you care about, and hand you ready `TensorDict[B, S]` batches as fast as possible.
-
-Background threads (when enabled) do the slice + encode work so that `next_batch()` is usually immediate. Only a small number of pre-encoded batches are held in memory.
+`DataLoader` turns slices of your `DatasetStore` into ready `TensorDict[B, S]` batches. It samples contiguous windows from the store and runs a row encoder that extracts conventional fields and stacks them (vector widths are the max present in each slice). Background workers can be used so `next_batch()` is usually non-blocking.
 
 ```python
-from mouse_core.data.batch import PrefetchBatchifier
+from mouse_core.data import DataLoader
 
-bf = PrefetchBatchifier(
+loader = DataLoader(
     store,
     sequence_length=64,
     batch_size=32,
@@ -305,11 +236,9 @@ bf = PrefetchBatchifier(
     prefetch=4,
     num_workers=2,
     pin_memory=True,
-    max_action_dim=18,            # sizes come from the model you will train
-    max_obs_continuous_dim=8,
 )
-step_stream = bf.next_batch()   # TensorDict[32, 64]
-bf.close()
+step_stream = loader.next_batch()   # TensorDict[32, 64]
+loader.close()
 ```
 
 ### Sampling modes
@@ -326,9 +255,9 @@ bf.close()
 Pass `num_workers=0` to disable background threads. `next_batch()` blocks on the calling thread. Useful for debugging or environments where threading is undesirable.
 
 ```python
-bf = PrefetchBatchifier(store, sequence_length=64, batch_size=32, num_workers=0)
-step_stream = bf.next_batch()
-bf.close()
+loader = DataLoader(store, sequence_length=64, batch_size=32, num_workers=0)
+step_stream = loader.next_batch()
+loader.close()
 ```
 
 ---

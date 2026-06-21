@@ -5,7 +5,7 @@ alwaysApply: true
 
 # Python Virtual Environment
 
-This project uses `uv` with a `.venv` at the repo root (`/home/user/Repos/mouse-env/.venv`).
+This project uses `uv` with a `.venv` at the repo root (`./.venv`).
 
 ## Rules
 

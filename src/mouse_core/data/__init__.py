@@ -5,12 +5,11 @@ from mouse_core.data.augment import (
     AugmentTokensConfig,
     TokenAugmenter,
 )
-from mouse_core.data.batch import PrefetchBatchifier
+from mouse_core.data.dataloader import DataLoader
 from mouse_core.data.dataset_store import (
     ACTION_KEY_CONTINUOUS,
     ACTION_KEY_DISCRETE,
     DatasetStore,
-    MouseEnvRecord,
     OBS_KEY_CONTINUOUS,
     OBS_KEY_DISCRETE,
     OBS_KEY_IMAGE,
@@ -24,12 +23,11 @@ __all__ = [
     "AugmentScalarSpec",
     "AugmentSnapshot",
     "AugmentTokensConfig",
+    "DataLoader",
     "DatasetStore",
-    "MouseEnvRecord",
     "OBS_KEY_CONTINUOUS",
     "OBS_KEY_DISCRETE",
     "OBS_KEY_IMAGE",
-    "PrefetchBatchifier",
     "TokenAugmenter",
     "push_stores_to_hub",
     "push_to_hub",
