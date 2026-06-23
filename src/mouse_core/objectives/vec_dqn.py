@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from tensordict import TensorDict
 
 from mouse_core.objectives.base import ObjectiveConfig
-from mouse_core.models.heads.vec_dqn import rope_rotate, vec_dqn_scores
+from mouse_core.models.heads.vec_dqn import rope_rotate, vector_action_scores
 
 
 @dataclass(frozen=True)
@@ -71,7 +71,7 @@ def vec_dqn_objective(
     action_idx_exp = next_actions.unsqueeze(-1).unsqueeze(-1).expand(B, S - 1, 1, D)
     curr_action_vecs = curr_vecs.gather(dim=2, index=action_idx_exp).squeeze(2)  # [B, S-1, D]
 
-    greedy_idx = vec_dqn_scores(next_vecs).argmax(dim=-1)                         # [B, S-1]
+    greedy_idx = vector_action_scores(next_vecs).argmax(dim=-1)                         # [B, S-1]
     greedy_idx_exp = greedy_idx.unsqueeze(-1).unsqueeze(-1).expand(B, S - 1, 1, D)
     next_action_vecs = next_vecs.gather(dim=2, index=greedy_idx_exp).squeeze(2)   # [B, S-1, D]
 
@@ -87,12 +87,12 @@ def vec_dqn_objective(
     cosine_sim = F.cosine_similarity(curr_action_vecs, rotated.detach(), dim=-1)  # [B, S-1]
     loss = (1.0 - cosine_sim).mean()
 
-    abs_scores = vec_dqn_scores(online_vecs[:, -1].float()).abs() / (math.pi)  # [B, A]
+    abs_scores = vector_action_scores(online_vecs[:, -1].float()).abs() / (math.pi)  # [B, A]
     named: dict[str, torch.Tensor] = {
-        "vec_dqn": loss.detach(),
-        "vec_dqn_score_abs_min": abs_scores.min().detach(),
-        "vec_dqn_score_abs_max": abs_scores.max().detach(),
-        "vec_dqn_score_abs_mean": abs_scores.mean().detach(),
+        "action_vector": loss.detach(),
+        "action_vector_score_abs_min": abs_scores.min().detach(),
+        "action_vector_score_abs_max": abs_scores.max().detach(),
+        "action_vector_score_abs_mean": abs_scores.mean().detach(),
     }
     metrics: dict[str, float] = dict(zip(named, torch.stack(list(named.values())).tolist()))
 

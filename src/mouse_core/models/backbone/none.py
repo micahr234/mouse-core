@@ -1,47 +1,37 @@
-"""ModelNone: no-backbone model that feeds embeddings directly to the heads."""
+"""Identity backbone for no-backbone ablations."""
 
 from __future__ import annotations
 
 from typing import Any
 
 import torch
-import torch.nn as nn
-from huggingface_hub import PyTorchModelHubMixin
 
-from mouse_core.models.base import Model, MODEL_CARD_TEMPLATE
+from mouse_core.models.backbone.base import Backbone
 
 
-class ModelNone(Model, PyTorchModelHubMixin, library_name="MOUSE", tags=["backbone:none"], model_card_template=MODEL_CARD_TEMPLATE):
-    """MOUSE model with no backbone; embeddings pass directly to the output heads.
+class IdentityBackbone(Backbone):
+    """A no-op backbone: returns inputs unchanged and never produces a cache.
 
-    Useful for ablations or lightweight baselines where no temporal context is
-    required. ``backbone_kwargs`` must be empty (or absent) in ``config.json``.
-    KV-cache is not supported — always returns ``None`` for the cache.
+    It can optionally be told a ``hidden_dim`` so that ``Model`` (and users)
+    can perform a consistency check against the encoder's hidden dimension.
     """
 
-    def _init_backbone(self, backbone_kwargs: dict) -> None:
-        """Assign an ``nn.Identity`` backbone (no-op pass-through)."""
-        self.backbone = nn.Identity()
+    def __init__(self, hidden_dim: int | None = None) -> None:
+        super().__init__()
+        self._hidden_dim = hidden_dim
 
-    def backbone_forward(
+    @property
+    def hidden_dim(self) -> int | None:
+        return self._hidden_dim
+
+    def forward(
         self,
         embeds: torch.Tensor,
-        token_type: torch.Tensor,
         cache: dict[str, Any] | None = None,
         use_cache: bool = False,
         cache_position: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, dict[str, Any] | None]:
-        """Pass embeddings through unchanged; always returns ``None`` for cache.
-
-        Args:
-            embeds: ``[B, T_total, D]`` embedding tensor.
-            token_type: Ignored.
-            cache: Ignored.
-            use_cache: Ignored.
-            cache_position: Ignored.
-
-        Returns:
-            Tuple of ``(embeds unchanged, None)``.
-        """
+        # Identity ignores masks; the mask would only matter to a real sequence model.
         return embeds, None

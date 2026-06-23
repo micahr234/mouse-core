@@ -20,16 +20,16 @@ def test_dqn_objective_runs() -> None:
     )
     out = TensorDict(
         {
-            "dqn": torch.randn(b, s, a),
-            "dqn_target": torch.randn(b, s, a),
+            "action_value": torch.randn(b, s, a),
+            "action_value_target": torch.randn(b, s, a),
         },
         batch_size=(b, s),
     )
     cfg = DqnObjectiveConfig(weight=1.0, gamma=0.99)
     loss, metrics = dqn_objective(step_stream, out, cfg)
     assert loss.ndim == 0
-    assert "dqn" in metrics
-    assert metrics["dqn"] >= 0.0
+    assert "action_value" in metrics
+    assert metrics["action_value"] >= 0.0
 
 
 def test_dqn_objective_requires_min_sequence() -> None:
@@ -42,7 +42,7 @@ def test_dqn_objective_requires_min_sequence() -> None:
         batch_size=(1, 1),
     )
     out = TensorDict(
-        {"dqn": torch.zeros(1, 1, 2), "dqn_target": torch.zeros(1, 1, 2)},
+        {"action_value": torch.zeros(1, 1, 2), "action_value_target": torch.zeros(1, 1, 2)},
         batch_size=(1, 1),
     )
     try:

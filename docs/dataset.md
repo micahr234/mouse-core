@@ -1,6 +1,6 @@
 # Dataset pipeline
 
-`DatasetStore` is a **sequential** container for step data.
+`Datastore` is a **sequential** container for step data.
 
 It stores rows (plain Python dicts) in the exact order they were added or loaded. The backing storage is a Hugging Face `Dataset` (Arrow). There is no required schema or contract — each row contains whatever your collection script, rollout, or external dataset produced. Extra columns and nested structures are preserved as-is.
 
@@ -12,7 +12,7 @@ The store and the data on disk/Hub are just the raw rows. The model (via its emb
 
 `DataLoader` repeatedly takes slices and yields ready `TensorDict[B, S]` batches. Everything else (loading, saving, pushing) is standard Hugging Face Dataset machinery.
 
-The two important classes are `DatasetStore` and `DataLoader`.
+The two important classes are `Datastore` and `DataLoader`.
 
 ---
 
@@ -55,13 +55,13 @@ Because the store is strictly sequential, step `t` contains whatever your enviro
 
 ---
 
-## DatasetStore (`mouse_core.data.dataset_store`)
+## Datastore (`mouse_core.data.datastore`)
 
 A sequential store backed by a Hugging Face `Dataset`. The full history stays in Arrow form; only the small prefetch window of encoded batches is materialized during training.
 
 ### Loading data (use the real `load_dataset`)
 
-`DatasetStore.from_dataset` is intentionally thin. All the power for selecting *what* to load lives in the standard Hugging Face `load_dataset`:
+`Datastore.from_dataset` is intentionally thin. All the power for selecting *what* to load lives in the standard Hugging Face `load_dataset`:
 
 - configs / subsets (your "bins")
 - splits
@@ -72,9 +72,9 @@ Do your selection first, then hand the resulting `Dataset` (or a prepared slice)
 
 ```python
 from datasets import load_dataset
-from mouse_core.data.dataset_store import DatasetStore
+from mouse_core.data.datastore import Datastore
 
-store = DatasetStore()
+store = Datastore()
 
 # Specific config (subset/bin) + split
 ds = load_dataset("your-org/your-dataset", "cartpole_ppo_expert", split="train")
@@ -168,7 +168,7 @@ This is completely standard `datasets.Dataset.push_to_hub` — no wrapper. Use i
 
 ## Pushing stores to the Hub (`mouse_core.data.hub`)
 
-`push_to_hub` and `push_stores_to_hub` combine `DatasetStore`s and delegate to ordinary `DatasetDict.push_to_hub(..., config_name=...)`. 
+`push_to_hub` and `push_stores_to_hub` combine `Datastore`s and delegate to ordinary `DatasetDict.push_to_hub(..., config_name=...)`. 
 
 What gets written to the Hub are the exact rows you stored. There is no mouse-core-specific wrapper format — downstream users (or you) can consume the dataset with plain `datasets` or even non-Python tools.
 
@@ -223,7 +223,7 @@ Columns that differ across the things you push in one call are aligned with plac
 
 ## DataLoader (`mouse_core.data`)
 
-`DataLoader` turns slices of your `DatasetStore` into ready `TensorDict[B, S]` batches. It samples contiguous windows from the store and runs a row encoder that extracts conventional fields and stacks them (vector widths are the max present in each slice). Background workers can be used so `next_batch()` is usually non-blocking.
+`DataLoader` turns slices of your `Datastore` into ready `TensorDict[B, S]` batches. It samples contiguous windows from the store and runs a row encoder that extracts conventional fields and stacks them (vector widths are the max present in each slice). Background workers can be used so `next_batch()` is usually non-blocking.
 
 ```python
 from mouse_core.data import DataLoader

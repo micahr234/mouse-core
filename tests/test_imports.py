@@ -11,16 +11,25 @@ def test_mouse_root_exports() -> None:
     assert hasattr(mouse_core, "ObjectiveConfig")
 
 
+def test_mouse_model_exports() -> None:
+    from mouse_core.models import IdentityBackbone, LlamaBackbone, Model, Qwen3Backbone
+
+    assert Model is not None
+    assert LlamaBackbone is not None
+    assert Qwen3Backbone is not None
+    assert IdentityBackbone is not None
+
+
 def test_mouse_data_exports() -> None:
     from mouse_core.data import (
         ACTION_KEY_DISCRETE,
         DataLoader,
-        DatasetStore,
+        Datastore,
         OBS_KEY_IMAGE,
         push_to_hub,
     )
 
-    assert DatasetStore is not None
+    assert Datastore is not None
     assert DataLoader is not None
     assert callable(push_to_hub)
     assert ACTION_KEY_DISCRETE == "discrete"

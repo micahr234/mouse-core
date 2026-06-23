@@ -36,8 +36,8 @@ def dqn_objective(
     cfg: DqnObjectiveConfig,
 ) -> tuple[torch.Tensor, dict[str, float]]:
 
-    q: torch.Tensor = out["dqn"]
-    q_target: torch.Tensor = out["dqn_target"]
+    q: torch.Tensor = out["action_value"]
+    q_target: torch.Tensor = out["action_value_target"]
 
     B, S, A = q.shape
     device = q.device
@@ -109,7 +109,7 @@ def dqn_objective(
         "q_values_min":  q_det.min(),
         "q_values_max":  q_det.max(),
         "q_values_target": td_target.detach().mean(),
-        "dqn":           loss.detach(),
+        "action_value":  loss.detach(),
     }
     if cql_penalty_mean is not None:
         named["cql_penalty"] = cql_penalty_mean

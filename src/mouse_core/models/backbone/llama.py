@@ -1,17 +1,20 @@
-"""ModelLlama: MOUSE model with a Llama transformer backbone."""
+"""Llama transformer backbone.
+
+Provides :class:`LlamaBackbone`, a thin Backbone adapter around
+``transformers.LlamaModel`` for use with the generic :class:`~mouse_core.models.base.Model`.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
 import torch.nn as nn
-from huggingface_hub import PyTorchModelHubMixin
 from transformers import LlamaConfig, LlamaModel
 
-from mouse_core.models.base import Model, MODEL_CARD_TEMPLATE
-from mouse_core.models.base import TokenType
+from mouse_core.models.backbone.base import Backbone, _load_transformer_weights
 
 
 def _disable_cudnn_sdp() -> None:
@@ -22,7 +25,7 @@ def _disable_cudnn_sdp() -> None:
 
 
 @dataclass
-class LlamaBackboneConfig:
+class _LlamaBackboneConfig:
     """Configuration for a Llama transformer backbone.
 
     Builds a HuggingFace ``LlamaModel`` with SDPA attention and no token
@@ -99,52 +102,158 @@ class LlamaBackboneConfig:
         return model
 
 
-class ModelLlama(Model, PyTorchModelHubMixin, library_name="MOUSE", tags=["backbone:llama"], model_card_template=MODEL_CARD_TEMPLATE):
-    """MOUSE model with a Llama transformer backbone.
+class LlamaBackbone(Backbone):
+    """Backbone adapter wrapping a ``transformers.LlamaModel``.
 
-    Attends over the full ``[B, S*T, D]`` token sequence with causal SDPA.
-    Supports KV-cache for incremental rollouts (``use_cache=True``).
+    Construct directly from config args::
+
+           backbone = LlamaBackbone(
+               hidden_dim=128,
+               num_layers=4,
+               num_heads=4,
+               max_position_embeddings=256,
+           )
+
+    Or load architecture and transformer weights from a pretrained Llama repo::
+
+           backbone = LlamaBackbone(
+               pretrained="meta-llama/Llama-3.2-1B",
+               num_layers=2,
+           )
+
+    The adapter translates the generic MOUSE call into the HF calling
+    convention and forwards an optional explicit ``attention_mask``.
     """
 
-    def _init_backbone(self, backbone_kwargs: dict) -> None:
-        """Build and assign ``self.backbone`` from ``backbone_kwargs``."""
-        cfg = LlamaBackboneConfig(**backbone_kwargs)
-        self.num_layers = cfg.num_layers
-        self.num_heads = cfg.num_heads
-        self.max_position_embeddings = cfg.max_position_embeddings
-        self.expand = cfg.expand
-        self.backbone = cfg.build(self.hidden_dim)
+    def __init__(
+        self,
+        model: LlamaModel | None = None,
+        *,
+        hidden_dim: int | None = None,
+        pretrained: str | Path | None = None,
+        load_weights: bool = True,
+        hub_kwargs: dict[str, Any] | None = None,
+        **config_kwargs: Any,
+    ) -> None:
+        super().__init__()
 
-    def backbone_forward(
+        if model is not None and pretrained is not None:
+            raise TypeError("LlamaBackbone accepts either model= or pretrained=, not both.")
+
+        if model is not None:
+            if not isinstance(model, LlamaModel):
+                raise TypeError(
+                    "When passing a model to LlamaBackbone, it must be a "
+                    "transformers.LlamaModel (with vocab_size=1 and norm=Identity)."
+                )
+            self.model = model
+            self._config_kwargs = self._config_kwargs_from_model(model)
+            return
+
+        if pretrained is not None:
+            hf_kwargs = hub_kwargs or {}
+            extracted_kwargs, extracted_hidden_dim = self._config_from_pretrained(
+                pretrained,
+                hub_kwargs=hf_kwargs,
+                overrides=config_kwargs,
+            )
+            if hidden_dim is not None and int(hidden_dim) != extracted_hidden_dim:
+                raise ValueError(
+                    f"hidden_dim={hidden_dim} does not match pretrained hidden size "
+                    f"{extracted_hidden_dim} from {pretrained!r}."
+                )
+            self.model = _LlamaBackboneConfig(**extracted_kwargs).build(extracted_hidden_dim)
+            self._config_kwargs = dict(extracted_kwargs)
+            if load_weights:
+                self._load_pretrained_weights(pretrained, hub_kwargs=hf_kwargs)
+            return
+
+        if hidden_dim is None:
+            raise TypeError(
+                "LlamaBackbone requires either a pre-built model, "
+                "pretrained=, or hidden_dim plus backbone config arguments "
+                "(e.g. LlamaBackbone(hidden_dim=128, num_layers=2, num_heads=4))."
+            )
+
+        cfg = _LlamaBackboneConfig(**config_kwargs)
+        self.model = cfg.build(hidden_dim)
+        self._config_kwargs = self._config_kwargs_from_model(self.model)
+
+    @staticmethod
+    def _config_from_pretrained(
+        repo_id_or_path: str | Path,
+        *,
+        hub_kwargs: dict[str, Any],
+        overrides: dict[str, Any],
+    ) -> tuple[dict[str, Any], int]:
+        from transformers import AutoConfig
+
+        hf_cfg = AutoConfig.from_pretrained(repo_id_or_path, **hub_kwargs)
+        model_type = getattr(hf_cfg, "model_type", "").lower()
+        if "llama" not in model_type:
+            raise ValueError(
+                f"LlamaBackbone can only load Llama configs, got model_type={model_type!r} "
+                f"from {repo_id_or_path!r}."
+            )
+
+        backbone_kwargs: dict[str, Any] = dict(
+            num_layers=hf_cfg.num_hidden_layers,
+            num_heads=hf_cfg.num_attention_heads,
+            num_key_value_heads=getattr(hf_cfg, "num_key_value_heads", hf_cfg.num_attention_heads),
+            max_position_embeddings=hf_cfg.max_position_embeddings,
+            intermediate_size=hf_cfg.intermediate_size,
+            rms_norm_eps=getattr(hf_cfg, "rms_norm_eps", 1e-5),
+            attention_bias=getattr(hf_cfg, "attention_bias", False),
+        )
+        backbone_kwargs.update(overrides)
+        return backbone_kwargs, int(hf_cfg.hidden_size)
+
+    @staticmethod
+    def _config_kwargs_from_model(model: LlamaModel) -> dict[str, Any]:
+        cfg = model.config
+        kwargs: dict[str, Any] = dict(
+            num_layers=len(model.layers),
+            num_heads=cfg.num_attention_heads,
+            num_key_value_heads=getattr(cfg, "num_key_value_heads", cfg.num_attention_heads),
+            max_position_embeddings=cfg.max_position_embeddings,
+            intermediate_size=cfg.intermediate_size,
+            rms_norm_eps=getattr(cfg, "rms_norm_eps", 1e-5),
+            attention_bias=getattr(cfg, "attention_bias", False),
+        )
+        rope_parameters = getattr(cfg, "rope_parameters", None)
+        if rope_parameters is not None:
+            kwargs["rope_parameters"] = rope_parameters
+        return kwargs
+
+    def _load_pretrained_weights(
+        self,
+        repo_id_or_path: str | Path,
+        *,
+        hub_kwargs: dict[str, Any],
+    ) -> None:
+        _load_transformer_weights(
+            self.model,
+            repo_id_or_path,
+            backbone_name="LlamaBackbone",
+            hub_kwargs=hub_kwargs,
+        )
+
+    @property
+    def hidden_dim(self) -> int:
+        return int(self.model.config.hidden_size)
+
+    def forward(
         self,
         embeds: torch.Tensor,
-        token_type: torch.Tensor,
         cache: dict[str, Any] | None = None,
         use_cache: bool = False,
         cache_position: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, dict[str, Any] | None]:
-        """Run the Llama backbone over the token sequence.
-
-        Args:
-            embeds: ``[B, T_total, D]`` embedding tensor from ``StepEmbedder``.
-            token_type: ``[B, T_total]`` int64 ``TokenType`` ids; ``PAD`` positions
-                are masked out from attention.
-            cache: KV-cache dict from a previous call, or ``None`` for full prefill.
-                Reads and writes the ``"backbone"`` key.
-            use_cache: If ``True``, return an updated KV-cache dict.
-            cache_position: Unused; present for interface compatibility.
-            **kwargs: Forwarded to the underlying ``LlamaModel``.
-
-        Returns:
-            Tuple of ``(hidden_states [B, T_total, D], cache_dict | None)``.
-        """
         cache = cache or {}
 
-        has_padding = bool((token_type == TokenType.PAD).any())
-        attention_mask = (token_type != TokenType.PAD).long() if has_padding else None
-
-        out = self.backbone(
+        out = self.model(
             inputs_embeds=embeds,
             past_key_values=cache.get("backbone", None),
             use_cache=use_cache,
@@ -155,3 +264,4 @@ class ModelLlama(Model, PyTorchModelHubMixin, library_name="MOUSE", tags=["backb
 
         new_cache = {"backbone": out.past_key_values} if use_cache else None
         return out.last_hidden_state, new_cache
+

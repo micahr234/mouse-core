@@ -71,13 +71,13 @@ The penalty is scaled by `|td_target| + cql_scale_q_eps` to keep its magnitude i
 
 ### Metrics returned
 
-`q_values_mean`, `q_values_std`, `q_values_min`, `q_values_max`, `q_values_target`, `dqn`, `cql_penalty` (if enabled).
+`q_values_mean`, `q_values_std`, `q_values_min`, `q_values_max`, `q_values_target`, `action_value`, `cql_penalty` (if enabled).
 
 ---
 
 ## Vector DQN objective (`mouse_core.objectives.vec_dqn`)
 
-Geometric objective for the `VecDQNHead`. Instead of scalar Q-values, each action is represented as a unit vector in `ℝ^D`. The objective trains the online action vector to point in the direction of a **reward-rotated** bootstrap target vector.
+Geometric objective for the `VectorActionValueHead` (action vectors). Instead of scalar Q-values, each action is represented as a unit vector in `ℝ^D`. The objective trains the online action vector to point in the direction of a **reward-rotated** bootstrap target vector.
 
 ```python
 from mouse_core.objectives.vec_dqn import VecDqnObjectiveConfig, vec_dqn_objective
@@ -94,8 +94,8 @@ cfg = VecDqnObjectiveConfig(
 
 loss, metrics = vec_dqn_objective(
     step_stream,
-    out["vec_dqn"],
-    out["vec_dqn_target"],
+    out["action_vector"],
+    out["action_vector_target"],
     cfg,
 )
 ```
@@ -103,7 +103,7 @@ loss, metrics = vec_dqn_objective(
 ### Algorithm
 
 1. For the executed action at step `t`, take the online vector `v(s_t, a_t)`.
-2. Find the greedy action at `s_{t+1}` using `vec_dqn_scores` on the target vectors.
+2. Find the greedy action at `s_{t+1}` using `vector_action_scores` on the target vectors.
 3. Rotate the greedy target vector by `θ = reward * reward_scale + reward_shift` using RoPE: `v_rotated = rope_rotate(v_greedy, θ)`.
 4. Minimise `1 − cosine_similarity(v(s_t, a_t), v_rotated.detach())`.
 
@@ -111,13 +111,13 @@ The rotation encodes the reward directly into the geometry of the representation
 
 ### Metrics returned
 
-`vec_dqn`, `vec_dqn_score_abs_min`, `vec_dqn_score_abs_max`, `vec_dqn_score_abs_mean`.
+`action_vector`, `action_vector_score_abs_min`, `action_vector_score_abs_max`, `action_vector_score_abs_mean`.
 
 ---
 
 ## Supervised policy objective (`mouse_core.objectives.sp`)
 
-Distils `q_star` annotations into the `sp` head logits. Six variants are available.
+Distils `q_star` annotations into the `action` head logits (the discrete action / policy head). Six variants are available.
 
 ```python
 from mouse_core.objectives.sp import SpObjectiveConfig, sp_objective
@@ -129,7 +129,7 @@ cfg = SpObjectiveConfig(
     label_smoothing=0.0,     # applied to teacher distribution only
 )
 
-loss, metrics = sp_objective(step_stream, out["sp"], cfg)
+loss, metrics = sp_objective(step_stream, out["action"], cfg)
 ```
 
 ### Loss types
@@ -147,13 +147,13 @@ All soft variants use `softmax(q_star / temperature)` as the teacher distributio
 
 ### Metrics returned
 
-`sp`.
+`action`.
 
 ---
 
 ## Supervised value objective (`mouse_core.objectives.sv`)
 
-Directly regresses the `sv` head onto `q_star` values. Only finite entries in `q_star` participate; `-inf` padding never contributes gradients.
+Directly regresses the `value` head onto `q_star` values. Only finite entries in `q_star` participate; `-inf` padding never contributes gradients.
 
 ```python
 from mouse_core.objectives.sv import SvObjectiveConfig, sv_objective
@@ -163,12 +163,12 @@ cfg = SvObjectiveConfig(
     loss_type="mse",   # "mse" or "mae"
 )
 
-loss, metrics = sv_objective(step_stream, out["sv"], cfg)
+loss, metrics = sv_objective(step_stream, out["value"], cfg)
 ```
 
 ### Metrics returned
 
-`sv`.
+`value`.
 
 ---
 

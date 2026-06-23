@@ -1,4 +1,4 @@
-"""DatasetStore — ordered sequence of arbitrary step records backed by a Hugging Face Dataset.
+"""Datastore — ordered sequence of arbitrary step records backed by a Hugging Face Dataset.
 
 A thin sequential container. It stores rows (plain dicts) in the order they
 were appended or loaded. There is no required schema or "contract" — a row can
@@ -81,7 +81,7 @@ def _interleave_tds(
     return TensorDict(result, batch_size=[n])
 
 
-class DatasetStore:
+class Datastore:
     """Ordered sequence of arbitrary rows, backed by a Hugging Face Dataset.
 
     The store does not care what is inside the rows. Each row is just a dict
@@ -116,7 +116,7 @@ class DatasetStore:
         return self._src_len + self._buf_len
 
     def __repr__(self) -> str:
-        return f"DatasetStore(steps={len(self)})"
+        return f"Datastore(steps={len(self)})"
 
     def __getitem__(self, indices: Any, **encode_kwargs) -> TensorDict:
         """Return encoded step records for the given indices as a TensorDict[N].
@@ -350,8 +350,8 @@ class DatasetStore:
         return concatenate_datasets([self._source, buf_ds])
 
     @classmethod
-    def merge_stores_to_dataset(cls, stores: list[DatasetStore]) -> Dataset:
-        """Concatenate multiple DatasetStores into one HF Dataset."""
+    def merge_stores_to_dataset(cls, stores: list[Datastore]) -> Dataset:
+        """Concatenate multiple Datastores into one HF Dataset."""
         parts = [p for s in stores if len(p := s.to_dataset()) > 0]
         return concatenate_datasets(parts) if parts else Dataset.from_list([])
 

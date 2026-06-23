@@ -1,0 +1,13 @@
+---
+description: Exactly one supported public way to accomplish any task
+alwaysApply: true
+---
+
+# One Way
+
+Exactly one public path for any outcome. No duplicate APIs, flows, or user-visible alternatives.
+
+- Choose the clearest; remove all others.
+- Do not keep the old path when introducing a preferred one — delete it in the same change.
+- Internal helpers may be private; public surface must expose only one way.
+- At end of change: confirm callers and docs have only one obvious way.

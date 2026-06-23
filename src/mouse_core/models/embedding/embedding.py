@@ -1,35 +1,37 @@
 """StepEmbedder — converts a batch of enriched step records into the per-token
 embedding sequence consumed by the sequence backbone.
 
-Each environment transition (step) produces exactly ``tokens_per_step`` embedding
-vectors.  Two modes are supported:
+Each modality declares its own token count via ``tokens`` in its spec
+(falling back to the constructor ``token_data_len`` default).  Each step produces
+exactly ``tokens_per_step`` embedding vectors.
 
 **Sum mode** (default, ``concat_modalities=False``):
 
-    Every active modality maps its data to a flat ``T * D`` vector, reshaped into
-    ``T`` tokens of dimension ``D`` and **added** to the running sum:
+    Modality contributions are summed into a shared block of width equal to the
+    *maximum* per-modality token count.  Modalities with fewer tokens affect only the
+    leading positions.
 
-        token[i] = Σ_modality  ( type_embed(modality) + content_embed(modality, i) )
-
-    ``tokens_per_step = T + K`` where ``K = num_compute_tokens``.
+        tokens_per_step = max(Tc) + K
 
 **Concat mode** (``concat_modalities=True``):
 
-    Each active modality gets its own dedicated block of ``T`` tokens in the
-    sequence, laid out sequentially rather than summed:
+    Modality blocks are concatenated in declaration order:
 
-        [modality_A × T | modality_B × T | ... | compute × K]
+        [modA × Ta | modB × Tb | ... | compute × K]
 
-    ``tokens_per_step = M * T + K`` where ``M`` is the number of active modalities
-    and ``K = num_compute_tokens``.
+    ``tokens_per_step = sum(Tc) + K``.
 
-**Compute tokens** (``num_compute_tokens > 0``):
+**Compute tokens**:
 
-    ``K`` learned scratch tokens are appended after the data tokens within every
-    step block.  They carry no input data — their embedding is a shared
-    ``nn.Parameter`` of shape ``[K, D]`` broadcast across ``(B, S)``.  The
-    backbone can use them as working memory.  The step representation is always
-    taken from the **last** token (the last compute token when ``K > 0``).
+    You can append ``K`` trailing scratch tokens with the top-level
+    ``num_compute_tokens=K`` (they are always added after all declared modalities).
+
+    You can also declare learnable blocks anywhere in the sequence by including
+    modalities with ``{"name": "...", "embed": "learnable", "tokens": N}``.  Such
+    modalities contribute learned scratch tokens at the position they appear in
+    the ``modalities`` list; the named modality does **not** need to be present in
+    the input rows (its data is ignored).  These are independent of the
+    trailing global ``num_compute_tokens``.
 
 After the backbone runs over the full ``[B, S*tokens_per_step, D]`` sequence, the
 last token within each step is used to produce one ``[D]``-vector per step.
@@ -37,7 +39,9 @@ last token within each step is used to produce one ``[D]``-vector per step.
 
 from __future__ import annotations
 
-from enum import IntEnum
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Any, ClassVar
 
 import torch
 import torch.nn as nn
@@ -47,18 +51,150 @@ from mouse_core.models.embedding.encoding import NormalizedPixel, RandomFourierF
 from mouse_core.models.embedding.linear import ScaledEmbedding, ScaledPosLinear
 
 
-class TokenType(IntEnum):
-    """Token type identifiers used by StepEmbedder when building the embedding sequence."""
+class Encoder(nn.Module, ABC):
+    """Abstract base for encoders.
 
-    PAD          = 0  # unused / padding
-    ACTION       = 1  # int64 action index (discrete)
-    REWARD       = 2  # float64 reward (continuous)
-    DONE         = 3  # int64 done flag: 0=not done, 1=terminal, 2=truncated
-    OBS_IMAGE    = 4  # image obs pixel
-    OBS_CONTINUOUS = 5  # continuous vector obs dimension
-    TIME         = 6  # int64 episode step index (the `time` field)
-    OBS_DISCRETE = 7  # discrete vector obs dimension
-    COMPUTE      = 8  # learned scratch token; carries no input data
+    An encoder is the first stage of a MOUSE model. It converts a ``TensorDict``
+    of step records ``[B, S]`` into a flat token embedding sequence
+    ``[B, T, D]`` that a backbone can process.
+
+    The encoder also defines how to extract per-step representations
+    (the vectors fed to heads for action output) from the backbone's
+    token-level hidden states via :meth:`pool_step_reprs`.
+
+    Subclasses must implement :meth:`forward` and :meth:`pool_step_reprs`,
+    and expose :attr:`hidden_dim` and :attr:`tokens_per_step`.
+    """
+
+    @property
+    @abstractmethod
+    def hidden_dim(self) -> int:
+        """Hidden dimension ``D`` of the produced embeddings."""
+        ...
+
+    @property
+    @abstractmethod
+    def tokens_per_step(self) -> int:
+        """Number of tokens produced per step record.
+
+        The backbone receives a sequence of length ``S * tokens_per_step``.
+        """
+        ...
+
+    @abstractmethod
+    def forward(self, step_stream: TensorDict) -> torch.Tensor:
+        """Encode a batch of step records into token embeddings.
+
+        Args:
+            step_stream: TensorDict ``[B, S]`` of step records. Required keys
+                depend on the concrete encoder configuration.
+
+        Returns:
+            ``embeds``: ``[B, T, D]`` with ``T = S * tokens_per_step``.
+        """
+        ...
+
+    @abstractmethod
+    def pool_step_reprs(self, h: torch.Tensor, batch_size: tuple[int, int]) -> torch.Tensor:
+        """Extract per-step representations from backbone hidden states.
+
+        After the backbone processes ``[B, T, D]`` tokens, this method maps
+        them back to one vector per step ``[B, S, D]``. These are the vectors
+        passed to output heads.
+
+        Args:
+            h: Backbone output of shape ``[B, T, D]`` where
+               ``T = S * tokens_per_step``.
+            batch_size: ``(B, S)`` — original batch dimensions.
+
+        Returns:
+            Step representations ``[B, S, D]``.
+        """
+        ...
+
+
+@dataclass
+class ModalitySpec:
+    """Specification for how to embed one modality from the input rows.
+
+    The encoder (StepEmbedder) builds the necessary sub-modules based on this
+    list (passed as the ``modalities`` argument) so that each declared modality
+    (action, reward, observations, scratch/compute, etc.) is turned into one or
+    more token embeddings.
+
+    Each modality can declare its own ``tokens`` (number of tokens it contributes
+    per step). If omitted, the constructor's ``token_data_len`` default is used.
+    This allows different modalities to map to different numbers of tokens.
+    For modalities whose token count can vary at runtime (e.g. images of varying
+    size), declare the maximum with ``tokens`` and unused slots can be marked
+    as PAD within that modality's block.
+
+    ``include_type_token`` can be set per modality to control whether the learned
+    type embedding is added for that modality's tokens (defaults to the global
+    ``include_type_token`` value if omitted from the spec).
+
+    Example::
+
+        modalities = [
+            {"name": "action", "embed": "discrete", "vocab_size": 18, "tokens": 1},
+            {"name": "reward", "embed": "rff", "tokens": 1},
+            {"name": "scratch", "embed": "learnable", "tokens": 2},  # learned scratch tokens; need not exist in data
+            {"name": "obs", "embed": "continuous", "dim": 8, "tokens": 2},
+            {"name": "img", "embed": "image", "dim": 7056, "tokens": 16},  # e.g. patches
+            {"name": "my_time", "embed": "discrete", "vocab_size": 1000, "absent": -1},
+        ]
+        enc = StepEmbedder(**{"hidden_dim": 128, "modalities": modalities})  # or pass hidden_dim + modalities directly; hidden_dim is part of the embedding config you feed to StepEmbedder
+    """
+
+    name: str
+    embed: str
+    vocab_size: int | None = None
+    dim: int | None = None
+    size: int | None = None
+    tokens: int | None = None
+    in_min: float | None = None
+    in_max: float | None = None
+    std: float | None = None
+    include_type_token: bool | None = None
+    method: str = "rff"
+    absent: Any = None
+
+    # Valid values for the ``embed`` field in ModalitySpec.
+    # These name the embedding *technique*, not the semantic role of the modality.
+    _VALID_EMBEDS: ClassVar[tuple[str, ...]] = (
+        "discrete",    # integer id → learned table (DiscreteEmbedder)
+        "rff",         # scalar → Random Fourier Features (ScalarRFFEmbedder)
+        "continuous",  # vector of scalars; ``method="rff"`` (default) or ``"linear"``
+        "image",       # pixel/patch values → normalized linear (ImageEmbedder)
+        "learnable",   # learned scratch tokens; input data ignored (LearnableEmbedder)
+    )
+    _METHOD_USING: ClassVar[tuple[str, ...]] = ("continuous",)
+    _DISCRETE_LIKE: ClassVar[tuple[str, ...]] = ("discrete",)
+
+    def __post_init__(self) -> None:
+        k = (self.embed or "").lower()
+        if k not in self._VALID_EMBEDS:
+            raise ValueError(
+                f"unknown embed kind {self.embed!r} for modality {self.name!r}; "
+                f"expected one of {self._VALID_EMBEDS}"
+            )
+        if self.method not in (None, "rff", "linear"):
+            m = str(self.method).lower()
+            if m not in ("rff", "linear"):
+                raise ValueError(
+                    f"unknown method {self.method!r} for modality {self.name!r}; expected 'rff' or 'linear'"
+                )
+            object.__setattr__(self, "method", m)
+        else:
+            if self.method is None:
+                object.__setattr__(self, "method", "rff")
+            elif isinstance(self.method, str):
+                object.__setattr__(self, "method", self.method.lower())
+        if self.embed != k:
+            object.__setattr__(self, "embed", k)
+
+        # If method is a non-default on a kind that doesn't use it, callers will enforce;
+        # here we just ensure the value itself is valid (done above).
 
 
 # ---------------------------------------------------------------------------
@@ -67,76 +203,29 @@ class TokenType(IntEnum):
 
 
 class TypeEmbedder(nn.Module):
-    """Shared token-type embedding table. Maps a ``TokenType`` → ``[N, T*D]``."""
+    """Shared token-type embedding table.
 
-    def __init__(self, hidden_dim: int, token_data_len: int, embedding_std: float = 0.02) -> None:
-        super().__init__()
-        self.embed = ScaledEmbedding(num_embeddings=8, embedding_dim=hidden_dim * token_data_len, scale=embedding_std)
-
-    def forward(self, token_type: TokenType, shape: tuple[int, ...], device: torch.device) -> torch.Tensor:
-        ids = torch.full(shape, int(token_type), device=device, dtype=torch.long)
-        return self.embed(ids)
-
-
-class ActionEmbedder(nn.Module):
-    """Embeds a discrete action id → flat content vector ``[N, T*D]``."""
-
-    def __init__(self, hidden_dim: int, token_data_len: int, max_num_actions: int, embedding_std: float = 0.02) -> None:
-        super().__init__()
-        self.embed = ScaledEmbedding(
-            num_embeddings=max_num_actions, embedding_dim=hidden_dim * token_data_len, scale=embedding_std
-        )
-
-    def forward(self, action: torch.Tensor) -> torch.Tensor:
-        """Args:
-            action: ``[N]`` int64 action indices.
-        Returns:
-            ``[N, T*D]`` content embedding.
-        """
-        return self.embed(action)
-
-
-class TimeEmbedder(nn.Module):
-    """Embeds episode step index → flat content vector ``[N, T*D]``.
-
-    Positions with ``time_idx < 0`` are treated as absent and produce a zero vector.
+    Maps a small integer id (from the encoder-assigned token_type tensor)
+    to a learned [D] vector that is added to tokens of that id when
+    ``include_type_token`` is enabled for the modality (or globally).
     """
 
-    def __init__(
-        self, hidden_dim: int, token_data_len: int, max_num_time_steps: int, embedding_std: float = 0.02
-    ) -> None:
+    def __init__(self, hidden_dim: int, embedding_std: float = 0.02) -> None:
         super().__init__()
-        self.embed = ScaledEmbedding(
-            num_embeddings=max_num_time_steps, embedding_dim=hidden_dim * token_data_len, scale=embedding_std
-        )
+        # Per-token type embedding (added to each token of that type).
+        self.embed = ScaledEmbedding(num_embeddings=64, embedding_dim=hidden_dim, scale=embedding_std)
 
-    def forward(self, time_idx: torch.Tensor) -> torch.Tensor:
-        """Args:
-            time_idx: ``[N]`` int64; negative values mean the field is absent.
-        Returns:
-            ``[N, T*D]`` content embedding (zero where time_idx < 0).
-        """
-        return self.embed(time_idx)
+    def forward(self, type_id: int, shape: tuple[int, ...], device: torch.device) -> torch.Tensor:
+        ids = torch.full(shape, int(type_id), device=device, dtype=torch.long)
+        return self.embed(ids)  # [..., D]
 
 
-class DoneEmbedder(nn.Module):
-    """Embeds a ternary done flag → flat content vector ``[N, T*D]``."""
+class ScalarRFFEmbedder(nn.Module):
+    """Embeds a scalar via Random Fourier Features → flat content vector ``[N, T*D]``.
 
-    def __init__(self, hidden_dim: int, token_data_len: int, embedding_std: float = 0.02) -> None:
-        super().__init__()
-        self.embed = ScaledEmbedding(num_embeddings=3, embedding_dim=hidden_dim * token_data_len, scale=embedding_std)
-
-    def forward(self, done: torch.Tensor) -> torch.Tensor:
-        """Args:
-            done: ``[N]`` int64 in {0, 1, 2}.
-        Returns:
-            ``[N, T*D]`` content embedding.
-        """
-        return self.embed(done)
-
-
-class RewardEmbedder(nn.Module):
-    """Embeds a scalar reward via Random Fourier Features → flat content vector ``[N, T*D]``."""
+    Used when ``embed="rff"`` (canonical name for scalar RFF). The embedding
+    technique is independent of the modality's semantic ``name``.
+    """
 
     def __init__(
         self,
@@ -152,20 +241,22 @@ class RewardEmbedder(nn.Module):
             num_features=hidden_dim * token_data_len, in_min=in_min, in_max=in_max, output_scale=rff_scale
         )
 
-    def forward(self, reward: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Args:
-            reward: ``[N]`` float32 scalar rewards.
+            x: ``[N]`` float32 scalar values.
         Returns:
             ``[N, T*D]`` content embedding.
         """
-        return self.rff(reward, 0)
+        return self.rff(x, 0)
 
 
-class ObsContinuousEmbedder(nn.Module):
-    """Embeds continuous observations → flat content vector ``[N, T*D]``.
+class VectorRFFEmbedder(nn.Module):
+    """Embeds a vector of scalars via per-element Random Fourier Features → ``[N, T*D]``.
 
-    Each obs dimension is projected via a position-indexed RFF; all contributions
-    are summed to give the final ``[N, T*D]`` output.
+    Each coordinate is projected with its own frequency set (position-indexed RFF).
+    All contributions are combined (summed or arranged) to produce the content embedding.
+    This is the technique used for continuous/vector modalities when ``method="rff"``.
+    The semantic role (obs, state, etc.) does not affect the embedding code.
     """
 
     def __init__(
@@ -186,38 +277,39 @@ class ObsContinuousEmbedder(nn.Module):
             num_freq_sets=max_num_obs, output_scale=rff_scale,
         )
 
-    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Args:
-            obs: ``[*batch, d]`` float32 observations, ``d`` may be <= ``max_num_obs``.
-                 Extra capacity is zero-padded internally.
+            x: ``[*batch, d]`` float32 vector, ``d`` may be <= ``max_num_obs``.
+               Extra capacity is zero-padded internally.
         Returns:
             ``[*batch, T*D]`` content embedding.
         """
-        obs = obs.float()
-        d = obs.shape[-1]
+        x = x.float()
+        d = x.shape[-1]
         m = self.max_num_obs
         if d >= m:
-            obs_use = obs[..., :m]
+            x_use = x[..., :m]
         else:
-            pad = torch.zeros((*obs.shape[:-1], m - d), device=obs.device, dtype=obs.dtype)
-            obs_use = torch.cat([obs, pad], dim=-1)
-        positions = torch.arange(m, device=obs.device).expand_as(obs_use)
-        return self.rff(obs_use, positions).sum(dim=-2)
+            pad = torch.zeros((*x.shape[:-1], m - d), device=x.device, dtype=x.dtype)
+            x_use = torch.cat([x, pad], dim=-1)
+        positions = torch.arange(m, device=x.device).expand_as(x_use)
+        return self.rff(x_use, positions).sum(dim=-2)
 
 
-class ObsContinuousLinearEmbedder(nn.Module):
-    """Embeds continuous observations → flat content vector ``[N, T*D]``.
+class VectorLinearEmbedder(nn.Module):
+    """Embeds a vector of scalars via per-element learned linear projections → ``[N, T*D]``.
 
-    Each obs dimension is projected via a position-specific learned linear map
-    applied directly to the scalar value; all contributions are summed to give
-    the final ``[N, T*D]`` output.  Unlike :class:`ObsContinuousEmbedder` this
-    uses no random features — the obs value scales a learned direction.
+    Each coordinate is mapped by a position-specific linear layer applied to the scalar;
+    contributions are combined to form the content embedding. No random features are used;
+    the input value directly scales a learned direction.
+
+    This is the technique for continuous/vector modalities when ``method="linear"``.
 
     Args:
         hidden_dim: Model hidden dimension ``D``.
-        max_num_obs: Length of the continuous obs vector.
+        max_num_obs: Length of the input vector.
         token_data_len: Number of tokens ``T`` per step.
-        input_std: Expected std of the incoming obs values, used to normalise
+        input_std: Expected std of the incoming values, used to normalise
             the linear initialisation.  Defaults to ``1.0``.
         embedding_std: Desired output std of the embedding.  Defaults to ``0.02``.
     """
@@ -232,42 +324,52 @@ class ObsContinuousLinearEmbedder(nn.Module):
     ) -> None:
         super().__init__()
         self.max_num_obs = max_num_obs
-        # Kaiming uniform for in_features=1 has std = 1/√3 (Uniform[-1,1]).
-        # ScaledPosLinear multiplies those weights by scale, so per-dim output std =
-        # scale × (1/√3) × input_std.  Divide scale by (1/√3) × √max_num_obs to
-        # hit embedding_std after summing max_num_obs independent dims.
+        self._one_token_per_elem = (token_data_len == max_num_obs)
+        out_tok = 1 if self._one_token_per_elem else token_data_len
+        # When one_token_per_elem, each position maps to its own D (no sum).
+        # Otherwise we sum over positions into T tokens.
         _kaiming_std = 3.0 ** -0.5
+        scale = embedding_std / (_kaiming_std * input_std)
+        if not self._one_token_per_elem:
+            scale = scale / (max_num_obs ** 0.5)
         self.projs = ScaledPosLinear(
             num_positions=max_num_obs,
             in_features=1,
-            out_features=hidden_dim * token_data_len,
-            scale=embedding_std / (_kaiming_std * input_std),
+            out_features=hidden_dim * out_tok,
+            scale=scale,
         )
 
-    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Args:
-            obs: ``[*batch, d]`` float32 observations, ``d`` may be <= ``max_num_obs``.
-                 Extra capacity is zero-padded internally.
+            x: ``[*batch, d]`` float32 vector, ``d`` may be <= ``max_num_obs``.
+               Extra capacity is zero-padded internally.
         Returns:
-            ``[*batch, T*D]`` content embedding.
+            ``[*batch, T*D]`` content embedding. If token_data_len == max_num_obs,
+            this is arranged as one token per input element (no summing).
         """
-        obs = obs.float()
-        d = obs.shape[-1]
+        x = x.float()
+        d = x.shape[-1]
         m = self.max_num_obs
         if d >= m:
-            obs_use = obs[..., :m]
+            x_use = x[..., :m]
         else:
-            pad = torch.zeros((*obs.shape[:-1], m - d), device=obs.device, dtype=obs.dtype)
-            obs_use = torch.cat([obs, pad], dim=-1)
-        positions = torch.arange(m, device=obs.device).expand_as(obs_use)
-        return self.projs(obs_use.unsqueeze(-1), positions).sum(dim=-2)
+            pad = torch.zeros((*x.shape[:-1], m - d), device=x.device, dtype=x.dtype)
+            x_use = torch.cat([x, pad], dim=-1)
+        positions = torch.arange(m, device=x.device).expand_as(x_use)
+        out = self.projs(x_use.unsqueeze(-1), positions)  # [*, m, out_tok * D]
+        if self._one_token_per_elem:
+            # Each position maps to its own D token. out is [*, m, D]
+            flat = out.reshape(*out.shape[:-2], m * (out.shape[-1]))
+            return flat
+        return out.sum(dim=-2)  # sum over elements into T*D
 
 
-class ObsDiscreteEmbedder(nn.Module):
-    """Embeds a scalar discrete state index → flat content vector ``[N, T*D]``.
+class ImageEmbedder(nn.Module):
+    """Embeds a vector of (normalized) pixel / patch values via per-position linear maps → ``[N, T*D]``.
 
-    The state index is looked up in a learned embedding table of size
-    ``max_num_obs`` (the state-space cardinality).
+    Each element is normalized then projected by a position-specific linear layer.
+    Contributions are combined (sum or one-per-element) to form the content embedding.
+    Used for any image/pixel modality regardless of whether it is called "obs", "pixels", etc.
     """
 
     def __init__(
@@ -279,69 +381,101 @@ class ObsDiscreteEmbedder(nn.Module):
     ) -> None:
         super().__init__()
         self.max_num_obs = max_num_obs
-        # Summing max_num_obs independent N(0, scale) rows inflates std by √max_num_obs.
-        # Note: if obs values are uniform integers in [0, max_num_obs-1], collisions further
-        # inflate by ≈√(2·max_num_obs-1)/√max_num_obs; √max_num_obs is a reasonable approximation.
-        self.embed = ScaledEmbedding(
-            num_embeddings=max_num_obs, embedding_dim=hidden_dim * token_data_len,
-            scale=embedding_std / max_num_obs ** 0.5,
-        )
-
-    def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        """Args:
-            obs: ``[*batch]`` int64 discrete state index.
-        Returns:
-            ``[*batch, T*D]`` content embedding.
-        """
-        return self.embed(obs)
-
-
-class ObsImageEmbedder(nn.Module):
-    """Embeds image pixels → flat content vector ``[N, T*D]``.
-
-    Each pixel is projected via a position-specific linear map on the normalised
-    pixel value; all contributions are summed to give the final ``[N, T*D]`` output.
-    """
-
-    def __init__(
-        self,
-        hidden_dim: int,
-        max_num_obs: int,
-        token_data_len: int,
-        embedding_std: float = 0.02,
-    ) -> None:
-        super().__init__()
-        self.max_num_obs = max_num_obs
-        # pixel_norm_std: std of NormalizedPixel output  ≈ std of Uniform[-1,1] = 1/√3
-        # _kaiming_std:   std of Kaiming-uniform weights for in_features=1 = 1/√3
-        # per-dim output std = scale × _kaiming_std × pixel_norm_std
-        # Divide scale by that product × √max_num_obs to hit embedding_std after summing.
+        self._one_token_per_elem = (token_data_len == max_num_obs)
+        out_tok = 1 if self._one_token_per_elem else token_data_len
+        # When one_token_per_elem, each pixel/patch maps to its own token of D.
         pixel_norm_std = 3.0 ** -0.5
         _kaiming_std = 3.0 ** -0.5
         self.norm = NormalizedPixel()
+        scale = embedding_std / (_kaiming_std * pixel_norm_std)
+        if not self._one_token_per_elem:
+            scale = scale / (max_num_obs ** 0.5)
         self.projs = ScaledPosLinear(
-            num_positions=max_num_obs, in_features=1, out_features=hidden_dim * token_data_len,
-            scale=embedding_std / (_kaiming_std * pixel_norm_std * max_num_obs ** 0.5),
+            num_positions=max_num_obs, in_features=1, out_features=hidden_dim * out_tok,
+            scale=scale,
         )
 
-    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Args:
-            obs: ``[*batch, d]`` int64/float pixel values, ``d`` may be <= ``max_num_obs``.
-                 Extra capacity is zero-padded internally.
+            x: ``[*batch, d]`` int64/float pixel values, ``d`` may be <= ``max_num_obs``.
+               Extra capacity is zero-padded internally.
         Returns:
-            ``[*batch, T*D]`` content embedding.
+            ``[*batch, T*D]`` content embedding. If token_data_len == max_num_obs,
+            this yields one token per input element (no summing across elements).
         """
-        obs = obs.float()
-        d = obs.shape[-1]
+        x = x.float()
+        d = x.shape[-1]
         m = self.max_num_obs
         if d >= m:
-            obs_use = obs[..., :m]
+            x_use = x[..., :m]
         else:
-            pad = torch.zeros((*obs.shape[:-1], m - d), device=obs.device, dtype=obs.dtype)
-            obs_use = torch.cat([obs, pad], dim=-1)
-        positions = torch.arange(m, device=obs.device).expand_as(obs_use)
-        normalized = self.norm(obs_use).unsqueeze(-1)            # [*batch, m, 1]
-        return self.projs(normalized, positions).sum(dim=-2)
+            pad = torch.zeros((*x.shape[:-1], m - d), device=x.device, dtype=x.dtype)
+            x_use = torch.cat([x, pad], dim=-1)
+        positions = torch.arange(m, device=x.device).expand_as(x_use)
+        normalized = self.norm(x_use).unsqueeze(-1)            # [*batch, m, 1]
+        out = self.projs(normalized, positions)  # [*, m, out_tok * D]
+        if self._one_token_per_elem:
+            return out.reshape(*out.shape[:-2], m * out.shape[-1])
+        return out.sum(dim=-2)
+
+
+class DiscreteEmbedder(nn.Module):
+    """Embeds discrete integer indices via a learned table → ``[N, T*D]``.
+
+    If ``absent_value`` is provided, positions holding that value yield the
+    zero vector (they are mapped through embed(0) then zeroed).
+
+    This is the technique for modalities declared with ``embed="discrete"``.
+    The modality ``name`` does not affect how the indices are embedded.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        token_data_len: int,
+        vocab_size: int,
+        absent_value: int | None = None,
+        embedding_std: float = 0.02,
+    ) -> None:
+        super().__init__()
+        if vocab_size <= 0:
+            raise ValueError("vocab_size must be > 0 for discrete embedder")
+        self.absent_value = absent_value
+        self.embed = ScaledEmbedding(
+            num_embeddings=vocab_size,
+            embedding_dim=hidden_dim * token_data_len,
+            scale=embedding_std,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.long()
+        if self.absent_value is not None:
+            mask = x == self.absent_value
+            safe = x.masked_fill(mask, 0)
+            out = self.embed(safe)
+            out = torch.where(mask.unsqueeze(-1), torch.zeros_like(out), out)
+            return out
+        return self.embed(x)
+
+
+class LearnableEmbedder(nn.Module):
+    """Learned scratch tokens for a declared learnable modality.
+
+    The input value for this modality (if any) is ignored. The tokens are
+    pure learned parameters placed at the position of the modality in the
+    ``modalities`` declaration order. Technique is independent of the
+    modality's ``name``.
+    """
+
+    def __init__(self, num_tokens: int, hidden_dim: int, std: float = 0.02):
+        super().__init__()
+        self.num_tokens = int(num_tokens)
+        self.embed = nn.Parameter(torch.empty(self.num_tokens, hidden_dim))
+        nn.init.normal_(self.embed, std=std)
+
+    def forward(self, x: torch.Tensor | None = None) -> torch.Tensor:
+        # Return base [Tc, D]. Expansion to [B, S, Tc, D] is done by caller.
+        return self.embed
 
 
 # ---------------------------------------------------------------------------
@@ -349,24 +483,27 @@ class ObsImageEmbedder(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class StepEmbedder(nn.Module):
+class StepEmbedder(Encoder):
     """Converts a batch of step records ``[B, S]`` into embedding sequences ``[B, S*T, D]``.
 
     ``tokens_per_step`` is fixed at construction time so that the backbone always
     receives a consistently-shaped input.
 
+    Modalities declare their token counts individually (see :class:`ModalitySpec`).
+    The global ``token_data_len`` is used only as a default for modalities that omit
+    an explicit ``tokens`` value.
+
     Two embedding modes are available:
 
     **Sum mode** (``concat_modalities=False``, default):
-        Every modality contributes ``token_data_len`` tokens; contributions are
-        **summed** at each position so the output is always exactly
-        ``token_data_len`` data tokens per step regardless of which modalities
-        are active.
+        Contributions are summed into a block whose size is the *max* per-modality
+        token count.  A modality with ``Tc`` tokens writes to the first ``Tc``
+        positions of that shared block.
 
     **Concat mode** (``concat_modalities=True``):
-        Each active modality occupies its own dedicated block of ``token_data_len``
-        tokens, laid out sequentially.
-        ``tokens_per_step = num_active_modalities * token_data_len + num_compute_tokens``.
+        The data tokens for each step are the concatenation of per-modality blocks,
+        in the exact order the modalities appear in the ``modalities`` list.
+        ``tokens_per_step = sum(Tc) + num_compute_tokens``.
 
     **Compute tokens** (``num_compute_tokens > 0``):
         ``K`` learned scratch tokens are appended after the data tokens in every
@@ -374,162 +511,269 @@ class StepEmbedder(nn.Module):
         memory.  The step representation is always pooled from the **last** token
         (the last compute token when ``K > 0``).
 
+    Each modality may specify its own ``tokens`` count (see :class:`ModalitySpec`).
+    If a modality omits it, the constructor's ``token_data_len`` acts as the default.
+
+    **Sum mode** (``concat_modalities=False``, default):
+        Modality contributions are summed into a shared block whose size is the
+        *maximum* per-modality token count.  A modality with fewer tokens contributes
+        only to the leading positions within that block (remaining positions are
+        unaffected by that modality).
+
+    **Concat mode** (``concat_modalities=True``):
+        Modality blocks are concatenated in modality order.  A modality with ``Tc``
+        tokens occupies exactly ``Tc`` positions.
+        ``tokens_per_step = sum(Tc for modalities) + num_compute_tokens``.
+
     Args:
         hidden_dim: Model hidden dimension ``D``.
-        max_num_actions: Size of the action embedding table.
-        max_num_obs_continuous: Continuous obs vector length; must be > 0 when include_obs_continuous is True.
-        max_num_obs_discrete: Discrete obs vector length; must be > 0 when include_obs_discrete is True.
-        max_num_obs_image: Total pixel count per image; must be > 0 when include_obs_image is True.
-        max_num_time_steps: TIME embedding table size; must be > 0 when include_time_token is True.
-        include_action_token: Emit an ACTION token per step.
-        include_done_token: Emit a DONE token per step.
-        include_reward_token: Emit a REWARD token per step.
-        include_obs_continuous: Emit an OBS_CONTINUOUS token per step.
-        include_obs_discrete: Emit an OBS_DISCRETE token per step.
-        include_obs_image: Emit an OBS_IMAGE token per step.
-        include_time_token: Emit a TIME token per step.
-        include_type_token: Add the learned type embedding to every token.
-        token_data_len: Number of tokens ``T`` produced per modality.
+        modalities: Declarative list of modality specs. Each may include a ``tokens``
+            field to set how many tokens that modality contributes per step.
+        token_data_len: Default number of tokens per modality when the modality spec
+            does not specify its own ``tokens``.
         num_compute_tokens: Number of learned scratch tokens ``K`` appended after
             the data tokens within each step block.  ``0`` disables compute tokens.
         concat_modalities: When ``True``, modality embeddings are concatenated
-            sequentially rather than summed.  Each active modality occupies its
-            own ``token_data_len`` slots.
-        fourier_in_min: Smallest input value the RFF resolves.
-        fourier_in_max: Largest input value the RFF covers.
+            sequentially rather than summed.
+        include_type_token: Add the learned type embedding to every token.
+            Can be overridden per modality via ``include_type_token`` in the modality spec.
+        fourier_min: Smallest input value the RFF resolves.
+        fourier_max: Largest input value the RFF covers.
         std: Initialisation std for embedding tables.
     """
 
     def __init__(
         self,
         hidden_dim: int,
-        max_num_actions: int,
-        max_num_obs_continuous: int,
-        max_num_obs_discrete: int,
-        max_num_obs_image: int,
-        max_num_time_steps: int,
-        include_action_token: bool,
-        include_done_token: bool,
-        include_reward_token: bool,
-        include_obs_continuous: bool,
-        include_obs_discrete: bool,
-        include_obs_image: bool,
-        include_time_token: bool,
-        include_type_token: bool,
-        token_data_len: int,
+        modalities: list[dict[str, Any] | ModalitySpec] | None = None,
+        token_data_len: int = 1,
         num_compute_tokens: int = 0,
         concat_modalities: bool = False,
-        fourier_in_min: float = -1.0,
-        fourier_in_max: float = 1.0,
+        include_type_token: bool = True,
+        fourier_min: float = 0.01,
+        fourier_max: float = 10.0,
         std: float = 0.02,
     ) -> None:
         super().__init__()
 
-        _size_checks = [
-            ("include_action_token", include_action_token, "max_num_actions", max_num_actions),
-            ("include_obs_continuous", include_obs_continuous, "max_num_obs_continuous", max_num_obs_continuous),
-            ("include_obs_discrete", include_obs_discrete, "max_num_obs_discrete", max_num_obs_discrete),
-            ("include_obs_image", include_obs_image, "max_num_obs_image", max_num_obs_image),
-            ("include_time_token", include_time_token, "max_num_time_steps", max_num_time_steps),
-        ]
-        for inc_name, inc_val, size_name, size_val in _size_checks:
-            if inc_val and int(size_val) <= 0:
-                raise ValueError(f"{inc_name} is True but {size_name} is {size_val} (must be > 0).")
-
         if int(num_compute_tokens) < 0:
             raise ValueError(f"num_compute_tokens must be >= 0, got {num_compute_tokens}.")
 
-        self.hidden_dim = int(hidden_dim)
-        self.include_action_token = bool(include_action_token)
-        self.include_time_token = bool(include_time_token)
-        self.include_done_token = bool(include_done_token)
-        self.include_reward_token = bool(include_reward_token)
-        self.include_obs_continuous = bool(include_obs_continuous)
-        self.include_obs_discrete = bool(include_obs_discrete)
-        self.include_obs_image = bool(include_obs_image)
+        if modalities is None:
+            modalities = []
+
+        self.modalities: list[ModalitySpec] = []
+        for c in (modalities or []):
+            if isinstance(c, dict):
+                self.modalities.append(ModalitySpec(**c))
+            else:
+                self.modalities.append(c)
+
+        # Validation for sized modalities (learnable modalities need no vocab/dim)
+        for cs in self.modalities:
+            k = cs.embed
+            if k == "learnable":
+                continue
+            if k == "discrete":
+                vs = cs.vocab_size or cs.size or 0
+                if vs <= 0:
+                    raise ValueError(f"modality {cs.name!r} (discrete) requires positive vocab_size")
+            if k in {"continuous", "image"}:
+                d = cs.dim or cs.size or 0
+                if d <= 0:
+                    raise ValueError(f"modality {cs.name!r} requires positive dim/size")
+
+        # Applicability checks: error on arguments supplied for the wrong modality kind
+        # rather than silently ignoring them.
+        for cs in self.modalities:
+            k = cs.embed
+            is_discrete = k in ModalitySpec._DISCRETE_LIKE
+            is_method_using = k in ModalitySpec._METHOD_USING
+
+            if cs.method != "rff" and not is_method_using:
+                raise ValueError(
+                    f"modality {cs.name!r} (embed={k}) does not support method={cs.method!r}; "
+                    f"method only applies to continuous (with linear vs rff choice)"
+                )
+
+            if cs.absent is not None and not is_discrete:
+                raise ValueError(
+                    f"modality {cs.name!r} (embed={k}) does not support 'absent'; "
+                    f"'absent' only applies to discrete modalities"
+                )
+
+            # in_min/in_max are only meaningful for RFF-using embedders (rff or continuous with rff)
+            uses_rff_ranges = (k == "rff") or (is_method_using and cs.method != "linear")
+            if (cs.in_min is not None or cs.in_max is not None) and not uses_rff_ranges:
+                raise ValueError(
+                    f"modality {cs.name!r} (embed={k}) does not use in_min/in_max; "
+                    f"those apply to rff or continuous (when not using linear)"
+                )
+
+        self._hidden_dim = int(hidden_dim)
         self.include_type_token = bool(include_type_token)
         self.num_compute_tokens = int(num_compute_tokens)
         self.concat_modalities = bool(concat_modalities)
-        self.token_data_len = int(token_data_len)
+        self.token_data_len = int(token_data_len)  # default for modalities without explicit tokens
+        self.fourier_min = float(fourier_min)
+        self.fourier_max = float(fourier_max)
+        self.std = float(std)
 
-        # Count active data modalities (determines tokens_per_step in concat mode).
-        self._num_data_modalities: int = sum([
-            include_time_token,
-            include_action_token,
-            include_obs_continuous,
-            include_obs_discrete,
-            include_obs_image,
-            include_reward_token,
-            include_done_token,
-        ])
+        # Per-modality token counts (fall back to global default)
+        self._modality_tokens: dict[str, int] = {}
+        self._modality_include_type: dict[str, bool] = {}
+        self._learnable_modalities: set[str] = set()
+        for cs in self.modalities:
+            tc = cs.tokens if (cs.tokens is not None) else self.token_data_len
+            if tc <= 0:
+                raise ValueError(f"modality {cs.name!r} has non-positive tokens ({tc})")
+            self._modality_tokens[cs.name] = int(tc)
 
-        # Compute tokens_per_step.
-        T = self.token_data_len
+            # Per-modality include_type_token overrides the global default
+            col_type = cs.include_type_token
+            self._modality_include_type[cs.name] = bool(col_type) if col_type is not None else self.include_type_token
+
+            if cs.embed.lower() == "learnable":
+                self._learnable_modalities.add(cs.name)
+
         K = self.num_compute_tokens
         if concat_modalities:
-            data_slots = self._num_data_modalities * T
+            data_slots = sum(self._modality_tokens.values())
         else:
-            data_slots = T
-        self.tokens_per_step: int = data_slots + K
+            data_slots = max(self._modality_tokens.values()) if self._modality_tokens else 0
+        self._tokens_per_step: int = data_slots + K
 
-        # Shared type embedding (only used internally, not in returned token_types).
-        self.type_embedder = TypeEmbedder(hidden_dim=hidden_dim, token_data_len=T, embedding_std=std)
+        # Type embedder now produces per-token [D] vectors
+        self.type_embedder = TypeEmbedder(hidden_dim=hidden_dim, embedding_std=std)
 
-        # Action (optional)
-        self.action_embedder = (
-            ActionEmbedder(hidden_dim=hidden_dim, token_data_len=T, max_num_actions=int(max_num_actions), embedding_std=std)
-            if include_action_token else None
-        )
+        self.modality_embedders = nn.ModuleDict()
+        self._modality_token_types: dict[str, int] = {}
+        tid = 1
+        # Assign token-type ids in the exact order of the modalities list.
+        for cs in self.modalities:
+            Tc = self._modality_tokens[cs.name]
+            emb = self._create_embedder_for_modality(cs, hidden_dim, Tc, std)
+            self.modality_embedders[cs.name] = emb
+            self._modality_token_types[cs.name] = tid
+            tid += 1
 
-        # Time (optional)
-        self.time_embedder = (
-            TimeEmbedder(hidden_dim=hidden_dim, token_data_len=T, max_num_time_steps=int(max_num_time_steps), embedding_std=std)
-            if include_time_token else None
-        )
-
-        # Done (optional)
-        self.done_embedder = (
-            DoneEmbedder(hidden_dim=hidden_dim, token_data_len=T, embedding_std=std)
-            if include_done_token else None
-        )
-
-        # Reward (optional)
-        self.reward_embedder = (
-            RewardEmbedder(hidden_dim=hidden_dim, token_data_len=T, in_min=fourier_in_min, in_max=fourier_in_max, embedding_std=std)
-            if include_reward_token else None
-        )
-
-        # Continuous obs (optional)
-        if include_obs_continuous:
-            self.obs_continuous_embedder = ObsContinuousEmbedder(
-                hidden_dim=hidden_dim, max_num_obs=int(max_num_obs_continuous), token_data_len=T,
-                in_min=fourier_in_min, in_max=fourier_in_max, embedding_std=std,
-            )
-        else:
-            self.obs_continuous_embedder = None
-
-        # Discrete obs (optional)
-        self.obs_discrete_embedder = (
-            ObsDiscreteEmbedder(
-                hidden_dim=hidden_dim, max_num_obs=int(max_num_obs_discrete), token_data_len=T, embedding_std=std
-            )
-            if include_obs_discrete else None
-        )
-
-        # Image obs (optional)
-        self.obs_image_embedder = (
-            ObsImageEmbedder(
-                hidden_dim=hidden_dim, max_num_obs=int(max_num_obs_image), token_data_len=T, embedding_std=std
-            )
-            if include_obs_image else None
-        )
-
-        # Compute tokens — one shared learned embedding per compute slot, broadcast over (B, S).
         if K > 0:
             self.compute_embed = nn.Parameter(torch.empty(K, int(hidden_dim)))
             nn.init.normal_(self.compute_embed, std=std)
         else:
             self.compute_embed = None  # type: ignore[assignment]
+
+    # ------------------------------------------------------------------
+    # Encoder interface
+    # ------------------------------------------------------------------
+
+    @property
+    def hidden_dim(self) -> int:
+        return self._hidden_dim
+
+    @property
+    def tokens_per_step(self) -> int:
+        return self._tokens_per_step
+
+    def pool_step_reprs(self, h: torch.Tensor, batch_size: tuple[int, int]) -> torch.Tensor:
+        """Extract step representations: last token of each step block.
+
+        The step representation is always the final token within each step's
+        token block (the last compute token when ``num_compute_tokens > 0``,
+        otherwise the last data token). This is the vector passed to heads.
+        """
+        B, S = batch_size
+        T = self._tokens_per_step
+        D = self._hidden_dim
+        return h.view(B, S, T, D)[:, :, -1, :]
+
+    def _create_embedder_for_modality(self, spec: ModalitySpec, hidden_dim: int, T: int, std: float) -> nn.Module:
+        k = spec.embed.lower()
+        nm = spec.name
+
+        # Per-modality range (for RFF/continuous/image); falls back to the
+        # embedder's global fourier_min/fourier_max defaults.
+        im = spec.in_min if spec.in_min is not None else self.fourier_min
+        ix = spec.in_max if spec.in_max is not None else self.fourier_max
+
+        # Per-modality std overrides the global one passed for this embedder
+        mod_std = spec.std if spec.std is not None else std
+
+        if k == "discrete":
+            vs = spec.vocab_size or spec.size or 0
+            absv = spec.absent
+            if absv is None and nm == "time":
+                absv = -1
+            return DiscreteEmbedder(hidden_dim, T, vs, absent_value=absv, embedding_std=mod_std)
+
+        if k == "rff":
+            return ScalarRFFEmbedder(hidden_dim, T, in_min=im, in_max=ix, embedding_std=mod_std)
+
+        if k == "continuous":
+            d = spec.dim or spec.size or 0
+            if (spec.method or "rff").lower() == "linear":
+                return VectorLinearEmbedder(hidden_dim, max_num_obs=d, token_data_len=T, input_std=1.0, embedding_std=mod_std)
+            return VectorRFFEmbedder(hidden_dim, max_num_obs=d, token_data_len=T, in_min=im, in_max=ix, embedding_std=mod_std)
+
+        if k == "image":
+            p = spec.dim or spec.size or 0
+            return ImageEmbedder(hidden_dim, max_num_obs=p, token_data_len=T, embedding_std=mod_std)
+
+        if k == "learnable":
+            return LearnableEmbedder(T, hidden_dim, std=mod_std)
+
+        raise ValueError(f"unknown embed kind {spec.embed!r} for modality {nm!r}")
+
+    @staticmethod
+    def infer_max_num_actions(embedding_kwargs: dict | object | None) -> int:
+        """Extract action cardinality from the modalities list (action modality's vocab_size).
+
+        Accepts:
+          - the original embedding_kwargs dict (with "modalities"), or
+          - a StepEmbedder instance (uses its .modalities), or
+          - None / empty (returns 0).
+        """
+        if embedding_kwargs is None:
+            return 0
+        # If it's (or behaves like) a StepEmbedder, use its stored modalities
+        mods = getattr(embedding_kwargs, "modalities", None)
+        if mods is not None:
+            for c in mods:
+                if getattr(c, "name", None) == "action":
+                    return int(getattr(c, "vocab_size", 0) or getattr(c, "size", 0) or 0)
+            return 0
+        # Otherwise treat as dict
+        d = embedding_kwargs or {}
+        if isinstance(d, dict) and "modalities" in d:
+            for c in d["modalities"]:
+                if isinstance(c, dict) and c.get("name") == "action":
+                    return int(c.get("vocab_size") or c.get("size") or 0)
+                if getattr(c, "name", None) == "action":
+                    return int(getattr(c, "vocab_size", 0) or getattr(c, "size", 0) or 0)
+        return 0
+
+    def _default_value_for(self, spec: ModalitySpec, B: int, S: int, device: torch.device) -> torch.Tensor:
+        """Synthesize a default (absent) tensor when a declared modality is missing from the batch."""
+        k = spec.embed.lower()
+        if k == "learnable":
+            # Learnable modalities never read data; return a dummy (should not be used).
+            return torch.zeros((B, S), device=device)
+        dtype = torch.long if k == "discrete" else torch.get_default_dtype()
+        if k == "discrete":
+            absv = spec.absent
+            if absv is not None:
+                return torch.full((B, S), int(absv), device=device, dtype=torch.long)
+            return torch.zeros((B, S), device=device, dtype=torch.long)
+        if k == "rff":
+            return torch.zeros((B, S), device=device, dtype=dtype)
+        if k == "continuous":
+            d = spec.dim or spec.size or 0
+            return torch.zeros((B, S, max(int(d), 0)), device=device, dtype=dtype)
+        if k == "image":
+            p = spec.dim or spec.size or 0
+            return torch.zeros((B, S, max(int(p), 0)), device=device, dtype=dtype)
+        # fallback scalar 0
+        return torch.zeros((B, S), device=device, dtype=dtype)
 
     # ------------------------------------------------------------------
     # Forward
@@ -538,206 +782,123 @@ class StepEmbedder(nn.Module):
     def forward(
         self,
         step_stream: TensorDict,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         """Embed a batch of steps.
 
         Args:
             step_stream: TensorDict of shape ``[B, S]``.
 
         Returns:
-            embeds:      ``[B, S*tokens_per_step, D]`` — per-position embedding vectors.
-            token_types: ``[B, S*tokens_per_step]`` int64 — ``TokenType`` id at each
-                         position (used by the backbone to build the attention mask).
-                         Data positions carry their modality's ``TokenType``; compute
-                         positions carry ``TokenType.COMPUTE``; unused padding positions
-                         carry ``TokenType.PAD`` (0).
+            embeds: ``[B, S*tokens_per_step, D]``
+
+            Padding information, if any, is not returned as part of the embedding
+            stream. If certain positions within the produced sequence should be
+            masked (e.g. unused slots for a variable-length modality), supply an
+            explicit ``attention_mask`` when calling the model or backbone.
         """
         device = next(self.parameters()).device
         step_stream = step_stream.to(device)
 
         B, S = int(step_stream.batch_size[0]), int(step_stream.batch_size[1])
-        T, D = self.token_data_len, self.hidden_dim
-
-        # Fetch each active modality from the step stream.
-        # For included modalities, synthesize a canonical "absent" value (full-size
-        # zero vector for vectors; 0 or -1 for scalars) when the key is missing from
-        # this particular batch. This makes the loader's data-driven emission robust
-        # even if a window contains none of a modality.
-        action   = step_stream["action"] if self.include_action_token else None
-        reward   = step_stream["reward"] if self.include_reward_token else None
-        done     = step_stream["done"]   if self.include_done_token else None
-        time_idx = step_stream["time"]   if self.include_time_token else None
-
-        obs_cont = None
-        if self.include_obs_continuous:
-            if "obs_continuous" in step_stream.keys():
-                obs_cont = step_stream["obs_continuous"]
-            else:
-                m = int(self.obs_continuous_embedder.max_num_obs)  # type: ignore[union-attr]
-                obs_cont = torch.zeros(B, S, m, device=device, dtype=torch.get_default_dtype())
-
-        obs_disc = None
-        if self.include_obs_discrete:
-            if "obs_discrete" in step_stream.keys():
-                obs_disc = step_stream["obs_discrete"]
-            else:
-                obs_disc = torch.zeros(B, S, device=device, dtype=torch.long)
-
-        obs_img = None
-        if self.include_obs_image:
-            if "obs_image" in step_stream.keys():
-                obs_img = step_stream["obs_image"]
-            else:
-                m = int(self.obs_image_embedder.max_num_obs)  # type: ignore[union-attr]
-                obs_img = torch.zeros(B, S, m, device=device, dtype=torch.get_default_dtype())
-
-        # For time, use the "absent" marker when include but key missing.
-        if self.include_time_token and time_idx is None:
-            time_idx = torch.full((B, S), -1, device=device, dtype=torch.long)
-
-        if self.include_reward_token and reward is None:
-            reward = torch.zeros(B, S, device=device, dtype=torch.get_default_dtype())
-        if self.include_done_token and done is None:
-            done = torch.zeros(B, S, device=device, dtype=torch.long)
-        if self.include_action_token and action is None:
-            action = torch.zeros(B, S, device=device, dtype=torch.long)
-
+        D = self._hidden_dim
         dtype = torch.get_default_dtype()
 
-        if self.concat_modalities:
-            data_embeds, data_types = self._forward_concat(
-                B, S, T, D, device, dtype,
-                action, reward, done, time_idx, obs_cont, obs_disc, obs_img,
-            )
-        else:
-            data_embeds, data_types = self._forward_sum(
-                B, S, T, D, device, dtype,
-                action, reward, done, time_idx, obs_cont, obs_disc, obs_img,
-            )
+        # Collect values (or synthesized defaults) for every declared modality.
+        # Compute modalities do not read from (or require) any data in the step_stream;
+        # we simply omit them from col_values.
+        col_values: dict[str, torch.Tensor] = {}
+        for spec in self.modalities:
+            key = spec.name
+            if key in self._learnable_modalities:
+                continue
+            if key in step_stream.keys():
+                col_values[key] = step_stream[key]
+            else:
+                col_values[key] = self._default_value_for(spec, B, S, device)
 
-        # Append compute tokens.
+        if self.concat_modalities:
+            data_embeds = self._forward_concat(B, S, D, device, dtype, col_values)
+        else:
+            data_embeds = self._forward_sum(B, S, D, device, dtype, col_values)
+
+        # Append the global trailing compute tokens (declared learnable modalities
+        # are already included in the data_* blocks above).
         K = self.num_compute_tokens
         if K > 0:
             assert self.compute_embed is not None
-            c = self.compute_embed.to(dtype=dtype)          # [K, D]
+            c = self.compute_embed.to(dtype=dtype)
             c = c.view(1, 1, K, D).expand(B, S, K, D)
-            embeds = torch.cat([data_embeds, c], dim=2)     # [B, S, data_slots+K, D]
-
-            c_types = torch.full((B, S, K), int(TokenType.COMPUTE), device=device, dtype=torch.long)
-            token_types = torch.cat([data_types, c_types], dim=2)  # [B, S, total]
+            embeds = torch.cat([data_embeds, c], dim=2)
         else:
             embeds = data_embeds
-            token_types = data_types
 
         total_T = embeds.shape[2]
-        return embeds.reshape(B, S * total_T, D), token_types.reshape(B, S * total_T)
+        return embeds.reshape(B, S * total_T, D)
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # Internal helpers (generalized over modalities)
     # ------------------------------------------------------------------
-
-    def _embed_modality(
-        self,
-        flat: torch.Tensor,
-        ttype: TokenType,
-        B: int,
-        S: int,
-        T: int,
-        D: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        """Apply optional type embedding and return ``[B, S, T, D]``."""
-        flat = flat.to(dtype=dtype)
-        if self.include_type_token:
-            flat = flat + self.type_embedder(ttype, (B, S), device).to(dtype=dtype)
-        return flat.view(B, S, T, D)
 
     def _forward_sum(
         self,
-        B: int, S: int, T: int, D: int,
+        B: int, S: int, D: int,
         device: torch.device, dtype: torch.dtype,
-        action, reward, done, time_idx, obs_cont, obs_disc, obs_img,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Sum mode: all modalities accumulated into T slots. Returns ([B,S,T,D], [B,S,T])."""
+        col_values: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """Sum mode: add contributions of all modalities into a shared block of size max(Tc)."""
+        if not self.modalities:
+            T = 0
+            return torch.empty(B, S, 0, D, device=device, dtype=dtype)
 
-        total = torch.zeros(B, S, T * D, device=device, dtype=dtype)
+        T = max(self._modality_tokens.values())
+        total = torch.zeros(B, S, T, D, device=device, dtype=dtype)
 
-        def _add(flat: torch.Tensor, ttype: TokenType) -> None:
-            flat = flat.to(dtype=dtype)
-            if self.include_type_token:
-                total.add_(flat + self.type_embedder(ttype, (B, S), device).to(dtype=dtype))
+        for spec in self.modalities:
+            Tc = self._modality_tokens[spec.name]
+            mod = self.modality_embedders[spec.name]
+            if spec.name in self._learnable_modalities:
+                # Learnable modalities ignore input data entirely.
+                cmod = mod  # narrowed by membership
+                assert isinstance(cmod, LearnableEmbedder)
+                base = cmod.embed.to(dtype=dtype)  # [Tc, D]
+                contrib = base.view(1, 1, Tc, D).expand(B, S, Tc, D)
             else:
-                total.add_(flat)
+                flat = mod(col_values[spec.name]).to(dtype=dtype)  # [B*S, Tc*D]
+                contrib = flat.view(B, S, Tc, D)
+            if self._modality_include_type[spec.name]:
+                typ = self.type_embedder(self._modality_token_types[spec.name], (B, S), device).to(dtype=dtype)
+                contrib = contrib + typ.unsqueeze(2)  # broadcast over Tc
+            if Tc < T:
+                pad = torch.zeros(B, S, T - Tc, D, device=device, dtype=dtype)
+                contrib = torch.cat([contrib, pad], dim=2)
+            total.add_(contrib)
 
-        if self.include_time_token:
-            assert self.time_embedder is not None
-            _add(self.time_embedder(time_idx), TokenType.TIME)
-        if self.include_action_token:
-            assert self.action_embedder is not None
-            _add(self.action_embedder(action), TokenType.ACTION)
-        if self.include_obs_continuous:
-            assert self.obs_continuous_embedder is not None
-            _add(self.obs_continuous_embedder(obs_cont), TokenType.OBS_CONTINUOUS)
-        if self.include_obs_discrete:
-            assert self.obs_discrete_embedder is not None
-            _add(self.obs_discrete_embedder(obs_disc), TokenType.OBS_DISCRETE)
-        if self.include_obs_image:
-            assert self.obs_image_embedder is not None
-            _add(self.obs_image_embedder(obs_img), TokenType.OBS_IMAGE)
-        if self.include_reward_token:
-            assert self.reward_embedder is not None
-            _add(self.reward_embedder(reward), TokenType.REWARD)
-        if self.include_done_token:
-            assert self.done_embedder is not None
-            _add(self.done_embedder(done), TokenType.DONE)
-
-        data_embeds = total.view(B, S, T, D)
-        # All data positions are valid (non-PAD); use ACTION=1 as a generic non-zero label.
-        data_types = torch.ones(B, S, T, device=device, dtype=torch.long)
-        return data_embeds, data_types
+        return total
 
     def _forward_concat(
         self,
-        B: int, S: int, T: int, D: int,
+        B: int, S: int, D: int,
         device: torch.device, dtype: torch.dtype,
-        action, reward, done, time_idx, obs_cont, obs_disc, obs_img,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Concat mode: each modality gets its own T slots. Returns ([B,S,M*T,D], [B,S,M*T])."""
-
+        col_values: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """Concat mode: concatenate per-modality blocks (each with its own Tc)."""
         parts: list[torch.Tensor] = []
-        type_parts: list[torch.Tensor] = []
 
-        def _push(flat: torch.Tensor, ttype: TokenType) -> None:
-            block = self._embed_modality(flat, ttype, B, S, T, D, device, dtype)  # [B, S, T, D]
+        for spec in self.modalities:
+            Tc = self._modality_tokens[spec.name]
+            mod = self.modality_embedders[spec.name]
+            if spec.name in self._learnable_modalities:
+                # Learnable modalities ignore any input data.
+                cmod = mod  # narrowed by membership
+                assert isinstance(cmod, LearnableEmbedder)
+                base = cmod.embed.to(dtype=dtype)  # [Tc, D]
+                block = base.view(1, 1, Tc, D).expand(B, S, Tc, D)
+            else:
+                flat = mod(col_values[spec.name]).to(dtype=dtype)  # [B*S, Tc*D]
+                block = flat.view(B, S, Tc, D)
+            if self._modality_include_type[spec.name]:
+                typ = self.type_embedder(self._modality_token_types[spec.name], (B, S), device).to(dtype=dtype)
+                block = block + typ.unsqueeze(2)
             parts.append(block)
-            type_parts.append(
-                torch.full((B, S, T), int(ttype), device=device, dtype=torch.long)
-            )
 
-        # Fixed canonical order (matches sum-mode _add order for consistency).
-        if self.include_time_token:
-            assert self.time_embedder is not None
-            _push(self.time_embedder(time_idx), TokenType.TIME)
-        if self.include_action_token:
-            assert self.action_embedder is not None
-            _push(self.action_embedder(action), TokenType.ACTION)
-        if self.include_obs_continuous:
-            assert self.obs_continuous_embedder is not None
-            _push(self.obs_continuous_embedder(obs_cont), TokenType.OBS_CONTINUOUS)
-        if self.include_obs_discrete:
-            assert self.obs_discrete_embedder is not None
-            _push(self.obs_discrete_embedder(obs_disc), TokenType.OBS_DISCRETE)
-        if self.include_obs_image:
-            assert self.obs_image_embedder is not None
-            _push(self.obs_image_embedder(obs_img), TokenType.OBS_IMAGE)
-        if self.include_reward_token:
-            assert self.reward_embedder is not None
-            _push(self.reward_embedder(reward), TokenType.REWARD)
-        if self.include_done_token:
-            assert self.done_embedder is not None
-            _push(self.done_embedder(done), TokenType.DONE)
-
-        data_embeds = torch.cat(parts, dim=2)       # [B, S, M*T, D]
-        data_types  = torch.cat(type_parts, dim=2)  # [B, S, M*T]
-        return data_embeds, data_types
+        return torch.cat(parts, dim=2) if parts else torch.empty(B, S, 0, D, device=device, dtype=dtype)

@@ -1,17 +1,12 @@
 ---
-description: Keep docs and code in sync — change both when either changes
+description: Keep documentation and implementation in sync
 alwaysApply: true
 ---
 
 # Docs ↔ Code Sync
 
-Documentation and implementation describe the same behavior. When one changes, update the other in the same task.
+Docs and code must describe the same behavior.
 
-## Rules
-
-1. **Doc change → update code.** If docs describe behavior, fields, or APIs differently than the code, fix the code (or fix the docs if the doc was wrong).
-2. **Code change → update docs.** If code changes user-visible behavior or public APIs, update the docs that describe them.
-
-## Before finishing
-
-Ask: would someone reading only the docs, or only the code, get a wrong picture? If yes, update the other side.
+- When docs change, update code in the same task (or fix docs if they were wrong).
+- When code changes user-visible behavior or public APIs, update the docs.
+- Final check: someone reading only the docs or only the code must get the correct picture.

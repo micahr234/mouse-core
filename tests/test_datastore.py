@@ -1,14 +1,14 @@
-"""Tests for DatasetStore append and encoding."""
+"""Tests for Datastore append and encoding."""
 
 from __future__ import annotations
 
 import pytest
 
-from mouse_core.data import DatasetStore
+from mouse_core.data import Datastore
 
 
 def test_append_and_len() -> None:
-    store = DatasetStore()
+    store = Datastore()
     store.append({
         "observation": {"discrete": 0},
         "action": {"discrete": 1},
@@ -27,7 +27,7 @@ def test_append_and_len() -> None:
 
 
 def test_encode_single_row() -> None:
-    store = DatasetStore()
+    store = Datastore()
     store.append({
         "observation": {"discrete": 3},
         "action": {"discrete": 2},
@@ -44,7 +44,7 @@ def test_encode_single_row() -> None:
 
 
 def test_encode_optional_fields() -> None:
-    store = DatasetStore()
+    store = Datastore()
     store.append({
         "observation": {"continuous": [0.1, 0.2]},
         "action": {"discrete": 1},
@@ -62,7 +62,7 @@ def test_encode_optional_fields() -> None:
 
 def test_dataset_roundtrip() -> None:
     """Append rows, export to a HuggingFace Dataset, reload, and re-encode."""
-    store = DatasetStore()
+    store = Datastore()
     for t in range(3):
         store.append({
             "observation": {"continuous": [float(t), float(t) + 0.5]},
@@ -78,7 +78,7 @@ def test_dataset_roundtrip() -> None:
     ds = store.to_dataset()
     assert len(ds) == 3
 
-    reloaded = DatasetStore()
+    reloaded = Datastore()
     reloaded.from_dataset(ds)
     td = reloaded.__getitem__([0, 1, 2])
     assert td["action"].tolist() == [0, 1, 0]
@@ -87,7 +87,7 @@ def test_dataset_roundtrip() -> None:
 
 
 def test_encode_continuous_action() -> None:
-    store = DatasetStore()
+    store = Datastore()
     store.append({
         "observation": {"continuous": [0.1, 0.2, 0.3]},
         "action": {"continuous": [0.5, -0.5]},
@@ -104,7 +104,7 @@ def test_encode_continuous_action() -> None:
 
 def test_encode_mixed_modalities() -> None:
     """One store holding discrete, continuous, and image steps zero-fills absent modalities."""
-    store = DatasetStore()
+    store = Datastore()
     store.append({  # discrete obs + discrete action
         "observation": {"discrete": 2},
         "action": {"discrete": 3},

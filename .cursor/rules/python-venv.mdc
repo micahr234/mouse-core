@@ -5,25 +5,10 @@ alwaysApply: true
 
 # Python Virtual Environment
 
-This project uses `uv` with a `.venv` at the repo root (`./.venv`).
+Project uses `uv` with `.venv` at repo root.
 
-## Rules
-
-- **Never** run bare `pip install`. Always use `uv pip install` or `.venv/bin/pip install`.
-- **Never** run bare `python`. Use `.venv/bin/python` or `uv run python`.
-- To add a new dependency: add it to `pyproject.toml` first, then run `uv pip install -e ".[dev]" --python .venv/bin/python`.
-- To verify the environment: `.venv/bin/python -c "import <pkg>"`.
-
-## Examples
-
-```bash
-# ❌ BAD
-pip install tensordict
-python -c "import mouse_core"
-jupyter lab examples/
-
-# ✅ GOOD
-uv pip install tensordict --python .venv/bin/python
-.venv/bin/python -c "import mouse_core"
-.venv/bin/jupyter lab examples/
-```
+Rules:
+- Never run bare `pip install`. Use `uv pip install ... --python .venv/bin/python`.
+- Never run bare `python`. Use `.venv/bin/python` or `uv run python`.
+- Add dependencies to `pyproject.toml` first.
+- Verify: `.venv/bin/python -c "import <pkg>"`.

@@ -213,6 +213,6 @@ def sp_objective(
             "(expected 'ce', 'ce-soft-fwd', 'ce-soft-bwd', 'js', 'kl-fwd', or 'kl-bwd')."
         )
 
-    metrics: dict[str, float] = {"sp": float(loss.detach().item())}
+    metrics: dict[str, float] = {"action": float(loss.detach().item())}
 
     return loss, metrics

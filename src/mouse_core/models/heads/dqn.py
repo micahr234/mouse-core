@@ -1,4 +1,4 @@
-"""DQNHead: SwiGLUHead with EMA target and Polyak averaging."""
+"""DiscreteActionValueHead: per-discrete-action values (e.g. Q(s,a)) with target network."""
 
 from __future__ import annotations
 
@@ -8,13 +8,12 @@ from mouse_core.models.heads.base import BaseHeadWithTarget
 from mouse_core.models.heads.swiglu import SwiGLUHead
 
 
-class DQNHead(BaseHeadWithTarget):
-    """SwiGLUHead paired with an EMA target copy and Polyak averaging.
+class DiscreteActionValueHead(BaseHeadWithTarget):
+    """Head that outputs a value for each discrete action.
 
-    ``forward`` runs the online head. ``target_forward`` runs the target head
-    (no gradient tracking). Call ``polyak_update(tau)`` after each optimizer
-    step to soft-update the target:  θ_target ← τ·θ_online + (1−τ)·θ_target.
-    Initialize with ``tau=1.0`` to copy online weights into the target.
+    Wraps a SwiGLU MLP and maintains an EMA target copy (for TD-style objectives).
+    ``forward`` runs the online network; ``target_forward`` and ``polyak_update``
+    are available for the target.
     """
 
     def __init__(
@@ -27,6 +26,12 @@ class DQNHead(BaseHeadWithTarget):
         use_norm: bool = True,
     ):
         super().__init__()
+        self.in_features = int(in_features)
+        self.out_features = int(out_features)
+        self.hidden_dim = int(hidden_dim)
+        self.num_layers = int(num_layers)
+        self.scale = float(scale)
+        self.use_norm = bool(use_norm)
         self.online = SwiGLUHead(
             in_features=in_features,
             out_features=out_features,
@@ -38,5 +43,5 @@ class DQNHead(BaseHeadWithTarget):
         self._init_target(self.online)
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
-        """Run the online head; returns Q-value logits ``[B, S, A]``."""
+        """Returns per-action values ``[B, S, A]``."""
         return self.online(h)

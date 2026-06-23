@@ -1,4 +1,4 @@
-"""Hugging Face Hub utilities for pushing DatasetStore data.
+"""Hugging Face Hub utilities for pushing Datastore data.
 
 Pushes write the raw rows (whatever shape you stored) using standard
 ``DatasetDict.push_to_hub`` with ``config_name`` for subsets/bins.
@@ -39,7 +39,7 @@ from huggingface_hub.errors import HfHubHTTPError, RepositoryNotFoundError
 from huggingface_hub.hf_api import CommitOperationDelete
 
 if TYPE_CHECKING:
-    from mouse_core.data.dataset_store import DatasetStore
+    from mouse_core.data.datastore import Datastore
 
 
 # ---------------------------------------------------------------------------
@@ -188,7 +188,7 @@ def _align_splits(splits: dict[str, Dataset]) -> dict[str, Dataset]:
 # ---------------------------------------------------------------------------
 
 def push_to_hub(
-    splits: dict[str, list[DatasetStore]],
+    splits: dict[str, list[Datastore]],
     repo_id: str,
     *,
     private: bool = False,
@@ -200,7 +200,7 @@ def push_to_hub(
     Parameters
     ----------
     splits :
-        Mapping of split name → list of ``DatasetStore`` objects.  All stores
+        Mapping of split name → list of ``Datastore`` objects.  All stores
         for the same split are concatenated before pushing.
     repo_id :
         Hub repository ID (``"user/dataset"`` or an unscoped name which is
@@ -241,7 +241,7 @@ def push_to_hub(
             config_name="cartpole_ppo_expert",
         )
     """
-    from mouse_core.data.dataset_store import DatasetStore as _DS
+    from mouse_core.data.datastore import Datastore as _DS
 
     resolved: dict[str, Dataset] = {}
     for split_name, stores in splits.items():
@@ -289,7 +289,7 @@ def push_to_hub(
 
 
 def push_stores_to_hub(
-    stores: list[DatasetStore],
+    stores: list[Datastore],
     repo_id: str,
     *,
     split: str = "train",
@@ -297,7 +297,7 @@ def push_stores_to_hub(
     commit_message: str = "New rollout data",
     config_name: str = "default",
 ) -> str | None:
-    """Push a list of ``DatasetStore`` objects to the Hub as a single split (inside a config/subset).
+    """Push a list of ``Datastore`` objects to the Hub as a single split (inside a config/subset).
 
     Convenience wrapper around :func:`push_to_hub` for the common case where
     all stores belong to one split.
@@ -311,7 +311,7 @@ def push_stores_to_hub(
     Parameters
     ----------
     stores :
-        One or more ``DatasetStore`` objects to concatenate and push.
+        One or more ``Datastore`` objects to concatenate and push.
     repo_id :
         Hub repository ID.
     split :

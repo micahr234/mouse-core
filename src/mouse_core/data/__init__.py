@@ -6,10 +6,10 @@ from mouse_core.data.augment import (
     TokenAugmenter,
 )
 from mouse_core.data.dataloader import DataLoader
-from mouse_core.data.dataset_store import (
+from mouse_core.data.datastore import (
     ACTION_KEY_CONTINUOUS,
     ACTION_KEY_DISCRETE,
-    DatasetStore,
+    Datastore,
     OBS_KEY_CONTINUOUS,
     OBS_KEY_DISCRETE,
     OBS_KEY_IMAGE,
@@ -24,7 +24,7 @@ __all__ = [
     "AugmentSnapshot",
     "AugmentTokensConfig",
     "DataLoader",
-    "DatasetStore",
+    "Datastore",
     "OBS_KEY_CONTINUOUS",
     "OBS_KEY_DISCRETE",
     "OBS_KEY_IMAGE",

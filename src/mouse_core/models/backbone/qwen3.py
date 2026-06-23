@@ -1,17 +1,20 @@
-"""ModelQwen3: MOUSE model with a Qwen3 transformer backbone."""
+"""Qwen3 transformer backbone.
+
+Provides :class:`Qwen3Backbone`, a thin Backbone adapter around
+``transformers.Qwen3Model`` for use with the generic :class:`~mouse_core.models.base.Model`.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
 import torch.nn as nn
-from huggingface_hub import PyTorchModelHubMixin
 from transformers import Qwen3Config, Qwen3Model
 
-from mouse_core.models.base import Model, MODEL_CARD_TEMPLATE
-from mouse_core.models.base import TokenType
+from mouse_core.models.backbone.base import Backbone, _load_transformer_weights
 
 
 def _disable_cudnn_sdp() -> None:
@@ -22,7 +25,7 @@ def _disable_cudnn_sdp() -> None:
 
 
 @dataclass
-class Qwen3BackboneConfig:
+class _Qwen3BackboneConfig:
     """Configuration for a Qwen3 transformer backbone.
 
     Builds a HuggingFace ``Qwen3Model`` with SDPA attention and no token
@@ -110,55 +113,140 @@ class Qwen3BackboneConfig:
         return model
 
 
-class ModelQwen3(Model, PyTorchModelHubMixin, library_name="MOUSE", tags=["backbone:qwen3"], model_card_template=MODEL_CARD_TEMPLATE):
-    """MOUSE model with a Qwen3 transformer backbone.
+class Qwen3Backbone(Backbone):
+    """Backbone adapter wrapping a ``transformers.Qwen3Model``."""
 
-    Attends over the full ``[B, S*T, D]`` token sequence with causal SDPA.
-    Supports an explicit ``head_dim`` (set in ``backbone_kwargs``) for grouped-query
-    attention with a head size independent of the model width. Supports KV-cache
-    for incremental rollouts (``use_cache=True``).
-    """
+    def __init__(
+        self,
+        model: Qwen3Model | None = None,
+        *,
+        hidden_dim: int | None = None,
+        pretrained: str | Path | None = None,
+        load_weights: bool = True,
+        hub_kwargs: dict[str, Any] | None = None,
+        **config_kwargs: Any,
+    ) -> None:
+        super().__init__()
+        if model is not None and pretrained is not None:
+            raise TypeError("Qwen3Backbone accepts either model= or pretrained=, not both.")
 
-    def _init_backbone(self, backbone_kwargs: dict) -> None:
-        """Build and assign ``self.backbone`` from ``backbone_kwargs``."""
-        cfg = Qwen3BackboneConfig(**backbone_kwargs)
-        self.num_layers = cfg.num_layers
-        self.num_heads = cfg.num_heads
-        self.head_dim = cfg.head_dim
-        self.max_position_embeddings = cfg.max_position_embeddings
-        self.expand = cfg.expand
-        self.backbone = cfg.build(self.hidden_dim)
+        if model is not None:
+            if not isinstance(model, Qwen3Model):
+                raise TypeError(
+                    "When passing a model to Qwen3Backbone, it must be a "
+                    "transformers.Qwen3Model (with vocab_size=1 and norm=Identity)."
+                )
+            self.model = model
+            self._config_kwargs = self._config_kwargs_from_model(model)
+            return
 
-    def backbone_forward(
+        if pretrained is not None:
+            hf_kwargs = hub_kwargs or {}
+            extracted_kwargs, extracted_hidden_dim = self._config_from_pretrained(
+                pretrained,
+                hub_kwargs=hf_kwargs,
+                overrides=config_kwargs,
+            )
+            if hidden_dim is not None and int(hidden_dim) != extracted_hidden_dim:
+                raise ValueError(
+                    f"hidden_dim={hidden_dim} does not match pretrained hidden size "
+                    f"{extracted_hidden_dim} from {pretrained!r}."
+                )
+            self.model = _Qwen3BackboneConfig(**extracted_kwargs).build(extracted_hidden_dim)
+            self._config_kwargs = dict(extracted_kwargs)
+            if load_weights:
+                self._load_pretrained_weights(pretrained, hub_kwargs=hf_kwargs)
+            return
+
+        if hidden_dim is None:
+            raise TypeError(
+                "Qwen3Backbone requires either a pre-built model, "
+                "pretrained=, or hidden_dim plus backbone config arguments "
+                "(e.g. Qwen3Backbone(hidden_dim=128, num_layers=2, num_heads=4))."
+            )
+
+        self.model = _Qwen3BackboneConfig(**config_kwargs).build(hidden_dim)
+        self._config_kwargs = self._config_kwargs_from_model(self.model)
+
+    @staticmethod
+    def _config_from_pretrained(
+        repo_id_or_path: str | Path,
+        *,
+        hub_kwargs: dict[str, Any],
+        overrides: dict[str, Any],
+    ) -> tuple[dict[str, Any], int]:
+        from transformers import AutoConfig
+
+        hf_cfg = AutoConfig.from_pretrained(repo_id_or_path, **hub_kwargs)
+        model_type = getattr(hf_cfg, "model_type", "").lower()
+        if "qwen3" not in model_type and "qwen" not in model_type:
+            raise ValueError(
+                f"Qwen3Backbone can only load Qwen configs, got model_type={model_type!r} "
+                f"from {repo_id_or_path!r}."
+            )
+
+        backbone_kwargs: dict[str, Any] = dict(
+            num_layers=hf_cfg.num_hidden_layers,
+            num_heads=hf_cfg.num_attention_heads,
+            num_key_value_heads=getattr(hf_cfg, "num_key_value_heads", hf_cfg.num_attention_heads),
+            head_dim=getattr(hf_cfg, "head_dim", None),
+            max_position_embeddings=hf_cfg.max_position_embeddings,
+            intermediate_size=hf_cfg.intermediate_size,
+            rms_norm_eps=getattr(hf_cfg, "rms_norm_eps", 1e-6),
+            attention_bias=getattr(hf_cfg, "attention_bias", False),
+            use_sliding_window=getattr(hf_cfg, "use_sliding_window", False),
+        )
+        backbone_kwargs.update(overrides)
+        return backbone_kwargs, int(hf_cfg.hidden_size)
+
+    @staticmethod
+    def _config_kwargs_from_model(model: Qwen3Model) -> dict[str, Any]:
+        cfg = model.config
+        kwargs: dict[str, Any] = dict(
+            num_layers=len(model.layers),
+            num_heads=cfg.num_attention_heads,
+            num_key_value_heads=getattr(cfg, "num_key_value_heads", cfg.num_attention_heads),
+            head_dim=getattr(cfg, "head_dim", None),
+            max_position_embeddings=cfg.max_position_embeddings,
+            intermediate_size=cfg.intermediate_size,
+            rms_norm_eps=getattr(cfg, "rms_norm_eps", 1e-6),
+            attention_bias=getattr(cfg, "attention_bias", False),
+            use_sliding_window=getattr(cfg, "use_sliding_window", False),
+        )
+        rope_parameters = getattr(cfg, "rope_parameters", None)
+        if rope_parameters is not None:
+            kwargs["rope_parameters"] = rope_parameters
+        return kwargs
+
+    def _load_pretrained_weights(
+        self,
+        repo_id_or_path: str | Path,
+        *,
+        hub_kwargs: dict[str, Any],
+    ) -> None:
+        _load_transformer_weights(
+            self.model,
+            repo_id_or_path,
+            backbone_name="Qwen3Backbone",
+            hub_kwargs=hub_kwargs,
+        )
+
+    @property
+    def hidden_dim(self) -> int:
+        return int(self.model.config.hidden_size)
+
+    def forward(
         self,
         embeds: torch.Tensor,
-        token_type: torch.Tensor,
         cache: dict[str, Any] | None = None,
         use_cache: bool = False,
         cache_position: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, dict[str, Any] | None]:
-        """Run the Qwen3 backbone over the token sequence.
-
-        Args:
-            embeds: ``[B, T_total, D]`` embedding tensor from ``StepEmbedder``.
-            token_type: ``[B, T_total]`` int64 ``TokenType`` ids; ``PAD`` positions
-                are masked out from attention.
-            cache: KV-cache dict from a previous call, or ``None`` for full prefill.
-                Reads and writes the ``"backbone"`` key.
-            use_cache: If ``True``, return an updated KV-cache dict.
-            cache_position: Unused; present for interface compatibility.
-            **kwargs: Forwarded to the underlying ``Qwen3Model``.
-
-        Returns:
-            Tuple of ``(hidden_states [B, T_total, D], cache_dict | None)``.
-        """
         cache = cache or {}
 
-        has_padding = bool((token_type == TokenType.PAD).any())
-        attention_mask = (token_type != TokenType.PAD).long() if has_padding else None
-
-        out = self.backbone(
+        out = self.model(
             inputs_embeds=embeds,
             past_key_values=cache.get("backbone", None),
             use_cache=use_cache,
@@ -169,3 +257,4 @@ class ModelQwen3(Model, PyTorchModelHubMixin, library_name="MOUSE", tags=["backb
 
         new_cache = {"backbone": out.past_key_values} if use_cache else None
         return out.last_hidden_state, new_cache
+

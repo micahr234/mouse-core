@@ -52,6 +52,12 @@ class SwiGLUHead(BaseHead):
         use_norm: bool = True,
     ):
         super().__init__()
+        self.in_features = int(in_features)
+        self.out_features = int(out_features)
+        self.hidden_dim = int(hidden_dim)
+        self.num_layers = int(num_layers)
+        self.scale = float(scale)
+        self.use_norm = bool(use_norm)
         if use_norm:
             self.norm = nn.RMSNorm(in_features, elementwise_affine=True, eps=1e-5)
         else:

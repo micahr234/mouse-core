@@ -1,4 +1,4 @@
-"""VecDQNHead: vector-valued DQN head with RoPE-based angular scoring."""
+"""VectorActionValueHead: per-action vector values with RoPE-based angular scoring."""
 
 from __future__ import annotations
 
@@ -29,8 +29,8 @@ def rope_rotate(x: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
     return rotated
 
 
-def vec_dqn_scores(vecs: torch.Tensor) -> torch.Tensor:
-    """Compute pairwise angular action scores from vec-DQN vectors.
+def vector_action_scores(vecs: torch.Tensor) -> torch.Tensor:
+    """Compute pairwise angular action scores from per-action vector values.
 
     For each pair of actions ``(i, a)``, computes the full signed angle
     ``φ_a − φ_i`` via ``atan2(sin, cos)``, then sums over all ``i`` to give
@@ -66,16 +66,13 @@ def vec_dqn_scores(vecs: torch.Tensor) -> torch.Tensor:
     return torch.atan2(sin_ia, cos_ia).sum(dim=-2)                     # [..., A]
 
 
-class VecDQNHead(BaseHeadWithTarget):
-    """SwiGLUHead paired with an EMA target copy and Polyak averaging.
+class VectorActionValueHead(BaseHeadWithTarget):
+    """Action-value head where each (discrete) action is represented by a vector.
 
-    Like ``DQNHead`` but each action produces a ``vec_dim``-dimensional vector
-    instead of a single scalar.  Output shape is ``[..., max_num_actions, vec_dim]``.
+    Each action is embedded as a ``vec_dim``-dimensional vector. Output shape
+    ``[..., num_actions, vec_dim]``. Includes a target network.
 
-    ``forward`` runs the online head. ``target_forward`` runs the target head
-    (no gradient tracking). Call ``polyak_update(tau)`` after each optimizer
-    step to soft-update the target:  θ_target ← τ·θ_online + (1−τ)·θ_target.
-    Initialize with ``tau=1.0`` to copy online weights into the target.
+    Use :func:`vector_action_scores` for selection from these vectors.
     """
 
     def __init__(
@@ -90,8 +87,16 @@ class VecDQNHead(BaseHeadWithTarget):
         use_norm: bool = True,
     ):
         super().__init__()
-        self.A = max_num_actions
-        self.D = vec_dim
+        self.in_features = int(in_features)
+        self.max_num_actions = int(max_num_actions)
+        self.vec_dim = int(vec_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.num_layers = int(num_layers)
+        self.scale = float(scale)
+        self.bias_scale = bias_scale
+        self.use_norm = bool(use_norm)
+        self.A = self.max_num_actions
+        self.D = self.vec_dim
         self.online = SwiGLUHead(
             in_features=in_features,
             out_features=max_num_actions * vec_dim,

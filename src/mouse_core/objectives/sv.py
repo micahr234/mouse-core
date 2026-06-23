@@ -54,6 +54,6 @@ def sv_objective(
         )
 
     metrics: dict[str, float] = {}
-    metrics["sv"] = float(loss.detach().item())
+    metrics["value"] = float(loss.detach().item())
 
     return loss, metrics

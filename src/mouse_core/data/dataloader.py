@@ -1,6 +1,6 @@
-"""DataLoader — batch producer for sequential step data from a DatasetStore.
+"""DataLoader — batch producer for sequential step data from a Datastore.
 
-A ``DatasetStore`` is a flat sequence of arbitrary rows.
+A ``Datastore`` is a flat sequence of arbitrary rows.
 
 The ``DataLoader`` repeatedly samples contiguous slices from the store
 (according to the chosen policy), runs them through a row encoder
@@ -15,8 +15,8 @@ Usage
 -----
 ::
 
-    store = DatasetStore()
-    store.from_dataset(ds)   # ds from load_dataset(...)
+    store = Datastore()
+    store.from_dataset(ds)   # or populate via append()
 
     loader = DataLoader(
         store,
@@ -37,11 +37,11 @@ import numpy as np
 from tensordict import TensorDict
 
 if TYPE_CHECKING:
-    from mouse_core.data.dataset_store import DatasetStore
+    from mouse_core.data.datastore import Datastore
 
 
 class DataLoader:
-    """Produces model-ready ``TensorDict[B, S]`` batches from a ``DatasetStore``.
+    """Produces model-ready ``TensorDict[B, S]`` batches from a ``Datastore``.
 
     The store holds a flat sequence of arbitrary rows. This loader samples
     contiguous windows and runs them through a row encoder that turns selected
@@ -58,11 +58,15 @@ class DataLoader:
     embedder configuration. The embedders adapt to the shapes that arrive
     from data.
 
+    Stores populated only via ``append`` are supported (a snapshot is taken at
+    construction time).
+
     Parameters
     ----------
     store :
-        ``DatasetStore`` after ``from_dataset`` (or after appending and
-        materializing via ``from_dataset(store.to_dataset())``).
+        ``Datastore`` (loaded via ``from_dataset`` or populated via ``append``).
+        A pure-append store is supported and will be snapshotted internally for
+        iteration; appends after construction are not observed by the loader.
     sequence_length :
         Length of each contiguous slice (in steps).
     batch_size :
@@ -79,7 +83,7 @@ class DataLoader:
 
     def __init__(
         self,
-        store: DatasetStore,
+        store: Datastore,
         sequence_length: int,
         batch_size: int,
         sampling: str = "random",
@@ -87,7 +91,7 @@ class DataLoader:
         num_workers: int = 1,
         pin_memory: bool = False,
     ) -> None:
-        from mouse_core.data.dataset_store import DatasetStore as _DS
+        from mouse_core.data.datastore import Datastore as _DS
 
         # Set teardown attrs early so __del__/close are safe even if later validation fails
         self._stop = None
@@ -96,11 +100,10 @@ class DataLoader:
         self._sync_rng = None
         self._worker_error = None
 
-        if not isinstance(store, _DS) or store._source is None:
-            raise TypeError(
-                "DataLoader requires a DatasetStore that has data loaded via from_dataset(). "
-                "After pure append, do store.from_dataset(store.to_dataset()) first, or load via from_dataset."
-            )
+        if not isinstance(store, _DS):
+            raise TypeError("DataLoader requires a Datastore instance.")
+        if len(store) == 0:
+            raise ValueError("DataLoader requires a non-empty Datastore.")
         if sampling not in ("batch", "random", "sequential", "last"):
             raise ValueError(f"sampling must be one of batch/random/sequential/last, got {sampling!r}")
 
@@ -109,7 +112,10 @@ class DataLoader:
         self.batch_size = batch_size
         self.sampling = sampling
 
-        self._dataset = store._source
+        # Use the Arrow Dataset for fast slicing. Prefer the loaded source when present
+        # (the append buffer is not visible to the loader until the user calls from_dataset).
+        # For pure-append stores we snapshot once for convenience.
+        self._dataset = store._source if store._source is not None else store.to_dataset()
         self._n = len(self._dataset)
 
         # Epoch-order state for sequential / batch / synchronous modes.
