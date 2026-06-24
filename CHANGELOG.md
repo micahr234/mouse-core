@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Expert Q-values from `mouse_envs` are now stored under the key `info_metadata_q_star` (previously `q_star`), following the `mouse-env` v0.4.1 change that forwards every Gymnasium `info` dict entry verbatim as `info_<key>`. `SpObjective`, `SvObjective`, and `apply_permute_action_augmentation` updated accordingly. The collection notebook (`01_collect_dataset`) also updated to read `info_metadata_q_star` when selecting oracle actions.
+
 ### Fixed
 - `push_stores_to_hub` and `push_to_hub` were writing every config's parquet data to the same path (`data/train-*.parquet`) because `data_dir="data"` was passed explicitly to `DatasetDict.push_to_hub`, overriding the per-config subdirectory behaviour introduced in datasets v5. Each config now writes to its own `data/{config_name}/` directory, so multiple subsets are no longer silently overwritten by the last one pushed.
 - `push_stores_to_hub` and `push_to_hub` `clear` parameter now correctly defaults to `True` (the docstring-stated default), ensuring stale parquet shards are wiped before each fresh push.

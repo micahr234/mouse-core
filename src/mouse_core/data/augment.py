@@ -113,7 +113,7 @@ class AugmentTokensConfig:
     shift_obs: AugmentScalarSpec = field(default_factory=lambda: AugmentScalarSpec(0.0, 0.0))
     scale_obs_image: AugmentScalarSpec = field(default_factory=lambda: AugmentScalarSpec(1.0, 0.0))
     shift_obs_image: AugmentScalarSpec = field(default_factory=lambda: AugmentScalarSpec(0.0, 0.0))
-    permute_obs_discrete: bool = False  # remap OBS_DISCRETE token ids only (q_star / actions unchanged — unsafe for semantic categoricals)
+    permute_obs_discrete: bool = False  # remap OBS_DISCRETE token ids only (info_metadata_q_star / actions unchanged — unsafe for semantic categoricals)
     permute_action: Literal[False, "input", "target", "both"] = False  # action permutation mode
     permute_done: bool = False  # random swap of done 0/1
     mask_prob: AugmentMaskProbConfig = field(default_factory=AugmentMaskProbConfig)
@@ -194,12 +194,12 @@ def apply_permute_action_augmentation(
         action = objective_data["action"]                          # [B, S]
         objective_data["action"].copy_(torch.gather(perm, dim=1, index=action.long()))
 
-    if apply_to_target and "q_star" in objective_data.keys():
+    if apply_to_target and "info_metadata_q_star" in objective_data.keys():
         inv_perm = _inverse_action_perm_rows(perm)
-        q = objective_data["q_star"]                               # [B, S, A]
+        q = objective_data["info_metadata_q_star"]                 # [B, S, A]
         B, S, A = q.shape
         inv_exp = inv_perm.unsqueeze(1).expand(B, S, A)        # [B, S, A]
-        objective_data["q_star"].copy_(torch.gather(q, dim=2, index=inv_exp))
+        objective_data["info_metadata_q_star"].copy_(torch.gather(q, dim=2, index=inv_exp))
 
 
 @torch.no_grad()

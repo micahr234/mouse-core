@@ -36,7 +36,7 @@ def test_step_embedder_keeps_default_for_optional_missing_modality() -> None:
     )
     batch = _batch([{"reward": 0.5}])
 
-    embeds, _ = encoder(batch)
+    embeds, _, _ = encoder(batch)
 
     assert embeds.shape == (1, 1, 8)
 
@@ -51,7 +51,7 @@ def test_step_embedder_returns_col_values() -> None:
     )
     batch = _batch([{"action": 2, "reward": 1.5}])
 
-    embeds, col_values = encoder(batch)
+    embeds, col_values, _ = encoder(batch)
 
     assert embeds.shape == (1, 1, 8)
     assert col_values["action"].item() == 2
@@ -71,33 +71,23 @@ def test_step_embedder_batch_shape() -> None:
         [{"action": (b * S + s) % 4, "reward": float(b * S + s)} for s in range(S)]
         for b in range(B)
     ]
-    embeds, col_values = encoder(batch)
+    embeds, col_values, _ = encoder(batch)
 
     assert embeds.shape == (B, S, 8)
     assert col_values["action"].shape == (B, S)
     assert col_values["reward"].shape == (B, S)
 
 
-def test_step_embedder_learnable_modality_cannot_be_required() -> None:
-    with pytest.raises(ValueError, match="cannot be required"):
-        StepEmbedder(
-            hidden_dim=8,
-            modalities=[
-                {"name": "scratch", "embed": "learnable", "tokens": 1, "required": True},
-            ],
-        )
-
-
-def test_step_embedder_learnable_modality_is_allowed_when_required_false() -> None:
+def test_step_embedder_learnable_modality_is_allowed() -> None:
     encoder = StepEmbedder(
         hidden_dim=8,
         modalities=[
-            {"name": "scratch", "embed": "learnable", "tokens": 1, "required": False},
+            {"name": "scratch", "embed": "learnable", "tokens": 1},
         ],
     )
     batch = [[{}]]
 
-    embeds, col_values = encoder(batch)
+    embeds, col_values, _ = encoder(batch)
 
     assert embeds.shape == (1, 1, 8)
     assert "scratch" not in col_values
@@ -113,7 +103,7 @@ def test_step_embedder_continuous_modality() -> None:
     )
     batch = [[{"obs": [0.1, 0.2, 0.3, 0.4], "reward": 1.0}]]
 
-    embeds, col_values = encoder(batch)
+    embeds, col_values, _ = encoder(batch)
 
     assert embeds.shape == (1, 1, 8)
     assert col_values["obs"].shape == (1, 1, 4)

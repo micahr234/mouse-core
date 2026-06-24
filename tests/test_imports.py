@@ -8,7 +8,7 @@ def test_mouse_root_exports() -> None:
 
     assert hasattr(mouse_core, "load_model")
     assert hasattr(mouse_core, "Model")
-    assert hasattr(mouse_core, "ObjectiveConfig")
+    assert hasattr(mouse_core, "Objective")
 
 
 def test_mouse_model_exports() -> None:

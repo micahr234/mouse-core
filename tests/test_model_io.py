@@ -88,6 +88,7 @@ def test_model_card_includes_usage_and_architecture(tmp_path) -> None:
     assert "| `action` | `discrete` | yes | `[B, S]` | `torch.long` | integer ids in `[0, 3]` |" in text
     assert '"action": 0,' in text
     assert '"reward": 0.0,' in text
-    assert "out, step_stream, cache = model(batch)" in text
+    assert "out, step_stream, cache = model(batch)" not in text
+    assert "predictions, objective_data, cache = model(batch)" in text
     assert "Backbone: `identity`" in text
     assert "Heads: `action_value`" in text
