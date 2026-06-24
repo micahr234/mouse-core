@@ -34,8 +34,10 @@ Issues = "https://github.com/micahr234/mouse-core/issues"
 [project.optional-dependencies]
 examples = [
     "mouse-env @ git+https://github.com/micahr234/mouse-env.git@main",
-    "gymnasium[atari]>=1.2.3",
+    "gymnasium[atari,toy-text]>=1.2.3",
     "opencv-python>=4.9",
+    "matplotlib>=3.9",
+    "pygame>=2.6",
 ]
 atari = [
     "gymnasium[atari]>=1.0.0",

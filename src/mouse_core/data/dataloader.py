@@ -2,14 +2,14 @@
 
 A ``Datastore`` is a flat sequence of arbitrary rows.
 
-The ``DataLoader`` repeatedly samples contiguous slices from the store
-(according to the chosen policy), runs them through a row encoder
-(``encode_hf_rows``) that projects common fields into tensors (shapes
-derived from the data present in each slice), and yields ready
-``TensorDict[B, S]`` batches for the model.
+The ``DataLoader`` repeatedly samples contiguous windows of ``S`` rows from
+the store and returns them as a ``list[list[dict]]`` of shape ``[B][S]``.
+Each element is a plain Python dict exactly as it was stored (no encoding or
+tensorisation happens here). The model (its encoder) is responsible for
+extracting and converting the fields it needs.
 
-When background workers are enabled, slice + encode work happens in the
-background so ``next_batch()`` is usually immediate.
+When background workers are enabled the slice work happens in the background
+so ``next_batch()`` is usually immediate.
 
 Usage
 -----
@@ -34,23 +34,18 @@ import threading
 from typing import TYPE_CHECKING
 
 import numpy as np
-from tensordict import TensorDict
 
 if TYPE_CHECKING:
     from mouse_core.data.datastore import Datastore
 
 
 class DataLoader:
-    """Produces model-ready ``TensorDict[B, S]`` batches from a ``Datastore``.
+    """Produces ``list[list[dict]]`` batches of raw step records from a ``Datastore``.
 
     The store holds a flat sequence of arbitrary rows. This loader samples
-    contiguous windows and runs them through a row encoder that turns selected
-    fields into tensors. Vector-like fields use the largest native length
-    present among rows in the current slice (shorter ones right-padded with 0).
-
-    The default encoder only cares about a few fields (whatever is needed to
-    produce the tensors the current models expect). Any other fields in your
-    rows are ignored for the batch.
+    contiguous windows and returns them as Python dicts without any encoding.
+    Columns are untouched; the model's encoder decides what to extract and
+    how to tensorize it.
 
     Background workers (when enabled) do the work asynchronously.
 
@@ -77,8 +72,6 @@ class DataLoader:
         How many batches to keep pre-encoded.
     num_workers : int
         Background workers (0 = synchronous).
-    pin_memory : bool
-        Pin the CPU tensors (CUDA only).
     """
 
     def __init__(
@@ -89,7 +82,6 @@ class DataLoader:
         sampling: str = "random",
         prefetch: int = 4,
         num_workers: int = 1,
-        pin_memory: bool = False,
     ) -> None:
         from mouse_core.data.datastore import Datastore as _DS
 
@@ -123,14 +115,12 @@ class DataLoader:
         self._next_window: int = 0
         self._window_order: np.ndarray = self._new_epoch_order()
 
-        self._pin_memory = pin_memory
-
         n_workers = num_workers if sampling in ("random", "last") else 1
 
         if n_workers == 0:
             # Synchronous mode: fetch directly on the calling thread.
             self._sync_rng: np.random.Generator | None = np.random.default_rng(seed=0)
-            self._result_queue: queue.Queue[TensorDict] | None = None
+            self._result_queue: queue.Queue[list[list[dict]]] | None = None
             self._stop: threading.Event | None = None
             self._worker_error: BaseException | None = None
             self._workers: list[threading.Thread] = []
@@ -161,8 +151,13 @@ class DataLoader:
         num_windows = self._n // self.sequence_length
         return max(0, (num_windows + self.batch_size - 1) // self.batch_size)
 
-    def next_batch(self) -> TensorDict:
-        """Return the next pre-encoded batch, blocking until one is ready."""
+    def next_batch(self) -> list[list[dict]]:
+        """Return the next batch of raw rows, blocking until one is ready.
+
+        Returns:
+            ``list[list[dict]]`` of shape ``[B][S]``.  Each inner dict is a
+            step record exactly as stored in the Datastore.
+        """
         if self._sync_rng is not None:
             return self._fetch_one_batch(self._sync_rng)
         assert self._result_queue is not None
@@ -247,15 +242,15 @@ class DataLoader:
 
         return windows * S
 
-    def _fetch_one_batch(self, rng: np.random.Generator) -> TensorDict:
+    def _fetch_one_batch(self, rng: np.random.Generator) -> list[list[dict]]:
         starts = self._sample_starts(rng)
         S = self.sequence_length
-        seqs = [self._dataset[int(s) : int(s) + S] for s in starts]
-        merged = {k: [v for seq in seqs for v in seq[k]] for k in seqs[0]}
-        td = self.store.encode_hf_rows(merged).reshape(len(starts), S)
-        if self._pin_memory:
-            td = td.pin_memory()
-        return td
+        batch: list[list[dict]] = []
+        for s in starts:
+            hf_slice = self._dataset[int(s) : int(s) + S]
+            seq = [{k: hf_slice[k][i] for k in hf_slice} for i in range(S)]
+            batch.append(seq)
+        return batch
 
     def _worker_loop(self, rng: np.random.Generator) -> None:
         assert self._stop is not None and self._result_queue is not None

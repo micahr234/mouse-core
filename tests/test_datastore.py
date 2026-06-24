@@ -1,78 +1,93 @@
-"""Tests for Datastore append and encoding."""
+"""Tests for Datastore append and raw-row retrieval."""
 
 from __future__ import annotations
-
-import pytest
 
 from mouse_core.data import Datastore
 
 
+def test_name_is_optional() -> None:
+    store = Datastore()
+    assert store.name is None
+    assert repr(store) == "Datastore(steps=0)"
+
+
+def test_named_store_repr() -> None:
+    store = Datastore(name="cartpole")
+    assert store.name == "cartpole"
+    assert repr(store) == "Datastore(name='cartpole', steps=0)"
+
+
+def test_name_is_not_saved_as_a_dataset_column() -> None:
+    store = Datastore(name="cartpole")
+    store.append({"action": 1, "reward": 0.5, "done": 0})
+    assert "name" not in store.to_dataset().column_names
+
+
 def test_append_and_len() -> None:
     store = Datastore()
-    store.append({
-        "observation": {"discrete": 0},
-        "action": {"discrete": 1},
-        "reward": 0.5,
-        "done": 0,
-        "time": 0,
-    })
-    store.append({
-        "observation": {"discrete": 1},
-        "action": {"discrete": 2},
-        "reward": 1.0,
-        "done": 0,
-        "time": 1,
-    })
+    store.append({"action": 1, "reward": 0.5, "done": 0})
+    store.append({"action": 2, "reward": 1.0, "done": 0})
     assert len(store) == 2
 
 
-def test_encode_single_row() -> None:
-    store = Datastore()
-    store.append({
-        "observation": {"discrete": 3},
-        "action": {"discrete": 2},
-        "reward": -1.0,
-        "done": 1,
-        "time": 4,
-    })
-    td = store.__getitem__(0)
-    assert td["action"].item() == 2
-    assert td["reward"].item() == -1.0
-    assert td["done"].item() == 1
-    assert td["obs_discrete"].item() == 3
-    assert td["time"].item() == 4
+def test_append_store() -> None:
+    left = Datastore(name="left")
+    left.append({"action": 1, "reward": 0.0, "done": 0})
+    right = Datastore(name="right")
+    right.append({"action": 2, "reward": 1.0, "done": 0})
+
+    left.append(right)
+
+    assert len(left) == 2
+    rows = left.__getitem__([0, 1])
+    assert [r["action"] for r in rows] == [1, 2]
 
 
-def test_encode_optional_fields() -> None:
+def test_append_store_list() -> None:
+    target = Datastore()
+    stores = []
+    for action in (1, 2):
+        store = Datastore()
+        store.append({"action": action, "reward": float(action), "done": 0})
+        stores.append(store)
+
+    target.append(stores)
+
+    assert len(target) == 2
+    rows = target.__getitem__([0, 1])
+    assert [r["action"] for r in rows] == [1, 2]
+
+
+def test_getitem_returns_list_of_dicts() -> None:
     store = Datastore()
-    store.append({
-        "observation": {"continuous": [0.1, 0.2]},
-        "action": {"discrete": 1},
-        "reward": 0.5,
-        "reward_episodic": 0.25,
-        "done": 0,
-        "time": 0,
-        "q_star": [1.0, 2.0, 3.0, 4.0],
-    })
-    td = store.__getitem__(0)
-    assert td["xformed_reward"].item() == 0.25
-    assert td["obs_continuous"].shape[-1] == 2
-    assert td["q_star"].shape[-1] == 4
+    store.append({"action": 3, "reward": -1.0, "done": 1, "time": 4})
+    rows = store.__getitem__(0)
+    assert isinstance(rows, list)
+    assert len(rows) == 1
+    assert rows[0]["action"] == 3
+    assert rows[0]["reward"] == -1.0
+    assert rows[0]["done"] == 1
+    assert rows[0]["time"] == 4
+
+
+def test_getitem_slice_preserves_order() -> None:
+    store = Datastore()
+    for i in range(5):
+        store.append({"action": i, "reward": float(i), "done": 0})
+    rows = store.__getitem__([2, 4, 0])
+    assert [r["action"] for r in rows] == [2, 4, 0]
 
 
 def test_dataset_roundtrip() -> None:
-    """Append rows, export to a HuggingFace Dataset, reload, and re-encode."""
+    """Append rows, export to a HuggingFace Dataset, reload, and re-retrieve."""
     store = Datastore()
     for t in range(3):
         store.append({
-            "observation": {"continuous": [float(t), float(t) + 0.5]},
-            "action": {"discrete": t % 2},
+            "action": t % 2,
             "reward": float(t),
-            "reward_episodic": float(t) / 10.0,
             "done": 0,
             "time": t,
             "group_id": "CartPole-v1#0",
-            "episode_index": 0,
         })
 
     ds = store.to_dataset()
@@ -80,58 +95,22 @@ def test_dataset_roundtrip() -> None:
 
     reloaded = Datastore()
     reloaded.from_dataset(ds)
-    td = reloaded.__getitem__([0, 1, 2])
-    assert td["action"].tolist() == [0, 1, 0]
-    assert td["obs_continuous"].shape == (3, 2)
-    assert abs(td["xformed_reward"][2].item() - 0.2) < 1e-6
+    rows = reloaded.__getitem__([0, 1, 2])
+    assert [r["action"] for r in rows] == [0, 1, 0]
+    assert rows[2]["reward"] == 2.0
 
 
-def test_encode_continuous_action() -> None:
+def test_getitem_mixed_source_and_buffer() -> None:
+    """Rows from the HF source and from the append buffer interleave correctly."""
     store = Datastore()
-    store.append({
-        "observation": {"continuous": [0.1, 0.2, 0.3]},
-        "action": {"continuous": [0.5, -0.5]},
-        "reward": 1.0,
-        "done": 0,
-        "time": 0,
-    })
-    td = store.__getitem__(0)
-    assert td["action_continuous"].shape[-1] == 2
-    assert td["action_continuous"][0].tolist() == pytest.approx([0.5, -0.5])
-    # Discrete action index is still emitted (0 placeholder for continuous-only rows).
-    assert td["action"].item() == 0
+    store.append({"action": 10, "reward": 0.0, "done": 0})
+    store.append({"action": 20, "reward": 0.0, "done": 0})
+    # Flush buffer to source
+    ds = store.to_dataset()
+    store2 = Datastore()
+    store2.from_dataset(ds)
+    # Now add more rows to the buffer
+    store2.append({"action": 30, "reward": 0.0, "done": 0})
 
-
-def test_encode_mixed_modalities() -> None:
-    """One store holding discrete, continuous, and image steps zero-fills absent modalities."""
-    store = Datastore()
-    store.append({  # discrete obs + discrete action
-        "observation": {"discrete": 2},
-        "action": {"discrete": 3},
-        "reward": 0.0, "done": 0, "time": 0,
-    })
-    store.append({  # continuous obs + continuous action
-        "observation": {"continuous": [0.1, 0.2, 0.3, 0.4]},
-        "action": {"continuous": [0.9]},
-        "reward": 1.0, "done": 0, "time": 1,
-    })
-    store.append({  # image obs + discrete action
-        "observation": {"image": [10, 20, 30, 40]},
-        "action": {"discrete": 5},
-        "reward": 0.0, "done": 1, "time": 2,
-    })
-
-    td = store.__getitem__([0, 1, 2])
-    assert td["action"].tolist() == [3, 0, 5]
-    assert td["action_continuous"].shape == (3, 1)
-    assert td["action_continuous"][:, 0].tolist() == pytest.approx([0.0, 0.9, 0.0])
-    # Discrete obs: real index on row 0, 0 placeholder elsewhere.
-    assert td["obs_discrete"].tolist() == [2, 0, 0]
-    # Continuous obs: populated on row 1, zero-filled elsewhere.
-    assert td["obs_continuous"].shape == (3, 4)
-    assert td["obs_continuous"][0].tolist() == [0.0, 0.0, 0.0, 0.0]
-    assert td["obs_continuous"][1].tolist() == pytest.approx([0.1, 0.2, 0.3, 0.4])
-    # Image obs: populated on row 2, zero-filled elsewhere.
-    assert td["obs_image"].shape == (3, 4)
-    assert td["obs_image"][2].tolist() == [10, 20, 30, 40]
-    assert td["obs_image"][0].tolist() == [0, 0, 0, 0]
+    rows = store2.__getitem__([0, 1, 2])
+    assert [r["action"] for r in rows] == [10, 20, 30]

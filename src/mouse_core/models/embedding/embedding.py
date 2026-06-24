@@ -27,7 +27,7 @@ exactly ``tokens_per_step`` embedding vectors.
     ``num_compute_tokens=K`` (they are always added after all declared modalities).
 
     You can also declare learnable blocks anywhere in the sequence by including
-    modalities with ``{"name": "...", "embed": "learnable", "tokens": N}``.  Such
+    modalities with ``{"name": "...", "embed": "learnable", "tokens": N, "required": False}``.  Such
     modalities contribute learned scratch tokens at the position they appear in
     the ``modalities`` list; the named modality does **not** need to be present in
     the input rows (its data is ignored).  These are independent of the
@@ -43,6 +43,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
+import numpy as np
 import torch
 import torch.nn as nn
 from tensordict import TensorDict
@@ -51,12 +52,98 @@ from mouse_core.models.embedding.encoding import NormalizedPixel, RandomFourierF
 from mouse_core.models.embedding.linear import ScaledEmbedding, ScaledPosLinear
 
 
+# ---------------------------------------------------------------------------
+# Modality config helpers  (dtype → embed kind)
+# ---------------------------------------------------------------------------
+
+
+def action_modality(dtype: torch.dtype, *, vocab_size: int | None = None, **kwargs: Any) -> dict:
+    """Return a modality config dict for the flat ``"action"`` key.
+
+    ``dtype`` comes from ``env.input_spec.action.dtype``:
+
+    * ``torch.int64``   → discrete action  (``"embed": "discrete"``; requires *vocab_size*)
+    * ``torch.float32`` → continuous action (``"embed": "continuous"``)
+
+    Extra keyword arguments are merged into the returned dict and forwarded to
+    :class:`ModalitySpec` (e.g. ``tokens``, ``std``, ``in_min``, ``in_max``).
+    """
+    if dtype == torch.int64:
+        if vocab_size is None:
+            raise ValueError(
+                "vocab_size is required for discrete (int64) actions; "
+                "pass vocab_size=env.action_dim or the known action-space size."
+            )
+        return {"name": "action", "embed": "discrete", "vocab_size": vocab_size, **kwargs}
+    return {"name": "action", "embed": "continuous", **kwargs}
+
+
+def observation_modalities(
+    obs_spec: Any,
+    *,
+    vocab_sizes: int | dict[str, int] | None = None,
+    **shared_kwargs: Any,
+) -> list[dict]:
+    """Return a list of modality config dicts for the observation field(s).
+
+    ``obs_spec`` comes from ``env.output_spec.observation``:
+
+    * A single ``FieldSpec`` (non-Dict obs space) → produces one modality named
+      ``"observation"``.
+    * A ``dict[str, FieldSpec]`` (``gym.spaces.Dict`` obs space) → the subspace
+      keys land directly on each output dict, so one modality is produced per key.
+
+    ``dtype`` drives the embed kind:
+
+    * ``torch.int64``             → ``"embed": "discrete"`` (requires *vocab_sizes*)
+    * ``torch.float32``, 1-D     → ``"embed": "continuous"``
+    * ``torch.float32``, 2-D/3-D → ``"embed": "image"``
+
+    ``vocab_sizes`` is used for discrete sub-spaces:
+
+    * Single obs: pass an ``int``.
+    * Dict obs:   pass a ``dict[key → int]``.
+
+    Extra keyword arguments are forwarded to every modality dict (e.g. ``tokens``,
+    ``std``).  Override per-key values after calling this function if needed.
+    """
+    if isinstance(obs_spec, dict):
+        result: list[dict] = []
+        for key, spec in obs_spec.items():
+            vs = vocab_sizes.get(key) if isinstance(vocab_sizes, dict) else None
+            result.append(_obs_modality(key, spec.dtype, getattr(spec, "shape", ()), vocab_size=vs, **shared_kwargs))
+        return result
+    return [_obs_modality("observation", obs_spec.dtype, getattr(obs_spec, "shape", ()), vocab_size=vocab_sizes if isinstance(vocab_sizes, int) else None, **shared_kwargs)]
+
+
+def _obs_modality(
+    name: str,
+    dtype: torch.dtype,
+    shape: tuple[int, ...],
+    *,
+    vocab_size: int | None,
+    **kwargs: Any,
+) -> dict:
+    if dtype == torch.int64:
+        if vocab_size is None:
+            raise ValueError(
+                f"vocab_size is required for discrete (int64) observation {name!r}; "
+                "pass vocab_sizes=<int> (or a dict for Dict obs spaces)."
+            )
+        return {"name": name, "embed": "discrete", "vocab_size": vocab_size, **kwargs}
+    if len(shape) >= 2:
+        return {"name": name, "embed": "image", "dim": int(np.prod(shape)), **kwargs}
+    return {"name": name, "embed": "continuous", **kwargs}
+
+
 class Encoder(nn.Module, ABC):
     """Abstract base for encoders.
 
-    An encoder is the first stage of a MOUSE model. It converts a ``TensorDict``
-    of step records ``[B, S]`` into a flat token embedding sequence
-    ``[B, T, D]`` that a backbone can process.
+    An encoder is the first stage of a MOUSE model. It converts a batch of
+    raw step records (a ``list[list[dict]]`` of shape ``[B][S]``) into a flat
+    token embedding sequence ``[B, T, D]`` that a backbone can process, and
+    simultaneously exposes the per-modality tensors it extracted so that
+    objectives and heads can use them.
 
     The encoder also defines how to extract per-step representations
     (the vectors fed to heads for action output) from the backbone's
@@ -82,15 +169,25 @@ class Encoder(nn.Module, ABC):
         ...
 
     @abstractmethod
-    def forward(self, step_stream: TensorDict) -> torch.Tensor:
-        """Encode a batch of step records into token embeddings.
+    def forward(
+        self, batch: list[list[dict]]
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Encode a batch of raw step records into token embeddings.
 
         Args:
-            step_stream: TensorDict ``[B, S]`` of step records. Required keys
-                depend on the concrete encoder configuration.
+            batch: ``[B][S]`` list of row dicts. Each dict contains whatever
+                fields the data source produced.  Required modality keys depend
+                on the concrete encoder configuration.
 
         Returns:
-            ``embeds``: ``[B, T, D]`` with ``T = S * tokens_per_step``.
+            ``(embeds, col_values)`` where
+
+            * ``embeds`` is ``[B, T, D]`` with ``T = S * tokens_per_step``.
+            * ``col_values`` maps each non-learnable modality name to its
+              extracted tensor (shape ``[B, S]`` for scalars, ``[B, S, D]``
+              for vectors). These are the same tensors used for embedding;
+              :class:`~mouse_core.models.base.Model` wraps them into the
+              ``step_stream`` TensorDict returned alongside the head outputs.
         """
         ...
 
@@ -138,7 +235,7 @@ class ModalitySpec:
         modalities = [
             {"name": "action", "embed": "discrete", "vocab_size": 18, "tokens": 1},
             {"name": "reward", "embed": "rff", "tokens": 1},
-            {"name": "scratch", "embed": "learnable", "tokens": 2},  # learned scratch tokens; need not exist in data
+            {"name": "scratch", "embed": "learnable", "tokens": 2, "required": False},  # learned scratch tokens; need not exist in data
             {"name": "obs", "embed": "continuous", "dim": 8, "tokens": 2},
             {"name": "img", "embed": "image", "dim": 7056, "tokens": 16},  # e.g. patches
             {"name": "my_time", "embed": "discrete", "vocab_size": 1000, "absent": -1},
@@ -158,6 +255,8 @@ class ModalitySpec:
     include_type_token: bool | None = None
     method: str = "rff"
     absent: Any = None
+    required: bool = True
+    allow_none: bool = False
 
     # Valid values for the ``embed`` field in ModalitySpec.
     # These name the embedding *technique*, not the semantic role of the modality.
@@ -601,6 +700,11 @@ class StepEmbedder(Encoder):
                     f"modality {cs.name!r} (embed={k}) does not support 'absent'; "
                     f"'absent' only applies to discrete modalities"
                 )
+            if cs.required and k == "learnable":
+                raise ValueError(
+                    f"modality {cs.name!r} (embed={k}) cannot be required; "
+                    "learnable modalities do not read input data"
+                )
 
             # in_min/in_max are only meaningful for RFF-using embedders (rff or continuous with rff)
             uses_rff_ranges = (k == "rff") or (is_method_using and cs.method != "linear")
@@ -781,48 +885,100 @@ class StepEmbedder(Encoder):
 
     def forward(
         self,
-        step_stream: TensorDict,
-    ) -> torch.Tensor:
-        """Embed a batch of steps.
+        batch: list[list[dict]],
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Embed a batch of raw step records.
 
         Args:
-            step_stream: TensorDict of shape ``[B, S]``.
+            batch: ``[B][S]`` list of row dicts.  Each dict contains the fields
+                produced by the data source (DataLoader or a manual rollout).
 
         Returns:
-            embeds: ``[B, S*tokens_per_step, D]``
+            ``(embeds, col_values)`` where
 
-            Padding information, if any, is not returned as part of the embedding
-            stream. If certain positions within the produced sequence should be
-            masked (e.g. unused slots for a variable-length modality), supply an
-            explicit ``attention_mask`` when calling the model or backbone.
+            * ``embeds`` is ``[B, S*tokens_per_step, D]``.
+            * ``col_values`` maps each non-learnable modality name to the tensor
+              extracted from the batch (``[B, S]`` for scalars, ``[B, S, D]``
+              for vectors), ready to be wrapped into a ``step_stream`` TensorDict
+              by :class:`~mouse_core.models.base.Model`.
         """
         device = next(self.parameters()).device
-        step_stream = step_stream.to(device)
-
-        B, S = int(step_stream.batch_size[0]), int(step_stream.batch_size[1])
+        B = len(batch)
+        S = len(batch[0]) if B > 0 else 0
         D = self._hidden_dim
         dtype = torch.get_default_dtype()
 
-        # Collect values (or synthesized defaults) for every declared modality.
-        # Compute modalities do not read from (or require) any data in the step_stream;
-        # we simply omit them from col_values.
-        col_values: dict[str, torch.Tensor] = {}
-        for spec in self.modalities:
-            key = spec.name
-            if key in self._learnable_modalities:
-                continue
-            if key in step_stream.keys():
-                col_values[key] = step_stream[key]
-            else:
-                col_values[key] = self._default_value_for(spec, B, S, device)
+        # ------------------------------------------------------------------ #
+        # Single-pass extraction: iterate each row once, fill all modality    #
+        # buffers simultaneously.  This keeps dict-lookup count at B*S        #
+        # instead of num_modalities * B * S (separate passes).                #
+        # ------------------------------------------------------------------ #
+        non_learnable = [s for s in self.modalities if s.name not in self._learnable_modalities]
 
+        # Pre-allocate one Python list per modality, length B*S.
+        raw: dict[str, list] = {spec.name: [None] * (B * S) for spec in non_learnable}
+
+        idx = 0
+        for b in range(B):
+            for s in range(S):
+                row = batch[b][s]
+                for spec in non_learnable:
+                    raw[spec.name][idx] = row.get(spec.name)
+                idx += 1
+
+        # Convert raw lists to tensors per modality.
+        col_values: dict[str, torch.Tensor] = {}
+        for spec in non_learnable:
+            values = raw[spec.name]
+            all_none = all(v is None for v in values)
+
+            if all_none:
+                if spec.required:
+                    raise KeyError(
+                        f"Required modality {spec.name!r} is missing from all "
+                        f"rows in the batch."
+                    )
+                col_values[spec.name] = self._default_value_for(spec, B, S, device)
+                continue
+
+            k = spec.embed.lower()
+
+            if k == "discrete":
+                absent_val = int(spec.absent) if spec.absent is not None else 0
+                arr = np.array(
+                    [int(v) if v is not None else absent_val for v in values],
+                    dtype=np.int64,
+                )
+                col_values[spec.name] = torch.from_numpy(arr).to(device).reshape(B, S)
+
+            elif k == "rff":
+                arr = np.array(
+                    [float(v) if v is not None else 0.0 for v in values],
+                    dtype=np.float32,
+                )
+                col_values[spec.name] = torch.from_numpy(arr).to(device).reshape(B, S)
+
+            elif k in ("continuous", "image"):
+                dim = spec.dim or spec.size or 0
+                np_dtype = np.float32 if k == "continuous" else np.int64
+                buf = np.zeros((B * S, dim), dtype=np_dtype)
+                for i, v in enumerate(values):
+                    if v is not None:
+                        a = np.asarray(v, dtype=np_dtype).ravel()
+                        d = min(a.size, dim)
+                        buf[i, :d] = a[:d]
+                col_values[spec.name] = (
+                    torch.from_numpy(buf).to(device).reshape(B, S, dim)
+                )
+
+        # ------------------------------------------------------------------ #
+        # Embed extracted tensors → token sequence [B, S, T, D].              #
+        # ------------------------------------------------------------------ #
         if self.concat_modalities:
             data_embeds = self._forward_concat(B, S, D, device, dtype, col_values)
         else:
             data_embeds = self._forward_sum(B, S, D, device, dtype, col_values)
 
-        # Append the global trailing compute tokens (declared learnable modalities
-        # are already included in the data_* blocks above).
         K = self.num_compute_tokens
         if K > 0:
             assert self.compute_embed is not None
@@ -833,7 +989,7 @@ class StepEmbedder(Encoder):
             embeds = data_embeds
 
         total_T = embeds.shape[2]
-        return embeds.reshape(B, S * total_T, D)
+        return embeds.reshape(B, S * total_T, D), col_values
 
     # ------------------------------------------------------------------
     # Internal helpers (generalized over modalities)

@@ -3,11 +3,13 @@
 A MOUSE model has three pieces:
 
 ```text
-TensorDict[B, S]
+list[list[dict]]  [B][S] of raw step records
     -> Encoder (StepEmbedder) -> token embeddings [B, T, D]
     -> Backbone (Llama, Qwen3, or Identity) -> hidden states [B, T, D]
-    -> Heads -> TensorDict[B, S]
+    -> Heads -> out: TensorDict[B, S]
 ```
+
+`Model.forward(batch)` returns `(out, step_stream, cache)`. `step_stream` is a `TensorDict[B, S]` of the modality tensors extracted by the encoder — use it in objectives. `out` contains one key per head.
 
 Build those pieces directly, then compose them with `Model`:
 
@@ -91,20 +93,49 @@ model = Model(encoder=encoder, backbone=backbone, heads=heads)
 
 ## Encoder
 
-`StepEmbedder` converts a `TensorDict[B, S]` of step records into token embeddings. Each modality reads one key from the input and declares how to embed it:
+`StepEmbedder` accepts `list[list[dict]]` (shape `[B][S]`) and extracts only the fields its `modalities` config declares. Each modality reads one key from the row dicts and declares how to embed it:
 
 - `"discrete"`: integer ids through a learned embedding table.
 - `"rff"`: scalar floats through random Fourier features.
-- `"continuous"`: float vectors, using RFF by default or `method="linear"`.
+- `"continuous"`: float vectors, zero-padded/truncated to `dim`.
 - `"image"`: image or patch values through per-position learned projections.
 - `"learnable"`: learned scratch tokens; no input key is required.
 
-Modalities can contribute one or more tokens via `tokens`. In the default sum mode (`concat_modalities=False`), modalities share a step block and are summed into matching positions. In concat mode (`concat_modalities=True`), modality blocks are laid out in order.
+Extraction happens in a single pass through the batch, filling all modality buffers simultaneously. Only the columns the encoder needs are touched; all other fields in the dicts are ignored.
+
+Modalities are required by default: if the declared field is absent from every row in the batch the encoder raises a `KeyError`. Set `required=False` when a missing field should use the encoder's default value. `learnable` modalities must use `required=False`.
+
+### Building modality configs from env specs
+
+Row dicts produced by `mouse-env` are flat: `{"action": tensor, "observation": tensor, "reward": tensor, "done": tensor, ...}`. The action and observation `FieldSpec` objects exposed by `env.input_spec` and `env.output_spec` carry the dtype that determines which embedder to use: `torch.int64` → discrete, `torch.float32` → continuous or image.
+
+`action_modality` and `observation_modalities` turn those specs into modality config dicts automatically:
+
+```python
+from mouse_envs import make_vector_env
+from mouse_core.models.embedding import action_modality, observation_modalities
+
+env = make_vector_env(cfg)
+
+modalities = [
+    # action_modality reads dtype: int64 → "discrete", float32 → "continuous"
+    action_modality(env.input_spec.action.dtype, vocab_size=4, tokens=1),
+    # observation_modalities handles both single FieldSpec and Dict obs spaces
+    *observation_modalities(env.output_spec.observation, vocab_sizes=16, tokens=1),
+    {"name": "reward", "embed": "rff"},
+    {"name": "done",   "embed": "discrete", "vocab_size": 3},
+]
+
+encoder = StepEmbedder(hidden_dim=hidden_dim, modalities=modalities)
+env.close()
+```
+
+For `gym.spaces.Dict` observation spaces the subspace keys land directly on the output dict (not under `"observation"`). `observation_modalities` detects this automatically and produces one modality per subspace key; pass `vocab_sizes` as a `dict[key → int]` in that case.
 
 `StepEmbedder.hidden_dim` is checked against `backbone.hidden_dim` by `Model`. If you need padding or variable token visibility, pass an explicit mask to the model:
 
 ```python
-out, cache = model(step_stream, attention_mask=attention_mask)
+out, step_stream, cache = model(batch, attention_mask=attention_mask)
 ```
 
 ## Backbone
@@ -159,7 +190,7 @@ Supported head names are `"action_value"`, `"action_vector"`, `"action"`, and `"
 `Model.get_action` reads the configured `action_head` from the last step:
 
 ```python
-out, cache = model(step_stream)
+out, _, cache = model(batch)
 action = model.get_action(out, temperature=0.0)
 ```
 
@@ -181,7 +212,7 @@ from mouse_core.models import load_model, push_model_to_hub, save_model
 save_model(model, "./checkpoints/step-10000")
 model = load_model("./checkpoints/step-10000")
 
-push_model_to_hub(model, "my-mouse-model", private=True)
+push_model_to_hub(model, "my-mouse-model", private=True, clear=True)
 model = load_model("my-mouse-model")
 ```
 

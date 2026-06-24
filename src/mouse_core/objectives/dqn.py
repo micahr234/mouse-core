@@ -23,7 +23,8 @@ class DqnObjectiveConfig(ObjectiveConfig):
     normalize_reward_std: bool = False  # per-sequence-row divide by std of TD rewards
     normalize_reward_eps: float = 1e-8  # numerical floor for variance and division in TD reward normalization
     normalize_reward_std_target: float = 1.0  # multiply normalized TD rewards by this (after mean/std norm; no effect if both norm flags false)
-    use_xformed_reward: bool = False  # use xformed_reward instead of reward as the TD target signal
+    use_episodic_reward: bool = False  # use reward_episodic instead of reward as the TD target signal
+    action_key: str = "action"  # key in step_stream that holds the integer action
     cql_weight: float = 0.0  # α in CQL penalty; 0 = disabled
     cql_scale_q_eps: float = 1.0  # additive floor in CQL Q-scaling: scale = |td_target| + cql_scale_q_eps
     reward_scale: float = 1.0  # multiply reward before TD target: td_target = r * reward_scale + reward_shift + γ * max Q(s')
@@ -46,14 +47,18 @@ def dqn_objective(
     if S < 2:
         raise ValueError("Not enough valid q values in data.")
 
-    action = step_stream["action"].to(dtype=torch.long)
-    if cfg.use_xformed_reward:
-        if "xformed_reward" not in step_stream.keys():
+    action = step_stream[cfg.action_key].to(dtype=torch.long)
+    if action.ndim == 3 and action.shape[-1] == 1:
+        action = action.squeeze(-1)
+    if action.ndim != 2:
+        raise ValueError(f"DQN objective expects action shape [B, S], got {tuple(action.shape)}.")
+    if cfg.use_episodic_reward:
+        if "reward_episodic" not in step_stream.keys():
             raise KeyError(
-                "use_xformed_reward=True but 'xformed_reward' is not in the batch. "
-                "Ensure your dataset includes the 'xformed_reward' column."
+                "use_episodic_reward=True but 'reward_episodic' is not in the batch. "
+                "Ensure your dataset includes the 'reward_episodic' column."
             )
-        reward = step_stream["xformed_reward"].to(dtype=value_dtype)
+        reward = step_stream["reward_episodic"].to(dtype=value_dtype)
     else:
         reward = step_stream["reward"].to(dtype=value_dtype)
     terminals = (step_stream["done"] == 1).to(dtype=value_dtype)

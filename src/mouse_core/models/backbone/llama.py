@@ -234,7 +234,6 @@ class LlamaBackbone(Backbone):
         _load_transformer_weights(
             self.model,
             repo_id_or_path,
-            backbone_name="LlamaBackbone",
             hub_kwargs=hub_kwargs,
         )
 

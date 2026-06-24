@@ -22,15 +22,11 @@ def test_mouse_model_exports() -> None:
 
 def test_mouse_data_exports() -> None:
     from mouse_core.data import (
-        ACTION_KEY_DISCRETE,
         DataLoader,
         Datastore,
-        OBS_KEY_IMAGE,
         push_to_hub,
     )
 
     assert Datastore is not None
     assert DataLoader is not None
     assert callable(push_to_hub)
-    assert ACTION_KEY_DISCRETE == "discrete"
-    assert OBS_KEY_IMAGE == "image"

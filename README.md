@@ -24,7 +24,6 @@ cd mouse-core
 source scripts/install.sh
 ```
 
-Import as **`mouse_core`** (PyPI package name is **`mouse-core`**).
 
 ---
 

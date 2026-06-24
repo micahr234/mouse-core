@@ -7,7 +7,7 @@ decoding.
 
 from __future__ import annotations
 
-import warnings
+from contextlib import contextmanager
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
@@ -67,11 +67,22 @@ class Backbone(nn.Module, ABC):
         ...
 
 
+@contextmanager
+def _quiet_transformers_load():
+    from transformers import logging as transformers_logging
+
+    verbosity = transformers_logging.get_verbosity()
+    transformers_logging.set_verbosity_error()
+    try:
+        yield
+    finally:
+        transformers_logging.set_verbosity(verbosity)
+
+
 def _load_transformer_weights(
     model: nn.Module,
     repo_id_or_path: str | Path,
     *,
-    backbone_name: str,
     hub_kwargs: dict[str, Any],
 ) -> None:
     """Load matching transformer weights into a MOUSE backbone internals.
@@ -81,7 +92,8 @@ def _load_transformer_weights(
     """
     from transformers import AutoModel
 
-    pretrained = AutoModel.from_pretrained(repo_id_or_path, **hub_kwargs)
+    with _quiet_transformers_load():
+        pretrained = AutoModel.from_pretrained(repo_id_or_path, **hub_kwargs)
     target_state = model.state_dict()
     loadable = {
         key: value
@@ -91,21 +103,6 @@ def _load_transformer_weights(
         and not key.startswith("embed_tokens")
         and key not in ("norm.weight", "norm.bias")
     }
-    missing, unexpected = model.load_state_dict(loadable, strict=False)
-
-    ignored_missing = {key for key in missing if key.startswith("embed_tokens") or key.startswith("norm.")}
-    real_missing = [key for key in missing if key not in ignored_missing]
-    if real_missing:
-        warnings.warn(
-            f"Loading {backbone_name} from {repo_id_or_path!r} left "
-            f"{len(real_missing)} key(s) uninitialised: {real_missing}",
-            stacklevel=3,
-        )
-    if unexpected:
-        warnings.warn(
-            f"Loading {backbone_name} from {repo_id_or_path!r} had "
-            f"{len(unexpected)} unexpected key(s): {unexpected}",
-            stacklevel=3,
-        )
+    model.load_state_dict(loadable, strict=False)
 
     del pretrained

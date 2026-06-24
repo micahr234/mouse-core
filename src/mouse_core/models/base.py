@@ -58,12 +58,13 @@ def push_model_to_hub(
     *,
     commit_message: str = "Upload MOUSE model",
     private: bool = False,
+    clear: bool = False,
     **kwargs: Any,
 ) -> str:
     """Push a MOUSE model to the Hugging Face Hub.
 
-    Creates the repository if needed, uploads the MOUSE checkpoint files, and
-    returns the Hub URL.
+    Creates the repository if needed, uploads the MOUSE checkpoint files plus a
+    model card, and returns the Hub URL.
 
     Args:
         model: The model instance to upload.
@@ -71,6 +72,8 @@ def push_model_to_hub(
             Unscoped names are resolved under the authenticated user.
         commit_message: Commit message written to the Hub.
         private: Create a private repository if it does not already exist.
+        clear: Delete all existing files in the repository before uploading.
+            Useful to avoid stale files from a previous push.
         **kwargs: Forwarded to ``huggingface_hub.HfApi.upload_folder``.
 
     Returns:
@@ -78,7 +81,7 @@ def push_model_to_hub(
 
     Example::
 
-        url = push_model_to_hub(model, "my-model")
+        url = push_model_to_hub(model, "my-model", clear=True)
         print(url)
     """
     from huggingface_hub import HfApi
@@ -91,8 +94,17 @@ def push_model_to_hub(
         token=kwargs.get("token"),
     )
     hub_repo_id = repo_url.repo_id
+    if clear:
+        existing = list(api.list_repo_files(hub_repo_id))
+        if existing:
+            api.delete_files(
+                repo_id=hub_repo_id,
+                delete_patterns=existing,
+                commit_message="Clear repository before upload",
+            )
     with tempfile.TemporaryDirectory() as tmp:
         save_model(model, tmp)
+        _write_model_card(model, Path(tmp) / "README.md", repo_id=hub_repo_id)
         api.upload_folder(
             repo_id=hub_repo_id,
             folder_path=tmp,
@@ -100,6 +112,178 @@ def push_model_to_hub(
             **kwargs,
         )
     return str(repo_url)
+
+
+def _write_model_card(model: "Model", path: Path, *, repo_id: str) -> None:
+    config = _model_config(model)
+    heads = config["heads"]["heads"]
+    head_names = ", ".join(head["name"] for head in heads) or "none"
+    modalities = config["encoder"]["kwargs"].get("modalities", [])
+    modality_table = _model_card_modality_table(modalities)
+    step_stream_example = _model_card_step_stream_example(modalities)
+    text = f"""---
+library_name: mouse-core
+tags:
+- mouse-core
+- reinforcement-learning
+---
+
+# {repo_id}
+
+This repository contains a MOUSE model checkpoint.
+
+## Architecture
+
+- Backbone: `{config["backbone"]["type"]}`
+- Hidden dimension: `{config["hidden_dim"]}`
+- Heads: `{head_names}`
+- Action head: `{config["heads"]["action_head"]}`
+
+### Encoder
+
+`StepEmbedder` reads flat step-record dicts and projects each declared modality
+into the shared `{config["hidden_dim"]}`-dimensional token space before the
+backbone.
+
+{modality_table}
+
+## Install MouseCore
+
+```bash
+pip install mouse-core
+```
+
+## Load The Model
+
+```python
+import torch
+from mouse_core import load_model
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = load_model("{repo_id}", map_location="cpu").eval().to(device)
+```
+
+## Run Inference
+
+The model accepts a `list[list[dict]]` batch of shape `[B][S]` — B sequences,
+each containing S step-record dicts with flat keys matching the encoder's
+declared modalities above.
+
+```python
+{step_stream_example}
+
+with torch.no_grad():
+    out, _, cache = model(batch)
+    action = model.get_action(out, temperature=0.0)
+```
+
+`model()` returns `(out, step_stream, cache)`. `step_stream` is a
+`TensorDict[B, S]` of the modality tensors extracted by the encoder — pass it
+to objectives during training. For cached one-step rollout, keep `cache` and
+pass it back on the next call with `use_cache=True`.
+"""
+    path.write_text(text, encoding="utf-8")
+
+
+def _model_card_modality_table(modalities: list[dict[str, Any]]) -> str:
+    rows = [
+        "| Field | Embed | Required | Tensor shape | Dtype | Notes |",
+        "|---|---|---:|---|---|---|",
+    ]
+    for modality in modalities:
+        name = str(modality["name"])
+        embed = str(modality["embed"])
+        required = bool(modality.get("required", True))
+        allow_none = bool(modality.get("allow_none", False))
+        rows.append(
+            "| "
+            + " | ".join([
+                f"`{name}`",
+                f"`{embed}`",
+                "yes" if required else "no",
+                f"`{_model_card_modality_shape(modality)}`",
+                f"`{_model_card_modality_dtype(modality)}`",
+                _model_card_modality_notes(modality, allow_none=allow_none),
+            ])
+            + " |"
+        )
+    return "\n".join(rows)
+
+
+def _model_card_modality_shape(modality: dict[str, Any]) -> str:
+    embed = modality["embed"]
+    if embed in ("continuous", "image"):
+        dim = modality.get("dim") or modality.get("size") or "D"
+        return f"[B, S, {dim}]"
+    if embed == "learnable":
+        return "not read from step_stream"
+    return "[B, S]"
+
+
+def _model_card_modality_dtype(modality: dict[str, Any]) -> str:
+    embed = modality["embed"]
+    if embed == "discrete":
+        return "torch.long"
+    if embed == "image":
+        return "torch.long or torch.float32"
+    if embed == "learnable":
+        return "n/a"
+    return "torch.float32"
+
+
+def _model_card_modality_notes(modality: dict[str, Any], *, allow_none: bool) -> str:
+    embed = modality["embed"]
+    parts: list[str] = []
+    if embed == "discrete":
+        vocab_size = modality.get("vocab_size") or modality.get("size")
+        if vocab_size is not None:
+            parts.append(f"integer ids in `[0, {int(vocab_size) - 1}]`")
+    elif embed == "rff":
+        parts.append("scalar value")
+    elif embed == "continuous":
+        parts.append("vector values")
+    elif embed == "image":
+        parts.append("pixel or patch values")
+    elif embed == "learnable":
+        parts.append("learned tokens; no input field")
+    if allow_none:
+        parts.append("`None` uses default value")
+    return "; ".join(parts) or "-"
+
+
+def _model_card_step_stream_example(modalities: list[dict[str, Any]]) -> str:
+    fields = [
+        _model_card_field_example(modality)
+        for modality in modalities
+        if modality["embed"] != "learnable"
+    ]
+    body = "\n".join(f"    {field}" for field in fields)
+    if not body:
+        body = "    # This model declares no input-backed modalities."
+    return f"""# Batch shape: [B=1][S=1] — one sequence of one step.
+batch = [[
+    {{
+{body}
+    }}
+]]
+out, step_stream, cache = model(batch)"""
+
+
+def _model_card_field_example(modality: dict[str, Any]) -> str:
+    name = modality["name"]
+    embed = modality["embed"]
+    optional = "" if modality.get("required", True) else "  # optional"
+    if embed == "discrete":
+        return f'"{name}": 0,{optional}'
+    if embed == "rff":
+        return f'"{name}": 0.0,{optional}'
+    if embed == "continuous":
+        dim = int(modality.get("dim") or modality.get("size") or 1)
+        return f'"{name}": [0.0] * {dim},{optional}'
+    if embed == "image":
+        dim = int(modality.get("dim") or modality.get("size") or 1)
+        return f'"{name}": [0] * {dim},{optional}'
+    return f'"{name}": 0,{optional}'
 
 
 def _model_config(model: "Model") -> dict[str, Any]:
@@ -574,16 +758,17 @@ class Model(nn.Module):
 
     def forward(
         self,
-        step_stream: TensorDict,
+        batch: list[list[dict]],
         cache: dict[str, Any] | None = None,
         use_cache: bool = False,
         cache_position: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
-    ) -> tuple[TensorDict, dict[str, Any] | None]:
+    ) -> tuple[TensorDict, TensorDict, dict[str, Any] | None]:
         """Run a full forward pass.
 
         Args:
-            step_stream: ``TensorDict[B, S]`` of step records.
+            batch: ``[B][S]`` list of raw step-record dicts, as returned by
+                ``DataLoader.next_batch()`` or assembled manually for rollout.
             cache: Optional KV cache from a prior call.
             use_cache: If True, return an updated cache.
             cache_position: Optional position ids for incremental decode.
@@ -593,12 +778,20 @@ class Model(nn.Module):
                 the backbone).
 
         Returns:
-            (out, cache) where ``out`` is a TensorDict[B, S] with one entry per
-            enabled head.
-        """
-        B, S = int(step_stream.batch_size[0]), int(step_stream.batch_size[1])
+            ``(out, step_stream, cache)`` where
 
-        embeds = self.encoder(step_stream)
+            * ``out`` is a ``TensorDict[B, S]`` with one entry per enabled head.
+            * ``step_stream`` is a ``TensorDict[B, S]`` of the modality tensors
+              extracted by the encoder — the same values used for embedding.
+              Pass this to objectives (e.g. ``dqn_objective(step_stream, out, cfg)``).
+            * ``cache`` is the updated KV cache, or ``None`` when ``use_cache=False``.
+        """
+        B = len(batch)
+        S = len(batch[0]) if B > 0 else 0
+
+        embeds, col_values = self.encoder(batch)
+        step_stream = TensorDict(col_values, batch_size=(B, S))
+
         h, new_cache = self.backbone(
             embeds=embeds,
             cache=cache,
@@ -608,7 +801,7 @@ class Model(nn.Module):
         )
 
         h_step = self.encoder.pool_step_reprs(h, (B, S)).float()
-        return self.head(h_step, batch_size=(B, S)), new_cache
+        return self.head(h_step, batch_size=(B, S)), step_stream, new_cache
 
     def head(self, h: torch.Tensor, batch_size: tuple[int, int]) -> TensorDict:
         """Run enabled heads on step representations ``[B, S, D]``."""

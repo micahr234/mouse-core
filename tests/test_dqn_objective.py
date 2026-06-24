@@ -32,6 +32,28 @@ def test_dqn_objective_runs() -> None:
     assert metrics["action_value"] >= 0.0
 
 
+def test_dqn_objective_accepts_trailing_singleton_action_dim() -> None:
+    b, s, a = 2, 4, 3
+    step_stream = TensorDict(
+        {
+            "action": torch.randint(0, a, (b, s, 1)),
+            "reward": torch.randn(b, s),
+            "done": torch.zeros(b, s, dtype=torch.long),
+        },
+        batch_size=(b, s),
+    )
+    out = TensorDict(
+        {
+            "action_value": torch.randn(b, s, a),
+            "action_value_target": torch.randn(b, s, a),
+        },
+        batch_size=(b, s),
+    )
+    loss, metrics = dqn_objective(step_stream, out, DqnObjectiveConfig(weight=1.0, gamma=0.99))
+    assert loss.ndim == 0
+    assert "action_value" in metrics
+
+
 def test_dqn_objective_requires_min_sequence() -> None:
     step_stream = TensorDict(
         {

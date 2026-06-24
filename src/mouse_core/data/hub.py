@@ -19,11 +19,14 @@ See https://huggingface.co/docs/datasets/repository_structure
 
 Public API
 ----------
+``load_stores_from_hub(repo_id, split=...)``
+    Load named stores from Hub dataset configs, discovering names by default.
+
 ``push_to_hub(splits, repo_id, config_name=...)``
     Push splits under a named config (subset/bin).
 
-``push_stores_to_hub(stores, repo_id, split=..., config_name=...)``
-    Single-split convenience.
+``push_stores_to_hub(stores, repo_id, split=...)``
+    Single-split convenience with one config per named store.
 """
 
 from __future__ import annotations
@@ -32,7 +35,7 @@ import re
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
-from datasets import Dataset, DatasetDict, Features, Value, concatenate_datasets
+from datasets import Dataset, DatasetDict, Features, Value, get_dataset_config_names, load_dataset
 from datasets import config as datasets_config
 from huggingface_hub import HfApi
 from huggingface_hub.errors import HfHubHTTPError, RepositoryNotFoundError
@@ -46,7 +49,7 @@ if TYPE_CHECKING:
 # Hub helpers
 # ---------------------------------------------------------------------------
 
-_HUB_PARQUET_SHARD_RE = re.compile(r"^data/([^/]+)-\d{5}-of-\d{5}\.parquet$")
+_HUB_PARQUET_SHARD_RE = re.compile(r"^data/(?:[^/]+/)?[^/]+-\d{5}-of-\d{5}\.parquet$")
 
 
 def _wipe_hub_repo_data(api: HfApi, repo_id: str) -> None:
@@ -183,9 +186,135 @@ def _align_splits(splits: dict[str, Dataset]) -> dict[str, Dataset]:
     return out
 
 
+def _raise_for_hub_403(error: HfHubHTTPError, repo_id: str) -> None:
+    code = getattr(getattr(error, "response", None), "status_code", None)
+    if code == 403:
+        raise RuntimeError(
+            "Hugging Face returned 403 when creating or pushing the dataset. "
+            f"repo_id={repo_id!r}: you need write access to that namespace "
+            "(use a short name to push under your logged-in user, e.g. "
+            "'my_dataset', or 'youruser/my_dataset' / an org you belong to). "
+            "Check your token at https://huggingface.co/settings/tokens"
+        ) from error
+    raise error
+
+
+def _build_split_datasets(splits: dict[str, list[Datastore]]) -> dict[str, Dataset]:
+    from mouse_core.data.datastore import Datastore as _DS
+
+    resolved: dict[str, Dataset] = {}
+    for split_name, stores in splits.items():
+        merged = _DS()
+        merged.append(stores)
+        combined = merged.to_dataset()
+        if len(combined) > 0:
+            resolved[split_name] = combined
+    return _align_splits(resolved)
+
+
+def _create_or_update_dataset_repo(
+    api: HfApi,
+    repo_id: str,
+    *,
+    private: bool,
+) -> tuple[str, str]:
+    repo_url = api.create_repo(repo_id, repo_type="dataset", private=private, exist_ok=True)
+    hub_repo_id = repo_url.repo_id
+    # create_repo only sets visibility on creation; enforce it on every push so
+    # re-pushing an existing repo with a different ``private`` value takes effect.
+    api.update_repo_settings(repo_id=hub_repo_id, repo_type="dataset", private=private)
+    return str(repo_url), hub_repo_id
+
+
+def _push_dataset_dict(
+    dataset_dict: DatasetDict,
+    *,
+    repo_id: str,
+    commit_message: str,
+    config_name: str,
+) -> None:
+    dataset_dict.push_to_hub(
+        repo_id=repo_id,
+        commit_message=commit_message,
+        data_dir="data",
+        config_name=config_name,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
+def _resolve_dataset_repo_id(repo_id: str, token: str | bool | None = None) -> str:
+    """Resolve an unscoped dataset repo name under the authenticated Hub user."""
+    if "/" in repo_id:
+        return repo_id
+    user = HfApi().whoami(token=token)["name"]
+    return f"{user}/{repo_id}"
+
+
+def load_stores_from_hub(
+    repo_id: str,
+    store_names: list[str] | None = None,
+    *,
+    split: str = "train",
+    token: str | bool | None = None,
+    **kwargs: Any,
+) -> list[Datastore]:
+    """Load Hub dataset configs into ``Datastore`` objects.
+
+    Short names such as ``"my-dataset"`` resolve under the authenticated Hub
+    user before delegating to ``datasets.load_dataset``. When ``store_names``
+    is omitted, config names are discovered with ``get_dataset_config_names``.
+    Each store name is used as the Hugging Face config name and copied onto the
+    returned ``Datastore.name``.
+    """
+    if store_names is not None:
+        if not store_names:
+            raise ValueError("load_stores_from_hub requires at least one store name.")
+        missing = [i for i, name in enumerate(store_names) if not name]
+        if missing:
+            raise ValueError(
+                "load_stores_from_hub requires every store name to be non-empty. "
+                f"Empty store name indices: {missing}."
+            )
+        if len(set(store_names)) != len(store_names):
+            raise ValueError("load_stores_from_hub requires unique store names.")
+
+    resolved_repo_id = _resolve_dataset_repo_id(repo_id, token=token)
+    load_kwargs = dict(kwargs)
+    if token is not None:
+        load_kwargs["token"] = token
+
+    if store_names is None:
+        discovered_kwargs: dict[str, Any] = {}
+        if token is not None:
+            discovered_kwargs["token"] = token
+        if "revision" in kwargs:
+            discovered_kwargs["revision"] = kwargs["revision"]
+        store_names = list(get_dataset_config_names(resolved_repo_id, **discovered_kwargs))
+
+    if not store_names:
+        raise ValueError(f"No store configs found for dataset {resolved_repo_id!r}.")
+    missing = [i for i, name in enumerate(store_names) if not name]
+    if missing:
+        raise ValueError(
+            "load_stores_from_hub requires every store name to be non-empty. "
+            f"Empty store name indices: {missing}."
+        )
+    if len(set(store_names)) != len(store_names):
+        raise ValueError("load_stores_from_hub requires unique store names.")
+
+    from mouse_core.data.datastore import Datastore as _DS
+
+    stores: list[Datastore] = []
+    for store_name in store_names:
+        ds = load_dataset(resolved_repo_id, store_name, split=split, **load_kwargs)
+        store = _DS(name=store_name)
+        store.from_dataset(ds)
+        stores.append(store)
+    return stores
+
 
 def push_to_hub(
     splits: dict[str, list[Datastore]],
@@ -194,6 +323,7 @@ def push_to_hub(
     private: bool = False,
     commit_message: str = "New rollout data",
     config_name: str = "default",
+    clear: bool = False,
 ) -> str | None:
     """Combine stores by split and push to the Hugging Face Hub.
 
@@ -212,10 +342,14 @@ def push_to_hub(
         Commit message written to the Hub.
     config_name :
         Hugging Face dataset configuration / subset name (also called "config").
+    clear :
+        Delete all existing parquet shards, dataset info, and the README card
+        before uploading. Keeps the dataset card and schema consistent with the
+        data being pushed. Defaults to ``True``.
         Use this to organize your data into different "bins" (e.g. different
         collection runs, different environment families, different policies).
         Default is ``"default"``. When loading later use
-        ``load_dataset(repo, config_name, split=...)``.
+        ``load_stores_from_hub(repo, [config_name], split=...)``.
 
     Returns
     -------
@@ -241,47 +375,27 @@ def push_to_hub(
             config_name="cartpole_ppo_expert",
         )
     """
-    from mouse_core.data.datastore import Datastore as _DS
-
-    resolved: dict[str, Dataset] = {}
-    for split_name, stores in splits.items():
-        parts = [_DS.merge_stores_to_dataset(stores)]
-        combined = concatenate_datasets([p for p in parts if len(p) > 0])
-        if len(combined) > 0:
-            resolved[split_name] = combined
+    resolved = _build_split_datasets(splits)
 
     if not resolved:
         print(f"push_to_hub: nothing to push to {repo_id!r}")
         return None
 
-    resolved = _align_splits(resolved)
     dataset_dict = DatasetDict(list(resolved.items()))
 
     try:
         api = HfApi()
-        repo_url = api.create_repo(repo_id, repo_type="dataset", private=private, exist_ok=True)
-        hub_repo_id = repo_url.repo_id
-        # create_repo only sets visibility on creation; enforce it on every push so
-        # re-pushing an existing repo with a different ``private`` value takes effect.
-        api.update_repo_settings(repo_id=hub_repo_id, repo_type="dataset", private=private)
-        _wipe_hub_repo_data(api=api, repo_id=hub_repo_id)
-        dataset_dict.push_to_hub(
+        repo_url, hub_repo_id = _create_or_update_dataset_repo(api, repo_id, private=private)
+        if clear:
+            _wipe_hub_repo_data(api=api, repo_id=hub_repo_id)
+        _push_dataset_dict(
+            dataset_dict,
             repo_id=hub_repo_id,
             commit_message=commit_message,
-            data_dir="data",
             config_name=config_name,
         )
     except HfHubHTTPError as e:
-        code = getattr(getattr(e, "response", None), "status_code", None)
-        if code == 403:
-            raise RuntimeError(
-                "Hugging Face returned 403 when creating or pushing the dataset. "
-                f"repo_id={repo_id!r}: you need write access to that namespace "
-                "(use a short name to push under your logged-in user, e.g. "
-                "'my_dataset', or 'youruser/my_dataset' / an org you belong to). "
-                "Check your token at https://huggingface.co/settings/tokens"
-            ) from e
-        raise
+        _raise_for_hub_403(e, repo_id)
 
     parts_str = ", ".join(f"{k}: {len(v)}" for k, v in resolved.items())
     print(f"Pushed to {hub_repo_id} ({parts_str} steps)")
@@ -295,23 +409,22 @@ def push_stores_to_hub(
     split: str = "train",
     private: bool = False,
     commit_message: str = "New rollout data",
-    config_name: str = "default",
+    clear: bool = False,
 ) -> str | None:
-    """Push a list of ``Datastore`` objects to the Hub as a single split (inside a config/subset).
+    """Push each ``Datastore`` to the Hub as a separate config/subset.
 
     Convenience wrapper around :func:`push_to_hub` for the common case where
-    all stores belong to one split.
+    every store belongs to the same split but should live in its own config.
 
-    Use ``config_name`` to put the data under a named "bin"/configuration
-    (e.g. a particular experiment, policy, or environment family). You can
-    later load it with the standard HF loader::
+    Every store must have a non-empty ``store.name``. Each store is pushed
+    under that config name, and can later be loaded with the standard HF loader::
 
-        load_dataset(repo_id, config_name, split=split)
+        load_stores_from_hub(repo_id, [store.name], split=split)
 
     Parameters
     ----------
     stores :
-        One or more ``Datastore`` objects to concatenate and push.
+        One or more ``Datastore`` objects to push.
     repo_id :
         Hub repository ID.
     split :
@@ -321,9 +434,10 @@ def push_stores_to_hub(
         and updating an existing repository's visibility to match.
     commit_message :
         Commit message written to the Hub.
-    config_name :
-        Configuration / subset name (default ``"default"``). This is the HF
-        "bin" for your data.
+    clear :
+        Delete all existing parquet shards, dataset info, and the README card
+        before uploading. Keeps the dataset card and schema consistent with the
+        data being pushed. Defaults to ``True``.
 
     Returns
     -------
@@ -333,22 +447,59 @@ def push_stores_to_hub(
     --------
     ::
 
-        from mouse_core.data.hub import push_stores_to_hub
+        from mouse_core.data import Datastore, push_stores_to_hub
 
-        url = push_stores_to_hub([store], repo_id="your-org/your-dataset", split="train")
-
-        # Save this collection under a named subset/bin
         url = push_stores_to_hub(
-            [store],
+            [Datastore(name="cartpole_v1_ppo_202406")],
             repo_id="your-org/your-dataset",
             split="train",
-            config_name="cartpole_v1_ppo_202406",
+        )
+
+        # Save each store under its own named subset/bin
+        url = push_stores_to_hub(
+            [cartpole_store, lunar_store],
+            repo_id="your-org/your-dataset",
+            split="train",
         )
     """
-    return push_to_hub(
-        {split: stores},
-        repo_id=repo_id,
-        private=private,
-        commit_message=commit_message,
-        config_name=config_name,
-    )
+    missing = [i for i, store in enumerate(stores) if not store.name]
+    if missing:
+        raise ValueError(
+            "push_stores_to_hub requires every store to have a non-empty name. "
+            f"Unnamed store indices: {missing}."
+        )
+    store_names = [store.name for store in stores if store.name]
+    if len(set(store_names)) != len(store_names):
+        raise ValueError("push_stores_to_hub requires unique store names.")
+
+    prepared: list[tuple[str, Dataset]] = []
+    for store, config_name in zip(stores, store_names, strict=True):
+        ds = store.to_dataset()
+        if len(ds) > 0:
+            prepared.append((config_name, ds))
+
+    if not prepared:
+        print(f"push_stores_to_hub: nothing to push to {repo_id!r}")
+        return None
+
+    try:
+        api = HfApi()
+        repo_url, hub_repo_id = _create_or_update_dataset_repo(api, repo_id, private=private)
+        if clear:
+            _wipe_hub_repo_data(api=api, repo_id=hub_repo_id)
+
+        pushed: dict[str, int] = {}
+        for config_name, ds in prepared:
+            _push_dataset_dict(
+                DatasetDict([(split, ds)]),
+                repo_id=hub_repo_id,
+                commit_message=commit_message,
+                config_name=config_name,
+            )
+            pushed[config_name] = len(ds)
+    except HfHubHTTPError as e:
+        _raise_for_hub_403(e, repo_id)
+
+    parts_str = ", ".join(f"{config}/{split}: {steps}" for config, steps in pushed.items())
+    print(f"Pushed to {hub_repo_id} ({parts_str} steps)")
+    return repo_url

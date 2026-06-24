@@ -6,7 +6,7 @@ It stores rows (plain Python dicts) in the exact order they were added or loaded
 
 All I/O uses ordinary Hugging Face tools (`load_dataset`, `push_to_hub`, `DatasetDict`, etc.). The only mouse-core-specific step is turning slices of rows into model batches.
 
-When training you ask for contiguous sequences of steps (e.g. 64 steps). Because the data is stored sequentially these are just slices. The tensors in the resulting batch are produced by `DataLoader` (or `encode_hf_rows`) according to the sizes you pass it and whatever fields happen to be present in the rows.
+When training you ask for contiguous sequences of steps (e.g. 64 steps). Because the data is stored sequentially these are just slices. `DataLoader.next_batch()` returns those slices as a raw `list[list[dict]]` of shape `[B][S]`. The model's encoder is then responsible for extracting whatever fields it needs from those dicts.
 
 The store and the data on disk/Hub are just the raw rows. The model (via its embedders / tokenizer / encoder) decides how to interpret them.
 
@@ -27,6 +27,7 @@ Because it is sequential, the two operations that must be fast are cheap:
 
 Concretely:
 - `append(row)` is a plain Python list append.
+- `append(store)` / `append(stores)` extends a store with loaded store data.
 - A sequence of length `S` is the slice `dataset[start:start+S]`.
 
 The entire history does not need to live in RAM. Only the active prefetch window of encoded batches is materialized while training.
@@ -41,13 +42,26 @@ rows = dataset[start : start + S]
 
 `DataLoader` repeatedly takes slices like this (workers when useful), projects the conventional fields present in those rows into tensors (vector widths taken from the max present in the slice), and yields `TensorDict[B, S]` batches.
 
-### What ends up in the TensorDict
+### From raw rows to tensors
 
-`DataLoader` (and `encode_hf_rows`) look for a few conventional fields (`action`, `reward`, `done`, `observation.*`, `q_star`, ...) and stack them. For vector-valued sub-fields the width `D` of the emitted tensor is the largest length that appears in the rows of *that particular slice*; shorter or absent entries are zero-padded (or -inf-padded for `q_star`) to that D within the slice.
+`DataLoader.next_batch()` returns raw Python dicts exactly as stored — no encoding, no column detection, no zero-padding. The batch is a `list[list[dict]]` of shape `[B][S]`.
 
-The resulting shapes are therefore driven by your data. Your model declares capacities (`max_num_obs_continuous`, `max_num_actions`, ...) when you build the embedders; those embedders internally adapt incoming vectors (pad or truncate) to their configured size.
+`Model.forward(batch)` returns `(out, step_stream, cache)`. Internally, the encoder (`StepEmbedder`) iterates the batch once and extracts only the fields declared in its `modalities` config:
 
-Other content in the rows is ignored for the batch but remains in the stored data. The store and loader are generic; interpretation lives in the model.
+- **discrete** fields → `torch.int64[B, S]`
+- **rff** (scalar float) fields → `torch.float32[B, S]`
+- **continuous** vector fields → `torch.float32[B, S, D]` zero-padded to `dim`
+- **learnable** modalities read no input field; they only add a learned token
+
+The extracted tensors are returned as `step_stream`, a `TensorDict[B, S]` ready for objectives:
+
+```python
+batch = loader.next_batch()              # list[list[dict]]
+out, step_stream, _ = model(batch)       # step_stream keyed by modality name
+loss, metrics = dqn_objective(step_stream, out, cfg)
+```
+
+If a required modality key is absent from every row in the batch the encoder raises a `KeyError` at forward time. Optional modalities (`required=False`) use their default values when missing.
 
 ### Note on ordering (for objective authors)
 
@@ -59,44 +73,39 @@ Because the store is strictly sequential, step `t` contains whatever your enviro
 
 A sequential store backed by a Hugging Face `Dataset`. The full history stays in Arrow form; only the small prefetch window of encoded batches is materialized during training.
 
-### Loading data (use the real `load_dataset`)
+### Loading stores from the Hub
 
-`Datastore.from_dataset` is intentionally thin. All the power for selecting *what* to load lives in the standard Hugging Face `load_dataset`:
+Use `load_stores_from_hub` to load dataset configs into `Datastore` objects:
 
-- configs / subsets (your "bins")
-- splits
-- file patterns / globs
-- unions of splits, streaming, etc.
+- when no names are passed, config names are discovered from the Hub dataset,
+- the returned store keeps that name in `store.name`,
+- the split is selected once for all loaded stores.
 
-Do your selection first, then hand the resulting `Dataset` (or a prepared slice) to the store.
+You can keep the stores separate or combine them before training.
 
 ```python
-from datasets import load_dataset
-from mouse_core.data.datastore import Datastore
+from mouse_core.data import Datastore, load_stores_from_hub
 
-store = Datastore()
+stores = load_stores_from_hub(
+    "your-dataset",
+    split="train",
+)
 
-# Specific config (subset/bin) + split
-ds = load_dataset("your-org/your-dataset", "cartpole_ppo_expert", split="train")
-store.from_dataset(ds)
-
-# Another bin
-ds2 = load_dataset("your-org/your-dataset", "lunar_random", split="train")
-store.from_dataset(ds2)
-
-# You can combine however you like before ingesting
-# (or keep separate stores if you prefer logical separation)
+combined = Datastore()
+combined.append(stores)
 ```
 
-`from_dataset` mainly exists so the *store* can:
+`from_dataset` exists so the *store* can:
 - mix loaded data with later `append()` calls (the live collection buffer), and
 - participate in `DataLoader` + our encoding to `TensorDict`.
 
-It does not try to replicate or wrap the rich selection features of `datasets.load_dataset`. Use the real thing.
+For fully custom Hugging Face loading workflows (globs, streaming, unusual unions), use `datasets.load_dataset` directly, then hand the resulting `Dataset` or `DatasetDict` to `Datastore.from_dataset`.
 
-If you pass a `DatasetDict` it will concatenate the splits inside it (the store is a flat sequence). Prefer selecting exactly what you want via `load_dataset(..., config, split=...)` first.
+If you pass a `DatasetDict` it will concatenate the splits inside it (the store is a flat sequence). Prefer selecting exactly what you want first.
 
 Call `from_dataset` as many times as you like; each extends the sequential history with zero-copy reference where possible.
+
+`Datastore(name=...)` is optional. Use a name when the store should become its own Hugging Face config through `push_stores_to_hub`; leave it unset when the store is just an in-memory sequence or when you will choose the config explicitly with `push_to_hub(..., config_name=...)`.
 
 ## Structuring your dataset repository on the Hub (configs + splits in YAML)
 
@@ -122,16 +131,25 @@ configs:
 ---
 ```
 
-You load exactly as you would with any HF dataset:
+Load through `load_stores_from_hub` so short repo names resolve under the authenticated Hub user:
 
 ```python
-from datasets import load_dataset
+from mouse_core.data import load_stores_from_hub
 
-ds = load_dataset("your-org/your-dataset", "cartpole_ppo_expert", split="train")
-store.from_dataset(ds)
+stores = load_stores_from_hub(
+    "your-dataset",
+    split="train",
+)
+
+# Or pass a list when you only want some configs:
+stores = load_stores_from_hub(
+    "your-dataset",
+    ["cartpole_ppo_expert"],
+    split="train",
+)
 ```
 
-Our `push_to_hub` / `push_stores_to_hub` (and raw `ds.push_to_hub(..., config_name=...)`) write parquet under `data/<config>/...` (or the layout produced by the HF pusher). The resulting files are compatible with the YAML `data_files` declarations above.
+Our `push_to_hub` / `push_stores_to_hub` (and raw `ds.push_to_hub(..., config_name=...)`) write parquet under `data/<config>/...` (or the layout produced by the HF pusher). With `push_stores_to_hub`, each store's `name` is used as its config name. Unnamed stores stay unnamed and are rejected by this helper rather than being pushed to a fallback config. The resulting files are compatible with the YAML `data_files` declarations above.
 
 Pushing data through our helpers **deletes the previous README** (and stale shards/infos) before the push. This ensures that `DatasetDict.push_to_hub` writes a fresh dataset card whose `dataset_info:` header (features, splits, sizes, etc.) accurately describes the data you are uploading right now. This is especially important for a brand new dataset or when the schema or split structure changes.
 
@@ -168,7 +186,7 @@ This is completely standard `datasets.Dataset.push_to_hub` — no wrapper. Use i
 
 ## Pushing stores to the Hub (`mouse_core.data.hub`)
 
-`push_to_hub` and `push_stores_to_hub` combine `Datastore`s and delegate to ordinary `DatasetDict.push_to_hub(..., config_name=...)`. 
+`push_to_hub` combines `Datastore`s into one config with splits. `push_stores_to_hub` saves each named store as its own config, using `store.name`. Both delegate to ordinary `DatasetDict.push_to_hub(..., config_name=...)`.
 
 What gets written to the Hub are the exact rows you stored. There is no mouse-core-specific wrapper format — downstream users (or you) can consume the dataset with plain `datasets` or even non-Python tools.
 
@@ -181,26 +199,40 @@ Hugging Face datasets support two levels:
 - **config** (also called subset or configuration name) — this is a great way to organize different "bins" of data inside one repo (different runs, different envs, different policies, etc.).
 - **split** — inside a config (train / test / eval / whatever you like, as long as it matches the HF split name rules).
 
-You keep using normal split names (`train`, `eval`, `my_eval`, ...), and additionally choose a `config_name` for the bin.
+You keep using normal split names (`train`, `eval`, `my_eval`, ...), and additionally choose config names for the bins.
 
-Loading the data later is pure HF:
+Loading the data later uses the mouse-core Hub loader:
 
 ```python
-ds = load_dataset("your-org/your-dataset", "cartpole_ppo_expert", split="train")
-store.from_dataset(ds)
+from mouse_core.data import load_stores_from_hub
+
+stores = load_stores_from_hub(
+    "your-dataset",
+    split="train",
+)
 ```
 
 Pushing:
 
 ```python
+from mouse_core.data import Datastore
 from mouse_core.data.hub import push_stores_to_hub, push_to_hub
 
-# One bin, one split (very common)
+# One store, one config, one split
+store = Datastore(name="cartpole_ppo_expert")
 push_stores_to_hub(
     [store],
     repo_id="your-org/your-dataset",
     split="train",
-    config_name="cartpole_ppo_expert",
+)
+
+# Multiple stores, one config per store
+cartpole_store = Datastore(name="cartpole_ppo_expert")
+lunar_store = Datastore(name="lunar_v2_random")
+push_stores_to_hub(
+    [cartpole_store, lunar_store],
+    repo_id="your-org/your-dataset",
+    split="train",
 )
 
 # Multiple splits inside one bin

@@ -2,6 +2,8 @@ from mouse_core.models.embedding.embedding import (
     Encoder,
     StepEmbedder,
     ModalitySpec,
+    action_modality,
+    observation_modalities,
     # Technique-oriented content embedders (selected by ModalitySpec.embed + method)
     DiscreteEmbedder,
     ScalarRFFEmbedder,
@@ -17,6 +19,8 @@ __all__ = [
     "Encoder",
     "StepEmbedder",
     "ModalitySpec",
+    "action_modality",
+    "observation_modalities",
     # Technique-based embedders (dispatch is by embed kind + method, not semantic role)
     "DiscreteEmbedder",
     "ScalarRFFEmbedder",

@@ -25,7 +25,8 @@ class VecDqnObjectiveConfig(ObjectiveConfig):
     normalize_reward_std: bool = False  # per-sequence-row divide by std of rewards
     normalize_reward_eps: float = 1e-8  # numerical floor for variance and division in reward normalization
     normalize_reward_std_target: float = 1.0  # multiply normalized rewards by this (after mean/std norm; no effect if both norm flags false)
-    use_xformed_reward: bool = False  # use xformed_reward instead of reward as the rotation signal
+    use_episodic_reward: bool = False  # use reward_episodic instead of reward as the rotation signal
+    action_key: str = "action"  # key in step_stream that holds the integer action
 
 
 def vec_dqn_objective(
@@ -42,14 +43,14 @@ def vec_dqn_objective(
     if S < 2:
         raise ValueError("Not enough valid vec_dqn vectors in data.")
 
-    action = step_stream["action"].to(dtype=torch.long)
-    if cfg.use_xformed_reward:
-        if "xformed_reward" not in step_stream.keys():
+    action = step_stream[cfg.action_key].to(dtype=torch.long)
+    if cfg.use_episodic_reward:
+        if "reward_episodic" not in step_stream.keys():
             raise KeyError(
-                "use_xformed_reward=True but 'xformed_reward' is not in the batch. "
-                "Ensure your dataset includes the 'xformed_reward' column."
+                "use_episodic_reward=True but 'reward_episodic' is not in the batch. "
+                "Ensure your dataset includes the 'reward_episodic' column."
             )
-        reward = step_stream["xformed_reward"].to(dtype=dtype)
+        reward = step_stream["reward_episodic"].to(dtype=dtype)
     else:
         reward = step_stream["reward"].to(dtype=dtype)
     online_vecs = online_vecs.to(dtype=dtype)

@@ -227,7 +227,6 @@ class Qwen3Backbone(Backbone):
         _load_transformer_weights(
             self.model,
             repo_id_or_path,
-            backbone_name="Qwen3Backbone",
             hub_kwargs=hub_kwargs,
         )
 
