@@ -120,7 +120,7 @@ def _write_model_card(model: "Model", path: Path, *, repo_id: str) -> None:
     head_names = ", ".join(head["name"] for head in heads) or "none"
     modalities = config["encoder"]["kwargs"].get("modalities", [])
     modality_table = _model_card_modality_table(modalities)
-    step_stream_example = _model_card_step_stream_example(modalities)
+    objective_data_example = _model_card_step_stream_example(modalities)
     text = f"""---
 library_name: mouse-core
 tags:
@@ -170,14 +170,14 @@ each containing S step-record dicts with flat keys matching the encoder's
 declared modalities above.
 
 ```python
-{step_stream_example}
+{objective_data_example}
 
 with torch.no_grad():
-    out, _, cache = model(batch)
-    action = model.get_action(out, temperature=0.0)
+    predictions, _, cache = model(batch)
+    action = model.get_action(predictions, temperature=0.0)
 ```
 
-`model()` returns `(out, step_stream, cache)`. `step_stream` is a
+`model()` returns `(predictions, objective_data, cache)`. `objective_data` is a
 `TensorDict[B, S]` of the modality tensors extracted by the encoder — pass it
 to objectives during training. For cached one-step rollout, keep `cache` and
 pass it back on the next call with `use_cache=True`.
@@ -266,7 +266,7 @@ batch = [[
 {body}
     }}
 ]]
-out, step_stream, cache = model(batch)"""
+predictions, objective_data, cache = model(batch)"""
 
 
 def _model_card_field_example(modality: dict[str, Any]) -> str:
@@ -310,7 +310,6 @@ def _encoder_config(encoder: Encoder) -> dict[str, Any]:
             "hidden_dim": int(encoder.hidden_dim),
             "modalities": [_drop_none(asdict(modality)) for modality in encoder.modalities],
             "token_data_len": int(encoder.token_data_len),
-            "num_compute_tokens": int(encoder.num_compute_tokens),
             "concat_modalities": bool(encoder.concat_modalities),
             "include_type_token": bool(encoder.include_type_token),
             "fourier_min": float(encoder.fourier_min),
@@ -778,19 +777,19 @@ class Model(nn.Module):
                 the backbone).
 
         Returns:
-            ``(out, step_stream, cache)`` where
+            ``(predictions, objective_data, cache)`` where
 
-            * ``out`` is a ``TensorDict[B, S]`` with one entry per enabled head.
-            * ``step_stream`` is a ``TensorDict[B, S]`` of the modality tensors
+            * ``predictions`` is a ``TensorDict[B, S]`` with one entry per enabled head.
+            * ``objective_data`` is a ``TensorDict[B, S]`` of the modality tensors
               extracted by the encoder — the same values used for embedding.
-              Pass this to objectives (e.g. ``dqn_objective(step_stream, out, cfg)``).
+              Pass this to objectives (e.g. ``dqn_objective(objective_data, predictions, cfg)``).
             * ``cache`` is the updated KV cache, or ``None`` when ``use_cache=False``.
         """
         B = len(batch)
         S = len(batch[0]) if B > 0 else 0
 
-        embeds, col_values = self.encoder(batch)
-        step_stream = TensorDict(col_values, batch_size=(B, S))
+        embeds, col_values, step_token_indices = self.encoder(batch)
+        objective_data = TensorDict(col_values, batch_size=(B, S)).to(embeds.device)
 
         h, new_cache = self.backbone(
             embeds=embeds,
@@ -800,8 +799,9 @@ class Model(nn.Module):
             attention_mask=attention_mask,
         )
 
-        h_step = self.encoder.pool_step_reprs(h, (B, S)).float()
-        return self.head(h_step, batch_size=(B, S)), step_stream, new_cache
+        h_step = self.encoder.pool_step_reprs(h, step_token_indices).float()
+        predictions = self.head(h_step, batch_size=(B, S))
+        return predictions, objective_data, new_cache
 
     def head(self, h: torch.Tensor, batch_size: tuple[int, int]) -> TensorDict:
         """Run enabled heads on step representations ``[B, S, D]``."""

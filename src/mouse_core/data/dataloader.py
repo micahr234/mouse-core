@@ -1,30 +1,40 @@
-"""DataLoader — batch producer for sequential step data from a Datastore.
+"""DataLoader — batch producer for sequential step data from one or more Datastores.
 
 A ``Datastore`` is a flat sequence of arbitrary rows.
 
-The ``DataLoader`` repeatedly samples contiguous windows of ``S`` rows from
-the store and returns them as a ``list[list[dict]]`` of shape ``[B][S]``.
-Each element is a plain Python dict exactly as it was stored (no encoding or
-tensorisation happens here). The model (its encoder) is responsible for
-extracting and converting the fields it needs.
+The ``DataLoader`` repeatedly samples contiguous windows of ``S`` rows and
+returns them as a ``list[list[dict]]`` of shape ``[B][S]``. Each element is a
+plain Python dict exactly as it was stored (no encoding or tensorisation
+happens here). The model (its encoder) is responsible for extracting and
+converting the fields it needs.
 
 When background workers are enabled the slice work happens in the background
 so ``next_batch()`` is usually immediate.
 
 Usage
 -----
-::
+Single store::
 
     store = Datastore()
-    store.from_dataset(ds)   # or populate via append()
+    store.from_dataset(ds)
+
+    loader = DataLoader(store, sequence_length=64, batch_size=8)
+    batch = loader.next_batch()   # list[list[dict]] shape [B][S]
+    loader.close()
+
+Multiple stores with weights::
 
     loader = DataLoader(
-        store,
+        [store_a, store_b],
         sequence_length=64,
         batch_size=8,
+        weights=[2.0, 1.0],
+        weight_mode="per_store",
     )
-    td = loader.next_batch()   # TensorDict[B, S]
-    loader.close()
+
+With packing (sequences may span store boundaries)::
+
+    loader = DataLoader(stores, sequence_length=64, batch_size=8, pack=True)
 """
 
 from __future__ import annotations
@@ -40,85 +50,128 @@ if TYPE_CHECKING:
 
 
 class DataLoader:
-    """Produces ``list[list[dict]]`` batches of raw step records from a ``Datastore``.
+    """Produces ``list[list[dict]]`` batches of raw step records from one or more Datastores.
 
-    The store holds a flat sequence of arbitrary rows. This loader samples
+    Each store holds a flat sequence of arbitrary rows. The loader samples
     contiguous windows and returns them as Python dicts without any encoding.
     Columns are untouched; the model's encoder decides what to extract and
     how to tensorize it.
 
+    When multiple stores are provided, each sequence in a batch independently
+    draws its store according to the computed per-store probabilities, giving
+    smooth within-batch mixing.
+
     Background workers (when enabled) do the work asynchronously.
-
-    The feature dimensions are *not* passed here; they live in your model
-    embedder configuration. The embedders adapt to the shapes that arrive
-    from data.
-
-    Stores populated only via ``append`` are supported (a snapshot is taken at
-    construction time).
 
     Parameters
     ----------
-    store :
-        ``Datastore`` (loaded via ``from_dataset`` or populated via ``append``).
-        A pure-append store is supported and will be snapshotted internally for
-        iteration; appends after construction are not observed by the loader.
+    stores :
+        A single ``Datastore`` or a list of them. Pure-append stores are
+        supported and will be snapshotted internally; appends after
+        construction are not observed by the loader.
     sequence_length :
         Length of each contiguous slice (in steps).
     batch_size :
         How many such slices per batch.
-    sampling :
-        Policy for choosing the starting positions of the slices.
-    prefetch : int
-        How many batches to keep pre-encoded.
-    num_workers : int
-        Background workers (0 = synchronous).
+    weights :
+        One positive float per store controlling the relative probability of
+        drawing from each store. ``None`` means uniform. Interpreted
+        differently depending on ``weight_mode``.
+    weight_mode :
+        How ``weights`` interact with store sizes.
+
+        ``"per_store"`` (default) — the probability of drawing from store *i*
+        is ``weight[i] / sum(weights)``.  Store size is ignored; all stores
+        are equally likely when ``weights`` is ``None``.
+
+        ``"per_step"`` — the probability is proportional to
+        ``weight[i] * len(store_i)``.  Larger stores are drawn more often;
+        ``weights`` act as multipliers on top of the size-proportional
+        baseline.
+    pack :
+        If ``True``, a sequence can start at any position in a store,
+        including the last few steps. When the initial window is shorter than
+        ``sequence_length``, additional independently-sampled segments (drawn
+        from the same store distribution) are appended until the sequence is
+        full. If ``False`` (default), every sequence comes from a single
+        in-store window of exactly ``sequence_length`` steps; stores shorter
+        than ``sequence_length`` are rejected at construction.
+    prefetch :
+        How many batches to keep pre-fetched in the background queue.
+    num_workers :
+        Background worker threads (0 = synchronous).
     """
 
     def __init__(
         self,
-        store: Datastore,
+        stores: Datastore | list[Datastore],
         sequence_length: int,
         batch_size: int,
-        sampling: str = "random",
+        *,
+        weights: list[float] | None = None,
+        weight_mode: str = "per_store",
+        pack: bool = False,
         prefetch: int = 4,
         num_workers: int = 1,
     ) -> None:
         from mouse_core.data.datastore import Datastore as _DS
 
-        # Set teardown attrs early so __del__/close are safe even if later validation fails
+        # Set teardown attrs early so __del__/close are safe even if later validation fails.
         self._stop = None
         self._result_queue = None
         self._workers = []
         self._sync_rng = None
         self._worker_error = None
 
-        if not isinstance(store, _DS):
-            raise TypeError("DataLoader requires a Datastore instance.")
-        if len(store) == 0:
-            raise ValueError("DataLoader requires a non-empty Datastore.")
-        if sampling not in ("batch", "random", "sequential", "last"):
-            raise ValueError(f"sampling must be one of batch/random/sequential/last, got {sampling!r}")
+        if isinstance(stores, _DS):
+            stores = [stores]
+        if not stores or not all(isinstance(s, _DS) for s in stores):
+            raise TypeError("DataLoader requires a Datastore or a non-empty list of Datastores.")
+        if weight_mode not in ("per_store", "per_step"):
+            raise ValueError(f"weight_mode must be 'per_store' or 'per_step', got {weight_mode!r}")
+        if weights is not None:
+            if len(weights) != len(stores):
+                raise ValueError(
+                    f"weights length ({len(weights)}) must match number of stores ({len(stores)})."
+                )
+            if any(w <= 0 for w in weights):
+                raise ValueError("All weights must be positive.")
 
-        self.store = store
+        self.stores = stores
         self.sequence_length = sequence_length
         self.batch_size = batch_size
-        self.sampling = sampling
+        self.weight_mode = weight_mode
+        self.pack = pack
 
-        # Use the Arrow Dataset for fast slicing. Prefer the loaded source when present
-        # (the append buffer is not visible to the loader until the user calls from_dataset).
-        # For pure-append stores we snapshot once for convenience.
-        self._dataset = store._source if store._source is not None else store.to_dataset()
-        self._n = len(self._dataset)
+        # Snapshot each store as an Arrow Dataset for fast slicing.
+        self._datasets = [
+            s._source if s._source is not None else s.to_dataset()
+            for s in stores
+        ]
+        self._ns: list[int] = [len(ds) for ds in self._datasets]
 
-        # Epoch-order state for sequential / batch / synchronous modes.
-        self._lock = threading.Lock()
-        self._next_window: int = 0
-        self._window_order: np.ndarray = self._new_epoch_order()
+        if not pack:
+            for i, (n, s) in enumerate(zip(self._ns, stores)):
+                if n == 0:
+                    raise ValueError(f"Store {i} ({s!r}) is empty.")
+                if n < sequence_length:
+                    name = s.name or f"index {i}"
+                    raise ValueError(
+                        f"Store {name!r} has {n} steps but sequence_length={sequence_length}. "
+                        "Use pack=True to allow sequences that span store boundaries."
+                    )
+        else:
+            for i, (n, s) in enumerate(zip(self._ns, stores)):
+                if n == 0:
+                    raise ValueError(f"Store {i} ({s!r}) is empty.")
 
-        n_workers = num_workers if sampling in ("random", "last") else 1
+        # Compute sampling probabilities.
+        w = np.ones(len(stores)) if weights is None else np.asarray(weights, dtype=float)
+        if weight_mode == "per_step":
+            w = w * np.array(self._ns, dtype=float)
+        self._probs: np.ndarray = w / w.sum()
 
-        if n_workers == 0:
-            # Synchronous mode: fetch directly on the calling thread.
+        if num_workers == 0:
             self._sync_rng: np.random.Generator | None = np.random.default_rng(seed=0)
             self._result_queue: queue.Queue[list[list[dict]]] | None = None
             self._stop: threading.Event | None = None
@@ -136,7 +189,7 @@ class DataLoader:
                     daemon=True,
                     name=f"DataLoader-{i}",
                 )
-                for i in range(n_workers)
+                for i in range(num_workers)
             ]
             for w in self._workers:
                 w.start()
@@ -147,9 +200,9 @@ class DataLoader:
 
     @property
     def total_batches(self) -> int:
-        """Approximate non-overlapping windows in the dataset."""
-        num_windows = self._n // self.sequence_length
-        return max(0, (num_windows + self.batch_size - 1) // self.batch_size)
+        """Approximate total non-overlapping windows across all stores."""
+        total_windows = sum(n // self.sequence_length for n in self._ns)
+        return max(0, (total_windows + self.batch_size - 1) // self.batch_size)
 
     def next_batch(self) -> list[list[dict]]:
         """Return the next batch of raw rows, blocking until one is ready.
@@ -173,7 +226,7 @@ class DataLoader:
     def close(self) -> None:
         """Stop background workers and drain the queue."""
         if self._stop is None:
-            return  # synchronous mode — nothing to tear down
+            return
         self._stop.set()
         assert self._result_queue is not None
         while True:
@@ -194,77 +247,67 @@ class DataLoader:
         self.close()
 
     def __repr__(self) -> str:
+        store_info = ", ".join(
+            f"{s.name or '?'}({n})" for s, n in zip(self.stores, self._ns)
+        )
         return (
-            f"DataLoader(n={self._n}, S={self.sequence_length}, "
-            f"B={self.batch_size}, sampling={self.sampling!r})"
+            f"DataLoader(stores=[{store_info}], S={self.sequence_length}, "
+            f"B={self.batch_size}, pack={self.pack})"
         )
 
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
 
-    def _new_epoch_order(self) -> np.ndarray:
-        num_windows = max(self._n // self.sequence_length, 0)
-        return (
-            np.arange(num_windows)
-            if self.sampling == "sequential"
-            else np.random.permutation(num_windows)
-        )
+    def _fetch_sequence(self, rng: np.random.Generator) -> list[dict]:
+        """Fetch exactly ``sequence_length`` steps for one sequence slot.
 
-    def _sample_starts(self, rng: np.random.Generator) -> np.ndarray:
-        """Return B start indices.  Each sequence is always dataset[start:start+S]."""
-        N, S, B = self._n, self.sequence_length, self.batch_size
+        Picks a store according to ``_probs``, draws a random start, and
+        slices up to ``sequence_length`` steps.  When ``pack=True`` and the
+        slice hits the end of the store, additional independently-sampled
+        segments are appended until the sequence is full.  When ``pack=False``
+        the start is guaranteed to leave a full window.
+        """
+        S = self.sequence_length
+        steps: list[dict] = []
 
-        if self.sampling == "random":
-            return rng.integers(0, N - S + 1, size=B)
+        while len(steps) < S:
+            store_idx = int(rng.choice(len(self._datasets), p=self._probs))
+            ds = self._datasets[store_idx]
+            n = self._ns[store_idx]
 
-        if self.sampling == "last":
-            num_windows = N // S
-            if num_windows < B:
-                raise ValueError(
-                    f"Dataset has {num_windows} windows but batch_size={B}; "
-                    "need at least batch_size windows for sampling='last'."
-                )
-            return np.arange(num_windows - B, num_windows) * S
+            if self.pack:
+                start = int(rng.integers(0, n))
+            else:
+                start = int(rng.integers(0, n - S + 1))
 
-        with self._lock:
-            num_windows = N // S
-            if len(self._window_order) != num_windows:
-                self._window_order = self._new_epoch_order()
-                self._next_window = 0
-            if self._next_window >= num_windows:
-                self._next_window = 0
-                self._window_order = self._new_epoch_order()
-            start = self._next_window
-            end = min(start + B, num_windows)
-            windows = self._window_order[start:end].copy()
-            self._next_window = end
+            end = min(start + (S - len(steps)), n)
+            hf_slice = ds[start:end]
+            count = end - start
+            steps.extend(
+                {k: hf_slice[k][i] for k in hf_slice} for i in range(count)
+            )
 
-        return windows * S
+            if not self.pack:
+                # Without packing the single slice is always full; exit immediately.
+                break
+
+        return steps[:S]
 
     def _fetch_one_batch(self, rng: np.random.Generator) -> list[list[dict]]:
-        starts = self._sample_starts(rng)
-        S = self.sequence_length
-        batch: list[list[dict]] = []
-        for s in starts:
-            hf_slice = self._dataset[int(s) : int(s) + S]
-            seq = [{k: hf_slice[k][i] for k in hf_slice} for i in range(S)]
-            batch.append(seq)
-        return batch
+        return [self._fetch_sequence(rng) for _ in range(self.batch_size)]
 
     def _worker_loop(self, rng: np.random.Generator) -> None:
         assert self._stop is not None and self._result_queue is not None
         while not self._stop.is_set():
             try:
-                td = self._fetch_one_batch(rng)
-
+                batch = self._fetch_one_batch(rng)
                 while not self._stop.is_set():
                     try:
-                        self._result_queue.put(td, timeout=0.05)
+                        self._result_queue.put(batch, timeout=0.05)
                         break
                     except queue.Full:
                         pass
-
             except Exception as exc:  # noqa: BLE001
                 self._worker_error = exc
                 return

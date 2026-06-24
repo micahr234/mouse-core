@@ -1,72 +1,58 @@
-"""Base types for MOUSE objective functions.
+"""Base type for MOUSE objective objects.
 
-All objective functions share the same call signature — take a batch and model output,
-return a scalar loss and a metrics dict.  Use :class:`ObjectiveConfig` as the base for
-custom config dataclasses, and :class:`ObjectiveFunction` as the typing interface.
+All objectives are plain Python objects: instantiate with hyperparameters,
+then call with ``(objective_data, predictions)`` to get a loss and metrics.
 
 Example — custom objective::
 
-    from dataclasses import dataclass
-    from mouse_core.objectives.base import ObjectiveConfig, ObjectiveFunction
+    from mouse_core.objectives.base import Objective
     from tensordict import TensorDict
     import torch
 
-    @dataclass(frozen=True)
-    class MyObjectiveConfig(ObjectiveConfig):
-        weight: float = 1.0
-        temperature: float = 1.0
+    class MyObjective(Objective):
+        def __init__(self, temperature: float = 1.0):
+            self.temperature = temperature
 
-    def my_objective(
-        step_stream: TensorDict,
-        out: TensorDict,
-        cfg: MyObjectiveConfig,
-    ) -> tuple[torch.Tensor, dict[str, float]]:
-        ...
-        return loss, {"my_objective": loss.item()}
+        def __call__(
+            self,
+            objective_data: TensorDict,
+            predictions: TensorDict,
+        ) -> tuple[torch.Tensor, dict[str, float]]:
+            ...
+            return loss, {"my_objective": loss.item()}
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Protocol
+from abc import ABC, abstractmethod
 
 import torch
 from tensordict import TensorDict
 
 
-@dataclass(frozen=True)
-class ObjectiveConfig:
-    """Base dataclass for objective configurations.
+class Objective(ABC):
+    """Abstract base for all MOUSE objective objects.
 
-    Subclass this and add your own hyperparameters.  Use ``frozen=True`` to keep
-    configs immutable and safe to share across training steps.
+    Subclass this and implement :meth:`__call__` to create a custom objective.
+    Instantiate with hyperparameters; call with ``(objective_data, predictions)``.
     """
 
-
-class ObjectiveFunction(Protocol):
-    """Protocol describing the expected signature of all MOUSE objective functions.
-
-    Any callable matching this signature can be used interchangeably with the
-    built-in objectives (``dqn_objective``, ``sp_objective``, etc.).
-    """
-
+    @abstractmethod
     def __call__(
         self,
-        step_stream: TensorDict,
-        out: TensorDict,
-        cfg: Any,
+        objective_data: TensorDict,
+        predictions: TensorDict,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         """Compute a scalar loss and return diagnostic metrics.
 
         Args:
-            step_stream: Batch of step records ``[B, S]`` from
-                :class:`~mouse_core.data.dataloader.DataLoader`.
-            out: Model output TensorDict ``[B, S]`` from
+            objective_data: ``TensorDict[B, S]`` of the modality tensors extracted
+                by the encoder (action, reward, done, observation, etc.).
+            predictions: ``TensorDict[B, S]`` of model head outputs from
                 :meth:`~mouse_core.models.base.Model.forward`.
-            cfg: Frozen config dataclass (subclass of :class:`ObjectiveConfig`).
 
         Returns:
-            Tuple of ``(scalar_loss, metrics)`` where ``metrics`` is a
-            ``dict[str, float]`` ready for logging to W&B / TensorBoard.
+            ``(scalar_loss, metrics)`` where ``metrics`` is a ``dict[str, float]``
+            ready for logging.
         """
         ...

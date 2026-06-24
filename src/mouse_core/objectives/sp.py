@@ -3,24 +3,13 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 from typing import Literal
-
-from mouse_core.objectives.base import ObjectiveConfig
 
 import torch
 import torch.nn.functional as F
 from tensordict import TensorDict
 
-
-@dataclass(frozen=True)
-class SpObjectiveConfig(ObjectiveConfig):
-    """Supervised action objective at PREDICTION (see ``sp_objective``)."""
-
-    weight: float = 0.0  # omit ``loop.sp.weight`` or set 0 = do not compute SP objective (YAML default)
-    label_smoothing: float = 0.0
-    loss_type: Literal["ce", "ce-soft-fwd", "ce-soft-bwd", "js", "kl-fwd", "kl-bwd"] = "ce"
-    temperature: float = 1.0  # used when ``loss_type != "ce"`` (must be > 0)
+from mouse_core.objectives.base import Objective
 
 
 def sp_js(
@@ -139,80 +128,69 @@ def sp_soft_ce(
     return per_row.mean()
 
 
-def sp_objective(
-    step_stream: TensorDict,
-    logits: torch.Tensor,
-    cfg: SpObjectiveConfig,
-) -> tuple[torch.Tensor, dict[str, float]]:
-    """Supervised policy objective over all ``[B, S]`` step positions.
+class SpObjective(Objective):
+    """Supervised policy objective distilling ``q_star`` expert targets into action logits.
+
+    Reads ``predictions["action"]`` (shape ``[B, S, A]``) from the model's action head.
 
     Args:
-        step_stream: TensorDict of shape ``[B, S]`` containing ``q_star`` targets.
-        logits: ``[B, S, A]`` action logits.
-        cfg: SP objective configuration (loss_type, temperature, label_smoothing).
-    Returns:
-        Scalar loss and scalar metrics for logging (e.g. W&B).
+        loss_type: Which distillation loss to apply.  ``"ce"`` uses the argmax of
+            ``q_star`` as a hard label; the soft variants treat ``q_star`` as a
+            distribution.
+        temperature: Softmax temperature applied to ``q_star`` before soft losses
+            (ignored for ``"ce"``).
+        label_smoothing: Label-smoothing coefficient (applied to hard ``"ce"`` only).
+        predictions_key: Key in ``predictions`` that holds the ``[B, S, A]`` action logits.
     """
-    temp = float(cfg.temperature)
 
-    A = logits.shape[-1]
-    logits = logits.reshape(-1, A)
-    q_targets = step_stream["q_star"].reshape(-1, A).to(dtype=logits.dtype)
+    def __init__(
+        self,
+        *,
+        loss_type: Literal["ce", "ce-soft-fwd", "ce-soft-bwd", "js", "kl-fwd", "kl-bwd"] = "ce",
+        temperature: float = 1.0,
+        label_smoothing: float = 0.0,
+        predictions_key: str = "action",
+    ) -> None:
+        self.loss_type = loss_type
+        self.temperature = temperature
+        self.label_smoothing = label_smoothing
+        self.predictions_key = predictions_key
 
-    if q_targets.shape[0] == 0:
-        raise ValueError("sp_objective: batch is empty (no tokens).")
+    def __call__(
+        self,
+        objective_data: TensorDict,
+        predictions: TensorDict,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        logits: torch.Tensor = predictions[self.predictions_key]
+        temp = float(self.temperature)
 
-    if not torch.isfinite(q_targets).all():
-        raise ValueError("sp_objective: q_star contains non-finite values (NaN or inf).")
+        A = logits.shape[-1]
+        logits = logits.reshape(-1, A)
+        q_targets = objective_data["q_star"].reshape(-1, A).to(dtype=logits.dtype)
 
-    if cfg.loss_type == "ce":
-        target_actions = q_targets.argmax(dim=-1).to(dtype=torch.long)
-        loss = F.cross_entropy(logits, target_actions, label_smoothing=cfg.label_smoothing)
-    elif cfg.loss_type == "ce-soft-fwd":
-        loss = sp_soft_ce(
-            q_targets=q_targets,
-            logits=logits,
-            temperature=temp,
-            label_smoothing=cfg.label_smoothing,
-            direction="fwd",
-        )
-    elif cfg.loss_type == "ce-soft-bwd":
-        loss = sp_soft_ce(
-            q_targets=q_targets,
-            logits=logits,
-            temperature=temp,
-            label_smoothing=cfg.label_smoothing,
-            direction="bwd",
-        )
-    elif cfg.loss_type == "js":
-        loss = sp_js(
-            q_targets=q_targets,
-            logits=logits,
-            temperature=temp,
-            label_smoothing=cfg.label_smoothing,
-        )
-    elif cfg.loss_type == "kl-fwd":
-        loss = sp_kl(
-            q_targets=q_targets,
-            logits=logits,
-            temperature=temp,
-            label_smoothing=cfg.label_smoothing,
-            direction="fwd",
-        )
-    elif cfg.loss_type == "kl-bwd":
-        loss = sp_kl(
-            q_targets=q_targets,
-            logits=logits,
-            temperature=temp,
-            label_smoothing=cfg.label_smoothing,
-            direction="bwd",
-        )
-    else:
-        raise ValueError(
-            f"Invalid SP objective loss_type: {cfg.loss_type!r} "
-            "(expected 'ce', 'ce-soft-fwd', 'ce-soft-bwd', 'js', 'kl-fwd', or 'kl-bwd')."
-        )
+        if q_targets.shape[0] == 0:
+            raise ValueError("SpObjective: batch is empty (no tokens).")
+        if not torch.isfinite(q_targets).all():
+            raise ValueError("SpObjective: q_star contains non-finite values (NaN or inf).")
 
-    metrics: dict[str, float] = {"action": float(loss.detach().item())}
+        if self.loss_type == "ce":
+            target_actions = q_targets.argmax(dim=-1).to(dtype=torch.long)
+            loss = F.cross_entropy(logits, target_actions, label_smoothing=self.label_smoothing)
+        elif self.loss_type == "ce-soft-fwd":
+            loss = sp_soft_ce(q_targets=q_targets, logits=logits, temperature=temp, label_smoothing=self.label_smoothing, direction="fwd")
+        elif self.loss_type == "ce-soft-bwd":
+            loss = sp_soft_ce(q_targets=q_targets, logits=logits, temperature=temp, label_smoothing=self.label_smoothing, direction="bwd")
+        elif self.loss_type == "js":
+            loss = sp_js(q_targets=q_targets, logits=logits, temperature=temp, label_smoothing=self.label_smoothing)
+        elif self.loss_type == "kl-fwd":
+            loss = sp_kl(q_targets=q_targets, logits=logits, temperature=temp, label_smoothing=self.label_smoothing, direction="fwd")
+        elif self.loss_type == "kl-bwd":
+            loss = sp_kl(q_targets=q_targets, logits=logits, temperature=temp, label_smoothing=self.label_smoothing, direction="bwd")
+        else:
+            raise ValueError(
+                f"Invalid SpObjective loss_type: {self.loss_type!r} "
+                "(expected 'ce', 'ce-soft-fwd', 'ce-soft-bwd', 'js', 'kl-fwd', or 'kl-bwd')."
+            )
 
-    return loss, metrics
+        metrics: dict[str, float] = {"action": float(loss.detach().item())}
+        return loss, metrics

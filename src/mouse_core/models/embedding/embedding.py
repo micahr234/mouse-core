@@ -11,30 +11,31 @@ exactly ``tokens_per_step`` embedding vectors.
     *maximum* per-modality token count.  Modalities with fewer tokens affect only the
     leading positions.
 
-        tokens_per_step = max(Tc) + K
+        tokens_per_step = max(Tc)
 
 **Concat mode** (``concat_modalities=True``):
 
     Modality blocks are concatenated in declaration order:
 
-        [modA × Ta | modB × Tb | ... | compute × K]
+        [modA × Ta | modB × Tb | ...]
 
-    ``tokens_per_step = sum(Tc) + K``.
+    ``tokens_per_step = sum(Tc)``.
 
-**Compute tokens**:
+**Scratch tokens**:
 
-    You can append ``K`` trailing scratch tokens with the top-level
-    ``num_compute_tokens=K`` (they are always added after all declared modalities).
+    Declare a learnable modality anywhere in the ``modalities`` list:
 
-    You can also declare learnable blocks anywhere in the sequence by including
-    modalities with ``{"name": "...", "embed": "learnable", "tokens": N, "required": False}``.  Such
-    modalities contribute learned scratch tokens at the position they appear in
-    the ``modalities`` list; the named modality does **not** need to be present in
-    the input rows (its data is ignored).  These are independent of the
-    trailing global ``num_compute_tokens``.
+        {"name": "scratch", "embed": "learnable", "tokens": N}
 
-After the backbone runs over the full ``[B, S*tokens_per_step, D]`` sequence, the
-last token within each step is used to produce one ``[D]``-vector per step.
+    Such modalities contribute ``N`` learned scratch tokens at the position they
+    appear in the list.  They never read from input rows — the embedding is a
+    pure learned parameter the backbone can freely write into.  Placing one last
+    in the list makes it the step's prediction token (the one the head reads).
+
+After the backbone runs over the full ``[B, S*tokens_per_step, D]`` sequence,
+``forward`` emits a ``step_token_indices [B, S]`` tensor identifying the single
+flat-sequence position that represents each step.  ``pool_step_reprs`` gathers
+those positions from the backbone output to produce one ``[D]``-vector per step.
 """
 
 from __future__ import annotations
@@ -171,7 +172,7 @@ class Encoder(nn.Module, ABC):
     @abstractmethod
     def forward(
         self, batch: list[list[dict]]
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor], torch.Tensor]:
         """Encode a batch of raw step records into token embeddings.
 
         Args:
@@ -180,29 +181,34 @@ class Encoder(nn.Module, ABC):
                 on the concrete encoder configuration.
 
         Returns:
-            ``(embeds, col_values)`` where
+            ``(embeds, col_values, step_token_indices)`` where
 
             * ``embeds`` is ``[B, T, D]`` with ``T = S * tokens_per_step``.
             * ``col_values`` maps each non-learnable modality name to its
               extracted tensor (shape ``[B, S]`` for scalars, ``[B, S, D]``
               for vectors). These are the same tensors used for embedding;
               :class:`~mouse_core.models.base.Model` wraps them into the
-              ``step_stream`` TensorDict returned alongside the head outputs.
+              ``objective_data`` TensorDict returned alongside the head outputs.
+            * ``step_token_indices`` is a ``[B, S]`` int64 tensor.  Entry
+              ``[b, s]`` is the absolute position within the flat ``T``-length
+              sequence of the single token that represents step ``s`` for batch
+              element ``b``.  :meth:`pool_step_reprs` gathers these positions
+              from the backbone output to produce one ``[D]``-vector per step.
         """
         ...
 
     @abstractmethod
-    def pool_step_reprs(self, h: torch.Tensor, batch_size: tuple[int, int]) -> torch.Tensor:
+    def pool_step_reprs(self, h: torch.Tensor, step_token_indices: torch.Tensor) -> torch.Tensor:
         """Extract per-step representations from backbone hidden states.
 
-        After the backbone processes ``[B, T, D]`` tokens, this method maps
-        them back to one vector per step ``[B, S, D]``. These are the vectors
-        passed to output heads.
+        After the backbone processes ``[B, T, D]`` tokens, gathers the single
+        token identified by ``step_token_indices`` for each step to produce one
+        ``[D]``-vector per step.
 
         Args:
-            h: Backbone output of shape ``[B, T, D]`` where
-               ``T = S * tokens_per_step``.
-            batch_size: ``(B, S)`` — original batch dimensions.
+            h: Backbone output of shape ``[B, T, D]``.
+            step_token_indices: ``[B, S]`` int64 tensor of absolute positions
+                within the flat sequence, as returned by :meth:`forward`.
 
         Returns:
             Step representations ``[B, S, D]``.
@@ -235,7 +241,7 @@ class ModalitySpec:
         modalities = [
             {"name": "action", "embed": "discrete", "vocab_size": 18, "tokens": 1},
             {"name": "reward", "embed": "rff", "tokens": 1},
-            {"name": "scratch", "embed": "learnable", "tokens": 2, "required": False},  # learned scratch tokens; need not exist in data
+            {"name": "scratch", "embed": "learnable", "tokens": 2},  # learned scratch tokens; never reads input data
             {"name": "obs", "embed": "continuous", "dim": 8, "tokens": 2},
             {"name": "img", "embed": "image", "dim": 7056, "tokens": 16},  # e.g. patches
             {"name": "my_time", "embed": "discrete", "vocab_size": 1000, "absent": -1},
@@ -291,6 +297,8 @@ class ModalitySpec:
                 object.__setattr__(self, "method", self.method.lower())
         if self.embed != k:
             object.__setattr__(self, "embed", k)
+        if k == "learnable":
+            object.__setattr__(self, "required", False)
 
         # If method is a non-default on a kind that doesn't use it, callers will enforce;
         # here we just ensure the value itself is valid (done above).
@@ -597,32 +605,16 @@ class StepEmbedder(Encoder):
     **Sum mode** (``concat_modalities=False``, default):
         Contributions are summed into a block whose size is the *max* per-modality
         token count.  A modality with ``Tc`` tokens writes to the first ``Tc``
-        positions of that shared block.
+        positions of that shared block.  ``tokens_per_step = max(Tc)``.
 
     **Concat mode** (``concat_modalities=True``):
         The data tokens for each step are the concatenation of per-modality blocks,
         in the exact order the modalities appear in the ``modalities`` list.
-        ``tokens_per_step = sum(Tc) + num_compute_tokens``.
+        ``tokens_per_step = sum(Tc)``.
 
-    **Compute tokens** (``num_compute_tokens > 0``):
-        ``K`` learned scratch tokens are appended after the data tokens in every
-        step block.  The backbone can attend to and write into them as working
-        memory.  The step representation is always pooled from the **last** token
-        (the last compute token when ``K > 0``).
-
-    Each modality may specify its own ``tokens`` count (see :class:`ModalitySpec`).
-    If a modality omits it, the constructor's ``token_data_len`` acts as the default.
-
-    **Sum mode** (``concat_modalities=False``, default):
-        Modality contributions are summed into a shared block whose size is the
-        *maximum* per-modality token count.  A modality with fewer tokens contributes
-        only to the leading positions within that block (remaining positions are
-        unaffected by that modality).
-
-    **Concat mode** (``concat_modalities=True``):
-        Modality blocks are concatenated in modality order.  A modality with ``Tc``
-        tokens occupies exactly ``Tc`` positions.
-        ``tokens_per_step = sum(Tc for modalities) + num_compute_tokens``.
+    The step representation passed to heads is always the **last** token of each
+    step block.  Place a ``{"name": "scratch", "embed": "learnable", "tokens": 1}``
+    modality last in the list to use it as a dedicated prediction token.
 
     Args:
         hidden_dim: Model hidden dimension ``D``.
@@ -630,8 +622,6 @@ class StepEmbedder(Encoder):
             field to set how many tokens that modality contributes per step.
         token_data_len: Default number of tokens per modality when the modality spec
             does not specify its own ``tokens``.
-        num_compute_tokens: Number of learned scratch tokens ``K`` appended after
-            the data tokens within each step block.  ``0`` disables compute tokens.
         concat_modalities: When ``True``, modality embeddings are concatenated
             sequentially rather than summed.
         include_type_token: Add the learned type embedding to every token.
@@ -646,7 +636,6 @@ class StepEmbedder(Encoder):
         hidden_dim: int,
         modalities: list[dict[str, Any] | ModalitySpec] | None = None,
         token_data_len: int = 1,
-        num_compute_tokens: int = 0,
         concat_modalities: bool = False,
         include_type_token: bool = True,
         fourier_min: float = 0.01,
@@ -654,9 +643,6 @@ class StepEmbedder(Encoder):
         std: float = 0.02,
     ) -> None:
         super().__init__()
-
-        if int(num_compute_tokens) < 0:
-            raise ValueError(f"num_compute_tokens must be >= 0, got {num_compute_tokens}.")
 
         if modalities is None:
             modalities = []
@@ -700,12 +686,6 @@ class StepEmbedder(Encoder):
                     f"modality {cs.name!r} (embed={k}) does not support 'absent'; "
                     f"'absent' only applies to discrete modalities"
                 )
-            if cs.required and k == "learnable":
-                raise ValueError(
-                    f"modality {cs.name!r} (embed={k}) cannot be required; "
-                    "learnable modalities do not read input data"
-                )
-
             # in_min/in_max are only meaningful for RFF-using embedders (rff or continuous with rff)
             uses_rff_ranges = (k == "rff") or (is_method_using and cs.method != "linear")
             if (cs.in_min is not None or cs.in_max is not None) and not uses_rff_ranges:
@@ -716,7 +696,6 @@ class StepEmbedder(Encoder):
 
         self._hidden_dim = int(hidden_dim)
         self.include_type_token = bool(include_type_token)
-        self.num_compute_tokens = int(num_compute_tokens)
         self.concat_modalities = bool(concat_modalities)
         self.token_data_len = int(token_data_len)  # default for modalities without explicit tokens
         self.fourier_min = float(fourier_min)
@@ -740,12 +719,10 @@ class StepEmbedder(Encoder):
             if cs.embed.lower() == "learnable":
                 self._learnable_modalities.add(cs.name)
 
-        K = self.num_compute_tokens
         if concat_modalities:
-            data_slots = sum(self._modality_tokens.values())
+            self._tokens_per_step: int = sum(self._modality_tokens.values())
         else:
-            data_slots = max(self._modality_tokens.values()) if self._modality_tokens else 0
-        self._tokens_per_step: int = data_slots + K
+            self._tokens_per_step = max(self._modality_tokens.values()) if self._modality_tokens else 0
 
         # Type embedder now produces per-token [D] vectors
         self.type_embedder = TypeEmbedder(hidden_dim=hidden_dim, embedding_std=std)
@@ -761,12 +738,6 @@ class StepEmbedder(Encoder):
             self._modality_token_types[cs.name] = tid
             tid += 1
 
-        if K > 0:
-            self.compute_embed = nn.Parameter(torch.empty(K, int(hidden_dim)))
-            nn.init.normal_(self.compute_embed, std=std)
-        else:
-            self.compute_embed = None  # type: ignore[assignment]
-
     # ------------------------------------------------------------------
     # Encoder interface
     # ------------------------------------------------------------------
@@ -779,17 +750,21 @@ class StepEmbedder(Encoder):
     def tokens_per_step(self) -> int:
         return self._tokens_per_step
 
-    def pool_step_reprs(self, h: torch.Tensor, batch_size: tuple[int, int]) -> torch.Tensor:
-        """Extract step representations: last token of each step block.
+    def pool_step_reprs(self, h: torch.Tensor, step_token_indices: torch.Tensor) -> torch.Tensor:
+        """Gather one representation vector per step from backbone hidden states.
 
-        The step representation is always the final token within each step's
-        token block (the last compute token when ``num_compute_tokens > 0``,
-        otherwise the last data token). This is the vector passed to heads.
+        Args:
+            h: Backbone output ``[B, T, D]``.
+            step_token_indices: ``[B, S]`` int64 tensor of absolute positions
+                within the flat sequence, as returned by :meth:`forward`.
+
+        Returns:
+            Step representations ``[B, S, D]``.
         """
-        B, S = batch_size
-        T = self._tokens_per_step
         D = self._hidden_dim
-        return h.view(B, S, T, D)[:, :, -1, :]
+        B, S = step_token_indices.shape
+        idx = step_token_indices.unsqueeze(-1).expand(B, S, D)
+        return h.gather(1, idx)
 
     def _create_embedder_for_modality(self, spec: ModalitySpec, hidden_dim: int, T: int, std: float) -> nn.Module:
         k = spec.embed.lower()
@@ -886,7 +861,7 @@ class StepEmbedder(Encoder):
     def forward(
         self,
         batch: list[list[dict]],
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor], torch.Tensor]:
         """Embed a batch of raw step records.
 
         Args:
@@ -894,13 +869,16 @@ class StepEmbedder(Encoder):
                 produced by the data source (DataLoader or a manual rollout).
 
         Returns:
-            ``(embeds, col_values)`` where
+            ``(embeds, col_values, step_token_indices)`` where
 
             * ``embeds`` is ``[B, S*tokens_per_step, D]``.
             * ``col_values`` maps each non-learnable modality name to the tensor
               extracted from the batch (``[B, S]`` for scalars, ``[B, S, D]``
-              for vectors), ready to be wrapped into a ``step_stream`` TensorDict
+              for vectors), ready to be wrapped into a ``objective_data`` TensorDict
               by :class:`~mouse_core.models.base.Model`.
+            * ``step_token_indices`` is ``[B, S]`` int64 — the absolute position
+              in the flat sequence of the last token of each step block (the token
+              used by heads for per-step prediction).
         """
         device = next(self.parameters()).device
         B = len(batch)
@@ -975,21 +953,16 @@ class StepEmbedder(Encoder):
         # Embed extracted tensors → token sequence [B, S, T, D].              #
         # ------------------------------------------------------------------ #
         if self.concat_modalities:
-            data_embeds = self._forward_concat(B, S, D, device, dtype, col_values)
+            embeds = self._forward_concat(B, S, D, device, dtype, col_values)
         else:
-            data_embeds = self._forward_sum(B, S, D, device, dtype, col_values)
+            embeds = self._forward_sum(B, S, D, device, dtype, col_values)
 
-        K = self.num_compute_tokens
-        if K > 0:
-            assert self.compute_embed is not None
-            c = self.compute_embed.to(dtype=dtype)
-            c = c.view(1, 1, K, D).expand(B, S, K, D)
-            embeds = torch.cat([data_embeds, c], dim=2)
-        else:
-            embeds = data_embeds
+        T = embeds.shape[2]
+        # Last token of each step block is the prediction token for that step.
+        step_indices = torch.arange(S, device=device) * T + (T - 1)       # [S]
+        step_token_indices = step_indices.unsqueeze(0).expand(B, -1).contiguous()  # [B, S]
 
-        total_T = embeds.shape[2]
-        return embeds.reshape(B, S * total_T, D), col_values
+        return embeds.reshape(B, S * T, D), col_values, step_token_indices
 
     # ------------------------------------------------------------------
     # Internal helpers (generalized over modalities)

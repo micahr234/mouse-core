@@ -1,0 +1,57 @@
+---
+description: Keep CHANGELOG.md up to date with every user-visible change
+alwaysApply: true
+---
+
+# Changelog Maintenance
+
+`CHANGELOG.md` at the repo root tracks notable changes. Keep it in sync with the code.
+
+## When to update
+
+Add an entry for any change that affects users:
+
+- New features or `EnvConfig` fields
+- API renames or removals (`make_env`, output field names, etc.)
+- New or removed environments (`Procedural-FrozenLake-v1`, `SyntheticEnv-v1`, …)
+- Changes to output/metric format or reward behavior
+- Bug fixes that change observable behavior
+
+## When NOT to update
+
+Skip the changelog for:
+
+- Internal refactors with no observable effect
+- Test-only changes
+- Doc typo fixes (no behavior change)
+
+## Format
+
+Always add to `## [Unreleased]` — never edit a released version block.
+Use these sub-sections (omit any that don't apply):
+
+```markdown
+## [Unreleased]
+
+### Added
+- ...
+
+### Changed
+- ...
+
+### Removed
+- ...
+
+### Fixed
+- ...
+```
+
+## On version bump
+
+When `version` in `pyproject.toml` is changed, promote `[Unreleased]` to the new version with today's date:
+
+```markdown
+## [x.y.z] - YYYY-MM-DD
+```
+
+Leave a fresh empty `## [Unreleased]` above it.

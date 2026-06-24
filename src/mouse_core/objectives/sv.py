@@ -2,58 +2,62 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Literal
-
-from mouse_core.objectives.base import ObjectiveConfig
 
 import torch
 import torch.nn.functional as F
 from tensordict import TensorDict
 
-
-@dataclass(frozen=True)
-class SvObjectiveConfig(ObjectiveConfig):
-    """Supervised q_star objective at PREDICTION (see ``sv_objective``)."""
-
-    weight: float = 0.0  # omit ``loop.sv.weight`` or set 0 = do not compute SV objective (YAML default)
-    loss_type: Literal["mse", "mae"] = "mse"
+from mouse_core.objectives.base import Objective
 
 
-def sv_objective(
-    step_stream: TensorDict,
-    logits: torch.Tensor,
-    cfg: SvObjectiveConfig,
-) -> tuple[torch.Tensor, dict[str, float]]:
-    """Supervised q_star objective over all ``[B, S]`` step positions, restricted to finite action slots.
+class SvObjective(Objective):
+    """Supervised Q-star value regression objective.
 
-    ``q_star_tok`` uses ``-inf`` as a sentinel for padded/invalid actions; only finite entries
-    participate in the loss so padding never contributes gradients.
+    Reads ``predictions["value"]`` (shape ``[B, S, A]``) from the model's value head.
+    Only finite entries of ``q_star`` participate in the loss; ``-inf`` sentinels used
+    for padded or invalid actions are automatically excluded.
 
-    Returns:
-        Scalar loss and scalar metrics for logging (e.g. W&B).
+    Args:
+        loss_type: ``"mse"`` (L2) or ``"mae"`` (L1) regression loss.
+        predictions_key: Key in ``predictions`` that holds the ``[B, S, A]`` value logits.
     """
-    A = logits.shape[-1]
-    logits = logits.reshape(-1, A)
-    q_targets = step_stream["q_star"].reshape(-1, A).to(dtype=logits.dtype)  # [B*S, A]
 
-    if q_targets.shape[0] == 0:
-        raise ValueError("sv_objective: batch is empty (no tokens).")
+    def __init__(
+        self,
+        *,
+        loss_type: Literal["mse", "mae"] = "mse",
+        predictions_key: str = "value",
+    ) -> None:
+        self.loss_type = loss_type
+        self.predictions_key = predictions_key
 
-    finite_mask = torch.isfinite(q_targets)  # [N, A]
-    if not finite_mask.any():
-        raise ValueError("sv_objective: q_star contains no finite values (all NaN or -inf).")
+    def __call__(
+        self,
+        objective_data: TensorDict,
+        predictions: TensorDict,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        logits: torch.Tensor = predictions[self.predictions_key]
 
-    if cfg.loss_type == "mse":
-        loss = F.mse_loss(logits[finite_mask], q_targets[finite_mask])
-    elif cfg.loss_type == "mae":
-        loss = F.l1_loss(logits[finite_mask], q_targets[finite_mask])
-    else:
-        raise ValueError(
-            f"Invalid SV objective loss_type: {cfg.loss_type!r} (expected 'mse' or 'mae')."
-        )
+        A = logits.shape[-1]
+        logits = logits.reshape(-1, A)
+        q_targets = objective_data["q_star"].reshape(-1, A).to(dtype=logits.dtype)  # [B*S, A]
 
-    metrics: dict[str, float] = {}
-    metrics["value"] = float(loss.detach().item())
+        if q_targets.shape[0] == 0:
+            raise ValueError("SvObjective: batch is empty (no tokens).")
 
-    return loss, metrics
+        finite_mask = torch.isfinite(q_targets)  # [N, A]
+        if not finite_mask.any():
+            raise ValueError("SvObjective: q_star contains no finite values (all NaN or -inf).")
+
+        if self.loss_type == "mse":
+            loss = F.mse_loss(logits[finite_mask], q_targets[finite_mask])
+        elif self.loss_type == "mae":
+            loss = F.l1_loss(logits[finite_mask], q_targets[finite_mask])
+        else:
+            raise ValueError(
+                f"Invalid SvObjective loss_type: {self.loss_type!r} (expected 'mse' or 'mae')."
+            )
+
+        metrics: dict[str, float] = {"value": float(loss.detach().item())}
+        return loss, metrics

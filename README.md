@@ -1,6 +1,6 @@
 # MOUSE Core
 
-<p align="center"><img src="https://raw.githubusercontent.com/micahr234/mouse-core/main/docs/mouse-core.png" width="400"/></p>
+<p align="center"><img src="https://raw.githubusercontent.com/micahr234/mouse-core/main/mouse-core.png" width="400"/></p>
 
 > **Warning:** MOUSE is in early development and is not yet ready for production use. APIs may change without notice.
 
@@ -106,15 +106,17 @@ For cached inference see [`examples/03_inference.ipynb`](examples/03_inference.i
 
 ---
 
-## Documentation
+## Examples
 
-- [`docs/models.md`](docs/models.md): encoder, backbone, heads, and model I/O.
-- [`docs/dataset.md`](docs/dataset.md): `Datastore`, batching, and Hub upload.
-- [`docs/objectives.md`](docs/objectives.md): DQN, VecDQN, SP, and SV objectives.
+The notebooks are the primary documentation — each one explains the concepts as it walks through them:
 
-API reference lives in the Python docstrings (`load_model`, `Datastore`, `dqn_objective`, etc.).
+| Notebook | What it covers |
+|---|---|
+| [`examples/01_collect_dataset.ipynb`](examples/01_collect_dataset.ipynb) | `Datastore`, collecting transitions, pushing to the Hub |
+| [`examples/02_train_offline.ipynb`](examples/02_train_offline.ipynb) | `DataLoader`, model architecture, DQN training, all objectives |
+| [`examples/03_inference.ipynb`](examples/03_inference.ipynb) | KV-cache inference, loading a trained model |
 
-Runnable notebooks (end-to-end collection, training, inference) are in [`examples/`](examples/).
+API reference lives in the Python docstrings (`load_model`, `Datastore`, `dqn_objective`, etc.). See [`CHANGELOG.md`](CHANGELOG.md) for release history.
 
 ---
 
