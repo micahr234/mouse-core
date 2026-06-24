@@ -198,3 +198,15 @@ def test_push_stores_to_hub_requires_named_stores() -> None:
 def test_push_stores_to_hub_requires_unique_store_names() -> None:
     with pytest.raises(ValueError, match="unique store names"):
         hub.push_stores_to_hub([_store(1, name="same"), _store(2, name="same")], repo_id="test-dataset")
+
+
+@pytest.mark.parametrize("bad_name", [
+    "env#0",
+    "frozenlake_slippery#1",
+    "my env",
+    "config?subset=1",
+    "config/sub",
+])
+def test_push_stores_to_hub_rejects_url_unsafe_names(bad_name: str) -> None:
+    with pytest.raises(ValueError, match="safe as Hugging Face"):
+        hub.push_stores_to_hub([_store(1, name=bad_name)], repo_id="test-dataset")

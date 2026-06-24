@@ -236,7 +236,7 @@ def _push_dataset_dict(
     dataset_dict.push_to_hub(
         repo_id=repo_id,
         commit_message=commit_message,
-        data_dir="data",
+        data_dir=f"data/{config_name}",
         config_name=config_name,
     )
 
@@ -323,7 +323,7 @@ def push_to_hub(
     private: bool = False,
     commit_message: str = "New rollout data",
     config_name: str = "default",
-    clear: bool = False,
+    clear: bool = True,
 ) -> str | None:
     """Combine stores by split and push to the Hugging Face Hub.
 
@@ -409,7 +409,7 @@ def push_stores_to_hub(
     split: str = "train",
     private: bool = False,
     commit_message: str = "New rollout data",
-    clear: bool = False,
+    clear: bool = True,
 ) -> str | None:
     """Push each ``Datastore`` to the Hub as a separate config/subset.
 
@@ -471,6 +471,18 @@ def push_stores_to_hub(
     store_names = [store.name for store in stores if store.name]
     if len(set(store_names)) != len(store_names):
         raise ValueError("push_stores_to_hub requires unique store names.")
+
+    _SAFE_CONFIG_NAME = re.compile(r"^[A-Za-z0-9_\-.]+$")
+    unsafe = [name for name in store_names if not _SAFE_CONFIG_NAME.match(name)]
+    if unsafe:
+        bad_chars = sorted({ch for name in unsafe for ch in name if not re.match(r"[A-Za-z0-9_\-.]", ch)})
+        raise ValueError(
+            f"Store names must contain only letters, digits, hyphens, underscores, and dots "
+            f"so they are safe as Hugging Face dataset config names and URLs. "
+            f"Offending names: {unsafe}. Illegal characters found: {bad_chars!r}. "
+            f"The '#' separator in multi-env slot names (e.g. 'env#0') breaks the "
+            f"HuggingFace dataset viewer — use '_' instead."
+        )
 
     prepared: list[tuple[str, Dataset]] = []
     for store, config_name in zip(stores, store_names, strict=True):
