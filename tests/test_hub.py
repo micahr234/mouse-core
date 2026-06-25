@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from pathlib import Path
+from typing import Any, cast
+
 import pytest
 from datasets import Dataset
 
@@ -30,14 +33,24 @@ class _FakeHfApi:
         assert repo_type == "dataset"
         self.settings_updates.append((repo_id, private))
 
-    def list_repo_files(self, *, repo_id: str, repo_type: str) -> list[str]:
+    def list_repo_files(
+        self,
+        *,
+        repo_id: str,
+        repo_type: str,
+        revision: str | None = None,
+        token: str | bool | None = None,
+    ) -> list[str]:
         assert repo_id == "user/test-dataset"
         assert repo_type == "dataset"
+        assert revision is None
+        assert token is None
         return [
             "README.md",
             "dataset_infos.json",
             "data/old-00000-of-00001.parquet",
             "data/cartpole/train-00000-of-00001.parquet",
+            "notes/old.txt",
         ]
 
     def create_commit(self, *, repo_id: str, repo_type: str, operations: list, commit_message: str) -> None:
@@ -64,82 +77,134 @@ def _store(*actions: int, name: str | None = None) -> Datastore:
     return store
 
 
-def test_load_stores_from_hub_loads_multiple_named_stores(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls: list[tuple[str, str, dict]] = []
-
-    def fake_load_dataset(repo_id: str, config_name: str, **kwargs):
-        calls.append((repo_id, config_name, kwargs))
-        return Dataset.from_list([{
-            "observation": {"discrete": len(calls)},
-            "action": {"discrete": len(calls)},
-            "reward": float(len(calls)),
+def _loaded_store_datasets() -> dict[str, Dataset]:
+    return {
+        "cartpole": Dataset.from_list([{
+            "observation": {"discrete": 1},
+            "action": {"discrete": 1},
+            "reward": 1.0,
             "done": 0,
             "time": 0,
-        }])
+        }]),
+        "lunar": Dataset.from_list([{
+            "observation": {"discrete": 2},
+            "action": {"discrete": 2},
+            "reward": 2.0,
+            "done": 0,
+            "time": 0,
+        }]),
+    }
 
+
+def _write_snapshot(root: Path, *store_names: str, split: str = "train") -> Path:
+    for store_name in store_names:
+        store_dir = root / "data" / store_name
+        store_dir.mkdir(parents=True, exist_ok=True)
+        (store_dir / f"{split}-00000-of-00001.parquet").touch()
+    return root
+
+
+def test_load_stores_from_hub_loads_requested_stores_in_one_call(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, dict]] = []
+    snapshot_calls: list[tuple[str, list[str] | None, str, str | None, str | bool | None]] = []
+    snapshot_dir = _write_snapshot(tmp_path, "cartpole", "lunar")
+
+    def fake_load_dataset(path: str, **kwargs):
+        calls.append((path, kwargs))
+        return _loaded_store_datasets()
+
+    def fake_snapshot(repo_id: str, *, store_names: list[str] | None, split: str, revision: str | None, token: str | bool | None):
+        snapshot_calls.append((repo_id, store_names, split, revision, token))
+        return snapshot_dir
+
+    monkeypatch.setattr(hub, "_snapshot_store_repo", fake_snapshot)
     monkeypatch.setattr(hub, "load_dataset", fake_load_dataset)
 
     stores = hub.load_stores_from_hub("org/dataset", ["cartpole", "lunar"], split="train")
 
     assert [store.name for store in stores] == ["cartpole", "lunar"]
     assert [len(store) for store in stores] == [1, 1]
-    assert calls == [
-        ("org/dataset", "cartpole", {"split": "train"}),
-        ("org/dataset", "lunar", {"split": "train"}),
-    ]
+    assert snapshot_calls == [("org/dataset", ["cartpole", "lunar"], "train", None, None)]
+    assert calls == [("parquet", {
+        "data_files": {
+            "cartpole": [str(snapshot_dir / "data/cartpole/train-00000-of-00001.parquet")],
+            "lunar": [str(snapshot_dir / "data/lunar/train-00000-of-00001.parquet")],
+        },
+    })]
+    assert "*" not in repr(calls[0][1]["data_files"])
 
 
-def test_load_stores_from_hub_discovers_store_names(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls: list[tuple[str, str, dict]] = []
-    discovered: list[tuple[str, dict]] = []
+def test_load_stores_from_hub_discovers_store_names(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, dict]] = []
+    snapshot_calls: list[tuple[str, list[str] | None, str, str | None, str | bool | None]] = []
+    snapshot_dir = _write_snapshot(tmp_path, "cartpole", "lunar")
 
-    def fake_get_dataset_config_names(repo_id: str, **kwargs):
-        discovered.append((repo_id, kwargs))
-        return ["cartpole", "lunar"]
+    def fake_load_dataset(path: str, **kwargs):
+        calls.append((path, kwargs))
+        return _loaded_store_datasets()
 
-    def fake_load_dataset(repo_id: str, config_name: str, **kwargs):
-        calls.append((repo_id, config_name, kwargs))
-        return Dataset.from_list([{
-            "observation": {"discrete": len(calls)},
-            "action": {"discrete": len(calls)},
-            "reward": float(len(calls)),
-            "done": 0,
-            "time": 0,
-        }])
+    def fake_snapshot(repo_id: str, *, store_names: list[str] | None, split: str, revision: str | None, token: str | bool | None):
+        snapshot_calls.append((repo_id, store_names, split, revision, token))
+        return snapshot_dir
 
-    monkeypatch.setattr(hub, "get_dataset_config_names", fake_get_dataset_config_names)
+    monkeypatch.setattr(hub, "_snapshot_store_repo", fake_snapshot)
     monkeypatch.setattr(hub, "load_dataset", fake_load_dataset)
 
     stores = hub.load_stores_from_hub("org/dataset", split="train", revision="main")
 
     assert [store.name for store in stores] == ["cartpole", "lunar"]
-    assert discovered == [("org/dataset", {"revision": "main"})]
-    assert calls == [
-        ("org/dataset", "cartpole", {"split": "train", "revision": "main"}),
-        ("org/dataset", "lunar", {"split": "train", "revision": "main"}),
-    ]
+    assert snapshot_calls == [("org/dataset", None, "train", "main", None)]
+    assert calls == [("parquet", {
+        "data_files": {
+            "cartpole": [str(snapshot_dir / "data/cartpole/train-00000-of-00001.parquet")],
+            "lunar": [str(snapshot_dir / "data/lunar/train-00000-of-00001.parquet")],
+        },
+    })]
 
 
-def test_load_stores_from_hub_scopes_short_names(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls: list[tuple[str, str, dict]] = []
+def test_load_stores_from_hub_scopes_short_names(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, dict]] = []
+    snapshot_calls: list[tuple[str, list[str] | None, str, str | None, str | bool | None]] = []
+    snapshot_dir = _write_snapshot(tmp_path, "config")
 
-    def fake_load_dataset(repo_id: str, config_name: str, **kwargs):
-        calls.append((repo_id, config_name, kwargs))
-        return Dataset.from_list([{
-            "observation": {"discrete": 0},
-            "action": {"discrete": 0},
-            "reward": 0.0,
-            "done": 0,
-            "time": 0,
-        }])
+    def fake_load_dataset(path: str, **kwargs):
+        calls.append((path, kwargs))
+        return {
+            "config": Dataset.from_list([{
+                "observation": {"discrete": 0},
+                "action": {"discrete": 0},
+                "reward": 0.0,
+                "done": 0,
+                "time": 0,
+            }])
+        }
+
+    def fake_snapshot(repo_id: str, *, store_names: list[str] | None, split: str, revision: str | None, token: str | bool | None):
+        snapshot_calls.append((repo_id, store_names, split, revision, token))
+        return snapshot_dir
 
     monkeypatch.setattr(hub, "HfApi", _FakeHfApi)
+    monkeypatch.setattr(hub, "_snapshot_store_repo", fake_snapshot)
     monkeypatch.setattr(hub, "load_dataset", fake_load_dataset)
 
     stores = hub.load_stores_from_hub("dataset", ["config"], split="train", token="token")
 
     assert stores[0].name == "config"
-    assert calls == [("user/dataset", "config", {"split": "train", "token": "token"})]
+    assert snapshot_calls == [("user/dataset", ["config"], "train", None, "token")]
+    assert calls == [("parquet", {
+        "data_files": {
+            "config": [str(snapshot_dir / "data/config/train-00000-of-00001.parquet")],
+        },
+    })]
 
 
 def test_load_stores_from_hub_requires_non_empty_store_names() -> None:
@@ -148,9 +213,13 @@ def test_load_stores_from_hub_requires_non_empty_store_names() -> None:
 
 
 def test_load_stores_from_hub_requires_discovered_store_names(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(hub, "get_dataset_config_names", lambda repo_id: [])
+    monkeypatch.setattr(
+        hub,
+        "_snapshot_store_repo",
+        lambda repo_id, *, store_names, split, revision, token: Path("/tmp/no-store-snapshot"),
+    )
 
-    with pytest.raises(ValueError, match="No store configs found"):
+    with pytest.raises(ValueError, match="No parquet store configs found"):
         hub.load_stores_from_hub("org/dataset")
 
 
@@ -161,16 +230,27 @@ def test_load_stores_from_hub_requires_unique_store_names() -> None:
 
 def test_push_stores_to_hub_pushes_one_config_per_store(monkeypatch: pytest.MonkeyPatch) -> None:
     api = _FakeHfApi()
-    pushes: list[tuple[str, str, int]] = []
+    commits: list[dict] = []
 
     monkeypatch.setattr(hub, "HfApi", lambda: api)
 
-    def fake_push_dataset_dict(dataset_dict, *, repo_id: str, commit_message: str, config_name: str) -> None:
+    def fake_commit_dataset_repo(
+        api,
+        *,
+        repo_id: str,
+        folder_path: Path,
+        commit_message: str,
+        clear: bool,
+    ) -> None:
         assert repo_id == "user/test-dataset"
         assert commit_message == "New rollout data"
-        pushes.append((config_name, next(iter(dataset_dict.keys())), len(dataset_dict["train"])))
+        commits.append({
+            "files": sorted(path.relative_to(folder_path).as_posix() for path in folder_path.rglob("*") if path.is_file()),
+            "readme": (folder_path / "README.md").read_text(encoding="utf-8"),
+            "clear": clear,
+        })
 
-    monkeypatch.setattr(hub, "_push_dataset_dict", fake_push_dataset_dict)
+    monkeypatch.setattr(hub, "_commit_dataset_repo", fake_commit_dataset_repo)
 
     url = hub.push_stores_to_hub(
         [_store(1, 2, name="cartpole"), _store(3, name="lunar")],
@@ -181,13 +261,47 @@ def test_push_stores_to_hub_pushes_one_config_per_store(monkeypatch: pytest.Monk
 
     assert url == "https://huggingface.co/datasets/user/test-dataset"
     assert api.settings_updates == [("user/test-dataset", True)]
-    assert api.commits == [[
-        "README.md",
+    assert api.commits == []
+    assert commits == [{
+        "files": [
+            "README.md",
+            "data/cartpole/train-00000-of-00001.parquet",
+            "data/lunar/train-00000-of-00001.parquet",
+        ],
+        "readme": (
+            "---\n"
+            "configs:\n"
+            "- config_name: cartpole\n"
+            "  data_files:\n"
+            "  - split: train\n"
+            "    path: data/cartpole/train-*.parquet\n"
+            "- config_name: lunar\n"
+            "  data_files:\n"
+            "  - split: train\n"
+            "    path: data/lunar/train-*.parquet\n"
+            "---\n"
+        ),
+        "clear": True,
+    }]
+
+
+def test_repo_files_to_clear_deletes_everything_except_replacements() -> None:
+    api = _FakeHfApi()
+
+    to_delete = hub._repo_files_to_clear(
+        cast(Any, api),
+        repo_id="user/test-dataset",
+        addition_paths={
+            "README.md",
+            "data/cartpole/train-00000-of-00001.parquet",
+        },
+    )
+
+    assert to_delete == [
         "dataset_infos.json",
         "data/old-00000-of-00001.parquet",
-        "data/cartpole/train-00000-of-00001.parquet",
-    ]]
-    assert pushes == [("cartpole", "train", 2), ("lunar", "train", 1)]
+        "notes/old.txt",
+    ]
 
 
 def test_push_stores_to_hub_requires_named_stores() -> None:

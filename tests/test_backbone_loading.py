@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any, cast
+
 import torch
 from transformers import LlamaConfig, LlamaModel
 
@@ -23,9 +25,11 @@ def test_llama_backbone_loads_pretrained_checkpoint(tmp_path) -> None:
 
     assert backbone.hidden_dim == 8
     assert len(backbone.model.layers) == 1
+    loaded_layer = cast(Any, backbone.model.layers[0])
+    source_layer = cast(Any, source.layers[0])
     assert torch.equal(
-        backbone.model.layers[0].self_attn.q_proj.weight,
-        source.layers[0].self_attn.q_proj.weight,
+        loaded_layer.self_attn.q_proj.weight,
+        source_layer.self_attn.q_proj.weight,
     )
 
 

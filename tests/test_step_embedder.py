@@ -6,6 +6,11 @@ import torch
 from mouse_core.models.embedding import StepEmbedder
 
 
+def _enc(**kwargs) -> StepEmbedder:
+    """Convenience wrapper: all tests disable type tokens (no type_embedding_std needed)."""
+    return StepEmbedder(include_type_token=False, **kwargs)
+
+
 def _batch(rows: list[dict], S: int = 1) -> list[list[dict]]:
     """Wrap a flat list of S row-dicts into a B=1 batch."""
     assert len(rows) == S
@@ -13,7 +18,7 @@ def _batch(rows: list[dict], S: int = 1) -> list[list[dict]]:
 
 
 def test_step_embedder_faults_on_missing_required_modality() -> None:
-    encoder = StepEmbedder(
+    encoder = _enc(
         hidden_dim=8,
         modalities=[
             {"field": "action", "type": "discrete", "vocab_size": 4},
@@ -26,8 +31,25 @@ def test_step_embedder_faults_on_missing_required_modality() -> None:
         encoder(batch)
 
 
+def test_step_embedder_faults_on_partially_missing_required_modality() -> None:
+    encoder = _enc(
+        hidden_dim=8,
+        modalities=[
+            {"field": "action", "type": "discrete", "vocab_size": 4},
+            {"field": "reward", "type": "rff"},
+        ],
+    )
+    batch = _batch([
+        {"action": 1, "reward": 0.0},
+        {"reward": 0.5},
+    ], S=2)
+
+    with pytest.raises(KeyError, match="missing from 1 of 2 rows"):
+        encoder(batch)
+
+
 def test_step_embedder_keeps_default_for_optional_missing_modality() -> None:
-    encoder = StepEmbedder(
+    encoder = _enc(
         hidden_dim=8,
         modalities=[
             {"field": "action", "type": "discrete", "vocab_size": 4, "required": False},
@@ -42,7 +64,7 @@ def test_step_embedder_keeps_default_for_optional_missing_modality() -> None:
 
 
 def test_step_embedder_returns_col_values() -> None:
-    encoder = StepEmbedder(
+    encoder = _enc(
         hidden_dim=8,
         modalities=[
             {"field": "action", "type": "discrete", "vocab_size": 4},
@@ -59,7 +81,7 @@ def test_step_embedder_returns_col_values() -> None:
 
 
 def test_step_embedder_expands_multi_field_modality_specs() -> None:
-    encoder = StepEmbedder(
+    encoder = _enc(
         hidden_dim=8,
         modalities=[
             {"field": ("action", "prev_action"), "type": "discrete", "vocab_size": 4},
@@ -79,7 +101,7 @@ def test_step_embedder_expands_multi_field_modality_specs() -> None:
 
 
 def test_step_embedder_batch_shape() -> None:
-    encoder = StepEmbedder(
+    encoder = _enc(
         hidden_dim=8,
         modalities=[
             {"field": "action", "type": "discrete", "vocab_size": 4},
@@ -99,7 +121,7 @@ def test_step_embedder_batch_shape() -> None:
 
 
 def test_step_embedder_learnable_modality_is_allowed() -> None:
-    encoder = StepEmbedder(
+    encoder = _enc(
         hidden_dim=8,
         modalities=[
             {"type": "learnable", "tokens": 1},
@@ -114,7 +136,7 @@ def test_step_embedder_learnable_modality_is_allowed() -> None:
 
 
 def test_step_embedder_continuous_modality() -> None:
-    encoder = StepEmbedder(
+    encoder = _enc(
         hidden_dim=8,
         modalities=[
             {"field": "obs", "type": "continuous", "dim": 4},
@@ -127,3 +149,28 @@ def test_step_embedder_continuous_modality() -> None:
 
     assert embeds.shape == (1, 1, 8)
     assert col_values["obs"].shape == (1, 1, 4)
+
+
+def test_step_embedder_requires_type_embedding_std_when_type_token_enabled() -> None:
+    with pytest.raises(ValueError, match="type_embedding_std is required"):
+        StepEmbedder(
+            hidden_dim=8,
+            modalities=[{"field": "action", "type": "discrete", "vocab_size": 4}],
+            include_type_token=True,
+            # type_embedding_std intentionally omitted
+        )
+
+
+def test_step_embedder_type_token_on_with_explicit_std() -> None:
+    encoder = StepEmbedder(
+        hidden_dim=8,
+        modalities=[
+            {"field": "action", "type": "discrete", "vocab_size": 4},
+            {"field": "reward", "type": "rff"},
+        ],
+        include_type_token=True,
+        type_embedding_std=0.02,
+    )
+    batch = _batch([{"action": 1, "reward": 0.5}])
+    embeds, _, _ = encoder(batch)
+    assert embeds.shape == (1, 1, 8)

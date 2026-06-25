@@ -247,7 +247,7 @@ class ModalitySpec:
             {"field": "img", "type": "image", "dim": 7056, "tokens": 16},  # e.g. patches
             {"field": "my_time", "type": "discrete", "vocab_size": 1000, "absent": -1},
         ]
-        enc = StepEmbedder(**{"hidden_dim": 128, "modalities": modalities})  # or pass hidden_dim + modalities directly; hidden_dim is part of the embedding config you feed to StepEmbedder
+        enc = StepEmbedder(hidden_dim=128, modalities=modalities, include_type_token=False)
     """
 
     type: str
@@ -645,10 +645,18 @@ class StepEmbedder(Encoder):
         concat_modalities: When ``True``, modality embeddings are concatenated
             sequentially rather than summed.
         include_type_token: Add the learned type embedding to every token.
+            Set to ``False`` to disable type embeddings entirely (recommended
+            when all modality content stds are already balanced).
             Can be overridden per modality via ``include_type_token`` in the modality spec.
         fourier_min: Smallest input value the RFF resolves.
         fourier_max: Largest input value the RFF covers.
-        std: Initialisation std for embedding tables.
+        std: Initialisation std for content embedding tables.
+        type_embedding_std: Initialisation std for the shared type embedding table.
+            **Required when** ``include_type_token=True``; raises ``ValueError``
+            if omitted.  Set to the same value as ``std`` to keep type and
+            content signals balanced, or to a smaller value to reduce type
+            influence on the summed token.  Ignored when
+            ``include_type_token=False``.
     """
 
     def __init__(
@@ -661,6 +669,7 @@ class StepEmbedder(Encoder):
         fourier_min: float = 0.01,
         fourier_max: float = 10.0,
         std: float = 0.02,
+        type_embedding_std: float | None = None,
     ) -> None:
         super().__init__()
 
@@ -723,6 +732,16 @@ class StepEmbedder(Encoder):
         self.fourier_max = float(fourier_max)
         self.std = float(std)
 
+        if self.include_type_token and type_embedding_std is None:
+            raise ValueError(
+                "type_embedding_std is required when include_type_token=True. "
+                "Set it explicitly to control the type-to-content signal ratio "
+                "(e.g. type_embedding_std=0.02 to match content std, or a smaller "
+                "value to reduce type influence). Use include_type_token=False to "
+                "disable type embeddings entirely."
+            )
+        self.type_embedding_std: float = float(type_embedding_std) if type_embedding_std is not None else 0.0
+
         # Per-modality token counts (fall back to global default)
         self._modality_tokens: dict[str, int] = {}
         self._modality_include_type: dict[str, bool] = {}
@@ -747,7 +766,7 @@ class StepEmbedder(Encoder):
             self._tokens_per_step = max(self._modality_tokens.values()) if self._modality_tokens else 0
 
         # Type embedder now produces per-token [D] vectors
-        self.type_embedder = TypeEmbedder(hidden_dim=hidden_dim, embedding_std=std)
+        self.type_embedder = TypeEmbedder(hidden_dim=hidden_dim, embedding_std=self.type_embedding_std)
 
         self.modality_embedders = nn.ModuleDict()
         self._modality_token_types: dict[str, int] = {}
@@ -935,6 +954,7 @@ class StepEmbedder(Encoder):
             assert isinstance(spec.field, str)
             values = raw[spec.field]
             all_none = all(v is None for v in values)
+            any_none = any(v is None for v in values)
 
             if all_none:
                 if spec.required:
@@ -944,6 +964,12 @@ class StepEmbedder(Encoder):
                     )
                 col_values[spec.field] = self._default_value_for(spec, B, S, device)
                 continue
+            if spec.required and any_none:
+                missing = sum(v is None for v in values)
+                raise KeyError(
+                    f"Required modality {spec.field!r} is missing from {missing} "
+                    f"of {B * S} rows in the batch."
+                )
 
             k = spec.type.lower()
 

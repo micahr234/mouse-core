@@ -17,6 +17,10 @@ class VecDqnObjective(Objective):
 
     Reads ``predictions["action_vector"]`` and ``predictions["action_vector_target"]``
     (shape ``[B, S, A, D]``) from the model's vector action-value head.
+    Boundary rows are not used as current states because the following row may
+    be a reset frame whose input action was ignored. When a transition ends at a
+    boundary and a reset row is available inside the sampled sequence, that reset
+    row supplies the target vector.
 
     Args:
         tau: Polyak coefficient for target-network updates.
@@ -71,6 +75,10 @@ class VecDqnObjective(Objective):
             raise ValueError("Not enough valid vec_dqn vectors in data.")
 
         action = objective_data[self.action_key].to(dtype=torch.long)
+        if action.ndim == 3 and action.shape[-1] == 1:
+            action = action.squeeze(-1)
+        if action.ndim != 2:
+            raise ValueError(f"VecDqnObjective expects action shape [B, S], got {tuple(action.shape)}.")
         if self.use_episodic_reward:
             if "reward_episodic" not in objective_data.keys():
                 raise KeyError(
@@ -80,6 +88,7 @@ class VecDqnObjective(Objective):
             reward = objective_data["reward_episodic"].to(dtype=dtype)
         else:
             reward = objective_data["reward"].to(dtype=dtype)
+        done = objective_data["done"]
         online_vecs = online_vecs.to(dtype=dtype)
         target_vecs = target_vecs.to(dtype=dtype)
 
@@ -91,6 +100,18 @@ class VecDqnObjective(Objective):
         next_vecs = target_vecs[:, 1:, :, :]    # [B, S-1, A, D]  vecs_target(s_{t+1})
         next_actions = action[:, 1:]             # [B, S-1]         a_t (stored at t+1)
         next_rewards = reward[:, 1:]             # [B, S-1]         r_t (stored at t+1)
+
+        boundary_at_next = done[:, 1:] != 0
+        if S > 2:
+            next_vecs[:, :-1, :, :] = torch.where(
+                boundary_at_next[:, :-1].view(B, S - 2, 1, 1),
+                target_vecs[:, 2:, :, :],
+                next_vecs[:, :-1, :, :],
+            )
+        valid_transition = done[:, :-1] == 0
+        valid_transition[:, -1] = valid_transition[:, -1] & ~boundary_at_next[:, -1]
+        if not valid_transition.any():
+            raise ValueError("VecDqnObjective: batch contains no valid transitions.")
 
         action_idx_exp = next_actions.unsqueeze(-1).unsqueeze(-1).expand(B, S - 1, 1, D)
         curr_action_vecs = curr_vecs.gather(dim=2, index=action_idx_exp).squeeze(2)  # [B, S-1, D]
@@ -108,7 +129,7 @@ class VecDqnObjective(Objective):
         rotated = rope_rotate(x=next_action_vecs, theta=theta)                # [B, S-1, D]
 
         cosine_sim = F.cosine_similarity(curr_action_vecs, rotated.detach(), dim=-1)  # [B, S-1]
-        loss = (1.0 - cosine_sim).mean()
+        loss = (1.0 - cosine_sim)[valid_transition].mean()
 
         abs_scores = vector_action_scores(online_vecs[:, -1].float()).abs() / (math.pi)  # [B, A]
         named: dict[str, torch.Tensor] = {

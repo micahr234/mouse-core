@@ -94,7 +94,7 @@ def test_mask_probabilities_apply_to_configured_fields() -> None:
 
 
 def test_shared_action_permutation_also_permutates_action_value_targets() -> None:
-    batch = [[{"action": 0, "prev_action": 1, "info_env_q_star": [10.0, 20.0, 30.0]}]]
+    batch = [[{"action": 0, "prev_action": 1, "info_q_star": [10.0, 20.0, 30.0]}]]
     expected_perm = np.random.default_rng(0).permutation(3)
     expected_inverse = np.empty_like(expected_perm)
     expected_inverse[expected_perm] = np.arange(len(expected_perm))
@@ -102,7 +102,7 @@ def test_shared_action_permutation_also_permutates_action_value_targets() -> Non
     augment = SequenceAugmenter(
         [
             {
-                "field": ("action", "prev_action", "info_env_q_star"),
+                "field": ("action", "prev_action", "info_q_star"),
                 "type": "discrete",
                 "vocab_size": 3,
                 "permute": True,
@@ -115,7 +115,7 @@ def test_shared_action_permutation_also_permutates_action_value_targets() -> Non
 
     assert out[0][0]["action"] == int(expected_perm[0])
     assert out[0][0]["prev_action"] == int(expected_perm[1])
-    assert out[0][0]["info_env_q_star"] == np.take([10.0, 20.0, 30.0], expected_inverse).tolist()
+    assert out[0][0]["info_q_star"] == np.take([10.0, 20.0, 30.0], expected_inverse).tolist()
 
 
 def test_multi_field_mask_uses_one_decision_per_step() -> None:

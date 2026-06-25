@@ -142,10 +142,18 @@ class SequenceAugmentModalitySpec:
                 f"modality {self.field!r}: set scale_in_low, scale_out_low, scale_in_high, "
                 "and scale_out_high together."
             )
-        in_low = float(self.scale_in_low)
-        out_low = float(self.scale_out_low)
-        in_high = float(self.scale_in_high)
-        out_high = float(self.scale_out_high)
+        scale_in_low = self.scale_in_low
+        scale_out_low = self.scale_out_low
+        scale_in_high = self.scale_in_high
+        scale_out_high = self.scale_out_high
+        assert scale_in_low is not None
+        assert scale_out_low is not None
+        assert scale_in_high is not None
+        assert scale_out_high is not None
+        in_low = float(scale_in_low)
+        out_low = float(scale_out_low)
+        in_high = float(scale_in_high)
+        out_high = float(scale_out_high)
         if in_low == in_high:
             raise ValueError(f"modality {self.field!r}: scale_in_low and scale_in_high must differ.")
         scale = (out_high - out_low) / (in_high - in_low)
@@ -222,7 +230,11 @@ class SequenceAugmenter:
         return rows
 
     def _draw_modality(self, spec: SequenceAugmentModalitySpec) -> dict[str, Any]:
-        perm = self._rng.permutation(spec.vocab_size) if spec.permute else None
+        if spec.permute:
+            assert spec.vocab_size is not None
+            perm = self._rng.permutation(spec.vocab_size)
+        else:
+            perm = None
         scale_spec = spec.scale_spec()
         shift_spec = spec.shift_spec()
         linear_scale, linear_shift = spec.linear_transform()

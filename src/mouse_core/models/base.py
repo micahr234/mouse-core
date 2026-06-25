@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+from collections.abc import Mapping
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, cast
@@ -314,7 +315,8 @@ def _encoder_config(encoder: Encoder) -> dict[str, Any]:
             "include_type_token": bool(encoder.include_type_token),
             "fourier_min": float(encoder.fourier_min),
             "fourier_max": float(encoder.fourier_max),
-            "std": float(getattr(encoder, "std", 0.02)),
+            "std": float(encoder.std),
+            "type_embedding_std": float(encoder.type_embedding_std),
         },
     }
 
@@ -576,7 +578,7 @@ class Model(nn.Module):
 
     @staticmethod
     def _normalize_heads(
-        heads: BaseHead | list[BaseHead] | dict[str, BaseHead | None] | None,
+        heads: BaseHead | list[BaseHead] | Mapping[str, BaseHead | None] | None,
         action_head: str | None,
     ) -> dict[str, BaseHead]:
         """Convert the flexible ``heads=`` argument into the internal ``name -> head`` dict.
@@ -592,7 +594,7 @@ class Model(nn.Module):
             return {}
 
         # Dict form gives full control over names.
-        if isinstance(heads, dict):
+        if isinstance(heads, Mapping):
             filtered: dict[str, BaseHead] = {}
             for name, h in heads.items():
                 if h is not None:
@@ -658,7 +660,7 @@ class Model(nn.Module):
         *,
         encoder: Encoder,
         backbone: nn.Module,
-        heads: BaseHead | list[BaseHead] | dict[str, BaseHead | None] | None = None,
+        heads: BaseHead | list[BaseHead] | Mapping[str, BaseHead | None] | None = None,
         action_head: str | None = None,
     ):
         """Construct a Model from three independent pieces.

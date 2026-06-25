@@ -20,7 +20,8 @@ See https://huggingface.co/docs/datasets/repository_structure
 Public API
 ----------
 ``load_stores_from_hub(repo_id, split=...)``
-    Load named stores from Hub dataset configs, discovering names by default.
+    Load named stores from Hub dataset configs in one batched parquet read,
+    discovering names by default.
 
 ``push_to_hub(splits, repo_id, config_name=...)``
     Push splits under a named config (subset/bin).
@@ -31,15 +32,17 @@ Public API
 
 from __future__ import annotations
 
+from pathlib import Path
 import re
-from typing import TYPE_CHECKING, Any
+import tempfile
+from typing import TYPE_CHECKING, Any, NoReturn
 
 import numpy as np
-from datasets import Dataset, DatasetDict, Features, Value, get_dataset_config_names, load_dataset
+from datasets import Dataset, DatasetDict, Features, Value, load_dataset
 from datasets import config as datasets_config
-from huggingface_hub import HfApi
+from huggingface_hub import HfApi, snapshot_download
 from huggingface_hub.errors import HfHubHTTPError, RepositoryNotFoundError
-from huggingface_hub.hf_api import CommitOperationDelete
+from huggingface_hub.hf_api import CommitOperationAdd, CommitOperationDelete
 
 if TYPE_CHECKING:
     from mouse_core.data.datastore import Datastore
@@ -186,7 +189,7 @@ def _align_splits(splits: dict[str, Dataset]) -> dict[str, Dataset]:
     return out
 
 
-def _raise_for_hub_403(error: HfHubHTTPError, repo_id: str) -> None:
+def _raise_for_hub_http_error(error: HfHubHTTPError, repo_id: str) -> NoReturn:
     code = getattr(getattr(error, "response", None), "status_code", None)
     if code == 403:
         raise RuntimeError(
@@ -241,6 +244,150 @@ def _push_dataset_dict(
     )
 
 
+def _dataset_card_for_configs(config_names: list[str], *, split: str) -> str:
+    lines = [
+        "---",
+        "configs:",
+    ]
+    for config_name in config_names:
+        lines.extend([
+            f"- config_name: {config_name}",
+            "  data_files:",
+            f"  - split: {split}",
+            f"    path: data/{config_name}/{split}-*.parquet",
+        ])
+    lines.extend([
+        "---",
+        "",
+    ])
+    return "\n".join(lines)
+
+
+def _snapshot_allow_patterns(store_names: list[str] | None, *, split: str) -> list[str]:
+    if store_names is None:
+        return [f"data/*/{split}-*.parquet"]
+    return [f"data/{store_name}/{split}-*.parquet" for store_name in store_names]
+
+
+def _snapshot_store_repo(
+    repo_id: str,
+    *,
+    store_names: list[str] | None,
+    split: str,
+    revision: str | None,
+    token: str | bool | None,
+) -> Path:
+    kwargs: dict[str, Any] = {
+        "repo_id": repo_id,
+        "repo_type": "dataset",
+        "allow_patterns": _snapshot_allow_patterns(store_names, split=split),
+    }
+    if revision is not None:
+        kwargs["revision"] = revision
+    if token is not None:
+        kwargs["token"] = token
+    return Path(snapshot_download(**kwargs))
+
+
+def _local_parquet_data_files(
+    snapshot_dir: Path,
+    *,
+    store_names: list[str] | None,
+    split: str,
+) -> tuple[list[str], dict[str, list[str]]]:
+    shard_re = re.compile(rf"^data/([^/]+)/{re.escape(split)}-\d{{5}}-of-\d{{5}}\.parquet$")
+    files_by_store: dict[str, list[str]] = {}
+    discovered_names: list[str] = []
+    seen: set[str] = set()
+    for path in sorted(snapshot_dir.glob(f"data/*/{split}-*.parquet")):
+        rel_path = path.relative_to(snapshot_dir).as_posix()
+        match = shard_re.match(rel_path)
+        if match is None:
+            continue
+        store_name = match.group(1)
+        files_by_store.setdefault(store_name, []).append(str(path))
+        if store_name not in seen:
+            discovered_names.append(store_name)
+            seen.add(store_name)
+
+    resolved_store_names = discovered_names if store_names is None else store_names
+    missing = [store_name for store_name in resolved_store_names if store_name not in files_by_store]
+    if missing:
+        raise FileNotFoundError(
+            f"No parquet shards found for split {split!r} in dataset snapshot {str(snapshot_dir)!r} "
+            f"for store configs: {missing}."
+        )
+    return resolved_store_names, {
+        store_name: files_by_store[store_name]
+        for store_name in resolved_store_names
+    }
+
+
+def _write_store_dataset_repo(
+    root: Path,
+    prepared: list[tuple[str, Dataset]],
+    *,
+    split: str,
+) -> None:
+    (root / "data").mkdir(parents=True, exist_ok=True)
+    (root / datasets_config.REPOCARD_FILENAME).write_text(
+        _dataset_card_for_configs([config_name for config_name, _ in prepared], split=split),
+        encoding="utf-8",
+    )
+
+    def write_one(config_name: str, ds: Dataset) -> None:
+        config_dir = root / "data" / config_name
+        config_dir.mkdir(parents=True, exist_ok=True)
+        ds.to_parquet(config_dir / f"{split}-00000-of-00001.parquet")
+
+    for config_name, ds in prepared:
+        write_one(config_name, ds)
+
+
+def _repo_files_to_clear(api: HfApi, repo_id: str, addition_paths: set[str]) -> list[str]:
+    try:
+        files = list(api.list_repo_files(repo_id=repo_id, repo_type="dataset"))
+    except RepositoryNotFoundError:
+        return []
+    return [
+        path for path in files
+        if path not in addition_paths
+    ]
+
+
+def _commit_dataset_repo(
+    api: HfApi,
+    *,
+    repo_id: str,
+    folder_path: Path,
+    commit_message: str,
+    clear: bool,
+) -> None:
+    additions = [
+        path for path in sorted(folder_path.rglob("*"))
+        if path.is_file()
+    ]
+    addition_paths = {path.relative_to(folder_path).as_posix() for path in additions}
+    deletions = _repo_files_to_clear(api, repo_id, addition_paths) if clear else []
+    operations = [
+        CommitOperationDelete(path_in_repo=path)
+        for path in deletions
+    ] + [
+        CommitOperationAdd(
+            path_in_repo=path.relative_to(folder_path).as_posix(),
+            path_or_fileobj=path,
+        )
+        for path in additions
+    ]
+
+    api.create_commit(
+        repo_id=repo_id,
+        repo_type="dataset",
+        commit_message=commit_message,
+        operations=operations,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -264,10 +411,13 @@ def load_stores_from_hub(
     """Load Hub dataset configs into ``Datastore`` objects.
 
     Short names such as ``"my-dataset"`` resolve under the authenticated Hub
-    user before delegating to ``datasets.load_dataset``. When ``store_names``
-    is omitted, config names are discovered with ``get_dataset_config_names``.
-    Each store name is used as the Hugging Face config name and copied onto the
-    returned ``Datastore.name``.
+    user before loading the parquet shards written by ``push_stores_to_hub``.
+    Matching parquet shards are downloaded as a Hugging Face snapshot first,
+    then local exact file paths are passed to one
+    ``datasets.load_dataset("parquet", data_files=...)`` call. This avoids one
+    Hub tree/glob request per store. When ``store_names`` is omitted, store
+    names are discovered from local ``data/{store}/{split}-*.parquet`` paths.
+    Each store name is copied onto the returned ``Datastore.name``.
     """
     if store_names is not None:
         if not store_names:
@@ -283,19 +433,25 @@ def load_stores_from_hub(
 
     resolved_repo_id = _resolve_dataset_repo_id(repo_id, token=token)
     load_kwargs = dict(kwargs)
-    if token is not None:
-        load_kwargs["token"] = token
 
-    if store_names is None:
-        discovered_kwargs: dict[str, Any] = {}
-        if token is not None:
-            discovered_kwargs["token"] = token
-        if "revision" in kwargs:
-            discovered_kwargs["revision"] = kwargs["revision"]
-        store_names = list(get_dataset_config_names(resolved_repo_id, **discovered_kwargs))
+    revision = load_kwargs.pop("revision", None)
+    snapshot_dir = _snapshot_store_repo(
+        resolved_repo_id,
+        store_names=store_names,
+        split=split,
+        revision=revision,
+        token=token,
+    )
+    store_names, data_files = _local_parquet_data_files(
+        snapshot_dir,
+        store_names=store_names,
+        split=split,
+    )
 
     if not store_names:
-        raise ValueError(f"No store configs found for dataset {resolved_repo_id!r}.")
+        raise ValueError(
+            f"No parquet store configs found for dataset {resolved_repo_id!r} and split {split!r}."
+        )
     missing = [i for i, name in enumerate(store_names) if not name]
     if missing:
         raise ValueError(
@@ -307,11 +463,16 @@ def load_stores_from_hub(
 
     from mouse_core.data.datastore import Datastore as _DS
 
+    loaded = load_dataset(
+        "parquet",
+        data_files=data_files,
+        **load_kwargs,
+    )
+
     stores: list[Datastore] = []
     for store_name in store_names:
-        ds = load_dataset(resolved_repo_id, store_name, split=split, **load_kwargs)
         store = _DS(name=store_name)
-        store.from_dataset(ds)
+        store.from_dataset(loaded[store_name])
         stores.append(store)
     return stores
 
@@ -343,9 +504,9 @@ def push_to_hub(
     config_name :
         Hugging Face dataset configuration / subset name (also called "config").
     clear :
-        Delete all existing parquet shards, dataset info, and the README card
-        before uploading. Keeps the dataset card and schema consistent with the
-        data being pushed. Defaults to ``True``.
+        Replace the dataset repository contents before uploading. Existing
+        remote files are deleted unless the same path is written by this push.
+        Defaults to ``True``.
         Use this to organize your data into different "bins" (e.g. different
         collection runs, different environment families, different policies).
         Default is ``"default"``. When loading later use
@@ -395,7 +556,7 @@ def push_to_hub(
             config_name=config_name,
         )
     except HfHubHTTPError as e:
-        _raise_for_hub_403(e, repo_id)
+        _raise_for_hub_http_error(e, repo_id)
 
     parts_str = ", ".join(f"{k}: {len(v)}" for k, v in resolved.items())
     print(f"Pushed to {hub_repo_id} ({parts_str} steps)")
@@ -438,7 +599,6 @@ def push_stores_to_hub(
         Delete all existing parquet shards, dataset info, and the README card
         before uploading. Keeps the dataset card and schema consistent with the
         data being pushed. Defaults to ``True``.
-
     Returns
     -------
     The canonical dataset URL on the Hub, or ``None`` if there was nothing to push.
@@ -497,21 +657,24 @@ def push_stores_to_hub(
     try:
         api = HfApi()
         repo_url, hub_repo_id = _create_or_update_dataset_repo(api, repo_id, private=private)
-        if clear:
-            _wipe_hub_repo_data(api=api, repo_id=hub_repo_id)
-
-        pushed: dict[str, int] = {}
-        for config_name, ds in prepared:
-            _push_dataset_dict(
-                DatasetDict([(split, ds)]),
-                repo_id=hub_repo_id,
-                commit_message=commit_message,
-                config_name=config_name,
+        with tempfile.TemporaryDirectory() as tmp:
+            folder_path = Path(tmp)
+            _write_store_dataset_repo(
+                folder_path,
+                prepared,
+                split=split,
             )
-            pushed[config_name] = len(ds)
+            _commit_dataset_repo(
+                api,
+                repo_id=hub_repo_id,
+                folder_path=folder_path,
+                commit_message=commit_message,
+                clear=clear,
+            )
     except HfHubHTTPError as e:
-        _raise_for_hub_403(e, repo_id)
+        _raise_for_hub_http_error(e, repo_id)
 
+    pushed = {config_name: len(ds) for config_name, ds in prepared}
     parts_str = ", ".join(f"{config}/{split}: {steps}" for config, steps in pushed.items())
     print(f"Pushed to {hub_repo_id} ({parts_str} steps)")
     return repo_url

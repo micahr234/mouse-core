@@ -40,7 +40,7 @@ def sp_js(
 
     log_m = torch.logaddexp(log_teacher, log_student) - math.log(2.0)
     # KL(P‖M) and KL(Q‖M) via kl_div(input=log M, target=log P, log_target=True)
-    # -> exp(log P) * (log P - log M). nan_to_num: -inf padding in info_env_q_star gives 0*(-inf) -> NaN otherwise.
+    # -> exp(log P) * (log P - log M). nan_to_num: -inf padding in info_q_star gives 0*(-inf) -> NaN otherwise.
     kl_pm = torch.nan_to_num(
         F.kl_div(log_m, log_teacher, log_target=True, reduction="none"),
         nan=0.0,
@@ -129,15 +129,15 @@ def sp_soft_ce(
 
 
 class SpObjective(Objective):
-    """Supervised policy objective distilling ``info_env_q_star`` expert targets into action logits.
+    """Supervised policy objective distilling ``info_q_star`` expert targets into action logits.
 
     Reads ``predictions["action"]`` (shape ``[B, S, A]``) from the model's action head.
 
     Args:
         loss_type: Which distillation loss to apply.  ``"ce"`` uses the argmax of
-            ``info_env_q_star`` as a hard label; the soft variants treat it as a
+            ``info_q_star`` as a hard label; the soft variants treat it as a
             distribution.
-        temperature: Softmax temperature applied to ``info_env_q_star`` before soft losses
+        temperature: Softmax temperature applied to ``info_q_star`` before soft losses
             (ignored for ``"ce"``).
         label_smoothing: Label-smoothing coefficient (applied to hard ``"ce"`` only).
         predictions_key: Key in ``predictions`` that holds the ``[B, S, A]`` action logits.
@@ -166,15 +166,23 @@ class SpObjective(Objective):
 
         A = logits.shape[-1]
         logits = logits.reshape(-1, A)
-        q_targets = objective_data["info_env_q_star"].reshape(-1, A).to(dtype=logits.dtype)
+        q_targets = objective_data["info_q_star"].reshape(-1, A).to(dtype=logits.dtype)
 
         if q_targets.shape[0] == 0:
             raise ValueError("SpObjective: batch is empty (no tokens).")
-        if not torch.isfinite(q_targets).all():
-            raise ValueError("SpObjective: info_env_q_star contains non-finite values (NaN or inf).")
+        if torch.isnan(q_targets).any():
+            raise ValueError("SpObjective: info_q_star contains NaN values.")
+        if torch.isposinf(q_targets).any():
+            raise ValueError("SpObjective: info_q_star contains +inf values.")
+
+        valid_rows = torch.isfinite(q_targets).any(dim=-1)
+        if not valid_rows.any():
+            raise ValueError("SpObjective: info_q_star contains no finite action targets.")
+        logits = logits[valid_rows]
+        q_targets = q_targets[valid_rows]
 
         if self.loss_type == "ce":
-            target_actions = q_targets.argmax(dim=-1).to(dtype=torch.long)
+            target_actions = q_targets.masked_fill(~torch.isfinite(q_targets), -torch.inf).argmax(dim=-1).to(dtype=torch.long)
             loss = F.cross_entropy(logits, target_actions, label_smoothing=self.label_smoothing)
         elif self.loss_type == "ce-soft-fwd":
             loss = sp_soft_ce(q_targets=q_targets, logits=logits, temperature=temp, label_smoothing=self.label_smoothing, direction="fwd")

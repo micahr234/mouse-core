@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import threading
 
+from datasets import Dataset
+
 from mouse_core.data import DataLoader, Datastore, SequenceAugmenter
 
 
@@ -77,3 +79,17 @@ def test_dataloader_runs_augmenter_in_worker_thread() -> None:
 
     assert all(row["augmenter_marker"] == "worker-0" for sequence in batch for row in sequence)
     assert all(row["augmenter_thread"] == "DataLoader-0" for sequence in batch for row in sequence)
+
+
+def test_dataloader_snapshots_loaded_source_and_appended_rows() -> None:
+    store = Datastore()
+    store.from_dataset(Dataset.from_list([
+        {"action": 1, "reward": 0.0, "done": 0},
+        {"action": 2, "reward": 0.0, "done": 0},
+    ]))
+    store.append({"action": 3, "reward": 0.0, "done": 0})
+
+    loader = DataLoader(store, sequence_length=3, batch_size=1, num_workers=0)
+    batch = loader.next_batch()
+
+    assert [row["action"] for row in batch[0]] == [1, 2, 3]

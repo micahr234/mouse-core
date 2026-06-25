@@ -55,7 +55,12 @@ from mouse_core.models.heads import DiscreteActionValueHead
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 store = Datastore()
-# ... store.append(...) or store.from_dataset(...)
+for t in range(32):
+    store.append({
+        "action": t % 4,
+        "reward": 0.0,
+        "done": 0,
+    })
 loader = DataLoader(store, sequence_length=16, batch_size=8, num_workers=0)
 
 hidden_dim = 32
@@ -64,8 +69,9 @@ encoder = StepEmbedder(
     modalities=[
         {"field": "action", "type": "discrete", "vocab_size": 4},
         {"field": "reward", "type": "rff"},
-        {"field": "done", "type": "discrete", "vocab_size": 3},
+        {"field": "done", "type": "discrete", "vocab_size": 5},
     ],
+    include_type_token=False,
 )
 
 backbone = IdentityBackbone(hidden_dim=hidden_dim)
@@ -85,7 +91,7 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 objective = DqnObjective(gamma_step=0.99, tau=0.005)
 
 for step in range(100):
-    batch = loader.next_batch().to(device)
+    batch = loader.next_batch()
     predictions, objective_data, _ = model(batch)
     loss, metrics = objective(objective_data, predictions)
 

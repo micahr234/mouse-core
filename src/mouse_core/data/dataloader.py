@@ -43,7 +43,7 @@ from __future__ import annotations
 import queue
 import threading
 from collections.abc import Callable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 
@@ -155,11 +155,10 @@ class DataLoader:
         self.pack = pack
         self.augmenter = augmenter
 
-        # Snapshot each store as an Arrow Dataset for fast slicing.
-        self._datasets = [
-            s._source if s._source is not None else s.to_dataset()
-            for s in stores
-        ]
+        # Snapshot each store as an Arrow Dataset for fast slicing. Always go
+        # through to_dataset() so loaded source rows and later appends are both
+        # visible to replay.
+        self._datasets = [s.to_dataset() for s in stores]
         self._ns: list[int] = [len(ds) for ds in self._datasets]
 
         if not pack:
@@ -342,5 +341,5 @@ def _fork_augmenter(augmenter: BatchAugmenter | None, *, seed: int) -> BatchAugm
         return None
     fork = getattr(augmenter, "fork", None)
     if callable(fork):
-        return fork(seed=seed)
+        return cast(BatchAugmenter, fork(seed=seed))
     return augmenter
