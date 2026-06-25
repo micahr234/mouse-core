@@ -25,7 +25,7 @@ def test_dqn_objective_runs() -> None:
         },
         batch_size=(b, s),
     )
-    objective = DqnObjective(gamma=0.99)
+    objective = DqnObjective(gamma_step=0.99)
     loss, metrics = objective(step_stream, out)
     assert loss.ndim == 0
     assert "action_value" in metrics
@@ -49,7 +49,7 @@ def test_dqn_objective_accepts_trailing_singleton_action_dim() -> None:
         },
         batch_size=(b, s),
     )
-    objective = DqnObjective(gamma=0.99)
+    objective = DqnObjective(gamma_step=0.99)
     loss, metrics = objective(step_stream, out)
     assert loss.ndim == 0
     assert "action_value" in metrics

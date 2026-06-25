@@ -16,8 +16,8 @@ def test_step_embedder_faults_on_missing_required_modality() -> None:
     encoder = StepEmbedder(
         hidden_dim=8,
         modalities=[
-            {"name": "action", "embed": "discrete", "vocab_size": 4},
-            {"name": "reward", "embed": "rff"},
+            {"field": "action", "type": "discrete", "vocab_size": 4},
+            {"field": "reward", "type": "rff"},
         ],
     )
     batch = _batch([{"reward": 0.5}])
@@ -30,8 +30,8 @@ def test_step_embedder_keeps_default_for_optional_missing_modality() -> None:
     encoder = StepEmbedder(
         hidden_dim=8,
         modalities=[
-            {"name": "action", "embed": "discrete", "vocab_size": 4, "required": False},
-            {"name": "reward", "embed": "rff"},
+            {"field": "action", "type": "discrete", "vocab_size": 4, "required": False},
+            {"field": "reward", "type": "rff"},
         ],
     )
     batch = _batch([{"reward": 0.5}])
@@ -45,8 +45,8 @@ def test_step_embedder_returns_col_values() -> None:
     encoder = StepEmbedder(
         hidden_dim=8,
         modalities=[
-            {"name": "action", "embed": "discrete", "vocab_size": 4},
-            {"name": "reward", "embed": "rff"},
+            {"field": "action", "type": "discrete", "vocab_size": 4},
+            {"field": "reward", "type": "rff"},
         ],
     )
     batch = _batch([{"action": 2, "reward": 1.5}])
@@ -58,12 +58,32 @@ def test_step_embedder_returns_col_values() -> None:
     assert col_values["reward"].item() == pytest.approx(1.5)
 
 
+def test_step_embedder_expands_multi_field_modality_specs() -> None:
+    encoder = StepEmbedder(
+        hidden_dim=8,
+        modalities=[
+            {"field": ("action", "prev_action"), "type": "discrete", "vocab_size": 4},
+            {"field": ("reward", "value"), "type": "rff"},
+        ],
+    )
+    batch = _batch([{"action": 2, "prev_action": 1, "reward": 1.5, "value": 0.25}])
+
+    embeds, col_values, _ = encoder(batch)
+
+    assert embeds.shape == (1, 1, 8)
+    assert [spec.field for spec in encoder.modalities] == ["action", "prev_action", "reward", "value"]
+    assert col_values["action"].item() == 2
+    assert col_values["prev_action"].item() == 1
+    assert col_values["reward"].item() == pytest.approx(1.5)
+    assert col_values["value"].item() == pytest.approx(0.25)
+
+
 def test_step_embedder_batch_shape() -> None:
     encoder = StepEmbedder(
         hidden_dim=8,
         modalities=[
-            {"name": "action", "embed": "discrete", "vocab_size": 4},
-            {"name": "reward", "embed": "rff"},
+            {"field": "action", "type": "discrete", "vocab_size": 4},
+            {"field": "reward", "type": "rff"},
         ],
     )
     B, S = 3, 5
@@ -82,7 +102,7 @@ def test_step_embedder_learnable_modality_is_allowed() -> None:
     encoder = StepEmbedder(
         hidden_dim=8,
         modalities=[
-            {"name": "scratch", "embed": "learnable", "tokens": 1},
+            {"type": "learnable", "tokens": 1},
         ],
     )
     batch = [[{}]]
@@ -97,8 +117,8 @@ def test_step_embedder_continuous_modality() -> None:
     encoder = StepEmbedder(
         hidden_dim=8,
         modalities=[
-            {"name": "obs", "embed": "continuous", "dim": 4},
-            {"name": "reward", "embed": "rff"},
+            {"field": "obs", "type": "continuous", "dim": 4},
+            {"field": "reward", "type": "rff"},
         ],
     )
     batch = [[{"obs": [0.1, 0.2, 0.3, 0.4], "reward": 1.0}]]

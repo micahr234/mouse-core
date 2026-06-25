@@ -4,12 +4,13 @@ A ``Datastore`` is a flat sequence of arbitrary rows.
 
 The ``DataLoader`` repeatedly samples contiguous windows of ``S`` rows and
 returns them as a ``list[list[dict]]`` of shape ``[B][S]``. Each element is a
-plain Python dict exactly as it was stored (no encoding or tensorisation
-happens here). The model (its encoder) is responsible for extracting and
-converting the fields it needs.
+plain Python dict exactly as it was stored, unless an optional batch augmenter
+rewrites the raw rows before return (no encoding or tensorisation happens
+here). The model (its encoder) is responsible for extracting and converting
+the fields it needs.
 
-When background workers are enabled the slice work happens in the background
-so ``next_batch()`` is usually immediate.
+When background workers are enabled the slice and augmentation work happens in
+the background so ``next_batch()`` is usually immediate.
 
 Usage
 -----
@@ -41,12 +42,16 @@ from __future__ import annotations
 
 import queue
 import threading
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import numpy as np
 
 if TYPE_CHECKING:
     from mouse_core.data.datastore import Datastore
+
+
+BatchAugmenter = Callable[[list[list[dict]]], list[list[dict]]]
 
 
 class DataLoader:
@@ -100,6 +105,11 @@ class DataLoader:
         How many batches to keep pre-fetched in the background queue.
     num_workers :
         Background worker threads (0 = synchronous).
+    augmenter :
+        Optional callable applied to each sampled batch. With background workers,
+        augmentation runs in the worker before the batch is put into the prefetch
+        queue. If the callable exposes ``fork(seed=...)``, each worker receives an
+        independent copy.
     """
 
     def __init__(
@@ -113,6 +123,7 @@ class DataLoader:
         pack: bool = False,
         prefetch: int = 4,
         num_workers: int = 1,
+        augmenter: BatchAugmenter | None = None,
     ) -> None:
         from mouse_core.data.datastore import Datastore as _DS
 
@@ -142,6 +153,7 @@ class DataLoader:
         self.batch_size = batch_size
         self.weight_mode = weight_mode
         self.pack = pack
+        self.augmenter = augmenter
 
         # Snapshot each store as an Arrow Dataset for fast slicing.
         self._datasets = [
@@ -173,19 +185,24 @@ class DataLoader:
 
         if num_workers == 0:
             self._sync_rng: np.random.Generator | None = np.random.default_rng(seed=0)
+            self._sync_augmenter: BatchAugmenter | None = augmenter
             self._result_queue: queue.Queue[list[list[dict]]] | None = None
             self._stop: threading.Event | None = None
             self._worker_error: BaseException | None = None
             self._workers: list[threading.Thread] = []
         else:
             self._sync_rng = None
+            self._sync_augmenter = None
             self._result_queue = queue.Queue(maxsize=prefetch)
             self._stop = threading.Event()
             self._worker_error = None
             self._workers = [
                 threading.Thread(
                     target=self._worker_loop,
-                    args=(np.random.default_rng(seed=i),),
+                    args=(
+                        np.random.default_rng(seed=i),
+                        _fork_augmenter(augmenter, seed=i),
+                    ),
                     daemon=True,
                     name=f"DataLoader-{i}",
                 )
@@ -212,7 +229,7 @@ class DataLoader:
             step record exactly as stored in the Datastore.
         """
         if self._sync_rng is not None:
-            return self._fetch_one_batch(self._sync_rng)
+            return self._fetch_one_batch(self._sync_rng, self._sync_augmenter)
         assert self._result_queue is not None
         while True:
             if self._worker_error is not None:
@@ -294,14 +311,21 @@ class DataLoader:
 
         return steps[:S]
 
-    def _fetch_one_batch(self, rng: np.random.Generator) -> list[list[dict]]:
-        return [self._fetch_sequence(rng) for _ in range(self.batch_size)]
+    def _fetch_one_batch(
+        self,
+        rng: np.random.Generator,
+        augmenter: BatchAugmenter | None,
+    ) -> list[list[dict]]:
+        batch = [self._fetch_sequence(rng) for _ in range(self.batch_size)]
+        if augmenter is not None:
+            batch = augmenter(batch)
+        return batch
 
-    def _worker_loop(self, rng: np.random.Generator) -> None:
+    def _worker_loop(self, rng: np.random.Generator, augmenter: BatchAugmenter | None) -> None:
         assert self._stop is not None and self._result_queue is not None
         while not self._stop.is_set():
             try:
-                batch = self._fetch_one_batch(rng)
+                batch = self._fetch_one_batch(rng, augmenter)
                 while not self._stop.is_set():
                     try:
                         self._result_queue.put(batch, timeout=0.05)
@@ -311,3 +335,12 @@ class DataLoader:
             except Exception as exc:  # noqa: BLE001
                 self._worker_error = exc
                 return
+
+
+def _fork_augmenter(augmenter: BatchAugmenter | None, *, seed: int) -> BatchAugmenter | None:
+    if augmenter is None:
+        return None
+    fork = getattr(augmenter, "fork", None)
+    if callable(fork):
+        return fork(seed=seed)
+    return augmenter

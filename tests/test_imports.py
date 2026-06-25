@@ -24,9 +24,13 @@ def test_mouse_data_exports() -> None:
     from mouse_core.data import (
         DataLoader,
         Datastore,
+        SequenceAugmentModalitySpec,
+        SequenceAugmenter,
         push_to_hub,
     )
 
     assert Datastore is not None
     assert DataLoader is not None
+    assert SequenceAugmentModalitySpec is not None
+    assert SequenceAugmenter is not None
     assert callable(push_to_hub)

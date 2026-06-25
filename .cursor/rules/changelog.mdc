@@ -27,7 +27,7 @@ Skip the changelog for:
 
 ## Format
 
-Always add to `## [Unreleased]` — never edit a released version block.
+Always add new work to `## [Unreleased]` — never add new entries to an already dated release block.
 Use these sub-sections (omit any that don't apply):
 
 ```markdown
@@ -55,3 +55,11 @@ When `version` in `pyproject.toml` is changed, promote `[Unreleased]` to the new
 ```
 
 Leave a fresh empty `## [Unreleased]` above it.
+
+## Before finishing
+
+For every implementation task, explicitly check whether the change is user-visible.
+
+- If yes, verify `CHANGELOG.md` has a matching `## [Unreleased]` entry before the final response.
+- If no, mention internally that the changelog was intentionally skipped because the change is test-only, internal-only, or a doc typo.
+- Do not consider the task complete if a public API, behavior, environment, output format, reward behavior, or documented feature changed without an `[Unreleased]` changelog entry.

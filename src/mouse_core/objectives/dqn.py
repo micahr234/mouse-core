@@ -20,7 +20,7 @@ class DqnObjective(Objective):
     +------+--------------------------------------+------------------------------+
     | done | Meaning                              | Discount parameter           |
     +======+======================================+==============================+
-    | 0    | Running (non-terminal)               | ``gamma``                    |
+    | 0    | Running (non-terminal)               | ``gamma_step``               |
     +------+--------------------------------------+------------------------------+
     | 1    | Episode terminated (not last in task)| ``gamma_episode_terminal``   |
     +------+--------------------------------------+------------------------------+
@@ -31,16 +31,11 @@ class DqnObjective(Objective):
     | 4    | Task truncated (last episode trunc.) | ``gamma_task_truncated``     |
     +------+--------------------------------------+------------------------------+
 
-    Within a task the episodes share a common context (same map, same task), so
-    bootstrapping across episode boundaries is usually correct — set
-    ``gamma_terminal=1.0`` and ``gamma_truncated=1.0``.  A task boundary, by
-    contrast, ends the context entirely: the next episode belongs to a different
-    task and its Q-values carry no meaningful signal for the current one.  Set
-    ``gamma_task_terminal=0.0`` and ``gamma_task_truncated=0.0`` to avoid
-    propagating information across task boundaries.
+    In the default examples, all episodes belong to one ongoing task, so each
+    done code uses a bootstrapping discount instead of cutting off the target.
 
     Args:
-        gamma: Discount factor for running (non-terminal) transitions (``done == 0``).
+        gamma_step: Discount factor for running (non-terminal) transitions (``done == 0``).
         gamma_episode_terminal: Discount applied when the episode terminates naturally
             within a task (``done == 1``). Set to ``1.0`` to bootstrap across
             episode boundaries (recommended for multi-episode MOUSE tasks).
@@ -48,11 +43,9 @@ class DqnObjective(Objective):
             task (``done == 2``). Set to ``1.0`` to bootstrap across episode
             boundaries.
         gamma_task_terminal: Discount applied when the task terminates naturally
-            (``done == 3``). Set to ``0.0`` to suppress bootstrapping across
-            task boundaries (recommended).
+            (``done == 3``).
         gamma_task_truncated: Discount applied when the task is truncated
-            (``done == 4``). Set to ``0.0`` to suppress bootstrapping across
-            task boundaries (recommended).
+            (``done == 4``).
         tau: Polyak coefficient for target-network updates.
             Pass to ``model.polyak_update(action_value_tau=objective.tau)`` after
             each optimizer step.
@@ -75,7 +68,7 @@ class DqnObjective(Objective):
     def __init__(
         self,
         *,
-        gamma: float = 0.99,
+        gamma_step: float = 0.99,
         gamma_episode_terminal: float = 0.0,
         gamma_episode_truncated: float = 0.0,
         gamma_task_terminal: float = 0.0,
@@ -92,7 +85,7 @@ class DqnObjective(Objective):
         reward_scale: float = 1.0,
         reward_shift: float = 0.0,
     ) -> None:
-        self.gamma = gamma
+        self.gamma_step = gamma_step
         self.gamma_episode_terminal = gamma_episode_terminal
         self.gamma_episode_truncated = gamma_episode_truncated
         self.gamma_task_terminal = gamma_task_terminal
@@ -169,7 +162,7 @@ class DqnObjective(Objective):
         # Non-terminal mask: 1.0 when none of the four boundary types fired.
         non_terminal = 1.0 - next_terminals - next_truncateds - next_task_terminals - next_task_truncateds
         discount = (
-            self.gamma                   * non_terminal
+            self.gamma_step              * non_terminal
             + self.gamma_episode_terminal  * next_terminals
             + self.gamma_episode_truncated * next_truncateds
             + self.gamma_task_terminal     * next_task_terminals

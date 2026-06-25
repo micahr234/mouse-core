@@ -25,7 +25,7 @@ exactly ``tokens_per_step`` embedding vectors.
 
     Declare a learnable modality anywhere in the ``modalities`` list:
 
-        {"name": "scratch", "embed": "learnable", "tokens": N}
+        {"type": "learnable", "tokens": N}
 
     Such modalities contribute ``N`` learned scratch tokens at the position they
     appear in the list.  They never read from input rows — the embedding is a
@@ -41,7 +41,8 @@ those positions from the backbone output to produce one ``[D]``-vector per step.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from collections.abc import Sequence
+from dataclasses import dataclass, replace
 from typing import Any, ClassVar
 
 import numpy as np
@@ -54,7 +55,7 @@ from mouse_core.models.embedding.linear import ScaledEmbedding, ScaledPosLinear
 
 
 # ---------------------------------------------------------------------------
-# Modality config helpers  (dtype → embed kind)
+# Modality config helpers  (dtype → type)
 # ---------------------------------------------------------------------------
 
 
@@ -63,8 +64,8 @@ def action_modality(dtype: torch.dtype, *, vocab_size: int | None = None, **kwar
 
     ``dtype`` comes from ``env.input_spec.action.dtype``:
 
-    * ``torch.int64``   → discrete action  (``"embed": "discrete"``; requires *vocab_size*)
-    * ``torch.float32`` → continuous action (``"embed": "continuous"``)
+    * ``torch.int64``   → discrete action  (``"type": "discrete"``; requires *vocab_size*)
+    * ``torch.float32`` → continuous action (``"type": "continuous"``)
 
     Extra keyword arguments are merged into the returned dict and forwarded to
     :class:`ModalitySpec` (e.g. ``tokens``, ``std``, ``in_min``, ``in_max``).
@@ -75,8 +76,8 @@ def action_modality(dtype: torch.dtype, *, vocab_size: int | None = None, **kwar
                 "vocab_size is required for discrete (int64) actions; "
                 "pass vocab_size=env.action_dim or the known action-space size."
             )
-        return {"name": "action", "embed": "discrete", "vocab_size": vocab_size, **kwargs}
-    return {"name": "action", "embed": "continuous", **kwargs}
+        return {"field": "action", "type": "discrete", "vocab_size": vocab_size, **kwargs}
+    return {"field": "action", "type": "continuous", **kwargs}
 
 
 def observation_modalities(
@@ -94,11 +95,11 @@ def observation_modalities(
     * A ``dict[str, FieldSpec]`` (``gym.spaces.Dict`` obs space) → the subspace
       keys land directly on each output dict, so one modality is produced per key.
 
-    ``dtype`` drives the embed kind:
+    ``dtype`` drives the modality type:
 
-    * ``torch.int64``             → ``"embed": "discrete"`` (requires *vocab_sizes*)
-    * ``torch.float32``, 1-D     → ``"embed": "continuous"``
-    * ``torch.float32``, 2-D/3-D → ``"embed": "image"``
+    * ``torch.int64``             → ``"type": "discrete"`` (requires *vocab_sizes*)
+    * ``torch.float32``, 1-D     → ``"type": "continuous"``
+    * ``torch.float32``, 2-D/3-D → ``"type": "image"``
 
     ``vocab_sizes`` is used for discrete sub-spaces:
 
@@ -131,10 +132,10 @@ def _obs_modality(
                 f"vocab_size is required for discrete (int64) observation {name!r}; "
                 "pass vocab_sizes=<int> (or a dict for Dict obs spaces)."
             )
-        return {"name": name, "embed": "discrete", "vocab_size": vocab_size, **kwargs}
+        return {"field": name, "type": "discrete", "vocab_size": vocab_size, **kwargs}
     if len(shape) >= 2:
-        return {"name": name, "embed": "image", "dim": int(np.prod(shape)), **kwargs}
-    return {"name": name, "embed": "continuous", **kwargs}
+        return {"field": name, "type": "image", "dim": int(np.prod(shape)), **kwargs}
+    return {"field": name, "type": "continuous", **kwargs}
 
 
 class Encoder(nn.Module, ABC):
@@ -239,18 +240,18 @@ class ModalitySpec:
     Example::
 
         modalities = [
-            {"name": "action", "embed": "discrete", "vocab_size": 18, "tokens": 1},
-            {"name": "reward", "embed": "rff", "tokens": 1},
-            {"name": "scratch", "embed": "learnable", "tokens": 2},  # learned scratch tokens; never reads input data
-            {"name": "obs", "embed": "continuous", "dim": 8, "tokens": 2},
-            {"name": "img", "embed": "image", "dim": 7056, "tokens": 16},  # e.g. patches
-            {"name": "my_time", "embed": "discrete", "vocab_size": 1000, "absent": -1},
+            {"field": "action", "type": "discrete", "vocab_size": 18, "tokens": 1},
+            {"field": "reward", "type": "rff", "tokens": 1},
+            {"type": "learnable", "tokens": 2},  # learned scratch tokens; never reads input data
+            {"field": "obs", "type": "continuous", "dim": 8, "tokens": 2},
+            {"field": "img", "type": "image", "dim": 7056, "tokens": 16},  # e.g. patches
+            {"field": "my_time", "type": "discrete", "vocab_size": 1000, "absent": -1},
         ]
         enc = StepEmbedder(**{"hidden_dim": 128, "modalities": modalities})  # or pass hidden_dim + modalities directly; hidden_dim is part of the embedding config you feed to StepEmbedder
     """
 
-    name: str
-    embed: str
+    type: str
+    field: str | Sequence[str] | None = None
     vocab_size: int | None = None
     dim: int | None = None
     size: int | None = None
@@ -264,9 +265,9 @@ class ModalitySpec:
     required: bool = True
     allow_none: bool = False
 
-    # Valid values for the ``embed`` field in ModalitySpec.
+    # Valid values for the ``type`` field in ModalitySpec.
     # These name the embedding *technique*, not the semantic role of the modality.
-    _VALID_EMBEDS: ClassVar[tuple[str, ...]] = (
+    _VALID_TYPES: ClassVar[tuple[str, ...]] = (
         "discrete",    # integer id → learned table (DiscreteEmbedder)
         "rff",         # scalar → Random Fourier Features (ScalarRFFEmbedder)
         "continuous",  # vector of scalars; ``method="rff"`` (default) or ``"linear"``
@@ -277,17 +278,17 @@ class ModalitySpec:
     _DISCRETE_LIKE: ClassVar[tuple[str, ...]] = ("discrete",)
 
     def __post_init__(self) -> None:
-        k = (self.embed or "").lower()
-        if k not in self._VALID_EMBEDS:
+        k = (self.type or "").lower()
+        if k not in self._VALID_TYPES:
             raise ValueError(
-                f"unknown embed kind {self.embed!r} for modality {self.name!r}; "
-                f"expected one of {self._VALID_EMBEDS}"
+                f"unknown modality type {self.type!r} for modality {self.field!r}; "
+                f"expected one of {self._VALID_TYPES}"
             )
         if self.method not in (None, "rff", "linear"):
             m = str(self.method).lower()
             if m not in ("rff", "linear"):
                 raise ValueError(
-                    f"unknown method {self.method!r} for modality {self.name!r}; expected 'rff' or 'linear'"
+                    f"unknown method {self.method!r} for modality {self.field!r}; expected 'rff' or 'linear'"
                 )
             object.__setattr__(self, "method", m)
         else:
@@ -295,13 +296,30 @@ class ModalitySpec:
                 object.__setattr__(self, "method", "rff")
             elif isinstance(self.method, str):
                 object.__setattr__(self, "method", self.method.lower())
-        if self.embed != k:
-            object.__setattr__(self, "embed", k)
+        if self.type != k:
+            object.__setattr__(self, "type", k)
         if k == "learnable":
             object.__setattr__(self, "required", False)
 
         # If method is a non-default on a kind that doesn't use it, callers will enforce;
         # here we just ensure the value itself is valid (done above).
+
+
+def _field_names(field: str | Sequence[str] | None) -> tuple[str, ...]:
+    if field is None:
+        return ()
+    if isinstance(field, str):
+        return (field,)
+    return tuple(field)
+
+
+def _expand_modality_spec(spec: ModalitySpec, fallback_field: str) -> list[ModalitySpec]:
+    fields = _field_names(spec.field)
+    if not fields and spec.type == "learnable":
+        return [replace(spec, field=fallback_field)]
+    if not fields:
+        raise ValueError("input-backed modalities must set a field")
+    return [replace(spec, field=field) for field in fields]
 
 
 # ---------------------------------------------------------------------------
@@ -330,7 +348,7 @@ class TypeEmbedder(nn.Module):
 class ScalarRFFEmbedder(nn.Module):
     """Embeds a scalar via Random Fourier Features → flat content vector ``[N, T*D]``.
 
-    Used when ``embed="rff"`` (canonical name for scalar RFF). The embedding
+    Used when ``type="rff"`` (canonical name for scalar RFF). The embedding
     technique is independent of the modality's semantic ``name``.
     """
 
@@ -532,7 +550,7 @@ class DiscreteEmbedder(nn.Module):
     If ``absent_value`` is provided, positions holding that value yield the
     zero vector (they are mapped through embed(0) then zeroed).
 
-    This is the technique for modalities declared with ``embed="discrete"``.
+    This is the technique for modalities declared with ``type="discrete"``.
     The modality ``name`` does not affect how the indices are embedded.
     """
 
@@ -613,13 +631,15 @@ class StepEmbedder(Encoder):
         ``tokens_per_step = sum(Tc)``.
 
     The step representation passed to heads is always the **last** token of each
-    step block.  Place a ``{"name": "scratch", "embed": "learnable", "tokens": 1}``
+    step block.  Place a ``{"type": "learnable", "tokens": 1}``
     modality last in the list to use it as a dedicated prediction token.
 
     Args:
         hidden_dim: Model hidden dimension ``D``.
         modalities: Declarative list of modality specs. Each may include a ``tokens``
-            field to set how many tokens that modality contributes per step.
+            field to set how many tokens that modality contributes per step. A
+            spec's ``field`` may also be a tuple/list of field names; in that case
+            each field is encoded as its own modality with the same settings.
         token_data_len: Default number of tokens per modality when the modality spec
             does not specify its own ``tokens``.
         concat_modalities: When ``True``, modality embeddings are concatenated
@@ -648,49 +668,50 @@ class StepEmbedder(Encoder):
             modalities = []
 
         self.modalities: list[ModalitySpec] = []
-        for c in (modalities or []):
+        for i, c in enumerate(modalities or []):
             if isinstance(c, dict):
-                self.modalities.append(ModalitySpec(**c))
+                spec = ModalitySpec(**c)
             else:
-                self.modalities.append(c)
+                spec = c
+            self.modalities.extend(_expand_modality_spec(spec, fallback_field=f"__learnable_{i}"))
 
         # Validation for sized modalities (learnable modalities need no vocab/dim)
         for cs in self.modalities:
-            k = cs.embed
+            k = cs.type
             if k == "learnable":
                 continue
             if k == "discrete":
                 vs = cs.vocab_size or cs.size or 0
                 if vs <= 0:
-                    raise ValueError(f"modality {cs.name!r} (discrete) requires positive vocab_size")
+                    raise ValueError(f"modality {cs.field!r} (discrete) requires positive vocab_size")
             if k in {"continuous", "image"}:
                 d = cs.dim or cs.size or 0
                 if d <= 0:
-                    raise ValueError(f"modality {cs.name!r} requires positive dim/size")
+                    raise ValueError(f"modality {cs.field!r} requires positive dim/size")
 
         # Applicability checks: error on arguments supplied for the wrong modality kind
         # rather than silently ignoring them.
         for cs in self.modalities:
-            k = cs.embed
+            k = cs.type
             is_discrete = k in ModalitySpec._DISCRETE_LIKE
             is_method_using = k in ModalitySpec._METHOD_USING
 
             if cs.method != "rff" and not is_method_using:
                 raise ValueError(
-                    f"modality {cs.name!r} (embed={k}) does not support method={cs.method!r}; "
+                    f"modality {cs.field!r} (type={k}) does not support method={cs.method!r}; "
                     f"method only applies to continuous (with linear vs rff choice)"
                 )
 
             if cs.absent is not None and not is_discrete:
                 raise ValueError(
-                    f"modality {cs.name!r} (embed={k}) does not support 'absent'; "
+                    f"modality {cs.field!r} (type={k}) does not support 'absent'; "
                     f"'absent' only applies to discrete modalities"
                 )
             # in_min/in_max are only meaningful for RFF-using embedders (rff or continuous with rff)
             uses_rff_ranges = (k == "rff") or (is_method_using and cs.method != "linear")
             if (cs.in_min is not None or cs.in_max is not None) and not uses_rff_ranges:
                 raise ValueError(
-                    f"modality {cs.name!r} (embed={k}) does not use in_min/in_max; "
+                    f"modality {cs.field!r} (type={k}) does not use in_min/in_max; "
                     f"those apply to rff or continuous (when not using linear)"
                 )
 
@@ -709,15 +730,16 @@ class StepEmbedder(Encoder):
         for cs in self.modalities:
             tc = cs.tokens if (cs.tokens is not None) else self.token_data_len
             if tc <= 0:
-                raise ValueError(f"modality {cs.name!r} has non-positive tokens ({tc})")
-            self._modality_tokens[cs.name] = int(tc)
+                raise ValueError(f"modality {cs.field!r} has non-positive tokens ({tc})")
+            assert isinstance(cs.field, str)
+            self._modality_tokens[cs.field] = int(tc)
 
             # Per-modality include_type_token overrides the global default
             col_type = cs.include_type_token
-            self._modality_include_type[cs.name] = bool(col_type) if col_type is not None else self.include_type_token
+            self._modality_include_type[cs.field] = bool(col_type) if col_type is not None else self.include_type_token
 
-            if cs.embed.lower() == "learnable":
-                self._learnable_modalities.add(cs.name)
+            if cs.type.lower() == "learnable":
+                self._learnable_modalities.add(cs.field)
 
         if concat_modalities:
             self._tokens_per_step: int = sum(self._modality_tokens.values())
@@ -732,10 +754,11 @@ class StepEmbedder(Encoder):
         tid = 1
         # Assign token-type ids in the exact order of the modalities list.
         for cs in self.modalities:
-            Tc = self._modality_tokens[cs.name]
+            assert isinstance(cs.field, str)
+            Tc = self._modality_tokens[cs.field]
             emb = self._create_embedder_for_modality(cs, hidden_dim, Tc, std)
-            self.modality_embedders[cs.name] = emb
-            self._modality_token_types[cs.name] = tid
+            self.modality_embedders[cs.field] = emb
+            self._modality_token_types[cs.field] = tid
             tid += 1
 
     # ------------------------------------------------------------------
@@ -767,8 +790,9 @@ class StepEmbedder(Encoder):
         return h.gather(1, idx)
 
     def _create_embedder_for_modality(self, spec: ModalitySpec, hidden_dim: int, T: int, std: float) -> nn.Module:
-        k = spec.embed.lower()
-        nm = spec.name
+        k = spec.type.lower()
+        assert isinstance(spec.field, str)
+        field = spec.field
 
         # Per-modality range (for RFF/continuous/image); falls back to the
         # embedder's global fourier_min/fourier_max defaults.
@@ -781,7 +805,7 @@ class StepEmbedder(Encoder):
         if k == "discrete":
             vs = spec.vocab_size or spec.size or 0
             absv = spec.absent
-            if absv is None and nm == "time":
+            if absv is None and field == "time":
                 absv = -1
             return DiscreteEmbedder(hidden_dim, T, vs, absent_value=absv, embedding_std=mod_std)
 
@@ -801,7 +825,7 @@ class StepEmbedder(Encoder):
         if k == "learnable":
             return LearnableEmbedder(T, hidden_dim, std=mod_std)
 
-        raise ValueError(f"unknown embed kind {spec.embed!r} for modality {nm!r}")
+        raise ValueError(f"unknown modality type {spec.type!r} for modality {field!r}")
 
     @staticmethod
     def infer_max_num_actions(embedding_kwargs: dict | object | None) -> int:
@@ -818,22 +842,22 @@ class StepEmbedder(Encoder):
         mods = getattr(embedding_kwargs, "modalities", None)
         if mods is not None:
             for c in mods:
-                if getattr(c, "name", None) == "action":
+                if "action" in _field_names(getattr(c, "field", "")):
                     return int(getattr(c, "vocab_size", 0) or getattr(c, "size", 0) or 0)
             return 0
         # Otherwise treat as dict
         d = embedding_kwargs or {}
         if isinstance(d, dict) and "modalities" in d:
             for c in d["modalities"]:
-                if isinstance(c, dict) and c.get("name") == "action":
+                if isinstance(c, dict) and "action" in _field_names(c.get("field", "")):
                     return int(c.get("vocab_size") or c.get("size") or 0)
-                if getattr(c, "name", None) == "action":
+                if "action" in _field_names(getattr(c, "field", "")):
                     return int(getattr(c, "vocab_size", 0) or getattr(c, "size", 0) or 0)
         return 0
 
     def _default_value_for(self, spec: ModalitySpec, B: int, S: int, device: torch.device) -> torch.Tensor:
         """Synthesize a default (absent) tensor when a declared modality is missing from the batch."""
-        k = spec.embed.lower()
+        k = spec.type.lower()
         if k == "learnable":
             # Learnable modalities never read data; return a dummy (should not be used).
             return torch.zeros((B, S), device=device)
@@ -891,35 +915,37 @@ class StepEmbedder(Encoder):
         # buffers simultaneously.  This keeps dict-lookup count at B*S        #
         # instead of num_modalities * B * S (separate passes).                #
         # ------------------------------------------------------------------ #
-        non_learnable = [s for s in self.modalities if s.name not in self._learnable_modalities]
+        non_learnable = [s for s in self.modalities if s.field not in self._learnable_modalities]
 
         # Pre-allocate one Python list per modality, length B*S.
-        raw: dict[str, list] = {spec.name: [None] * (B * S) for spec in non_learnable}
+        raw: dict[str, list] = {str(spec.field): [None] * (B * S) for spec in non_learnable}
 
         idx = 0
         for b in range(B):
             for s in range(S):
                 row = batch[b][s]
                 for spec in non_learnable:
-                    raw[spec.name][idx] = row.get(spec.name)
+                    assert isinstance(spec.field, str)
+                    raw[spec.field][idx] = row.get(spec.field)
                 idx += 1
 
         # Convert raw lists to tensors per modality.
         col_values: dict[str, torch.Tensor] = {}
         for spec in non_learnable:
-            values = raw[spec.name]
+            assert isinstance(spec.field, str)
+            values = raw[spec.field]
             all_none = all(v is None for v in values)
 
             if all_none:
                 if spec.required:
                     raise KeyError(
-                        f"Required modality {spec.name!r} is missing from all "
+                        f"Required modality {spec.field!r} is missing from all "
                         f"rows in the batch."
                     )
-                col_values[spec.name] = self._default_value_for(spec, B, S, device)
+                col_values[spec.field] = self._default_value_for(spec, B, S, device)
                 continue
 
-            k = spec.embed.lower()
+            k = spec.type.lower()
 
             if k == "discrete":
                 absent_val = int(spec.absent) if spec.absent is not None else 0
@@ -927,14 +953,14 @@ class StepEmbedder(Encoder):
                     [int(v) if v is not None else absent_val for v in values],
                     dtype=np.int64,
                 )
-                col_values[spec.name] = torch.from_numpy(arr).to(device).reshape(B, S)
+                col_values[spec.field] = torch.from_numpy(arr).to(device).reshape(B, S)
 
             elif k == "rff":
                 arr = np.array(
                     [float(v) if v is not None else 0.0 for v in values],
                     dtype=np.float32,
                 )
-                col_values[spec.name] = torch.from_numpy(arr).to(device).reshape(B, S)
+                col_values[spec.field] = torch.from_numpy(arr).to(device).reshape(B, S)
 
             elif k in ("continuous", "image"):
                 dim = spec.dim or spec.size or 0
@@ -945,7 +971,7 @@ class StepEmbedder(Encoder):
                         a = np.asarray(v, dtype=np_dtype).ravel()
                         d = min(a.size, dim)
                         buf[i, :d] = a[:d]
-                col_values[spec.name] = (
+                col_values[spec.field] = (
                     torch.from_numpy(buf).to(device).reshape(B, S, dim)
                 )
 
@@ -983,19 +1009,20 @@ class StepEmbedder(Encoder):
         total = torch.zeros(B, S, T, D, device=device, dtype=dtype)
 
         for spec in self.modalities:
-            Tc = self._modality_tokens[spec.name]
-            mod = self.modality_embedders[spec.name]
-            if spec.name in self._learnable_modalities:
+            assert isinstance(spec.field, str)
+            Tc = self._modality_tokens[spec.field]
+            mod = self.modality_embedders[spec.field]
+            if spec.field in self._learnable_modalities:
                 # Learnable modalities ignore input data entirely.
                 cmod = mod  # narrowed by membership
                 assert isinstance(cmod, LearnableEmbedder)
                 base = cmod.embed.to(dtype=dtype)  # [Tc, D]
                 contrib = base.view(1, 1, Tc, D).expand(B, S, Tc, D)
             else:
-                flat = mod(col_values[spec.name]).to(dtype=dtype)  # [B*S, Tc*D]
+                flat = mod(col_values[spec.field]).to(dtype=dtype)  # [B*S, Tc*D]
                 contrib = flat.view(B, S, Tc, D)
-            if self._modality_include_type[spec.name]:
-                typ = self.type_embedder(self._modality_token_types[spec.name], (B, S), device).to(dtype=dtype)
+            if self._modality_include_type[spec.field]:
+                typ = self.type_embedder(self._modality_token_types[spec.field], (B, S), device).to(dtype=dtype)
                 contrib = contrib + typ.unsqueeze(2)  # broadcast over Tc
             if Tc < T:
                 pad = torch.zeros(B, S, T - Tc, D, device=device, dtype=dtype)
@@ -1014,19 +1041,20 @@ class StepEmbedder(Encoder):
         parts: list[torch.Tensor] = []
 
         for spec in self.modalities:
-            Tc = self._modality_tokens[spec.name]
-            mod = self.modality_embedders[spec.name]
-            if spec.name in self._learnable_modalities:
+            assert isinstance(spec.field, str)
+            Tc = self._modality_tokens[spec.field]
+            mod = self.modality_embedders[spec.field]
+            if spec.field in self._learnable_modalities:
                 # Learnable modalities ignore any input data.
                 cmod = mod  # narrowed by membership
                 assert isinstance(cmod, LearnableEmbedder)
                 base = cmod.embed.to(dtype=dtype)  # [Tc, D]
                 block = base.view(1, 1, Tc, D).expand(B, S, Tc, D)
             else:
-                flat = mod(col_values[spec.name]).to(dtype=dtype)  # [B*S, Tc*D]
+                flat = mod(col_values[spec.field]).to(dtype=dtype)  # [B*S, Tc*D]
                 block = flat.view(B, S, Tc, D)
-            if self._modality_include_type[spec.name]:
-                typ = self.type_embedder(self._modality_token_types[spec.name], (B, S), device).to(dtype=dtype)
+            if self._modality_include_type[spec.field]:
+                typ = self.type_embedder(self._modality_token_types[spec.field], (B, S), device).to(dtype=dtype)
                 block = block + typ.unsqueeze(2)
             parts.append(block)
 

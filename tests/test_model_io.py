@@ -17,9 +17,9 @@ def test_composed_model_roundtrip(tmp_path) -> None:
     encoder = StepEmbedder(
         hidden_dim=hidden_dim,
         modalities=[
-            {"name": "action", "embed": "discrete", "vocab_size": 4},
-            {"name": "reward", "embed": "rff"},
-            {"name": "done", "embed": "discrete", "vocab_size": 3},
+            {"field": "action", "type": "discrete", "vocab_size": 4},
+            {"field": "reward", "type": "rff"},
+            {"field": "done", "type": "discrete", "vocab_size": 3},
         ],
     )
     backbone = IdentityBackbone(hidden_dim=hidden_dim)
@@ -58,9 +58,9 @@ def test_model_card_includes_usage_and_architecture(tmp_path) -> None:
         encoder=StepEmbedder(
             hidden_dim=8,
             modalities=[
-                {"name": "action", "embed": "discrete", "vocab_size": 4},
-                {"name": "reward", "embed": "rff"},
-                {"name": "done", "embed": "discrete", "vocab_size": 3},
+                {"field": "action", "type": "discrete", "vocab_size": 4},
+                {"field": "reward", "type": "rff"},
+                {"field": "done", "type": "discrete", "vocab_size": 3},
             ],
         ),
         backbone=IdentityBackbone(hidden_dim=8),

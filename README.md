@@ -46,7 +46,7 @@ A compact training skeleton looks like this:
 ```python
 import torch
 from mouse_core.data import DataLoader, Datastore
-from mouse_core.objectives import DqnObjectiveConfig, dqn_objective
+from mouse_core.objectives import DqnObjective
 from mouse_core.models import Model
 from mouse_core.models.backbone import IdentityBackbone
 from mouse_core.models.embedding import StepEmbedder
@@ -62,9 +62,9 @@ hidden_dim = 32
 encoder = StepEmbedder(
     hidden_dim=hidden_dim,
     modalities=[
-        {"name": "action", "embed": "discrete", "vocab_size": 4},
-        {"name": "reward", "embed": "rff"},
-        {"name": "done", "embed": "discrete", "vocab_size": 3},
+        {"field": "action", "type": "discrete", "vocab_size": 4},
+        {"field": "reward", "type": "rff"},
+        {"field": "done", "type": "discrete", "vocab_size": 3},
     ],
 )
 
@@ -82,18 +82,18 @@ model = Model(
 ).train().to(device)
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-cfg = DqnObjectiveConfig(weight=1.0, gamma=0.99, tau=0.005)
+objective = DqnObjective(gamma_step=0.99, tau=0.005)
 
 for step in range(100):
     batch = loader.next_batch().to(device)
-    out, _ = model(batch)
-    loss, metrics = dqn_objective(batch, out, cfg)
+    predictions, objective_data, _ = model(batch)
+    loss, metrics = objective(objective_data, predictions)
 
     optimizer.zero_grad()
     loss.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimizer.step()
-    model.polyak_update(action_value_tau=cfg.tau)
+    model.polyak_update(action_value_tau=objective.tau)
 
 loader.close()
 ```
@@ -102,7 +102,8 @@ The notebook version with synthetic data and a pretrained Llama backbone is in
 [`examples/02_train_offline.ipynb`](examples/02_train_offline.ipynb).
 
 For dataset collection see [`examples/01_collect_dataset.ipynb`](examples/01_collect_dataset.ipynb).
-For cached inference see [`examples/03_inference.ipynb`](examples/03_inference.ipynb).
+For online training see [`examples/03_train_online.ipynb`](examples/03_train_online.ipynb).
+For cached inference see [`examples/04_inference.ipynb`](examples/04_inference.ipynb).
 
 ---
 
@@ -114,9 +115,10 @@ The notebooks are the primary documentation — each one explains the concepts a
 |---|---|
 | [`examples/01_collect_dataset.ipynb`](examples/01_collect_dataset.ipynb) | `Datastore`, collecting transitions, pushing to the Hub |
 | [`examples/02_train_offline.ipynb`](examples/02_train_offline.ipynb) | `DataLoader`, model architecture, DQN training, all objectives |
-| [`examples/03_inference.ipynb`](examples/03_inference.ipynb) | KV-cache inference, loading a trained model |
+| [`examples/03_train_online.ipynb`](examples/03_train_online.ipynb) | Online rollout collection, `Datastore` replay buffers, `DataLoader` sampling |
+| [`examples/04_inference.ipynb`](examples/04_inference.ipynb) | KV-cache inference, loading the current checkpoint from the shared Hub model repo |
 
-API reference lives in the Python docstrings (`load_model`, `Datastore`, `dqn_objective`, etc.). See [`CHANGELOG.md`](CHANGELOG.md) for release history.
+API reference lives in the Python docstrings (`load_model`, `Datastore`, `DqnObjective`, etc.). See [`CHANGELOG.md`](CHANGELOG.md) for release history.
 
 ---
 

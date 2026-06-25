@@ -14,46 +14,35 @@ classifiers = [
     "Intended Audience :: Science/Research",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
-    "torch>=2.12.0",
-    "numpy>=2.4.4",
-    "transformers>=5.8.0",
-    "tensordict>=0.12.1",
-    "datasets>=4.8.5",
-    "huggingface_hub>=0.30.0",
+    "torch>=2.12.1",
+    "numpy>=2.5.0",
+    "transformers>=5.12.1",
+    "tensordict>=0.13.0",
+    "datasets>=5.0.0",
+    "huggingface_hub>=1.20.1",
 ]
 
 [project.urls]
 Homepage = "https://github.com/micahr234/mouse-core"
-Documentation = "https://github.com/micahr234/mouse-core/tree/main/docs"
 Repository = "https://github.com/micahr234/mouse-core"
 Issues = "https://github.com/micahr234/mouse-core/issues"
 
 [project.optional-dependencies]
 examples = [
-    "mouse-env @ git+https://github.com/micahr234/mouse-env.git@main",
-    "gymnasium[atari,toy-text]>=1.2.3",
-    "opencv-python>=4.9",
-    "matplotlib>=3.9",
-    "pygame>=2.6",
-]
-atari = [
-    "gymnasium[atari]>=1.0.0",
-    "ale-py>=0.10.0",
-    "opencv-python>=4.9",
+    "mouse-env[all] @ git+https://github.com/micahr234/mouse-env.git@main",
+    "jupyter>=1.1.1",
+    "ipykernel>=7.3.0",
 ]
 all = [
-    "mouse-core[examples,atari]",
+    "mouse-core[examples]",
 ]
 dev = [
-    "pyright",
-    "pytest",
-    "build>=1.2",
-    "twine>=6.1",
-    "jupyter>=1.1.1",
-    "ipykernel>=6.29.5",
+    "pyright>=1.1.411",
+    "pytest>=9.1.1",
+    "build>=1.5.0",
+    "twine>=6.2.0",
 ]
 
 [tool.pytest.ini_options]
@@ -65,6 +54,7 @@ mouse_core = ["py.typed"]
 
 [tool.uv]
 environments = ["sys_platform == 'linux'"]
+no-build-isolation-package = ["box2d-py"]
 
 [tool.setuptools]
 packages = [

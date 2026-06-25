@@ -187,19 +187,19 @@ pass it back on the next call with `use_cache=True`.
 
 def _model_card_modality_table(modalities: list[dict[str, Any]]) -> str:
     rows = [
-        "| Field | Embed | Required | Tensor shape | Dtype | Notes |",
+        "| Field | Type | Required | Tensor shape | Dtype | Notes |",
         "|---|---|---:|---|---|---|",
     ]
     for modality in modalities:
-        name = str(modality["name"])
-        embed = str(modality["embed"])
+        field = str(modality.get("field", ""))
+        modality_type = str(modality["type"])
         required = bool(modality.get("required", True))
         allow_none = bool(modality.get("allow_none", False))
         rows.append(
             "| "
             + " | ".join([
-                f"`{name}`",
-                f"`{embed}`",
+                f"`{field}`" if field else "-",
+                f"`{modality_type}`",
                 "yes" if required else "no",
                 f"`{_model_card_modality_shape(modality)}`",
                 f"`{_model_card_modality_dtype(modality)}`",
@@ -211,40 +211,40 @@ def _model_card_modality_table(modalities: list[dict[str, Any]]) -> str:
 
 
 def _model_card_modality_shape(modality: dict[str, Any]) -> str:
-    embed = modality["embed"]
-    if embed in ("continuous", "image"):
+    modality_type = modality["type"]
+    if modality_type in ("continuous", "image"):
         dim = modality.get("dim") or modality.get("size") or "D"
         return f"[B, S, {dim}]"
-    if embed == "learnable":
+    if modality_type == "learnable":
         return "not read from step_stream"
     return "[B, S]"
 
 
 def _model_card_modality_dtype(modality: dict[str, Any]) -> str:
-    embed = modality["embed"]
-    if embed == "discrete":
+    modality_type = modality["type"]
+    if modality_type == "discrete":
         return "torch.long"
-    if embed == "image":
+    if modality_type == "image":
         return "torch.long or torch.float32"
-    if embed == "learnable":
+    if modality_type == "learnable":
         return "n/a"
     return "torch.float32"
 
 
 def _model_card_modality_notes(modality: dict[str, Any], *, allow_none: bool) -> str:
-    embed = modality["embed"]
+    modality_type = modality["type"]
     parts: list[str] = []
-    if embed == "discrete":
+    if modality_type == "discrete":
         vocab_size = modality.get("vocab_size") or modality.get("size")
         if vocab_size is not None:
             parts.append(f"integer ids in `[0, {int(vocab_size) - 1}]`")
-    elif embed == "rff":
+    elif modality_type == "rff":
         parts.append("scalar value")
-    elif embed == "continuous":
+    elif modality_type == "continuous":
         parts.append("vector values")
-    elif embed == "image":
+    elif modality_type == "image":
         parts.append("pixel or patch values")
-    elif embed == "learnable":
+    elif modality_type == "learnable":
         parts.append("learned tokens; no input field")
     if allow_none:
         parts.append("`None` uses default value")
@@ -255,7 +255,7 @@ def _model_card_step_stream_example(modalities: list[dict[str, Any]]) -> str:
     fields = [
         _model_card_field_example(modality)
         for modality in modalities
-        if modality["embed"] != "learnable"
+        if modality["type"] != "learnable"
     ]
     body = "\n".join(f"    {field}" for field in fields)
     if not body:
@@ -270,20 +270,20 @@ predictions, objective_data, cache = model(batch)"""
 
 
 def _model_card_field_example(modality: dict[str, Any]) -> str:
-    name = modality["name"]
-    embed = modality["embed"]
+    field = modality["field"]
+    modality_type = modality["type"]
     optional = "" if modality.get("required", True) else "  # optional"
-    if embed == "discrete":
-        return f'"{name}": 0,{optional}'
-    if embed == "rff":
-        return f'"{name}": 0.0,{optional}'
-    if embed == "continuous":
+    if modality_type == "discrete":
+        return f'"{field}": 0,{optional}'
+    if modality_type == "rff":
+        return f'"{field}": 0.0,{optional}'
+    if modality_type == "continuous":
         dim = int(modality.get("dim") or modality.get("size") or 1)
-        return f'"{name}": [0.0] * {dim},{optional}'
-    if embed == "image":
+        return f'"{field}": [0.0] * {dim},{optional}'
+    if modality_type == "image":
         dim = int(modality.get("dim") or modality.get("size") or 1)
-        return f'"{name}": [0] * {dim},{optional}'
-    return f'"{name}": 0,{optional}'
+        return f'"{field}": [0] * {dim},{optional}'
+    return f'"{field}": 0,{optional}'
 
 
 def _model_config(model: "Model") -> dict[str, Any]:
@@ -308,7 +308,7 @@ def _encoder_config(encoder: Encoder) -> dict[str, Any]:
         "type": "step",
         "kwargs": {
             "hidden_dim": int(encoder.hidden_dim),
-            "modalities": [_drop_none(asdict(modality)) for modality in encoder.modalities],
+            "modalities": [_public_modality_config(modality) for modality in encoder.modalities],
             "token_data_len": int(encoder.token_data_len),
             "concat_modalities": bool(encoder.concat_modalities),
             "include_type_token": bool(encoder.include_type_token),
@@ -317,6 +317,13 @@ def _encoder_config(encoder: Encoder) -> dict[str, Any]:
             "std": float(getattr(encoder, "std", 0.02)),
         },
     }
+
+
+def _public_modality_config(modality: Any) -> dict[str, Any]:
+    data = _drop_none(asdict(modality))
+    if data.get("type") == "learnable" and str(data.get("field", "")).startswith("__learnable_"):
+        data.pop("field", None)
+    return data
 
 
 def _backbone_config(backbone: nn.Module) -> dict[str, Any]:
@@ -782,14 +789,16 @@ class Model(nn.Module):
             * ``predictions`` is a ``TensorDict[B, S]`` with one entry per enabled head.
             * ``objective_data`` is a ``TensorDict[B, S]`` of the modality tensors
               extracted by the encoder — the same values used for embedding.
-              Pass this to objectives (e.g. ``dqn_objective(objective_data, predictions, cfg)``).
+              Pass this to objectives (e.g. ``objective(objective_data, predictions)``).
             * ``cache`` is the updated KV cache, or ``None`` when ``use_cache=False``.
         """
         B = len(batch)
         S = len(batch[0]) if B > 0 else 0
 
         embeds, col_values, step_token_indices = self.encoder(batch)
-        objective_data = TensorDict(col_values, batch_size=(B, S)).to(embeds.device)
+        if any(value.device != embeds.device for value in col_values.values()):
+            col_values = {key: value.to(embeds.device) for key, value in col_values.items()}
+        objective_data = TensorDict(col_values, batch_size=(B, S))
 
         h, new_cache = self.backbone(
             embeds=embeds,
