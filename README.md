@@ -6,6 +6,14 @@
 
 **mouse-core** is the core library for [MOUSE](https://github.com/micahr234/mouse-core), a modular PyTorch stack for in-context reinforcement learning. It provides embeddings, transformer backbones, output heads, objectives, and data utilities for training and deploying agents that adapt from transition history at inference time, without weight updates.
 
+<p align="center">
+  <video src="frozenlake.mp4" width="256" controls autoplay></video>
+</p>
+<p align="center">
+  <em>An agent navigating Procedural FrozenLake with no map access and no gradient updates at test time — pure in-context RL.<br>
+  Train one yourself using the <a href="examples/">example notebooks</a>.</em>
+</p>
+
 For vector environments and rollout collection, see **[mouse-env](https://github.com/micahr234/mouse-env)**.
 
 ---
