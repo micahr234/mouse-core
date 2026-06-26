@@ -1,6 +1,6 @@
 """Training-time augmentation for raw sequence batches.
 
-``SequenceAugmenter`` runs between ``DataLoader.next_batch()`` and
+``Augmenter`` runs between ``DataLoader.next_batch()`` and
 ``model(batch)``. It operates on raw ``list[list[dict]]`` batches and samples
 augmentation parameters independently for each sequence in the batch.
 """
@@ -172,7 +172,7 @@ class SequenceAugmentModalitySpec:
         )
 
 
-class SequenceAugmenter:
+class Augmenter:
     """Callable augmenter for raw ``[batch][sequence]`` step batches."""
 
     def __init__(
@@ -182,33 +182,46 @@ class SequenceAugmenter:
         enabled: bool = True,
         seed: int | None = None,
         generator: np.random.Generator | None = None,
+        keep_fields: Sequence[str] | None = None,
     ) -> None:
         if seed is not None and generator is not None:
             raise ValueError("Pass either seed or generator, not both.")
         self.enabled = enabled
         self.modalities = tuple(_coerce_modality(spec) for spec in modalities)
         self._rng = generator if generator is not None else np.random.default_rng(seed)
+        self.keep_fields: tuple[str, ...] | None = tuple(keep_fields) if keep_fields is not None else None
 
     def __call__(self, batch: list[list[dict]]) -> list[list[dict]]:
         """Return an augmented batch without mutating the sampled input batch."""
 
-        if not self.enabled or not any(spec.is_active() for spec in self.modalities):
+        augment = self.enabled and any(spec.is_active() for spec in self.modalities)
+        keep = self.keep_fields is not None
+
+        if not augment and not keep:
             return batch
-        return [self._augment_sequence(sequence) for sequence in batch]
+
+        result = [self._augment_sequence(sequence) if augment else [dict(row) for row in sequence] for sequence in batch]
+
+        if keep:
+            keep_set = set(self.keep_fields)  # type: ignore[arg-type]
+            result = [[{k: v for k, v in row.items() if k in keep_set} for row in seq] for seq in result]
+
+        return result
 
     def fork(
         self,
         *,
         seed: int | None = None,
         generator: np.random.Generator | None = None,
-    ) -> SequenceAugmenter:
+    ) -> Augmenter:
         """Create an equivalent augmenter with independent RNG state."""
 
-        return SequenceAugmenter(
+        return Augmenter(
             self.modalities,
             enabled=self.enabled,
             seed=seed,
             generator=generator,
+            keep_fields=self.keep_fields,
         )
 
     def _augment_sequence(self, sequence: list[dict]) -> list[dict]:

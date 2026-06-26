@@ -7,13 +7,13 @@ import pytest
 
 from mouse_core.data import (
     SequenceAugmentModalitySpec,
-    SequenceAugmenter,
+    Augmenter,
 )
 
 
 def test_disabled_augmenter_returns_input_batch() -> None:
     batch = [[{"action": 1, "reward": 2.0}]]
-    augment = SequenceAugmenter(
+    augment = Augmenter(
         [
             {
                 "field": "reward",
@@ -33,7 +33,7 @@ def test_disabled_augmenter_returns_input_batch() -> None:
 def test_linear_scale_endpoints_copy_without_mutating_input() -> None:
     batch = [[{"reward": 2.0, "obs_continuous": [1.0, 2.0]}]]
     original = copy.deepcopy(batch)
-    augment = SequenceAugmenter(
+    augment = Augmenter(
         [
             {
                 "field": "reward",
@@ -76,7 +76,7 @@ def test_mask_probabilities_apply_to_configured_fields() -> None:
             }
         ]
     ]
-    augment = SequenceAugmenter(
+    augment = Augmenter(
         [
             {"field": "action", "type": "discrete", "mask_prob": 1.0},
             {"field": "reward", "type": "linear", "mask_prob": 1.0},
@@ -99,7 +99,7 @@ def test_shared_action_permutation_also_permutates_action_value_targets() -> Non
     expected_inverse = np.empty_like(expected_perm)
     expected_inverse[expected_perm] = np.arange(len(expected_perm))
 
-    augment = SequenceAugmenter(
+    augment = Augmenter(
         [
             {
                 "field": ("action", "prev_action", "info_q_star"),
@@ -120,7 +120,7 @@ def test_shared_action_permutation_also_permutates_action_value_targets() -> Non
 
 def test_multi_field_mask_uses_one_decision_per_step() -> None:
     batch = [[{"action": 3, "done": 4}]]
-    augment = SequenceAugmenter(
+    augment = Augmenter(
         [{"field": ("action", "done"), "type": "discrete", "mask_prob": 0.5}],
         seed=0,
     )
@@ -135,7 +135,7 @@ def test_permutation_is_sampled_independently_per_sequence() -> None:
     first_perm = rng.permutation(10)
     second_perm = rng.permutation(10)
 
-    augment = SequenceAugmenter(
+    augment = Augmenter(
         [{"field": "action", "type": "discrete", "vocab_size": 10, "permute": True}],
         seed=0,
     )
@@ -152,7 +152,7 @@ def test_discrete_and_done_permutations_use_configured_vocab_sizes() -> None:
     done_perm = rng.permutation(5)
     obs_perm = rng.permutation(4)
 
-    augment = SequenceAugmenter(
+    augment = Augmenter(
         [
             {"field": "done", "type": "discrete", "vocab_size": 5, "permute": True},
             {"field": "observation", "type": "discrete", "vocab_size": 4, "permute": True},
@@ -168,7 +168,7 @@ def test_discrete_and_done_permutations_use_configured_vocab_sizes() -> None:
 
 def test_image_scale_shift_clamps_to_pixel_range() -> None:
     batch = [[{"obs_image": [-10, 10, 300]}]]
-    augment = SequenceAugmenter(
+    augment = Augmenter(
         [
             {
                 "field": "obs_image",
@@ -207,3 +207,36 @@ def test_linear_scale_input_endpoints_must_differ() -> None:
             scale_in_high=1.0,
             scale_out_high=2.0,
         )
+
+
+def test_keep_fields_removes_unlisted_keys() -> None:
+    batch = [[{"obs": 0, "action": 1, "reward": 2.0, "done": False}]]
+    augment = Augmenter([], keep_fields=["obs", "action"])
+    result = augment(batch)
+    assert result == [[{"obs": 0, "action": 1}]]
+
+
+def test_keep_fields_does_not_mutate_original() -> None:
+    step = {"obs": 0, "action": 1, "reward": 2.0}
+    batch = [[step]]
+    augment = Augmenter([], keep_fields=["obs"])
+    augment(batch)
+    assert "reward" in step
+
+
+def test_keep_fields_with_augmentation() -> None:
+    batch = [[{"obs": 0, "action": 1, "reward": 1.0}]]
+    augment = Augmenter(
+        [{"field": "reward", "type": "linear",
+          "scale_in_low": 0.0, "scale_out_low": 0.0,
+          "scale_in_high": 1.0, "scale_out_high": 2.0}],
+        keep_fields=["obs", "action"],
+    )
+    result = augment(batch)
+    assert list(result[0][0].keys()) == ["obs", "action"]
+
+
+def test_keep_fields_propagated_by_fork() -> None:
+    augment = Augmenter([], keep_fields=["obs"])
+    forked = augment.fork(seed=0)
+    assert forked.keep_fields == ("obs",)

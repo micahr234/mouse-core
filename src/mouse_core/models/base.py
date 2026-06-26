@@ -96,7 +96,10 @@ def push_model_to_hub(
     )
     hub_repo_id = repo_url.repo_id
     if clear:
-        existing = list(api.list_repo_files(hub_repo_id))
+        # huggingface_hub never deletes .gitattributes, so exclude it from the
+        # list to avoid a spurious "no files modified" warning when it is the
+        # only file present (e.g. a freshly created repo).
+        existing = [f for f in api.list_repo_files(hub_repo_id) if f != ".gitattributes"]
         if existing:
             api.delete_files(
                 repo_id=hub_repo_id,
@@ -409,7 +412,7 @@ def _drop_none(data: dict[str, Any]) -> dict[str, Any]:
 
 def load_model(
     repo_id_or_path: str,
-    force_download: bool = False,
+    force_download: bool = True,
     local_dir: str | Path | None = None,
     **kwargs: Any,
 ) -> "Model":
@@ -419,7 +422,7 @@ def load_model(
         repo_id_or_path: A local path to a checkpoint directory or a HF Hub
             repo id (e.g. ``"my-model"`` or ``"your-org/your-model"``).
             Unscoped Hub names are resolved under the authenticated user.
-        force_download: If ``True``, bypass the HF Hub cache and re-download.
+        force_download: If ``True`` (default), bypass the HF Hub cache and re-download.
             Ignored for local paths.
         local_dir: Directory where Hub files are saved after download.  When
             set, ``hf_hub_download`` writes files there and

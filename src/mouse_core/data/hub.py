@@ -276,11 +276,13 @@ def _snapshot_store_repo(
     split: str,
     revision: str | None,
     token: str | bool | None,
+    force_download: bool = False,
 ) -> Path:
     kwargs: dict[str, Any] = {
         "repo_id": repo_id,
         "repo_type": "dataset",
         "allow_patterns": _snapshot_allow_patterns(store_names, split=split),
+        "force_download": force_download,
     }
     if revision is not None:
         kwargs["revision"] = revision
@@ -405,6 +407,7 @@ def load_stores_from_hub(
     store_names: list[str] | None = None,
     *,
     split: str = "train",
+    force_download: bool = False,
     token: str | bool | None = None,
     **kwargs: Any,
 ) -> list[Datastore]:
@@ -441,6 +444,7 @@ def load_stores_from_hub(
         split=split,
         revision=revision,
         token=token,
+        force_download=force_download,
     )
     store_names, data_files = _local_parquet_data_files(
         snapshot_dir,

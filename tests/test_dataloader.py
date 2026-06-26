@@ -6,7 +6,7 @@ import threading
 
 from datasets import Dataset
 
-from mouse_core.data import DataLoader, Datastore, SequenceAugmenter
+from mouse_core.data import DataLoader, Datastore, Augmenter
 
 
 def _store_with_actions() -> Datastore:
@@ -16,8 +16,8 @@ def _store_with_actions() -> Datastore:
     return store
 
 
-def test_dataloader_applies_sequence_augmenter_before_returning_batch() -> None:
-    augmenter = SequenceAugmenter(
+def test_dataloader_applies_augmenter_before_returning_batch() -> None:
+    augmenter = Augmenter(
         modalities=[
             {
                 "field": "action",

@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `StepEmbedder` accepts a new `type_embedding_std` parameter to control the initialisation std of the type embedding table independently from the content embedding `std`. **Required when `include_type_token=True`**; raises `ValueError` if omitted to prevent accidental type-to-content signal imbalance.
 
 ### Changed
+- `SequenceAugmenter` renamed to `Augmenter` in `mouse_core.data`.
+- `load_model` now defaults to `force_download=True`, always pulling the latest checkpoint from the Hub instead of serving a cached copy.
 - `DqnObjective`: replaced `use_episodic_reward` with an explicit `reward_key: str = "reward"` parameter; added `done_key: str = "done"` parameter (parallel to `action_key`).
 - `DqnObjective`: removed `normalize_reward_mean`, `normalize_reward_std`, `normalize_reward_eps`, `normalize_reward_std_target`, `reward_scale`, and `reward_shift`.
 - `DqnObjective`: discount is now computed via a vectorized gamma lookup (`gammas[done_next]`) instead of four boolean masks; the reset-frame bootstrap workaround is removed.
@@ -36,7 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `push_stores_to_hub` now batches named store configs into a single Hub commit.
 - `mouse_core.__version__` now exposes the installed `mouse-core` package version from package metadata.
 - Added `examples/03_train_online.ipynb`, showing live environment training with epsilon-greedy action selection, `Datastore` replay buffers, `DataLoader` sampling over appended experience, DQN updates, and task-boundary policy-context resets.
-- `SequenceAugmenter` now provides the public training-time augmentation path for raw `DataLoader` batches, configured by modality specs that use `field` plus an augmentation `type`. A modality `field` may name multiple fields to share the same sampled permutation and per-step mask decision, linear numeric fields use `scale_in_low`, `scale_out_low`, `scale_in_high`, and `scale_out_high` endpoint pairs to derive the reward/value affine transform, and `DataLoader(..., augmenter=augment)` runs augmentation inside the sampling path so worker threads can prepare augmented batches.
+- `Augmenter` now provides the public training-time augmentation path for raw `DataLoader` batches, configured by modality specs that use `field` plus an augmentation `type`. A modality `field` may name multiple fields to share the same sampled permutation and per-step mask decision, linear numeric fields use `scale_in_low`, `scale_out_low`, `scale_in_high`, and `scale_out_high` endpoint pairs to derive the reward/value affine transform, and `DataLoader(..., augmenter=augment)` runs augmentation inside the sampling path so worker threads can prepare augmented batches.
 - `StepEmbedder` modality specs may now use a tuple/list `field` to encode multiple raw fields with the same modality settings. Learnable scratch modalities no longer need a fake data field; use `{"type": "learnable", "tokens": N}`.
 - Notebook 01 now collects expert demonstrations using `q_star_source={"provider": "env_q_star"}` and a curriculum policy (`oracle_prob` 0 → 0.5 → 1.0 across three collection phases).
 - `Encoder.forward` now returns a third value `step_token_indices [B, S]` — the absolute flat-sequence position of the prediction token for each step. `Encoder.pool_step_reprs` now takes this tensor instead of `batch_size`, enabling future variable-token-count modalities without any change to the pooling logic.
@@ -46,7 +48,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `DqnObjective` now uses `gamma_step` for running transitions instead of `gamma`; the example DQN configs bootstrap through all done codes by setting episode and task boundary discounts to `0.99`.
 - FrozenLake examples now use deterministic 50-step episodes inside one infinite task (`episodes_per_task=0`, `is_slippery=False`, `max_episode_steps=50`) across collection, online training, and inference.
 - Example notebooks now flow from dataset collection, to offline training, to online training, to inference. Offline and online training both push to the shared `mouse-example-model` Hub repo, and `examples/04_inference.ipynb` loads whichever checkpoint is currently published there.
-- Modality specs now use the public key `type` instead of `embed` in both `StepEmbedder` and `SequenceAugmenter` configs.
+- Modality specs now use the public key `type` instead of `embed` in both `StepEmbedder` and `Augmenter` configs.
 - Expert Q-values from `mouse_envs` are now read from the environment-produced key `info_q_star`, following the `mouse-env` output contract that forwards `info["q_star"]` as `info_q_star`. `SpObjective`, `SvObjective`, and the collection notebook (`01_collect_dataset`) now use that single field.
 - Example notebooks migrated from `FrozenLake-v1` to `Procedural-FrozenLake-v1` with a step penalty (`step_penalty=-0.04`) so the expert Q-table properly distinguishes shorter from longer paths.
 - Example notebook 02 trains with `DqnObjective` using separate step, episode-boundary, and task-boundary discount factors. q_star labels from the curriculum are used to guide data collection but not as a direct training signal.

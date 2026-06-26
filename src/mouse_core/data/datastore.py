@@ -77,9 +77,20 @@ class Datastore:
         return self._src_len + self._buf_len
 
     def __repr__(self) -> str:
+        cols = self.columns
+        col_str = f", columns={cols}" if cols else ""
         if self.name is not None:
-            return f"Datastore(name={self.name!r}, steps={len(self)})"
-        return f"Datastore(steps={len(self)})"
+            return f"Datastore(name={self.name!r}, steps={len(self)}{col_str})"
+        return f"Datastore(steps={len(self)}{col_str})"
+
+    @property
+    def columns(self) -> list[str]:
+        """Return the column names present in this store, or an empty list if the store is empty."""
+        if self._source is not None:
+            return list(self._source.column_names)
+        if self._rows:
+            return list(self._rows[0].keys())
+        return []
 
     def __getitem__(self, indices: Any) -> list[dict]:
         """Return raw step records for the given indices as a list of dicts.
