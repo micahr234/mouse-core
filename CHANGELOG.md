@@ -22,6 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `load_stores_from_hub` now snapshots matching dataset parquet shards once and loads local exact file paths in one `datasets.load_dataset("parquet", data_files=...)` call, avoiding one Hub tree/glob request per store.
 - `examples/04_inference.ipynb` now separates evaluation env count from replay output count, allowing 100-env evaluation while only embedding the first 10 replay videos.
 - FrozenLake training examples now use the full pretrained `Qwen/Qwen3-0.6B` backbone instead of truncating `Qwen3Backbone` with `num_layers=2`.
+- `examples/03_train_online.ipynb` now uses the tuned offline baseline's training horizon, context length, batch size, learnable-token scale, and action-value head scale while keeping data collection online.
+- The README quick start now shows online training against a live `mouse-env` environment instead of an offline-style prefilled datastore.
 
 ### Fixed
 - `DataLoader` now snapshots both loaded source rows and newly appended rows from each `Datastore`, so replay built from Hub data plus live rollout does not silently ignore recent experience.

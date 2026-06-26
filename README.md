@@ -55,10 +55,12 @@ Backbone loading has one public path: instantiate the backbone. For example, `Ll
 
 ## Quick Start
 
-A compact training skeleton looks like this:
+A compact online training skeleton looks like this:
 
 ```python
 import torch
+from mouse_envs import EnvConfig, make_env
+
 from mouse_core.data import DataLoader, Datastore
 from mouse_core.objectives import DqnObjective
 from mouse_core.models import Model
@@ -68,22 +70,34 @@ from mouse_core.models.heads import DiscreteActionValueHead
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-store = Datastore()
-for t in range(32):
-    store.append({
-        "action": t % 4,
-        "reward": 0.0,
-        "done": 0,
-    })
-loader = DataLoader(store, sequence_length=16, batch_size=8, num_workers=0)
+env = make_env([
+    EnvConfig(
+        id="Procedural-FrozenLake-v1",
+        name="quickstart_frozenlake",
+        reset_seed=0,
+        episodes_per_task=0,
+        kwargs={
+            "is_slippery": False,
+            "min_width": 4,
+            "max_width": 4,
+            "min_height": 4,
+            "max_height": 4,
+            "step_penalty": -0.01,
+            "max_episode_steps": 50,
+            "map_seed": 0,
+        },
+    )
+])
 
 hidden_dim = 32
 encoder = StepEmbedder(
     hidden_dim=hidden_dim,
     modalities=[
         {"field": "action", "type": "discrete", "vocab_size": 4},
-        {"field": "reward", "type": "rff"},
+        {"field": "observation", "type": "discrete", "vocab_size": 64},
+        {"field": "reward", "type": "rff", "in_min": 0.01, "in_max": 100.0},
         {"field": "done", "type": "discrete", "vocab_size": 5},
+        {"type": "learnable", "std": 0.02, "tokens": 1},
     ],
     include_type_token=False,
 )
@@ -104,8 +118,37 @@ model = Model(
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 objective = DqnObjective(gamma_step=0.99, tau=0.005)
 
+stores = [Datastore(name=name) for name in env.names]
+contexts = [[] for _ in env.names]
+sequence_length = 16
+
 for step in range(100):
+    epsilon = max(0.05, 1.0 - step / 100)
+    random_inputs = env.sample_random_inputs()
+    inputs = []
+
+    for i, context in enumerate(contexts):
+        if not context or torch.rand(()) < epsilon:
+            inputs.append(random_inputs[i])
+        else:
+            with torch.no_grad():
+                predictions, _, _ = model([context[-sequence_length:]])
+                action = model.get_action(predictions, temperature=0.0, num_actions=4)
+            inputs.append({"action": action.squeeze().cpu()})
+
+    outputs = env.step(inputs)
+    for store, context, inp, out in zip(stores, contexts, inputs, outputs):
+        row = {**inp, **out}
+        store.append(row)
+        context.append(row)
+
+    if min(len(store) for store in stores) < sequence_length:
+        continue
+
+    loader = DataLoader(stores, sequence_length=sequence_length, batch_size=1, num_workers=0)
     batch = loader.next_batch()
+    loader.close()
+
     predictions, objective_data, _ = model(batch)
     loss, metrics = objective(objective_data, predictions)
 
@@ -115,14 +158,14 @@ for step in range(100):
     optimizer.step()
     model.polyak_update(action_value_tau=objective.tau)
 
-loader.close()
+env.close()
 ```
 
-The notebook version with synthetic data and a pretrained Llama backbone is in
-[`examples/02_train_offline.ipynb`](examples/02_train_offline.ipynb).
+The tuned online version with live environment collection and a pretrained Qwen backbone is in
+[`examples/03_train_online.ipynb`](examples/03_train_online.ipynb).
 
 For dataset collection see [`examples/01_collect_dataset.ipynb`](examples/01_collect_dataset.ipynb).
-For online training see [`examples/03_train_online.ipynb`](examples/03_train_online.ipynb).
+For offline replay training see [`examples/02_train_offline.ipynb`](examples/02_train_offline.ipynb).
 For cached inference see [`examples/04_inference.ipynb`](examples/04_inference.ipynb).
 
 ---
@@ -134,8 +177,8 @@ The notebooks are the primary documentation — each one explains the concepts a
 | Notebook | What it covers |
 |---|---|
 | [`examples/01_collect_dataset.ipynb`](examples/01_collect_dataset.ipynb) | `Datastore`, collecting transitions, pushing to the Hub |
-| [`examples/02_train_offline.ipynb`](examples/02_train_offline.ipynb) | `DataLoader`, model architecture, DQN training, all objectives |
-| [`examples/03_train_online.ipynb`](examples/03_train_online.ipynb) | Online rollout collection, `Datastore` replay buffers, `DataLoader` sampling |
+| [`examples/03_train_online.ipynb`](examples/03_train_online.ipynb) | Online rollout collection, in-memory replay, DQN training |
+| [`examples/02_train_offline.ipynb`](examples/02_train_offline.ipynb) | Offline replay baseline, model architecture, all objectives |
 | [`examples/04_inference.ipynb`](examples/04_inference.ipynb) | KV-cache inference, loading the current checkpoint from the shared Hub model repo |
 
 API reference lives in the Python docstrings (`load_model`, `Datastore`, `DqnObjective`, etc.). See [`CHANGELOG.md`](CHANGELOG.md) for release history.
