@@ -116,7 +116,7 @@ def test_load_stores_from_hub_loads_requested_stores_in_one_call(
         calls.append((path, kwargs))
         return _loaded_store_datasets()
 
-    def fake_snapshot(repo_id: str, *, store_names: list[str] | None, split: str, revision: str | None, token: str | bool | None):
+    def fake_snapshot(repo_id: str, *, store_names: list[str] | None, split: str, revision: str | None, token: str | bool | None, force_download: bool = False):
         snapshot_calls.append((repo_id, store_names, split, revision, token))
         return snapshot_dir
 
@@ -149,7 +149,7 @@ def test_load_stores_from_hub_discovers_store_names(
         calls.append((path, kwargs))
         return _loaded_store_datasets()
 
-    def fake_snapshot(repo_id: str, *, store_names: list[str] | None, split: str, revision: str | None, token: str | bool | None):
+    def fake_snapshot(repo_id: str, *, store_names: list[str] | None, split: str, revision: str | None, token: str | bool | None, force_download: bool = False):
         snapshot_calls.append((repo_id, store_names, split, revision, token))
         return snapshot_dir
 
@@ -188,7 +188,7 @@ def test_load_stores_from_hub_scopes_short_names(
             }])
         }
 
-    def fake_snapshot(repo_id: str, *, store_names: list[str] | None, split: str, revision: str | None, token: str | bool | None):
+    def fake_snapshot(repo_id: str, *, store_names: list[str] | None, split: str, revision: str | None, token: str | bool | None, force_download: bool = False):
         snapshot_calls.append((repo_id, store_names, split, revision, token))
         return snapshot_dir
 
@@ -216,7 +216,7 @@ def test_load_stores_from_hub_requires_discovered_store_names(monkeypatch: pytes
     monkeypatch.setattr(
         hub,
         "_snapshot_store_repo",
-        lambda repo_id, *, store_names, split, revision, token: Path("/tmp/no-store-snapshot"),
+        lambda repo_id, *, store_names, split, revision, token, force_download=False: Path("/tmp/no-store-snapshot"),
     )
 
     with pytest.raises(ValueError, match="No parquet store configs found"):

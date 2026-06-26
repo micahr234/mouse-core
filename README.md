@@ -4,17 +4,23 @@
 
 > **Warning:** MOUSE is in early development and is not yet ready for production use. APIs may change without notice.
 
-**mouse-core** is the core library for [MOUSE](https://github.com/micahr234/mouse-core), a modular PyTorch stack for in-context reinforcement learning. It provides embeddings, transformer backbones, output heads, objectives, and data utilities for training and deploying agents that adapt from transition history at inference time, without weight updates.
+**mouse-core** is the core library for the Meta-Optimization Using Sequential Experience (MOUSE) learning system, a modular PyTorch stack for in-context reinforcement learning (ICRL). It provides data utilities, embeddings frameworks, transformer backbones, output heads, and objective functions for training and deploying agents that adapt from transition history at inference time, without weight updates.
 
-<p align="center">
-  <img src="frozenlake.gif" width="256" alt="MOUSE agent on Procedural FrozenLake"/>
-</p>
-<p align="center">
-  <em>An agent navigating Procedural FrozenLake with no map access and no gradient updates at test time — pure in-context RL.<br>
-  Train one yourself using the <a href="examples/">example notebooks</a>.</em>
-</p>
+**[mouse-env](https://github.com/micahr234/mouse-env)** sits alongside mouse-core and handles the environment side: it wraps any Gymnasium env into a reset-free continuing interface, stitching episodes together into uninterrupted trajectories with explicit task boundaries. **mouse-core** is what you use to learn from those trajectories — data utilities, models, and objectives for training and deploying in-context RL agents.
 
-**[mouse-env](https://github.com/micahr234/mouse-env)** sits alongside mouse-core and handles the environment side: it wraps any Gymnasium env into a reset-free continuing interface, stitching episodes together into uninterrupted trajectories with explicit task boundaries. **mouse-core** is what you use to learn from those trajectories — models, objectives, and data utilities for training and deploying in-context RL agents.
+---
+
+## Why MOUSE exists
+
+MOUSE is built around two observations:
+
+1. General learning systems that scale tend to outperform hand-crafted solutions in the long run. This idea is captured in Rich Sutton's essay [The Bitter Lesson](https://web.archive.org/web/20260409023855/https://www.incompleteideas.net/IncIdeas/BitterLesson.html). MOUSE takes that lesson seriously: it meta-learns during training how to solve tasks, so that at deployment time it can adapt to new situations from experience.
+
+2. Learning must not stop at deployment time. The [Big World Hypothesis](http://incompleteideas.net/papers/The_Big_World_Hypothesis.pdf) says that real environments are too vast to model completely ahead of time, so agents cannot be given all the information they will need before they act. MOUSE adapts by conditioning on prior history rather than updating its weights. Because the weights remain fixed at deployment, this avoids plasticity loss, a common continual-learning failure mode where repeated updates gradually reduce an agent's ability to learn.
+
+In the video below, an agent plays FrozenLake on a map it has never seen before, with the map hidden from the agent. Without gradient updates, using only in-context learning, it tries different paths until it finds one that leads directly to the goal. You can train one yourself using the [example notebooks](examples/).
+
+<p align="center"><img src="frozenlake.gif" width="400" alt="MOUSE agent on Procedural FrozenLake"/></p>
 
 ---
 
