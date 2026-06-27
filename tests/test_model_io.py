@@ -71,11 +71,12 @@ def test_composed_model_roundtrip(tmp_path) -> None:
     assert config["backbone"]["type"] == "identity"
     enc_kwargs = config["encoder"]["kwargs"]
     for required_key in (
-        "hidden_dim", "modalities", "token_data_len", "concat_modalities",
+        "hidden_dim", "modalities", "token_data_len", "modality_fusion",
         "include_type_token", "fourier_min", "fourier_max", "std",
         "type_embedding_std",
     ):
         assert required_key in enc_kwargs, f"encoder config missing key {required_key!r}"
+    assert enc_kwargs["modality_fusion"] == "sum"
 
 
 def test_composed_model_roundtrip_with_type_token(tmp_path) -> None:

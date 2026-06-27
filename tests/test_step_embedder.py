@@ -120,6 +120,49 @@ def test_step_embedder_batch_shape() -> None:
     assert col_values["reward"].shape == (B, S)
 
 
+def test_step_embedder_sum_fusion_uses_max_modality_tokens() -> None:
+    encoder = _enc(
+        hidden_dim=8,
+        modality_fusion="sum",
+        modalities=[
+            {"field": "action", "type": "discrete", "vocab_size": 4, "tokens": 1},
+            {"field": "reward", "type": "rff", "tokens": 2},
+        ],
+    )
+
+    embeds, _, step_token_indices = encoder(_batch([{"action": 2, "reward": 1.5}]))
+
+    assert encoder.tokens_per_step == 2
+    assert embeds.shape == (1, 2, 8)
+    assert step_token_indices.tolist() == [[1]]
+
+
+def test_step_embedder_concat_fusion_uses_sum_modality_tokens() -> None:
+    encoder = _enc(
+        hidden_dim=8,
+        modality_fusion="concat",
+        modalities=[
+            {"field": "action", "type": "discrete", "vocab_size": 4, "tokens": 1},
+            {"field": "reward", "type": "rff", "tokens": 2},
+        ],
+    )
+
+    embeds, _, step_token_indices = encoder(_batch([{"action": 2, "reward": 1.5}]))
+
+    assert encoder.tokens_per_step == 3
+    assert embeds.shape == (1, 3, 8)
+    assert step_token_indices.tolist() == [[2]]
+
+
+def test_step_embedder_rejects_unknown_modality_fusion() -> None:
+    with pytest.raises(ValueError, match='modality_fusion must be either "sum" or "concat"'):
+        _enc(
+            hidden_dim=8,
+            modality_fusion="average",  # type: ignore[arg-type]
+            modalities=[{"field": "action", "type": "discrete", "vocab_size": 4}],
+        )
+
+
 def test_step_embedder_learnable_modality_is_allowed() -> None:
     encoder = _enc(
         hidden_dim=8,

@@ -314,7 +314,7 @@ def _encoder_config(encoder: Encoder) -> dict[str, Any]:
             "hidden_dim": int(encoder.hidden_dim),
             "modalities": [_public_modality_config(modality) for modality in encoder.modalities],
             "token_data_len": int(encoder.token_data_len),
-            "concat_modalities": bool(encoder.concat_modalities),
+            "modality_fusion": encoder.modality_fusion,
             "include_type_token": bool(encoder.include_type_token),
             "fourier_min": float(encoder.fourier_min),
             "fourier_max": float(encoder.fourier_max),

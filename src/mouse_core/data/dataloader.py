@@ -71,9 +71,10 @@ class DataLoader:
     Parameters
     ----------
     stores :
-        A single ``Datastore`` or a list of them. Pure-append stores are
-        supported and will be snapshotted internally; appends after
-        construction are not observed by the loader.
+        A single ``Datastore`` or a list of them. Each store is snapshotted
+        at construction (and on :meth:`refresh`) via ``Datastore.to_dataset()``.
+        Call :meth:`refresh` after appending new rows so sampling sees the
+        latest data.
     sequence_length :
         Length of each contiguous slice (in steps).
     batch_size :
@@ -98,13 +99,19 @@ class DataLoader:
         including the last few steps. When the initial window is shorter than
         ``sequence_length``, additional independently-sampled segments (drawn
         from the same store distribution) are appended until the sequence is
-        full. If ``False`` (default), every sequence comes from a single
-        in-store window of exactly ``sequence_length`` steps; stores shorter
-        than ``sequence_length`` are rejected at construction.
+        full. Empty stores are allowed at construction and on :meth:`refresh`;
+        :meth:`next_batch` raises if every store is still empty. If ``False``
+        (default), every sequence comes from a single in-store window of
+        exactly ``sequence_length`` steps; stores shorter than
+        ``sequence_length`` are rejected at construction.
     prefetch :
         How many batches to keep pre-fetched in the background queue.
     num_workers :
         Background worker threads (0 = synchronous).
+    seed :
+        Seed for the loader's internal NumPy RNG. ``None`` (default) uses
+        unpredictable entropy. When set, worker ``i`` uses ``seed + i`` so
+        multi-worker sampling is reproducible for a given ``seed``.
     augmenter :
         Optional callable applied to each sampled batch. With background workers,
         augmentation runs in the worker before the batch is put into the prefetch
@@ -123,6 +130,7 @@ class DataLoader:
         pack: bool = False,
         prefetch: int = 4,
         num_workers: int = 1,
+        seed: int | None = None,
         augmenter: BatchAugmenter | None = None,
     ) -> None:
         from mouse_core.data.datastore import Datastore as _DS
@@ -153,37 +161,20 @@ class DataLoader:
         self.batch_size = batch_size
         self.weight_mode = weight_mode
         self.pack = pack
+        self.seed = seed
         self.augmenter = augmenter
+        self._weights: np.ndarray = (
+            np.ones(len(stores)) if weights is None else np.asarray(weights, dtype=float)
+        )
+        self._snapshot_lock = threading.Lock()
 
-        # Snapshot each store as an Arrow Dataset for fast slicing. Always go
-        # through to_dataset() so loaded source rows and later appends are both
-        # visible to replay.
-        self._datasets = [s.to_dataset() for s in stores]
-        self._ns: list[int] = [len(ds) for ds in self._datasets]
-
-        if not pack:
-            for i, (n, s) in enumerate(zip(self._ns, stores)):
-                if n == 0:
-                    raise ValueError(f"Store {i} ({s!r}) is empty.")
-                if n < sequence_length:
-                    name = s.name or f"index {i}"
-                    raise ValueError(
-                        f"Store {name!r} has {n} steps but sequence_length={sequence_length}. "
-                        "Use pack=True to allow sequences that span store boundaries."
-                    )
-        else:
-            for i, (n, s) in enumerate(zip(self._ns, stores)):
-                if n == 0:
-                    raise ValueError(f"Store {i} ({s!r}) is empty.")
-
-        # Compute sampling probabilities.
-        w = np.ones(len(stores)) if weights is None else np.asarray(weights, dtype=float)
-        if weight_mode == "per_step":
-            w = w * np.array(self._ns, dtype=float)
-        self._probs: np.ndarray = w / w.sum()
+        self._datasets: list = []
+        self._ns: list[int] = []
+        self._probs: np.ndarray = np.empty(0)
+        self._resnapshot_stores()
 
         if num_workers == 0:
-            self._sync_rng: np.random.Generator | None = np.random.default_rng(seed=0)
+            self._sync_rng: np.random.Generator | None = np.random.default_rng(seed=seed)
             self._sync_augmenter: BatchAugmenter | None = augmenter
             self._result_queue: queue.Queue[list[list[dict]]] | None = None
             self._stop: threading.Event | None = None
@@ -199,8 +190,8 @@ class DataLoader:
                 threading.Thread(
                     target=self._worker_loop,
                     args=(
-                        np.random.default_rng(seed=i),
-                        _fork_augmenter(augmenter, seed=i),
+                        np.random.default_rng(seed=None if seed is None else seed + i),
+                        _fork_augmenter(augmenter, seed=None if seed is None else seed + i),
                     ),
                     daemon=True,
                     name=f"DataLoader-{i}",
@@ -219,6 +210,17 @@ class DataLoader:
         """Approximate total non-overlapping windows across all stores."""
         total_windows = sum(n // self.sequence_length for n in self._ns)
         return max(0, (total_windows + self.batch_size - 1) // self.batch_size)
+
+    def refresh(self) -> None:
+        """Drop prefetched batches and re-snapshot all stores.
+
+        Call after appending new rows to the underlying ``Datastore`` objects
+        so :meth:`next_batch` samples from the latest data. When
+        ``weight_mode="per_step"``, store-size weights are recomputed too.
+        """
+        with self._snapshot_lock:
+            self._resnapshot_stores()
+            self._drain_prefetch_queue()
 
     def next_batch(self) -> list[list[dict]]:
         """Return the next batch of raw rows, blocking until one is ready.
@@ -268,12 +270,46 @@ class DataLoader:
         )
         return (
             f"DataLoader(stores=[{store_info}], S={self.sequence_length}, "
-            f"B={self.batch_size}, pack={self.pack})"
+            f"B={self.batch_size}, pack={self.pack}, seed={self.seed})"
         )
 
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
+
+    def _drain_prefetch_queue(self) -> None:
+        if self._result_queue is None:
+            return
+        while True:
+            try:
+                self._result_queue.get_nowait()
+            except queue.Empty:
+                break
+
+    def _resnapshot_stores(self) -> None:
+        self._datasets = [s.to_dataset() for s in self.stores]
+        self._ns = [len(ds) for ds in self._datasets]
+
+        if not self.pack:
+            for i, (n, s) in enumerate(zip(self._ns, self.stores)):
+                if n == 0:
+                    raise ValueError(f"Store {i} ({s!r}) is empty.")
+                if n < self.sequence_length:
+                    name = s.name or f"index {i}"
+                    raise ValueError(
+                        f"Store {name!r} has {n} steps but sequence_length={self.sequence_length}. "
+                        "Use pack=True to allow sequences that span store boundaries."
+                    )
+        w = self._weights.copy()
+        ns = np.array(self._ns, dtype=float)
+        if self.weight_mode == "per_step":
+            w = w * ns
+        elif self.pack:
+            w = w * (ns > 0)
+        if w.sum() == 0:
+            self._probs = np.ones(len(self.stores)) / len(self.stores)
+        else:
+            self._probs = w / w.sum()
 
     def _fetch_sequence(self, rng: np.random.Generator) -> list[dict]:
         """Fetch exactly ``sequence_length`` steps for one sequence slot.
@@ -284,6 +320,9 @@ class DataLoader:
         segments are appended until the sequence is full.  When ``pack=False``
         the start is guaranteed to leave a full window.
         """
+        if sum(self._ns) == 0:
+            raise ValueError("Cannot sample batches: all stores are empty.")
+
         S = self.sequence_length
         steps: list[dict] = []
 
@@ -315,7 +354,8 @@ class DataLoader:
         rng: np.random.Generator,
         augmenter: BatchAugmenter | None,
     ) -> list[list[dict]]:
-        batch = [self._fetch_sequence(rng) for _ in range(self.batch_size)]
+        with self._snapshot_lock:
+            batch = [self._fetch_sequence(rng) for _ in range(self.batch_size)]
         if augmenter is not None:
             batch = augmenter(batch)
         return batch
@@ -336,7 +376,7 @@ class DataLoader:
                 return
 
 
-def _fork_augmenter(augmenter: BatchAugmenter | None, *, seed: int) -> BatchAugmenter | None:
+def _fork_augmenter(augmenter: BatchAugmenter | None, *, seed: int | None) -> BatchAugmenter | None:
     if augmenter is None:
         return None
     fork = getattr(augmenter, "fork", None)

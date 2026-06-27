@@ -8,11 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `DataLoader.refresh()` re-snapshots underlying stores and drains any prefetched batches, so online replay can pick up newly appended rows without rebuilding the loader.
+- `DataLoader` accepts an optional `seed` argument (default `None`) that controls its internal NumPy RNG; when set, worker `i` uses `seed + i` for deterministic multi-worker sampling.
 - `StepEmbedder` accepts a new `type_embedding_std` parameter to control the initialisation std of the type embedding table independently from the content embedding `std`. **Required when `include_type_token=True`**; raises `ValueError` if omitted to prevent accidental type-to-content signal imbalance.
 
 ### Changed
+- README quick start now points to the example notebooks instead of an inline training skeleton.
+- `DataLoader` with `pack=True` allows empty stores at construction and on `refresh()`; `next_batch()` raises if every store is still empty.
+- Example notebooks updated for `mouse-env` 0.5.0: `make_env` now creates a `SingleEnv`, `make_group_env` creates a `GroupEnv`, and `sample_random_input()` replaces `sample_random_inputs()`.
+- `examples/03_train_online.ipynb` collection keeps one KV cache per env visit (`COLLECT_STEPS` transitions), growing it incrementally and discarding it when moving to the next env; the context deque may slide independently.
+- `examples/03_train_online.ipynb` collection now processes one env at a time with a single KV cache (discarded after each env's `COLLECT_STEPS`) instead of windowing envs into `ENV_BATCH_SIZE` parallel caches; step counters now count env transitions directly.
+- `examples/03_train_online.ipynb` reorganizes collection and training into separate documented sections with `collect_round` and `train_round` helpers; episode stats print after each collect round instead of a separate evaluation phase.
 - `SequenceAugmenter` renamed to `Augmenter` in `mouse_core.data`.
 - `load_model` now defaults to `force_download=True`, always pulling the latest checkpoint from the Hub instead of serving a cached copy.
+- `examples/03_train_online.ipynb` now ramps epsilon-greedy exploration from `0.0` to `1.0` by `EXPLORATION_FULL_AT_STEP`, then keeps full exploration for the remainder.
+- `StepEmbedder` now uses `modality_fusion="sum"` or `"concat"` instead of the old `concat_modalities` boolean; the example notebooks use explicit sum fusion.
+- `examples/02_train_offline.ipynb` and `examples/03_train_online.ipynb` now include final kernel shutdown cells to release all notebook-owned GPU memory after training.
 - `DqnObjective`: replaced `use_episodic_reward` with an explicit `reward_key: str = "reward"` parameter; added `done_key: str = "done"` parameter (parallel to `action_key`).
 - `DqnObjective`: removed `normalize_reward_mean`, `normalize_reward_std`, `normalize_reward_eps`, `normalize_reward_std_target`, `reward_scale`, and `reward_shift`.
 - `DqnObjective`: discount is now computed via a vectorized gamma lookup (`gammas[done_next]`) instead of four boolean masks; the reset-frame bootstrap workaround is removed.
@@ -23,14 +34,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `examples/04_inference.ipynb` now separates evaluation env count from replay output count, allowing 100-env evaluation while only embedding the first 10 replay videos.
 - FrozenLake training examples now use the full pretrained `Qwen/Qwen3-0.6B` backbone instead of truncating `Qwen3Backbone` with `num_layers=2`.
 - `examples/03_train_online.ipynb` now uses the tuned offline baseline's training horizon, context length, batch size, learnable-token scale, and action-value head scale while keeping data collection online.
-- The README quick start now shows online training against a live `mouse-env` environment instead of an offline-style prefilled datastore.
 
 ### Fixed
 - `DataLoader` now snapshots both loaded source rows and newly appended rows from each `Datastore`, so replay built from Hub data plus live rollout does not silently ignore recent experience.
 - `StepEmbedder` now raises when a required modality is missing from only some rows in a batch instead of silently filling those rows with default values.
 - `DqnObjective` and `VecDqnObjective` now skip invalid reset-frame transitions after boundary rows and use the following reset row for boundary bootstrapping when available.
 - `SpObjective` now supports `-inf` padded invalid actions in `info_q_star` while still rejecting NaN and `+inf` targets.
-- The README quick start now uses a runnable raw batch loop and the current five-code `done` vocabulary.
 - `examples/04_inference.ipynb` now renders only the replay envs created with `render_mode="rgb_array"`, avoiding Gymnasium render-mode warnings from non-video evaluation envs.
 - `examples/02_train_offline.ipynb` now passes AdamW beta coefficients with PyTorch's supported `betas` keyword.
 

@@ -5,7 +5,7 @@ Each modality declares its own token count via ``tokens`` in its spec
 (falling back to the constructor ``token_data_len`` default).  Each step produces
 exactly ``tokens_per_step`` embedding vectors.
 
-**Sum mode** (default, ``concat_modalities=False``):
+**Sum fusion** (default, ``modality_fusion="sum"``):
 
     Modality contributions are summed into a shared block of width equal to the
     *maximum* per-modality token count.  Modalities with fewer tokens affect only the
@@ -13,7 +13,7 @@ exactly ``tokens_per_step`` embedding vectors.
 
         tokens_per_step = max(Tc)
 
-**Concat mode** (``concat_modalities=True``):
+**Concat fusion** (``modality_fusion="concat"``):
 
     Modality blocks are concatenated in declaration order:
 
@@ -43,7 +43,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 import numpy as np
 import torch
@@ -52,6 +52,8 @@ from tensordict import TensorDict
 
 from mouse_core.models.embedding.encoding import NormalizedPixel, RandomFourierFeatures
 from mouse_core.models.embedding.linear import ScaledEmbedding, ScaledPosLinear
+
+ModalityFusion = Literal["sum", "concat"]
 
 
 # ---------------------------------------------------------------------------
@@ -618,14 +620,14 @@ class StepEmbedder(Encoder):
     The global ``token_data_len`` is used only as a default for modalities that omit
     an explicit ``tokens`` value.
 
-    Two embedding modes are available:
+    Two modality fusion modes are available:
 
-    **Sum mode** (``concat_modalities=False``, default):
+    **Sum fusion** (``modality_fusion="sum"``, default):
         Contributions are summed into a block whose size is the *max* per-modality
         token count.  A modality with ``Tc`` tokens writes to the first ``Tc``
         positions of that shared block.  ``tokens_per_step = max(Tc)``.
 
-    **Concat mode** (``concat_modalities=True``):
+    **Concat fusion** (``modality_fusion="concat"``):
         The data tokens for each step are the concatenation of per-modality blocks,
         in the exact order the modalities appear in the ``modalities`` list.
         ``tokens_per_step = sum(Tc)``.
@@ -642,8 +644,9 @@ class StepEmbedder(Encoder):
             each field is encoded as its own modality with the same settings.
         token_data_len: Default number of tokens per modality when the modality spec
             does not specify its own ``tokens``.
-        concat_modalities: When ``True``, modality embeddings are concatenated
-            sequentially rather than summed.
+        modality_fusion: How per-modality embeddings are combined. Use ``"sum"``
+            to sum contributions into a shared token block, or ``"concat"`` to
+            concatenate per-modality token blocks sequentially.
         include_type_token: Add the learned type embedding to every token.
             Set to ``False`` to disable type embeddings entirely (recommended
             when all modality content stds are already balanced).
@@ -664,7 +667,7 @@ class StepEmbedder(Encoder):
         hidden_dim: int,
         modalities: list[dict[str, Any] | ModalitySpec] | None = None,
         token_data_len: int = 1,
-        concat_modalities: bool = False,
+        modality_fusion: ModalityFusion = "sum",
         include_type_token: bool = True,
         fourier_min: float = 0.01,
         fourier_max: float = 10.0,
@@ -726,7 +729,9 @@ class StepEmbedder(Encoder):
 
         self._hidden_dim = int(hidden_dim)
         self.include_type_token = bool(include_type_token)
-        self.concat_modalities = bool(concat_modalities)
+        if modality_fusion not in {"sum", "concat"}:
+            raise ValueError('modality_fusion must be either "sum" or "concat".')
+        self.modality_fusion: ModalityFusion = modality_fusion
         self.token_data_len = int(token_data_len)  # default for modalities without explicit tokens
         self.fourier_min = float(fourier_min)
         self.fourier_max = float(fourier_max)
@@ -760,7 +765,7 @@ class StepEmbedder(Encoder):
             if cs.type.lower() == "learnable":
                 self._learnable_modalities.add(cs.field)
 
-        if concat_modalities:
+        if self.modality_fusion == "concat":
             self._tokens_per_step: int = sum(self._modality_tokens.values())
         else:
             self._tokens_per_step = max(self._modality_tokens.values()) if self._modality_tokens else 0
@@ -1004,7 +1009,7 @@ class StepEmbedder(Encoder):
         # ------------------------------------------------------------------ #
         # Embed extracted tensors → token sequence [B, S, T, D].              #
         # ------------------------------------------------------------------ #
-        if self.concat_modalities:
+        if self.modality_fusion == "concat":
             embeds = self._forward_concat(B, S, D, device, dtype, col_values)
         else:
             embeds = self._forward_sum(B, S, D, device, dtype, col_values)
@@ -1026,7 +1031,7 @@ class StepEmbedder(Encoder):
         device: torch.device, dtype: torch.dtype,
         col_values: dict[str, torch.Tensor],
     ) -> torch.Tensor:
-        """Sum mode: add contributions of all modalities into a shared block of size max(Tc)."""
+        """Sum fusion: add contributions of all modalities into a shared block of size max(Tc)."""
         if not self.modalities:
             T = 0
             return torch.empty(B, S, 0, D, device=device, dtype=dtype)
@@ -1063,7 +1068,7 @@ class StepEmbedder(Encoder):
         device: torch.device, dtype: torch.dtype,
         col_values: dict[str, torch.Tensor],
     ) -> torch.Tensor:
-        """Concat mode: concatenate per-modality blocks (each with its own Tc)."""
+        """Concat fusion: concatenate per-modality blocks (each with its own Tc)."""
         parts: list[torch.Tensor] = []
 
         for spec in self.modalities:
