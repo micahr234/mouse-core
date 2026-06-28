@@ -12,16 +12,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `DataLoader` accepts an optional `seed` argument (default `None`) that controls its internal NumPy RNG; when set, worker `i` uses `seed + i` for deterministic multi-worker sampling.
 - `StepEmbedder` accepts a new `type_embedding_std` parameter to control the initialisation std of the type embedding table independently from the content embedding `std`. **Required when `include_type_token=True`**; raises `ValueError` if omitted to prevent accidental type-to-content signal imbalance.
 
+### Fixed
+- `examples/03_train_online.ipynb` collect/train loop no longer consumes all env steps in a single rollout; `ENV_STEPS_PER_CYCLE` caps each cycle so DQN updates run repeatedly, and epsilon is recomputed per env transition instead of once per cycle.
+
 ### Changed
+- Example notebooks share `GRADIENT_STEPS` as the total optimizer-step budget (`TRAIN_STEPS` renamed in `02_train_offline.ipynb`). Online adds `ENV_STEPS_PER_CYCLE`, `STEPS_PER_ENV`, and `GRADIENT_STEPS_PER_CYCLE` to interleave live env interaction with the same number of gradient updates as offline training. `EXPLORATION_FULL_AT_STEP` renamed to `EXPLORATION_ENDS`.
 - README quick start now points to the example notebooks instead of an inline training skeleton.
 - `DataLoader` with `pack=True` allows empty stores at construction and on `refresh()`; `next_batch()` raises if every store is still empty.
 - Example notebooks updated for `mouse-env` 0.5.0: `make_env` now creates a `SingleEnv`, `make_group_env` creates a `GroupEnv`, and `sample_random_input()` replaces `sample_random_inputs()`.
-- `examples/03_train_online.ipynb` collection keeps one KV cache per env visit (`COLLECT_STEPS` transitions), growing it incrementally and discarding it when moving to the next env; the context deque may slide independently.
-- `examples/03_train_online.ipynb` collection now processes one env at a time with a single KV cache (discarded after each env's `COLLECT_STEPS`) instead of windowing envs into `ENV_BATCH_SIZE` parallel caches; step counters now count env transitions directly.
+- `examples/03_train_online.ipynb` collection keeps one KV cache per env visit (`STEPS_PER_ENV` transitions), growing it incrementally and discarding it when moving to the next env; the context deque may slide independently.
+- `examples/03_train_online.ipynb` collection now processes one env at a time with a single KV cache (discarded after each env's `STEPS_PER_ENV`) instead of windowing envs into `ENV_BATCH_SIZE` parallel caches; step counters now count env transitions directly.
 - `examples/03_train_online.ipynb` reorganizes collection and training into separate documented sections with `collect_round` and `train_round` helpers; episode stats print after each collect round instead of a separate evaluation phase.
 - `SequenceAugmenter` renamed to `Augmenter` in `mouse_core.data`.
 - `load_model` now defaults to `force_download=True`, always pulling the latest checkpoint from the Hub instead of serving a cached copy.
-- `examples/03_train_online.ipynb` now ramps epsilon-greedy exploration from `0.0` to `1.0` by `EXPLORATION_FULL_AT_STEP`, then keeps full exploration for the remainder.
+- `examples/03_train_online.ipynb` now ramps epsilon-greedy exploration from `0.0` to `1.0` by `EXPLORATION_ENDS`, then keeps full exploration for the remainder.
 - `StepEmbedder` now uses `modality_fusion="sum"` or `"concat"` instead of the old `concat_modalities` boolean; the example notebooks use explicit sum fusion.
 - `examples/02_train_offline.ipynb` and `examples/03_train_online.ipynb` now include final kernel shutdown cells to release all notebook-owned GPU memory after training.
 - `DqnObjective`: replaced `use_episodic_reward` with an explicit `reward_key: str = "reward"` parameter; added `done_key: str = "done"` parameter (parallel to `action_key`).
