@@ -85,11 +85,19 @@ class HeadSpec:
     num_layers: int | None = None
     scale: float | None = None
     use_norm: bool | None = None
+    # Layerwise action value specific
+    num_backbone_layers: int | None = None
     # Vector action value specific
     vec_dim: int | None = None
     bias_scale: float | None = None
 
-    _VALID: ClassVar[tuple[str, ...]] = ("action_value", "action_vector", "action", "value")
+    _VALID: ClassVar[tuple[str, ...]] = (
+        "action_value",
+        "action_value_layerwise",
+        "action_vector",
+        "action",
+        "value",
+    )
 
     def __post_init__(self) -> None:
         if self.name not in self._VALID:
@@ -114,6 +122,13 @@ class HeadSpec:
                 f"head {self.name!r} has negative num_layers ({self.num_layers}); "
                 f"use 0 to disable or a positive integer"
             )
+        if self.num_backbone_layers is not None and self.name != "action_value_layerwise":
+            raise ValueError(
+                f"num_backbone_layers is only valid for 'action_value_layerwise' heads, "
+                f"got name={self.name!r}"
+            )
+        if self.num_backbone_layers is not None and int(self.num_backbone_layers) <= 0:
+            raise ValueError(f"num_backbone_layers must be positive, got {self.num_backbone_layers!r}")
         if self.vec_dim is not None and self.name != "action_vector":
             raise ValueError(f"vec_dim is only valid for 'action_vector' heads, got name={self.name!r}")
         if self.vec_dim is not None and int(self.vec_dim) <= 0:

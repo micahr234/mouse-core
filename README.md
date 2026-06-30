@@ -65,6 +65,8 @@ The [example notebooks](examples/) are the primary documentation. Work through t
 | [02 — Train offline](examples/02_train_offline.ipynb) | Offline replay baseline, model architecture, DQN training *(recommended first training run)* |
 | [03 — Train online](examples/03_train_online.ipynb) | Live `mouse-env` rollouts, in-memory replay, DQN updates |
 | [04 — Inference](examples/04_inference.ipynb) | KV-cache inference, loading the current checkpoint from the shared Hub model repo |
+| [05 — Layerwise DQN online](examples/05_train_online_layerwise_dqn.ipynb) | Per-layer Q heads and `LayerwiseDqnObjective` |
+| [06 — Vector-DQN online](examples/06_train_online_vec_dqn.ipynb) | 2D action vectors, RoPE reward rotation, `VecDqnObjective` |
 
 Each notebook explains the relevant concepts inline. API details live in the Python docstrings (`load_model`, `Datastore`, `DqnObjective`, etc.).
 

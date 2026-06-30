@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `examples/06_train_online_vec_dqn.ipynb`: online FrozenLake training with Vector-DQN (`VectorActionValueHead`, `vec_dim=2`, `VecDqnObjective`).
+- `examples/run_vec_dqn_learning_demo.py`: scaled-down online Vector-DQN run that logs `action_vector` loss and rollout return (CPU-friendly smoke test).
+- `LayerwiseDiscreteActionValueHead` and `action_value_layerwise` model head: one DQN value head per backbone layer, reading pooled hidden states from every transformer block.
+- `LayerwiseDqnObjective`: layer `0` uses each `gamma_*_start`; the deepest layer uses the matching deep gamma. Intermediate layers get **linearly increasing effective horizon** `H = 1/(1-γ)` from shallow to deep endpoints (`gamma_l = 1 - 1/H_l`).
+- `examples/05_train_online_layerwise_dqn.ipynb`: online FrozenLake training with layerwise DQN.
+- Backbones accept `output_hidden_states=True` and return per-layer hidden states (transformer block outputs) as a third return value.
 - `DataLoader.refresh()` re-snapshots underlying stores and drains any prefetched batches, so online replay can pick up newly appended rows without rebuilding the loader.
 - `DataLoader` accepts an optional `seed` argument (default `None`) that controls its internal NumPy RNG; when set, worker `i` uses `seed + i` for deterministic multi-worker sampling.
 - `StepEmbedder` accepts a new `type_embedding_std` parameter to control the initialisation std of the type embedding table independently from the content embedding `std`. **Required when `include_type_token=True`**; raises `ValueError` if omitted to prevent accidental type-to-content signal imbalance.
@@ -16,6 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `examples/03_train_online.ipynb` collect/train loop no longer consumes all env steps in a single rollout; `ENV_STEPS_PER_CYCLE` caps each cycle so DQN updates run repeatedly, and epsilon is recomputed per env transition instead of once per cycle.
 
 ### Changed
+- `LayerwiseDqnObjective` metrics now include per-layer TD loss (`layer_{i}_loss`) alongside `layer_{i}_q_mean`.
+- `LayerwiseDqnObjective` discount schedule is horizon-linear (even spacing in `1/(1-γ)`), replacing the earlier buildup curve.
 - Example notebooks share `GRADIENT_STEPS` as the total optimizer-step budget (`TRAIN_STEPS` renamed in `02_train_offline.ipynb`). Online adds `ENV_STEPS_PER_CYCLE`, `STEPS_PER_ENV`, and `GRADIENT_STEPS_PER_CYCLE` to interleave live env interaction with the same number of gradient updates as offline training. `EXPLORATION_FULL_AT_STEP` renamed to `EXPLORATION_ENDS`.
 - README quick start now points to the example notebooks instead of an inline training skeleton.
 - `DataLoader` with `pack=True` allows empty stores at construction and on `refresh()`; `next_batch()` raises if every store is still empty.
@@ -25,7 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `examples/03_train_online.ipynb` reorganizes collection and training into separate documented sections with `collect_round` and `train_round` helpers; episode stats print after each collect round instead of a separate evaluation phase.
 - `SequenceAugmenter` renamed to `Augmenter` in `mouse_core.data`.
 - `load_model` now defaults to `force_download=True`, always pulling the latest checkpoint from the Hub instead of serving a cached copy.
-- `examples/03_train_online.ipynb` now ramps epsilon-greedy exploration from `0.0` to `1.0` by `EXPLORATION_ENDS`, then keeps full exploration for the remainder.
+- Online training example notebooks (`03`, `05`, `06`) now use standard ε-greedy linear decay from `1.0` to `0.0` by `EXPLORATION_ENDS`, replacing the inverted 0→1 ramp.
 - `StepEmbedder` now uses `modality_fusion="sum"` or `"concat"` instead of the old `concat_modalities` boolean; the example notebooks use explicit sum fusion.
 - `examples/02_train_offline.ipynb` and `examples/03_train_online.ipynb` now include final kernel shutdown cells to release all notebook-owned GPU memory after training.
 - `DqnObjective`: replaced `use_episodic_reward` with an explicit `reward_key: str = "reward"` parameter; added `done_key: str = "done"` parameter (parallel to `action_key`).

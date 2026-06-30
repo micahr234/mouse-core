@@ -1,5 +1,6 @@
 from mouse_core.models.heads.base import BaseHead, BaseHeadWithTarget, HeadSpec
 from mouse_core.models.heads.swiglu import SwiGLU, SwiGLUHead
+from mouse_core.models.heads.layerwise_dqn import LayerwiseDiscreteActionValueHead
 from mouse_core.models.heads.dqn import DiscreteActionValueHead
 from mouse_core.models.heads.vec_dqn import VectorActionValueHead, vector_action_scores, rope_rotate
 
@@ -10,6 +11,7 @@ __all__ = [
     "SwiGLU",
     "SwiGLUHead",
     "DiscreteActionValueHead",
+    "LayerwiseDiscreteActionValueHead",
     "VectorActionValueHead",
     "vector_action_scores",
     "rope_rotate",
@@ -52,6 +54,7 @@ def build_heads(
 
     built: dict[str, BaseHead | None] = {
         "action_value": None,
+        "action_value_layerwise": None,
         "action_vector": None,
         "action": None,
         "value": None,
@@ -69,7 +72,21 @@ def build_heads(
         hd = spec.hidden_dim if spec.hidden_dim is not None else hidden_dim
         sc = spec.scale if spec.scale is not None else 1.0
         un = spec.use_norm if spec.use_norm is not None else True
-        if nm == "action_value":
+        if nm == "action_value_layerwise":
+            if spec.num_backbone_layers is None:
+                raise ValueError(
+                    "action_value_layerwise head requires num_backbone_layers in HeadSpec."
+                )
+            built[nm] = LayerwiseDiscreteActionValueHead(
+                num_backbone_layers=int(spec.num_backbone_layers),
+                in_features=hidden_dim,
+                out_features=max_num_actions,
+                hidden_dim=hd,
+                num_layers=int(spec.num_layers),
+                scale=sc,
+                use_norm=un,
+            )
+        elif nm == "action_value":
             built[nm] = DiscreteActionValueHead(
                 in_features=hidden_dim,
                 out_features=max_num_actions,

@@ -85,13 +85,14 @@ def test_learning_starts_delays_first_train_burst() -> None:
     assert stats["cycles"] == 3
 
 
-def test_epsilon_ramp() -> None:
-    def epsilon(env_step: int, exploration_ends: int) -> float:
+def test_epsilon_decay() -> None:
+    def epsilon(env_step: int, *, exploration_ends: int) -> float:
         if exploration_ends <= 0:
             raise ValueError("exploration_ends must be positive.")
-        return min(env_step / exploration_ends, 1.0)
+        frac = min(env_step / exploration_ends, 1.0)
+        return 1.0 - frac
 
-    assert epsilon(0, 10_000) == 0.0
-    assert epsilon(5_000, 10_000) == 0.5
-    assert epsilon(10_000, 10_000) == 1.0
-    assert epsilon(20_000, 10_000) == 1.0
+    assert epsilon(0, exploration_ends=10_000) == 1.0
+    assert epsilon(5_000, exploration_ends=10_000) == 0.5
+    assert epsilon(10_000, exploration_ends=10_000) == 0.0
+    assert epsilon(20_000, exploration_ends=10_000) == 0.0

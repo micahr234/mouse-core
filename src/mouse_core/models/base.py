@@ -15,8 +15,22 @@ from tensordict import TensorDict
 from mouse_core.models.embedding.embedding import Encoder
 from mouse_core.models.heads.base import BaseHead
 from mouse_core.models.heads.dqn import DiscreteActionValueHead
+from mouse_core.models.heads.layerwise_dqn import LayerwiseDiscreteActionValueHead
 from mouse_core.models.heads.swiglu import SwiGLUHead
 from mouse_core.models.heads.vec_dqn import VectorActionValueHead, vector_action_scores
+
+
+def _backbone_num_layers(backbone: nn.Module) -> int | None:
+    """Return transformer block count when the backbone exposes ``model.layers``."""
+    inner = getattr(backbone, "model", None)
+    layers = getattr(inner, "layers", None)
+    if layers is not None:
+        return len(layers)
+    from mouse_core.models.backbone import IdentityBackbone
+
+    if isinstance(backbone, IdentityBackbone):
+        return 1
+    return None
 
 
 def _hub_repo_id_for_user(repo_id: str, token: str | bool | None = None) -> str:
@@ -366,6 +380,18 @@ def _heads_config(model: "Model") -> dict[str, Any]:
 
 
 def _head_config(name: str, head: BaseHead) -> dict[str, Any] | None:
+    if isinstance(head, LayerwiseDiscreteActionValueHead):
+        return {
+            "name": name,
+            "type": "action_value_layerwise",
+            "num_backbone_layers": head.num_backbone_layers,
+            "in_features": head.in_features,
+            "out_features": head.out_features,
+            "hidden_dim": head.hidden_dim,
+            "num_layers": head.num_layers,
+            "scale": head.scale,
+            "use_norm": head.use_norm,
+        }
     if isinstance(head, DiscreteActionValueHead):
         return {
             "name": name,
@@ -506,7 +532,17 @@ def _build_heads_from_config(heads: list[dict[str, Any]]) -> dict[str, BaseHead]
     for spec in heads:
         name = spec["name"]
         head_type = spec["type"]
-        if head_type == "action_value":
+        if head_type == "action_value_layerwise":
+            built[name] = LayerwiseDiscreteActionValueHead(
+                num_backbone_layers=spec["num_backbone_layers"],
+                in_features=spec["in_features"],
+                out_features=spec["out_features"],
+                hidden_dim=spec["hidden_dim"],
+                num_layers=spec["num_layers"],
+                scale=spec.get("scale", 1.0),
+                use_norm=spec.get("use_norm", True),
+            )
+        elif head_type == "action_value":
             built[name] = DiscreteActionValueHead(
                 in_features=spec["in_features"],
                 out_features=spec["out_features"],
@@ -577,7 +613,7 @@ class Model(nn.Module):
     The backbone is independent; it does not know about the encoder or heads.
     """
 
-    _VALID_HEADS = ("action_value", "action_vector", "action", "value")
+    _VALID_HEADS = ("action_value", "action_value_layerwise", "action_vector", "action", "value")
 
     @staticmethod
     def _normalize_heads(
@@ -645,6 +681,8 @@ class Model(nn.Module):
     @staticmethod
     def _infer_head_name(head: BaseHead, preferred: str | None = None) -> str:
         """Infer the canonical storage / output key for a concrete head instance."""
+        if isinstance(head, LayerwiseDiscreteActionValueHead):
+            return "action_value_layerwise"
         if isinstance(head, VectorActionValueHead):
             return "action_vector"
         if isinstance(head, DiscreteActionValueHead):
@@ -719,12 +757,28 @@ class Model(nn.Module):
             self.action_head: str = action_head
         else:
             # Auto-detect preference order
-            for candidate in ("action_vector", "action_value", "action", "value"):
+            for candidate in ("action_vector", "action_value_layerwise", "action_value", "action", "value"):
                 if candidate in self.heads:
                     self.action_head = candidate
                     break
             else:
                 raise ValueError("No output head is enabled; cannot determine action_head.")
+
+        if "action_value_layerwise" in self._heads:
+            layerwise_head = self._heads["action_value_layerwise"]
+            if not isinstance(layerwise_head, LayerwiseDiscreteActionValueHead):
+                raise TypeError("action_value_layerwise head has unexpected type.")
+            bb_layers = _backbone_num_layers(self.backbone)
+            if bb_layers is None:
+                raise ValueError(
+                    "action_value_layerwise requires a backbone with a known layer count "
+                    "(e.g. Qwen3Backbone or LlamaBackbone)."
+                )
+            if layerwise_head.num_backbone_layers != bb_layers:
+                raise ValueError(
+                    f"Layerwise head expects {layerwise_head.num_backbone_layers} backbone layers "
+                    f"but backbone has {bb_layers}."
+                )
 
         # Convenience: expose hidden_dim and max_num_actions from encoder/heads
         self.hidden_dim = int(encoder.hidden_dim)
@@ -805,23 +859,54 @@ class Model(nn.Module):
             col_values = {key: value.to(embeds.device) for key, value in col_values.items()}
         objective_data = TensorDict(col_values, batch_size=(B, S))
 
-        h, new_cache = self.backbone(
+        needs_layerwise = "action_value_layerwise" in self._heads
+        backbone_out = self.backbone(
             embeds=embeds,
             cache=cache,
             use_cache=use_cache,
             cache_position=cache_position,
             attention_mask=attention_mask,
+            output_hidden_states=needs_layerwise,
         )
+        if needs_layerwise:
+            h, new_cache, layer_hiddens = backbone_out
+        else:
+            h, new_cache = backbone_out
+            layer_hiddens = None
 
         h_step = self.encoder.pool_step_reprs(h, step_token_indices).float()
-        predictions = self.head(h_step, batch_size=(B, S))
+        if needs_layerwise:
+            assert layer_hiddens is not None
+            h_layers = torch.stack(
+                [
+                    self.encoder.pool_step_reprs(layer_h, step_token_indices).float()
+                    for layer_h in layer_hiddens
+                ],
+                dim=1,
+            )
+            predictions = self.head(h_step, batch_size=(B, S), h_layers=h_layers)
+        else:
+            predictions = self.head(h_step, batch_size=(B, S))
         return predictions, objective_data, new_cache
 
-    def head(self, h: torch.Tensor, batch_size: tuple[int, int]) -> TensorDict:
+    def head(
+        self,
+        h: torch.Tensor,
+        batch_size: tuple[int, int],
+        *,
+        h_layers: torch.Tensor | None = None,
+    ) -> TensorDict:
         """Run enabled heads on step representations ``[B, S, D]``."""
         tensors: dict[str, torch.Tensor] = {}
         for name, head_fn in self._heads.items():
-            if name == "action_value":
+            if name == "action_value_layerwise":
+                if h_layers is None:
+                    raise ValueError("action_value_layerwise head requires h_layers from Model.forward.")
+                tensors["action_value_layerwise"] = head_fn.forward(h_layers)
+                if hasattr(head_fn, "target_forward"):
+                    tf = getattr(head_fn, "target_forward")
+                    tensors["action_value_layerwise_target"] = tf(h_layers)
+            elif name == "action_value":
                 tensors["action_value"] = head_fn.forward(h)
                 if hasattr(head_fn, "target_forward"):
                     tf = getattr(head_fn, "target_forward")
@@ -835,13 +920,23 @@ class Model(nn.Module):
                 tensors[name] = head_fn.forward(h)
         return TensorDict(tensors, batch_size=batch_size)
 
-    def polyak_update(self, action_value_tau: float = 0.0, action_vector_tau: float = 0.0) -> None:
+    def polyak_update(
+        self,
+        action_value_tau: float = 0.0,
+        action_value_layerwise_tau: float = 0.0,
+        action_vector_tau: float = 0.0,
+    ) -> None:
         """Soft-update target heads (for heads that support targets)."""
         if "action_value" in self._heads:
             hd = self._heads["action_value"]
             if hasattr(hd, "polyak_update"):
                 pu = getattr(hd, "polyak_update")
                 pu(tau=action_value_tau)
+        if "action_value_layerwise" in self._heads:
+            hl = self._heads["action_value_layerwise"]
+            if hasattr(hl, "polyak_update"):
+                pu = getattr(hl, "polyak_update")
+                pu(tau=action_value_layerwise_tau)
         if "action_vector" in self._heads:
             hv = self._heads["action_vector"]
             if hasattr(hv, "polyak_update"):
@@ -856,7 +951,12 @@ class Model(nn.Module):
     ) -> torch.Tensor:
         """Select an action using ``action_head`` from the last step."""
         raw = cast(torch.Tensor, out[self.action_head])[:, -1]
-        scores: torch.Tensor = vector_action_scores(raw) if self.action_head == "action_vector" else raw
+        if self.action_head == "action_value_layerwise":
+            scores = raw[:, -1, :]
+        elif self.action_head == "action_vector":
+            scores = vector_action_scores(raw)
+        else:
+            scores = raw
         if num_actions is not None:
             scores = scores[:, :num_actions]
         if temperature == 0.0:

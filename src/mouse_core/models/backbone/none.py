@@ -33,5 +33,7 @@ class IdentityBackbone(Backbone):
         attention_mask: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, dict[str, Any] | None]:
-        # Identity ignores masks; the mask would only matter to a real sequence model.
+        output_hidden_states = bool(kwargs.pop("output_hidden_states", False))
+        if output_hidden_states:
+            return embeds, None, (embeds,)
         return embeds, None
