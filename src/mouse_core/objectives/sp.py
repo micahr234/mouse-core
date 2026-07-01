@@ -129,18 +129,22 @@ def sp_soft_ce(
 
 
 class SpObjective(Objective):
-    """Supervised policy objective distilling ``info_q_star`` expert targets into action logits.
+    """Supervised policy objective distilling per-action Q targets into action logits.
 
-    Reads ``predictions["action"]`` (shape ``[B, S, A]``) from the model's action head.
+    Reads ``predictions[predictions_key]`` (shape ``[B, S, A]``) and compares against
+    ``objective_data[targets_key]`` (same shape).
 
     Args:
         loss_type: Which distillation loss to apply.  ``"ce"`` uses the argmax of
-            ``info_q_star`` as a hard label; the soft variants treat it as a
+            ``targets_key`` as a hard label; the soft variants treat it as a
             distribution.
-        temperature: Softmax temperature applied to ``info_q_star`` before soft losses
+        temperature: Softmax temperature applied to targets before soft losses
             (ignored for ``"ce"``).
         label_smoothing: Label-smoothing coefficient (applied to hard ``"ce"`` only).
         predictions_key: Key in ``predictions`` that holds the ``[B, S, A]`` action logits.
+        targets_key: Key in ``objective_data`` that holds ``[B, S, A]`` Q targets
+            (default ``"info_q_star"`` from env expert Q; use e.g. ``"action_value"``
+            for teacher-model distillation).
     """
 
     def __init__(
@@ -150,11 +154,13 @@ class SpObjective(Objective):
         temperature: float = 1.0,
         label_smoothing: float = 0.0,
         predictions_key: str = "action",
+        targets_key: str = "info_q_star",
     ) -> None:
         self.loss_type = loss_type
         self.temperature = temperature
         self.label_smoothing = label_smoothing
         self.predictions_key = predictions_key
+        self.targets_key = targets_key
 
     def __call__(
         self,
@@ -166,18 +172,20 @@ class SpObjective(Objective):
 
         A = logits.shape[-1]
         logits = logits.reshape(-1, A)
-        q_targets = objective_data["info_q_star"].reshape(-1, A).to(dtype=logits.dtype)
+        q_targets = objective_data[self.targets_key].reshape(-1, A).to(dtype=logits.dtype)
 
         if q_targets.shape[0] == 0:
             raise ValueError("SpObjective: batch is empty (no tokens).")
         if torch.isnan(q_targets).any():
-            raise ValueError("SpObjective: info_q_star contains NaN values.")
+            raise ValueError(f"SpObjective: {self.targets_key!r} contains NaN values.")
         if torch.isposinf(q_targets).any():
-            raise ValueError("SpObjective: info_q_star contains +inf values.")
+            raise ValueError(f"SpObjective: {self.targets_key!r} contains +inf values.")
 
         valid_rows = torch.isfinite(q_targets).any(dim=-1)
         if not valid_rows.any():
-            raise ValueError("SpObjective: info_q_star contains no finite action targets.")
+            raise ValueError(
+                f"SpObjective: {self.targets_key!r} contains no finite action targets."
+            )
         logits = logits[valid_rows]
         q_targets = q_targets[valid_rows]
 

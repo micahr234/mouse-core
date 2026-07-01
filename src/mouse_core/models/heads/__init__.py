@@ -1,6 +1,7 @@
 from mouse_core.models.heads.base import BaseHead, BaseHeadWithTarget, HeadSpec
 from mouse_core.models.heads.swiglu import SwiGLU, SwiGLUHead
 from mouse_core.models.heads.layerwise_dqn import LayerwiseDiscreteActionValueHead
+from mouse_core.models.heads.discrete_action import DiscreteActionHead
 from mouse_core.models.heads.dqn import DiscreteActionValueHead
 from mouse_core.models.heads.vec_dqn import VectorActionValueHead, vector_action_scores, rope_rotate
 
@@ -10,6 +11,7 @@ __all__ = [
     "HeadSpec",
     "SwiGLU",
     "SwiGLUHead",
+    "DiscreteActionHead",
     "DiscreteActionValueHead",
     "LayerwiseDiscreteActionValueHead",
     "VectorActionValueHead",
@@ -36,7 +38,7 @@ def build_heads(
     Supported names:
       - "action_value": DiscreteActionValueHead (per-discrete-action values, has target net)
       - "action_vector": VectorActionValueHead (vector per action, has target net)
-      - "action": plain head for direct discrete action logits/policy
+      - "action": DiscreteActionHead — discrete action logits / policy (no target net)
       - "value": plain head for value regression
 
     If ``head_kwargs`` is None or has no ``heads`` list, all heads are disabled.
@@ -106,6 +108,15 @@ def build_heads(
                 num_layers=int(spec.num_layers),
                 scale=sc,
                 bias_scale=bs,
+                use_norm=un,
+            )
+        elif nm == "action":
+            built[nm] = DiscreteActionHead(
+                in_features=hidden_dim,
+                out_features=max_num_actions,
+                hidden_dim=hd,
+                num_layers=int(spec.num_layers),
+                scale=sc,
                 use_norm=un,
             )
         else:

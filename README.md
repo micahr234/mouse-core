@@ -49,10 +49,10 @@ source scripts/install.sh
 mouse-core gives you three building blocks for in-context RL. Compose them in your own training loop:
 
 * **Data** (`mouse_core.data`) — stores sequential rows in `Datastore` and batches contiguous windows with `DataLoader`.
-* **Models** (`mouse_core.models`) — encoder + backbone (`LlamaBackbone`, `Qwen3Backbone`, or `IdentityBackbone`) + output heads.
+* **Models** (`mouse_core.models`) — encoder + backbone (`ModernBertBackbone`, `LlamaBackbone`, `Qwen3Backbone`, or `IdentityBackbone`) + output heads (`DiscreteActionHead`, `DiscreteActionValueHead`, …).
 * **Objectives** (`mouse_core.objectives`) — training losses such as DQN, VecDQN, SP, and SV.
 
-Backbone loading has one public path: instantiate the backbone. For example, `LlamaBackbone(pretrained="meta-llama/Llama-3.2-1B", num_layers=2)` reads the pretrained config, loads matching transformer weights, and exposes `backbone.hidden_dim` for the encoder and heads.
+Backbone loading has one public path: instantiate the backbone. For example, `LlamaBackbone(pretrained="meta-llama/Llama-3.2-1B", num_layers=2)` reads the pretrained config, loads matching transformer weights, and exposes `backbone.hidden_dim` for the encoder and heads. Use `ModernBertBackbone(pretrained="answerdotai/ModernBERT-large")` when you want full bidirectional attention over the context window (no KV-cache incremental inference).
 
 
 ## Quick start 🚀
@@ -67,6 +67,7 @@ The [example notebooks](examples/) are the primary documentation. Work through t
 | [04 — Inference](examples/04_inference.ipynb) | KV-cache inference, loading the current checkpoint from the shared Hub model repo |
 | [05 — Layerwise DQN online](examples/05_train_online_layerwise_dqn.ipynb) | Per-layer Q heads and `LayerwiseDqnObjective` |
 | [06 — Vector-DQN online](examples/06_train_online_vec_dqn.ipynb) | 2D action vectors, RoPE reward rotation, `VecDqnObjective` |
+| [07 — Teacher–student distill online](examples/07_train_online_distill.ipynb) | Bidirectional teacher DQN + causal student `SpObjective` co-training |
 
 Each notebook explains the relevant concepts inline. API details live in the Python docstrings (`load_model`, `Datastore`, `DqnObjective`, etc.).
 

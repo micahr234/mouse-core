@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `DiscreteActionHead`: discrete action logits head (pairs with `DiscreteActionValueHead` for teacher–student distillation via `SpObjective`); save/load type `discrete_action`; `build_heads` `"action"` name builds it.
+- `examples/07_train_online_distill.ipynb`: online teacher–student co-training — student (`Qwen3Backbone` + `DiscreteActionHead`) collects replay; teacher (`ModernBertBackbone` + `DiscreteActionValueHead`) learns DQN; student distills teacher Q via `SpObjective` on shared batches with one optimizer.
+- `ModernBertBackbone`: bidirectional ModernBERT encoder adapter (`answerdotai/ModernBERT-large` pretrained loading, per-layer hidden-state export, and save/load support). KV caching is not supported; reprocess the full context on each forward.
 - `examples/06_train_online_vec_dqn.ipynb`: online FrozenLake training with Vector-DQN (`VectorActionValueHead`, `vec_dim=2`, `VecDqnObjective`).
 - `examples/run_vec_dqn_learning_demo.py`: scaled-down online Vector-DQN run that logs `action_vector` loss and rollout return (CPU-friendly smoke test).
 - `LayerwiseDiscreteActionValueHead` and `action_value_layerwise` model head: one DQN value head per backbone layer, reading pooled hidden states from every transformer block.
@@ -17,6 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `DataLoader.refresh()` re-snapshots underlying stores and drains any prefetched batches, so online replay can pick up newly appended rows without rebuilding the loader.
 - `DataLoader` accepts an optional `seed` argument (default `None`) that controls its internal NumPy RNG; when set, worker `i` uses `seed + i` for deterministic multi-worker sampling.
 - `StepEmbedder` accepts a new `type_embedding_std` parameter to control the initialisation std of the type embedding table independently from the content embedding `std`. **Required when `include_type_token=True`**; raises `ValueError` if omitted to prevent accidental type-to-content signal imbalance.
+
+### Changed
+- `SpObjective` and `SvObjective` accept `targets_key` (default `"info_q_star"`) to select the per-action Q target column in `objective_data`, parallel to `DqnObjective`'s `action_key` / `reward_key` / `done_key`.
 
 ### Fixed
 - `examples/03_train_online.ipynb` collect/train loop no longer consumes all env steps in a single rollout; `ENV_STEPS_PER_CYCLE` caps each cycle so DQN updates run repeatedly, and epsilon is recomputed per env transition instead of once per cycle.

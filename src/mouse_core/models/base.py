@@ -14,6 +14,7 @@ from tensordict import TensorDict
 
 from mouse_core.models.embedding.embedding import Encoder
 from mouse_core.models.heads.base import BaseHead
+from mouse_core.models.heads.discrete_action import DiscreteActionHead
 from mouse_core.models.heads.dqn import DiscreteActionValueHead
 from mouse_core.models.heads.layerwise_dqn import LayerwiseDiscreteActionValueHead
 from mouse_core.models.heads.swiglu import SwiGLUHead
@@ -21,11 +22,15 @@ from mouse_core.models.heads.vec_dqn import VectorActionValueHead, vector_action
 
 
 def _backbone_num_layers(backbone: nn.Module) -> int | None:
-    """Return transformer block count when the backbone exposes ``model.layers``."""
+    """Return transformer block count when the backbone exposes block layers."""
     inner = getattr(backbone, "model", None)
     layers = getattr(inner, "layers", None)
     if layers is not None:
         return len(layers)
+    encoder = getattr(inner, "encoder", None)
+    encoder_layers = getattr(encoder, "layer", None)
+    if encoder_layers is not None:
+        return len(encoder_layers)
     from mouse_core.models.backbone import IdentityBackbone
 
     if isinstance(backbone, IdentityBackbone):
@@ -347,11 +352,18 @@ def _public_modality_config(modality: Any) -> dict[str, Any]:
 
 def _backbone_config(backbone: nn.Module) -> dict[str, Any]:
     from mouse_core.models.backbone.llama import LlamaBackbone
+    from mouse_core.models.backbone.modernbert import ModernBertBackbone
     from mouse_core.models.backbone.none import IdentityBackbone
     from mouse_core.models.backbone.qwen3 import Qwen3Backbone
 
     if isinstance(backbone, IdentityBackbone):
         return {"type": "identity", "hidden_dim": backbone.hidden_dim}
+    if isinstance(backbone, ModernBertBackbone):
+        return {
+            "type": "modernbert",
+            "hidden_dim": backbone.hidden_dim,
+            "kwargs": dict(backbone._config_kwargs),
+        }
     if isinstance(backbone, LlamaBackbone):
         return {
             "type": "llama",
@@ -365,7 +377,8 @@ def _backbone_config(backbone: nn.Module) -> dict[str, Any]:
             "kwargs": dict(backbone._config_kwargs),
         }
     raise TypeError(
-        "save_model currently supports IdentityBackbone, LlamaBackbone, and Qwen3Backbone. "
+        "save_model currently supports IdentityBackbone, ModernBertBackbone, LlamaBackbone, "
+        "and Qwen3Backbone. "
         f"Got {type(backbone).__name__}."
     )
 
@@ -418,6 +431,17 @@ def _head_config(name: str, head: BaseHead) -> dict[str, Any] | None:
         if head.bias_scale is not None:
             spec["bias_scale"] = head.bias_scale
         return spec
+    if isinstance(head, DiscreteActionHead):
+        return {
+            "name": name,
+            "type": "discrete_action",
+            "in_features": head.in_features,
+            "out_features": head.out_features,
+            "hidden_dim": head.hidden_dim,
+            "num_layers": head.num_layers,
+            "scale": head.scale,
+            "use_norm": head.use_norm,
+        }
     if isinstance(head, SwiGLUHead):
         return {
             "name": name,
@@ -516,6 +540,10 @@ def _build_backbone_from_config(config: dict[str, Any]) -> nn.Module:
         from mouse_core.models.backbone import IdentityBackbone
 
         return IdentityBackbone(hidden_dim=config.get("hidden_dim"))
+    if backbone_type == "modernbert":
+        from mouse_core.models.backbone import ModernBertBackbone
+
+        return ModernBertBackbone(hidden_dim=config["hidden_dim"], **config["kwargs"])
     if backbone_type == "llama":
         from mouse_core.models.backbone import LlamaBackbone
 
@@ -560,6 +588,15 @@ def _build_heads_from_config(heads: list[dict[str, Any]]) -> dict[str, BaseHead]
                 num_layers=spec["num_layers"],
                 scale=spec.get("scale", 1.0),
                 bias_scale=spec.get("bias_scale"),
+                use_norm=spec.get("use_norm", True),
+            )
+        elif head_type == "discrete_action":
+            built[name] = DiscreteActionHead(
+                in_features=spec["in_features"],
+                out_features=spec["out_features"],
+                hidden_dim=spec["hidden_dim"],
+                num_layers=spec["num_layers"],
+                scale=spec.get("scale", 1.0),
                 use_norm=spec.get("use_norm", True),
             )
         elif head_type == "swiglu":

@@ -35,3 +35,20 @@ def test_sp_objective_skips_rows_with_no_finite_action_targets() -> None:
     loss, _ = SpObjective(loss_type="ce")(objective_data, predictions)
 
     assert loss.item() < 1.0e-4
+
+
+def test_sp_objective_custom_targets_key() -> None:
+    objective_data = TensorDict(
+        {"action_value": torch.tensor([[[0.0, 2.0]]])},
+        batch_size=(1, 1),
+    )
+    predictions = TensorDict(
+        {"action": torch.tensor([[[0.0, 1.0]]])},
+        batch_size=(1, 1),
+    )
+
+    loss, _ = SpObjective(loss_type="ce", targets_key="action_value")(
+        objective_data, predictions
+    )
+
+    assert loss.item() > 0.0
