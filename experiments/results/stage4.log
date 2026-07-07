@@ -1,0 +1,9 @@
+===== STARTING --name full_online --augment true =====
+Loading weights:   0%|          | 0/310 [00:00<?, ?it/s]Loading weights: 100%|██████████| 310/310 [00:00<00:00, 12113.68it/s]
+[full_online] model built in 4.8s on cuda
+[full_online] random policy holdout: success=0.051169786096256685
+[full_online] env_step=5000 grad_step=0 | envs_seen=25 | episodes=680 mean_reward=0.021161766722798347
+[full_online] grad_step=1000 | loss=0.0087 q=0.166
+[full_online] env_step=10000 grad_step=1000 | envs_seen=50 | episodes=560 mean_reward=0.026035716757178307
+[full_online] grad_step=2000 | loss=0.0054 q=0.142
+[full_online] env_step=15000 grad_step=2000 | envs_seen=75 | episodes=765 mean_reward=-0.011581696569919586

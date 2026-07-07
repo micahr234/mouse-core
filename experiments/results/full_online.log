@@ -1,0 +1,34 @@
+Loading weights:   0%|          | 0/310 [00:00<?, ?it/s]Loading weights: 100%|██████████| 310/310 [00:00<00:00, 11208.14it/s]
+[full_online] model built in 4.8s on cuda
+[full_online] random policy holdout: success=0.17252747252747253
+[full_online] env_step=5000 grad_step=0 | envs_seen=25 | episodes=567 mean_reward=0.07583773881196976
+[full_online] grad_step=1000 | loss=0.0080 q=0.128
+[full_online] env_step=10000 grad_step=1000 | envs_seen=50 | episodes=434 mean_reward=0.08294931054115295
+[full_online] grad_step=2000 | loss=0.0055 q=0.109
+[full_online] env_step=15000 grad_step=2000 | envs_seen=75 | episodes=445 mean_reward=0.1550561785697937
+[full_online] grad_step=3000 | loss=0.0046 q=0.117
+[full_online] env_step=20000 grad_step=3000 | envs_seen=100 | episodes=455 mean_reward=0.3142857253551483
+[full_online] grad_step=4000 | loss=0.0064 q=0.181
+[full_online] env_step=25000 grad_step=4000 | envs_seen=125 | episodes=608 mean_reward=0.21381579339504242
+[full_online] grad_step=5000 | loss=0.0074 q=0.229
+[full_online] EVAL holdout @ 5000 temp=0.0: success=0.32107142857142856 bump=0.41718155527443457 stuck=0.09733333333333333
+[full_online] EVAL train-maps @ 5000: success=0.4522540652750548 bump=0.3136416287396163 stuck=0.098
+[full_online] env_step=30000 grad_step=5000 | envs_seen=150 | episodes=625 mean_reward=0.2896000146865845
+[full_online] grad_step=6000 | loss=0.0095 q=0.287
+[full_online] env_step=35000 grad_step=6000 | envs_seen=175 | episodes=651 mean_reward=0.4439324140548706
+[full_online] grad_step=7000 | loss=0.0126 q=0.390
+[full_online] env_step=40000 grad_step=7000 | envs_seen=200 | episodes=518 mean_reward=0.5173745155334473
+[full_online] grad_step=8000 | loss=0.0149 q=0.470
+[full_online] env_step=45000 grad_step=8000 | envs_seen=225 | episodes=447 mean_reward=0.6420581936836243
+[full_online] grad_step=9000 | loss=0.0167 q=0.538
+[full_online] env_step=50000 grad_step=9000 | envs_seen=250 | episodes=637 mean_reward=0.35949763655662537
+[full_online] grad_step=10000 | loss=0.0187 q=0.609
+[full_online] EVAL holdout @ 10000 temp=0.0: success=0.6821235947960086 bump=0.1940801375726605 stuck=0.02733333333333333
+[full_online] EVAL train-maps @ 10000: success=0.6971028154851684 bump=0.14301814497971774 stuck=0.0
+[full_online] env_step=55000 grad_step=10000 | envs_seen=275 | episodes=631 mean_reward=0.44690966606140137
+[full_online] grad_step=11000 | loss=0.0202 q=0.693
+[full_online] env_step=60000 grad_step=11000 | envs_seen=300 | episodes=539 mean_reward=0.3562152087688446
+[full_online] grad_step=12000 | loss=0.0214 q=0.743
+[full_online] env_step=65000 grad_step=12000 | envs_seen=325 | episodes=574 mean_reward=0.44947734475135803
+[full_online] grad_step=13000 | loss=0.0238 q=0.811
+[full_online] env_step=70000 grad_step=13000 | envs_seen=350 | episodes=540 mean_reward=0.4333333373069763

@@ -1,5 +1,5 @@
 from mouse_core.models.base import Model, load_model, save_model, push_model_to_hub
-from mouse_core.models.backbone import Backbone, ModernBertBackbone, LlamaBackbone, Qwen3Backbone, IdentityBackbone
+from mouse_core.models.backbone import Backbone, LlamaBackbone, Qwen3Backbone, IdentityBackbone
 from mouse_core.models.heads import BaseHead, BaseHeadWithTarget, HeadSpec, SwiGLUHead, DiscreteActionHead, DiscreteActionValueHead, LayerwiseDiscreteActionValueHead, VectorActionValueHead, build_heads
 from mouse_core.models.embedding.embedding import Encoder, StepEmbedder, ModalitySpec
 
@@ -10,7 +10,6 @@ __all__ = [
     "push_model_to_hub",
     "Encoder",
     "Backbone",
-    "ModernBertBackbone",
     "LlamaBackbone",
     "Qwen3Backbone",
     "IdentityBackbone",

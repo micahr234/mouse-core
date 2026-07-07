@@ -29,6 +29,19 @@ from datasets import Dataset, concatenate_datasets
 datasets.disable_progress_bar()
 
 
+def _normalize_value(value: Any) -> Any:
+    """Unwrap 0-dim arrays/tensors to plain Python scalars.
+
+    Environments (e.g. mouse-gym) emit step fields as 0-dim NumPy arrays.
+    ``Dataset.from_list`` would serialize those as 1-element lists, breaking
+    scalar consumers downstream, so scalars are unwrapped once at append time.
+    """
+    item = getattr(value, "item", None)
+    if item is not None and getattr(value, "ndim", None) == 0:
+        return item()
+    return value
+
+
 def _hf_batch_to_rows(batch: dict[str, Any]) -> list[dict]:
     """Convert an HF batch (dict-of-lists) to a list of row dicts."""
     if not batch:
@@ -151,7 +164,7 @@ class Datastore:
             raise TypeError("append expects a row dict, Datastore, or list of Datastore objects.")
         if not data:
             raise ValueError("Row cannot be empty.")
-        self._rows.append(dict(data))
+        self._rows.append({k: _normalize_value(v) for k, v in data.items()})
 
     # ------------------------------------------------------------------
     # HuggingFace Dataset I/O

@@ -352,18 +352,11 @@ def _public_modality_config(modality: Any) -> dict[str, Any]:
 
 def _backbone_config(backbone: nn.Module) -> dict[str, Any]:
     from mouse_core.models.backbone.llama import LlamaBackbone
-    from mouse_core.models.backbone.modernbert import ModernBertBackbone
     from mouse_core.models.backbone.none import IdentityBackbone
     from mouse_core.models.backbone.qwen3 import Qwen3Backbone
 
     if isinstance(backbone, IdentityBackbone):
         return {"type": "identity", "hidden_dim": backbone.hidden_dim}
-    if isinstance(backbone, ModernBertBackbone):
-        return {
-            "type": "modernbert",
-            "hidden_dim": backbone.hidden_dim,
-            "kwargs": dict(backbone._config_kwargs),
-        }
     if isinstance(backbone, LlamaBackbone):
         return {
             "type": "llama",
@@ -377,8 +370,7 @@ def _backbone_config(backbone: nn.Module) -> dict[str, Any]:
             "kwargs": dict(backbone._config_kwargs),
         }
     raise TypeError(
-        "save_model currently supports IdentityBackbone, ModernBertBackbone, LlamaBackbone, "
-        "and Qwen3Backbone. "
+        "save_model currently supports IdentityBackbone, LlamaBackbone, and Qwen3Backbone. "
         f"Got {type(backbone).__name__}."
     )
 
@@ -540,10 +532,6 @@ def _build_backbone_from_config(config: dict[str, Any]) -> nn.Module:
         from mouse_core.models.backbone import IdentityBackbone
 
         return IdentityBackbone(hidden_dim=config.get("hidden_dim"))
-    if backbone_type == "modernbert":
-        from mouse_core.models.backbone import ModernBertBackbone
-
-        return ModernBertBackbone(hidden_dim=config["hidden_dim"], **config["kwargs"])
     if backbone_type == "llama":
         from mouse_core.models.backbone import LlamaBackbone
 

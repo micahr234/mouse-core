@@ -1,0 +1,947 @@
+{
+  "config": {
+    "name": "aug50",
+    "seed": 0,
+    "backbone_layers": null,
+    "num_envs": 50,
+    "env_steps_per_cycle": 1000,
+    "steps_per_env": 100,
+    "rotate_envs": true,
+    "augment": true,
+    "gradient_steps": 5000,
+    "gradient_steps_per_cycle": 500,
+    "learning_starts": 1000,
+    "sequence_length": 256,
+    "batch_size": 4,
+    "lr": 1e-05,
+    "exploration_mode": "global",
+    "exploration_ends": 6000,
+    "per_env_exploration_steps": 200,
+    "epsilon_floor": 0.0,
+    "gamma_step": 1.0,
+    "gamma_episode": 0.99,
+    "tau": 0.0005,
+    "step_penalty": 0.0,
+    "eval_maps": 10,
+    "eval_steps": 150,
+    "eval_fracs": [
+      0.5,
+      1.0
+    ],
+    "final_eval_temperatures": [
+      0.0,
+      0.2
+    ]
+  },
+  "device": "cuda",
+  "cycles": [
+    {
+      "env_steps": 1000,
+      "episodes": 107,
+      "mean_reward": 0.05607476457953453,
+      "mean_length": 6.934579372406006,
+      "distinct_envs_visited": 10,
+      "grad_steps": 0,
+      "epsilon": 0.8333333333333334,
+      "train": {
+        "loss_mean": 0.008326868920041306,
+        "loss_last": 0.003641804913058877,
+        "q_mean": 0.2002526777823168,
+        "grad_steps": 500
+      }
+    },
+    {
+      "env_steps": 2000,
+      "episodes": 130,
+      "mean_reward": 0.06923077255487442,
+      "mean_length": 5.55384635925293,
+      "distinct_envs_visited": 20,
+      "grad_steps": 500,
+      "epsilon": 0.6666666666666667,
+      "train": {
+        "loss_mean": 0.008817758146018605,
+        "loss_last": 0.007054770831018686,
+        "q_mean": 0.14777865290641784,
+        "grad_steps": 1000
+      }
+    },
+    {
+      "env_steps": 3000,
+      "episodes": 110,
+      "mean_reward": 0.036363635212183,
+      "mean_length": 7.563636302947998,
+      "distinct_envs_visited": 30,
+      "grad_steps": 1000,
+      "epsilon": 0.5,
+      "train": {
+        "loss_mean": 0.004755735134138376,
+        "loss_last": 0.00510262930765748,
+        "q_mean": 0.1112888500392437,
+        "grad_steps": 1500
+      }
+    },
+    {
+      "env_steps": 4000,
+      "episodes": 113,
+      "mean_reward": 0.02654867246747017,
+      "mean_length": 6.796460151672363,
+      "distinct_envs_visited": 40,
+      "grad_steps": 1500,
+      "epsilon": 0.33333333333333337,
+      "train": {
+        "loss_mean": 0.003683378872588946,
+        "loss_last": 0.004592725541442633,
+        "q_mean": 0.10414772030711174,
+        "grad_steps": 2000
+      }
+    },
+    {
+      "env_steps": 5000,
+      "episodes": 107,
+      "mean_reward": 0.05607476457953453,
+      "mean_length": 7.364486217498779,
+      "distinct_envs_visited": 50,
+      "grad_steps": 2000,
+      "epsilon": 0.16666666666666663,
+      "train": {
+        "loss_mean": 0.0036947781453491187,
+        "loss_last": 0.002019476843997836,
+        "q_mean": 0.10458141978085041,
+        "grad_steps": 2500
+      }
+    },
+    {
+      "env_steps": 6000,
+      "episodes": 115,
+      "mean_reward": 0.043478261679410934,
+      "mean_length": 7.904347896575928,
+      "distinct_envs_visited": 50,
+      "grad_steps": 2500,
+      "epsilon": 0.0,
+      "train": {
+        "loss_mean": 0.003305736093498126,
+        "loss_last": 0.005146683659404516,
+        "q_mean": 0.10775655004382133,
+        "grad_steps": 3000
+      }
+    },
+    {
+      "env_steps": 7000,
+      "episodes": 126,
+      "mean_reward": 0.095238097012043,
+      "mean_length": 7.246031761169434,
+      "distinct_envs_visited": 50,
+      "grad_steps": 3000,
+      "epsilon": 0.0,
+      "train": {
+        "loss_mean": 0.0037761568547866773,
+        "loss_last": 0.0041010561399161816,
+        "q_mean": 0.12867127922177315,
+        "grad_steps": 3500
+      }
+    },
+    {
+      "env_steps": 8000,
+      "episodes": 66,
+      "mean_reward": 0.06060606241226196,
+      "mean_length": 12.57575798034668,
+      "distinct_envs_visited": 50,
+      "grad_steps": 3500,
+      "epsilon": 0.0,
+      "train": {
+        "loss_mean": 0.0026885135737647944,
+        "loss_last": 0.0014977460959926248,
+        "q_mean": 0.134803726837039,
+        "grad_steps": 4000
+      }
+    },
+    {
+      "env_steps": 9000,
+      "episodes": 153,
+      "mean_reward": 0.03267974033951759,
+      "mean_length": 5.392157077789307,
+      "distinct_envs_visited": 50,
+      "grad_steps": 4000,
+      "epsilon": 0.0,
+      "train": {
+        "loss_mean": 0.002665364304513787,
+        "loss_last": 0.003527540946379304,
+        "q_mean": 0.1390962568372488,
+        "grad_steps": 4500
+      }
+    },
+    {
+      "env_steps": 10000,
+      "episodes": 98,
+      "mean_reward": 0.09183673560619354,
+      "mean_length": 9.13265323638916,
+      "distinct_envs_visited": 50,
+      "grad_steps": 4500,
+      "epsilon": 0.0,
+      "train": {
+        "loss_mean": 0.002818838022387354,
+        "loss_last": 0.004732269793748856,
+        "q_mean": 0.152726866081357,
+        "grad_steps": 5000
+      }
+    }
+  ],
+  "evals": [
+    {
+      "holdout": true,
+      "policy": "random",
+      "temperature": 0.0,
+      "episodes_total": 143,
+      "success_rate": 0.0868997668997669,
+      "first_half_success": 0.06999999999999999,
+      "second_half_success": 0.09761904761904762,
+      "mean_episode_length": 11.723294483294485,
+      "bump_frac": 0.22238090256774196,
+      "stuck_frac": 0.0,
+      "per_env": [
+        {
+          "map_id": 1000000,
+          "episodes": 25,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 4.6,
+          "bump_frac": 0.1414141414141414,
+          "stuck_frac": 0.0
+        },
+        {
+          "map_id": 1000001,
+          "episodes": 24,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 5.125,
+          "bump_frac": 0.1485148514851485,
+          "stuck_frac": 0.0
+        },
+        {
+          "map_id": 1000002,
+          "episodes": 8,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 15.375,
+          "bump_frac": 0.2857142857142857,
+          "stuck_frac": 0.0
+        },
+        {
+          "map_id": 1000003,
+          "episodes": 18,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 7.222222222222222,
+          "bump_frac": 0.23008849557522124,
+          "stuck_frac": 0.0
+        },
+        {
+          "map_id": 1000004,
+          "episodes": 13,
+          "success_rate": 0.15384615384615385,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.16666666666666666,
+          "second_half_success": 0.14285714285714285,
+          "mean_length": 8.307692307692308,
+          "bump_frac": 0.2845528455284553,
+          "stuck_frac": 0.0
+        },
+        {
+          "map_id": 1000005,
+          "episodes": 6,
+          "success_rate": 0.3333333333333333,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.3333333333333333,
+          "second_half_success": 0.3333333333333333,
+          "mean_length": 23.166666666666668,
+          "bump_frac": 0.18248175182481752,
+          "stuck_frac": 0.0
+        },
+        {
+          "map_id": 1000006,
+          "episodes": 15,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 9.0,
+          "bump_frac": 0.325,
+          "stuck_frac": 0.0
+        },
+        {
+          "map_id": 1000007,
+          "episodes": 18,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 7.0,
+          "bump_frac": 0.22123893805309736,
+          "stuck_frac": 0.0
+        },
+        {
+          "map_id": 1000008,
+          "episodes": 5,
+          "success_rate": 0.2,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.3333333333333333,
+          "mean_length": 26.8,
+          "bump_frac": 0.2158273381294964,
+          "stuck_frac": 0.0
+        },
+        {
+          "map_id": 1000009,
+          "episodes": 11,
+          "success_rate": 0.18181818181818182,
+          "first_episode_success": 1.0,
+          "first_half_success": 0.2,
+          "second_half_success": 0.16666666666666666,
+          "mean_length": 10.636363636363637,
+          "bump_frac": 0.1889763779527559,
+          "stuck_frac": 0.0
+        }
+      ],
+      "grad_steps": 0
+    },
+    {
+      "holdout": true,
+      "policy": "model",
+      "temperature": 0.0,
+      "episodes_total": 150,
+      "success_rate": 0.0,
+      "first_half_success": 0.0,
+      "second_half_success": 0.0,
+      "mean_episode_length": 25.062514822134386,
+      "bump_frac": 0.5504274535636585,
+      "stuck_frac": 0.3526666666666667,
+      "per_env": [
+        {
+          "map_id": 1000000,
+          "episodes": 46,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 2.260869565217391,
+          "bump_frac": 0.034482758620689655,
+          "stuck_frac": 0.0
+        },
+        {
+          "map_id": 1000001,
+          "episodes": 30,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 3.8,
+          "bump_frac": 0.06741573033707865,
+          "stuck_frac": 0.0
+        },
+        {
+          "map_id": 1000002,
+          "episodes": 2,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 50.0,
+          "bump_frac": 0.9586206896551724,
+          "stuck_frac": 0.7666666666666667
+        },
+        {
+          "map_id": 1000003,
+          "episodes": 22,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 5.590909090909091,
+          "bump_frac": 0.2,
+          "stuck_frac": 0.0
+        },
+        {
+          "map_id": 1000004,
+          "episodes": 23,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 5.260869565217392,
+          "bump_frac": 0.3592233009708738,
+          "stuck_frac": 0.013333333333333334
+        },
+        {
+          "map_id": 1000005,
+          "episodes": 2,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 50.0,
+          "bump_frac": 1.0,
+          "stuck_frac": 0.8066666666666666
+        },
+        {
+          "map_id": 1000006,
+          "episodes": 2,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 50.0,
+          "bump_frac": 0.8758620689655172,
+          "stuck_frac": 0.6866666666666666
+        },
+        {
+          "map_id": 1000007,
+          "episodes": 2,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 50.0,
+          "bump_frac": 1.0,
+          "stuck_frac": 0.8066666666666666
+        },
+        {
+          "map_id": 1000008,
+          "episodes": 16,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 8.3125,
+          "bump_frac": 0.28205128205128205,
+          "stuck_frac": 0.0
+        },
+        {
+          "map_id": 1000009,
+          "episodes": 5,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 25.4,
+          "bump_frac": 0.7266187050359713,
+          "stuck_frac": 0.44666666666666666
+        }
+      ],
+      "grad_steps": 2500
+    },
+    {
+      "holdout": false,
+      "policy": "model",
+      "temperature": 0.0,
+      "episodes_total": 168,
+      "success_rate": 0.025416666666666664,
+      "first_half_success": 0.0125,
+      "second_half_success": 0.0375,
+      "mean_episode_length": 26.964938932560745,
+      "bump_frac": 0.7204893932572698,
+      "stuck_frac": 0.43200000000000005,
+      "per_env": [
+        {
+          "map_id": 0,
+          "episodes": 2,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 50.0,
+          "bump_frac": 1.0,
+          "stuck_frac": 0.8066666666666666
+        },
+        {
+          "map_id": 1,
+          "episodes": 3,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 42.0,
+          "bump_frac": 0.972027972027972,
+          "stuck_frac": 0.6933333333333334
+        },
+        {
+          "map_id": 2,
+          "episodes": 16,
+          "success_rate": 0.1875,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.125,
+          "second_half_success": 0.25,
+          "mean_length": 8.1875,
+          "bump_frac": 0.4017094017094017,
+          "stuck_frac": 0.21333333333333335
+        },
+        {
+          "map_id": 3,
+          "episodes": 15,
+          "success_rate": 0.06666666666666667,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.125,
+          "mean_length": 8.866666666666667,
+          "bump_frac": 0.47058823529411764,
+          "stuck_frac": 0.18666666666666668
+        },
+        {
+          "map_id": 4,
+          "episodes": 2,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 50.0,
+          "bump_frac": 1.0,
+          "stuck_frac": 0.8066666666666666
+        },
+        {
+          "map_id": 5,
+          "episodes": 2,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 50.0,
+          "bump_frac": 0.896551724137931,
+          "stuck_frac": 0.7
+        },
+        {
+          "map_id": 6,
+          "episodes": 2,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 50.0,
+          "bump_frac": 0.9379310344827586,
+          "stuck_frac": 0.7466666666666667
+        },
+        {
+          "map_id": 7,
+          "episodes": 74,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 1.0135135135135136,
+          "bump_frac": 1.0,
+          "stuck_frac": 0.0
+        },
+        {
+          "map_id": 8,
+          "episodes": 29,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 4.103448275862069,
+          "bump_frac": 0.0989010989010989,
+          "stuck_frac": 0.0
+        },
+        {
+          "map_id": 9,
+          "episodes": 23,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 5.478260869565218,
+          "bump_frac": 0.42718446601941745,
+          "stuck_frac": 0.16666666666666666
+        }
+      ],
+      "grad_steps": 2500
+    },
+    {
+      "holdout": true,
+      "policy": "model",
+      "temperature": 0.0,
+      "episodes_total": 102,
+      "success_rate": 0.0,
+      "first_half_success": 0.0,
+      "second_half_success": 0.0,
+      "mean_episode_length": 24.001461455211455,
+      "bump_frac": 0.5944631812064743,
+      "stuck_frac": 0.10733333333333332,
+      "per_env": [
+        {
+          "map_id": 1000000,
+          "episodes": 39,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 2.8205128205128207,
+          "bump_frac": 0.7323943661971831,
+          "stuck_frac": 0.02
+        },
+        {
+          "map_id": 1000001,
+          "episodes": 7,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 20.428571428571427,
+          "bump_frac": 0.5735294117647058,
+          "stuck_frac": 0.12666666666666668
+        },
+        {
+          "map_id": 1000002,
+          "episodes": 16,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 8.3125,
+          "bump_frac": 0.452991452991453,
+          "stuck_frac": 0.013333333333333334
+        },
+        {
+          "map_id": 1000003,
+          "episodes": 4,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 33.25,
+          "bump_frac": 0.5673758865248227,
+          "stuck_frac": 0.04666666666666667
+        },
+        {
+          "map_id": 1000004,
+          "episodes": 3,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 33.666666666666664,
+          "bump_frac": 0.6363636363636364,
+          "stuck_frac": 0.14666666666666667
+        },
+        {
+          "map_id": 1000005,
+          "episodes": 11,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 12.636363636363637,
+          "bump_frac": 0.53125,
+          "stuck_frac": 0.10666666666666667
+        },
+        {
+          "map_id": 1000006,
+          "episodes": 8,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 17.5,
+          "bump_frac": 0.5864661654135338,
+          "stuck_frac": 0.05333333333333334
+        },
+        {
+          "map_id": 1000007,
+          "episodes": 10,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 11.4,
+          "bump_frac": 0.4573643410852713,
+          "stuck_frac": 0.0
+        },
+        {
+          "map_id": 1000008,
+          "episodes": 2,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 50.0,
+          "bump_frac": 0.7172413793103448,
+          "stuck_frac": 0.2866666666666667
+        },
+        {
+          "map_id": 1000009,
+          "episodes": 2,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 50.0,
+          "bump_frac": 0.6896551724137931,
+          "stuck_frac": 0.2733333333333333
+        }
+      ],
+      "grad_steps": 5000
+    },
+    {
+      "holdout": true,
+      "policy": "model",
+      "temperature": 0.2,
+      "episodes_total": 146,
+      "success_rate": 0.0706043956043956,
+      "first_half_success": 0.05,
+      "second_half_success": 0.08809523809523809,
+      "mean_episode_length": 11.516821835571836,
+      "bump_frac": 0.21762007529002547,
+      "stuck_frac": 0.0,
+      "per_env": [
+        {
+          "map_id": 1000000,
+          "episodes": 27,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 4.37037037037037,
+          "bump_frac": 0.14736842105263157,
+          "stuck_frac": 0.0
+        },
+        {
+          "map_id": 1000001,
+          "episodes": 16,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 8.1875,
+          "bump_frac": 0.24786324786324787,
+          "stuck_frac": 0.0
+        },
+        {
+          "map_id": 1000002,
+          "episodes": 9,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 15.333333333333334,
+          "bump_frac": 0.21374045801526717,
+          "stuck_frac": 0.0
+        },
+        {
+          "map_id": 1000003,
+          "episodes": 16,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 8.125,
+          "bump_frac": 0.1794871794871795,
+          "stuck_frac": 0.0
+        },
+        {
+          "map_id": 1000004,
+          "episodes": 12,
+          "success_rate": 0.25,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.3333333333333333,
+          "second_half_success": 0.16666666666666666,
+          "mean_length": 11.333333333333334,
+          "bump_frac": 0.224,
+          "stuck_frac": 0.0
+        },
+        {
+          "map_id": 1000005,
+          "episodes": 13,
+          "success_rate": 0.38461538461538464,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.16666666666666666,
+          "second_half_success": 0.5714285714285714,
+          "mean_length": 10.461538461538462,
+          "bump_frac": 0.14634146341463414,
+          "stuck_frac": 0.0
+        },
+        {
+          "map_id": 1000006,
+          "episodes": 14,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 9.214285714285714,
+          "bump_frac": 0.24793388429752067,
+          "stuck_frac": 0.0
+        },
+        {
+          "map_id": 1000007,
+          "episodes": 21,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 6.142857142857143,
+          "bump_frac": 0.37962962962962965,
+          "stuck_frac": 0.0
+        },
+        {
+          "map_id": 1000008,
+          "episodes": 4,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 32.5,
+          "bump_frac": 0.19148936170212766,
+          "stuck_frac": 0.0
+        },
+        {
+          "map_id": 1000009,
+          "episodes": 14,
+          "success_rate": 0.07142857142857142,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.14285714285714285,
+          "mean_length": 9.5,
+          "bump_frac": 0.19834710743801653,
+          "stuck_frac": 0.0
+        }
+      ],
+      "grad_steps": 5000
+    },
+    {
+      "holdout": false,
+      "policy": "model",
+      "temperature": 0.0,
+      "episodes_total": 197,
+      "success_rate": 0.014285714285714285,
+      "first_half_success": 0.014285714285714285,
+      "second_half_success": 0.014285714285714285,
+      "mean_episode_length": 9.51040446481623,
+      "bump_frac": 0.4972610039250931,
+      "stuck_frac": 0.068,
+      "per_env": [
+        {
+          "map_id": 0,
+          "episodes": 11,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 10.818181818181818,
+          "bump_frac": 0.6220472440944882,
+          "stuck_frac": 0.14666666666666667
+        },
+        {
+          "map_id": 1,
+          "episodes": 14,
+          "success_rate": 0.14285714285714285,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.14285714285714285,
+          "second_half_success": 0.14285714285714285,
+          "mean_length": 9.142857142857142,
+          "bump_frac": 0.24793388429752067,
+          "stuck_frac": 0.0
+        },
+        {
+          "map_id": 2,
+          "episodes": 3,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 33.666666666666664,
+          "bump_frac": 0.5034965034965035,
+          "stuck_frac": 0.16
+        },
+        {
+          "map_id": 3,
+          "episodes": 14,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 8.142857142857142,
+          "bump_frac": 0.5785123966942148,
+          "stuck_frac": 0.12666666666666668
+        },
+        {
+          "map_id": 4,
+          "episodes": 33,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 3.393939393939394,
+          "bump_frac": 0.24096385542168675,
+          "stuck_frac": 0.0
+        },
+        {
+          "map_id": 5,
+          "episodes": 17,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 7.529411764705882,
+          "bump_frac": 0.4608695652173913,
+          "stuck_frac": 0.0
+        },
+        {
+          "map_id": 6,
+          "episodes": 18,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 7.277777777777778,
+          "bump_frac": 0.4247787610619469,
+          "stuck_frac": 0.0
+        },
+        {
+          "map_id": 7,
+          "episodes": 40,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 2.75,
+          "bump_frac": 1.0,
+          "stuck_frac": 0.10666666666666667
+        },
+        {
+          "map_id": 8,
+          "episodes": 13,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 9.0,
+          "bump_frac": 0.5853658536585366,
+          "stuck_frac": 0.13333333333333333
+        },
+        {
+          "map_id": 9,
+          "episodes": 34,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 3.3823529411764706,
+          "bump_frac": 0.30864197530864196,
+          "stuck_frac": 0.006666666666666667
+        }
+      ],
+      "grad_steps": 5000
+    }
+  ],
+  "timing": {
+    "total_s": 1725.2056202888489,
+    "rollout_s": 180.32813501358032,
+    "train_s": 1346.8970115184784,
+    "eval_s": 192.78772139549255
+  }
+}

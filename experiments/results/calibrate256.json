@@ -1,0 +1,208 @@
+{
+  "config": {
+    "name": "calibrate256",
+    "seed": 0,
+    "backbone_layers": null,
+    "num_envs": 50,
+    "env_steps_per_cycle": 150,
+    "steps_per_env": 100,
+    "rotate_envs": false,
+    "gradient_steps": 30,
+    "gradient_steps_per_cycle": 30,
+    "learning_starts": 150,
+    "sequence_length": 256,
+    "batch_size": 4,
+    "lr": 1e-05,
+    "exploration_mode": "global",
+    "exploration_ends": 300,
+    "per_env_exploration_steps": 200,
+    "epsilon_floor": 0.0,
+    "gamma_step": 1.0,
+    "gamma_episode": 0.99,
+    "tau": 0.0005,
+    "step_penalty": 0.0,
+    "eval_maps": 2,
+    "eval_steps": 30,
+    "eval_fracs": [
+      1.0
+    ],
+    "final_eval_temperatures": [
+      0.0,
+      0.2
+    ]
+  },
+  "device": "cuda",
+  "cycles": [
+    {
+      "env_steps": 150,
+      "episodes": 13,
+      "mean_reward": 0.0,
+      "mean_length": 7.615384578704834,
+      "distinct_envs_visited": 2,
+      "grad_steps": 0,
+      "epsilon": 0.5,
+      "train": {
+        "loss_mean": 0.0011630064516793936,
+        "loss_last": 0.00014081895642448217,
+        "q_mean": 0.27227668861548104,
+        "grad_steps": 30
+      }
+    }
+  ],
+  "evals": [
+    {
+      "holdout": true,
+      "policy": "random",
+      "temperature": 0.0,
+      "episodes_total": 9,
+      "success_rate": 0.0,
+      "first_half_success": 0.0,
+      "second_half_success": 0.0,
+      "mean_episode_length": 4.125,
+      "bump_frac": 0.12406015037593984,
+      "stuck_frac": 0.0,
+      "per_env": [
+        {
+          "map_id": 1000000,
+          "episodes": 4,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 6.25,
+          "bump_frac": 0.14285714285714285,
+          "stuck_frac": 0.0
+        },
+        {
+          "map_id": 1000001,
+          "episodes": 5,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 2.0,
+          "bump_frac": 0.10526315789473684,
+          "stuck_frac": 0.0
+        }
+      ],
+      "grad_steps": 0
+    },
+    {
+      "holdout": true,
+      "policy": "model",
+      "temperature": 0.0,
+      "episodes_total": 6,
+      "success_rate": 0.0,
+      "first_half_success": 0.0,
+      "second_half_success": 0.0,
+      "mean_episode_length": 3.5,
+      "bump_frac": 0.46551724137931033,
+      "stuck_frac": 0.31666666666666665,
+      "per_env": [
+        {
+          "map_id": 1000000,
+          "episodes": 6,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 3.5,
+          "bump_frac": 0.0,
+          "stuck_frac": 0.0
+        },
+        {
+          "map_id": 1000001,
+          "episodes": 0,
+          "success_rate": null,
+          "first_episode_success": null,
+          "first_half_success": null,
+          "second_half_success": null,
+          "mean_length": null,
+          "bump_frac": 0.9310344827586207,
+          "stuck_frac": 0.6333333333333333
+        }
+      ],
+      "grad_steps": 30
+    },
+    {
+      "holdout": true,
+      "policy": "model",
+      "temperature": 0.2,
+      "episodes_total": 13,
+      "success_rate": 0.0,
+      "first_half_success": 0.0,
+      "second_half_success": 0.0,
+      "mean_episode_length": 3.321428571428571,
+      "bump_frac": 0.21764705882352942,
+      "stuck_frac": 0.0,
+      "per_env": [
+        {
+          "map_id": 1000000,
+          "episodes": 6,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 3.5,
+          "bump_frac": 0.23529411764705882,
+          "stuck_frac": 0.0
+        },
+        {
+          "map_id": 1000001,
+          "episodes": 7,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": 0.0,
+          "second_half_success": 0.0,
+          "mean_length": 3.142857142857143,
+          "bump_frac": 0.2,
+          "stuck_frac": 0.0
+        }
+      ],
+      "grad_steps": 30
+    },
+    {
+      "holdout": false,
+      "policy": "model",
+      "temperature": 0.0,
+      "episodes_total": 1,
+      "success_rate": 0.0,
+      "first_half_success": null,
+      "second_half_success": 0.0,
+      "mean_episode_length": 1.0,
+      "bump_frac": 0.8052362707535121,
+      "stuck_frac": 0.35,
+      "per_env": [
+        {
+          "map_id": 0,
+          "episodes": 1,
+          "success_rate": 0.0,
+          "first_episode_success": 0.0,
+          "first_half_success": null,
+          "second_half_success": 0.0,
+          "mean_length": 1.0,
+          "bump_frac": 0.8518518518518519,
+          "stuck_frac": 0.5
+        },
+        {
+          "map_id": 1,
+          "episodes": 0,
+          "success_rate": null,
+          "first_episode_success": null,
+          "first_half_success": null,
+          "second_half_success": null,
+          "mean_length": null,
+          "bump_frac": 0.7586206896551724,
+          "stuck_frac": 0.2
+        }
+      ],
+      "grad_steps": 30
+    }
+  ],
+  "timing": {
+    "total_s": 17.99836564064026,
+    "rollout_s": 1.0621452331542969,
+    "train_s": 7.5726988315582275,
+    "eval_s": 4.574217081069946
+  }
+}

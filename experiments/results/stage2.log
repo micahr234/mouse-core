@@ -1,0 +1,94 @@
+===== STARTING --name aug50 --num-envs 50 --env-steps-per-cycle 1000 --steps-per-env 100 --exploration-ends 6000 =====
+Loading weights:   0%|          | 0/310 [00:00<?, ?it/s]Loading weights: 100%|██████████| 310/310 [00:00<00:00, 12811.83it/s]
+[aug50] model built in 5.1s on cuda
+[aug50] random policy holdout: success=0.0868997668997669
+[aug50] env_step=1000 grad_step=0 | envs_seen=10 | episodes=107 mean_reward=0.05607476457953453
+[aug50] grad_step=500 | loss=0.0083 q=0.200
+[aug50] env_step=2000 grad_step=500 | envs_seen=20 | episodes=130 mean_reward=0.06923077255487442
+[aug50] grad_step=1000 | loss=0.0088 q=0.148
+[aug50] env_step=3000 grad_step=1000 | envs_seen=30 | episodes=110 mean_reward=0.036363635212183
+[aug50] grad_step=1500 | loss=0.0048 q=0.111
+[aug50] env_step=4000 grad_step=1500 | envs_seen=40 | episodes=113 mean_reward=0.02654867246747017
+[aug50] grad_step=2000 | loss=0.0037 q=0.104
+[aug50] env_step=5000 grad_step=2000 | envs_seen=50 | episodes=107 mean_reward=0.05607476457953453
+[aug50] grad_step=2500 | loss=0.0037 q=0.105
+[aug50] EVAL holdout @ 2500 temp=0.0: success=0.0 bump=0.5504274535636585 stuck=0.3526666666666667
+[aug50] EVAL train-maps @ 2500: success=0.025416666666666664 bump=0.7204893932572698 stuck=0.43200000000000005
+[aug50] env_step=6000 grad_step=2500 | envs_seen=50 | episodes=115 mean_reward=0.043478261679410934
+[aug50] grad_step=3000 | loss=0.0033 q=0.108
+[aug50] env_step=7000 grad_step=3000 | envs_seen=50 | episodes=126 mean_reward=0.095238097012043
+[aug50] grad_step=3500 | loss=0.0038 q=0.129
+[aug50] env_step=8000 grad_step=3500 | envs_seen=50 | episodes=66 mean_reward=0.06060606241226196
+[aug50] grad_step=4000 | loss=0.0027 q=0.135
+[aug50] env_step=9000 grad_step=4000 | envs_seen=50 | episodes=153 mean_reward=0.03267974033951759
+[aug50] grad_step=4500 | loss=0.0027 q=0.139
+[aug50] env_step=10000 grad_step=4500 | envs_seen=50 | episodes=98 mean_reward=0.09183673560619354
+[aug50] grad_step=5000 | loss=0.0028 q=0.153
+[aug50] EVAL holdout @ 5000 temp=0.0: success=0.0 bump=0.5944631812064743 stuck=0.10733333333333332
+[aug50] EVAL holdout @ 5000 temp=0.2: success=0.0706043956043956 bump=0.21762007529002547 stuck=0.0
+[aug50] EVAL train-maps @ 5000: success=0.014285714285714285 bump=0.4972610039250931 stuck=0.068
+[aug50] done in 1725s -> /home/user/Repos/mouse-core/experiments/results/aug50.json
+===== FINISHED --name aug50 --num-envs 50 --env-steps-per-cycle 1000 --steps-per-env 100 --exploration-ends 6000 =====
+===== STARTING --name aug_rich --num-envs 100 --env-steps-per-cycle 2000 --steps-per-env 200 --exploration-mode per_env --per-env-exploration-steps 150 --epsilon-floor 0.05 =====
+Loading weights:   0%|          | 0/310 [00:00<?, ?it/s]Loading weights: 100%|██████████| 310/310 [00:00<00:00, 12743.40it/s]
+[aug_rich] model built in 4.8s on cuda
+[aug_rich] random policy holdout: success=0.07713675213675213
+[aug_rich] env_step=2000 grad_step=0 | envs_seen=10 | episodes=296 mean_reward=0.06418918818235397
+[aug_rich] grad_step=500 | loss=0.0101 q=0.188
+[aug_rich] env_step=4000 grad_step=500 | envs_seen=20 | episodes=298 mean_reward=0.00671140942722559
+[aug_rich] grad_step=1000 | loss=0.0045 q=0.122
+[aug_rich] env_step=6000 grad_step=1000 | envs_seen=30 | episodes=180 mean_reward=0.08888889104127884
+[aug_rich] grad_step=1500 | loss=0.0034 q=0.114
+[aug_rich] env_step=8000 grad_step=1500 | envs_seen=40 | episodes=196 mean_reward=0.020408162847161293
+[aug_rich] grad_step=2000 | loss=0.0023 q=0.099
+[aug_rich] env_step=10000 grad_step=2000 | envs_seen=50 | episodes=224 mean_reward=0.0491071417927742
+[aug_rich] grad_step=2500 | loss=0.0029 q=0.098
+[aug_rich] EVAL holdout @ 2500 temp=0.0: success=0.09333333333333334 bump=0.5641662242093978 stuck=0.18866666666666668
+[aug_rich] EVAL train-maps @ 2500: success=0.0 bump=0.6988495809548441 stuck=0.46733333333333327
+[aug_rich] env_step=12000 grad_step=2500 | envs_seen=60 | episodes=230 mean_reward=0.056521739810705185
+[aug_rich] grad_step=3000 | loss=0.0030 q=0.098
+[aug_rich] env_step=14000 grad_step=3000 | envs_seen=70 | episodes=233 mean_reward=0.01287553645670414
+[aug_rich] grad_step=3500 | loss=0.0026 q=0.095
+[aug_rich] env_step=16000 grad_step=3500 | envs_seen=80 | episodes=264 mean_reward=0.01515151560306549
+[aug_rich] grad_step=4000 | loss=0.0022 q=0.095
+[aug_rich] env_step=18000 grad_step=4000 | envs_seen=90 | episodes=177 mean_reward=0.10169491171836853
+[aug_rich] grad_step=4500 | loss=0.0029 q=0.098
+[aug_rich] env_step=20000 grad_step=4500 | envs_seen=100 | episodes=264 mean_reward=0.03787878900766373
+[aug_rich] grad_step=5000 | loss=0.0028 q=0.102
+[aug_rich] EVAL holdout @ 5000 temp=0.0: success=0.0 bump=0.8169201742816693 stuck=0.55
+[aug_rich] EVAL holdout @ 5000 temp=0.2: success=0.06738095238095239 bump=0.22058938040225157 stuck=0.0
+[aug_rich] EVAL train-maps @ 5000: success=0.0 bump=0.6406944519026039 stuck=0.3706666666666667
+[aug_rich] done in 1842s -> /home/user/Repos/mouse-core/experiments/results/aug_rich.json
+===== FINISHED --name aug_rich --num-envs 100 --env-steps-per-cycle 2000 --steps-per-env 200 --exploration-mode per_env --per-env-exploration-steps 150 --epsilon-floor 0.05 =====
+===== STARTING --name oracle_rich --num-envs 100 --env-steps-per-cycle 2000 --steps-per-env 200 --exploration-mode oracle --per-env-exploration-steps 150 --epsilon-floor 0.05 =====
+Loading weights:   0%|          | 0/310 [00:00<?, ?it/s]Loading weights: 100%|██████████| 310/310 [00:00<00:00, 11795.01it/s]
+[oracle_rich] model built in 5.0s on cuda
+[oracle_rich] random policy holdout: success=0.08246753246753247
+[oracle_rich] env_step=2000 grad_step=0 | envs_seen=10 | episodes=102 mean_reward=0.0784313753247261
+[oracle_rich] grad_step=500 | loss=0.0017 q=0.121
+[oracle_rich] env_step=4000 grad_step=500 | envs_seen=20 | episodes=146 mean_reward=0.25342464447021484
+[oracle_rich] grad_step=1000 | loss=0.0123 q=0.156
+[oracle_rich] env_step=6000 grad_step=1000 | envs_seen=30 | episodes=153 mean_reward=0.3660130798816681
+[oracle_rich] grad_step=1500 | loss=0.0112 q=0.141
+[oracle_rich] env_step=8000 grad_step=1500 | envs_seen=40 | episodes=111 mean_reward=0.2432432472705841
+[oracle_rich] grad_step=2000 | loss=0.0085 q=0.164
+[oracle_rich] env_step=10000 grad_step=2000 | envs_seen=50 | episodes=137 mean_reward=0.029197080060839653
+[oracle_rich] grad_step=2500 | loss=0.0071 q=0.162
+[oracle_rich] EVAL holdout @ 2500 temp=0.0: success=0.01111111111111111 bump=0.578952904397692 stuck=0.13066666666666665
+[oracle_rich] EVAL train-maps @ 2500: success=0.016666666666666666 bump=0.526194921065364 stuck=0.11000000000000001
+[oracle_rich] env_step=12000 grad_step=2500 | envs_seen=60 | episodes=142 mean_reward=0.18309858441352844
+[oracle_rich] grad_step=3000 | loss=0.0069 q=0.170
+[oracle_rich] env_step=14000 grad_step=3000 | envs_seen=70 | episodes=116 mean_reward=0.1034482792019844
+[oracle_rich] grad_step=3500 | loss=0.0054 q=0.161
+[oracle_rich] env_step=16000 grad_step=3500 | envs_seen=80 | episodes=150 mean_reward=0.07333333045244217
+[oracle_rich] grad_step=4000 | loss=0.0056 q=0.169
+[oracle_rich] env_step=18000 grad_step=4000 | envs_seen=90 | episodes=138 mean_reward=0.21014492213726044
+[oracle_rich] grad_step=4500 | loss=0.0058 q=0.185
+[oracle_rich] env_step=20000 grad_step=4500 | envs_seen=100 | episodes=128 mean_reward=0.0
+[oracle_rich] grad_step=5000 | loss=0.0049 q=0.178
+[oracle_rich] EVAL holdout @ 5000 temp=0.0: success=0.1 bump=0.635070893519389 stuck=0.27799999999999997
+[oracle_rich] EVAL holdout @ 5000 temp=0.2: success=0.10666666666666666 bump=0.21032346025278592 stuck=0.0
+[oracle_rich] EVAL train-maps @ 5000: success=0.22972136222910217 bump=0.3614082335560889 stuck=0.10533333333333335
+[oracle_rich] done in 1569s -> /home/user/Repos/mouse-core/experiments/results/oracle_rich.json
+===== FINISHED --name oracle_rich --num-envs 100 --env-steps-per-cycle 2000 --steps-per-env 200 --exploration-mode oracle --per-env-exploration-steps 150 --epsilon-floor 0.05 =====
+===== STAGE2 COMPLETE =====

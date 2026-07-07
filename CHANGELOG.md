@@ -7,10 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Environment backend switched from `mouse-env` to [`mouse-gym`](https://github.com/micahr234/mouse-gym) plus [`procedural-frozenlake`](https://github.com/micahr234/procedural-frozenlake). All example notebooks and the experiment runner import `EnvConfig` / `make_env` / `make_group_env` from `mouse_gym` and register `Procedural-FrozenLake-v1` via `import procedural_frozenlake`.
+- `mouse-gym` step outputs are NumPy-based and expose the Gymnasium `info` dict verbatim: expert Q-values are read from `output["info"]["q_star"]` (enabled with the `emit_q_star=True` env kwarg) instead of the flattened `info_q_star` key; `01_collect_dataset` flattens them back into an `info_q_star` dataset column for `SpObjective` / `SvObjective`. `env.tracker` is now `env.metrics`.
+- Expert Q\* from Procedural Frozen Lake is no longer degenerate: value iteration uses `q_star_step_penalty` (defaulting to a tiny `-1e-6` epsilon when `step_penalty` is zero), so `argmax(q_star)` breaks ties toward shorter paths instead of collapsing to a fixed action. Live rewards stay unshaped — episode truncation at `max_episode_steps` is what pressures policies to make progress. The `is_slippery` kwarg no longer exists — movement is deterministic unless glare-ice tiles are enabled via `glare_prob`.
+- `Datastore.append` now unwraps 0-dim arrays/tensors to plain Python scalars at append time, so NumPy scalar step fields survive the Hugging Face `Dataset` round-trip as scalars instead of 1-element lists.
+
+### Fixed
+- Online training notebooks (`03`, `05`, `06`, `07`) previously restarted every rollout at env `0`, so with the default budgets only the first 10 of `NUM_ENVS` environments were ever visited. Rollouts now cycle through envs round-robin via a persistent `env_cursor`, so all configured environments contribute training data.
+
 ### Added
-- `DiscreteActionHead`: discrete action logits head (pairs with `DiscreteActionValueHead` for teacher–student distillation via `SpObjective`); save/load type `discrete_action`; `build_heads` `"action"` name builds it.
-- `examples/07_train_online_distill.ipynb`: online teacher–student co-training — student (`Qwen3Backbone` + `DiscreteActionHead`) collects replay; teacher (`ModernBertBackbone` + `DiscreteActionValueHead`) learns DQN; student distills teacher Q via `SpObjective` on shared batches with one optimizer.
-- `ModernBertBackbone`: bidirectional ModernBERT encoder adapter (`answerdotai/ModernBERT-large` pretrained loading, per-layer hidden-state export, and save/load support). KV caching is not supported; reprocess the full context on each forward.
+- `examples/07_train_online_distill.ipynb`: online teacher–student co-training — student (`Qwen3Backbone` + `DiscreteActionHead`) collects replay; teacher (`Qwen3Backbone` + `DiscreteActionValueHead`) learns DQN; student distills teacher Q via `SpObjective` on shared batches with one optimizer.
 - `examples/06_train_online_vec_dqn.ipynb`: online FrozenLake training with Vector-DQN (`VectorActionValueHead`, `vec_dim=2`, `VecDqnObjective`).
 - `examples/run_vec_dqn_learning_demo.py`: scaled-down online Vector-DQN run that logs `action_vector` loss and rollout return (CPU-friendly smoke test).
 - `LayerwiseDiscreteActionValueHead` and `action_value_layerwise` model head: one DQN value head per backbone layer, reading pooled hidden states from every transformer block.
@@ -21,7 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `DataLoader` accepts an optional `seed` argument (default `None`) that controls its internal NumPy RNG; when set, worker `i` uses `seed + i` for deterministic multi-worker sampling.
 - `StepEmbedder` accepts a new `type_embedding_std` parameter to control the initialisation std of the type embedding table independently from the content embedding `std`. **Required when `include_type_token=True`**; raises `ValueError` if omitted to prevent accidental type-to-content signal imbalance.
 
+### Removed
+- `ModernBertBackbone` (bidirectional ModernBERT adapter) and bidirectional teacher masking experiments.
+
 ### Changed
+- `examples/07_train_online_distill.ipynb`: teacher is now causal `Qwen3Backbone` (replacing bidirectional `ModernBertBackbone`).
 - `SpObjective` and `SvObjective` accept `targets_key` (default `"info_q_star"`) to select the per-action Q target column in `objective_data`, parallel to `DqnObjective`'s `action_key` / `reward_key` / `done_key`.
 
 ### Fixed
