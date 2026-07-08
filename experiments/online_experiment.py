@@ -65,6 +65,11 @@ class Config:
     # id-level map memorization, forcing in-context inference.
     augment: bool = False
 
+    # Env-level id permutation: each map gets its own fixed random relabeling
+    # of observation and action ids (sampled with the map from map_seed).
+    # Applied to train and eval envs alike.
+    permute_env: bool = True
+
     # Optimization
     gradient_steps: int = 20000
     gradient_steps_per_cycle: int = 1000
@@ -92,9 +97,11 @@ class Config:
     # Env reward shaping
     step_penalty: float = 0.0
 
-    # Eval
+    # Eval. eval_steps should match sequence_length: within-eval context (the
+    # KV cache) accumulates across episodes, and adaptation is still climbing
+    # well past 150 steps, so shorter windows understate adapted performance.
     eval_maps: int = 16
-    eval_steps: int = 250
+    eval_steps: int = 512
     eval_fracs: tuple[float, ...] = (0.5, 1.0)
     final_eval_temperatures: tuple[float, ...] = (0.0, 0.2)
 
@@ -110,6 +117,7 @@ def make_frozenlake(
     reset_seed: int,
     step_penalty: float,
     with_q_star: bool = False,
+    permute: bool = True,
 ):
     config = EnvConfig(
         id="Procedural-FrozenLake-v1",
@@ -124,8 +132,12 @@ def make_frozenlake(
             "max_episode_steps": 50,
             "map_seed": map_seed,
             "step_penalty": step_penalty,
-            # q_star_step_penalty defaults to step_penalty (or -1e-6 when zero),
-            # so emitted Q* is always a non-degenerate shortest-path expert.
+            # Per-map random relabeling of observation/action ids.
+            "permute_obs": permute,
+            "permute_actions": permute,
+            # Value iteration discounts with q_star_gamma (default 0.999), so
+            # emitted Q* is always a non-degenerate shortest-path expert
+            # (reported in external/permuted action order).
             "emit_q_star": with_q_star,
         },
     )
@@ -303,6 +315,7 @@ def evaluate(
             map_seed=map_id,
             reset_seed=EVAL_RESET_OFFSET + j,
             step_penalty=cfg.step_penalty,
+            permute=cfg.permute_env,
         )
         env.metrics.clear()
 
@@ -441,6 +454,7 @@ def run(cfg: Config) -> None:
             reset_seed=i,
             step_penalty=cfg.step_penalty,
             with_q_star=cfg.exploration_mode == "oracle",
+            permute=cfg.permute_env,
         )
         for i in range(cfg.num_envs)
     ]
@@ -562,6 +576,11 @@ def run(cfg: Config) -> None:
     loader.close()
     for env in envs:
         env.close()
+
+    # Save final weights so longer/alternate evals can run post hoc.
+    ckpt_path = out_dir / f"{cfg.name}.pt"
+    torch.save(model.state_dict(), ckpt_path)
+    result["checkpoint"] = str(ckpt_path)
 
     result["timing"] = {
         "total_s": time.time() - t0,

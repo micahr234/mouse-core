@@ -18,7 +18,7 @@ COMMON=(
   --gradient-steps-per-cycle 1000
   --learning-starts 2000
   --eval-maps 10
-  --eval-steps 150
+  --eval-steps 512
   --eval-fracs 0.25 0.5 0.75 1.0
   --rotate-envs true
   --num-envs 500
