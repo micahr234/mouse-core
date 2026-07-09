@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from tensordict import TensorDict
 
 from mouse_core.objectives.base import Objective
+from mouse_core.objectives.dqn import _valid_transitions
 from mouse_core.models.heads.vec_dqn import rope_rotate, vector_action_scores
 
 
@@ -20,7 +21,9 @@ class VecDqnObjective(Objective):
     Boundary rows are not used as current states because the following row may
     be a reset frame whose input action was ignored. When a transition ends at a
     boundary and a reset row is available inside the sampled sequence, that reset
-    row supplies the target vector.
+    row supplies the target vector. Row pairs that straddle a packed-segment seam
+    (``is_seam`` from ``DataLoader(pack=True)``) are excluded, as are boundary
+    transitions whose substitute target row starts a new segment.
 
     Args:
         tau: Polyak coefficient for target-network updates.
@@ -97,7 +100,9 @@ class VecDqnObjective(Objective):
         # the ones taken *from* obs_t.  Therefore the action, reward, and done that
         # correspond to the transition out of state t are stored one step ahead at t+1.
         curr_vecs = online_vecs[:, :-1, :, :]   # [B, S-1, A, D]  vecs(s_t)
-        next_vecs = target_vecs[:, 1:, :, :]    # [B, S-1, A, D]  vecs_target(s_{t+1})
+        # Cloned because the boundary substitution below writes into it; a plain
+        # slice is a view that would mutate predictions["action_vector_target"].
+        next_vecs = target_vecs[:, 1:, :, :].clone()  # [B, S-1, A, D]  vecs_target(s_{t+1})
         next_actions = action[:, 1:]             # [B, S-1]         a_t (stored at t+1)
         next_rewards = reward[:, 1:]             # [B, S-1]         r_t (stored at t+1)
 
@@ -110,6 +115,15 @@ class VecDqnObjective(Objective):
             )
         valid_transition = done[:, :-1] == 0
         valid_transition[:, -1] = valid_transition[:, -1] & ~boundary_at_next[:, -1]
+
+        # Exclude pairs straddling a packed-segment seam (is_seam at t+1), and
+        # boundary transitions whose substituted target row (t+2) starts a new
+        # segment — that row belongs to an unrelated slice.
+        valid_transition &= _valid_transitions(objective_data, B, S, device=done.device)
+        if S > 2 and "is_seam" in objective_data.keys():
+            seam_at_substitute = objective_data["is_seam"][:, 2:] != 0
+            valid_transition[:, :-1] &= ~(boundary_at_next[:, :-1] & seam_at_substitute)
+
         if not valid_transition.any():
             raise ValueError("VecDqnObjective: batch contains no valid transitions.")
 

@@ -1,11 +1,11 @@
 {
-  "pythonVersion": "3.12",
+  "pythonVersion": "3.13",
   "venvPath": ".",
   "venv": ".venv",
   "include": ["src", "tests", "examples"],
   "extraPaths": [
     "src",
-    ".venv/lib/python3.12/site-packages"
+    ".venv/lib/python3.13/site-packages"
   ],
   "reportPrivateImportUsage": false
 }

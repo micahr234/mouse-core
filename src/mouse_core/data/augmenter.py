@@ -94,11 +94,18 @@ class SequenceAugmentModalitySpec:
         self.linear_transform()
         self.scale_spec()
         self.shift_spec()
-        if self.type == "linear" and self._uses_direct_scale_shift():
-            raise ValueError(
-                f"modality {self.field!r}: linear augmentation uses scale_in_low, "
-                "scale_out_low, scale_in_high, and scale_out_high."
-            )
+        if self._uses_direct_scale_shift():
+            if self.type == "linear":
+                raise ValueError(
+                    f"modality {self.field!r}: linear augmentation uses scale_in_low, "
+                    "scale_out_low, scale_in_high, and scale_out_high."
+                )
+            if self.type == "discrete":
+                raise ValueError(
+                    f"modality {self.field!r}: scale/shift parameters only apply to "
+                    "type='image'; discrete modalities support permute, mask_prob, "
+                    "and mask_value."
+                )
 
     @property
     def fields(self) -> tuple[str, ...]:

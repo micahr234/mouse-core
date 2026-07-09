@@ -59,7 +59,7 @@ setup_venv() {
     fi
     
     # Create new virtual environment
-    if ! uv venv --python python3.12; then
+    if ! uv venv --python python3.13; then
         error "Failed to create virtual environment"
         exit 1
     fi

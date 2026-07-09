@@ -304,6 +304,84 @@ def test_repo_files_to_clear_deletes_everything_except_replacements() -> None:
     ]
 
 
+def test_push_stores_to_hub_clear_true_wipes_whole_dataset(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """clear=True deletes every remote file not rewritten, across all configs."""
+    api = _FakeHfApi()
+    monkeypatch.setattr(hub, "HfApi", lambda: api)
+
+    hub.push_stores_to_hub([_store(1, name="cartpole")], repo_id="test-dataset", private=True)
+
+    assert len(api.commits) == 1
+    committed = api.commits[0]
+    # Stale files from other configs and unrelated paths are deleted in the
+    # same commit that adds the fresh push; the rewritten paths are re-added.
+    assert "dataset_infos.json" in committed
+    assert "data/old-00000-of-00001.parquet" in committed
+    assert "notes/old.txt" in committed
+    assert "README.md" in committed
+    assert "data/cartpole/train-00000-of-00001.parquet" in committed
+
+
+def test_push_stores_to_hub_clear_false_deletes_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """clear=False layers the push on top of existing files: additions only."""
+    api = _FakeHfApi()
+    monkeypatch.setattr(hub, "HfApi", lambda: api)
+
+    hub.push_stores_to_hub(
+        [_store(1, name="cartpole")], repo_id="test-dataset", clear=False, private=True
+    )
+
+    assert api.commits == [[
+        "README.md",
+        "data/cartpole/train-00000-of-00001.parquet",
+    ]]
+
+
+def test_push_to_hub_clear_flag_controls_wipe(monkeypatch: pytest.MonkeyPatch) -> None:
+    wipes: list[str] = []
+    pushes: list[str] = []
+
+    monkeypatch.setattr(hub, "HfApi", _FakeHfApi)
+    monkeypatch.setattr(
+        hub,
+        "_wipe_hub_repo_data",
+        lambda *, api, repo_id: wipes.append(repo_id),
+    )
+    monkeypatch.setattr(
+        hub,
+        "_push_dataset_dict",
+        lambda dataset_dict, *, repo_id, commit_message, config_name: pushes.append(config_name),
+    )
+
+    hub.push_to_hub({"train": [_store(1, name="cartpole")]}, repo_id="test-dataset", private=True)
+    assert wipes == ["user/test-dataset"]
+    assert pushes == ["default"]
+
+    hub.push_to_hub(
+        {"train": [_store(1, name="cartpole")]}, repo_id="test-dataset", clear=False, private=True
+    )
+    assert wipes == ["user/test-dataset"]  # unchanged: no second wipe
+    assert pushes == ["default", "default"]
+
+
+def test_wipe_hub_repo_data_selects_all_shards_and_card() -> None:
+    api = _FakeHfApi()
+
+    hub._wipe_hub_repo_data(api=cast(Any, api), repo_id="user/test-dataset")
+
+    assert api.commits == [[
+        "README.md",
+        "dataset_infos.json",
+        "data/old-00000-of-00001.parquet",
+        "data/cartpole/train-00000-of-00001.parquet",
+    ]]
+
+
 def test_push_stores_to_hub_requires_named_stores() -> None:
     with pytest.raises(ValueError, match="non-empty name"):
         hub.push_stores_to_hub([_store(1), _store(2, name="cartpole")], repo_id="test-dataset")

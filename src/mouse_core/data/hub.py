@@ -507,14 +507,17 @@ def push_to_hub(
         Commit message written to the Hub.
     config_name :
         Hugging Face dataset configuration / subset name (also called "config").
-    clear :
-        Replace the dataset repository contents before uploading. Existing
-        remote files are deleted unless the same path is written by this push.
-        Defaults to ``True``.
         Use this to organize your data into different "bins" (e.g. different
         collection runs, different environment families, different policies).
         Default is ``"default"``. When loading later use
         ``load_stores_from_hub(repo, [config_name], split=...)``.
+    clear :
+        If ``True`` (default), totally wipe the dataset before uploading:
+        every existing parquet shard (all configs, not just ``config_name``),
+        ``dataset_infos.json``, and the README card are deleted so the fresh
+        push fully defines the repository. If ``False``, nothing is deleted
+        and this push is layered on top of the existing repository — you are
+        responsible for keeping the combined configs/splits consistent.
 
     Returns
     -------
@@ -600,9 +603,14 @@ def push_stores_to_hub(
     commit_message :
         Commit message written to the Hub.
     clear :
-        Delete all existing parquet shards, dataset info, and the README card
-        before uploading. Keeps the dataset card and schema consistent with the
-        data being pushed. Defaults to ``True``.
+        If ``True`` (default), totally wipe the dataset: every remote file not
+        rewritten by this push is deleted in the same commit, so the pushed
+        stores fully define the repository. If ``False``, nothing is deleted
+        and the pushed configs are layered on top of the existing repository —
+        you are responsible for keeping the combined contents consistent
+        (including the README ``configs:`` block, which this push overwrites
+        with only the stores being pushed now).
+
     Returns
     -------
     The canonical dataset URL on the Hub, or ``None`` if there was nothing to push.

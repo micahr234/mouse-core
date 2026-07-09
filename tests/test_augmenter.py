@@ -197,6 +197,17 @@ def test_linear_scale_endpoints_must_be_complete() -> None:
         )
 
 
+def test_discrete_scale_shift_raises() -> None:
+    with pytest.raises(ValueError, match="only apply to type='image'"):
+        SequenceAugmentModalitySpec(
+            field="observation",
+            type="discrete",
+            vocab_size=10,
+            scale_mean=2.0,
+            shift_mean=5.0,
+        )
+
+
 def test_linear_scale_input_endpoints_must_differ() -> None:
     with pytest.raises(ValueError, match="must differ"):
         SequenceAugmentModalitySpec(

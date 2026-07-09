@@ -13,7 +13,7 @@ MOUSE is actively developed and contributions are very welcome — whether that'
 ## Development setup
 
 ```bash
-# Clone and create a virtual environment (Python 3.12, via uv)
+# Clone and create a virtual environment (Python 3.13, via uv)
 git clone https://github.com/micahr234/mouse-core.git
 cd mouse-core
 source scripts/install.sh
@@ -40,7 +40,7 @@ If you add a new feature, include a short usage example in the PR description or
 
 ## Code style
 
-- Python 3.12+, type-annotated throughout.
+- Python 3.13+, type-annotated throughout.
 - Follow the existing patterns: base classes in `base.py`, public API in `__init__.py`, documentation in `docs/`.
 - Avoid silent fallbacks — if a precondition isn't met, raise a clear error.
 - Comments should explain *why*, not *what*.

@@ -17,6 +17,27 @@ def _batch(rows: list[dict], S: int = 1) -> list[list[dict]]:
     return [rows]
 
 
+def test_step_embedder_passes_is_seam_through_without_embedding() -> None:
+    encoder = _enc(
+        hidden_dim=8,
+        modalities=[{"field": "action", "type": "discrete", "vocab_size": 4}],
+    )
+    with_seam = [[
+        {"action": 0, "is_seam": 0},
+        {"action": 1, "is_seam": 1},
+    ]]
+    without_seam = [[{"action": 0}, {"action": 1}]]
+
+    embeds, col_values, _ = encoder(with_seam)
+    plain_embeds, plain_col_values, _ = encoder(without_seam)
+
+    assert torch.equal(col_values["is_seam"], torch.tensor([[0, 1]]))
+    assert col_values["is_seam"].dtype == torch.int64
+    # The flag is metadata for objectives; it must not change the embeddings.
+    assert torch.equal(embeds, plain_embeds)
+    assert "is_seam" not in plain_col_values
+
+
 def test_step_embedder_faults_on_missing_required_modality() -> None:
     encoder = _enc(
         hidden_dim=8,

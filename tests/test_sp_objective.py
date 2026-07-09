@@ -37,6 +37,39 @@ def test_sp_objective_skips_rows_with_no_finite_action_targets() -> None:
     assert loss.item() < 1.0e-4
 
 
+def test_sp_objective_soft_losses_finite_with_padded_actions() -> None:
+    """-inf padding sentinels must not blow up any soft loss or its gradient."""
+    torch.manual_seed(0)
+    q = torch.randn(2, 3, 4)
+    q[..., -1] = -torch.inf
+    objective_data = TensorDict({"info_q_star": q}, batch_size=(2, 3))
+
+    for loss_type in ("kl-fwd", "kl-bwd", "ce-soft-fwd", "ce-soft-bwd", "js"):
+        logits = torch.randn(2, 3, 4, requires_grad=True)
+        predictions = TensorDict({"action": logits}, batch_size=(2, 3))
+        loss, _ = SpObjective(loss_type=loss_type, label_smoothing=0.1)(
+            objective_data, predictions
+        )
+        loss.backward()
+        assert torch.isfinite(loss), loss_type
+        assert logits.grad is not None and torch.isfinite(logits.grad).all(), loss_type
+        # Padded actions carry no gradient: the student renormalizes over valid ones.
+        assert logits.grad[..., -1].abs().max() == 0.0, loss_type
+
+
+def test_sp_objective_soft_losses_ignore_padded_student_logits() -> None:
+    """A junk student logit at a padded slot must not affect the loss."""
+    q = torch.tensor([[[1.0, 2.0, 3.0, -torch.inf]]])
+    objective_data = TensorDict({"info_q_star": q}, batch_size=(1, 1))
+    matching = TensorDict(
+        {"action": torch.tensor([[[1.0, 2.0, 3.0, 100.0]]])}, batch_size=(1, 1)
+    )
+
+    for direction in ("kl-fwd", "kl-bwd"):
+        loss, _ = SpObjective(loss_type=direction)(objective_data, matching)
+        assert loss.item() < 1.0e-6, direction
+
+
 def test_sp_objective_custom_targets_key() -> None:
     objective_data = TensorDict(
         {"action_value": torch.tensor([[[0.0, 2.0]]])},

@@ -99,7 +99,11 @@ class DataLoader:
         including the last few steps. When the initial window is shorter than
         ``sequence_length``, additional independently-sampled segments (drawn
         from the same store distribution) are appended until the sequence is
-        full. Empty stores are allowed at construction and on :meth:`refresh`;
+        full. Every row then carries an ``"is_seam"`` flag (``1`` on the first
+        row of each appended segment, ``0`` elsewhere); the encoder passes it
+        through to ``objective_data`` so TD objectives skip the row pairs that
+        straddle a seam, which are not real environment transitions. Empty
+        stores are allowed at construction and on :meth:`refresh`;
         :meth:`next_batch` raises if every store is still empty. If ``False``
         (default), every sequence comes from a single in-store window of
         exactly ``sequence_length`` steps; stores shorter than
@@ -110,8 +114,11 @@ class DataLoader:
         Background worker threads (0 = synchronous).
     seed :
         Seed for the loader's internal NumPy RNG. ``None`` (default) uses
-        unpredictable entropy. When set, worker ``i`` uses ``seed + i`` so
-        multi-worker sampling is reproducible for a given ``seed``.
+        unpredictable entropy. When set, each worker's sampling RNG and its
+        forked augmenter receive independent child seeds derived via
+        ``numpy.random.SeedSequence(seed).spawn(...)``, so multi-worker
+        sampling is reproducible for a given ``seed`` and no two streams
+        (across workers, or between sampling and augmentation) coincide.
     augmenter :
         Optional callable applied to each sampled batch. With background workers,
         augmentation runs in the worker before the batch is put into the prefetch
@@ -186,12 +193,25 @@ class DataLoader:
             self._result_queue = queue.Queue(maxsize=prefetch)
             self._stop = threading.Event()
             self._worker_error = None
+            # Independent child seeds per worker for sampling (even slots) and
+            # augmentation (odd slots): seed arithmetic like ``seed + i`` makes
+            # the two streams within a worker identical and lets nearby seeds
+            # share worker streams across loaders.
+            if seed is None:
+                sample_seeds: list = [None] * num_workers
+                augment_seeds: list = [None] * num_workers
+            else:
+                children = np.random.SeedSequence(seed).spawn(2 * num_workers)
+                sample_seeds = children[0::2]
+                augment_seeds = [
+                    int(child.generate_state(1)[0]) for child in children[1::2]
+                ]
             self._workers = [
                 threading.Thread(
                     target=self._worker_loop,
                     args=(
-                        np.random.default_rng(seed=None if seed is None else seed + i),
-                        _fork_augmenter(augmenter, seed=None if seed is None else seed + i),
+                        np.random.default_rng(seed=sample_seeds[i]),
+                        _fork_augmenter(augmenter, seed=augment_seeds[i]),
                     ),
                     daemon=True,
                     name=f"DataLoader-{i}",
@@ -319,6 +339,11 @@ class DataLoader:
         slice hits the end of the store, additional independently-sampled
         segments are appended until the sequence is full.  When ``pack=False``
         the start is guaranteed to leave a full window.
+
+        In pack mode every row carries an ``"is_seam"`` flag: ``1`` on the
+        first row of each appended segment after the first (the row pair that
+        straddles it is not a real environment transition), ``0`` elsewhere.
+        TD objectives use it to skip transitions that cross a seam.
         """
         if sum(self._ns) == 0:
             raise ValueError("Cannot sample batches: all stores are empty.")
@@ -339,9 +364,19 @@ class DataLoader:
             end = min(start + (S - len(steps)), n)
             hf_slice = ds[start:end]
             count = end - start
-            steps.extend(
-                {k: hf_slice[k][i] for k in hf_slice} for i in range(count)
-            )
+            if self.pack:
+                starts_new_segment = len(steps) > 0
+                steps.extend(
+                    {
+                        **{k: hf_slice[k][i] for k in hf_slice},
+                        "is_seam": int(starts_new_segment and i == 0),
+                    }
+                    for i in range(count)
+                )
+            else:
+                steps.extend(
+                    {k: hf_slice[k][i] for k in hf_slice} for i in range(count)
+                )
 
             if not self.pack:
                 # Without packing the single slice is always full; exit immediately.

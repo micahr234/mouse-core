@@ -7,6 +7,7 @@ decoding.
 
 from __future__ import annotations
 
+import warnings
 from contextlib import contextmanager
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -39,7 +40,6 @@ class Backbone(nn.Module, ABC):
         embeds: torch.Tensor,
         cache: dict[str, Any] | None = None,
         use_cache: bool = False,
-        cache_position: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, dict[str, Any] | None]:
@@ -50,9 +50,9 @@ class Backbone(nn.Module, ABC):
             cache: Opaque cache dict from a prior call. Backbones that support
                 KV-caching should read/write under a conventional key (e.g.
                 ``"backbone"``) and return an updated dict when ``use_cache``
-                is True.
+                is True. Token positions for incremental decoding are inferred
+                from the cached sequence length.
             use_cache: If True, return an updated cache for incremental use.
-            cache_position: Optional position indices for incremental decoding.
             attention_mask: Optional mask of shape ``[B, T]`` (or broadcastable)
                 where positions with 0 / False are ignored by attention.
                 When None, the backbone attends to all provided tokens.
@@ -89,6 +89,10 @@ def _load_transformer_weights(
 
     MOUSE backbones replace token embeddings with ``StepEmbedder`` and replace
     the final norm with ``Identity``, so those pretrained keys are skipped.
+
+    Warns with the names of any other backbone tensors that did not receive
+    pretrained weights (missing from the checkpoint or shape-mismatched), so a
+    config/checkpoint mismatch cannot silently leave the model random-init.
     """
     from transformers import AutoModel
 
@@ -103,6 +107,21 @@ def _load_transformer_weights(
         and not key.startswith("embed_tokens")
         and key not in ("norm.weight", "norm.bias")
     }
+
+    intentionally_skipped = ("embed_tokens",)
+    not_loaded = [
+        key
+        for key in target_state
+        if key not in loadable and not key.startswith(intentionally_skipped)
+    ]
+    if not_loaded:
+        warnings.warn(
+            f"{len(not_loaded)} of {len(target_state)} backbone tensors did not "
+            f"receive pretrained weights from {str(repo_id_or_path)!r} and keep "
+            f"their random initialization: {not_loaded}",
+            stacklevel=2,
+        )
+
     model.load_state_dict(loadable, strict=False)
 
     del pretrained

@@ -923,7 +923,10 @@ class StepEmbedder(Encoder):
             * ``col_values`` maps each non-learnable modality name to the tensor
               extracted from the batch (``[B, S]`` for scalars, ``[B, S, D]``
               for vectors), ready to be wrapped into a ``objective_data`` TensorDict
-              by :class:`~mouse_core.models.base.Model`.
+              by :class:`~mouse_core.models.base.Model`.  When rows carry the
+              DataLoader's pack-mode ``"is_seam"`` flag it is passed through as
+              an int64 ``[B, S]`` tensor (never embedded) so TD objectives can
+              skip transitions that cross packed-segment boundaries.
             * ``step_token_indices`` is ``[B, S]`` int64 — the absolute position
               in the flat sequence of the last token of each step block (the token
               used by heads for per-step prediction).
@@ -1005,6 +1008,16 @@ class StepEmbedder(Encoder):
                 col_values[spec.field] = (
                     torch.from_numpy(buf).to(device).reshape(B, S, dim)
                 )
+
+        # Pass the DataLoader's pack-mode seam markers through to objectives.
+        # ``is_seam`` is never embedded: it only tells TD objectives which row
+        # pairs straddle a packed-segment boundary and are not real transitions.
+        if B > 0 and S > 0 and "is_seam" not in col_values and "is_seam" in batch[0][0]:
+            seam = np.array(
+                [int(row.get("is_seam", 0)) for rows in batch for row in rows],
+                dtype=np.int64,
+            )
+            col_values["is_seam"] = torch.from_numpy(seam).to(device).reshape(B, S)
 
         # ------------------------------------------------------------------ #
         # Embed extracted tensors → token sequence [B, S, T, D].              #

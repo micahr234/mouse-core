@@ -828,7 +828,6 @@ class Model(nn.Module):
         embeds: torch.Tensor,
         cache: dict[str, Any] | None = None,
         use_cache: bool = False,
-        cache_position: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, dict[str, Any] | None]:
@@ -837,7 +836,6 @@ class Model(nn.Module):
             embeds=embeds,
             cache=cache,
             use_cache=use_cache,
-            cache_position=cache_position,
             attention_mask=attention_mask,
             **kwargs,
         )
@@ -851,7 +849,6 @@ class Model(nn.Module):
         batch: list[list[dict]],
         cache: dict[str, Any] | None = None,
         use_cache: bool = False,
-        cache_position: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
     ) -> tuple[TensorDict, TensorDict, dict[str, Any] | None]:
         """Run a full forward pass.
@@ -859,9 +856,9 @@ class Model(nn.Module):
         Args:
             batch: ``[B][S]`` list of raw step-record dicts, as returned by
                 ``DataLoader.next_batch()`` or assembled manually for rollout.
-            cache: Optional KV cache from a prior call.
+            cache: Optional KV cache from a prior call. Token positions for
+                incremental decode are inferred from the cache length.
             use_cache: If True, return an updated cache.
-            cache_position: Optional position ids for incremental decode.
             attention_mask: Optional ``[B, T]`` (or broadcastable) mask. Positions
                 corresponding to 0/False are ignored by attention. When None the
                 full sequence is attended to (subject to causal masking inside
@@ -889,7 +886,6 @@ class Model(nn.Module):
             embeds=embeds,
             cache=cache,
             use_cache=use_cache,
-            cache_position=cache_position,
             attention_mask=attention_mask,
             output_hidden_states=needs_layerwise,
         )

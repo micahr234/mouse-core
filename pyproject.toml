@@ -7,13 +7,14 @@ name = "mouse-core"
 version = "0.4.0"
 description = "Meta-Optimization Using Sequential Experiences — core ICRL library"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.13"
 license = "GPL-3.0-or-later"
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
     "torch>=2.12.1",

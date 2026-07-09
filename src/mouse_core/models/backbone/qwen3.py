@@ -239,7 +239,6 @@ class Qwen3Backbone(Backbone):
         embeds: torch.Tensor,
         cache: dict[str, Any] | None = None,
         use_cache: bool = False,
-        cache_position: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, dict[str, Any] | None]:

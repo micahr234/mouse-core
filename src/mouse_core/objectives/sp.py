@@ -12,6 +12,37 @@ from tensordict import TensorDict
 from mouse_core.objectives.base import Objective
 
 
+def _soft_distributions(
+    q_targets: torch.Tensor,
+    logits: torch.Tensor,
+    temperature: float,
+    label_smoothing: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Teacher and student log-probs renormalized over valid actions only.
+
+    ``-inf`` entries in ``q_targets`` are padding sentinels for actions that do
+    not exist. Both distributions assign them exactly zero probability (label
+    smoothing included): otherwise backward-direction losses, where the student
+    puts mass on actions with zero teacher mass, are infinite.
+
+    Padded positions are masked with a very negative *finite* value rather than
+    ``-inf`` so that ``exp`` underflows to exactly 0 while every intermediate
+    tensor and jacobian stays finite — masking with ``-inf`` makes the loss
+    finite but its gradient NaN.
+    """
+    invalid = ~torch.isfinite(q_targets)
+    fill = torch.finfo(logits.dtype).min / 4
+    log_teacher = F.log_softmax((q_targets / temperature).masked_fill(invalid, fill), dim=-1)
+    log_student = F.log_softmax(logits.masked_fill(invalid, fill), dim=-1)
+    if label_smoothing > 0.0:
+        valid = (~invalid).to(log_teacher.dtype)
+        num_valid = valid.sum(dim=-1, keepdim=True).clamp(min=1.0)
+        smoothed = (1.0 - label_smoothing) * log_teacher.exp() + label_smoothing * valid / num_valid
+        # Fill with 1.0 before the log (not after) so no -inf is ever created.
+        log_teacher = smoothed.masked_fill(invalid, 1.0).log().masked_fill(invalid, fill)
+    return log_teacher, log_student
+
+
 def sp_js(
     q_targets: torch.Tensor,
     logits: torch.Tensor,
@@ -32,15 +63,13 @@ def sp_js(
     temp = float(temperature)
     if temp <= 0.0:
         raise ValueError(f"sp_js temperature must be > 0, got {temp}.")
-    log_teacher = F.log_softmax(q_targets / temp, dim=-1)
-    log_student = F.log_softmax(logits, dim=-1)
-    if label_smoothing > 0.0:
-        num_actions = q_targets.shape[-1]
-        log_teacher = ((1.0 - label_smoothing) * log_teacher.exp() + label_smoothing / num_actions).log()
+    log_teacher, log_student = _soft_distributions(q_targets, logits, temp, label_smoothing)
 
     log_m = torch.logaddexp(log_teacher, log_student) - math.log(2.0)
     # KL(P‖M) and KL(Q‖M) via kl_div(input=log M, target=log P, log_target=True)
-    # -> exp(log P) * (log P - log M). nan_to_num: -inf padding in info_q_star gives 0*(-inf) -> NaN otherwise.
+    # -> exp(log P) * (log P - log M). nan_to_num is defensive: padded actions are
+    # already finite-masked in _soft_distributions, but rows that are entirely
+    # padded (possible when calling this helper directly) would still yield NaN.
     kl_pm = torch.nan_to_num(
         F.kl_div(log_m, log_teacher, log_target=True, reduction="none"),
         nan=0.0,
@@ -75,11 +104,7 @@ def sp_kl(
         raise ValueError(f"sp_kl temperature must be > 0, got {temp}.")
     if direction not in ("fwd", "bwd"):
         raise ValueError(f"sp_kl direction must be 'fwd' or 'bwd', got {direction!r}.")
-    log_teacher = F.log_softmax(q_targets / temp, dim=-1)
-    log_student = F.log_softmax(logits, dim=-1)
-    if label_smoothing > 0.0:
-        num_actions = q_targets.shape[-1]
-        log_teacher = ((1.0 - label_smoothing) * log_teacher.exp() + label_smoothing / num_actions).log()
+    log_teacher, log_student = _soft_distributions(q_targets, logits, temp, label_smoothing)
 
     if direction == "fwd":
         kl = torch.nan_to_num(
@@ -114,11 +139,7 @@ def sp_soft_ce(
         raise ValueError(f"sp_soft_ce temperature must be > 0, got {temp}.")
     if direction not in ("fwd", "bwd"):
         raise ValueError(f"sp_soft_ce direction must be 'fwd' or 'bwd', got {direction!r}.")
-    log_teacher = F.log_softmax(q_targets / temp, dim=-1)
-    if label_smoothing > 0.0:
-        num_actions = q_targets.shape[-1]
-        log_teacher = ((1.0 - label_smoothing) * log_teacher.exp() + label_smoothing / num_actions).log()
-    log_student = F.log_softmax(logits, dim=-1)
+    log_teacher, log_student = _soft_distributions(q_targets, logits, temp, label_smoothing)
     if direction == "fwd":
         teacher = log_teacher.exp()
         per_row = torch.nan_to_num(-(teacher * log_student), nan=0.0).sum(dim=-1)

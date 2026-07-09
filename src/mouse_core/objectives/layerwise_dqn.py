@@ -8,6 +8,7 @@ import torch
 from tensordict import TensorDict
 
 from mouse_core.objectives.base import Objective
+from mouse_core.objectives.dqn import _valid_transitions
 
 
 def effective_horizon(gamma: float) -> float:
@@ -69,7 +70,9 @@ class LayerwiseDqnObjective(Objective):
     Reads ``predictions["action_value_layerwise"]`` and
     ``predictions["action_value_layerwise_target"]`` with shape ``[B, S, L, A]``.
     Each layer and each done-code uses its own discount, built at construction
-    from explicit shallow/deep endpoint pairs.
+    from explicit shallow/deep endpoint pairs. Row pairs that straddle a
+    packed-segment seam (``is_seam`` from ``DataLoader(pack=True)``) are
+    excluded from every layer's loss.
 
     Effective planning horizon is ``H(gamma) = 1 / (1 - gamma)``. Layer ``0`` uses
     each ``gamma_*_start``; the deepest layer uses the deep value
@@ -237,6 +240,8 @@ class LayerwiseDqnObjective(Objective):
                 f"Layerwise DQN objective expects done shape [{B}, {S}], got {tuple(done.shape)}."
             )
 
+        valid = _valid_transitions(objective_data, B, S, device)
+
         curr_q = q[:, :-1, :, :]              # [B, S-1, L, A]
         next_actions = action[:, 1:]        # [B, S-1]
         next_rewards = reward[:, 1:]        # [B, S-1]
@@ -270,17 +275,17 @@ class LayerwiseDqnObjective(Objective):
                 q_scale = (td_target.abs() + self.cql_scale_q_eps).detach()
                 cql_penalty = torch.logsumexp(curr_q_layer, dim=-1) - q_values
                 loss = loss + self.cql_weight * q_scale * cql_penalty
-                cql_penalties.append(cql_penalty.detach().mean())
+                cql_penalties.append(cql_penalty.detach()[valid].mean())
 
-            layer_losses.append(loss.mean())
-            layer_q_means.append(q_values.detach().mean())
+            layer_losses.append(loss[valid].mean())
+            layer_q_means.append(q_values.detach()[valid].mean())
 
         total_loss = torch.stack(layer_losses).mean()
 
         deepest_q = q[:, :-1, -1, :].gather(
             dim=-1, index=next_actions.unsqueeze(-1)
         ).squeeze(-1)
-        q_det = deepest_q.detach()
+        q_det = deepest_q.detach()[valid]
         q_std = (
             q_det.std()
             if q_det.numel() > 1
