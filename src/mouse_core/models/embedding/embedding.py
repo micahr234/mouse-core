@@ -885,7 +885,7 @@ class StepEmbedder(Encoder):
         if k == "learnable":
             # Learnable modalities never read data; return a dummy (should not be used).
             return torch.zeros((B, S), device=device)
-        dtype = torch.long if k == "discrete" else torch.get_default_dtype()
+        dtype = torch.long if k == "discrete" else next(self.parameters()).dtype
         if k == "discrete":
             absv = spec.absent
             if absv is not None:
@@ -935,7 +935,7 @@ class StepEmbedder(Encoder):
         B = len(batch)
         S = len(batch[0]) if B > 0 else 0
         D = self._hidden_dim
-        dtype = torch.get_default_dtype()
+        dtype = next(self.parameters()).dtype
 
         # ------------------------------------------------------------------ #
         # Single-pass extraction: iterate each row once, fill all modality    #

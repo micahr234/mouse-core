@@ -64,7 +64,7 @@ The [example notebooks](examples/) are the primary documentation. Work through t
 | [01 — Collect dataset](examples/01_collect_dataset.ipynb) | `Datastore`, collecting transitions, pushing to the Hub |
 | [02 — Train offline](examples/02_train_offline.ipynb) | Offline replay baseline, model architecture, DQN training *(recommended first training run)* |
 | [03 — Train online](examples/03_train_online.ipynb) | Live `mouse-gym` rollouts, in-memory replay, DQN updates |
-| [04 — Inference](examples/04_inference.ipynb) | KV-cache inference, loading the current checkpoint from the shared Hub model repo |
+| [04 — Inference](examples/04_inference.ipynb) | Batched FlexAttention cached inference, loading the current checkpoint from the shared Hub model repo |
 | [05 — Layerwise DQN online](examples/05_train_online_layerwise_dqn.ipynb) | Per-layer Q heads and `LayerwiseDqnObjective` |
 | [06 — Vector-DQN online](examples/06_train_online_vec_dqn.ipynb) | 2D action vectors, RoPE reward rotation, `VecDqnObjective` |
 

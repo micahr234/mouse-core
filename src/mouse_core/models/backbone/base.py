@@ -1,8 +1,10 @@
 """Backbone interface for MOUSE models.
 
 A backbone is a sequence processor that takes token embeddings and returns
-hidden states of the same shape. It may support KV-caching for incremental
-decoding.
+hidden states of the same shape. Full (uncached) forwards go through
+:meth:`Backbone.forward`; incremental decoding goes through a
+:class:`~mouse_core.models.backbone.flex_decode.FlexDecodeSession` created by
+:meth:`Backbone.decode_session`.
 """
 
 from __future__ import annotations
@@ -16,13 +18,14 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from mouse_core.models.backbone.flex_decode import FlexDecodeSession
+
 
 class Backbone(nn.Module, ABC):
     """Abstract base for backbones.
 
     A backbone consumes a token embedding sequence ``[B, T, D]`` and returns
-    processed hidden states of shape ``[B, T, D]``. It may receive an optional
-    ``attention_mask`` for positions that should be ignored (e.g. padding).
+    processed hidden states of shape ``[B, T, D]``.
 
     Implementations may be:
     - a full transformer (Llama, Qwen3, …)
@@ -38,33 +41,36 @@ class Backbone(nn.Module, ABC):
     def forward(
         self,
         embeds: torch.Tensor,
-        cache: dict[str, Any] | None = None,
-        use_cache: bool = False,
-        attention_mask: torch.Tensor | None = None,
+        output_hidden_states: bool = False,
         **kwargs: Any,
-    ) -> tuple[torch.Tensor, dict[str, Any] | None]:
-        """Run the backbone over a token sequence.
+    ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+        """Run a full (uncached) forward over a token sequence.
 
         Args:
             embeds: Token embeddings ``[B, T, D]``.
-            cache: Opaque cache dict from a prior call. Backbones that support
-                KV-caching should read/write under a conventional key (e.g.
-                ``"backbone"``) and return an updated dict when ``use_cache``
-                is True. Token positions for incremental decoding are inferred
-                from the cached sequence length.
-            use_cache: If True, return an updated cache for incremental use.
-            attention_mask: Optional mask of shape ``[B, T]`` (or broadcastable)
-                where positions with 0 / False are ignored by attention.
-                When None, the backbone attends to all provided tokens.
-            **kwargs: Implementation-specific options (e.g. ``position_ids``).
+            output_hidden_states: Also return every layer's hidden states
+                (for layerwise heads).
+            **kwargs: Implementation-specific options.
 
         Returns:
-            A tuple ``(hidden_states, cache)`` where:
-
-            - ``hidden_states``: ``[B, T, D]``
-            - ``cache``: updated cache dict, or ``None`` if ``use_cache=False``.
+            Hidden states ``[B, T, D]``, or ``(hidden_states, layer_hiddens)``
+            when ``output_hidden_states=True``.
         """
         ...
+
+    def decode_session(self, batch_size: int, capacity: int) -> FlexDecodeSession:
+        """Create a cached-decode session over ``batch_size`` sequences.
+
+        ``Model.forward`` calls this on the first ``use_cache=True`` call and
+        carries the session inside its cache dict. Requires the backbone to
+        expose a ``transformers`` decoder stack as ``self.model``.
+        """
+        model = getattr(self, "model", None)
+        if model is None:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support cached decoding."
+            )
+        return FlexDecodeSession(model, batch_size=batch_size, capacity=capacity)
 
 
 @contextmanager

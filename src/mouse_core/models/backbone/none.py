@@ -27,12 +27,9 @@ class IdentityBackbone(Backbone):
     def forward(
         self,
         embeds: torch.Tensor,
-        cache: dict[str, Any] | None = None,
-        use_cache: bool = False,
-        attention_mask: torch.Tensor | None = None,
+        output_hidden_states: bool = False,
         **kwargs: Any,
-    ) -> tuple[torch.Tensor, dict[str, Any] | None]:
-        output_hidden_states = bool(kwargs.pop("output_hidden_states", False))
+    ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
         if output_hidden_states:
-            return embeds, None, (embeds,)
-        return embeds, None
+            return embeds, (embeds,)
+        return embeds

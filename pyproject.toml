@@ -37,6 +37,7 @@ examples = [
     "gymnasium[toy-text]>=1.3.0",
     "jupyter>=1.1.1",
     "ipykernel>=7.3.0",
+    "matplotlib>=3.10.0",
 ]
 all = [
     "mouse-core[examples]",

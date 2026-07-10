@@ -7,7 +7,7 @@ import torch
 
 from mouse_core.models import Model, load_model, save_model
 from mouse_core.models.base import _write_model_card
-from mouse_core.models.backbone import IdentityBackbone
+from mouse_core.models.backbone import IdentityBackbone, Qwen3Backbone
 from mouse_core.models.embedding import StepEmbedder
 from mouse_core.models.heads import DiscreteActionValueHead
 
@@ -164,3 +164,37 @@ def test_model_card_includes_usage_and_architecture(tmp_path) -> None:
     assert "predictions, objective_data, cache = model(batch)" in text
     assert "Backbone: `identity`" in text
     assert "Heads: `action_value`" in text
+
+
+def test_model_to_bfloat16_keeps_heads_float32() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    hidden_dim = 8
+    encoder = StepEmbedder(
+        hidden_dim=hidden_dim,
+        modalities=[
+            {"field": "action", "type": "discrete", "vocab_size": 4},
+            {"field": "reward", "type": "rff"},
+            {"field": "done", "type": "discrete", "vocab_size": 3},
+        ],
+        include_type_token=False,
+    )
+    backbone = Qwen3Backbone(hidden_dim=hidden_dim, num_layers=1, num_heads=2)
+    heads = DiscreteActionValueHead(
+        in_features=hidden_dim,
+        out_features=4,
+        hidden_dim=hidden_dim,
+        num_layers=1,
+    )
+    model = Model(encoder=encoder, backbone=backbone, heads=heads).eval()
+    model = model.to(device=torch.device("cuda"), dtype=torch.bfloat16)
+
+    assert next(model.encoder.parameters()).dtype == torch.bfloat16
+    assert next(model.backbone.parameters()).dtype == torch.bfloat16
+    assert next(model.heads.parameters()).dtype == torch.float32
+
+    batch = [[{"action": 0, "reward": 0.0, "done": 0}]]
+    with torch.no_grad():
+        preds, _, _ = model(batch, use_cache=True)
+    assert preds["action_value"].dtype == torch.float32

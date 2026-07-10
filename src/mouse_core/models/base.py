@@ -202,8 +202,11 @@ with torch.no_grad():
 
 `model()` returns `(predictions, objective_data, cache)`. `objective_data` is a
 `TensorDict[B, S]` of the modality tensors extracted by the encoder — pass it
-to objectives during training. For cached one-step rollout, keep `cache` and
-pass it back on the next call with `use_cache=True`.
+to objectives during training. For cached incremental rollout, keep `cache` and
+pass it back on the next call with `use_cache=True`. Cached batch rows may have
+different lengths on every call (e.g. envs emitting different numbers of steps
+between model calls): decoding runs through a FlexAttention session carried in
+the cache, so each row decodes exactly as it would alone.
 """
     path.write_text(text, encoding="utf-8")
 
@@ -819,26 +822,20 @@ class Model(nn.Module):
                 self.max_num_actions = out
                 break
 
-    # ------------------------------------------------------------------
-    # Backbone adapter (delegates to composed backbone)
-    # ------------------------------------------------------------------
-
-    def backbone_forward(
-        self,
-        embeds: torch.Tensor,
-        cache: dict[str, Any] | None = None,
-        use_cache: bool = False,
-        attention_mask: torch.Tensor | None = None,
-        **kwargs: Any,
-    ) -> tuple[torch.Tensor, dict[str, Any] | None]:
-        """Run the composed backbone; provided for compatibility with external callers."""
-        return self.backbone(
-            embeds=embeds,
-            cache=cache,
-            use_cache=use_cache,
-            attention_mask=attention_mask,
-            **kwargs,
-        )
+    def to(self, *args: Any, **kwargs: Any) -> "Model":
+        """Move/cast the model; output heads always stay float32."""
+        dtype_kw = kwargs.get("dtype")
+        dtype_arg = args[0] if len(args) == 1 and isinstance(args[0], torch.dtype) else None
+        target_dtype = dtype_kw or dtype_arg
+        if target_dtype is not None and target_dtype != torch.float32:
+            kwargs_no_dtype = {k: v for k, v in kwargs.items() if k != "dtype"}
+            args_no_dtype = () if dtype_arg is not None else args
+            super().to(*args_no_dtype, **kwargs_no_dtype)
+            self.encoder.to(*args_no_dtype, dtype=target_dtype, **kwargs_no_dtype)
+            self.backbone.to(*args_no_dtype, dtype=target_dtype, **kwargs_no_dtype)
+            self.heads.to(*args_no_dtype, dtype=torch.float32, **kwargs_no_dtype)
+            return self
+        return super().to(*args, **kwargs)
 
     # ------------------------------------------------------------------
     # Forward
@@ -849,20 +846,30 @@ class Model(nn.Module):
         batch: list[list[dict]],
         cache: dict[str, Any] | None = None,
         use_cache: bool = False,
-        attention_mask: torch.Tensor | None = None,
     ) -> tuple[TensorDict, TensorDict, dict[str, Any] | None]:
         """Run a full forward pass.
+
+        When decoding with a cache, rows in ``batch`` may have **different
+        lengths** on every call (including empty): incremental decoding runs
+        through a FlexAttention session that keeps each row inside its own
+        causal prefix with per-row RoPE positions, so every row decodes exactly
+        as it would alone (verified in ``tests/test_kv_cache.py``). The session
+        travels inside the returned ``cache``, so batched incremental decoding
+        with ragged chunks (e.g. envs emitting different numbers of steps
+        between model calls) needs no bookkeeping from the caller. Predictions
+        at a row's leading pad positions are meaningless: row ``b``'s real
+        steps are the trailing ``len(batch[b])`` entries, and the last step —
+        the one :meth:`get_action` reads — is always real for non-empty rows.
 
         Args:
             batch: ``[B][S]`` list of raw step-record dicts, as returned by
                 ``DataLoader.next_batch()`` or assembled manually for rollout.
-            cache: Optional KV cache from a prior call. Token positions for
-                incremental decode are inferred from the cache length.
+                Rows may have unequal lengths (including empty) when decoding
+                with a cache; at least one row must be non-empty.
+            cache: Optional cache from a prior call. Requires ``use_cache=True``
+                (the decode session inside is mutated by every call). The batch
+                size must match the call that created the cache.
             use_cache: If True, return an updated cache.
-            attention_mask: Optional ``[B, T]`` (or broadcastable) mask. Positions
-                corresponding to 0/False are ignored by attention. When None the
-                full sequence is attended to (subject to causal masking inside
-                the backbone).
 
         Returns:
             ``(predictions, objective_data, cache)`` where
@@ -871,10 +878,28 @@ class Model(nn.Module):
             * ``objective_data`` is a ``TensorDict[B, S]`` of the modality tensors
               extracted by the encoder — the same values used for embedding.
               Pass this to objectives (e.g. ``objective(objective_data, predictions)``).
-            * ``cache`` is the updated KV cache, or ``None`` when ``use_cache=False``.
+            * ``cache`` is the updated cache, or ``None`` when ``use_cache=False``.
         """
+        if cache is not None and not use_cache:
+            # The decode session in the cache is mutated by every call, so a
+            # "read-only" pass over an existing cache cannot exist.
+            raise ValueError("Passing cache= requires use_cache=True.")
+
         B = len(batch)
-        S = len(batch[0]) if B > 0 else 0
+        lengths = [len(rows) for rows in batch]
+        S = max(lengths, default=0)
+
+        ragged = any(n != S for n in lengths)
+        if ragged or use_cache:
+            if S == 0:
+                raise ValueError("Model.forward requires at least one non-empty row in batch.")
+            if not use_cache:
+                raise ValueError("Ragged batches require use_cache=True (cached decoding).")
+            if ragged:
+                # Pad rows are never attended to and never enter the KV cache,
+                # so any real row works as filler for the encoder.
+                pad_row = next(rows[0] for rows in batch if rows)
+                batch = [[pad_row] * (S - n) + rows for rows, n in zip(batch, lengths)]
 
         embeds, col_values, step_token_indices = self.encoder(batch)
         if any(value.device != embeds.device for value in col_values.values()):
@@ -882,25 +907,30 @@ class Model(nn.Module):
         objective_data = TensorDict(col_values, batch_size=(B, S))
 
         needs_layerwise = "action_value_layerwise" in self._heads
-        backbone_out = self.backbone(
-            embeds=embeds,
-            cache=cache,
-            use_cache=use_cache,
-            attention_mask=attention_mask,
-            output_hidden_states=needs_layerwise,
-        )
-        if needs_layerwise:
-            h, new_cache, layer_hiddens = backbone_out
+        if use_cache:
+            session = cache["session"] if cache else self.backbone.decode_session(
+                batch_size=B, capacity=embeds.shape[1]
+            )
+            token_lengths = [n * self.encoder.tokens_per_step for n in lengths]
+            session_out = session.forward(
+                embeds, token_lengths, output_hidden_states=needs_layerwise
+            )
+            new_cache: dict[str, Any] | None = {"session": session}
         else:
-            h, new_cache = backbone_out
+            session_out = self.backbone(embeds, output_hidden_states=needs_layerwise)
+            new_cache = None
+        if needs_layerwise:
+            h, layer_hiddens = session_out
+        else:
+            h = session_out
             layer_hiddens = None
 
-        h_step = self.encoder.pool_step_reprs(h, step_token_indices).float()
+        h_step = self.encoder.pool_step_reprs(h, step_token_indices)
         if needs_layerwise:
             assert layer_hiddens is not None
             h_layers = torch.stack(
                 [
-                    self.encoder.pool_step_reprs(layer_h, step_token_indices).float()
+                    self.encoder.pool_step_reprs(layer_h, step_token_indices)
                     for layer_h in layer_hiddens
                 ],
                 dim=1,
@@ -918,6 +948,9 @@ class Model(nn.Module):
         h_layers: torch.Tensor | None = None,
     ) -> TensorDict:
         """Run enabled heads on step representations ``[B, S, D]``."""
+        h = h.float()
+        if h_layers is not None:
+            h_layers = h_layers.float()
         tensors: dict[str, torch.Tensor] = {}
         for name, head_fn in self._heads.items():
             if name == "action_value_layerwise":

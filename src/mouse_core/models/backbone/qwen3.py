@@ -237,29 +237,17 @@ class Qwen3Backbone(Backbone):
     def forward(
         self,
         embeds: torch.Tensor,
-        cache: dict[str, Any] | None = None,
-        use_cache: bool = False,
-        attention_mask: torch.Tensor | None = None,
+        output_hidden_states: bool = False,
         **kwargs: Any,
-    ) -> tuple[torch.Tensor, dict[str, Any] | None]:
-        cache = cache or {}
-
-        output_hidden_states = bool(kwargs.pop("output_hidden_states", False))
-
+    ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
         out = self.model(
             inputs_embeds=embeds,
-            past_key_values=cache.get("backbone", None),
-            use_cache=use_cache,
-            position_ids=None,
-            attention_mask=attention_mask,
             output_hidden_states=output_hidden_states,
             **kwargs,
         )
-
-        new_cache = {"backbone": out.past_key_values} if use_cache else None
         if output_hidden_states:
             if out.hidden_states is None:
                 raise RuntimeError("Qwen3Backbone expected hidden_states but the model returned None.")
-            return out.last_hidden_state, new_cache, out.hidden_states[1:]
-        return out.last_hidden_state, new_cache
+            return out.last_hidden_state, out.hidden_states[1:]
+        return out.last_hidden_state
 
