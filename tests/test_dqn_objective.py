@@ -138,7 +138,7 @@ def test_dqn_objective_skips_transitions_across_pack_seams() -> None:
     loss, metrics = DqnObjective(gamma_step=0.0)(step_stream, out)
 
     assert abs(loss.item() - 4.0) < 1e-5
-    assert abs(metrics["q_values_mean"] - 3.0) < 1e-5  # seam pair excluded
+    assert abs(metrics["q_values_mean"] - 3.0) < 1e-5  # max online Q at current state
 
 
 def test_dqn_objective_without_seams_trains_all_pairs() -> None:

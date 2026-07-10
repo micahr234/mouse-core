@@ -145,12 +145,14 @@ class VecDqnObjective(Objective):
         cosine_sim = F.cosine_similarity(curr_action_vecs, rotated.detach(), dim=-1)  # [B, S-1]
         loss = (1.0 - cosine_sim)[valid_transition].mean()
 
-        abs_scores = vector_action_scores(online_vecs[:, -1].float()).abs() / (math.pi)  # [B, A]
+        curr_scores = vector_action_scores(curr_vecs).abs() / math.pi  # [B, S-1, A]
+        curr_max_score = curr_scores.amax(dim=-1)  # [B, S-1]
+        curr_max_det = curr_max_score.detach()[valid_transition]
         named: dict[str, torch.Tensor] = {
             "action_vector": loss.detach(),
-            "action_vector_score_abs_min": abs_scores.min().detach(),
-            "action_vector_score_abs_max": abs_scores.max().detach(),
-            "action_vector_score_abs_mean": abs_scores.mean().detach(),
+            "action_vector_score_abs_min": curr_max_det.min(),
+            "action_vector_score_abs_max": curr_max_det.max(),
+            "action_vector_score_abs_mean": curr_max_det.mean(),
         }
         metrics: dict[str, float] = dict(zip(named, torch.stack(list(named.values())).tolist()))
         return loss, metrics

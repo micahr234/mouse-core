@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import torch
+from tensordict import TensorDict
 
 from mouse_core.models.backbone import Qwen3Backbone
 from mouse_core.models.embedding import StepEmbedder
@@ -78,3 +79,35 @@ def test_model_layerwise_forward_and_objective() -> None:
     assert action.shape == (1,)
 
     model.polyak_update(action_value_layerwise_tau=objective.tau)
+
+
+def test_layerwise_objective_q_metrics_use_curr_max_q() -> None:
+    """q_values_mean and layer_q_mean report max online Q at the current state."""
+    step_stream = TensorDict(
+        {
+            "action": torch.tensor([[0, 1, 0]]),
+            "reward": torch.tensor([[0.0, 1.0, 5.0]]),
+            "done": torch.tensor([[0, 0, 0]]),
+        },
+        batch_size=(1, 3),
+    )
+    out = TensorDict(
+        {
+            "action_value_layerwise": torch.tensor(
+                [[[[0.0, 2.0], [3.0, 0.0]], [[0.0, 0.0], [0.0, 0.0]], [[0.0, 0.0], [0.0, 0.0]]]]
+            ),
+            "action_value_layerwise_target": torch.zeros(1, 3, 2, 2),
+        },
+        batch_size=(1, 3),
+    )
+
+    _, metrics = LayerwiseDqnObjective(
+        num_backbone_layers=2,
+        gamma_step_start=0.0,
+        gamma_step=0.0,
+    )(step_stream, out)
+
+    # Deepest layer (L-1): max online Q at s_0 is 3, at s_1 is 0 → mean 1.5.
+    assert abs(metrics["q_values_mean"] - 1.5) < 1e-5
+    assert abs(metrics["layer_0_q_mean"] - 1.0) < 1e-5
+    assert abs(metrics["layer_1_q_mean"] - 1.5) < 1e-5

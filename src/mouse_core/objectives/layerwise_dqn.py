@@ -249,8 +249,9 @@ class LayerwiseDqnObjective(Objective):
         next_q_target = q_target[:, 1:, :, :]  # [B, S-1, L, A]
 
         layer_losses: list[torch.Tensor] = []
-        layer_q_means: list[torch.Tensor] = []
+        layer_curr_max_means: list[torch.Tensor] = []
         cql_penalties: list[torch.Tensor] = []
+        deepest_curr_max_q: torch.Tensor | None = None
 
         for layer_idx in range(L):
             gammas = torch.tensor(
@@ -266,6 +267,7 @@ class LayerwiseDqnObjective(Objective):
             q_values = curr_q_layer.gather(
                 dim=-1, index=next_actions.unsqueeze(-1)
             ).squeeze(-1)
+            curr_max_q = curr_q_layer.amax(dim=-1)
             next_max_q_target = next_q_target_layer.amax(dim=-1)
             td_target = next_rewards + discount * next_max_q_target
 
@@ -278,25 +280,28 @@ class LayerwiseDqnObjective(Objective):
                 cql_penalties.append(cql_penalty.detach()[valid].mean())
 
             layer_losses.append(loss[valid].mean())
-            layer_q_means.append(q_values.detach()[valid].mean())
+            layer_curr_max_means.append(curr_max_q.detach()[valid].mean())
+            if layer_idx == L - 1:
+                deepest_curr_max_q = curr_max_q
 
         total_loss = torch.stack(layer_losses).mean()
 
-        deepest_q = q[:, :-1, -1, :].gather(
-            dim=-1, index=next_actions.unsqueeze(-1)
-        ).squeeze(-1)
-        q_det = deepest_q.detach()[valid]
-        q_std = (
-            q_det.std()
-            if q_det.numel() > 1
+        if deepest_curr_max_q is None:
+            raise RuntimeError(
+                "Layerwise DQN objective did not compute deepest-layer current-state max Q values."
+            )
+        curr_max_det = deepest_curr_max_q.detach()[valid]
+        curr_max_std = (
+            curr_max_det.std()
+            if curr_max_det.numel() > 1
             else torch.zeros((), device=device, dtype=value_dtype)
         )
 
         named: dict[str, torch.Tensor] = {
-            "q_values_mean": q_det.mean(),
-            "q_values_std": q_std,
-            "q_values_min": q_det.min(),
-            "q_values_max": q_det.max(),
+            "q_values_mean": curr_max_det.mean(),
+            "q_values_std": curr_max_std,
+            "q_values_min": curr_max_det.min(),
+            "q_values_max": curr_max_det.max(),
             "action_value_layerwise": total_loss.detach(),
         }
         for layer_idx, gamma in enumerate(self.layer_gamma_step):
@@ -304,7 +309,7 @@ class LayerwiseDqnObjective(Objective):
                 gamma, device=device, dtype=value_dtype
             )
             named[f"layer_{layer_idx}_loss"] = layer_losses[layer_idx].detach()
-            named[f"layer_{layer_idx}_q_mean"] = layer_q_means[layer_idx]
+            named[f"layer_{layer_idx}_q_mean"] = layer_curr_max_means[layer_idx]
         if cql_penalties:
             named["cql_penalty"] = torch.stack(cql_penalties).mean()
 

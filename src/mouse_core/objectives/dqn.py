@@ -191,15 +191,18 @@ class DqnObjective(Objective):
 
         loss = loss[valid].mean()
 
-        q_det = q_values.detach()[valid]
-        td_det = td_target.detach()[valid]
-        q_std = q_det.std() if q_det.numel() > 1 else torch.zeros((), device=device, dtype=value_dtype)
+        curr_max_q = curr_q.amax(dim=-1)  # [B, S-1]  max online Q at s_t
+        curr_max_det = curr_max_q.detach()[valid]
+        curr_max_std = (
+            curr_max_det.std()
+            if curr_max_det.numel() > 1
+            else torch.zeros((), device=device, dtype=value_dtype)
+        )
         named: dict[str, torch.Tensor] = {
-            "q_values_mean":   q_det.mean(),
-            "q_values_std":    q_std,
-            "q_values_min":    q_det.min(),
-            "q_values_max":    q_det.max(),
-            "q_values_target": td_det.mean(),
+            "q_values_mean":   curr_max_det.mean(),
+            "q_values_std":    curr_max_std,
+            "q_values_min":    curr_max_det.min(),
+            "q_values_max":    curr_max_det.max(),
             "action_value":    loss.detach(),
         }
         if cql_penalty_mean is not None:
