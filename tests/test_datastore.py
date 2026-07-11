@@ -60,14 +60,14 @@ def test_append_store_list() -> None:
 
 def test_getitem_returns_list_of_dicts() -> None:
     store = Datastore()
-    store.append({"action": 3, "reward": -1.0, "done": 1, "time": 4})
+    store.append({"action": 3, "reward": -1.0, "done": 1, "step_index": 4})
     rows = store.__getitem__(0)
     assert isinstance(rows, list)
     assert len(rows) == 1
     assert rows[0]["action"] == 3
     assert rows[0]["reward"] == -1.0
     assert rows[0]["done"] == 1
-    assert rows[0]["time"] == 4
+    assert rows[0]["step_index"] == 4
 
 
 def test_getitem_slice_preserves_order() -> None:
@@ -86,7 +86,7 @@ def test_dataset_roundtrip() -> None:
             "action": t % 2,
             "reward": float(t),
             "done": 0,
-            "time": t,
+            "step_index": t,
             "group_id": "CartPole-v1#0",
         })
 

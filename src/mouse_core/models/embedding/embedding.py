@@ -247,7 +247,7 @@ class ModalitySpec:
             {"type": "learnable", "tokens": 2},  # learned scratch tokens; never reads input data
             {"field": "obs", "type": "continuous", "dim": 8, "tokens": 2},
             {"field": "img", "type": "image", "dim": 7056, "tokens": 16},  # e.g. patches
-            {"field": "my_time", "type": "discrete", "vocab_size": 1000, "absent": -1},
+            {"field": "step_index", "type": "discrete", "vocab_size": 1000, "absent": -1},
         ]
         enc = StepEmbedder(hidden_dim=128, modalities=modalities, include_type_token=False)
     """
@@ -829,7 +829,7 @@ class StepEmbedder(Encoder):
         if k == "discrete":
             vs = spec.vocab_size or spec.size or 0
             absv = spec.absent
-            if absv is None and field == "time":
+            if absv is None and field == "step_index":
                 absv = -1
             return DiscreteEmbedder(hidden_dim, T, vs, absent_value=absv, embedding_std=mod_std)
 

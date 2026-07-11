@@ -342,3 +342,21 @@ def test_uniform_then_ragged_cached_decode() -> None:
     for b in range(2):
         batched = torch.cat(collected[b], dim=0)
         assert torch.allclose(batched, reference[b], atol=1e-5)
+
+
+def test_flex_decode_session_drops_without_cyclic_gc() -> None:
+    """mask_mod must not close over the session (that kept KV alive until gc)."""
+    import gc
+    import weakref
+
+    from mouse_core.models.backbone.flex_decode import FlexDecodeSession
+
+    model = _tiny_model(Qwen3Backbone)
+    session = FlexDecodeSession(model.backbone.model, batch_size=2, capacity=64)
+    wr = weakref.ref(session)
+    gc.disable()
+    try:
+        del session
+        assert wr() is None, "FlexDecodeSession stayed alive without cyclic GC"
+    finally:
+        gc.enable()

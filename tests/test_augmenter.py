@@ -72,7 +72,7 @@ def test_mask_probabilities_apply_to_configured_fields() -> None:
                 "done": 4,
                 "observation": 7,
                 "pixels": [10, 20],
-                "time": 12,
+                "step_index": 12,
             }
         ]
     ]
@@ -83,14 +83,14 @@ def test_mask_probabilities_apply_to_configured_fields() -> None:
             {"field": "done", "type": "discrete", "mask_prob": 1.0},
             {"field": "observation", "type": "discrete", "mask_prob": 1.0},
             {"field": "pixels", "type": "image", "mask_prob": 1.0},
-            {"field": "time", "type": "discrete", "mask_prob": 1.0},
+            {"field": "step_index", "type": "discrete", "mask_prob": 1.0},
         ],
         seed=0,
     )
 
     out = augment(batch)
 
-    assert out == [[{"action": 0, "reward": 0.0, "done": 0, "observation": 0, "pixels": [0, 0], "time": -1}]]
+    assert out == [[{"action": 0, "reward": 0.0, "done": 0, "observation": 0, "pixels": [0, 0], "step_index": -1}]]
 
 
 def test_shared_action_permutation_also_permutates_action_value_targets() -> None:

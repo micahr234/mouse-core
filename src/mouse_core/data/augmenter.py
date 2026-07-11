@@ -310,7 +310,7 @@ class Augmenter:
             return value
         if spec.mask_value is not None:
             return _copy_value(spec.mask_value)
-        if field == "time":
+        if field == "step_index":
             return -1
         return _zero_like(value)
 

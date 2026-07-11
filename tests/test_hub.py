@@ -72,7 +72,7 @@ def _store(*actions: int, name: str | None = None) -> Datastore:
             "action": {"discrete": action},
             "reward": float(i),
             "done": 0,
-            "time": i,
+            "step_index": i,
         })
     return store
 
@@ -84,14 +84,14 @@ def _loaded_store_datasets() -> dict[str, Dataset]:
             "action": {"discrete": 1},
             "reward": 1.0,
             "done": 0,
-            "time": 0,
+            "step_index": 0,
         }]),
         "lunar": Dataset.from_list([{
             "observation": {"discrete": 2},
             "action": {"discrete": 2},
             "reward": 2.0,
             "done": 0,
-            "time": 0,
+            "step_index": 0,
         }]),
     }
 
@@ -184,7 +184,7 @@ def test_load_stores_from_hub_scopes_short_names(
                 "action": {"discrete": 0},
                 "reward": 0.0,
                 "done": 0,
-                "time": 0,
+                "step_index": 0,
             }])
         }
 

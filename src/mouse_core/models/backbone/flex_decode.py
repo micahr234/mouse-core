@@ -112,14 +112,22 @@ class FlexDecodeSession:
         # Stable mask_mod identity (reads a per-call position table) lets
         # torch.compile reuse the traced mask across calls instead of
         # re-guarding on fresh closures.
-        self._q_pos = torch.zeros(0, 0, dtype=torch.long, device=self.device)
+        #
+        # Important: close over a dict holder, not ``self``. A ``mask_mod`` that
+        # captures ``self`` creates a reference cycle (session → mask_mod →
+        # session). Cyclic GC may not run between rollout and train, so the KV
+        # buffers stay allocated and online training OOMs after a few cycles.
+        q_pos_holder: dict[str, torch.Tensor] = {
+            "t": torch.zeros(0, 0, dtype=torch.long, device=self.device)
+        }
+        self._q_pos_holder = q_pos_holder
 
         def mask_mod(b, h, q_idx, kv_idx):
             # Causal within each sequence, offset by its cached history.
             # Pad queries carry a clamped position (a prefix of real slots),
             # so they stay finite; their K/V are never written and their
             # outputs are discarded by the caller.
-            return kv_idx <= self._q_pos[b, q_idx]
+            return kv_idx <= q_pos_holder["t"][b, q_idx]
 
         self._mask_mod = mask_mod
 
@@ -176,7 +184,7 @@ class FlexDecodeSession:
         # Pad columns get earlier/negative values; clamp keeps RoPE and the
         # mask finite (pad outputs are discarded by the caller either way).
         pos = self.lengths[:, None] + col - pad
-        self._q_pos = pos.clamp_min(0)
+        self._q_pos_holder["t"] = pos.clamp_min(0)
 
         # Real tokens are the trailing lengths[b] columns; only they are
         # written to the cache, at their own sequence's slots.
