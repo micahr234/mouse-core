@@ -39,7 +39,7 @@ def build_heads(
       - "action_value": DiscreteActionValueHead (per-discrete-action values, has target net)
       - "action_vector": VectorActionValueHead (vector per action, has target net)
       - "action": DiscreteActionHead — discrete action logits / policy (no target net)
-      - "value": plain head for value regression
+      - "value": SwiGLUHead — scalar/vector value (e.g. PPO critic; no target net)
 
     If ``head_kwargs`` is None or has no ``heads`` list, all heads are disabled.
     A head with ``num_layers`` of 0 (or falsy) is disabled.

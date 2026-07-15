@@ -3,12 +3,12 @@ from __future__ import annotations
 import pytest
 import torch
 
-from mouse_core.models.embedding import StepEmbedder
+from mouse_core.models.embedding import NumericEmbedder
 
 
-def _enc(**kwargs) -> StepEmbedder:
+def _enc(**kwargs) -> NumericEmbedder:
     """Convenience wrapper: all tests disable type tokens (no type_embedding_std needed)."""
-    return StepEmbedder(include_type_token=False, **kwargs)
+    return NumericEmbedder(include_type_token=False, **kwargs)
 
 
 def _batch(rows: list[dict], S: int = 1) -> list[list[dict]]:
@@ -17,7 +17,8 @@ def _batch(rows: list[dict], S: int = 1) -> list[list[dict]]:
     return [rows]
 
 
-def test_step_embedder_passes_is_seam_through_without_embedding() -> None:
+def test_numeric_embedder_ignores_is_seam_in_row_dicts() -> None:
+    """Pack metadata must not live in row dicts; encoder leaves it alone."""
     encoder = _enc(
         hidden_dim=8,
         modalities=[{"field": "action", "type": "discrete", "vocab_size": 4}],
@@ -31,14 +32,12 @@ def test_step_embedder_passes_is_seam_through_without_embedding() -> None:
     embeds, col_values, _ = encoder(with_seam)
     plain_embeds, plain_col_values, _ = encoder(without_seam)
 
-    assert torch.equal(col_values["is_seam"], torch.tensor([[0, 1]]))
-    assert col_values["is_seam"].dtype == torch.int64
-    # The flag is metadata for objectives; it must not change the embeddings.
-    assert torch.equal(embeds, plain_embeds)
+    assert "is_seam" not in col_values
     assert "is_seam" not in plain_col_values
+    assert torch.equal(embeds, plain_embeds)
 
 
-def test_step_embedder_faults_on_missing_required_modality() -> None:
+def test_numeric_embedder_faults_on_missing_required_modality() -> None:
     encoder = _enc(
         hidden_dim=8,
         modalities=[
@@ -52,7 +51,7 @@ def test_step_embedder_faults_on_missing_required_modality() -> None:
         encoder(batch)
 
 
-def test_step_embedder_faults_on_partially_missing_required_modality() -> None:
+def test_numeric_embedder_faults_on_partially_missing_required_modality() -> None:
     encoder = _enc(
         hidden_dim=8,
         modalities=[
@@ -69,7 +68,7 @@ def test_step_embedder_faults_on_partially_missing_required_modality() -> None:
         encoder(batch)
 
 
-def test_step_embedder_keeps_default_for_optional_missing_modality() -> None:
+def test_numeric_embedder_keeps_default_for_optional_missing_modality() -> None:
     encoder = _enc(
         hidden_dim=8,
         modalities=[
@@ -84,7 +83,7 @@ def test_step_embedder_keeps_default_for_optional_missing_modality() -> None:
     assert embeds.shape == (1, 1, 8)
 
 
-def test_step_embedder_returns_col_values() -> None:
+def test_numeric_embedder_returns_col_values() -> None:
     encoder = _enc(
         hidden_dim=8,
         modalities=[
@@ -101,7 +100,7 @@ def test_step_embedder_returns_col_values() -> None:
     assert col_values["reward"].item() == pytest.approx(1.5)
 
 
-def test_step_embedder_expands_multi_field_modality_specs() -> None:
+def test_numeric_embedder_expands_multi_field_modality_specs() -> None:
     encoder = _enc(
         hidden_dim=8,
         modalities=[
@@ -121,7 +120,7 @@ def test_step_embedder_expands_multi_field_modality_specs() -> None:
     assert col_values["value"].item() == pytest.approx(0.25)
 
 
-def test_step_embedder_batch_shape() -> None:
+def test_numeric_embedder_batch_shape() -> None:
     encoder = _enc(
         hidden_dim=8,
         modalities=[
@@ -141,7 +140,7 @@ def test_step_embedder_batch_shape() -> None:
     assert col_values["reward"].shape == (B, S)
 
 
-def test_step_embedder_sum_fusion_uses_max_modality_tokens() -> None:
+def test_numeric_embedder_sum_fusion_uses_max_modality_tokens() -> None:
     encoder = _enc(
         hidden_dim=8,
         modality_fusion="sum",
@@ -158,7 +157,7 @@ def test_step_embedder_sum_fusion_uses_max_modality_tokens() -> None:
     assert step_token_indices.tolist() == [[1]]
 
 
-def test_step_embedder_concat_fusion_uses_sum_modality_tokens() -> None:
+def test_numeric_embedder_concat_fusion_uses_sum_modality_tokens() -> None:
     encoder = _enc(
         hidden_dim=8,
         modality_fusion="concat",
@@ -175,7 +174,7 @@ def test_step_embedder_concat_fusion_uses_sum_modality_tokens() -> None:
     assert step_token_indices.tolist() == [[2]]
 
 
-def test_step_embedder_rejects_unknown_modality_fusion() -> None:
+def test_numeric_embedder_rejects_unknown_modality_fusion() -> None:
     with pytest.raises(ValueError, match='modality_fusion must be either "sum" or "concat"'):
         _enc(
             hidden_dim=8,
@@ -184,7 +183,7 @@ def test_step_embedder_rejects_unknown_modality_fusion() -> None:
         )
 
 
-def test_step_embedder_learnable_modality_is_allowed() -> None:
+def test_numeric_embedder_learnable_modality_is_allowed() -> None:
     encoder = _enc(
         hidden_dim=8,
         modalities=[
@@ -199,7 +198,7 @@ def test_step_embedder_learnable_modality_is_allowed() -> None:
     assert "scratch" not in col_values
 
 
-def test_step_embedder_continuous_modality() -> None:
+def test_numeric_embedder_continuous_modality() -> None:
     encoder = _enc(
         hidden_dim=8,
         modalities=[
@@ -215,9 +214,9 @@ def test_step_embedder_continuous_modality() -> None:
     assert col_values["obs"].shape == (1, 1, 4)
 
 
-def test_step_embedder_requires_type_embedding_std_when_type_token_enabled() -> None:
+def test_numeric_embedder_requires_type_embedding_std_when_type_token_enabled() -> None:
     with pytest.raises(ValueError, match="type_embedding_std is required"):
-        StepEmbedder(
+        NumericEmbedder(
             hidden_dim=8,
             modalities=[{"field": "action", "type": "discrete", "vocab_size": 4}],
             include_type_token=True,
@@ -225,8 +224,8 @@ def test_step_embedder_requires_type_embedding_std_when_type_token_enabled() -> 
         )
 
 
-def test_step_embedder_type_token_on_with_explicit_std() -> None:
-    encoder = StepEmbedder(
+def test_numeric_embedder_type_token_on_with_explicit_std() -> None:
+    encoder = NumericEmbedder(
         hidden_dim=8,
         modalities=[
             {"field": "action", "type": "discrete", "vocab_size": 4},
@@ -238,3 +237,43 @@ def test_step_embedder_type_token_on_with_explicit_std() -> None:
     batch = _batch([{"action": 1, "reward": 0.5}])
     embeds, _, _ = encoder(batch)
     assert embeds.shape == (1, 1, 8)
+
+
+def test_numeric_embedder_skip_shortens_concat_step() -> None:
+    encoder = _enc(
+        hidden_dim=8,
+        modality_fusion="concat",
+        modalities=[
+            {"field": "action", "type": "discrete", "vocab_size": 4, "tokens": 1},
+            {"field": "reward", "type": "rff", "tokens": 1, "skip": 0.0},
+            {"type": "learnable", "tokens": 1},
+        ],
+    )
+    # reward skipped → 2 tokens; reward present → 3 tokens
+    batch = [[
+        {"action": 1, "reward": 0.0},
+        {"action": 2, "reward": 1.5},
+    ]]
+    embeds, col_values, indices = encoder(batch)
+    assert col_values["reward"].tolist() == [[0.0, 1.5]]
+    # step0: action+learnable (2); step1: action+reward+learnable (3) → L=5
+    assert embeds.shape == (1, 5, 8)
+    assert indices.tolist() == [[1, 4]]
+
+
+def test_numeric_embedder_skip_sum_uses_present_only() -> None:
+    encoder = _enc(
+        hidden_dim=8,
+        modality_fusion="sum",
+        modalities=[
+            {"field": "action", "type": "discrete", "vocab_size": 4, "tokens": 2},
+            {"field": "reward", "type": "rff", "tokens": 1, "skip": 0.0},
+        ],
+    )
+    batch = [[
+        {"action": 1, "reward": 0.0},  # only action → 2 tokens
+        {"action": 2, "reward": 1.0},  # both → max(2,1)=2 tokens
+    ]]
+    embeds, _, indices = encoder(batch)
+    assert embeds.shape == (1, 4, 8)
+    assert indices.tolist() == [[1, 3]]

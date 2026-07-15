@@ -61,8 +61,8 @@ class Datastore:
     remain anonymous.
 
     No encoding or tensorisation happens here. ``DataLoader.next_batch()``
-    returns plain row dicts; the model's encoder extracts and converts what it
-    needs.
+    returns plain row dicts plus parallel segment IDs; the model's encoder
+    extracts and converts what it needs from the rows.
     """
 
     def __init__(self, name: str | None = None) -> None:

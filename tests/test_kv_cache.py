@@ -16,13 +16,13 @@ import torch
 
 from mouse_core.models import Model
 from mouse_core.models.backbone import LlamaBackbone, Qwen3Backbone
-from mouse_core.models.embedding import StepEmbedder
+from mouse_core.models.embedding import NumericEmbedder
 from mouse_core.models.heads import DiscreteActionValueHead
 
 
 def _tiny_model(backbone_cls, tokens: int = 1) -> Model:
     hidden_dim = 16
-    encoder = StepEmbedder(
+    encoder = NumericEmbedder(
         hidden_dim=hidden_dim,
         modalities=[
             {"field": "action", "type": "discrete", "vocab_size": 4, "tokens": tokens},
@@ -219,7 +219,7 @@ def test_concat_fusion_ragged_chunks_match_unbatched() -> None:
     blocks, and the mask must expand to exactly that many tokens per step."""
     torch.manual_seed(6)
     hidden_dim = 16
-    encoder = StepEmbedder(
+    encoder = NumericEmbedder(
         hidden_dim=hidden_dim,
         modalities=[
             {"field": "action", "type": "discrete", "vocab_size": 4, "tokens": 2},

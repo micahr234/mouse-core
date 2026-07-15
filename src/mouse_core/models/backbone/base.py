@@ -93,7 +93,9 @@ def _load_transformer_weights(
 ) -> None:
     """Load matching transformer weights into a MOUSE backbone internals.
 
-    MOUSE backbones replace token embeddings with ``StepEmbedder`` and replace
+    MOUSE backbones replace token embeddings with a MOUSE encoder
+    (:class:`~mouse_core.models.embedding.NumericEmbedder` or
+    :class:`~mouse_core.models.embedding.TextEmbedder`) and replace
     the final norm with ``Identity``, so those pretrained keys are skipped.
 
     Warns with the names of any other backbone tensors that did not receive

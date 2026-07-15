@@ -71,8 +71,8 @@ class LayerwiseDqnObjective(Objective):
     ``predictions["action_value_layerwise_target"]`` with shape ``[B, S, L, A]``.
     Each layer and each done-code uses its own discount, built at construction
     from explicit shallow/deep endpoint pairs. Row pairs that straddle a
-    packed-segment seam (``is_seam`` from ``DataLoader(pack=True)``) are
-    excluded from every layer's loss.
+    packed-segment boundary (different ``segment_id`` values from
+    ``DataLoader(pack=True)``) are excluded from every layer's loss.
 
     Effective planning horizon is ``H(gamma) = 1 / (1 - gamma)``. Layer ``0`` uses
     each ``gamma_*_start``; the deepest layer uses the deep value

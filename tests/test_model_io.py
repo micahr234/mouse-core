@@ -8,14 +8,14 @@ import torch
 from mouse_core.models import Model, load_model, save_model
 from mouse_core.models.base import _write_model_card
 from mouse_core.models.backbone import IdentityBackbone, Qwen3Backbone
-from mouse_core.models.embedding import StepEmbedder
+from mouse_core.models.embedding import NumericEmbedder
 from mouse_core.models.heads import DiscreteActionValueHead
 
 
 def test_composed_model_roundtrip(tmp_path) -> None:
     torch.manual_seed(0)
     hidden_dim = 8
-    encoder = StepEmbedder(
+    encoder = NumericEmbedder(
         hidden_dim=hidden_dim,
         modalities=[
             {"field": "action", "type": "discrete", "vocab_size": 4},
@@ -69,6 +69,7 @@ def test_composed_model_roundtrip(tmp_path) -> None:
         config = json.load(fh)
     assert config["format"] == "mouse-core-model-v1"
     assert config["backbone"]["type"] == "identity"
+    assert config["encoder"]["type"] == "numeric"
     enc_kwargs = config["encoder"]["kwargs"]
     for required_key in (
         "hidden_dim", "modalities", "token_data_len", "modality_fusion",
@@ -83,7 +84,7 @@ def test_composed_model_roundtrip_with_type_token(tmp_path) -> None:
     """type_embedding_std must survive save/load when include_type_token=True."""
     torch.manual_seed(42)
     hidden_dim = 8
-    encoder = StepEmbedder(
+    encoder = NumericEmbedder(
         hidden_dim=hidden_dim,
         modalities=[
             {"field": "action", "type": "discrete", "vocab_size": 4},
@@ -126,7 +127,7 @@ def test_composed_model_roundtrip_with_type_token(tmp_path) -> None:
 
 def test_model_card_includes_usage_and_architecture(tmp_path) -> None:
     model = Model(
-        encoder=StepEmbedder(
+        encoder=NumericEmbedder(
             hidden_dim=8,
             modalities=[
                 {"field": "action", "type": "discrete", "vocab_size": 4},
@@ -171,7 +172,7 @@ def test_model_to_bfloat16_keeps_heads_float32() -> None:
         pytest.skip("CUDA required")
 
     hidden_dim = 8
-    encoder = StepEmbedder(
+    encoder = NumericEmbedder(
         hidden_dim=hidden_dim,
         modalities=[
             {"field": "action", "type": "discrete", "vocab_size": 4},

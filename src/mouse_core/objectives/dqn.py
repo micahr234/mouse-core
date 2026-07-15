@@ -18,23 +18,23 @@ def _valid_transitions(
     """Boolean ``[B, S-1]`` mask: True where the pair ``(t, t+1)`` is a real transition.
 
     ``DataLoader(pack=True)`` stitches sequences from independently sampled
-    segments and flags the first row of each appended segment with
-    ``is_seam=1``. A pair whose row ``t+1`` starts a new segment straddles two
-    unrelated slices, so it must not be trained on. Batches without an
-    ``is_seam`` column (unpacked loaders, manual batches) are fully valid.
+    segments and labels each step with a ``segment_id``. A pair whose adjacent
+    steps have different IDs straddles two unrelated slices, so it must not be
+    trained on. Batches without a ``segment_id`` column (manual batches that
+    never went through ``Model.forward``) are fully valid.
     """
     valid = torch.ones(B, S - 1, dtype=torch.bool, device=device)
-    if "is_seam" in objective_data.keys():
-        is_seam = objective_data["is_seam"]
-        if is_seam.shape != torch.Size([B, S]):
+    if "segment_id" in objective_data.keys():
+        segment_id = objective_data["segment_id"]
+        if segment_id.shape != torch.Size([B, S]):
             raise ValueError(
-                f"is_seam must have shape [{B}, {S}], got {tuple(is_seam.shape)}."
+                f"segment_id must have shape [{B}, {S}], got {tuple(segment_id.shape)}."
             )
-        valid &= is_seam[:, 1:] == 0
+        valid &= segment_id[:, 1:] == segment_id[:, :-1]
         if not valid.any():
             raise ValueError(
                 "No valid transitions: every consecutive pair in the batch "
-                "crosses a packed-segment seam."
+                "crosses a packed-segment boundary."
             )
     return valid
 
@@ -46,8 +46,8 @@ class DqnObjective(Objective):
     ``(objective_data, predictions)`` to compute the loss.
 
     Every consecutive pair ``(t, t+1)`` within a sampled sequence is a valid
-    TD transition, unless ``objective_data`` carries the DataLoader's pack-mode
-    ``is_seam`` flag and row ``t+1`` starts a new packed segment — those pairs
+    TD transition, unless ``objective_data`` carries pack-mode ``segment_id``
+    values and the two steps belong to different pack slices — those pairs
     straddle independently sampled slices and are excluded from the loss. The
     done code stored at ``t+1`` determines the discount applied to the
     bootstrap value:

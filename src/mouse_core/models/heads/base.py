@@ -57,7 +57,7 @@ class HeadSpec:
     - ``"action_value"``: DiscreteActionValueHead — value per discrete action (has target net)
     - ``"action_vector"``: VectorActionValueHead — vector per action (has target net)
     - ``"action"``: DiscreteActionHead — discrete action logits / policy (no target net)
-    - ``"value"``: plain head for value regression
+    - ``"value"``: SwiGLUHead — scalar or vector value regression (e.g. PPO critic)
 
     Common options for all:
       - ``num_layers``, ``hidden_dim``, ``scale``, ``use_norm``

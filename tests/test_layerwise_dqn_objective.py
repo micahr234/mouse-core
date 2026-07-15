@@ -69,8 +69,8 @@ def test_layerwise_dqn_objective_runs() -> None:
     assert metrics["layer_0_loss"] >= 0.0
 
 
-def test_layerwise_dqn_objective_skips_transitions_across_pack_seams() -> None:
-    """Corrupting data at a seam-masked pair must leave the loss unchanged."""
+def test_layerwise_dqn_objective_skips_transitions_across_pack_segments() -> None:
+    """Corrupting data at a segment-boundary pair must leave the loss unchanged."""
     b, s, layers, a = 1, 5, 2, 3
     torch.manual_seed(0)
     step_stream = TensorDict(
@@ -78,7 +78,7 @@ def test_layerwise_dqn_objective_skips_transitions_across_pack_seams() -> None:
             "action": torch.randint(0, a, (b, s)),
             "reward": torch.randn(b, s),
             "done": torch.zeros(b, s, dtype=torch.long),
-            "is_seam": torch.tensor([[0, 0, 1, 0, 0]]),
+            "segment_id": torch.tensor([[0, 0, 1, 1, 1]]),
         },
         batch_size=(b, s),
     )
@@ -98,7 +98,7 @@ def test_layerwise_dqn_objective_skips_transitions_across_pack_seams() -> None:
     loss_before, _ = objective(step_stream, out)
 
     corrupted = step_stream.clone()
-    corrupted["reward"][0, 2] = 1.0e6  # reward entering the seam row (pair t=1)
+    corrupted["reward"][0, 2] = 1.0e6  # reward entering the new segment (pair t=1)
     loss_after, _ = objective(corrupted, out)
 
     assert torch.allclose(loss_before, loss_after)

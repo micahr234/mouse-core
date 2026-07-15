@@ -49,6 +49,92 @@ def _hub_repo_id_for_user(repo_id: str, token: str | bool | None = None) -> str:
     return f"{user}/{repo_id}"
 
 
+def _expand_segment_ids_to_tokens(
+    segment_ids: torch.Tensor,
+    counts: torch.Tensor,
+) -> torch.Tensor:
+    """Expand step-level segment IDs ``[B, S]`` by per-step token counts ``[B, S]``.
+
+    Result is ``[B, L]`` (batch-padded with ``-1`` for unused trailing slots).
+    """
+    from mouse_core.models.embedding.packing import expand_segment_ids
+
+    return expand_segment_ids(segment_ids, counts)
+
+
+def _segment_causal_attention_mask(
+    segment_token_ids: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+    token_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Additive 4D mask ``[B, 1, L, L]``: causal and same-segment only.
+
+    Allowed positions are ``0.0``; blocked positions are a large negative value
+    compatible with HuggingFace SDPA / float attention masks.
+
+    When ``token_mask`` is provided (``[B, L]`` bool, True = real token), pad
+    positions neither attend nor are attended to. Segment id ``-1`` (batch pad)
+    is also treated as non-attending.
+    """
+    # segment_token_ids: [B, L]
+    B, L = segment_token_ids.shape
+    device = segment_token_ids.device
+    q = torch.arange(L, device=device).view(1, L, 1)
+    k = torch.arange(L, device=device).view(1, 1, L)
+    causal = k <= q
+    real_seg = segment_token_ids >= 0
+    same_segment = (
+        (segment_token_ids.unsqueeze(2) == segment_token_ids.unsqueeze(1))
+        & real_seg.unsqueeze(2)
+        & real_seg.unsqueeze(1)
+    )
+    allowed = causal & same_segment  # [B, L, L]
+    if token_mask is not None:
+        if token_mask.shape != (B, L):
+            raise ValueError(
+                f"token_mask must have shape [{B}, {L}], got {tuple(token_mask.shape)}"
+            )
+        allowed = allowed & token_mask.unsqueeze(2) & token_mask.unsqueeze(1)
+    neg = torch.finfo(dtype).min
+    mask = torch.zeros(B, 1, L, L, device=device, dtype=dtype)
+    mask = mask.masked_fill(~allowed.unsqueeze(1), neg)
+    return mask
+
+
+def _segment_position_ids(
+    segment_token_ids: torch.Tensor,
+    *,
+    token_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """RoPE position ids ``[B, L]`` reset to 0 at each segment boundary.
+
+    Pad tokens (``token_mask`` False or segment id ``-1``) keep position 0 and
+    are masked out of attention separately.
+    """
+    B, L = segment_token_ids.shape
+    if L == 0:
+        return torch.zeros(B, 0, dtype=torch.long, device=segment_token_ids.device)
+    real = segment_token_ids >= 0
+    if token_mask is not None:
+        real = real & token_mask
+    # Sentinel prev id so the first real token is always treated as a segment start.
+    prev = torch.cat(
+        [
+            segment_token_ids.new_full((B, 1), -1),
+            segment_token_ids[:, :-1],
+        ],
+        dim=1,
+    )
+    new_seg = (segment_token_ids != prev) & real
+    idx = torch.arange(L, device=segment_token_ids.device).view(1, L).expand(B, -1)
+    markers = torch.where(new_seg, idx, torch.full_like(idx, -1))
+    # Only accumulate starts on real tokens; pads keep markers at -1 until a real start.
+    last_start = markers.cummax(dim=1).values.clamp(min=0)
+    pos = (idx - last_start).to(torch.long)
+    return torch.where(real, pos, torch.zeros_like(pos))
+
+
 def save_model(model: "Model", path: str | Path) -> None:
     """Save a MOUSE model to a local directory.
 
@@ -164,7 +250,7 @@ This repository contains a MOUSE model checkpoint.
 
 ### Encoder
 
-`StepEmbedder` reads flat step-record dicts and projects each declared modality
+`NumericEmbedder` reads flat step-record dicts and projects each declared modality
 into the shared `{config["hidden_dim"]}`-dimensional token space before the
 backbone.
 
@@ -323,27 +409,38 @@ def _model_config(model: "Model") -> dict[str, Any]:
 
 
 def _encoder_config(encoder: Encoder) -> dict[str, Any]:
-    from mouse_core.models.embedding.embedding import StepEmbedder
+    from mouse_core.models.embedding.embedding import NumericEmbedder
+    from mouse_core.models.embedding.text import TextEmbedder
 
-    if not isinstance(encoder, StepEmbedder):
-        raise TypeError(
-            "save_model currently supports StepEmbedder encoders. "
-            f"Got {type(encoder).__name__}."
-        )
-    return {
-        "type": "step",
-        "kwargs": {
-            "hidden_dim": int(encoder.hidden_dim),
-            "modalities": [_public_modality_config(modality) for modality in encoder.modalities],
-            "token_data_len": int(encoder.token_data_len),
-            "modality_fusion": encoder.modality_fusion,
-            "include_type_token": bool(encoder.include_type_token),
-            "fourier_min": float(encoder.fourier_min),
-            "fourier_max": float(encoder.fourier_max),
-            "std": float(encoder.std),
-            "type_embedding_std": float(encoder.type_embedding_std),
-        },
-    }
+    if isinstance(encoder, NumericEmbedder):
+        return {
+            "type": "numeric",
+            "kwargs": {
+                "hidden_dim": int(encoder.hidden_dim),
+                "modalities": [_public_modality_config(modality) for modality in encoder.modalities],
+                "token_data_len": int(encoder.token_data_len),
+                "modality_fusion": encoder.modality_fusion,
+                "include_type_token": bool(encoder.include_type_token),
+                "fourier_min": float(encoder.fourier_min),
+                "fourier_max": float(encoder.fourier_max),
+                "std": float(encoder.std),
+                "type_embedding_std": float(encoder.type_embedding_std),
+            },
+        }
+    if isinstance(encoder, TextEmbedder):
+        return {
+            "type": "text",
+            "kwargs": {
+                "hidden_dim": int(encoder.hidden_dim),
+                "modalities": [_public_modality_config(modality) for modality in encoder.modalities],
+                "pretrained": encoder.pretrained,
+                "format": encoder.format,
+            },
+        }
+    raise TypeError(
+        "save_model currently supports NumericEmbedder and TextEmbedder encoders. "
+        f"Got {type(encoder).__name__}."
+    )
 
 
 def _public_modality_config(modality: Any) -> dict[str, Any]:
@@ -522,11 +619,18 @@ def _build_model_from_config(config: dict[str, Any]) -> "Model":
 
 
 def _build_encoder_from_config(config: dict[str, Any]) -> Encoder:
-    if config.get("type") != "step":
-        raise ValueError(f"Unsupported encoder type {config.get('type')!r}.")
-    from mouse_core.models.embedding import StepEmbedder
+    enc_type = config.get("type")
+    if enc_type == "numeric":
+        from mouse_core.models.embedding import NumericEmbedder
 
-    return StepEmbedder(**config["kwargs"])
+        return NumericEmbedder(**config["kwargs"])
+    if enc_type == "text":
+        from mouse_core.models.embedding import TextEmbedder
+
+        kwargs = dict(config["kwargs"])
+        # image_processor / tokenizer are not serialized; reload from pretrained.
+        return TextEmbedder(**kwargs)
+    raise ValueError(f"Unsupported encoder type {enc_type!r}.")
 
 
 def _build_backbone_from_config(config: dict[str, Any]) -> nn.Module:
@@ -632,7 +736,7 @@ class Model(nn.Module):
 
     The only supported construction is the explicit three-piece composition:
 
-        encoder = StepEmbedder(...)
+        encoder = NumericEmbedder(...)
         backbone = LlamaBackbone(...)   # or any Backbone
         heads = DiscreteActionValueHead(...)            # or a dict/list of heads
 
@@ -844,6 +948,7 @@ class Model(nn.Module):
     def forward(
         self,
         batch: list[list[dict]],
+        segment_ids: list[list[int]] | None = None,
         cache: dict[str, Any] | None = None,
         use_cache: bool = False,
     ) -> tuple[TensorDict, TensorDict, dict[str, Any] | None]:
@@ -866,6 +971,12 @@ class Model(nn.Module):
                 ``DataLoader.next_batch()`` or assembled manually for rollout.
                 Rows may have unequal lengths (including empty) when decoding
                 with a cache; at least one row must be non-empty.
+            segment_ids: Optional ``[B][S]`` pack-slice IDs parallel to
+                ``batch`` (from ``DataLoader.next_batch()``). Training uses them
+                to build a same-segment causal attention mask and to reset RoPE
+                ``position_ids`` at each new segment. ``None`` (rollouts) treats
+                every step in a row as one segment. Injected into
+                ``objective_data`` as ``segment_id`` for TD objectives.
             cache: Optional cache from a prior call. Requires ``use_cache=True``
                 (the decode session inside is mutated by every call). The batch
                 size must match the call that created the cache.
@@ -876,7 +987,8 @@ class Model(nn.Module):
 
             * ``predictions`` is a ``TensorDict[B, S]`` with one entry per enabled head.
             * ``objective_data`` is a ``TensorDict[B, S]`` of the modality tensors
-              extracted by the encoder — the same values used for embedding.
+              extracted by the encoder — the same values used for embedding —
+              plus ``segment_id``.
               Pass this to objectives (e.g. ``objective(objective_data, predictions)``).
             * ``cache`` is the updated cache, or ``None`` when ``use_cache=False``.
         """
@@ -901,23 +1013,83 @@ class Model(nn.Module):
                 pad_row = next(rows[0] for rows in batch if rows)
                 batch = [[pad_row] * (S - n) + rows for rows, n in zip(batch, lengths)]
 
+        if segment_ids is None:
+            segment_ids = [[0] * len(rows) for rows in batch]
+        if len(segment_ids) != B:
+            raise ValueError(
+                f"segment_ids batch size ({len(segment_ids)}) must match batch ({B})."
+            )
+        for b, (rows, ids) in enumerate(zip(batch, segment_ids)):
+            if len(ids) != len(rows):
+                raise ValueError(
+                    f"segment_ids[{b}] length ({len(ids)}) must match batch[{b}] "
+                    f"length ({len(rows)})."
+                )
+
         embeds, col_values, step_token_indices = self.encoder(batch)
         if any(value.device != embeds.device for value in col_values.values()):
             col_values = {key: value.to(embeds.device) for key, value in col_values.items()}
+        segment_id_tensor = torch.tensor(
+            segment_ids, device=embeds.device, dtype=torch.long
+        )
+        if segment_id_tensor.shape != (B, S):
+            raise ValueError(
+                f"segment_ids must have shape [{B}, {S}], got {tuple(segment_id_tensor.shape)}."
+            )
+        col_values["segment_id"] = segment_id_tensor
         objective_data = TensorDict(col_values, batch_size=(B, S))
+
+        from mouse_core.models.embedding.packing import (
+            counts_from_step_token_indices,
+            real_token_lengths_from_indices,
+            token_pad_mask,
+        )
+
+        counts = counts_from_step_token_indices(step_token_indices)
+        pad_mask = token_pad_mask(step_token_indices, embeds.shape[1])
 
         needs_layerwise = "action_value_layerwise" in self._heads
         if use_cache:
-            session = cache["session"] if cache else self.backbone.decode_session(
-                batch_size=B, capacity=embeds.shape[1]
+            from mouse_core.models.embedding.packing import left_align_content
+
+            token_lengths = real_token_lengths_from_indices(
+                step_token_indices, num_real_steps=lengths
             )
-            token_lengths = [n * self.encoder.tokens_per_step for n in lengths]
+            flex_embeds, pool_indices = left_align_content(embeds, step_token_indices)
+            session = cache["session"] if cache else self.backbone.decode_session(
+                batch_size=B, capacity=max(flex_embeds.shape[1], 1)
+            )
             session_out = session.forward(
-                embeds, token_lengths, output_hidden_states=needs_layerwise
+                flex_embeds, token_lengths, output_hidden_states=needs_layerwise
             )
             new_cache: dict[str, Any] | None = {"session": session}
+            step_token_indices = pool_indices
         else:
-            session_out = self.backbone(embeds, output_hidden_states=needs_layerwise)
+            segment_token_ids = _expand_segment_ids_to_tokens(
+                segment_id_tensor, counts
+            )
+            # Batch-pad expand may be shorter/longer than embeds if packing differs;
+            # align to embeds length.
+            L = embeds.shape[1]
+            if segment_token_ids.shape[1] < L:
+                pad = segment_token_ids.new_full(
+                    (B, L - segment_token_ids.shape[1]), -1
+                )
+                segment_token_ids = torch.cat([segment_token_ids, pad], dim=1)
+            elif segment_token_ids.shape[1] > L:
+                segment_token_ids = segment_token_ids[:, :L]
+            attention_mask = _segment_causal_attention_mask(
+                segment_token_ids, dtype=embeds.dtype, token_mask=pad_mask
+            )
+            position_ids = _segment_position_ids(
+                segment_token_ids, token_mask=pad_mask
+            )
+            session_out = self.backbone(
+                embeds,
+                output_hidden_states=needs_layerwise,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+            )
             new_cache = None
         if needs_layerwise:
             h, layer_hiddens = session_out

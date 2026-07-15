@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import threading
+import multiprocessing as mp
 
 import pytest
 from datasets import Dataset
@@ -37,26 +37,26 @@ def test_dataloader_applies_augmenter_before_returning_batch() -> None:
         augmenter=augmenter,
     )
 
-    batch = loader.next_batch()
+    batch, _segment_ids = loader.next_batch()
 
     assert all(row["action"] == 0 for sequence in batch for row in sequence)
 
 
-class _ThreadMarkerAugmenter:
+class _ProcessMarkerAugmenter:
     def __init__(self, marker: str = "root") -> None:
         self.marker = marker
 
-    def fork(self, *, seed: int) -> _ThreadMarkerAugmenter:
-        return _ThreadMarkerAugmenter(marker=f"worker-{seed}")
+    def fork(self, *, seed: int) -> _ProcessMarkerAugmenter:
+        return _ProcessMarkerAugmenter(marker=f"worker-{seed}")
 
     def __call__(self, batch: list[list[dict]]) -> list[list[dict]]:
-        thread_name = threading.current_thread().name
+        process_name = mp.current_process().name
         return [
             [
                 {
                     **row,
                     "augmenter_marker": self.marker,
-                    "augmenter_thread": thread_name,
+                    "augmenter_process": process_name,
                 }
                 for row in sequence
             ]
@@ -64,7 +64,7 @@ class _ThreadMarkerAugmenter:
         ]
 
 
-def test_dataloader_runs_augmenter_in_worker_thread() -> None:
+def test_dataloader_runs_augmenter_in_worker_process() -> None:
     loader = DataLoader(
         _store_with_actions(),
         sequence_length=3,
@@ -72,17 +72,19 @@ def test_dataloader_runs_augmenter_in_worker_thread() -> None:
         num_workers=1,
         prefetch=1,
         seed=0,
-        augmenter=_ThreadMarkerAugmenter(),
+        augmenter=_ProcessMarkerAugmenter(),
     )
     try:
-        batch = loader.next_batch()
+        batch, _segment_ids = loader.next_batch()
     finally:
         loader.close()
 
     markers = {row["augmenter_marker"] for sequence in batch for row in sequence}
     assert len(markers) == 1
     assert markers.pop().startswith("worker-")
-    assert all(row["augmenter_thread"] == "DataLoader-0" for sequence in batch for row in sequence)
+    assert all(
+        row["augmenter_process"] == "DataLoader-0" for sequence in batch for row in sequence
+    )
 
 
 def test_dataloader_snapshots_loaded_source_and_appended_rows() -> None:
@@ -94,9 +96,10 @@ def test_dataloader_snapshots_loaded_source_and_appended_rows() -> None:
     store.append({"action": 3, "reward": 0.0, "done": 0})
 
     loader = DataLoader(store, sequence_length=3, batch_size=1, num_workers=0)
-    batch = loader.next_batch()
+    batch, segment_ids = loader.next_batch()
 
     assert [row["action"] for row in batch[0]] == [1, 2, 3]
+    assert segment_ids[0] == [0, 0, 0]
 
 
 def test_dataloader_seed_is_deterministic() -> None:
@@ -118,25 +121,30 @@ def test_dataloader_seed_is_deterministic_with_workers() -> None:
         loader_b.close()
 
 
+class _SeedRecorder:
+    """Records augmenter fork seeds in the parent process (fork runs before spawn/fork)."""
+
+    def __init__(self, seen: list[int] | None = None) -> None:
+        self.seen = seen if seen is not None else []
+
+    def fork(self, *, seed: int) -> _SeedRecorder:
+        self.seen.append(seed)
+        return _SeedRecorder(seen=self.seen)
+
+    def __call__(self, batch: list[list[dict]]) -> list[list[dict]]:
+        return batch
+
+
 def test_dataloader_sampling_and_augmenter_seed_streams_differ() -> None:
     """Sampling RNG and augmenter fork must not share a seed stream."""
     seen: list[int] = []
-
-    class _SeedRecorder:
-        def fork(self, *, seed: int) -> "_SeedRecorder":
-            seen.append(seed)
-            return self
-
-        def __call__(self, batch: list[list[dict]]) -> list[list[dict]]:
-            return batch
-
     loader = DataLoader(
         _store_with_actions(),
         sequence_length=3,
         batch_size=1,
         num_workers=2,
         seed=7,
-        augmenter=_SeedRecorder(),
+        augmenter=_SeedRecorder(seen=seen),
     )
     try:
         loader.next_batch()
@@ -157,13 +165,13 @@ def test_dataloader_refresh_picks_up_appended_rows() -> None:
     loader.next_batch()
 
     store.append({"action": 4, "reward": 0.0, "done": 0})
-    batch_before_refresh = loader.next_batch()
+    batch_before_refresh, _ = loader.next_batch()
     assert all(row["action"] != 4 for row in batch_before_refresh[0])
 
     loader.refresh()
     seen = set()
     for _ in range(20):
-        batch = loader.next_batch()
+        batch, _ = loader.next_batch()
         seen.update(row["action"] for row in batch[0])
     assert 4 in seen
 
@@ -191,33 +199,35 @@ def test_dataloader_refresh_drains_prefetch_queue_and_updates_lengths() -> None:
         loader.close()
 
 
-def test_dataloader_pack_marks_segment_seams() -> None:
+def test_dataloader_pack_assigns_segment_ids() -> None:
     store = Datastore()
     for action in (1, 2, 3):
         store.append({"action": action, "reward": 0.0, "done": 0})
 
     # sequence_length 8 over a 3-row store forces at least 2 extra segments.
     loader = DataLoader(store, sequence_length=8, batch_size=1, pack=True, num_workers=0, seed=0)
-    batch = loader.next_batch()
+    batch, segment_ids = loader.next_batch()
     sequence = batch[0]
+    ids = segment_ids[0]
 
-    assert all("is_seam" in row for row in sequence)
-    assert sequence[0]["is_seam"] == 0  # first row never starts at a seam
-    seam_count = sum(row["is_seam"] for row in sequence)
-    assert seam_count >= 2
-    # A seam row is exactly a row where a fresh segment begins: the previous
-    # row is the end of an independently sampled slice, so consecutive
-    # actions need not be contiguous there.
-    for prev, row in zip(sequence, sequence[1:]):
-        if row["is_seam"] == 0 and prev["action"] < 3:
+    assert all("is_seam" not in row for row in sequence)
+    assert len(ids) == 8
+    assert ids[0] == 0
+    assert max(ids) >= 2
+    # Within a segment, consecutive actions stay contiguous when possible.
+    for prev, row, prev_id, seg_id in zip(sequence, sequence[1:], ids, ids[1:]):
+        if seg_id == prev_id and prev["action"] < 3:
             assert row["action"] == prev["action"] + 1
+        if seg_id != prev_id:
+            assert seg_id == prev_id + 1
 
 
-def test_dataloader_unpacked_rows_carry_no_seam_flag() -> None:
+def test_dataloader_unpacked_segment_ids_are_zero() -> None:
     loader = DataLoader(_store_with_actions(), sequence_length=3, batch_size=1, num_workers=0)
-    batch = loader.next_batch()
+    batch, segment_ids = loader.next_batch()
 
     assert all("is_seam" not in row for row in batch[0])
+    assert segment_ids[0] == [0, 0, 0]
 
 
 def test_dataloader_pack_allows_empty_stores_until_sampling() -> None:
@@ -229,7 +239,62 @@ def test_dataloader_pack_allows_empty_stores_until_sampling() -> None:
 
         store.append({"action": 1, "reward": 0.0, "done": 0})
         loader.refresh()
-        batch = loader.next_batch()
+        batch, segment_ids = loader.next_batch()
         assert len(batch[0]) == 2
+        assert len(segment_ids[0]) == 2
+    finally:
+        loader.close()
+
+
+def test_dataloader_pad_right_pads_short_windows() -> None:
+    store = Datastore()
+    for action in (1, 2, 3):
+        store.append({"action": action, "reward": 0.0, "done": 0})
+
+    loader = DataLoader(store, sequence_length=8, batch_size=1, pad=True, num_workers=0, seed=0)
+    batch, segment_ids = loader.next_batch()
+    sequence = batch[0]
+    ids = segment_ids[0]
+
+    assert len(sequence) == 8
+    assert ids[0] == 0
+    # Real suffix shares segment 0; each pad step gets its own id.
+    real_len = sum(1 for seg_id in ids if seg_id == 0)
+    assert 1 <= real_len <= 3
+    assert ids[:real_len] == [0] * real_len
+    assert ids[real_len:] == list(range(1, 1 + (8 - real_len)))
+    # Pads copy the last real row.
+    last_real = sequence[real_len - 1]
+    for row in sequence[real_len:]:
+        assert row == last_real
+
+
+def test_dataloader_pad_allows_short_stores() -> None:
+    store = Datastore()
+    store.append({"action": 7, "reward": 1.0, "done": 0})
+    loader = DataLoader(store, sequence_length=4, batch_size=1, pad=True, num_workers=0)
+    batch, segment_ids = loader.next_batch()
+    assert len(batch[0]) == 4
+    assert segment_ids[0] == [0, 1, 2, 3]
+    assert all(row["action"] == 7 for row in batch[0])
+
+
+def test_dataloader_rejects_pack_and_pad_together() -> None:
+    store = _store_with_actions()
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        DataLoader(store, sequence_length=3, batch_size=1, pack=True, pad=True, num_workers=0)
+
+
+def test_dataloader_pad_allows_empty_stores_until_sampling() -> None:
+    store = Datastore()
+    loader = DataLoader(store, sequence_length=2, batch_size=1, pad=True, num_workers=0)
+    try:
+        with pytest.raises(ValueError, match="all stores are empty"):
+            loader.next_batch()
+        store.append({"action": 1, "reward": 0.0, "done": 0})
+        loader.refresh()
+        batch, segment_ids = loader.next_batch()
+        assert len(batch[0]) == 2
+        assert segment_ids[0] == [0, 1]
     finally:
         loader.close()

@@ -47,16 +47,16 @@ def test_vec_dqn_objective_is_idempotent() -> None:
     assert torch.equal(loss_first, loss_second)
 
 
-def test_vec_dqn_objective_ignores_transitions_across_pack_seams() -> None:
-    """Loss must not depend on data at a pair that straddles a packed seam."""
+def test_vec_dqn_objective_ignores_transitions_across_pack_segments() -> None:
+    """Loss must not depend on data at a pair that straddles a pack segment boundary."""
     objective_data, predictions = _make_batch(S=6)
     objective_data["done"].zero_()
-    objective_data["is_seam"] = torch.tensor([[0, 0, 0, 1, 0, 0]])
+    objective_data["segment_id"] = torch.tensor([[0, 0, 0, 1, 1, 1]])
 
     loss_before, _ = VecDqnObjective()(objective_data, predictions)
 
-    # Corrupt the seam pair: reward entering the seam row and the target
-    # vectors at the seam row itself. A masked objective must not notice.
+    # Corrupt the boundary pair: reward entering the new segment and the target
+    # vectors at the first row of the new segment. A masked objective must not notice.
     corrupted_data = objective_data.clone()
     corrupted_preds = predictions.clone()
     corrupted_data["reward"][0, 3] = 1.0e6
@@ -67,13 +67,13 @@ def test_vec_dqn_objective_ignores_transitions_across_pack_seams() -> None:
     assert torch.allclose(loss_before, loss_after)
 
 
-def test_vec_dqn_objective_skips_substitution_from_seam_row() -> None:
-    """A boundary transition whose reset-substitute row starts a new segment is dropped."""
+def test_vec_dqn_objective_skips_substitution_from_other_segment() -> None:
+    """A boundary transition whose reset-substitute row is a different segment is dropped."""
     # done boundary at t+1=1 makes transition t=0 look for its target at t+2=2,
-    # but row 2 begins a new packed segment — so transition 0 must be invalid
-    # and the target vectors at row 2 must not influence the loss.
+    # but row 2 belongs to a different pack segment — so transition 0 must be
+    # invalid and the target vectors at row 2 must not influence the loss.
     objective_data, predictions = _make_batch(S=4)
-    objective_data["is_seam"] = torch.tensor([[0, 0, 1, 0]])
+    objective_data["segment_id"] = torch.tensor([[0, 0, 1, 1]])
 
     loss_before, _ = VecDqnObjective()(objective_data, predictions)
 

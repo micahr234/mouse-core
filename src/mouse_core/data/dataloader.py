@@ -3,14 +3,16 @@
 A ``Datastore`` is a flat sequence of arbitrary rows.
 
 The ``DataLoader`` repeatedly samples contiguous windows of ``S`` rows and
-returns them as a ``list[list[dict]]`` of shape ``[B][S]``. Each element is a
-plain Python dict exactly as it was stored, unless an optional batch augmenter
-rewrites the raw rows before return (no encoding or tensorisation happens
-here). The model (its encoder) is responsible for extracting and converting
-the fields it needs.
+returns ``(batch, segment_ids)`` where ``batch`` is a ``list[list[dict]]`` of
+shape ``[B][S]`` and ``segment_ids`` is a parallel ``list[list[int]]``. Each
+element of ``batch`` is a plain Python dict exactly as it was stored, unless
+an optional batch augmenter rewrites the raw rows before return (no encoding
+or tensorisation happens here). The model (its encoder) is responsible for
+extracting and converting the fields it needs.
 
 When background workers are enabled the slice and augmentation work happens in
-the background so ``next_batch()`` is usually immediate.
+worker processes so ``next_batch()`` is usually immediate and batch prep can
+use multiple CPU cores.
 
 Usage
 -----
@@ -20,7 +22,7 @@ Single store::
     store.from_dataset(ds)
 
     loader = DataLoader(store, sequence_length=64, batch_size=8)
-    batch = loader.next_batch()   # list[list[dict]] shape [B][S]
+    batch, segment_ids = loader.next_batch()   # [B][S] rows + segment ids
     loader.close()
 
 Multiple stores with weights::
@@ -33,17 +35,22 @@ Multiple stores with weights::
         weight_mode="per_store",
     )
 
-With packing (sequences may span store boundaries)::
+With packing (fill short windows by appending other slices)::
 
     loader = DataLoader(stores, sequence_length=64, batch_size=8, pack=True)
+
+With padding (fill short windows with right-padding)::
+
+    loader = DataLoader(stores, sequence_length=64, batch_size=8, pad=True)
 """
 
 from __future__ import annotations
 
+import multiprocessing as mp
 import queue
-import threading
 from collections.abc import Callable
-from typing import TYPE_CHECKING, cast
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 
@@ -53,20 +60,145 @@ if TYPE_CHECKING:
 
 BatchAugmenter = Callable[[list[list[dict]]], list[list[dict]]]
 
+# Sentinel / tagged queue payloads from worker processes.
+_BatchItem = tuple[list[list[dict]], list[list[int]]]
+
+
+def _mp_context() -> mp.context.BaseContext:
+    """Prefer fork so HF Dataset snapshots are COW-shared across workers."""
+    if "fork" in mp.get_all_start_methods():
+        return mp.get_context("fork")
+    return mp.get_context("spawn")
+
+
+@dataclass(frozen=True)
+class _SnapshotConfig:
+    """Immutable sampling snapshot passed into each worker process."""
+
+    datasets: tuple[Any, ...]
+    ns: tuple[int, ...]
+    probs: np.ndarray
+    sequence_length: int
+    batch_size: int
+    pack: bool
+    pad: bool
+
+
+def _fetch_sequence(
+    cfg: _SnapshotConfig,
+    rng: np.random.Generator,
+) -> tuple[list[dict], list[int]]:
+    """Fetch exactly ``sequence_length`` steps and their segment IDs."""
+    if sum(cfg.ns) == 0:
+        raise ValueError("Cannot sample batches: all stores are empty.")
+
+    S = cfg.sequence_length
+    steps: list[dict] = []
+    segment_ids: list[int] = []
+    seg = 0
+
+    while len(steps) < S:
+        store_idx = int(rng.choice(len(cfg.datasets), p=cfg.probs))
+        ds = cfg.datasets[store_idx]
+        n = cfg.ns[store_idx]
+
+        if cfg.pack or cfg.pad:
+            start = int(rng.integers(0, n))
+        else:
+            start = int(rng.integers(0, n - S + 1))
+
+        end = min(start + (S - len(steps)), n)
+        hf_slice = ds[start:end]
+        count = end - start
+        steps.extend({k: hf_slice[k][i] for k in hf_slice} for i in range(count))
+        segment_ids.extend([seg] * count)
+
+        if cfg.pad:
+            # One real slice, then right-pad; do not stitch further segments.
+            break
+
+        if not cfg.pack:
+            # Without packing the single slice is always full; exit immediately.
+            break
+
+        seg += 1
+
+    if cfg.pad and len(steps) < S:
+        if not steps:
+            raise ValueError("Cannot pad an empty sequence: sampled zero real steps.")
+        pad_row = dict(steps[-1])
+        next_seg = seg + 1
+        while len(steps) < S:
+            steps.append(dict(pad_row))
+            segment_ids.append(next_seg)
+            next_seg += 1
+
+    return steps[:S], segment_ids[:S]
+
+
+def _fetch_one_batch(
+    cfg: _SnapshotConfig,
+    rng: np.random.Generator,
+    augmenter: BatchAugmenter | None,
+) -> _BatchItem:
+    pairs = [_fetch_sequence(cfg, rng) for _ in range(cfg.batch_size)]
+    batch = [steps for steps, _ in pairs]
+    segment_ids = [ids for _, ids in pairs]
+    if augmenter is not None:
+        batch = augmenter(batch)
+    return batch, segment_ids
+
+
+def _worker_loop(
+    result_queue: mp.Queue,
+    stop_event: mp.synchronize.Event,
+    cfg: _SnapshotConfig,
+    sample_seed: Any,
+    augmenter: BatchAugmenter | None,
+) -> None:
+    """Prefetch loop run inside a worker process."""
+    rng = np.random.default_rng(seed=sample_seed)
+    while not stop_event.is_set():
+        try:
+            item = _fetch_one_batch(cfg, rng, augmenter)
+            while not stop_event.is_set():
+                try:
+                    result_queue.put(("ok", item), timeout=0.05)
+                    break
+                except queue.Full:
+                    pass
+        except Exception as exc:  # noqa: BLE001
+            try:
+                result_queue.put(("err", exc), timeout=1.0)
+            except Exception:  # noqa: BLE001
+                pass
+            return
+
+
+def _fork_augmenter(augmenter: BatchAugmenter | None, *, seed: int | None) -> BatchAugmenter | None:
+    if augmenter is None:
+        return None
+    fork = getattr(augmenter, "fork", None)
+    if callable(fork):
+        return cast(BatchAugmenter, fork(seed=seed))
+    return augmenter
+
 
 class DataLoader:
-    """Produces ``list[list[dict]]`` batches of raw step records from one or more Datastores.
+    """Produces batches of raw step records plus per-step segment IDs.
 
     Each store holds a flat sequence of arbitrary rows. The loader samples
     contiguous windows and returns them as Python dicts without any encoding.
     Columns are untouched; the model's encoder decides what to extract and
-    how to tensorize it.
+    how to tensorize it. Segment IDs are returned separately from the row
+    dicts and label which independently sampled pack slice each step came from.
 
     When multiple stores are provided, each sequence in a batch independently
     draws its store according to the computed per-store probabilities, giving
     smooth within-batch mixing.
 
-    Background workers (when enabled) do the work asynchronously.
+    Background workers (when enabled) run in separate processes so slice and
+    augmentation work can use multiple CPU cores.
 
     Parameters
     ----------
@@ -99,19 +231,31 @@ class DataLoader:
         including the last few steps. When the initial window is shorter than
         ``sequence_length``, additional independently-sampled segments (drawn
         from the same store distribution) are appended until the sequence is
-        full. Every row then carries an ``"is_seam"`` flag (``1`` on the first
-        row of each appended segment, ``0`` elsewhere); the encoder passes it
-        through to ``objective_data`` so TD objectives skip the row pairs that
-        straddle a seam, which are not real environment transitions. Empty
+        full. ``next_batch`` returns parallel ``segment_ids``: within each
+        sequence the first pack slice is ``0``, the next ``1``, and so on.
+        The model uses these IDs for attention/RoPE isolation and TD
+        objectives skip pairs whose adjacent steps have different IDs. Empty
         stores are allowed at construction and on :meth:`refresh`;
-        :meth:`next_batch` raises if every store is still empty. If ``False``
-        (default), every sequence comes from a single in-store window of
-        exactly ``sequence_length`` steps; stores shorter than
+        :meth:`next_batch` raises if every store is still empty. Mutually
+        exclusive with ``pad``.
+    pad :
+        If ``True``, a sequence can start at any position in a store. When the
+        remaining suffix is shorter than ``sequence_length``, the window is
+        right-padded by repeating the last real row until length ``S``. Each
+        padded step gets its own ``segment_id`` (continuing after the real
+        slice's id) so attention/RoPE isolate pads and TD objectives skip
+        pad transitions. Empty stores are allowed at construction and on
+        :meth:`refresh`; :meth:`next_batch` raises if every store is still
+        empty. Mutually exclusive with ``pack``.
+
+        If both ``pack`` and ``pad`` are ``False`` (default), every sequence
+        comes from a single in-store window of exactly ``sequence_length``
+        steps (all ``segment_ids`` are ``0``); stores shorter than
         ``sequence_length`` are rejected at construction.
     prefetch :
         How many batches to keep pre-fetched in the background queue.
     num_workers :
-        Background worker threads (0 = synchronous).
+        Background worker processes (0 = synchronous).
     seed :
         Seed for the loader's internal NumPy RNG. ``None`` (default) uses
         unpredictable entropy. When set, each worker's sampling RNG and its
@@ -119,11 +263,14 @@ class DataLoader:
         ``numpy.random.SeedSequence(seed).spawn(...)``, so multi-worker
         sampling is reproducible for a given ``seed`` and no two streams
         (across workers, or between sampling and augmentation) coincide.
+        Each :meth:`refresh` that restarts workers draws a fresh spawn wave
+        from the same ``SeedSequence`` so streams do not replay after refresh.
     augmenter :
         Optional callable applied to each sampled batch. With background workers,
         augmentation runs in the worker before the batch is put into the prefetch
         queue. If the callable exposes ``fork(seed=...)``, each worker receives an
-        independent copy.
+        independent copy. Augmenters used with ``num_workers > 0`` must be
+        picklable when the process start method is ``spawn``.
     """
 
     def __init__(
@@ -135,6 +282,7 @@ class DataLoader:
         weights: list[float] | None = None,
         weight_mode: str = "per_store",
         pack: bool = False,
+        pad: bool = False,
         prefetch: int = 4,
         num_workers: int = 1,
         seed: int | None = None,
@@ -143,11 +291,13 @@ class DataLoader:
         from mouse_core.data.datastore import Datastore as _DS
 
         # Set teardown attrs early so __del__/close are safe even if later validation fails.
-        self._stop = None
-        self._result_queue = None
-        self._workers = []
-        self._sync_rng = None
-        self._worker_error = None
+        self._ctx = _mp_context()
+        self._stop: mp.synchronize.Event | None = None
+        self._result_queue: mp.Queue | None = None
+        self._workers: list[mp.Process] = []
+        self._sync_rng: np.random.Generator | None = None
+        self._sync_augmenter: BatchAugmenter | None = None
+        self._worker_error: BaseException | None = None
 
         if isinstance(stores, _DS):
             stores = [stores]
@@ -155,6 +305,8 @@ class DataLoader:
             raise TypeError("DataLoader requires a Datastore or a non-empty list of Datastores.")
         if weight_mode not in ("per_store", "per_step"):
             raise ValueError(f"weight_mode must be 'per_store' or 'per_step', got {weight_mode!r}")
+        if pack and pad:
+            raise ValueError("pack and pad are mutually exclusive; set at most one of them.")
         if weights is not None:
             if len(weights) != len(stores):
                 raise ValueError(
@@ -162,18 +314,25 @@ class DataLoader:
                 )
             if any(w <= 0 for w in weights):
                 raise ValueError("All weights must be positive.")
+        if num_workers < 0:
+            raise ValueError(f"num_workers must be >= 0, got {num_workers}.")
 
         self.stores = stores
         self.sequence_length = sequence_length
         self.batch_size = batch_size
         self.weight_mode = weight_mode
         self.pack = pack
+        self.pad = pad
         self.seed = seed
         self.augmenter = augmenter
+        self._num_workers = num_workers
+        self._prefetch = prefetch
         self._weights: np.ndarray = (
             np.ones(len(stores)) if weights is None else np.asarray(weights, dtype=float)
         )
-        self._snapshot_lock = threading.Lock()
+        self._seed_seq: np.random.SeedSequence | None = (
+            np.random.SeedSequence(seed) if seed is not None else None
+        )
 
         self._datasets: list = []
         self._ns: list[int] = []
@@ -181,45 +340,10 @@ class DataLoader:
         self._resnapshot_stores()
 
         if num_workers == 0:
-            self._sync_rng: np.random.Generator | None = np.random.default_rng(seed=seed)
-            self._sync_augmenter: BatchAugmenter | None = augmenter
-            self._result_queue: queue.Queue[list[list[dict]]] | None = None
-            self._stop: threading.Event | None = None
-            self._worker_error: BaseException | None = None
-            self._workers: list[threading.Thread] = []
+            self._sync_rng = np.random.default_rng(seed=seed)
+            self._sync_augmenter = augmenter
         else:
-            self._sync_rng = None
-            self._sync_augmenter = None
-            self._result_queue = queue.Queue(maxsize=prefetch)
-            self._stop = threading.Event()
-            self._worker_error = None
-            # Independent child seeds per worker for sampling (even slots) and
-            # augmentation (odd slots): seed arithmetic like ``seed + i`` makes
-            # the two streams within a worker identical and lets nearby seeds
-            # share worker streams across loaders.
-            if seed is None:
-                sample_seeds: list = [None] * num_workers
-                augment_seeds: list = [None] * num_workers
-            else:
-                children = np.random.SeedSequence(seed).spawn(2 * num_workers)
-                sample_seeds = children[0::2]
-                augment_seeds = [
-                    int(child.generate_state(1)[0]) for child in children[1::2]
-                ]
-            self._workers = [
-                threading.Thread(
-                    target=self._worker_loop,
-                    args=(
-                        np.random.default_rng(seed=sample_seeds[i]),
-                        _fork_augmenter(augmenter, seed=augment_seeds[i]),
-                    ),
-                    daemon=True,
-                    name=f"DataLoader-{i}",
-                )
-                for i in range(num_workers)
-            ]
-            for w in self._workers:
-                w.start()
+            self._start_workers()
 
     # ------------------------------------------------------------------
     # Public interface
@@ -237,43 +361,47 @@ class DataLoader:
         Call after appending new rows to the underlying ``Datastore`` objects
         so :meth:`next_batch` samples from the latest data. When
         ``weight_mode="per_step"``, store-size weights are recomputed too.
+        With background workers, processes are restarted against the new
+        snapshot so they never read a stale shared object graph.
         """
-        with self._snapshot_lock:
-            self._resnapshot_stores()
-            self._drain_prefetch_queue()
+        if self._num_workers > 0:
+            self._stop_workers()
+        self._resnapshot_stores()
+        if self._num_workers > 0:
+            self._start_workers()
 
-    def next_batch(self) -> list[list[dict]]:
-        """Return the next batch of raw rows, blocking until one is ready.
+    def next_batch(self) -> tuple[list[list[dict]], list[list[int]]]:
+        """Return the next batch of raw rows and parallel segment IDs.
 
         Returns:
-            ``list[list[dict]]`` of shape ``[B][S]``.  Each inner dict is a
-            step record exactly as stored in the Datastore.
+            ``(batch, segment_ids)`` where ``batch`` is ``list[list[dict]]`` of
+            shape ``[B][S]`` (step records exactly as stored) and
+            ``segment_ids`` is ``list[list[int]]`` of the same shape. Within
+            each sequence, independently sampled pack slices (and each pad
+            step when ``pad=True``) share distinct ids (``0``, ``1``, …); with
+            neither ``pack`` nor ``pad``, every id is ``0``.
         """
         if self._sync_rng is not None:
-            return self._fetch_one_batch(self._sync_rng, self._sync_augmenter)
+            cfg = self._snapshot_config()
+            return _fetch_one_batch(cfg, self._sync_rng, self._sync_augmenter)
         assert self._result_queue is not None
         while True:
             if self._worker_error is not None:
                 raise RuntimeError("A prefetch worker raised an exception.") from self._worker_error
             try:
-                return self._result_queue.get(timeout=0.05)
+                kind, payload = self._result_queue.get(timeout=0.05)
             except queue.Empty:
                 if not any(w.is_alive() for w in self._workers):
                     raise RuntimeError("All prefetch workers stopped unexpectedly.")
+                continue
+            if kind == "err":
+                self._worker_error = cast(BaseException, payload)
+                raise RuntimeError("A prefetch worker raised an exception.") from self._worker_error
+            return cast(_BatchItem, payload)
 
     def close(self) -> None:
         """Stop background workers and drain the queue."""
-        if self._stop is None:
-            return
-        self._stop.set()
-        assert self._result_queue is not None
-        while True:
-            try:
-                self._result_queue.get_nowait()
-            except queue.Empty:
-                break
-        for w in self._workers:
-            w.join(timeout=2.0)
+        self._stop_workers()
 
     def __enter__(self) -> DataLoader:
         return self
@@ -290,27 +418,89 @@ class DataLoader:
         )
         return (
             f"DataLoader(stores=[{store_info}], S={self.sequence_length}, "
-            f"B={self.batch_size}, pack={self.pack}, seed={self.seed})"
+            f"B={self.batch_size}, pack={self.pack}, pad={self.pad}, seed={self.seed})"
         )
 
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
 
-    def _drain_prefetch_queue(self) -> None:
-        if self._result_queue is None:
+    def _snapshot_config(self) -> _SnapshotConfig:
+        return _SnapshotConfig(
+            datasets=tuple(self._datasets),
+            ns=tuple(self._ns),
+            probs=self._probs.copy(),
+            sequence_length=self.sequence_length,
+            batch_size=self.batch_size,
+            pack=self.pack,
+            pad=self.pad,
+        )
+
+    def _worker_seeds(self) -> tuple[list[Any], list[int | None]]:
+        n = self._num_workers
+        if self._seed_seq is None:
+            return [None] * n, [None] * n
+        # Independent child seeds per worker for sampling (even slots) and
+        # augmentation (odd slots): seed arithmetic like ``seed + i`` makes
+        # the two streams within a worker identical and lets nearby seeds
+        # share worker streams across loaders. Each call advances the
+        # SeedSequence spawn counter so refresh waves do not replay.
+        children = self._seed_seq.spawn(2 * n)
+        sample_seeds = children[0::2]
+        augment_seeds = [int(child.generate_state(1)[0]) for child in children[1::2]]
+        return sample_seeds, augment_seeds
+
+    def _start_workers(self) -> None:
+        assert self._num_workers > 0
+        self._worker_error = None
+        self._result_queue = self._ctx.Queue(maxsize=self._prefetch)
+        self._stop = self._ctx.Event()
+        cfg = self._snapshot_config()
+        sample_seeds, augment_seeds = self._worker_seeds()
+        self._workers = []
+        for i in range(self._num_workers):
+            proc = self._ctx.Process(
+                target=_worker_loop,
+                args=(
+                    self._result_queue,
+                    self._stop,
+                    cfg,
+                    sample_seeds[i],
+                    _fork_augmenter(self.augmenter, seed=augment_seeds[i]),
+                ),
+                daemon=True,
+                name=f"DataLoader-{i}",
+            )
+            proc.start()
+            self._workers.append(proc)
+
+    def _stop_workers(self) -> None:
+        if self._stop is None:
+            self._workers = []
+            self._result_queue = None
             return
-        while True:
-            try:
-                self._result_queue.get_nowait()
-            except queue.Empty:
-                break
+        self._stop.set()
+        if self._result_queue is not None:
+            while True:
+                try:
+                    self._result_queue.get_nowait()
+                except queue.Empty:
+                    break
+        for w in self._workers:
+            w.join(timeout=2.0)
+            if w.is_alive():
+                w.terminate()
+                w.join(timeout=1.0)
+        self._workers = []
+        self._stop = None
+        self._result_queue = None
 
     def _resnapshot_stores(self) -> None:
         self._datasets = [s.to_dataset() for s in self.stores]
         self._ns = [len(ds) for ds in self._datasets]
 
-        if not self.pack:
+        allow_short = self.pack or self.pad
+        if not allow_short:
             for i, (n, s) in enumerate(zip(self._ns, self.stores)):
                 if n == 0:
                     raise ValueError(f"Store {i} ({s!r}) is empty.")
@@ -318,103 +508,15 @@ class DataLoader:
                     name = s.name or f"index {i}"
                     raise ValueError(
                         f"Store {name!r} has {n} steps but sequence_length={self.sequence_length}. "
-                        "Use pack=True to allow sequences that span store boundaries."
+                        "Use pack=True or pad=True to allow shorter stores."
                     )
         w = self._weights.copy()
         ns = np.array(self._ns, dtype=float)
         if self.weight_mode == "per_step":
             w = w * ns
-        elif self.pack:
+        elif allow_short:
             w = w * (ns > 0)
         if w.sum() == 0:
             self._probs = np.ones(len(self.stores)) / len(self.stores)
         else:
             self._probs = w / w.sum()
-
-    def _fetch_sequence(self, rng: np.random.Generator) -> list[dict]:
-        """Fetch exactly ``sequence_length`` steps for one sequence slot.
-
-        Picks a store according to ``_probs``, draws a random start, and
-        slices up to ``sequence_length`` steps.  When ``pack=True`` and the
-        slice hits the end of the store, additional independently-sampled
-        segments are appended until the sequence is full.  When ``pack=False``
-        the start is guaranteed to leave a full window.
-
-        In pack mode every row carries an ``"is_seam"`` flag: ``1`` on the
-        first row of each appended segment after the first (the row pair that
-        straddles it is not a real environment transition), ``0`` elsewhere.
-        TD objectives use it to skip transitions that cross a seam.
-        """
-        if sum(self._ns) == 0:
-            raise ValueError("Cannot sample batches: all stores are empty.")
-
-        S = self.sequence_length
-        steps: list[dict] = []
-
-        while len(steps) < S:
-            store_idx = int(rng.choice(len(self._datasets), p=self._probs))
-            ds = self._datasets[store_idx]
-            n = self._ns[store_idx]
-
-            if self.pack:
-                start = int(rng.integers(0, n))
-            else:
-                start = int(rng.integers(0, n - S + 1))
-
-            end = min(start + (S - len(steps)), n)
-            hf_slice = ds[start:end]
-            count = end - start
-            if self.pack:
-                starts_new_segment = len(steps) > 0
-                steps.extend(
-                    {
-                        **{k: hf_slice[k][i] for k in hf_slice},
-                        "is_seam": int(starts_new_segment and i == 0),
-                    }
-                    for i in range(count)
-                )
-            else:
-                steps.extend(
-                    {k: hf_slice[k][i] for k in hf_slice} for i in range(count)
-                )
-
-            if not self.pack:
-                # Without packing the single slice is always full; exit immediately.
-                break
-
-        return steps[:S]
-
-    def _fetch_one_batch(
-        self,
-        rng: np.random.Generator,
-        augmenter: BatchAugmenter | None,
-    ) -> list[list[dict]]:
-        with self._snapshot_lock:
-            batch = [self._fetch_sequence(rng) for _ in range(self.batch_size)]
-        if augmenter is not None:
-            batch = augmenter(batch)
-        return batch
-
-    def _worker_loop(self, rng: np.random.Generator, augmenter: BatchAugmenter | None) -> None:
-        assert self._stop is not None and self._result_queue is not None
-        while not self._stop.is_set():
-            try:
-                batch = self._fetch_one_batch(rng, augmenter)
-                while not self._stop.is_set():
-                    try:
-                        self._result_queue.put(batch, timeout=0.05)
-                        break
-                    except queue.Full:
-                        pass
-            except Exception as exc:  # noqa: BLE001
-                self._worker_error = exc
-                return
-
-
-def _fork_augmenter(augmenter: BatchAugmenter | None, *, seed: int | None) -> BatchAugmenter | None:
-    if augmenter is None:
-        return None
-    fork = getattr(augmenter, "fork", None)
-    if callable(fork):
-        return cast(BatchAugmenter, fork(seed=seed))
-    return augmenter

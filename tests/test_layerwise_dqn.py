@@ -6,7 +6,7 @@ import torch
 from tensordict import TensorDict
 
 from mouse_core.models.backbone import Qwen3Backbone
-from mouse_core.models.embedding import StepEmbedder
+from mouse_core.models.embedding import NumericEmbedder
 from mouse_core.models.heads import LayerwiseDiscreteActionValueHead
 from mouse_core.models.base import Model
 from mouse_core.objectives import LayerwiseDqnObjective
@@ -40,7 +40,7 @@ def test_layerwise_head_forward_shape() -> None:
 
 def test_model_layerwise_forward_and_objective() -> None:
     backbone = Qwen3Backbone(hidden_dim=16, num_layers=2, num_heads=2)
-    encoder = StepEmbedder(
+    encoder = NumericEmbedder(
         hidden_dim=backbone.hidden_dim,
         modalities=[
             {"field": "action", "type": "discrete", "vocab_size": 4, "std": 0.02, "tokens": 1},

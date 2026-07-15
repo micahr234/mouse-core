@@ -7,7 +7,7 @@ import torch
 from mouse_core.models import Model, load_model, save_model
 from mouse_core.models.backbone import IdentityBackbone
 from mouse_core.models.base import Model as ModelClass
-from mouse_core.models.embedding import StepEmbedder
+from mouse_core.models.embedding import NumericEmbedder
 from mouse_core.models.heads import DiscreteActionHead
 
 
@@ -35,7 +35,7 @@ def test_infer_head_name_is_action() -> None:
 def test_discrete_action_head_save_load_roundtrip(tmp_path) -> None:
     torch.manual_seed(0)
     hidden_dim = 8
-    encoder = StepEmbedder(
+    encoder = NumericEmbedder(
         hidden_dim=hidden_dim,
         modalities=[
             {"field": "action", "type": "discrete", "vocab_size": 4},

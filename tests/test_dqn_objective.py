@@ -109,13 +109,13 @@ def test_dqn_objective_trains_on_terminal_transitions() -> None:
     assert abs(loss.item() - 2.5) < 1e-5
 
 
-def _seam_fixture(is_seam: list[int]) -> tuple[TensorDict, TensorDict]:
+def _segment_fixture(segment_id: list[int]) -> tuple[TensorDict, TensorDict]:
     step_stream = TensorDict(
         {
             "action": torch.tensor([[0, 1, 0]]),
             "reward": torch.tensor([[0.0, 1.0, 5.0]]),
             "done": torch.tensor([[0, 0, 0]]),
-            "is_seam": torch.tensor([is_seam]),
+            "segment_id": torch.tensor([segment_id]),
         },
         batch_size=(1, 3),
     )
@@ -129,11 +129,11 @@ def _seam_fixture(is_seam: list[int]) -> tuple[TensorDict, TensorDict]:
     return step_stream, out
 
 
-def test_dqn_objective_skips_transitions_across_pack_seams() -> None:
-    """A pair whose second row starts a new packed segment is not a transition."""
-    # Row 1 is the first row of a new packed segment, so the (0, 1) pair is
-    # fake and only the (1, 2) pair contributes: (3 - 5)^2 = 4.0.
-    step_stream, out = _seam_fixture([0, 1, 0])
+def test_dqn_objective_skips_transitions_across_pack_segments() -> None:
+    """A pair whose steps belong to different pack segments is not a transition."""
+    # Rows 0 and 1 are different segments, so only the (1, 2) pair contributes:
+    # (3 - 5)^2 = 4.0.
+    step_stream, out = _segment_fixture([0, 1, 1])
 
     loss, metrics = DqnObjective(gamma_step=0.0)(step_stream, out)
 
@@ -141,20 +141,20 @@ def test_dqn_objective_skips_transitions_across_pack_seams() -> None:
     assert abs(metrics["q_values_mean"] - 3.0) < 1e-5  # max online Q at current state
 
 
-def test_dqn_objective_without_seams_trains_all_pairs() -> None:
-    step_stream, out = _seam_fixture([0, 0, 0])
+def test_dqn_objective_without_segment_breaks_trains_all_pairs() -> None:
+    step_stream, out = _segment_fixture([0, 0, 0])
 
     loss, _ = DqnObjective(gamma_step=0.0)(step_stream, out)
 
     assert abs(loss.item() - 2.5) < 1e-5
 
 
-def test_dqn_objective_raises_when_all_pairs_cross_seams() -> None:
-    step_stream, out = _seam_fixture([0, 1, 1])
+def test_dqn_objective_raises_when_all_pairs_cross_segments() -> None:
+    step_stream, out = _segment_fixture([0, 1, 2])
 
     try:
         DqnObjective(gamma_step=0.0)(step_stream, out)
     except ValueError as e:
-        assert "seam" in str(e)
+        assert "packed-segment" in str(e)
     else:
-        raise AssertionError("expected ValueError when every pair crosses a seam")
+        raise AssertionError("expected ValueError when every pair crosses a segment boundary")

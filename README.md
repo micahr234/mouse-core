@@ -50,7 +50,7 @@ mouse-core gives you three building blocks for in-context RL. Compose them in yo
 
 * **Data** (`mouse_core.data`) — stores sequential rows in `Datastore` and batches contiguous windows with `DataLoader`.
 * **Models** (`mouse_core.models`) — encoder + backbone (`LlamaBackbone`, `Qwen3Backbone`, or `IdentityBackbone`) + output heads (`DiscreteActionHead`, `DiscreteActionValueHead`, …).
-* **Objectives** (`mouse_core.objectives`) — training losses such as DQN, VecDQN, SP, and SV.
+* **Objectives** (`mouse_core.objectives`) — training losses such as DQN, VecDQN, PPO, GRPO, SP, and SV.
 
 Backbone loading has one public path: instantiate the backbone. For example, `LlamaBackbone(pretrained="meta-llama/Llama-3.2-1B", num_layers=2)` reads the pretrained config, loads matching transformer weights, and exposes `backbone.hidden_dim` for the encoder and heads.
 
@@ -67,6 +67,9 @@ The [example notebooks](examples/) are the primary documentation. Work through t
 | [04 — Inference](examples/04_inference.ipynb) | Batched FlexAttention cached inference, loading the current checkpoint from the shared Hub model repo |
 | [05 — Layerwise DQN offline](examples/05_train_offline_layerwise_dqn.ipynb) | Same offline loop as `02`, with per-layer Q heads and `LayerwiseDqnObjective` |
 | [06 — Vector-DQN offline](examples/06_train_offline_vec_dqn.ipynb) | Same offline loop as `02`, with 2D action vectors and `VecDqnObjective` |
+| [07 — TextEmbedder offline](examples/07_train_offline_text.ipynb) | Same offline loop as `02`, with `TextEmbedder` (`token` + `text`; `image` documented for VL checkpoints) |
+| [08 — Train online PPO](examples/08_train_online_ppo.ipynb) | Online on-policy PPO (`DiscreteActionHead` + value head, `PpoObjective` with GAE) |
+| [09 — Train online GRPO](examples/09_train_online_grpo.ipynb) | Branched GRPO: fork env+context at many `L`, group-relative advantages, `GrpoObjective` |
 
 Each notebook explains the relevant concepts inline. API details live in the Python docstrings (`load_model`, `Datastore`, `DqnObjective`, etc.).
 

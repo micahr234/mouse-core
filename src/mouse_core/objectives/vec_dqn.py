@@ -21,9 +21,9 @@ class VecDqnObjective(Objective):
     Boundary rows are not used as current states because the following row may
     be a reset frame whose input action was ignored. When a transition ends at a
     boundary and a reset row is available inside the sampled sequence, that reset
-    row supplies the target vector. Row pairs that straddle a packed-segment seam
-    (``is_seam`` from ``DataLoader(pack=True)``) are excluded, as are boundary
-    transitions whose substitute target row starts a new segment.
+    row supplies the target vector. Row pairs that straddle a packed-segment
+    boundary (different ``segment_id`` values) are excluded, as are boundary
+    transitions whose substitute target row belongs to a different segment.
 
     Args:
         tau: Polyak coefficient for target-network updates.
@@ -116,13 +116,14 @@ class VecDqnObjective(Objective):
         valid_transition = done[:, :-1] == 0
         valid_transition[:, -1] = valid_transition[:, -1] & ~boundary_at_next[:, -1]
 
-        # Exclude pairs straddling a packed-segment seam (is_seam at t+1), and
-        # boundary transitions whose substituted target row (t+2) starts a new
-        # segment — that row belongs to an unrelated slice.
+        # Exclude pairs straddling a packed-segment boundary (different
+        # segment_id), and boundary transitions whose substituted target row
+        # (t+2) belongs to a different segment — that row is an unrelated slice.
         valid_transition &= _valid_transitions(objective_data, B, S, device=done.device)
-        if S > 2 and "is_seam" in objective_data.keys():
-            seam_at_substitute = objective_data["is_seam"][:, 2:] != 0
-            valid_transition[:, :-1] &= ~(boundary_at_next[:, :-1] & seam_at_substitute)
+        if S > 2 and "segment_id" in objective_data.keys():
+            segment_id = objective_data["segment_id"]
+            substitute_differs = segment_id[:, 2:] != segment_id[:, 1:-1]
+            valid_transition[:, :-1] &= ~(boundary_at_next[:, :-1] & substitute_differs)
 
         if not valid_transition.any():
             raise ValueError("VecDqnObjective: batch contains no valid transitions.")

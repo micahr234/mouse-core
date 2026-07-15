@@ -1,8 +1,9 @@
 """Training-time augmentation for raw sequence batches.
 
-``Augmenter`` runs between ``DataLoader.next_batch()`` and
-``model(batch)``. It operates on raw ``list[list[dict]]`` batches and samples
-augmentation parameters independently for each sequence in the batch.
+``Augmenter`` runs on the ``batch`` half of ``DataLoader.next_batch()``
+(before ``model(batch, segment_ids=...)``). It operates on raw
+``list[list[dict]]`` batches and samples augmentation parameters independently
+for each sequence; parallel ``segment_ids`` are left unchanged.
 """
 
 from __future__ import annotations
