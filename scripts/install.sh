@@ -58,13 +58,28 @@ setup_venv() {
         rm -rf .venv
     fi
     
+    # Free-threaded 3.14t so DataLoader(num_workers>0) can use real thread parallelism.
+    log "Ensuring free-threaded Python 3.14t is available..."
+    if ! uv python install 3.14t; then
+        error "Failed to install Python 3.14t"
+        exit 1
+    fi
+
     # Create new virtual environment
-    if ! uv venv --python python3.13; then
+    if ! uv venv --python 3.14t; then
         error "Failed to create virtual environment"
         exit 1
     fi
     
     success "Virtual environment created"
+
+    # TEMPORARY: transformers still pins tokenizers<=0.23.0, which re-enables the
+    # GIL on import. tokenizers>=0.23.1 is free-thread-safe but blocked by that pin.
+    # When transformers allows tokenizers>=0.23.1, remove this PYTHON_GIL=0 export
+    # (and the matching CI env) — see CONTRIBUTING.md.
+    if ! grep -qxF 'export PYTHON_GIL=0' .venv/bin/activate 2>/dev/null; then
+        echo 'export PYTHON_GIL=0' >> .venv/bin/activate
+    fi
     
     # Install project dependencies (core + all optional extras).
     log "Installing project dependencies..."

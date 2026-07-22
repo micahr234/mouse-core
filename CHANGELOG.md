@@ -7,8 +7,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Packed ``Model.forward`` no longer rebuilds step-level ``segment_id`` with a
+  ``B*S`` loop of ``eq`` / ``any`` / ``nonzero`` over the flat token stream
+  (thousands of tiny GPU ops + host syncs per step). It gathers from
+  ``segment_ids[step_token_indices]`` instead. Flex train / flat RoPE positions
+  use a sync-free ``cummax`` run reset (no ``.item()`` for run count). Embedder
+  type scatters skip host ``.any()`` checks.
+
 ### Changed
-- `DataLoader` background workers are now **processes** (not threads) so `num_workers > 1` can use multiple CPU cores for slice/augmentation. `refresh()` restarts workers against a fresh store snapshot. Prefer the `fork` start method when available so HF Dataset snapshots stay copy-on-write shared; augmenters used with `num_workers > 0` must be picklable under `spawn`.
+- CUDA training/inference examples use ``preferred_dtype(device)`` (``bfloat16`` on
+  GPU, ``float32`` on CPU) via ``Model.to(device=..., dtype=...)``. Encoder and
+  backbone run in bf16 so FlexAttention compiles; heads stay float32. Training
+  in float32 on CUDA falls back to the unfused Flex path and warns once.
+- ``flex_packed_forward`` caches the compiled FlexAttention kernel per device/dtype
+  instead of recreating ``torch.compile(flex_attention)`` every step.
+- Example notebooks: inference moved to ``09_inference.ipynb`` (was ``04``);
+  layerwise / vec / text / PPO / GRPO training notebooks renumbered to ``04``–``08``.
+  All training notebooks periodically run greedy held-out eval on a separate
+  ``GroupEnv`` (seed stream offset by ``DEFAULT_EVAL_SEED_OFFSET``).
+
+### Added
+- ``mouse_core.task_eval``: ``make_procedural_frozenlake_group`` and
+  ``run_task_eval`` for held-out task-budget evaluation during training
+  (exported from ``mouse_core``).
+- ``preferred_dtype(device)``: returns ``torch.bfloat16`` on CUDA and
+  ``torch.float32`` otherwise (exported from ``mouse_core.models``).
+- ``TokenBatch``: flat concatenated token stream (no padding) with parallel
+  ``token_types`` / ``token_ids`` / ``scalars`` / ``sequence_ids`` / ``step_ids`` /
+  ``segment_ids`` / ``step_token_indices``. Built by ``Encoder.prepare`` /
+  ``make_preparer()`` and consumed by embedders and ``Model.forward``.
+- ``StaticFourierFeatures``: deterministic log-spaced Fourier features (buffers
+  only; no ``nn.Parameter``). One token per real scalar.
+- ``DataLoader(..., preparer=encoder.make_preparer())``: workers run
+  sample → augment → prepare and return a ``TokenBatch``.
+- ``flex_packed_forward``: FlexAttention training over a packed flat sequence
+  masked by ``sequence_ids`` ∩ ``segment_ids`` (CUDA). CPU uses an equivalent
+  SDPA document mask (Flex has no backward on CPU).
+- ``mouse_core.models.kv_policy``: grow-then-rebuild helpers
+  (``resolve_cache_bounds``, ``rebuild_starts``, ``cache_needs_rebuild``) for
+  cached inference. Examples ``03``, ``07``, and ``09`` use ``max_cache`` +
+  ``start_cache`` instead of a sliding ``deque(maxlen=...)`` paired with a
+  never-rebased KV session.
+
+### Removed
+- ``modality_fusion`` / ``include_type_token`` / ``type_embedding_std`` /
+  ``token_data_len`` / continuous ``method="linear"`` / learnable RFF weights /
+  numeric raw-pixel ``ImageEmbedder``. Tokens are always concatenated; reals use
+  static Fourier; images require an image tokenizer (``image_tokenizer=``).
+- `action_modality` / `observation_modalities` helpers and `NumericEmbedder.infer_max_num_actions`.
+  Modalities are declared with generic ``ModalitySpec`` field names and types
+  (``discrete`` / ``continuous`` / ``image`` / …); env-specific field naming belongs
+  at the call site.
+- Padded ``embeds [B, L, D]`` training path and SDPA segment float masks for
+  training (replaced by flat concat + Flex / document mask).
+
+### Changed
+- ``NumericEmbedder`` / ``TextEmbedder``: CPU ``prepare`` builds ``TokenBatch``;
+  ``forward`` only does typed GPU embedding gathers / static Fourier →
+  ``embeds [L, D]``. ``Model.forward`` accepts ``TokenBatch`` or raw steps
+  (online); pools to ``[B, S]`` via ``step_token_indices``.
+- `DataLoader` background workers are now **threads** on free-threaded CPython
+  (`3.14t`) so `num_workers > 1` uses multiple CPU cores while sharing the HF
+  Dataset snapshot and prepared ``TokenBatch`` objects in-process (no
+  multiprocessing queue pickle). ``num_workers > 0`` requires a free-threaded
+  build with the GIL disabled. Install/CI temporarily set ``PYTHON_GIL=0``
+  because current ``transformers`` pins ``tokenizers<=0.23.0``, which re-enables
+  the GIL on import; drop that once ``transformers`` allows ``tokenizers>=0.23.1``
+  (see ``CONTRIBUTING.md``). ``refresh()`` restarts worker threads against a
+  fresh store snapshot. Minimum Python raised to **3.14**.
+- Development setup (`scripts/install.sh`), CI, publish workflow, and Pyright
+  now target free-threaded Python 3.14t; Python 3.13 is no longer supported.
 
 ### Added
 - `GrpoObjective`: clipped policy loss with **group-relative** advantages (no critic). Caller stamps `advantage` via `group_relative_advantages` over G branch returns; inject with `batch_field` alongside `old_log_prob`.

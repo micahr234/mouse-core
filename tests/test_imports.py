@@ -12,12 +12,23 @@ def test_mouse_root_exports() -> None:
 
 
 def test_mouse_model_exports() -> None:
-    from mouse_core.models import IdentityBackbone, LlamaBackbone, Model, Qwen3Backbone
+    import torch
+    from mouse_core.models import (
+        IdentityBackbone,
+        LlamaBackbone,
+        Model,
+        Qwen3Backbone,
+        preferred_dtype,
+    )
 
     assert Model is not None
     assert LlamaBackbone is not None
     assert Qwen3Backbone is not None
     assert IdentityBackbone is not None
+    assert preferred_dtype(torch.device("cpu")) is torch.float32
+    assert preferred_dtype("cpu") is torch.float32
+    if torch.cuda.is_available():
+        assert preferred_dtype(torch.device("cuda")) is torch.bfloat16
 
 
 def test_mouse_data_exports() -> None:

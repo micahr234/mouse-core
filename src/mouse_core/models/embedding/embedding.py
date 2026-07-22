@@ -1,252 +1,88 @@
-"""NumericEmbedder — converts a batch of enriched step records into a flat
-token embedding sequence consumed by the sequence backbone.
+"""NumericEmbedder — typed GPU maps over a flat TokenBatch.
 
-Each modality declares its own token count via ``tokens`` in its spec
-(falling back to the constructor ``token_data_len`` default).  Each step
-produces a variable-length span of embedding vectors that are packed into a
-flat sequence ``[B, L, D]`` (no fixed tokens-per-step axis).
-
-**Sum fusion** (default, ``modality_fusion="sum"``):
-
-    Present modalities are summed into a shared block of width equal to the
-    *maximum* token count among modalities present on that step.
-
-**Concat fusion** (``modality_fusion="concat"``):
-
-    Present modality blocks are concatenated in declaration order.
-
-**Skip**:
-
-    When a field value equals the modality ``skip`` sentinel (or the field is
-    missing and ``required=False``), that modality contributes no tokens on
-    that step.
-
-**Scratch tokens**:
-
-    Declare a learnable modality anywhere in the ``modalities`` list:
-
-        {"type": "learnable", "tokens": N}
-
-After the backbone runs over the flat ``[B, L, D]`` sequence, ``forward``
-emits ``step_token_indices [B, S]`` identifying the prediction token for each
-step.  ``pool_step_reprs`` gathers those positions to produce one ``[D]``-vector
-per step.
+The DataLoader (via :meth:`NumericEmbedder.prepare` /
+:meth:`make_preparer`) builds a concatenated token stream with parallel
+type/id/scalar arrays. This module only applies embedding tables and static
+Fourier features — no Python walks over nested step dicts on the GPU path.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
-from typing import Any, ClassVar, Literal
+from typing import Any, ClassVar
 
 import numpy as np
 import torch
 import torch.nn as nn
-from tensordict import TensorDict
 
-from mouse_core.models.embedding.encoding import NormalizedPixel, RandomFourierFeatures
-from mouse_core.models.embedding.linear import ScaledEmbedding, ScaledPosLinear
-from mouse_core.models.embedding.packing import pack_and_pad_rows
+from mouse_core.models.embedding.encoding import StaticFourierFeatures
+from mouse_core.models.embedding.linear import ScaledEmbedding
+from mouse_core.models.embedding.token_batch import TokenBatch, empty_token_batch
 
-ModalityFusion = Literal["sum", "concat"]
-
-
-# ---------------------------------------------------------------------------
-# Modality config helpers  (dtype → type)
-# ---------------------------------------------------------------------------
-
-
-def action_modality(dtype: torch.dtype, *, vocab_size: int | None = None, **kwargs: Any) -> dict:
-    """Return a modality config dict for the flat ``"action"`` key.
-
-    ``dtype`` comes from ``env.input_spec.action.dtype``:
-
-    * ``torch.int64``   → discrete action  (``"type": "discrete"``; requires *vocab_size*)
-    * ``torch.float32`` → continuous action (``"type": "continuous"``)
-
-    Extra keyword arguments are merged into the returned dict and forwarded to
-    :class:`ModalitySpec` (e.g. ``tokens``, ``std``, ``in_min``, ``in_max``).
-    """
-    if dtype == torch.int64:
-        if vocab_size is None:
-            raise ValueError(
-                "vocab_size is required for discrete (int64) actions; "
-                "pass vocab_size=env.action_dim or the known action-space size."
-            )
-        return {"field": "action", "type": "discrete", "vocab_size": vocab_size, **kwargs}
-    return {"field": "action", "type": "continuous", **kwargs}
-
-
-def observation_modalities(
-    obs_spec: Any,
-    *,
-    vocab_sizes: int | dict[str, int] | None = None,
-    **shared_kwargs: Any,
-) -> list[dict]:
-    """Return a list of modality config dicts for the observation field(s).
-
-    ``obs_spec`` comes from ``env.output_spec.observation``:
-
-    * A single ``FieldSpec`` (non-Dict obs space) → produces one modality named
-      ``"observation"``.
-    * A ``dict[str, FieldSpec]`` (``gym.spaces.Dict`` obs space) → the subspace
-      keys land directly on each output dict, so one modality is produced per key.
-
-    ``dtype`` drives the modality type:
-
-    * ``torch.int64``             → ``"type": "discrete"`` (requires *vocab_sizes*)
-    * ``torch.float32``, 1-D     → ``"type": "continuous"``
-    * ``torch.float32``, 2-D/3-D → ``"type": "image"``
-
-    ``vocab_sizes`` is used for discrete sub-spaces:
-
-    * Single obs: pass an ``int``.
-    * Dict obs:   pass a ``dict[key → int]``.
-
-    Extra keyword arguments are forwarded to every modality dict (e.g. ``tokens``,
-    ``std``).  Override per-key values after calling this function if needed.
-    """
-    if isinstance(obs_spec, dict):
-        result: list[dict] = []
-        for key, spec in obs_spec.items():
-            vs = vocab_sizes.get(key) if isinstance(vocab_sizes, dict) else None
-            result.append(_obs_modality(key, spec.dtype, getattr(spec, "shape", ()), vocab_size=vs, **shared_kwargs))
-        return result
-    return [_obs_modality("observation", obs_spec.dtype, getattr(obs_spec, "shape", ()), vocab_size=vocab_sizes if isinstance(vocab_sizes, int) else None, **shared_kwargs)]
-
-
-def _obs_modality(
-    name: str,
-    dtype: torch.dtype,
-    shape: tuple[int, ...],
-    *,
-    vocab_size: int | None,
-    **kwargs: Any,
-) -> dict:
-    if dtype == torch.int64:
-        if vocab_size is None:
-            raise ValueError(
-                f"vocab_size is required for discrete (int64) observation {name!r}; "
-                "pass vocab_sizes=<int> (or a dict for Dict obs spaces)."
-            )
-        return {"field": name, "type": "discrete", "vocab_size": vocab_size, **kwargs}
-    if len(shape) >= 2:
-        return {"field": name, "type": "image", "dim": int(np.prod(shape)), **kwargs}
-    return {"field": name, "type": "continuous", **kwargs}
+# Token-type kind tags stored in preparer metadata (not the runtime type id).
+_KIND_DISCRETE = "discrete"
+_KIND_FOURIER = "fourier"
+_KIND_LEARNABLE = "learnable"
+_KIND_IMAGE = "image"
 
 
 class Encoder(nn.Module, ABC):
-    """Abstract base for encoders.
-
-    An encoder is the first stage of a MOUSE model. It converts a batch of
-    raw step records (a ``list[list[dict]]`` of shape ``[B][S]``) into a flat
-    token embedding sequence ``[B, T, D]`` that a backbone can process, and
-    simultaneously exposes the per-modality tensors it extracted so that
-    objectives and heads can use them.
-
-    The encoder also defines how to extract per-step representations
-    (the vectors fed to heads for action output) from the backbone's
-    token-level hidden states via :meth:`pool_step_reprs`.
-
-    Subclasses must implement :meth:`forward` and :meth:`pool_step_reprs`,
-    and expose :attr:`hidden_dim` and :attr:`tokens_per_step` (for
-    :class:`NumericEmbedder`, the fusion width when nothing is skipped; for
-    :class:`~mouse_core.models.embedding.text.TextEmbedder`, token counts are
-    entirely data-dependent).
-    """
+    """Abstract base for encoders over :class:`TokenBatch`."""
 
     @property
     @abstractmethod
-    def hidden_dim(self) -> int:
-        """Hidden dimension ``D`` of the produced embeddings."""
-        ...
+    def hidden_dim(self) -> int: ...
 
     @property
     @abstractmethod
     def tokens_per_step(self) -> int:
-        """Capacity / layout hint for tokens produced per step.
-
-        Actual sequence length is data-dependent; use ``step_token_indices``
-        from :meth:`forward` for real layouts.
-        """
+        """Capacity hint; real layout comes from ``step_token_indices``."""
         ...
 
     @abstractmethod
+    def prepare(
+        self,
+        batch: list[list[dict]],
+        segment_ids: list[list[int]] | None = None,
+    ) -> TokenBatch:
+        """CPU: raw ``[B][S]`` steps → flat :class:`TokenBatch` (no padding)."""
+        ...
+
+    def make_preparer(self) -> Callable[..., TokenBatch]:
+        """Return a ``(batch, segment_ids=None) -> TokenBatch`` callable for workers."""
+        return self.prepare
+
+    @abstractmethod
     def forward(
-        self, batch: list[list[dict]]
+        self, token_batch: TokenBatch
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor], torch.Tensor]:
-        """Encode a batch of raw step records into token embeddings.
-
-        Args:
-            batch: ``[B][S]`` list of row dicts. Each dict contains whatever
-                fields the data source produced.  Required modality keys depend
-                on the concrete encoder configuration.
-
-        Returns:
-            ``(embeds, col_values, step_token_indices)`` where
-
-            * ``embeds`` is ``[B, L, D]`` (flat, batch right-padded).
-            * ``col_values`` maps each non-learnable modality name to its
-              extracted tensor (shape ``[B, S]`` for scalars, ``[B, S, D]``
-              for vectors). These are the same tensors used for embedding;
-              :class:`~mouse_core.models.base.Model` wraps them into the
-              ``objective_data`` TensorDict returned alongside the head outputs.
-            * ``step_token_indices`` is a ``[B, S]`` int64 tensor.  Entry
-              ``[b, s]`` is the absolute position within the flat ``L``-length
-              sequence of the single token that represents step ``s`` for batch
-              element ``b``.  :meth:`pool_step_reprs` gathers these positions
-              from the backbone output to produce one ``[D]``-vector per step.
-        """
+        """Embed ``TokenBatch`` → ``(embeds [L, D], col_values, step_token_indices [B, S])``."""
         ...
 
     @abstractmethod
     def pool_step_reprs(self, h: torch.Tensor, step_token_indices: torch.Tensor) -> torch.Tensor:
-        """Extract per-step representations from backbone hidden states.
+        """Gather prediction tokens → ``[B, S, D]``.
 
-        After the backbone processes ``[B, L, D]`` tokens, gathers the single
-        token identified by ``step_token_indices`` for each step to produce one
-        ``[D]``-vector per step.
-
-        Args:
-            h: Backbone output of shape ``[B, L, D]``.
-            step_token_indices: ``[B, S]`` int64 tensor of absolute positions
-                within the flat sequence, as returned by :meth:`forward`.
-
-        Returns:
-            Step representations ``[B, S, D]``.
+        ``h`` is ``[L, D]`` (flat packed) or ``[B, L, D]`` (decode).
+        ``step_token_indices`` is ``[B, S]`` absolute indices into the token axis
+        of ``h`` (for flat ``[L, D]``, indices are in ``0 .. L-1`` and ``B`` is
+        recovered from the indices tensor shape).
         """
         ...
 
 
 @dataclass
 class ModalitySpec:
-    """Specification for how to embed one modality from the input rows.
+    """How to turn one modality into tokens in the preparer.
 
-    The encoder (:class:`NumericEmbedder`) builds the necessary sub-modules based on this
-    list (passed as the ``modalities`` argument) so that each declared modality
-    (action, reward, observations, scratch/compute, etc.) is turned into one or
-    more token embeddings.
-
-    Each modality can declare its own ``tokens`` (number of tokens it contributes
-    per step). If omitted, the constructor's ``token_data_len`` default is used.
-    This allows different modalities to map to different numbers of tokens.
-
-    ``include_type_token`` can be set per modality to control whether the learned
-    type embedding is added for that modality's tokens (defaults to the global
-    ``include_type_token`` value if omitted from the spec).
-
-    Example::
-
-        modalities = [
-            {"field": "action", "type": "discrete", "vocab_size": 18, "tokens": 1},
-            {"field": "reward", "type": "rff", "tokens": 1},
-            {"type": "learnable", "tokens": 2},  # learned scratch tokens; never reads input data
-            {"field": "obs", "type": "continuous", "dim": 8, "tokens": 2},
-            {"field": "img", "type": "image", "dim": 7056, "tokens": 16},  # e.g. patches
-            {"field": "step_index", "type": "discrete", "vocab_size": 1000, "skip": -1},
-        ]
-        enc = NumericEmbedder(hidden_dim=128, modalities=modalities, include_type_token=False)
+    Types:
+      * ``discrete`` — integer id → embedding table (one token)
+      * ``rff`` — scalar → one static-Fourier token
+      * ``continuous`` — vector → one static-Fourier token per component
+      * ``image`` — requires an image tokenizer → discrete visual token ids
+      * ``learnable`` — ``tokens`` scratch embedding rows
     """
 
     type: str
@@ -258,23 +94,16 @@ class ModalitySpec:
     in_min: float | None = None
     in_max: float | None = None
     std: float | None = None
-    include_type_token: bool | None = None
-    method: str = "rff"
     skip: Any = None
     required: bool = True
-    allow_none: bool = False
 
-    # Valid values for the ``type`` field in ModalitySpec.
-    # These name the embedding *technique*, not the semantic role of the modality.
     _VALID_TYPES: ClassVar[tuple[str, ...]] = (
-        "discrete",    # integer id → learned table (DiscreteEmbedder)
-        "rff",         # scalar → Random Fourier Features (ScalarRFFEmbedder)
-        "continuous",  # vector of scalars; ``method="rff"`` (default) or ``"linear"``
-        "image",       # pixel/patch values → normalized linear (ImageEmbedder)
-        "learnable",   # learned scratch tokens; input data ignored (LearnableEmbedder)
+        "discrete",
+        "rff",
+        "continuous",
+        "image",
+        "learnable",
     )
-    _METHOD_USING: ClassVar[tuple[str, ...]] = ("continuous",)
-    _DISCRETE_LIKE: ClassVar[tuple[str, ...]] = ("discrete",)
 
     def __post_init__(self) -> None:
         k = (self.type or "").lower()
@@ -283,29 +112,12 @@ class ModalitySpec:
                 f"unknown modality type {self.type!r} for modality {self.field!r}; "
                 f"expected one of {self._VALID_TYPES}"
             )
-        if self.method not in (None, "rff", "linear"):
-            m = str(self.method).lower()
-            if m not in ("rff", "linear"):
-                raise ValueError(
-                    f"unknown method {self.method!r} for modality {self.field!r}; expected 'rff' or 'linear'"
-                )
-            object.__setattr__(self, "method", m)
-        else:
-            if self.method is None:
-                object.__setattr__(self, "method", "rff")
-            elif isinstance(self.method, str):
-                object.__setattr__(self, "method", self.method.lower())
-        if self.type != k:
-            object.__setattr__(self, "type", k)
+        object.__setattr__(self, "type", k)
         if k == "learnable":
             object.__setattr__(self, "required", False)
 
-        # If method is a non-default on a kind that doesn't use it, callers will enforce;
-        # here we just ensure the value itself is valid (done above).
-
 
 def _unwrap_scalar(value: Any) -> Any:
-    """Unwrap 0-d NumPy / torch scalars to plain Python values."""
     if isinstance(value, np.ndarray) and value.ndim == 0:
         return value.item()
     if isinstance(value, torch.Tensor) and value.ndim == 0:
@@ -320,7 +132,6 @@ def _unwrap_scalar(value: Any) -> Any:
 
 
 def _values_equal(a: Any, b: Any) -> bool:
-    """Exact equality after unwrapping NumPy/torch scalars."""
     return _unwrap_scalar(a) == _unwrap_scalar(b)
 
 
@@ -341,424 +152,146 @@ def _expand_modality_spec(spec: ModalitySpec, fallback_field: str) -> list[Modal
     return [replace(spec, field=field) for field in fields]
 
 
-# ---------------------------------------------------------------------------
-# Per-modality content embedders
-# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class _ModalityMeta:
+    """Runtime metadata for one expanded modality."""
 
-
-class TypeEmbedder(nn.Module):
-    """Shared token-type embedding table.
-
-    Maps a small integer id (from the encoder-assigned token_type tensor)
-    to a learned [D] vector that is added to tokens of that id when
-    ``include_type_token`` is enabled for the modality (or globally).
-    """
-
-    def __init__(self, hidden_dim: int, embedding_std: float = 0.02) -> None:
-        super().__init__()
-        # Per-token type embedding (added to each token of that type).
-        self.embed = ScaledEmbedding(num_embeddings=64, embedding_dim=hidden_dim, scale=embedding_std)
-
-    def forward(self, type_id: int, shape: tuple[int, ...], device: torch.device) -> torch.Tensor:
-        ids = torch.full(shape, int(type_id), device=device, dtype=torch.long)
-        return self.embed(ids)  # [..., D]
-
-
-class ScalarRFFEmbedder(nn.Module):
-    """Embeds a scalar via Random Fourier Features → flat content vector ``[N, T*D]``.
-
-    Used when ``type="rff"`` (canonical name for scalar RFF). The embedding
-    technique is independent of the modality's semantic ``name``.
-    """
-
-    def __init__(
-        self,
-        hidden_dim: int,
-        token_data_len: int,
-        in_min: float,
-        in_max: float,
-        embedding_std: float = 0.02,
-    ) -> None:
-        super().__init__()
-        rff_scale = embedding_std / 0.5 ** 0.5
-        self.rff = RandomFourierFeatures(
-            num_features=hidden_dim * token_data_len, in_min=in_min, in_max=in_max, output_scale=rff_scale
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Args:
-            x: ``[N]`` float32 scalar values.
-        Returns:
-            ``[N, T*D]`` content embedding.
-        """
-        return self.rff(x, 0)
-
-
-class VectorRFFEmbedder(nn.Module):
-    """Embeds a vector of scalars via per-element Random Fourier Features → ``[N, T*D]``.
-
-    Each coordinate is projected with its own frequency set (position-indexed RFF).
-    All contributions are combined (summed or arranged) to produce the content embedding.
-    This is the technique used for continuous/vector modalities when ``method="rff"``.
-    The semantic role (obs, state, etc.) does not affect the embedding code.
-    """
-
-    def __init__(
-        self,
-        hidden_dim: int,
-        max_num_obs: int,
-        token_data_len: int,
-        in_min: float,
-        in_max: float,
-        embedding_std: float = 0.02,
-    ) -> None:
-        super().__init__()
-        self.max_num_obs = max_num_obs
-        # cos has std ≈ 1/√2; sum over max_num_obs dims grows by √max_num_obs → divide both out
-        rff_scale = embedding_std / (0.5 ** 0.5 * max_num_obs ** 0.5)
-        self.rff = RandomFourierFeatures(
-            num_features=hidden_dim * token_data_len, in_min=in_min, in_max=in_max,
-            num_freq_sets=max_num_obs, output_scale=rff_scale,
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Args:
-            x: ``[*batch, d]`` float32 vector, ``d`` may be <= ``max_num_obs``.
-               Extra capacity is zero-padded internally.
-        Returns:
-            ``[*batch, T*D]`` content embedding.
-        """
-        x = x.float()
-        d = x.shape[-1]
-        m = self.max_num_obs
-        if d >= m:
-            x_use = x[..., :m]
-        else:
-            pad = torch.zeros((*x.shape[:-1], m - d), device=x.device, dtype=x.dtype)
-            x_use = torch.cat([x, pad], dim=-1)
-        positions = torch.arange(m, device=x.device).expand_as(x_use)
-        return self.rff(x_use, positions).sum(dim=-2)
-
-
-class VectorLinearEmbedder(nn.Module):
-    """Embeds a vector of scalars via per-element learned linear projections → ``[N, T*D]``.
-
-    Each coordinate is mapped by a position-specific linear layer applied to the scalar;
-    contributions are combined to form the content embedding. No random features are used;
-    the input value directly scales a learned direction.
-
-    This is the technique for continuous/vector modalities when ``method="linear"``.
-
-    Args:
-        hidden_dim: Model hidden dimension ``D``.
-        max_num_obs: Length of the input vector.
-        token_data_len: Number of tokens ``T`` per step.
-        input_std: Expected std of the incoming values, used to normalise
-            the linear initialisation.  Defaults to ``1.0``.
-        embedding_std: Desired output std of the embedding.  Defaults to ``0.02``.
-    """
-
-    def __init__(
-        self,
-        hidden_dim: int,
-        max_num_obs: int,
-        token_data_len: int,
-        input_std: float = 1.0,
-        embedding_std: float = 0.02,
-    ) -> None:
-        super().__init__()
-        self.max_num_obs = max_num_obs
-        self._one_token_per_elem = (token_data_len == max_num_obs)
-        out_tok = 1 if self._one_token_per_elem else token_data_len
-        # When one_token_per_elem, each position maps to its own D (no sum).
-        # Otherwise we sum over positions into T tokens.
-        _kaiming_std = 3.0 ** -0.5
-        scale = embedding_std / (_kaiming_std * input_std)
-        if not self._one_token_per_elem:
-            scale = scale / (max_num_obs ** 0.5)
-        self.projs = ScaledPosLinear(
-            num_positions=max_num_obs,
-            in_features=1,
-            out_features=hidden_dim * out_tok,
-            scale=scale,
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Args:
-            x: ``[*batch, d]`` float32 vector, ``d`` may be <= ``max_num_obs``.
-               Extra capacity is zero-padded internally.
-        Returns:
-            ``[*batch, T*D]`` content embedding. If token_data_len == max_num_obs,
-            this is arranged as one token per input element (no summing).
-        """
-        x = x.float()
-        d = x.shape[-1]
-        m = self.max_num_obs
-        if d >= m:
-            x_use = x[..., :m]
-        else:
-            pad = torch.zeros((*x.shape[:-1], m - d), device=x.device, dtype=x.dtype)
-            x_use = torch.cat([x, pad], dim=-1)
-        positions = torch.arange(m, device=x.device).expand_as(x_use)
-        out = self.projs(x_use.unsqueeze(-1), positions)  # [*, m, out_tok * D]
-        if self._one_token_per_elem:
-            # Each position maps to its own D token. out is [*, m, D]
-            flat = out.reshape(*out.shape[:-2], m * (out.shape[-1]))
-            return flat
-        return out.sum(dim=-2)  # sum over elements into T*D
-
-
-class ImageEmbedder(nn.Module):
-    """Embeds a vector of (normalized) pixel / patch values via per-position linear maps → ``[N, T*D]``.
-
-    Each element is normalized then projected by a position-specific linear layer.
-    Contributions are combined (sum or one-per-element) to form the content embedding.
-    Used for any image/pixel modality regardless of whether it is called "obs", "pixels", etc.
-    """
-
-    def __init__(
-        self,
-        hidden_dim: int,
-        max_num_obs: int,
-        token_data_len: int,
-        embedding_std: float = 0.02,
-    ) -> None:
-        super().__init__()
-        self.max_num_obs = max_num_obs
-        self._one_token_per_elem = (token_data_len == max_num_obs)
-        out_tok = 1 if self._one_token_per_elem else token_data_len
-        # When one_token_per_elem, each pixel/patch maps to its own token of D.
-        pixel_norm_std = 3.0 ** -0.5
-        _kaiming_std = 3.0 ** -0.5
-        self.norm = NormalizedPixel()
-        scale = embedding_std / (_kaiming_std * pixel_norm_std)
-        if not self._one_token_per_elem:
-            scale = scale / (max_num_obs ** 0.5)
-        self.projs = ScaledPosLinear(
-            num_positions=max_num_obs, in_features=1, out_features=hidden_dim * out_tok,
-            scale=scale,
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Args:
-            x: ``[*batch, d]`` int64/float pixel values, ``d`` may be <= ``max_num_obs``.
-               Extra capacity is zero-padded internally.
-        Returns:
-            ``[*batch, T*D]`` content embedding. If token_data_len == max_num_obs,
-            this yields one token per input element (no summing across elements).
-        """
-        x = x.float()
-        d = x.shape[-1]
-        m = self.max_num_obs
-        if d >= m:
-            x_use = x[..., :m]
-        else:
-            pad = torch.zeros((*x.shape[:-1], m - d), device=x.device, dtype=x.dtype)
-            x_use = torch.cat([x, pad], dim=-1)
-        positions = torch.arange(m, device=x.device).expand_as(x_use)
-        normalized = self.norm(x_use).unsqueeze(-1)            # [*batch, m, 1]
-        out = self.projs(normalized, positions)  # [*, m, out_tok * D]
-        if self._one_token_per_elem:
-            return out.reshape(*out.shape[:-2], m * out.shape[-1])
-        return out.sum(dim=-2)
-
-
-class DiscreteEmbedder(nn.Module):
-    """Embeds discrete integer indices via a learned table → ``[N, T*D]``.
-
-    This is the technique for modalities declared with ``type="discrete"``.
-    The modality ``name`` does not affect how the indices are embedded.
-    Skipped values are omitted at the :class:`NumericEmbedder` fusion layer
-    (modality ``skip``), not zeroed here.
-    """
-
-    def __init__(
-        self,
-        hidden_dim: int,
-        token_data_len: int,
-        vocab_size: int,
-        embedding_std: float = 0.02,
-    ) -> None:
-        super().__init__()
-        if vocab_size <= 0:
-            raise ValueError("vocab_size must be > 0 for discrete embedder")
-        self.embed = ScaledEmbedding(
-            num_embeddings=vocab_size,
-            embedding_dim=hidden_dim * token_data_len,
-            scale=embedding_std,
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.embed(x.long())
-
-
-class LearnableEmbedder(nn.Module):
-    """Learned scratch tokens for a declared learnable modality.
-
-    The input value for this modality (if any) is ignored. The tokens are
-    pure learned parameters placed at the position of the modality in the
-    ``modalities`` declaration order. Technique is independent of the
-    modality's ``name``.
-    """
-
-    def __init__(self, num_tokens: int, hidden_dim: int, std: float = 0.02):
-        super().__init__()
-        self.num_tokens = int(num_tokens)
-        self.embed = nn.Parameter(torch.empty(self.num_tokens, hidden_dim))
-        nn.init.normal_(self.embed, std=std)
-
-    def forward(self, x: torch.Tensor | None = None) -> torch.Tensor:
-        # Return base [Tc, D]. Expansion to [B, S, Tc, D] is done by caller.
-        return self.embed
-
-
-# ---------------------------------------------------------------------------
-# NumericEmbedder
-# ---------------------------------------------------------------------------
+    spec: ModalitySpec
+    type_id: int
+    kind: str
+    vocab_size: int = 0
+    dim: int = 0
+    n_learnable: int = 0
+    freq_sets: int = 1
 
 
 class NumericEmbedder(Encoder):
-    """Converts a batch of step records ``[B][S]`` into flat embeddings ``[B, L, D]``.
-
-    Modalities declare their token counts individually (see :class:`ModalitySpec`).
-    Per-step spans are fused (sum or concat), then packed with no fixed ``T`` axis.
-
-    **Sum fusion** (``modality_fusion="sum"``, default):
-        Present modalities are summed into a block of width ``max(Tc)`` among
-        modalities present on that step.
-
-    **Concat fusion** (``modality_fusion="concat"``):
-        Present modality blocks are concatenated in declaration order.
-
-    When a field value equals modality ``skip`` (or the field is missing and
-    ``required=False``), that modality contributes no tokens on that step.
-
-    The step representation passed to heads is always the **last** token of each
-    step span.  Place a ``{"type": "learnable", "tokens": 1}`` modality last to
-    use it as a dedicated prediction token.
-
-    Args:
-        hidden_dim: Model hidden dimension ``D``.
-        modalities: Declarative list of modality specs.
-        token_data_len: Default tokens per modality when ``tokens`` is omitted.
-        modality_fusion: ``"sum"`` or ``"concat"``.
-        include_type_token: Add learned type embeddings (overridable per modality).
-        fourier_min / fourier_max: RFF range defaults.
-        std: Content embedding init std.
-        type_embedding_std: Required when ``include_type_token=True``.
-    """
+    """Typed embedding tables + static Fourier over a :class:`TokenBatch`."""
 
     def __init__(
         self,
         hidden_dim: int,
         modalities: list[dict[str, Any] | ModalitySpec] | None = None,
-        token_data_len: int = 1,
-        modality_fusion: ModalityFusion = "sum",
-        include_type_token: bool = True,
+        *,
         fourier_min: float = 0.01,
         fourier_max: float = 10.0,
         std: float = 0.02,
+        image_tokenizer: Callable[[Any], Sequence[int]] | None = None,
+        # Removed knobs (accepted only to fault clearly):
+        token_data_len: int | None = None,
+        modality_fusion: str | None = None,
+        include_type_token: bool | None = None,
         type_embedding_std: float | None = None,
+        method: str | None = None,
     ) -> None:
         super().__init__()
-
-        if modalities is None:
-            modalities = []
-
-        self.modalities: list[ModalitySpec] = []
-        for i, c in enumerate(modalities or []):
-            if isinstance(c, dict):
-                spec = ModalitySpec(**c)
-            else:
-                spec = c
-            self.modalities.extend(_expand_modality_spec(spec, fallback_field=f"__learnable_{i}"))
-
-        for cs in self.modalities:
-            k = cs.type
-            if k == "learnable":
-                continue
-            if k == "discrete":
-                vs = cs.vocab_size or cs.size or 0
-                if vs <= 0:
-                    raise ValueError(f"modality {cs.field!r} (discrete) requires positive vocab_size")
-            if k in {"continuous", "image"}:
-                d = cs.dim or cs.size or 0
-                if d <= 0:
-                    raise ValueError(f"modality {cs.field!r} requires positive dim/size")
-
-        for cs in self.modalities:
-            k = cs.type
-            is_method_using = k in ModalitySpec._METHOD_USING
-
-            if cs.method != "rff" and not is_method_using:
-                raise ValueError(
-                    f"modality {cs.field!r} (type={k}) does not support method={cs.method!r}; "
-                    f"method only applies to continuous (with linear vs rff choice)"
-                )
-
-            uses_rff_ranges = (k == "rff") or (is_method_using and cs.method != "linear")
-            if (cs.in_min is not None or cs.in_max is not None) and not uses_rff_ranges:
-                raise ValueError(
-                    f"modality {cs.field!r} (type={k}) does not use in_min/in_max; "
-                    f"those apply to rff or continuous (when not using linear)"
-                )
+        if token_data_len is not None:
+            raise TypeError(
+                "token_data_len was removed; discrete/rff emit one token, "
+                "continuous emits one token per component, learnable uses tokens="
+            )
+        if modality_fusion is not None:
+            raise TypeError(
+                "modality_fusion was removed; tokens are always concatenated in "
+                "modality declaration order"
+            )
+        if include_type_token:
+            raise TypeError(
+                "include_type_token was removed; use distinct token_types "
+                "(embedding tables) instead"
+            )
+        if type_embedding_std is not None and include_type_token:
+            raise TypeError("type_embedding_std was removed with include_type_token")
+        if method is not None:
+            raise TypeError("per-modality method= was removed; reals use static Fourier only")
+        # include_type_token=False / type_embedding_std ignored (legacy call sites)
 
         self._hidden_dim = int(hidden_dim)
-        self.include_type_token = bool(include_type_token)
-        if modality_fusion not in {"sum", "concat"}:
-            raise ValueError('modality_fusion must be either "sum" or "concat".')
-        self.modality_fusion: ModalityFusion = modality_fusion
-        self.token_data_len = int(token_data_len)
         self.fourier_min = float(fourier_min)
         self.fourier_max = float(fourier_max)
         self.std = float(std)
+        self.image_tokenizer = image_tokenizer
 
-        if self.include_type_token and type_embedding_std is None:
-            raise ValueError(
-                "type_embedding_std is required when include_type_token=True. "
-                "Set it explicitly to control the type-to-content signal ratio "
-                "(e.g. type_embedding_std=0.02 to match content std, or a smaller "
-                "value to reduce type influence). Use include_type_token=False to "
-                "disable type embeddings entirely."
+        raw = modalities or []
+        self.modalities: list[ModalitySpec] = []
+        for i, m in enumerate(raw):
+            spec = m if isinstance(m, ModalitySpec) else ModalitySpec(**{
+                k: v for k, v in m.items()
+                if k not in ("method", "include_type_token")  # removed knobs
+            })
+            self.modalities.extend(_expand_modality_spec(spec, fallback_field=f"__learnable_{i}"))
+
+        if any(s.type == "image" for s in self.modalities) and image_tokenizer is None:
+            raise TypeError(
+                "NumericEmbedder with type='image' modalities requires image_tokenizer=; "
+                "raw pixel embedding was removed"
             )
-        self.type_embedding_std: float = float(type_embedding_std) if type_embedding_std is not None else 0.0
 
-        self._modality_tokens: dict[str, int] = {}
-        self._modality_include_type: dict[str, bool] = {}
-        self._learnable_modalities: set[str] = set()
-        for cs in self.modalities:
-            tc = cs.tokens if (cs.tokens is not None) else self.token_data_len
-            if tc <= 0:
-                raise ValueError(f"modality {cs.field!r} has non-positive tokens ({tc})")
-            assert isinstance(cs.field, str)
-            self._modality_tokens[cs.field] = int(tc)
+        self._meta: list[_ModalityMeta] = []
+        self._tables = nn.ModuleDict()
+        max_freq_sets = 1
+        type_id = 0
+        for spec in self.modalities:
+            assert isinstance(spec.field, str)
+            k = spec.type
+            if k == "discrete":
+                vs = int(spec.vocab_size or spec.size or 0)
+                if vs <= 0:
+                    raise ValueError(f"discrete modality {spec.field!r} requires vocab_size=")
+                meta = _ModalityMeta(spec=spec, type_id=type_id, kind=_KIND_DISCRETE, vocab_size=vs)
+                self._tables[str(type_id)] = ScaledEmbedding(vs, hidden_dim, scale=spec.std or std)
+                self._meta.append(meta)
+                type_id += 1
+            elif k in ("rff", "continuous"):
+                dim = 1 if k == "rff" else int(spec.dim or spec.size or 0)
+                if dim <= 0:
+                    raise ValueError(f"continuous modality {spec.field!r} requires dim=")
+                max_freq_sets = max(max_freq_sets, dim)
+                meta = _ModalityMeta(
+                    spec=spec, type_id=type_id, kind=_KIND_FOURIER, dim=dim, freq_sets=dim
+                )
+                self._meta.append(meta)
+                type_id += 1
+            elif k == "learnable":
+                n = int(spec.tokens or 1)
+                if n <= 0:
+                    raise ValueError("learnable tokens must be >= 1")
+                meta = _ModalityMeta(
+                    spec=spec, type_id=type_id, kind=_KIND_LEARNABLE, n_learnable=n
+                )
+                self._tables[str(type_id)] = ScaledEmbedding(n, hidden_dim, scale=spec.std or std)
+                self._meta.append(meta)
+                type_id += 1
+            elif k == "image":
+                # Tokenizer produces ids; table sized lazily is awkward — require vocab on spec.
+                vs = int(spec.vocab_size or spec.size or 0)
+                if vs <= 0:
+                    raise ValueError(
+                        f"image modality {spec.field!r} requires vocab_size= "
+                        "(size of the image tokenizer vocabulary)"
+                    )
+                meta = _ModalityMeta(spec=spec, type_id=type_id, kind=_KIND_IMAGE, vocab_size=vs)
+                self._tables[str(type_id)] = ScaledEmbedding(vs, hidden_dim, scale=spec.std or std)
+                self._meta.append(meta)
+                type_id += 1
+            else:
+                raise ValueError(f"unsupported modality type {k!r}")
 
-            col_type = cs.include_type_token
-            self._modality_include_type[cs.field] = bool(col_type) if col_type is not None else self.include_type_token
-
-            if cs.type.lower() == "learnable":
-                self._learnable_modalities.add(cs.field)
-            elif cs.skip is None and cs.field == "step_index" and cs.type == "discrete":
-                # Default skip for episode step index (was skip=-1).
-                object.__setattr__(cs, "skip", -1)
-
-        if self.modality_fusion == "concat":
-            self._tokens_per_step: int = sum(self._modality_tokens.values()) if self._modality_tokens else 0
-        else:
-            self._tokens_per_step = max(self._modality_tokens.values()) if self._modality_tokens else 0
-
-        self.type_embedder = TypeEmbedder(hidden_dim=hidden_dim, embedding_std=self.type_embedding_std)
-
-        self.modality_embedders = nn.ModuleDict()
-        self._modality_token_types: dict[str, int] = {}
-        tid = 1
-        for cs in self.modalities:
-            assert isinstance(cs.field, str)
-            Tc = self._modality_tokens[cs.field]
-            emb = self._create_embedder_for_modality(cs, hidden_dim, Tc, std)
-            self.modality_embedders[cs.field] = emb
-            self._modality_token_types[cs.field] = tid
-            tid += 1
+        # Shared Fourier type id for all fourier modalities (dispatch by kind in forward).
+        # Each fourier modality still has its own type_id for masking/debug; forward
+        # routes kind==fourier through self.fourier.
+        rff_scale = float(std) / (0.5 ** 0.5)
+        self.fourier = StaticFourierFeatures(
+            num_features=hidden_dim,
+            in_min=fourier_min,
+            in_max=fourier_max,
+            num_freq_sets=max_freq_sets,
+            output_scale=rff_scale,
+        )
+        self._n_types = type_id
+        self._learnable_fields = {
+            m.spec.field for m in self._meta if m.kind == _KIND_LEARNABLE
+        }
 
     @property
     def hidden_dim(self) -> int:
@@ -766,262 +299,254 @@ class NumericEmbedder(Encoder):
 
     @property
     def tokens_per_step(self) -> int:
-        """Maximum tokens per step (capacity hint)."""
-        return self._tokens_per_step
+        """Max tokens if nothing is skipped (capacity hint)."""
+        total = 0
+        for m in self._meta:
+            if m.kind == _KIND_DISCRETE:
+                total += 1
+            elif m.kind == _KIND_FOURIER:
+                total += m.dim
+            elif m.kind == _KIND_LEARNABLE:
+                total += m.n_learnable
+            elif m.kind == _KIND_IMAGE:
+                total += 1  # unknown a priori; hint only
+        return total
+
+    def make_preparer(self) -> Callable[..., TokenBatch]:
+        """Preparer capturing modality metadata (no nn modules) for worker threads."""
+        meta = self._meta
+        image_tokenizer = self.image_tokenizer
+        learnable_fields = set(self._learnable_fields)
+
+        def _prepare(
+            batch: list[list[dict]],
+            segment_ids: list[list[int]] | None = None,
+        ) -> TokenBatch:
+            return _prepare_numeric(batch, segment_ids, meta, image_tokenizer, learnable_fields)
+
+        return _prepare
+
+    def prepare(
+        self,
+        batch: list[list[dict]],
+        segment_ids: list[list[int]] | None = None,
+    ) -> TokenBatch:
+        return _prepare_numeric(
+            batch, segment_ids, self._meta, self.image_tokenizer, self._learnable_fields
+        )
+
+    def forward(
+        self, token_batch: TokenBatch | list[list[dict]]
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor], torch.Tensor]:
+        if not isinstance(token_batch, TokenBatch):
+            token_batch = self.prepare(token_batch)
+        try:
+            device = next(self.parameters()).device
+            dtype = next(self.parameters()).dtype
+        except StopIteration:
+            device = self.fourier.get_buffer("freqs").device
+            dtype = self.fourier.get_buffer("freqs").dtype
+        t = token_batch.to_tensors(device)
+        types = t["token_types"]
+        ids = t["token_ids"]
+        scalars = t["scalars"]
+        L = types.shape[0]
+        D = self._hidden_dim
+        embeds = torch.zeros(L, D, device=device, dtype=dtype)
+
+        if L > 0:
+            for type_id_str, table in self._tables.items():
+                tid = int(type_id_str)
+                mask = types == tid
+                # Empty mask → empty gather/assign (no host .any() sync).
+                embeds[mask] = table(ids[mask]).to(dtype=dtype)
+
+            fourier_type_ids = {m.type_id for m in self._meta if m.kind == _KIND_FOURIER}
+            for tid in fourier_type_ids:
+                mask = types == tid
+                embeds[mask] = self.fourier(scalars[mask], ids[mask]).to(dtype=dtype)
+
+        col_values = t["col_values"]
+        sti = t["step_token_indices"].view(token_batch.B, token_batch.S)
+        return embeds, col_values, sti
 
     def pool_step_reprs(self, h: torch.Tensor, step_token_indices: torch.Tensor) -> torch.Tensor:
         D = self._hidden_dim
+        if h.ndim == 2:
+            # Flat packed [L, D]
+            idx = step_token_indices.reshape(-1)
+            return h[idx].view(*step_token_indices.shape, D)
+        # [B, L, D] decode layout
         B, S = step_token_indices.shape
         idx = step_token_indices.unsqueeze(-1).expand(B, S, D)
         return h.gather(1, idx)
 
-    def _create_embedder_for_modality(self, spec: ModalitySpec, hidden_dim: int, T: int, std: float) -> nn.Module:
-        k = spec.type.lower()
-        assert isinstance(spec.field, str)
-        field = spec.field
 
-        im = spec.in_min if spec.in_min is not None else self.fourier_min
-        ix = spec.in_max if spec.in_max is not None else self.fourier_max
-        mod_std = spec.std if spec.std is not None else std
-
-        if k == "discrete":
-            vs = spec.vocab_size or spec.size or 0
-            return DiscreteEmbedder(hidden_dim, T, vs, embedding_std=mod_std)
-
-        if k == "rff":
-            return ScalarRFFEmbedder(hidden_dim, T, in_min=im, in_max=ix, embedding_std=mod_std)
-
-        if k == "continuous":
-            d = spec.dim or spec.size or 0
-            if (spec.method or "rff").lower() == "linear":
-                return VectorLinearEmbedder(hidden_dim, max_num_obs=d, token_data_len=T, input_std=1.0, embedding_std=mod_std)
-            return VectorRFFEmbedder(hidden_dim, max_num_obs=d, token_data_len=T, in_min=im, in_max=ix, embedding_std=mod_std)
-
-        if k == "image":
-            p = spec.dim or spec.size or 0
-            return ImageEmbedder(hidden_dim, max_num_obs=p, token_data_len=T, embedding_std=mod_std)
-
-        if k == "learnable":
-            return LearnableEmbedder(T, hidden_dim, std=mod_std)
-
-        raise ValueError(f"unknown modality type {spec.type!r} for modality {field!r}")
-
-    @staticmethod
-    def infer_max_num_actions(embedding_kwargs: dict | object | None) -> int:
-        """Extract action cardinality from the modalities list (action modality's vocab_size)."""
-        if embedding_kwargs is None:
-            return 0
-        mods = getattr(embedding_kwargs, "modalities", None)
-        if mods is not None:
-            for c in mods:
-                if "action" in _field_names(getattr(c, "field", "")):
-                    return int(getattr(c, "vocab_size", 0) or getattr(c, "size", 0) or 0)
-            return 0
-        d = embedding_kwargs or {}
-        if isinstance(d, dict) and "modalities" in d:
-            for c in d["modalities"]:
-                if isinstance(c, dict) and "action" in _field_names(c.get("field", "")):
-                    return int(c.get("vocab_size") or c.get("size") or 0)
-                if "action" in _field_names(getattr(c, "field", "")):
-                    return int(getattr(c, "vocab_size", 0) or getattr(c, "size", 0) or 0)
-        return 0
-
-    def _default_value_for(self, spec: ModalitySpec, B: int, S: int, device: torch.device) -> torch.Tensor:
-        """Synthesize a default tensor when a declared modality is missing from the batch."""
-        k = spec.type.lower()
-        if k == "learnable":
-            return torch.zeros((B, S), device=device)
-        dtype = torch.long if k == "discrete" else next(self.parameters()).dtype
-        if k == "discrete":
-            skip_v = spec.skip
-            if skip_v is not None:
-                return torch.full((B, S), int(skip_v), device=device, dtype=torch.long)
-            return torch.zeros((B, S), device=device, dtype=torch.long)
-        if k == "rff":
-            return torch.zeros((B, S), device=device, dtype=dtype)
-        if k == "continuous":
-            d = spec.dim or spec.size or 0
-            return torch.zeros((B, S, max(int(d), 0)), device=device, dtype=dtype)
-        if k == "image":
-            p = spec.dim or spec.size or 0
-            return torch.zeros((B, S, max(int(p), 0)), device=device, dtype=dtype)
-        return torch.zeros((B, S), device=device, dtype=dtype)
-
-    def _modality_present(self, spec: ModalitySpec, value: Any) -> bool:
-        """Whether this modality contributes tokens on this step."""
-        if spec.field in self._learnable_modalities:
-            return True
-        if value is None:
-            return False
-        if spec.skip is not None and _values_equal(value, spec.skip):
-            return False
-        return True
-
-    def _embed_modality_step(
-        self,
-        spec: ModalitySpec,
-        value_tensor: torch.Tensor | None,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        """Embed one modality for one step → ``[Tc, D]``."""
-        assert isinstance(spec.field, str)
-        Tc = self._modality_tokens[spec.field]
-        D = self._hidden_dim
-        mod = self.modality_embedders[spec.field]
-        if spec.field in self._learnable_modalities:
-            assert isinstance(mod, LearnableEmbedder)
-            contrib = mod.embed.to(dtype=dtype)  # [Tc, D]
-        else:
-            assert value_tensor is not None
-            flat = mod(value_tensor.unsqueeze(0)).to(dtype=dtype)  # [1, Tc*D]
-            contrib = flat.view(Tc, D)
-        if self._modality_include_type[spec.field]:
-            typ = self.type_embedder(
-                self._modality_token_types[spec.field], (1,), device
-            ).to(dtype=dtype)  # [1, D]
-            contrib = contrib + typ
-        return contrib
-
-    def _fuse_step(
-        self,
-        present: list[tuple[ModalitySpec, torch.Tensor | None]],
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        """Fuse present modalities for one step → ``[n, D]``."""
-        if not present:
+def _prepare_numeric(
+    batch: list[list[dict]],
+    segment_ids: list[list[int]] | None,
+    meta: list[_ModalityMeta],
+    image_tokenizer: Callable[[Any], Sequence[int]] | None,
+    learnable_fields: set[str],
+) -> TokenBatch:
+    B = len(batch)
+    S = len(batch[0]) if B > 0 else 0
+    for b, rows in enumerate(batch):
+        if len(rows) != S:
             raise ValueError(
-                "step has no present modalities (all skipped); "
-                "add a learnable modality or ensure at least one field is present"
+                f"all rows must have the same number of steps; row 0 has {S}, "
+                f"row {b} has {len(rows)}"
             )
-        blocks = [
-            self._embed_modality_step(spec, val, device, dtype)
-            for spec, val in present
-        ]
-        if self.modality_fusion == "concat":
-            return torch.cat(blocks, dim=0)
-        T = max(b.shape[0] for b in blocks)
-        D = self._hidden_dim
-        total = torch.zeros(T, D, device=device, dtype=dtype)
-        for block in blocks:
-            Tc = block.shape[0]
-            if Tc < T:
-                block = torch.cat(
-                    [block, torch.zeros(T - Tc, D, device=device, dtype=dtype)],
-                    dim=0,
+    if segment_ids is None:
+        segment_ids = [[0] * S for _ in range(B)]
+    if len(segment_ids) != B:
+        raise ValueError("segment_ids batch size must match batch")
+
+    # col_values accumulation
+    non_learnable = [m for m in meta if m.kind != _KIND_LEARNABLE]
+    raw_cols: dict[str, list[Any]] = {str(m.spec.field): [] for m in non_learnable}
+
+    tok_types: list[int] = []
+    tok_ids: list[int] = []
+    tok_scalars: list[float] = []
+    seq_ids: list[int] = []
+    step_ids: list[int] = []
+    seg_ids: list[int] = []
+    step_token_indices = np.zeros(B * S, dtype=np.int64)
+
+    for b in range(B):
+        if len(segment_ids[b]) != S:
+            raise ValueError(f"segment_ids[{b}] length must match S={S}")
+        for s in range(S):
+            row = batch[b][s]
+            flat_step = b * S + s
+            step_start = len(tok_types)
+
+            for m in meta:
+                field = str(m.spec.field)
+                spec = m.spec
+                if m.kind == _KIND_LEARNABLE:
+                    for i in range(m.n_learnable):
+                        tok_types.append(m.type_id)
+                        tok_ids.append(i)
+                        tok_scalars.append(0.0)
+                        seq_ids.append(b)
+                        step_ids.append(flat_step)
+                        seg_ids.append(int(segment_ids[b][s]))
+                    continue
+
+                value = row.get(field)
+                if field in raw_cols:
+                    raw_cols[field].append(value)
+
+                if value is None:
+                    if spec.required:
+                        raise KeyError(
+                            f"Required modality {field!r} is missing from "
+                            f"batch[{b}][{s}]"
+                        )
+                    continue
+                if spec.skip is not None and _values_equal(value, spec.skip):
+                    continue
+
+                if m.kind == _KIND_DISCRETE:
+                    tok_types.append(m.type_id)
+                    tok_ids.append(int(_unwrap_scalar(value)))
+                    tok_scalars.append(0.0)
+                    seq_ids.append(b)
+                    step_ids.append(flat_step)
+                    seg_ids.append(int(segment_ids[b][s]))
+                elif m.kind == _KIND_FOURIER:
+                    if m.dim == 1:
+                        vals = [float(_unwrap_scalar(value))]
+                    else:
+                        arr = np.asarray(value, dtype=np.float32).ravel()
+                        if arr.size < m.dim:
+                            pad = np.zeros(m.dim - arr.size, dtype=np.float32)
+                            arr = np.concatenate([arr, pad])
+                        vals = [float(arr[i]) for i in range(m.dim)]
+                    for i, v in enumerate(vals):
+                        tok_types.append(m.type_id)
+                        tok_ids.append(i)  # freq bank index
+                        tok_scalars.append(v)
+                        seq_ids.append(b)
+                        step_ids.append(flat_step)
+                        seg_ids.append(int(segment_ids[b][s]))
+                elif m.kind == _KIND_IMAGE:
+                    if image_tokenizer is None:
+                        raise RuntimeError("image_tokenizer is not configured")
+                    ids = list(image_tokenizer(value))
+                    if not ids:
+                        raise ValueError(f"image tokenizer returned no tokens for {field!r}")
+                    for tid in ids:
+                        tok_types.append(m.type_id)
+                        tok_ids.append(int(tid))
+                        tok_scalars.append(0.0)
+                        seq_ids.append(b)
+                        step_ids.append(flat_step)
+                        seg_ids.append(int(segment_ids[b][s]))
+
+            step_end = len(tok_types)
+            if step_end == step_start:
+                raise ValueError(
+                    "step has no tokens after skips; ensure at least one modality "
+                    "is present (e.g. add a learnable modality)"
                 )
-            total = total + block
-        return total
+            step_token_indices[flat_step] = step_end - 1
 
-    def forward(
-        self,
-        batch: list[list[dict]],
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor], torch.Tensor]:
-        """Embed a batch of raw step records into flat ``[B, L, D]`` embeddings."""
-        device = next(self.parameters()).device
-        B = len(batch)
-        S = len(batch[0]) if B > 0 else 0
-        D = self._hidden_dim
-        dtype = next(self.parameters()).dtype
-
-        non_learnable = [s for s in self.modalities if s.field not in self._learnable_modalities]
-        raw: dict[str, list] = {str(spec.field): [None] * (B * S) for spec in non_learnable}
-
-        idx = 0
-        for b in range(B):
-            for s in range(S):
-                row = batch[b][s]
-                for spec in non_learnable:
-                    assert isinstance(spec.field, str)
-                    raw[spec.field][idx] = row.get(spec.field)
-                idx += 1
-
-        col_values: dict[str, torch.Tensor] = {}
-        raw_grid: dict[str, list[list[Any]]] = {}
-        for spec in non_learnable:
-            assert isinstance(spec.field, str)
-            values = raw[spec.field]
-            all_none = all(v is None for v in values)
-            any_none = any(v is None for v in values)
-
-            if all_none:
-                if spec.required:
-                    raise KeyError(
-                        f"Required modality {spec.field!r} is missing from all "
-                        f"rows in the batch."
+    # Build col_values [B, S] / [B, S, dim]
+    col_values: dict[str, np.ndarray] = {}
+    for m in non_learnable:
+        field = str(m.spec.field)
+        values = raw_cols[field]
+        if m.kind == _KIND_DISCRETE or (m.kind == _KIND_FOURIER and m.dim == 1):
+            fill = 0 if m.kind == _KIND_DISCRETE else 0.0
+            out = []
+            for v in values:
+                if v is None:
+                    out.append(fill)
+                else:
+                    out.append(
+                        int(_unwrap_scalar(v))
+                        if m.kind == _KIND_DISCRETE
+                        else float(_unwrap_scalar(v))
                     )
-                col_values[spec.field] = self._default_value_for(spec, B, S, device)
-                raw_grid[spec.field] = [
-                    [None for _ in range(S)] for _ in range(B)
-                ]
-                continue
-            if spec.required and any_none:
-                missing = sum(v is None for v in values)
-                raise KeyError(
-                    f"Required modality {spec.field!r} is missing from {missing} "
-                    f"of {B * S} rows in the batch."
-                )
+            dtype = np.int64 if m.kind == _KIND_DISCRETE else np.float32
+            col_values[field] = np.asarray(out, dtype=dtype).reshape(B, S)
+        elif m.kind == _KIND_FOURIER:
+            buf = np.zeros((B * S, m.dim), dtype=np.float32)
+            for i, v in enumerate(values):
+                if v is None:
+                    continue
+                a = np.asarray(v, dtype=np.float32).ravel()
+                d = min(a.size, m.dim)
+                buf[i, :d] = a[:d]
+            col_values[field] = buf.reshape(B, S, m.dim)
+        elif m.kind == _KIND_IMAGE:
+            # Store a placeholder int grid; objectives rarely need raw images.
+            col_values[field] = np.zeros((B, S), dtype=np.int64)
 
-            grid: list[list[Any]] = []
-            flat_i = 0
-            for b in range(B):
-                row_vals: list[Any] = []
-                for s in range(S):
-                    row_vals.append(values[flat_i])
-                    flat_i += 1
-                grid.append(row_vals)
-            raw_grid[spec.field] = grid
+    if B == 0 or S == 0:
+        return empty_token_batch(B, S)
 
-            k = spec.type.lower()
-            if k == "discrete":
-                fill = int(spec.skip) if spec.skip is not None else 0
-                arr = np.array(
-                    [int(v) if v is not None else fill for v in values],
-                    dtype=np.int64,
-                )
-                col_values[spec.field] = torch.from_numpy(arr).to(device).reshape(B, S)
-            elif k == "rff":
-                arr = np.array(
-                    [float(v) if v is not None else 0.0 for v in values],
-                    dtype=np.float32,
-                )
-                col_values[spec.field] = torch.from_numpy(arr).to(device).reshape(B, S)
-            elif k in ("continuous", "image"):
-                dim = spec.dim or spec.size or 0
-                np_dtype = np.float32 if k == "continuous" else np.int64
-                buf = np.zeros((B * S, dim), dtype=np_dtype)
-                for i, v in enumerate(values):
-                    if v is not None:
-                        a = np.asarray(v, dtype=np_dtype).ravel()
-                        d = min(a.size, dim)
-                        buf[i, :d] = a[:d]
-                col_values[spec.field] = (
-                    torch.from_numpy(buf).to(device).reshape(B, S, dim)
-                )
+    return TokenBatch(
+        token_types=np.asarray(tok_types, dtype=np.int64),
+        token_ids=np.asarray(tok_ids, dtype=np.int64),
+        scalars=np.asarray(tok_scalars, dtype=np.float32),
+        sequence_ids=np.asarray(seq_ids, dtype=np.int64),
+        step_ids=np.asarray(step_ids, dtype=np.int64),
+        segment_ids=np.asarray(seg_ids, dtype=np.int64),
+        step_token_indices=step_token_indices,
+        col_values=col_values,
+        B=B,
+        S=S,
+    )
 
-        row_step_spans: list[list[torch.Tensor]] = []
-        for b in range(B):
-            step_spans: list[torch.Tensor] = []
-            for s in range(S):
-                present: list[tuple[ModalitySpec, torch.Tensor | None]] = []
-                for spec in self.modalities:
-                    assert isinstance(spec.field, str)
-                    if spec.field in self._learnable_modalities:
-                        present.append((spec, None))
-                        continue
-                    value = raw_grid[spec.field][b][s]
-                    if not self._modality_present(spec, value):
-                        continue
-                    present.append((spec, col_values[spec.field][b, s]))
-                step_spans.append(self._fuse_step(present, device, dtype))
-            row_step_spans.append(step_spans)
 
-        if B == 0:
-            empty = torch.zeros(0, 0, D, device=device, dtype=dtype)
-            return empty, col_values, torch.zeros(0, 0, device=device, dtype=torch.long)
+# Back-compat names removed from public use but some tests may import —
+# keep DiscreteEmbedder as a thin ScaledEmbedding alias for imports that break soft.
+class DiscreteEmbedder(ScaledEmbedding):
+    """Embedding table for discrete token ids (used internally / tests)."""
 
-        embeds, step_token_indices = pack_and_pad_rows(
-            row_step_spans, hidden_dim=D, device=device, dtype=dtype
-        )
-        return embeds, col_values, step_token_indices
+    def __init__(self, vocab_size: int, hidden_dim: int, embedding_std: float = 0.02) -> None:
+        super().__init__(vocab_size, hidden_dim, scale=embedding_std)

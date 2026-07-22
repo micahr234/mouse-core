@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-import multiprocessing as mp
+import sys
+import sysconfig
+import threading
+from unittest.mock import patch
 
 import pytest
 from datasets import Dataset
@@ -42,21 +45,21 @@ def test_dataloader_applies_augmenter_before_returning_batch() -> None:
     assert all(row["action"] == 0 for sequence in batch for row in sequence)
 
 
-class _ProcessMarkerAugmenter:
+class _ThreadMarkerAugmenter:
     def __init__(self, marker: str = "root") -> None:
         self.marker = marker
 
-    def fork(self, *, seed: int) -> _ProcessMarkerAugmenter:
-        return _ProcessMarkerAugmenter(marker=f"worker-{seed}")
+    def fork(self, *, seed: int) -> _ThreadMarkerAugmenter:
+        return _ThreadMarkerAugmenter(marker=f"worker-{seed}")
 
     def __call__(self, batch: list[list[dict]]) -> list[list[dict]]:
-        process_name = mp.current_process().name
+        thread_name = threading.current_thread().name
         return [
             [
                 {
                     **row,
                     "augmenter_marker": self.marker,
-                    "augmenter_process": process_name,
+                    "augmenter_thread": thread_name,
                 }
                 for row in sequence
             ]
@@ -64,7 +67,7 @@ class _ProcessMarkerAugmenter:
         ]
 
 
-def test_dataloader_runs_augmenter_in_worker_process() -> None:
+def test_dataloader_runs_augmenter_in_worker_thread() -> None:
     loader = DataLoader(
         _store_with_actions(),
         sequence_length=3,
@@ -72,7 +75,7 @@ def test_dataloader_runs_augmenter_in_worker_process() -> None:
         num_workers=1,
         prefetch=1,
         seed=0,
-        augmenter=_ProcessMarkerAugmenter(),
+        augmenter=_ThreadMarkerAugmenter(),
     )
     try:
         batch, _segment_ids = loader.next_batch()
@@ -83,8 +86,20 @@ def test_dataloader_runs_augmenter_in_worker_process() -> None:
     assert len(markers) == 1
     assert markers.pop().startswith("worker-")
     assert all(
-        row["augmenter_process"] == "DataLoader-0" for sequence in batch for row in sequence
+        row["augmenter_thread"] == "DataLoader-0" for sequence in batch for row in sequence
     )
+
+
+def test_dataloader_num_workers_requires_free_threading() -> None:
+    store = _store_with_actions()
+    with patch.object(sysconfig, "get_config_var", return_value=0):
+        with pytest.raises(RuntimeError, match="free-threaded"):
+            DataLoader(store, sequence_length=3, batch_size=1, num_workers=1)
+
+    if sysconfig.get_config_var("Py_GIL_DISABLED"):
+        with patch.object(sys, "_is_gil_enabled", return_value=True):
+            with pytest.raises(RuntimeError, match="free-threaded|GIL"):
+                DataLoader(store, sequence_length=3, batch_size=1, num_workers=1)
 
 
 def test_dataloader_snapshots_loaded_source_and_appended_rows() -> None:
@@ -122,7 +137,7 @@ def test_dataloader_seed_is_deterministic_with_workers() -> None:
 
 
 class _SeedRecorder:
-    """Records augmenter fork seeds in the parent process (fork runs before spawn/fork)."""
+    """Records augmenter fork seeds in the parent (fork runs before workers start)."""
 
     def __init__(self, seen: list[int] | None = None) -> None:
         self.seen = seen if seen is not None else []
@@ -296,5 +311,34 @@ def test_dataloader_pad_allows_empty_stores_until_sampling() -> None:
         batch, segment_ids = loader.next_batch()
         assert len(batch[0]) == 2
         assert segment_ids[0] == [0, 1]
+    finally:
+        loader.close()
+
+
+def test_dataloader_preparer_returns_token_batch() -> None:
+    from mouse_core.models.embedding import NumericEmbedder
+
+    encoder = NumericEmbedder(
+        hidden_dim=8,
+        modalities=[
+            {"field": "action", "type": "discrete", "vocab_size": 16},
+            {"field": "reward", "type": "rff"},
+        ],
+    )
+    loader = DataLoader(
+        _store_with_actions(),
+        sequence_length=3,
+        batch_size=2,
+        num_workers=0,
+        preparer=encoder.make_preparer(),
+    )
+    try:
+        tb = loader.next_batch()
+        assert tb.B == 2 and tb.S == 3
+        assert tb.L == 2 * 3 * 2  # action + reward per step
+        assert tb.sequence_ids.tolist()[:3] == [0, 0, 0]
+        embeds, col_values, sti = encoder(tb)
+        assert embeds.shape == (tb.L, 8)
+        assert sti.shape == (2, 3)
     finally:
         loader.close()

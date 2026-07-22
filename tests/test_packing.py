@@ -7,6 +7,7 @@ import torch
 from mouse_core.models.embedding.packing import (
     counts_from_step_token_indices,
     pack_and_pad_rows,
+    pack_live_step_tokens,
     real_token_lengths_from_indices,
     token_pad_mask,
 )
@@ -49,3 +50,22 @@ def test_pack_and_pad_rows() -> None:
     )
     assert embeds.shape == (2, 3, D)
     assert indices.tolist() == [[0, 2], [1, 2]]
+
+
+def test_pack_live_step_tokens_compacts_holes() -> None:
+    # Concat-style: 3 slots/step; middle slot absent on step 0.
+    B, S, Tslot, D = 1, 2, 3, 2
+    buf = torch.zeros(B, S, Tslot, D)
+    buf[0, 0, 0] = 1.0
+    buf[0, 0, 2] = 2.0
+    buf[0, 1, 0] = 3.0
+    buf[0, 1, 1] = 4.0
+    buf[0, 1, 2] = 5.0
+    live = torch.tensor([[[True, False, True], [True, True, True]]])
+    counts = torch.tensor([[2, 3]])
+    embeds, indices = pack_live_step_tokens(buf, live, counts)
+    assert embeds.shape == (1, 5, D)
+    assert indices.tolist() == [[1, 4]]
+    assert torch.allclose(embeds[0, 0], torch.tensor([1.0, 1.0]))
+    assert torch.allclose(embeds[0, 1], torch.tensor([2.0, 2.0]))
+    assert torch.allclose(embeds[0, 2], torch.tensor([3.0, 3.0]))

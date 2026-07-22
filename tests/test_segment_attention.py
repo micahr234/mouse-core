@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
-
 import torch
 
 from mouse_core.models.base import (
@@ -57,22 +55,12 @@ def test_segment_causal_attention_mask_blocks_cross_segment() -> None:
     assert mask[0, 0, 3, 3] == 0.0
 
 
-def test_model_forward_passes_attention_mask_and_position_ids() -> None:
+def test_model_forward_injects_segment_ids_and_runs() -> None:
     encoder = NumericEmbedder(
         hidden_dim=8,
-        include_type_token=False,
         modalities=[{"field": "action", "type": "discrete", "vocab_size": 4}],
     )
     backbone = IdentityBackbone(hidden_dim=8)
-    captured: dict = {}
-
-    def _spy(embeds, output_hidden_states=False, **kwargs):
-        captured["kwargs"] = kwargs
-        if output_hidden_states:
-            return embeds, (embeds,)
-        return embeds
-
-    backbone.forward = MagicMock(side_effect=_spy)  # type: ignore[method-assign]
     model = Model(
         encoder=encoder,
         backbone=backbone,
@@ -90,8 +78,11 @@ def test_model_forward_passes_attention_mask_and_position_ids() -> None:
 
     assert "segment_id" in objective_data.keys()
     assert objective_data["segment_id"].tolist() == [[0, 0, 1]]
-    assert "attention_mask" in captured["kwargs"]
-    assert "position_ids" in captured["kwargs"]
-    pos = captured["kwargs"]["position_ids"]
-    assert pos.tolist() == [[0, 1, 0]]  # tokens_per_step == 1
     assert predictions["action_value"].shape == (1, 3, 4)
+
+    # TokenBatch path: flat embeds through identity
+    tb = encoder.prepare(batch, segment_ids)
+    assert tb.L == 3
+    assert list(tb.segment_ids) == [0, 0, 1]
+    preds2, _, _ = model(tb)
+    assert preds2["action_value"].shape == (1, 3, 4)

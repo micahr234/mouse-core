@@ -6,12 +6,12 @@
 
 **mouse-core** is the core library for the Meta-Optimization Using Sequential Experience (MOUSE) learning system — a modular PyTorch stack for <u>in-context reinforcement learning (ICRL)</u>. It provides data utilities, embedding frameworks, transformer backbones, output heads, and objective functions for training and deploying agents that adapt from transition history at inference time, **without weight updates**.
 
-**[mouse-gym](https://github.com/micahr234/mouse-gym)** sits alongside mouse-core and handles the environment side: it wraps any Gymnasium env into a reset-free continuing interface, stitching episodes together into uninterrupted trajectories with explicit task boundaries. Environment implementations live in their own packages — the examples use **[procedural-frozenlake](https://github.com/micahr234/procedural-frozenlake)**, a FrozenLake variant with procedurally generated maps and optimal-Q supervision signals. **mouse-core** is what you use to learn from those trajectories — data utilities, models, and objectives for training and deploying in-context RL agents.
+**[mouse-gym](https://github.com/micahr234/mouse-gym)** sits alongside mouse-core and handles the environment side: it wraps any Gymnasium env into a **reset-free** continuing interface. Episodes still end as usual, but you choose how many episodes make up a **task** (`episodes_per_task`), so the hard division is at task boundaries rather than after every episode. Environment implementations live in their own packages — the examples use **[procedural-frozenlake](https://github.com/micahr234/procedural-frozenlake)**, a FrozenLake variant with procedurally generated maps and optimal-Q supervision signals. **mouse-core** is what you use to learn from those trajectories — data utilities, models, and objectives for training and deploying in-context RL agents.
 
 
 ## News 📰
 
-- **2026-06-26 — Offline training works.** [`examples/02_train_offline.ipynb`](examples/02_train_offline.ipynb) now trains a full `Qwen/Qwen3-0.6B` MOUSE model from Hub replay data and reaches strong FrozenLake performance. Push the checkpoint, then evaluate in [`examples/04_inference.ipynb`](examples/04_inference.ipynb).
+- **2026-06-26 — Offline training works.** [`examples/02_train_offline.ipynb`](examples/02_train_offline.ipynb) now trains a full `Qwen/Qwen3-0.6B` MOUSE model from Hub replay data and reaches strong FrozenLake performance. Push the checkpoint, then evaluate in [`examples/09_inference.ipynb`](examples/09_inference.ipynb).
 
 See [CHANGELOG.md](CHANGELOG.md) for the full release history.
 
@@ -35,7 +35,8 @@ In the video below, an agent plays FrozenLake on a map it has never seen before,
 pip install mouse-core
 ```
 
-For development:
+For development (free-threaded Python **3.14t** via uv — required for
+`DataLoader(num_workers>0)`):
 
 ```bash
 git clone https://github.com/micahr234/mouse-core.git
@@ -62,16 +63,34 @@ The [example notebooks](examples/) are the primary documentation. Work through t
 | Notebook | What it covers |
 |----------|----------------|
 | [01 — Collect dataset](examples/01_collect_dataset.ipynb) | `Datastore`, collecting transitions, pushing to the Hub |
-| [02 — Train offline](examples/02_train_offline.ipynb) | Offline replay baseline, model architecture, DQN training *(recommended first training run)* |
-| [03 — Train online](examples/03_train_online.ipynb) | Live `mouse-gym` rollouts, in-memory replay, DQN updates |
-| [04 — Inference](examples/04_inference.ipynb) | Batched FlexAttention cached inference, loading the current checkpoint from the shared Hub model repo |
-| [05 — Layerwise DQN offline](examples/05_train_offline_layerwise_dqn.ipynb) | Same offline loop as `02`, with per-layer Q heads and `LayerwiseDqnObjective` |
-| [06 — Vector-DQN offline](examples/06_train_offline_vec_dqn.ipynb) | Same offline loop as `02`, with 2D action vectors and `VecDqnObjective` |
-| [07 — TextEmbedder offline](examples/07_train_offline_text.ipynb) | Same offline loop as `02`, with `TextEmbedder` (`token` + `text`; `image` documented for VL checkpoints) |
-| [08 — Train online PPO](examples/08_train_online_ppo.ipynb) | Online on-policy PPO (`DiscreteActionHead` + value head, `PpoObjective` with GAE) |
-| [09 — Train online GRPO](examples/09_train_online_grpo.ipynb) | Branched GRPO: fork env+context at many `L`, group-relative advantages, `GrpoObjective` |
+| [02 — Train offline](examples/02_train_offline.ipynb) | Offline replay baseline, model architecture, DQN training, held-out env eval *(recommended first training run)* |
+| [03 — Train online](examples/03_train_online.ipynb) | Live `mouse-gym` rollouts, in-memory replay, DQN updates, separate eval envs |
+| [04 — Layerwise DQN offline](examples/04_train_offline_layerwise_dqn.ipynb) | Same offline loop as `02`, with per-layer Q heads and `LayerwiseDqnObjective` |
+| [05 — Vector-DQN offline](examples/05_train_offline_vec_dqn.ipynb) | Same offline loop as `02`, with 2D action vectors and `VecDqnObjective` |
+| [06 — TextEmbedder offline](examples/06_train_offline_text.ipynb) | Same offline loop as `02`, with `TextEmbedder` (`token` + `text`; `image` documented for VL checkpoints) |
+| [07 — Train online PPO](examples/07_train_online_ppo.ipynb) | Online on-policy PPO (`DiscreteActionHead` + value head, `PpoObjective` with GAE) |
+| [08 — Train online GRPO](examples/08_train_online_grpo.ipynb) | Branched GRPO: fork env+context at many `L`, group-relative advantages, `GrpoObjective` |
+| [09 — Inference](examples/09_inference.ipynb) | Batched FlexAttention cached inference with grow-then-rebuild (`max_cache` / `start_cache`), loading a Hub checkpoint after training |
+
+### Example dependencies
+
+The notebooks need the `examples` extra (`mouse-gym`, `procedural-frozenlake`, `matplotlib`, …). A full `source scripts/install.sh` already installs it via `mouse-core[all]`. From a lighter venv:
+
+```bash
+uv pip install -e ".[examples]" --python .venv/bin/python
+```
+
+That pulls `gymnasium[toy-text]` → `pygame-ce`. On free-threaded Python there is often no prebuilt `pygame-ce` wheel, so the install builds from source and needs SDL2 / PortMidi headers. On Debian/Ubuntu:
+
+```bash
+sudo apt install libsdl2-dev libsdl2-image-dev libsdl2-mixer-dev libsdl2-ttf-dev libportmidi-dev libfreetype6-dev
+```
+
+Without these, install fails with errors like `library 'SDL2' not found` or `library 'portmidi' not found`.
 
 Each notebook explains the relevant concepts inline. API details live in the Python docstrings (`load_model`, `Datastore`, `DqnObjective`, etc.).
+
+On CUDA, place models with `model.to(device=device, dtype=preferred_dtype(device))` so the encoder/backbone run in **bfloat16** and FlexAttention compiles; output heads stay float32. CPU stays float32.
 
 
 ## Contributing 🔧

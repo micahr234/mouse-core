@@ -22,7 +22,6 @@ def test_composed_model_roundtrip(tmp_path) -> None:
             {"field": "reward", "type": "rff"},
             {"field": "done", "type": "discrete", "vocab_size": 3},
         ],
-        include_type_token=False,
     )
     backbone = IdentityBackbone(hidden_dim=hidden_dim)
     heads = DiscreteActionValueHead(
@@ -72,16 +71,15 @@ def test_composed_model_roundtrip(tmp_path) -> None:
     assert config["encoder"]["type"] == "numeric"
     enc_kwargs = config["encoder"]["kwargs"]
     for required_key in (
-        "hidden_dim", "modalities", "token_data_len", "modality_fusion",
-        "include_type_token", "fourier_min", "fourier_max", "std",
-        "type_embedding_std",
+        "hidden_dim", "modalities", "fourier_min", "fourier_max", "std",
     ):
         assert required_key in enc_kwargs, f"encoder config missing key {required_key!r}"
-    assert enc_kwargs["modality_fusion"] == "sum"
+    assert "modality_fusion" not in enc_kwargs
+    assert "include_type_token" not in enc_kwargs
 
 
-def test_composed_model_roundtrip_with_type_token(tmp_path) -> None:
-    """type_embedding_std must survive save/load when include_type_token=True."""
+def test_composed_model_roundtrip_static_fourier(tmp_path) -> None:
+    """Static Fourier buffers survive save/load."""
     torch.manual_seed(42)
     hidden_dim = 8
     encoder = NumericEmbedder(
@@ -90,8 +88,6 @@ def test_composed_model_roundtrip_with_type_token(tmp_path) -> None:
             {"field": "action", "type": "discrete", "vocab_size": 4},
             {"field": "reward", "type": "rff"},
         ],
-        include_type_token=True,
-        type_embedding_std=0.01,
     )
     backbone = IdentityBackbone(hidden_dim=hidden_dim)
     heads = DiscreteActionValueHead(
@@ -110,19 +106,10 @@ def test_composed_model_roundtrip_with_type_token(tmp_path) -> None:
     actual, _, _ = loaded(batch)
 
     assert torch.allclose(actual["action_value"], expected["action_value"])
-
-    # All params identical
-    orig_sd = model.state_dict()
-    loaded_sd = loaded.state_dict()
-    assert set(orig_sd.keys()) == set(loaded_sd.keys())
-    for key in orig_sd:
-        assert torch.equal(orig_sd[key], loaded_sd[key]), f"param {key!r} differs"
-
-    # Config preserves type_embedding_std
-    with (tmp_path / "config.json").open() as fh:
-        config = json.load(fh)
-    assert config["encoder"]["kwargs"]["type_embedding_std"] == pytest.approx(0.01)
-    assert config["encoder"]["kwargs"]["include_type_token"] is True
+    assert torch.equal(
+        model.encoder.fourier.get_buffer("freqs"),
+        loaded.encoder.fourier.get_buffer("freqs"),
+    )
 
 
 def test_model_card_includes_usage_and_architecture(tmp_path) -> None:
@@ -134,7 +121,6 @@ def test_model_card_includes_usage_and_architecture(tmp_path) -> None:
                 {"field": "reward", "type": "rff"},
                 {"field": "done", "type": "discrete", "vocab_size": 3},
             ],
-            include_type_token=False,
         ),
         backbone=IdentityBackbone(hidden_dim=8),
         heads=DiscreteActionValueHead(
@@ -179,7 +165,6 @@ def test_model_to_bfloat16_keeps_heads_float32() -> None:
             {"field": "reward", "type": "rff"},
             {"field": "done", "type": "discrete", "vocab_size": 3},
         ],
-        include_type_token=False,
     )
     backbone = Qwen3Backbone(hidden_dim=hidden_dim, num_layers=1, num_heads=2)
     heads = DiscreteActionValueHead(

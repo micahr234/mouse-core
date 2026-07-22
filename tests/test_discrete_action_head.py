@@ -41,7 +41,6 @@ def test_discrete_action_head_save_load_roundtrip(tmp_path) -> None:
             {"field": "action", "type": "discrete", "vocab_size": 4},
             {"field": "reward", "type": "rff"},
         ],
-        include_type_token=False,
     )
     model = Model(
         encoder=encoder,

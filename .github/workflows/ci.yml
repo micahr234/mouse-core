@@ -12,21 +12,23 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      # TEMPORARY: keep GIL off while transformers pins tokenizers<=0.23.0
+      # (those wheels re-enable the GIL). Remove once transformers allows
+      # tokenizers>=0.23.1 — see CONTRIBUTING.md.
+      PYTHON_GIL: "0"
     steps:
       - uses: actions/checkout@v6
-
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.13"
 
       - uses: astral-sh/setup-uv@v8.1.0
         with:
           enable-cache: true
           cache-dependency-glob: "pyproject.toml"
 
-      - name: Install package and dev extras
+      - name: Install free-threaded Python and package
         run: |
-          uv venv --python 3.13
+          uv python install 3.14t
+          uv venv --python 3.14t
           uv pip install -e ".[dev]" --python .venv/bin/python
 
       - name: Type check

@@ -43,13 +43,11 @@ def test_model_layerwise_forward_and_objective() -> None:
     encoder = NumericEmbedder(
         hidden_dim=backbone.hidden_dim,
         modalities=[
-            {"field": "action", "type": "discrete", "vocab_size": 4, "std": 0.02, "tokens": 1},
-            {"field": "observation", "type": "discrete", "vocab_size": 8, "std": 0.02, "tokens": 1},
-            {"field": "reward", "type": "rff", "std": 0.02, "in_min": 0.01, "in_max": 100.0, "tokens": 1},
-            {"field": "done", "type": "discrete", "vocab_size": 5, "std": 0.02, "tokens": 1},
+            {"field": "action", "type": "discrete", "vocab_size": 4, "std": 0.02},
+            {"field": "observation", "type": "discrete", "vocab_size": 8, "std": 0.02},
+            {"field": "reward", "type": "rff", "std": 0.02, "in_min": 0.01, "in_max": 100.0},
+            {"field": "done", "type": "discrete", "vocab_size": 5, "std": 0.02},
         ],
-        modality_fusion="sum",
-        include_type_token=False,
     )
     head = LayerwiseDiscreteActionValueHead(
         num_backbone_layers=2,

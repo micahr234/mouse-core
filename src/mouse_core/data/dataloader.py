@@ -1,53 +1,32 @@
-"""DataLoader — batch producer for sequential step data from one or more Datastores.
+"""DataLoader — sample steps, optionally augment, then build a TokenBatch.
 
-A ``Datastore`` is a flat sequence of arbitrary rows.
-
-The ``DataLoader`` repeatedly samples contiguous windows of ``S`` rows and
-returns ``(batch, segment_ids)`` where ``batch`` is a ``list[list[dict]]`` of
-shape ``[B][S]`` and ``segment_ids`` is a parallel ``list[list[int]]``. Each
-element of ``batch`` is a plain Python dict exactly as it was stored, unless
-an optional batch augmenter rewrites the raw rows before return (no encoding
-or tensorisation happens here). The model (its encoder) is responsible for
-extracting and converting the fields it needs.
-
-When background workers are enabled the slice and augmentation work happens in
-worker processes so ``next_batch()`` is usually immediate and batch prep can
-use multiple CPU cores.
+A ``Datastore`` is a flat sequence of arbitrary rows. The loader samples
+contiguous windows of ``S`` steps for ``B`` sequences, runs an optional
+augmenter on the raw ``[B][S]`` dicts, then calls an encoder ``preparer`` to
+produce a flat concatenated :class:`~mouse_core.models.embedding.token_batch.TokenBatch`
+(no padding). Workers run sample → augment → prepare so the training process
+mostly feeds the GPU.
 
 Usage
 -----
-Single store::
-
-    store = Datastore()
-    store.from_dataset(ds)
-
-    loader = DataLoader(store, sequence_length=64, batch_size=8)
-    batch, segment_ids = loader.next_batch()   # [B][S] rows + segment ids
-    loader.close()
-
-Multiple stores with weights::
+::
 
     loader = DataLoader(
-        [store_a, store_b],
+        store,
         sequence_length=64,
         batch_size=8,
-        weights=[2.0, 1.0],
-        weight_mode="per_store",
+        preparer=model.encoder.make_preparer(),
     )
-
-With packing (fill short windows by appending other slices)::
-
-    loader = DataLoader(stores, sequence_length=64, batch_size=8, pack=True)
-
-With padding (fill short windows with right-padding)::
-
-    loader = DataLoader(stores, sequence_length=64, batch_size=8, pad=True)
+    token_batch = loader.next_batch()
+    predictions, objective_data, _ = model(token_batch)
 """
 
 from __future__ import annotations
 
-import multiprocessing as mp
 import queue
+import sys
+import sysconfig
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
@@ -56,24 +35,33 @@ import numpy as np
 
 if TYPE_CHECKING:
     from mouse_core.data.datastore import Datastore
+    from mouse_core.models.embedding.token_batch import TokenBatch
 
 
 BatchAugmenter = Callable[[list[list[dict]]], list[list[dict]]]
+BatchPreparer = Callable[..., Any]  # (batch, segment_ids) -> TokenBatch
 
-# Sentinel / tagged queue payloads from worker processes.
-_BatchItem = tuple[list[list[dict]], list[list[int]]]
+_FREE_THREADING_HINT = (
+    "DataLoader(num_workers>0) requires a free-threaded CPython build with the "
+    "GIL disabled (e.g. Python 3.14t). Install with `uv python install 3.14t` "
+    "and create the venv with that interpreter. If imports re-enable the GIL "
+    "(common with older `tokenizers` wheels), run with `PYTHON_GIL=0` or "
+    "`python -Xgil=0`."
+)
 
 
-def _mp_context() -> mp.context.BaseContext:
-    """Prefer fork so HF Dataset snapshots are COW-shared across workers."""
-    if "fork" in mp.get_all_start_methods():
-        return mp.get_context("fork")
-    return mp.get_context("spawn")
+def _require_free_threading() -> None:
+    """Raise unless this process can run CPU-bound worker threads in parallel."""
+    if not sysconfig.get_config_var("Py_GIL_DISABLED"):
+        raise RuntimeError(_FREE_THREADING_HINT)
+    is_gil_enabled = getattr(sys, "_is_gil_enabled", None)
+    if callable(is_gil_enabled) and is_gil_enabled():
+        raise RuntimeError(_FREE_THREADING_HINT)
 
 
 @dataclass(frozen=True)
 class _SnapshotConfig:
-    """Immutable sampling snapshot passed into each worker process."""
+    """Immutable sampling snapshot shared with worker threads."""
 
     datasets: tuple[Any, ...]
     ns: tuple[int, ...]
@@ -140,27 +128,31 @@ def _fetch_one_batch(
     cfg: _SnapshotConfig,
     rng: np.random.Generator,
     augmenter: BatchAugmenter | None,
-) -> _BatchItem:
+    preparer: BatchPreparer | None,
+) -> Any:
     pairs = [_fetch_sequence(cfg, rng) for _ in range(cfg.batch_size)]
     batch = [steps for steps, _ in pairs]
     segment_ids = [ids for _, ids in pairs]
     if augmenter is not None:
         batch = augmenter(batch)
-    return batch, segment_ids
+    if preparer is None:
+        return batch, segment_ids
+    return preparer(batch, segment_ids)
 
 
 def _worker_loop(
-    result_queue: mp.Queue,
-    stop_event: mp.synchronize.Event,
+    result_queue: queue.Queue,
+    stop_event: threading.Event,
     cfg: _SnapshotConfig,
     sample_seed: Any,
     augmenter: BatchAugmenter | None,
+    preparer: BatchPreparer | None,
 ) -> None:
-    """Prefetch loop run inside a worker process."""
+    """Prefetch loop run inside a worker thread."""
     rng = np.random.default_rng(seed=sample_seed)
     while not stop_event.is_set():
         try:
-            item = _fetch_one_batch(cfg, rng, augmenter)
+            item = _fetch_one_batch(cfg, rng, augmenter, preparer)
             while not stop_event.is_set():
                 try:
                     result_queue.put(("ok", item), timeout=0.05)
@@ -197,8 +189,9 @@ class DataLoader:
     draws its store according to the computed per-store probabilities, giving
     smooth within-batch mixing.
 
-    Background workers (when enabled) run in separate processes so slice and
-    augmentation work can use multiple CPU cores.
+    Background workers (when enabled) run in threads on a free-threaded
+    CPython build so slice and augmentation work can use multiple CPU cores
+    while sharing the HF Dataset snapshot and prepared batches in-process.
 
     Parameters
     ----------
@@ -255,7 +248,8 @@ class DataLoader:
     prefetch :
         How many batches to keep pre-fetched in the background queue.
     num_workers :
-        Background worker processes (0 = synchronous).
+        Background worker threads (0 = synchronous). ``num_workers > 0``
+        requires a free-threaded CPython build with the GIL disabled.
     seed :
         Seed for the loader's internal NumPy RNG. ``None`` (default) uses
         unpredictable entropy. When set, each worker's sampling RNG and its
@@ -266,11 +260,15 @@ class DataLoader:
         Each :meth:`refresh` that restarts workers draws a fresh spawn wave
         from the same ``SeedSequence`` so streams do not replay after refresh.
     augmenter :
-        Optional callable applied to each sampled batch. With background workers,
-        augmentation runs in the worker before the batch is put into the prefetch
-        queue. If the callable exposes ``fork(seed=...)``, each worker receives an
-        independent copy. Augmenters used with ``num_workers > 0`` must be
-        picklable when the process start method is ``spawn``.
+        Optional callable applied to each sampled raw ``[B][S]`` batch **before**
+        the preparer. With background workers, augmentation runs in the worker.
+        If the callable exposes ``fork(seed=...)``, each worker receives an
+        independent copy with its own RNG.
+    preparer :
+        Callable ``(batch, segment_ids) -> TokenBatch`` from
+        ``encoder.make_preparer()``. Required for training: turns raw steps into
+        a flat concatenated token stream. When ``None``, :meth:`next_batch`
+        returns ``(batch, segment_ids)`` for debugging only.
     """
 
     def __init__(
@@ -287,14 +285,14 @@ class DataLoader:
         num_workers: int = 1,
         seed: int | None = None,
         augmenter: BatchAugmenter | None = None,
+        preparer: BatchPreparer | None = None,
     ) -> None:
         from mouse_core.data.datastore import Datastore as _DS
 
         # Set teardown attrs early so __del__/close are safe even if later validation fails.
-        self._ctx = _mp_context()
-        self._stop: mp.synchronize.Event | None = None
-        self._result_queue: mp.Queue | None = None
-        self._workers: list[mp.Process] = []
+        self._stop: threading.Event | None = None
+        self._result_queue: queue.Queue | None = None
+        self._workers: list[threading.Thread] = []
         self._sync_rng: np.random.Generator | None = None
         self._sync_augmenter: BatchAugmenter | None = None
         self._worker_error: BaseException | None = None
@@ -316,6 +314,8 @@ class DataLoader:
                 raise ValueError("All weights must be positive.")
         if num_workers < 0:
             raise ValueError(f"num_workers must be >= 0, got {num_workers}.")
+        if num_workers > 0:
+            _require_free_threading()
 
         self.stores = stores
         self.sequence_length = sequence_length
@@ -325,8 +325,10 @@ class DataLoader:
         self.pad = pad
         self.seed = seed
         self.augmenter = augmenter
+        self.preparer = preparer
         self._num_workers = num_workers
         self._prefetch = prefetch
+        self._sync_preparer: BatchPreparer | None = None
         self._weights: np.ndarray = (
             np.ones(len(stores)) if weights is None else np.asarray(weights, dtype=float)
         )
@@ -342,6 +344,7 @@ class DataLoader:
         if num_workers == 0:
             self._sync_rng = np.random.default_rng(seed=seed)
             self._sync_augmenter = augmenter
+            self._sync_preparer = preparer
         else:
             self._start_workers()
 
@@ -361,7 +364,7 @@ class DataLoader:
         Call after appending new rows to the underlying ``Datastore`` objects
         so :meth:`next_batch` samples from the latest data. When
         ``weight_mode="per_step"``, store-size weights are recomputed too.
-        With background workers, processes are restarted against the new
+        With background workers, threads are restarted against the new
         snapshot so they never read a stale shared object graph.
         """
         if self._num_workers > 0:
@@ -370,20 +373,27 @@ class DataLoader:
         if self._num_workers > 0:
             self._start_workers()
 
-    def next_batch(self) -> tuple[list[list[dict]], list[list[int]]]:
-        """Return the next batch of raw rows and parallel segment IDs.
+    def set_preparer(self, preparer: BatchPreparer | None) -> None:
+        """Attach or replace the encoder preparer (restarts workers if needed)."""
+        self.preparer = preparer
+        if self._num_workers == 0:
+            self._sync_preparer = preparer
+            return
+        self._stop_workers()
+        self._start_workers()
 
-        Returns:
-            ``(batch, segment_ids)`` where ``batch`` is ``list[list[dict]]`` of
-            shape ``[B][S]`` (step records exactly as stored) and
-            ``segment_ids`` is ``list[list[int]]`` of the same shape. Within
-            each sequence, independently sampled pack slices (and each pad
-            step when ``pad=True``) share distinct ids (``0``, ``1``, …); with
-            neither ``pack`` nor ``pad``, every id is ``0``.
+    def next_batch(self) -> Any:
+        """Return the next :class:`TokenBatch` (or raw batch if no preparer).
+
+        With ``preparer=`` (normal training), returns a flat concatenated
+        ``TokenBatch``. Without a preparer, returns ``(batch, segment_ids)`` as
+        ``list[list[dict]]`` / ``list[list[int]]`` for debugging.
         """
         if self._sync_rng is not None:
             cfg = self._snapshot_config()
-            return _fetch_one_batch(cfg, self._sync_rng, self._sync_augmenter)
+            return _fetch_one_batch(
+                cfg, self._sync_rng, self._sync_augmenter, self._sync_preparer
+            )
         assert self._result_queue is not None
         while True:
             if self._worker_error is not None:
@@ -397,7 +407,7 @@ class DataLoader:
             if kind == "err":
                 self._worker_error = cast(BaseException, payload)
                 raise RuntimeError("A prefetch worker raised an exception.") from self._worker_error
-            return cast(_BatchItem, payload)
+            return payload
 
     def close(self) -> None:
         """Stop background workers and drain the queue."""
@@ -446,20 +456,22 @@ class DataLoader:
         # share worker streams across loaders. Each call advances the
         # SeedSequence spawn counter so refresh waves do not replay.
         children = self._seed_seq.spawn(2 * n)
-        sample_seeds = children[0::2]
-        augment_seeds = [int(child.generate_state(1)[0]) for child in children[1::2]]
+        sample_seeds: list[Any] = list(children[0::2])
+        augment_seeds: list[int | None] = [
+            int(child.generate_state(1)[0]) for child in children[1::2]
+        ]
         return sample_seeds, augment_seeds
 
     def _start_workers(self) -> None:
         assert self._num_workers > 0
         self._worker_error = None
-        self._result_queue = self._ctx.Queue(maxsize=self._prefetch)
-        self._stop = self._ctx.Event()
+        self._result_queue = queue.Queue(maxsize=self._prefetch)
+        self._stop = threading.Event()
         cfg = self._snapshot_config()
         sample_seeds, augment_seeds = self._worker_seeds()
         self._workers = []
         for i in range(self._num_workers):
-            proc = self._ctx.Process(
+            thread = threading.Thread(
                 target=_worker_loop,
                 args=(
                     self._result_queue,
@@ -467,12 +479,13 @@ class DataLoader:
                     cfg,
                     sample_seeds[i],
                     _fork_augmenter(self.augmenter, seed=augment_seeds[i]),
+                    self.preparer,
                 ),
                 daemon=True,
                 name=f"DataLoader-{i}",
             )
-            proc.start()
-            self._workers.append(proc)
+            thread.start()
+            self._workers.append(thread)
 
     def _stop_workers(self) -> None:
         if self._stop is None:
@@ -488,9 +501,6 @@ class DataLoader:
                     break
         for w in self._workers:
             w.join(timeout=2.0)
-            if w.is_alive():
-                w.terminate()
-                w.join(timeout=1.0)
         self._workers = []
         self._stop = None
         self._result_queue = None

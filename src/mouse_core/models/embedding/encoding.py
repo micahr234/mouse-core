@@ -8,28 +8,15 @@ import torch
 import torch.nn as nn
 
 
+class StaticFourierFeatures(nn.Module):
+    """Deterministic log-spaced Fourier features (no learnable parameters).
 
-class RandomFourierFeatures(nn.Module):
-    """Random Fourier Features (Rahimi & Recht, 2007) with log-uniform frequencies.
+    Each feature is ``output_scale * cos(ω x + b)`` where ω is fixed log-spaced
+    over ``[1/in_max, 1/in_min]`` and phases ``b`` are fixed evenly in
+    ``[0, 2π)``. Sign-sensitive via nonzero phases; no ``nn.Parameter``.
 
-    Each feature is ``cos(ωx + b)`` where ω is sampled log-uniformly over
-    [1/in_max, 1/in_min] and b ~ Uniform(0, 2π). The random phase breaks the
-    even-function symmetry of plain cos, making the encoding sign-sensitive
-    (x ≠ −x) while halving the output size vs a sin+cos encoding.
-
-    ``in_min`` and ``in_max`` are expressed in input-space units:
-    - the lowest frequency (ω = 1/in_max) completes one cycle across ``in_max`` units;
-    - the highest frequency (ω = 1/in_min) completes one cycle across ``in_min`` units.
-
-    ``num_freq_sets`` independent (ω, b) pairs are sampled, forming banks of
-    shape ``(num_freq_sets, num_features)``. ``forward`` requires a ``freq_idx``
-    integer tensor of the same shape as ``x`` to select which set to use per
-    element. Both buffers are persistent so they are saved with the checkpoint.
-
-    Output has per-dim std ≈ output_scale / √2 before the affine.
-
-    After the cosine, a learnable per-(freq set, feature) weight is applied
-    (shape ``(num_freq_sets, num_features)``; initialised to ``output_scale``).
+    ``num_freq_sets`` independent banks support one bank per vector coordinate
+    (selected via ``freq_idx``).
     """
 
     def __init__(
@@ -40,7 +27,7 @@ class RandomFourierFeatures(nn.Module):
         num_freq_sets: int = 1,
         output_scale: float = 1.0,
         dtype: torch.dtype = torch.float32,
-    ):
+    ) -> None:
         super().__init__()
         if num_features <= 0:
             raise ValueError("num_features must be > 0")
@@ -50,37 +37,54 @@ class RandomFourierFeatures(nn.Module):
             raise ValueError("in_min must be < in_max")
         if num_freq_sets < 1:
             raise ValueError("num_freq_sets must be >= 1")
-        # ω = 1/x so that one cycle spans x units of input: ω_min = 1/in_max, ω_max = 1/in_min
+
         log_w_min = math.log(1.0 / in_max)
         log_w_max = math.log(1.0 / in_min)
-        freqs = torch.empty(num_freq_sets, num_features, dtype=dtype).uniform_(log_w_min, log_w_max).exp()
-        phases = torch.empty(num_freq_sets, num_features, dtype=dtype).uniform_(0.0, 2.0 * math.pi)
+        # Fixed log-spaced frequencies (not random).
+        t = torch.linspace(0.0, 1.0, num_features, dtype=dtype)
+        log_w = log_w_min + t * (log_w_max - log_w_min)
+        freqs = log_w.exp().unsqueeze(0).expand(num_freq_sets, -1).contiguous()
+        # Fixed phases: offset each freq-set so banks differ.
+        phase_base = torch.linspace(0.0, 2.0 * math.pi, num_features + 1, dtype=dtype)[:-1]
+        phases = torch.stack(
+            [(phase_base + (2.0 * math.pi * s / num_freq_sets)) % (2.0 * math.pi) for s in range(num_freq_sets)],
+            dim=0,
+        )
         self.register_buffer("freqs", freqs, persistent=True)
         self.register_buffer("phases", phases, persistent=True)
-        self.weight = nn.Parameter(torch.full((num_freq_sets, num_features), float(output_scale), dtype=dtype))
+        self.register_buffer(
+            "output_scale",
+            torch.tensor(float(output_scale), dtype=dtype),
+            persistent=True,
+        )
 
-    def forward(self, x: torch.Tensor, freq_idx: torch.Tensor | int) -> torch.Tensor:
-        """Map scalar inputs to RFF embeddings.
+    def forward(self, x: torch.Tensor, freq_idx: torch.Tensor | int = 0) -> torch.Tensor:
+        """Map scalar inputs to static Fourier embeddings.
 
         Args:
-            x:        Scalar inputs, shape ``(*batch,)``.
-            freq_idx: Which frequency set(s) to use. Either:
-                      - an ``int`` constant — same set broadcast over all elements, or
-                      - an integer tensor of the same shape as ``x`` — one set per element.
+            x: Scalar inputs ``(*batch,)``.
+            freq_idx: Frequency bank index (int or same shape as ``x``).
+
         Returns:
-            Tensor of shape ``(*batch, num_features)``.
+            ``(*batch, num_features)``.
         """
-        if isinstance(freq_idx, torch.Tensor):
-            assert x.shape == freq_idx.shape, (
-                f"x and freq_idx must have the same shape, got {x.shape} and {freq_idx.shape}"
+        if isinstance(freq_idx, torch.Tensor) and freq_idx.shape != x.shape:
+            raise ValueError(
+                f"x and freq_idx must have the same shape, got {tuple(x.shape)} and "
+                f"{tuple(freq_idx.shape)}"
             )
-        freqs = self.get_buffer("freqs")    # (num_freq_sets, num_features)
-        phases = self.get_buffer("phases")  # (num_freq_sets, num_features)
+        freqs = self.get_buffer("freqs")
+        phases = self.get_buffer("phases")
+        scale = self.get_buffer("output_scale")
         x = x.to(dtype=freqs.dtype)
-        w = freqs[freq_idx]   # (num_features,) or (*batch, num_features)
-        b = phases[freq_idx]  # (num_features,) or (*batch, num_features)
-        aw = self.weight[freq_idx]
-        return aw * (x.unsqueeze(-1) * w + b).cos()
+        w = freqs[freq_idx]
+        b = phases[freq_idx]
+        return scale * (x.unsqueeze(-1) * w + b).cos()
+
+
+# Alias kept only for older checkpoints that expect the name in state dict docs;
+# new code must use StaticFourierFeatures (no learnable weight).
+RandomFourierFeatures = StaticFourierFeatures
 
 
 class NormalizedPixel(nn.Module):

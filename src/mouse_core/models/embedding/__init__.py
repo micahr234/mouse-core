@@ -2,18 +2,12 @@ from mouse_core.models.embedding.embedding import (
     Encoder,
     NumericEmbedder,
     ModalitySpec,
-    action_modality,
-    observation_modalities,
     DiscreteEmbedder,
-    ScalarRFFEmbedder,
-    VectorRFFEmbedder,
-    VectorLinearEmbedder,
-    ImageEmbedder,
-    LearnableEmbedder,
 )
 from mouse_core.models.embedding.text import TextEmbedder, TextModalitySpec
-from mouse_core.models.embedding.encoding import RandomFourierFeatures, NormalizedPixel
+from mouse_core.models.embedding.encoding import StaticFourierFeatures, RandomFourierFeatures, NormalizedPixel
 from mouse_core.models.embedding.linear import ScaledEmbedding, ScaledLinear, PosLinear, ScaledPosLinear
+from mouse_core.models.embedding.token_batch import TokenBatch, empty_token_batch
 
 __all__ = [
     "Encoder",
@@ -21,14 +15,10 @@ __all__ = [
     "TextEmbedder",
     "TextModalitySpec",
     "ModalitySpec",
-    "action_modality",
-    "observation_modalities",
     "DiscreteEmbedder",
-    "ScalarRFFEmbedder",
-    "VectorRFFEmbedder",
-    "VectorLinearEmbedder",
-    "ImageEmbedder",
-    "LearnableEmbedder",
+    "TokenBatch",
+    "empty_token_batch",
+    "StaticFourierFeatures",
     "RandomFourierFeatures",
     "NormalizedPixel",
     "ScaledEmbedding",

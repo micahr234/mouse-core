@@ -49,12 +49,11 @@ def test_text_embedder_skip_omits_value_keeps_commas() -> None:
     assert col_values["reward"].dtype == torch.float32
     assert col_values["action"].dtype == torch.int64
     assert col_values["reward"].tolist() == [[0.0, 1.0]]
-    assert embeds.shape[0] == 1
-    assert embeds.shape[2] == 8
+    assert embeds.ndim == 2 and embeds.shape[1] == 8
     c0 = int(indices[0, 0].item()) + 1
     c1 = int(indices[0, 1].item()) - int(indices[0, 0].item())
     assert c0 < c1
-    assert embeds.shape[1] == c0 + c1
+    assert embeds.shape[0] == c0 + c1
 
     seen: list[str] = []
 
@@ -77,7 +76,7 @@ def test_text_embedder_skip_omits_value_keeps_commas() -> None:
     )
     out, _, _ = enc2([[{"observation": 1, "action": 0, "reward": 0.0, "done": 0}]])
     assert seen == ["<action=", ",observation=1,,>"]
-    matches = (out[0] == 7.0).all(dim=-1)
+    matches = (out == 7.0).all(dim=-1)
     assert int(matches.sum().item()) == 1
 
 
@@ -96,9 +95,9 @@ def test_token_modality_is_single_embed_row() -> None:
         modalities=[{"field": "action", "type": "token"}],
     )
     embeds, _, indices = enc([[{"action": 16}]])
-    assert embeds.shape[1] == 1
+    assert embeds.shape[0] == 1
     assert int(indices[0, 0].item()) == 0
-    assert torch.equal(embeds[0, 0], emb.weight[16])
+    assert torch.equal(embeds[0], emb.weight[16])
 
 
 def test_text_embedder_rejects_learnable() -> None:
@@ -144,18 +143,18 @@ def test_text_embedder_field_format_in_step_template() -> None:
     assert seen == ["<o=3|a=2>"]
 
 
-def test_text_embedder_image_fake_processor() -> None:
+def test_text_embedder_image_token_ids() -> None:
     D = 8
 
-    def fake_image_proc(image):
-        return torch.randn(2, D)
+    def fake_image_tok(image):
+        return [3, 4]  # discrete visual token ids
 
     emb = nn.Embedding(32, D)
     enc = TextEmbedder(
         hidden_dim=D,
         tokenizer=_FakeTokenizer(),
         embed_tokens=emb,
-        image_processor=fake_image_proc,
+        image_processor=fake_image_tok,
         format="<{observation},{pixels}>",
         modalities=[
             {"field": "observation", "type": "text", "format": "{observation}"},
@@ -165,8 +164,8 @@ def test_text_embedder_image_fake_processor() -> None:
     batch = [[{"observation": 3, "pixels": [1, 2, 3]}]]
     embeds, col_values, indices = enc(batch)
     assert "pixels" in col_values
-    assert embeds.shape[0] == 1
-    assert int(indices[0, 0].item()) + 1 == embeds.shape[1]
+    assert embeds.ndim == 2 and embeds.shape[1] == D
+    assert int(indices[0, 0].item()) + 1 == embeds.shape[0]
 
 
 def test_text_embedder_save_load(tmp_path) -> None:
@@ -197,3 +196,4 @@ def test_text_embedder_save_load(tmp_path) -> None:
     assert cfg["kwargs"]["modalities"][0]["type"] == "token"
     assert "std" not in cfg["kwargs"]
     assert "separator" not in cfg["kwargs"]
+    assert model is not None

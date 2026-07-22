@@ -25,11 +25,10 @@ def _tiny_model(backbone_cls, tokens: int = 1) -> Model:
     encoder = NumericEmbedder(
         hidden_dim=hidden_dim,
         modalities=[
-            {"field": "action", "type": "discrete", "vocab_size": 4, "tokens": tokens},
+            {"field": "action", "type": "discrete", "vocab_size": 4},
             {"field": "reward", "type": "rff"},
             {"field": "done", "type": "discrete", "vocab_size": 5},
         ],
-        include_type_token=False,
     )
     backbone = backbone_cls(hidden_dim=hidden_dim, num_layers=2, num_heads=2)
     head = DiscreteActionValueHead(
@@ -222,20 +221,18 @@ def test_concat_fusion_ragged_chunks_match_unbatched() -> None:
     encoder = NumericEmbedder(
         hidden_dim=hidden_dim,
         modalities=[
-            {"field": "action", "type": "discrete", "vocab_size": 4, "tokens": 2},
-            {"field": "reward", "type": "rff", "tokens": 1},
-            {"field": "done", "type": "discrete", "vocab_size": 5, "tokens": 1},
+            {"field": "action", "type": "discrete", "vocab_size": 4},
+            {"field": "reward", "type": "rff"},
+            {"field": "done", "type": "discrete", "vocab_size": 5},
             {"type": "learnable", "tokens": 1},  # dedicated prediction token
         ],
-        modality_fusion="concat",
-        include_type_token=False,
     )
     backbone = Qwen3Backbone(hidden_dim=hidden_dim, num_layers=2, num_heads=2)
     head = DiscreteActionValueHead(
         in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1
     )
     model = Model(encoder=encoder, backbone=backbone, heads=head).eval()
-    assert model.encoder.tokens_per_step == 5
+    assert model.encoder.tokens_per_step == 4
 
     chunk_lengths = [[1, 4, 2], [3, 0, 1], [2, 2, 3]]
     totals = [sum(call[b] for call in chunk_lengths) for b in range(3)]

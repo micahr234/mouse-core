@@ -203,6 +203,57 @@ def left_align_content(
     return aligned, pool_indices
 
 
+def pack_live_step_tokens(
+    buf: torch.Tensor,
+    live: torch.Tensor,
+    counts: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack masked per-step token slots into a right-padded flat sequence.
+
+    Used by :class:`NumericEmbedder` for both uniform and ragged steps: modalities
+    write into a dense ``[B, S, Tslot, D]`` buffer; ``live`` marks which slots are
+    real (concat skips leave holes that this removes).
+
+    Args:
+        buf: Token buffer ``[B, S, Tslot, D]``.
+        live: Boolean mask ``[B, S, Tslot]`` — True for tokens that belong in the
+            packed sequence (order is step-major, then slot).
+        counts: Per-step token counts ``[B, S]`` (must be ``live.sum(-1)`` and >= 1).
+
+    Returns:
+        ``(embeds [B, L, D], step_token_indices [B, S])`` with content starting at
+        index 0 (right-padded).
+    """
+    if buf.ndim != 4:
+        raise ValueError(f"buf must be [B, S, Tslot, D], got shape {tuple(buf.shape)}")
+    if live.shape != buf.shape[:3]:
+        raise ValueError(
+            f"live shape {tuple(live.shape)} must match buf leading dims {tuple(buf.shape[:3])}"
+        )
+    if counts.shape != buf.shape[:2]:
+        raise ValueError(
+            f"counts shape {tuple(counts.shape)} must be [B, S]={tuple(buf.shape[:2])}"
+        )
+    if (counts < 1).any():
+        raise ValueError(
+            "step has no present modalities (all skipped); "
+            "add a learnable modality or ensure at least one field is present"
+        )
+
+    B, S, t_slot, D = buf.shape
+    flat = buf.reshape(B, S * t_slot, D)
+    live_flat = live.reshape(B, S * t_slot)
+    row_lengths = live_flat.sum(dim=1)
+    L = int(row_lengths.max().item()) if B > 0 else 0
+    embeds = buf.new_zeros(B, L, D)
+    if L > 0 and live_flat.any():
+        dest = live_flat.to(dtype=torch.long).cumsum(dim=1) - 1
+        b_idx, src_idx = torch.where(live_flat)
+        embeds[b_idx, dest[b_idx, src_idx]] = flat[b_idx, src_idx]
+    indices = counts.cumsum(dim=1) - 1
+    return embeds, indices
+
+
 def pack_and_pad_rows(
     row_step_spans: list[list[torch.Tensor]],
     *,

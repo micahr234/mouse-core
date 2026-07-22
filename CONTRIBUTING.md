@@ -13,13 +13,21 @@ MOUSE is actively developed and contributions are very welcome — whether that'
 ## Development setup
 
 ```bash
-# Clone and create a virtual environment (Python 3.13, via uv)
+# Clone and create a free-threaded Python 3.14t virtual environment (via uv)
 git clone https://github.com/micahr234/mouse-core.git
 cd mouse-core
 source scripts/install.sh
 ```
 
-This installs the package in editable mode with the `dev` and `all` extras (`all` bundles every feature extra — currently `examples`, which adds Gymnasium for the [`examples/`](examples/) notebooks). Activate with `source .venv/bin/activate`.
+This installs the package in editable mode with the `dev` and `all` extras (`all` bundles every feature extra — currently `examples`). Activate with `source .venv/bin/activate`. The install uses free-threaded CPython (`3.14t`). System packages needed to run the notebooks are documented under **Example dependencies** in the [README](README.md#example-dependencies).
+
+### Temporary `PYTHON_GIL=0` (remove when possible)
+
+`scripts/install.sh` and CI set `PYTHON_GIL=0` so the free-threaded interpreter **keeps the GIL off** after imports. Today `transformers` still pins `tokenizers<=0.23.0`, and those builds re-enable the GIL on import. `tokenizers>=0.23.1` declares free-threading support, but we cannot depend on it until `transformers` allows that version.
+
+**Follow-up:** when `transformers` accepts `tokenizers>=0.23.1`, pin that pair, drop `PYTHON_GIL=0` from [`scripts/install.sh`](scripts/install.sh) and [`.github/workflows/ci.yml`](.github/workflows/ci.yml), and tighten the DataLoader free-threading hint accordingly.
+
+**Risk:** forcing the GIL off skips CPython’s “this extension did not opt in” safety brake. That is fine for our usual path (read-only HF Dataset slices + numeric prepare). It is riskier if multiple worker threads concurrently mutate shared C-extension state — the main case here is a shared Hugging Face `tokenizer` under `TextEmbedder` prepare. Prefer `num_workers=0` for text prepare until the follow-up lands, or treat multi-worker text as experimental.
 
 The package lives at `src/mouse_core/` (standard src layout) and is imported as `mouse_core`.
 
@@ -40,7 +48,7 @@ If you add a new feature, include a short usage example in the PR description or
 
 ## Code style
 
-- Python 3.13+, type-annotated throughout.
+- Python 3.14+ (free-threaded `3.14t` for multi-worker DataLoader), type-annotated throughout.
 - Follow the existing patterns: base classes in `base.py`, public API in `__init__.py`, documentation in `docs/`.
 - Avoid silent fallbacks — if a precondition isn't met, raise a clear error.
 - Comments should explain *why*, not *what*.

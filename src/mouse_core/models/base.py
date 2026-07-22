@@ -267,16 +267,22 @@ pip install mouse-core
 ```python
 import torch
 from mouse_core import load_model
+from mouse_core.models import preferred_dtype
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = load_model("{repo_id}", map_location="cpu").eval().to(device)
+model = (
+    load_model("{repo_id}", map_location="cpu")
+    .eval()
+    .to(device=device, dtype=preferred_dtype(device))
+)
 ```
 
 ## Run Inference
 
-The model accepts a `list[list[dict]]` batch of shape `[B][S]` — B sequences,
+Online / inference: pass a `list[list[dict]]` batch of shape `[B][S]` — B sequences,
 each containing S step-record dicts with flat keys matching the encoder's
-declared modalities above.
+declared modalities above. Training typically passes a `TokenBatch` from
+`DataLoader(preparer=encoder.make_preparer())`.
 
 ```python
 {objective_data_example}
@@ -418,13 +424,9 @@ def _encoder_config(encoder: Encoder) -> dict[str, Any]:
             "kwargs": {
                 "hidden_dim": int(encoder.hidden_dim),
                 "modalities": [_public_modality_config(modality) for modality in encoder.modalities],
-                "token_data_len": int(encoder.token_data_len),
-                "modality_fusion": encoder.modality_fusion,
-                "include_type_token": bool(encoder.include_type_token),
                 "fourier_min": float(encoder.fourier_min),
                 "fourier_max": float(encoder.fourier_max),
                 "std": float(encoder.std),
-                "type_embedding_std": float(encoder.type_embedding_std),
             },
         }
     if isinstance(encoder, TextEmbedder):
@@ -447,6 +449,8 @@ def _public_modality_config(modality: Any) -> dict[str, Any]:
     data = _drop_none(asdict(modality))
     if data.get("type") == "learnable" and str(data.get("field", "")).startswith("__learnable_"):
         data.pop("field", None)
+    for dead in ("method", "include_type_token", "allow_none"):
+        data.pop(dead, None)
     return data
 
 
@@ -623,7 +627,24 @@ def _build_encoder_from_config(config: dict[str, Any]) -> Encoder:
     if enc_type == "numeric":
         from mouse_core.models.embedding import NumericEmbedder
 
-        return NumericEmbedder(**config["kwargs"])
+        kwargs = dict(config["kwargs"])
+        for dead in (
+            "token_data_len",
+            "modality_fusion",
+            "include_type_token",
+            "type_embedding_std",
+            "method",
+        ):
+            kwargs.pop(dead, None)
+        # Drop removed modality keys
+        mods = []
+        for m in kwargs.get("modalities", []):
+            m = dict(m)
+            for dead in ("method", "include_type_token", "allow_none"):
+                m.pop(dead, None)
+            mods.append(m)
+        kwargs["modalities"] = mods
+        return NumericEmbedder(**kwargs)
     if enc_type == "text":
         from mouse_core.models.embedding import TextEmbedder
 
@@ -927,7 +948,11 @@ class Model(nn.Module):
                 break
 
     def to(self, *args: Any, **kwargs: Any) -> "Model":
-        """Move/cast the model; output heads always stay float32."""
+        """Move/cast the model; output heads always stay float32.
+
+        On CUDA, prefer ``model.to(device=device, dtype=preferred_dtype(device))``
+        so the encoder/backbone run in bfloat16 and FlexAttention compiles.
+        """
         dtype_kw = kwargs.get("dtype")
         dtype_arg = args[0] if len(args) == 1 and isinstance(args[0], torch.dtype) else None
         target_dtype = dtype_kw or dtype_arg
@@ -947,169 +972,184 @@ class Model(nn.Module):
 
     def forward(
         self,
-        batch: list[list[dict]],
+        batch: Any,
         segment_ids: list[list[int]] | None = None,
         cache: dict[str, Any] | None = None,
         use_cache: bool = False,
     ) -> tuple[TensorDict, TensorDict, dict[str, Any] | None]:
-        """Run a full forward pass.
+        """Run a full forward pass over a :class:`TokenBatch` or raw steps.
 
-        When decoding with a cache, rows in ``batch`` may have **different
-        lengths** on every call (including empty): incremental decoding runs
-        through a FlexAttention session that keeps each row inside its own
-        causal prefix with per-row RoPE positions, so every row decodes exactly
-        as it would alone (verified in ``tests/test_kv_cache.py``). The session
-        travels inside the returned ``cache``, so batched incremental decoding
-        with ragged chunks (e.g. envs emitting different numbers of steps
-        between model calls) needs no bookkeeping from the caller. Predictions
-        at a row's leading pad positions are meaningless: row ``b``'s real
-        steps are the trailing ``len(batch[b])`` entries, and the last step —
-        the one :meth:`get_action` reads — is always real for non-empty rows.
+        Training: pass a ``TokenBatch`` from ``DataLoader(preparer=...)``.
+        Online: pass raw ``list[list[dict]]`` (optionally ragged with
+        ``use_cache=True``); the encoder preparer builds the ``TokenBatch``.
 
-        Args:
-            batch: ``[B][S]`` list of raw step-record dicts, as returned by
-                ``DataLoader.next_batch()`` or assembled manually for rollout.
-                Rows may have unequal lengths (including empty) when decoding
-                with a cache; at least one row must be non-empty.
-            segment_ids: Optional ``[B][S]`` pack-slice IDs parallel to
-                ``batch`` (from ``DataLoader.next_batch()``). Training uses them
-                to build a same-segment causal attention mask and to reset RoPE
-                ``position_ids`` at each new segment. ``None`` (rollouts) treats
-                every step in a row as one segment. Injected into
-                ``objective_data`` as ``segment_id`` for TD objectives.
-            cache: Optional cache from a prior call. Requires ``use_cache=True``
-                (the decode session inside is mutated by every call). The batch
-                size must match the call that created the cache.
-            use_cache: If True, return an updated cache.
-
-        Returns:
-            ``(predictions, objective_data, cache)`` where
-
-            * ``predictions`` is a ``TensorDict[B, S]`` with one entry per enabled head.
-            * ``objective_data`` is a ``TensorDict[B, S]`` of the modality tensors
-              extracted by the encoder — the same values used for embedding —
-              plus ``segment_id``.
-              Pass this to objectives (e.g. ``objective(objective_data, predictions)``).
-            * ``cache`` is the updated cache, or ``None`` when ``use_cache=False``.
+        Training attention uses FlexAttention over the flat concatenated token
+        stream (no cross-sequence padding). Cached decode keeps
+        ``FlexDecodeSession`` with per-sequence KV caches.
         """
+        from mouse_core.models.embedding.token_batch import TokenBatch
+
         if cache is not None and not use_cache:
-            # The decode session in the cache is mutated by every call, so a
-            # "read-only" pass over an existing cache cannot exist.
             raise ValueError("Passing cache= requires use_cache=True.")
 
-        B = len(batch)
-        lengths = [len(rows) for rows in batch]
-        S = max(lengths, default=0)
-
-        ragged = any(n != S for n in lengths)
-        if ragged or use_cache:
-            if S == 0:
-                raise ValueError("Model.forward requires at least one non-empty row in batch.")
-            if not use_cache:
-                raise ValueError("Ragged batches require use_cache=True (cached decoding).")
-            if ragged:
-                # Pad rows are never attended to and never enter the KV cache,
-                # so any real row works as filler for the encoder.
-                pad_row = next(rows[0] for rows in batch if rows)
-                batch = [[pad_row] * (S - n) + rows for rows, n in zip(batch, lengths)]
-
-        if segment_ids is None:
-            segment_ids = [[0] * len(rows) for rows in batch]
-        if len(segment_ids) != B:
-            raise ValueError(
-                f"segment_ids batch size ({len(segment_ids)}) must match batch ({B})."
-            )
-        for b, (rows, ids) in enumerate(zip(batch, segment_ids)):
-            if len(ids) != len(rows):
+        raw_lengths: list[int] | None = None
+        if isinstance(batch, TokenBatch):
+            if segment_ids is not None:
+                raise ValueError("segment_ids are already inside TokenBatch; do not pass them again")
+            token_batch = batch
+            B, S = token_batch.B, token_batch.S
+        else:
+            # Raw [B][S] steps (online / tests)
+            raw_batch = cast(list[list[dict]], batch)
+            B = len(raw_batch)
+            lengths = [len(rows) for rows in raw_batch]
+            S = max(lengths, default=0)
+            ragged = any(n != S for n in lengths)
+            if ragged or use_cache:
+                if S == 0:
+                    raise ValueError("Model.forward requires at least one non-empty row in batch.")
+                if not use_cache:
+                    raise ValueError("Ragged batches require use_cache=True (cached decoding).")
+                if ragged:
+                    pad_row = next(rows[0] for rows in raw_batch if rows)
+                    raw_batch = [
+                        [pad_row] * (S - n) + rows for rows, n in zip(raw_batch, lengths)
+                    ]
+                raw_lengths = lengths
+            if segment_ids is None:
+                segment_ids = [[0] * len(rows) for rows in raw_batch]
+            if len(segment_ids) != B:
                 raise ValueError(
-                    f"segment_ids[{b}] length ({len(ids)}) must match batch[{b}] "
-                    f"length ({len(rows)})."
+                    f"segment_ids batch size ({len(segment_ids)}) must match batch ({B})."
                 )
+            for b, (rows, ids) in enumerate(zip(raw_batch, segment_ids)):
+                if len(ids) != len(rows):
+                    raise ValueError(
+                        f"segment_ids[{b}] length ({len(ids)}) must match batch[{b}] "
+                        f"length ({len(rows)})."
+                    )
+            token_batch = self.encoder.prepare(raw_batch, segment_ids)
 
-        embeds, col_values, step_token_indices = self.encoder(batch)
+        embeds, col_values, step_token_indices = self.encoder(token_batch)
+        # embeds: [L, D]
         if any(value.device != embeds.device for value in col_values.values()):
             col_values = {key: value.to(embeds.device) for key, value in col_values.items()}
-        segment_id_tensor = torch.tensor(
-            segment_ids, device=embeds.device, dtype=torch.long
-        )
-        if segment_id_tensor.shape != (B, S):
-            raise ValueError(
-                f"segment_ids must have shape [{B}, {S}], got {tuple(segment_id_tensor.shape)}."
-            )
+
+        # Step-level segment ids for objectives: gather from each step's last token
+        # (``step_token_indices``). Avoids a B*S Python loop of eq/any/nonzero.
+        t = token_batch.to_tensors(embeds.device)
+        seg_tok = t["segment_ids"]
+        sequence_ids = t["sequence_ids"]
+        if token_batch.L > 0 and S > 0:
+            segment_id_tensor = seg_tok[step_token_indices]
+        else:
+            segment_id_tensor = torch.zeros(B, S, device=embeds.device, dtype=torch.long)
         col_values["segment_id"] = segment_id_tensor
         objective_data = TensorDict(col_values, batch_size=(B, S))
 
-        from mouse_core.models.embedding.packing import (
-            counts_from_step_token_indices,
-            real_token_lengths_from_indices,
-            token_pad_mask,
-        )
-
-        counts = counts_from_step_token_indices(step_token_indices)
-        pad_mask = token_pad_mask(step_token_indices, embeds.shape[1])
-
         needs_layerwise = "action_value_layerwise" in self._heads
+        new_cache: dict[str, Any] | None
+
         if use_cache:
             from mouse_core.models.embedding.packing import left_align_content
 
-            token_lengths = real_token_lengths_from_indices(
-                step_token_indices, num_real_steps=lengths
+            batched_embeds, token_lengths, local_indices = _flat_to_batched_left_pad(
+                embeds, sequence_ids, step_token_indices, B, S, raw_lengths
             )
-            flex_embeds, pool_indices = left_align_content(embeds, step_token_indices)
             session = cache["session"] if cache else self.backbone.decode_session(
-                batch_size=B, capacity=max(flex_embeds.shape[1], 1)
+                batch_size=B, capacity=max(batched_embeds.shape[1], 1)
             )
+            # FlexDecode wants left-padded content in trailing columns — local_indices
+            # already account for right-pad scatter; left_align if needed.
+            flex_embeds, pool_indices = left_align_content(batched_embeds, local_indices)
+            if raw_lengths is not None:
+                from mouse_core.models.embedding.packing import real_token_lengths_from_indices
+
+                token_lengths = real_token_lengths_from_indices(
+                    local_indices, num_real_steps=raw_lengths
+                )
             session_out = session.forward(
                 flex_embeds, token_lengths, output_hidden_states=needs_layerwise
             )
-            new_cache: dict[str, Any] | None = {"session": session}
+            new_cache = {"session": session}
             step_token_indices = pool_indices
+            h_source_batched = True
         else:
-            segment_token_ids = _expand_segment_ids_to_tokens(
-                segment_id_tensor, counts
+            # Training: Flex packed on CUDA; SDPA mask fallback on CPU (no Flex backward).
+            transformer = getattr(self.backbone, "model", None)
+            use_flex = (
+                transformer is not None
+                and hasattr(transformer, "layers")
+                and embeds.device.type == "cuda"
             )
-            # Batch-pad expand may be shorter/longer than embeds if packing differs;
-            # align to embeds length.
-            L = embeds.shape[1]
-            if segment_token_ids.shape[1] < L:
-                pad = segment_token_ids.new_full(
-                    (B, L - segment_token_ids.shape[1]), -1
+            if use_flex:
+                from mouse_core.models.backbone.flex_train import flex_packed_forward
+
+                session_out = flex_packed_forward(
+                    transformer,
+                    embeds,
+                    sequence_ids,
+                    seg_tok,
+                    output_hidden_states=needs_layerwise,
                 )
-                segment_token_ids = torch.cat([segment_token_ids, pad], dim=1)
-            elif segment_token_ids.shape[1] > L:
-                segment_token_ids = segment_token_ids[:, :L]
-            attention_mask = _segment_causal_attention_mask(
-                segment_token_ids, dtype=embeds.dtype, token_mask=pad_mask
-            )
-            position_ids = _segment_position_ids(
-                segment_token_ids, token_mask=pad_mask
-            )
-            session_out = self.backbone(
-                embeds,
-                output_hidden_states=needs_layerwise,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-            )
+            else:
+                # Flat [L,D] → [1,L,D] with document/segment causal mask
+                attention_mask = _flat_segment_causal_mask(
+                    sequence_ids, seg_tok, dtype=embeds.dtype
+                )
+                position_ids = _flat_segment_position_ids(sequence_ids, seg_tok)
+                session_out = self.backbone(
+                    embeds.unsqueeze(0),
+                    output_hidden_states=needs_layerwise,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                )
+                if needs_layerwise:
+                    h0, layers = session_out
+                    if h0.ndim == 3:
+                        h0 = h0.squeeze(0)
+                    layers = tuple(x.squeeze(0) if x.ndim == 3 else x for x in layers)
+                    session_out = (h0, layers)
+                elif isinstance(session_out, torch.Tensor) and session_out.ndim == 3:
+                    session_out = session_out.squeeze(0)
             new_cache = None
+            h_source_batched = False
+
         if needs_layerwise:
             h, layer_hiddens = session_out
         else:
             h = session_out
             layer_hiddens = None
 
-        h_step = self.encoder.pool_step_reprs(h, step_token_indices)
-        if needs_layerwise:
-            assert layer_hiddens is not None
-            h_layers = torch.stack(
-                [
-                    self.encoder.pool_step_reprs(layer_h, step_token_indices)
-                    for layer_h in layer_hiddens
-                ],
-                dim=1,
-            )
-            predictions = self.head(h_step, batch_size=(B, S), h_layers=h_layers)
+        if h_source_batched:
+            h_step = self.encoder.pool_step_reprs(h, step_token_indices)
+            if needs_layerwise:
+                assert layer_hiddens is not None
+                h_layers = torch.stack(
+                    [
+                        self.encoder.pool_step_reprs(layer_h, step_token_indices)
+                        for layer_h in layer_hiddens
+                    ],
+                    dim=1,
+                )
+                predictions = self.head(h_step, batch_size=(B, S), h_layers=h_layers)
+            else:
+                predictions = self.head(h_step, batch_size=(B, S))
         else:
-            predictions = self.head(h_step, batch_size=(B, S))
+            # h is [L, D]; step_token_indices [B, S] absolute into L
+            h_step = self.encoder.pool_step_reprs(h, step_token_indices)
+            if needs_layerwise:
+                assert layer_hiddens is not None
+                h_layers = torch.stack(
+                    [
+                        self.encoder.pool_step_reprs(layer_h, step_token_indices)
+                        for layer_h in layer_hiddens
+                    ],
+                    dim=1,
+                )
+                predictions = self.head(h_step, batch_size=(B, S), h_layers=h_layers)
+            else:
+                predictions = self.head(h_step, batch_size=(B, S))
         return predictions, objective_data, new_cache
 
     def head(
@@ -1190,3 +1230,82 @@ class Model(nn.Module):
         scores = scores - scores.max(dim=-1, keepdim=True).values
         probs = F.softmax(scores / temperature, dim=-1)
         return torch.multinomial(probs, num_samples=1).squeeze(-1)
+
+
+def preferred_dtype(device: torch.device | str | None = None) -> torch.dtype:
+    """Compute dtype for encoder/backbone: ``bfloat16`` on CUDA, else ``float32``.
+
+    Pass to ``Model.to(device=..., dtype=preferred_dtype(device))``. Heads stay
+    float32 via :meth:`Model.to`. CUDA FlexAttention only fuses for bf16/fp16.
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    elif not isinstance(device, torch.device):
+        device = torch.device(device)
+    if device.type == "cuda":
+        return torch.bfloat16
+    return torch.float32
+
+
+def _flat_to_batched_left_pad(
+    embeds: torch.Tensor,
+    sequence_ids: torch.Tensor,
+    step_token_indices: torch.Tensor,
+    B: int,
+    S: int,
+    raw_lengths: list[int] | None,
+) -> tuple[torch.Tensor, list[int], torch.Tensor]:
+    """Scatter flat ``[L, D]`` embeds into right-padded ``[B, Lmax, D]``."""
+    L, D = embeds.shape
+    lengths = [(sequence_ids == b).sum().item() for b in range(B)]
+    Lmax = max(lengths) if lengths else 0
+    out = embeds.new_zeros(B, Lmax, D)
+    local_indices = torch.zeros(B, S, device=embeds.device, dtype=torch.long)
+    for b in range(B):
+        mask = sequence_ids == b
+        toks = embeds[mask]
+        out[b, : toks.shape[0]] = toks
+        for s in range(S):
+            abs_i = int(step_token_indices[b, s].item())
+            if abs_i < 0 or abs_i >= L:
+                continue
+            local_indices[b, s] = int((sequence_ids[: abs_i + 1] == b).sum().item()) - 1
+    return out, lengths, local_indices
+
+
+def _flat_segment_causal_mask(
+    sequence_ids: torch.Tensor,
+    segment_ids: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Additive attention mask ``[1, 1, L, L]`` for a packed flat sequence."""
+    L = sequence_ids.shape[0]
+    device = sequence_ids.device
+    q = torch.arange(L, device=device)
+    kv = torch.arange(L, device=device)
+    causal = kv.unsqueeze(0) <= q.unsqueeze(1)
+    same_seq = sequence_ids.unsqueeze(1) == sequence_ids.unsqueeze(0)
+    same_seg = segment_ids.unsqueeze(1) == segment_ids.unsqueeze(0)
+    allow = causal & same_seq & same_seg
+    neg = torch.finfo(dtype).min
+    mask = torch.where(allow, torch.zeros((), device=device, dtype=dtype), torch.full((), neg, device=device, dtype=dtype))
+    return mask.view(1, 1, L, L)
+
+
+def _flat_segment_position_ids(
+    sequence_ids: torch.Tensor,
+    segment_ids: torch.Tensor,
+) -> torch.Tensor:
+    """RoPE positions ``[1, L]`` resetting at each (sequence, segment) run."""
+    L = sequence_ids.shape[0]
+    device = sequence_ids.device
+    if L == 0:
+        return torch.zeros(1, 0, dtype=torch.long, device=device)
+    arange = torch.arange(L, device=device)
+    new_run = torch.ones(L, dtype=torch.bool, device=device)
+    new_run[1:] = (sequence_ids[1:] != sequence_ids[:-1]) | (
+        segment_ids[1:] != segment_ids[:-1]
+    )
+    markers = torch.where(new_run, arange, torch.full_like(arange, -1))
+    return (arange - torch.cummax(markers, dim=0).values).unsqueeze(0)
