@@ -91,15 +91,16 @@ def _infer_col_dtype(raw_values: list[Any]) -> torch.dtype:
 class TextEmbedder(Encoder):
     """Pretrained token embeddings over a flat :class:`TokenBatch`.
 
-    :meth:`prepare` formats and tokenizes on CPU; :meth:`forward` only runs
-    ``embed_tokens`` (and optional vision) on the GPU.
+    :meth:`prepare` formats and tokenizes on CPU; :meth:`forward` looks up
+    ``embed_tokens``. Image modalities need ``image_processor=`` returning
+    discrete token ids (no vision tower in this path).
     """
 
     def __init__(
         self,
+        *,
         hidden_dim: int,
         modalities: list[dict | TextModalitySpec] | None = None,
-        *,
         format: str | None = None,
         pretrained: str | Path | None = None,
         tokenizer=None,
@@ -173,28 +174,17 @@ class TextEmbedder(Encoder):
         else:
             self.tokenizer = None
 
-        self.image_processor = image_processor
-        self._vision: nn.Module | None = None
-        self._pretrained = pretrained
         if has_image:
-            if image_processor is not None and callable(image_processor) and not hasattr(
-                image_processor, "image_processor"
-            ):
-                # Custom callable that returns token ids or [n,D] — prefer ids for TokenBatch.
-                pass
-            elif pretrained is not None:
-                self._vision, self.image_processor = self._load_vision(pretrained)
-            else:
+            if image_processor is None or not callable(image_processor):
                 raise TypeError(
-                    "TextEmbedder with image modalities requires image_processor= or "
-                    "a vision-capable pretrained="
+                    "TextEmbedder with image modalities requires image_processor= "
+                    "callable that returns discrete token ids"
                 )
+        self.image_processor = image_processor
+        self._pretrained = str(pretrained) if pretrained is not None else None
 
         if freeze_embeddings:
             self.embed_tokens.weight.requires_grad_(False)
-            if self._vision is not None:
-                for p in self._vision.parameters():
-                    p.requires_grad_(False)
 
     def _load_embed_tokens(self, pretrained: str | Path, hidden_dim: int) -> nn.Embedding:
         from transformers import AutoModel
@@ -210,37 +200,6 @@ class TextEmbedder(Encoder):
             emb.weight.copy_(src.weight)
         del model
         return emb
-
-    def _load_vision(self, pretrained: str | Path) -> tuple[nn.Module, Any]:
-        try:
-            from transformers import AutoProcessor
-        except ImportError as exc:
-            raise ImportError("transformers AutoProcessor required for image modalities") from exc
-
-        processor = AutoProcessor.from_pretrained(pretrained, **self._hub_kwargs)
-        if not hasattr(processor, "image_processor") and type(processor).__name__ == "PreTrainedTokenizerFast":
-            raise ValueError(
-                f"pretrained {pretrained!r} has no image processor; "
-                "cannot declare type='image' modalities"
-            )
-        from transformers import AutoModel
-
-        model = AutoModel.from_pretrained(pretrained, **self._hub_kwargs)
-        vision = getattr(model, "vision_model", None) or getattr(model, "vision_tower", None)
-        if vision is None:
-            raise ValueError(
-                f"pretrained {pretrained!r} exposes no vision_model/vision_tower; "
-                "cannot declare type='image' modalities"
-            )
-        projector = getattr(model, "multi_modal_projector", None) or getattr(
-            model, "mm_projector", None
-        )
-        wrapper = _VisionEmbedder(vision, projector, self._hidden_dim)
-        wrapper.load_from(model)
-        del model
-        return wrapper, processor
-
-        self._pretrained = str(pretrained) if pretrained is not None else None
 
     @property
     def pretrained(self) -> str | Path | None:
@@ -266,36 +225,14 @@ class TextEmbedder(Encoder):
         modalities = list(self.modalities)
         tokenizer = self.tokenizer
         image_processor = self.image_processor
-        # Vision path in prepare: only support tokenizer-like callables that return ids.
-        # Full vision tower runs in forward when prepare stores a sentinel — for now
-        # image prepare requires a callable returning Sequence[int] token ids.
-        has_vision_module = self._vision is not None
 
-        def _prepare(
-            batch: list[list[dict]],
-            segment_ids: list[list[int]] | None = None,
-        ) -> TokenBatch:
-            return _prepare_text(
-                batch,
-                segment_ids,
-                format_str=format_str,
-                text_by_field=text_by_field,
-                token_by_field=token_by_field,
-                image_by_field=image_by_field,
-                modalities=modalities,
-                tokenizer=tokenizer,
-                image_processor=image_processor,
-                has_vision_module=has_vision_module,
-            )
+        def _prepare(batch: list[list[dict]]) -> TokenBatch:
+            return _prepare_text(format_str=format_str, text_by_field=text_by_field, token_by_field=token_by_field, image_by_field=image_by_field, modalities=modalities, tokenizer=tokenizer, image_processor=image_processor, batch=batch)
 
         return _prepare
 
-    def prepare(
-        self,
-        batch: list[list[dict]],
-        segment_ids: list[list[int]] | None = None,
-    ) -> TokenBatch:
-        return self.make_preparer()(batch, segment_ids)
+    def prepare(self, batch: list[list[dict]]) -> TokenBatch:
+        return self.make_preparer()(batch)
 
     def forward(
         self, token_batch: TokenBatch | list[list[dict]]
@@ -317,16 +254,15 @@ class TextEmbedder(Encoder):
             embeds[vision_mask] = self.embed_tokens(ids[vision_mask]).to(dtype=dtype)
 
         col_values = t["col_values"]
-        sti = t["step_token_indices"].view(token_batch.B, token_batch.S)
-        return embeds, col_values, sti
+        prediction_indices = t["prediction_indices"]
+        return embeds, col_values, prediction_indices
 
-    def pool_step_reprs(self, h: torch.Tensor, step_token_indices: torch.Tensor) -> torch.Tensor:
+    def pool_step_reprs(self, h: torch.Tensor, prediction_indices: torch.Tensor) -> torch.Tensor:
         D = self._hidden_dim
         if h.ndim == 2:
-            idx = step_token_indices.reshape(-1)
-            return h[idx].view(*step_token_indices.shape, D)
-        B, S = step_token_indices.shape
-        idx = step_token_indices.unsqueeze(-1).expand(B, S, D)
+            return h[prediction_indices.reshape(-1)]
+        B, S = prediction_indices.shape
+        idx = prediction_indices.unsqueeze(-1).expand(B, S, D)
         return h.gather(1, idx)
 
     def _coerce_col_value(self, value: Any, dt: torch.dtype) -> Any:
@@ -383,9 +319,8 @@ def _tokenize_ids(tokenizer: Any, text: str) -> list[int]:
 
 
 def _prepare_text(
-    batch: list[list[dict]],
-    segment_ids: list[list[int]] | None,
     *,
+    batch: list[list[dict]],
     format_str: str | None,
     text_by_field: dict[str, TextModalitySpec],
     token_by_field: dict[str, TextModalitySpec],
@@ -393,18 +328,12 @@ def _prepare_text(
     modalities: list[TextModalitySpec],
     tokenizer: Any,
     image_processor: Any,
-    has_vision_module: bool,
 ) -> TokenBatch:
     B = len(batch)
-    S = len(batch[0]) if B > 0 else 0
-    for b, rows in enumerate(batch):
-        if len(rows) != S:
-            raise ValueError(
-                f"all rows must have the same number of steps; row 0 has {S}, "
-                f"row {b} has {len(rows)}"
-            )
-    if segment_ids is None:
-        segment_ids = [[0] * S for _ in range(B)]
+    step_counts = np.asarray([len(rows) for rows in batch], dtype=np.int64)
+    N = int(step_counts.sum()) if B > 0 else 0
+    if B > 0 and (step_counts < 0).any():
+        raise ValueError("sequence step counts must be non-negative")
 
     # col_values
     raw: dict[str, list[Any]] = {
@@ -416,23 +345,20 @@ def _prepare_text(
     tok_scalars: list[float] = []
     seq_ids: list[int] = []
     step_ids: list[int] = []
-    seg_ids: list[int] = []
-    step_token_indices = np.zeros(B * S, dtype=np.int64)
+    prediction_indices = np.zeros(N, dtype=np.int64)
+    flat_step = 0
 
-    def _emit(b: int, flat_step: int, seg: int, ids: list[int], type_id: int = _TYPE_TEXT) -> None:
+    def _emit(b: int, local_step: int, ids: list[int], type_id: int = _TYPE_TEXT) -> None:
         for tid in ids:
             tok_types.append(type_id)
             tok_ids.append(tid)
             tok_scalars.append(0.0)
             seq_ids.append(b)
-            step_ids.append(flat_step)
-            seg_ids.append(seg)
+            step_ids.append(local_step)
 
     for b in range(B):
-        for s in range(S):
+        for s in range(int(step_counts[b])):
             row = batch[b][s]
-            flat_step = b * S + s
-            seg = int(segment_ids[b][s])
             for field in raw:
                 raw[field].append(row.get(field))
 
@@ -448,7 +374,7 @@ def _prepare_text(
                     if tokenizer is None:
                         raise RuntimeError("tokenizer required to tokenize text runs")
                     ids = _tokenize_ids(tokenizer, text)
-                    _emit(b, flat_step, seg, ids)
+                    _emit(b, s, ids)
 
                 for literal, name, _fmt, _conv in Formatter().parse(format_str):
                     if name is None:
@@ -469,7 +395,7 @@ def _prepare_text(
                                 continue
                             if spec.skip is not None and _values_equal(value, spec.skip):
                                 continue
-                            _emit(b, flat_step, seg, [int(_unwrap_scalar(value))])
+                            _emit(b, s, [int(_unwrap_scalar(value))])
                         else:
                             spec = image_by_field[name]
                             value = row.get(name)
@@ -479,35 +405,22 @@ def _prepare_text(
                                 continue
                             if spec.skip is not None and _values_equal(value, spec.skip):
                                 continue
-                            # Prefer callable returning token ids; else fault if only vision tower.
-                            if callable(image_processor) and not hasattr(
-                                image_processor, "image_processor"
-                            ):
-                                out = image_processor(value)
-                                if isinstance(out, torch.Tensor):
-                                    if out.ndim == 2 and out.shape[-1] > 1:
-                                        raise TypeError(
-                                            "image_processor must return token ids for "
-                                            "TokenBatch prepare; embedding tensors belong "
-                                            "in the embedder"
-                                        )
-                                    ids = [int(x) for x in out.view(-1).tolist()]
-                                elif isinstance(out, (list, tuple, np.ndarray)):
-                                    ids = [int(x) for x in np.asarray(out).ravel().tolist()]
-                                else:
-                                    raise TypeError(
-                                        "image_processor must return a sequence of token ids"
-                                    )
-                                _emit(b, flat_step, seg, ids, type_id=1)
-                            elif has_vision_module:
-                                raise TypeError(
-                                    "TextEmbedder image modalities with a vision tower "
-                                    "require an image tokenizer that returns discrete "
-                                    "token ids in prepare; continuous vision embeds are "
-                                    "not supported in the TokenBatch path"
-                                )
-                            else:
+                            if image_processor is None:
                                 raise RuntimeError("image_processor is not configured")
+                            out = image_processor(value)
+                            if isinstance(out, torch.Tensor):
+                                if out.ndim == 2 and out.shape[-1] > 1:
+                                    raise TypeError(
+                                        "image_processor must return token ids, not embeddings"
+                                    )
+                                ids = [int(x) for x in out.view(-1).tolist()]
+                            elif isinstance(out, (list, tuple, np.ndarray)):
+                                ids = [int(x) for x in np.asarray(out).ravel().tolist()]
+                            else:
+                                raise TypeError(
+                                    "image_processor must return a sequence of token ids"
+                                )
+                            _emit(b, s, ids, type_id=1)
                         continue
 
                     if literal:
@@ -525,7 +438,8 @@ def _prepare_text(
                     "step has no tokens after skips; ensure the step format still "
                     "produces at least one token"
                 )
-            step_token_indices[flat_step] = len(tok_types) - 1
+            prediction_indices[flat_step] = len(tok_types) - 1
+            flat_step += 1
 
     col_values: dict[str, np.ndarray] = {}
     for field, values in raw.items():
@@ -543,7 +457,7 @@ def _prepare_text(
                 ),
                 default=1,
             )
-            buf = np.zeros((B * S, dim), dtype=np.float32)
+            buf = np.zeros((N, dim), dtype=np.float32)
             for i, v in enumerate(values):
                 if v is None:
                     continue
@@ -552,7 +466,7 @@ def _prepare_text(
                     dtype=np.float32,
                 ).ravel()
                 buf[i, : a.size] = a
-            col_values[field] = buf.reshape(B, S, dim)
+            col_values[field] = buf
         elif dt in (torch.uint8, torch.int64, torch.int32) and any(
             isinstance(v, (list, tuple, np.ndarray, torch.Tensor)) for v in values if v is not None
         ):
@@ -567,7 +481,7 @@ def _prepare_text(
                 default=1,
             )
             np_dtype = np.uint8 if dt == torch.uint8 else np.int64
-            buf = np.zeros((B * S, dim), dtype=np_dtype)
+            buf = np.zeros((N, dim), dtype=np_dtype)
             for i, v in enumerate(values):
                 if v is None:
                     continue
@@ -576,22 +490,25 @@ def _prepare_text(
                     dtype=np_dtype,
                 ).ravel()
                 buf[i, : a.size] = a
-            col_values[field] = buf.reshape(B, S, dim)
+            col_values[field] = buf
         elif dt in (torch.float32, torch.float64):
             arr = np.array(
                 [0.0 if v is None else float(_unwrap_scalar(v)) for v in values],
                 dtype=np.float32,
             )
-            col_values[field] = arr.reshape(B, S)
+            col_values[field] = arr
         else:
             arr = np.array(
                 [0 if v is None else int(_unwrap_scalar(v)) for v in values],
                 dtype=np.int64,
             )
-            col_values[field] = arr.reshape(B, S)
+            col_values[field] = arr
 
-    if B == 0 or S == 0:
-        return empty_token_batch(B, S)
+    if N > 0:
+        col_values["sequence_id"] = np.repeat(np.arange(B, dtype=np.int64), step_counts)
+
+    if B == 0 or N == 0:
+        return empty_token_batch(B)
 
     return TokenBatch(
         token_types=np.asarray(tok_types, dtype=np.int64),
@@ -599,38 +516,7 @@ def _prepare_text(
         scalars=np.asarray(tok_scalars, dtype=np.float32),
         sequence_ids=np.asarray(seq_ids, dtype=np.int64),
         step_ids=np.asarray(step_ids, dtype=np.int64),
-        segment_ids=np.asarray(seg_ids, dtype=np.int64),
-        step_token_indices=step_token_indices,
+        prediction_indices=prediction_indices,
         col_values=col_values,
         B=B,
-        S=S,
     )
-
-
-class _VisionEmbedder(nn.Module):
-    """Minimal vision tower → ``[n, D]`` wrapper (legacy; TokenBatch prefers token ids)."""
-
-    def __init__(self, vision: nn.Module, projector: nn.Module | None, hidden_dim: int) -> None:
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        self.vision = vision
-        self.projector = projector
-
-    def load_from(self, model: nn.Module) -> None:
-        return
-
-    def forward(self, image: Any, processor: Any) -> torch.Tensor:
-        inputs = processor(images=image, return_tensors="pt")
-        pixel_values = inputs["pixel_values"].to(
-            device=next(self.vision.parameters()).device,
-            dtype=next(self.vision.parameters()).dtype,
-        )
-        out = self.vision(pixel_values=pixel_values)
-        feats = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
-        if self.projector is not None:
-            feats = self.projector(feats)
-        if feats.shape[-1] != self.hidden_dim:
-            raise ValueError(
-                f"vision features dim {feats.shape[-1]} != hidden_dim {self.hidden_dim}"
-            )
-        return feats.squeeze(0)

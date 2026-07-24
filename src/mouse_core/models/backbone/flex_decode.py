@@ -30,6 +30,8 @@ when the segment ends.
 
 from __future__ import annotations
 
+from typing import Any, cast
+
 import torch
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
@@ -86,22 +88,24 @@ class FlexDecodeSession:
     """
 
     def __init__(self, model: torch.nn.Module, batch_size: int, capacity: int = _BLOCK_SIZE) -> None:
-        if getattr(model.config, "use_sliding_window", False):
+        # HF decoder stacks are ``nn.Module``; pyright treats children as Tensor|Module.
+        hf = cast(Any, model)
+        if getattr(hf.config, "use_sliding_window", False):
             raise ValueError("FlexDecodeSession does not support sliding-window attention.")
-        self.model = model
-        cfg = model.config
+        self.model = hf
+        cfg = hf.config
         self.B = batch_size
         self.cap = _round_up(max(capacity, 1), _BLOCK_SIZE)
-        self.n_heads = cfg.num_attention_heads
-        self.n_kv_heads = cfg.num_key_value_heads
-        self.head_dim = cfg.head_dim
+        self.n_heads = int(cfg.num_attention_heads)
+        self.n_kv_heads = int(cfg.num_key_value_heads)
+        self.head_dim = int(cfg.head_dim)
 
-        param = next(model.parameters())
+        param = next(hf.parameters())
         self.device, self.dtype = param.device, param.dtype
         self._flex = _FlexKernel(self.device, self.dtype)
         self._compile_masks = _use_flex_compile(self.device, self.dtype)
 
-        n_layers = len(model.layers)
+        n_layers = len(hf.layers)
         self.k_cache = torch.zeros(
             n_layers, self.B, self.n_kv_heads, self.cap, self.head_dim,
             device=self.device, dtype=self.dtype,
@@ -149,9 +153,9 @@ class FlexDecodeSession:
     @torch.no_grad()
     def forward(
         self,
+        *,
         embeds: torch.Tensor,
         lengths: list[int],
-        *,
         output_hidden_states: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
         """Decode one chunk per sequence.

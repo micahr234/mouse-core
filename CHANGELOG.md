@@ -7,13 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+- ``DataLoader`` ``pack`` / ``pad`` flags and train-time ``segment_ids`` plumbing.
+  Packing/padding short windows and pack-seam isolation are gone (one public path).
+- ``TokenBatch.lengths``: per-sequence step counts are derived from
+  ``col_values["sequence_id"]`` + ``B`` via ``TokenBatch.step_counts()``
+  (``step_counts_from_sequence_id``).
+- Dead packing helpers (``pack_and_pad_rows``, ``pack_live_step_tokens``,
+  ``counts_from_prediction_indices``, …); only ``left_align_content`` remains.
+- Compat aliases / unused modules: ``DiscreteEmbedder``, ``RandomFourierFeatures``,
+  ``NormalizedPixel``, ``PosLinear`` / ``ScaledPosLinear``, ``build_heads``,
+  TextEmbedder vision-tower path, ``DataLoader.set_preparer``, and
+  ``_segment_*`` attention helpers.
+- Removed NumericEmbedder kwargs (``modality_fusion``, ``include_type_token``, …)
+  and unused ``ModalitySpec`` fields (``size``, ``in_min``, ``in_max``).
+
+### Changed
+- Public constructors and helpers are **keyword-only** (``def f(*, ...)`` / ``def m(self, *, ...)``):
+  ``Model``, encoders, backbones, objectives, ``DataLoader``, hub push/load helpers,
+  ``Model.head``, ``FlexDecodeSession.forward``, and related utilities. Call sites must
+  use keyword arguments (``Model(encoder=..., backbone=..., heads=...)``).
+  ``nn.Module.forward`` methods that are invoked via ``module(...)`` (e.g. ``Model.forward``,
+  head ``forward``) keep a leading positional tensor/batch argument so PyTorch's
+  ``__call__`` still works.
+- Training batches are **ragged**: ``sequence_length`` is a max window length;
+  each of ``B`` sequences is one contiguous store slice of length ``1 .. S_max``.
+  ``DataLoader.next_batch()`` with a preparer returns a ``TokenBatch``; without a
+  preparer it returns ``list[list[dict]]`` only (no ``segment_ids``).
+- ``step_token_indices`` renamed to ``prediction_indices`` (and
+  ``counts_from_step_token_indices`` → ``counts_from_prediction_indices``).
+- ``TokenBatch`` / ``Encoder.prepare``: variable per-sequence step counts; flat
+  ``prediction_indices`` ``[N]``, ``col_values`` ``[N]`` (+ ``sequence_id``).
+  No stored ``lengths`` / ``segment_ids`` fields.
+- ``Model.forward`` training path: predictions and ``objective_data`` are flat
+  ``TensorDict[N]`` (``N = len(prediction_indices)``). Flex / CPU document
+  attention masks by ``sequence_ids`` only (causal within sequence). Cached
+  decode stays rectangular ``[B, S]``.
+- Objectives (DQN / Layerwise / Vec / PPO / GRPO): flat ``x[:-1]`` / ``x[1:]`` with
+  valid pairs where ``sequence_id[i] == sequence_id[i+1]``.
+
 ### Fixed
-- Packed ``Model.forward`` no longer rebuilds step-level ``segment_id`` with a
-  ``B*S`` loop of ``eq`` / ``any`` / ``nonzero`` over the flat token stream
-  (thousands of tiny GPU ops + host syncs per step). It gathers from
-  ``segment_ids[step_token_indices]`` instead. Flex train / flat RoPE positions
-  use a sync-free ``cummax`` run reset (no ``.item()`` for run count). Embedder
-  type scatters skip host ``.any()`` checks.
+- Flex train / flat RoPE positions use a sync-free ``cummax`` run reset (no
+  ``.item()`` for run count). Embedder type scatters skip host ``.any()`` checks.
 
 ### Changed
 - CUDA training/inference examples use ``preferred_dtype(device)`` (``bfloat16`` on
@@ -24,26 +59,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of recreating ``torch.compile(flex_attention)`` every step.
 - Example notebooks: inference moved to ``09_inference.ipynb`` (was ``04``);
   layerwise / vec / text / PPO / GRPO training notebooks renumbered to ``04``–``08``.
-  All training notebooks periodically run greedy held-out eval on a separate
-  ``GroupEnv`` (seed stream offset by ``DEFAULT_EVAL_SEED_OFFSET``).
+  All training notebooks run greedy held-out eval on a separate ``GroupEnv``
+  (seed stream offset by ``EVAL_SEED_OFFSET``), with eval helpers defined locally
+  in each notebook.
+- All example notebooks build environments in a dedicated **Build Environment**
+  section immediately after imports (train and held-out eval envs together when
+  both are used).
+- Example notebook import / constant cells use one compact formatting style
+  (grouped imports, aligned trailing comments, no sparse blank lines).
+- Training example notebooks use a uniform cycle loop: ``NUM_CYCLES`` drives the
+  outer loop; ``run_train`` / ``run_eval`` / ``run_rollout`` each take
+  ``num_steps`` from ``TRAIN_STEPS`` / ``EVAL_STEPS`` / ``ROLLOUT_STEPS``.
+  Eval runs once per cycle (``EVAL_EVERY*`` schedules removed).
+  Each of ``run_eval`` / ``run_rollout`` is defined in its own notebook cell;
+  ``run_train`` shares a cell with optimizer / objective setup. Those helpers
+  are grouped together after model / buffer setup and immediately before the
+  outer ``## Run`` cycle loop.
+  ``run_eval`` / ``run_rollout`` leave the model in ``eval``; ``run_train``
+  calls ``model.train()``.
+- Offline training notebooks use the shared ``EPISODES_PER_TASK`` /
+  ``MAX_EPISODE_STEPS`` constants (removed ``EVAL_EPISODES_PER_TASK`` /
+  ``EVAL_MAX_EPISODE_STEPS``).
+- Example ``run_eval`` / ``run_rollout`` keep row **contexts** across cycle
+  calls and rebuild the **KV cache** from those contexts each call (cache does
+  not persist between calls).
 
 ### Added
-- ``mouse_core.task_eval``: ``make_procedural_frozenlake_group`` and
-  ``run_task_eval`` for held-out task-budget evaluation during training
-  (exported from ``mouse_core``).
 - ``preferred_dtype(device)``: returns ``torch.bfloat16`` on CUDA and
   ``torch.float32`` otherwise (exported from ``mouse_core.models``).
 - ``TokenBatch``: flat concatenated token stream (no padding) with parallel
   ``token_types`` / ``token_ids`` / ``scalars`` / ``sequence_ids`` / ``step_ids`` /
-  ``segment_ids`` / ``step_token_indices``. Built by ``Encoder.prepare`` /
-  ``make_preparer()`` and consumed by embedders and ``Model.forward``.
+  ``prediction_indices`` (step counts via ``sequence_id`` + ``B``). Built by
+  ``Encoder.prepare`` / ``make_preparer()`` and consumed by embedders and
+  ``Model.forward``.
 - ``StaticFourierFeatures``: deterministic log-spaced Fourier features (buffers
   only; no ``nn.Parameter``). One token per real scalar.
 - ``DataLoader(..., preparer=encoder.make_preparer())``: workers run
   sample → augment → prepare and return a ``TokenBatch``.
 - ``flex_packed_forward``: FlexAttention training over a packed flat sequence
-  masked by ``sequence_ids`` ∩ ``segment_ids`` (CUDA). CPU uses an equivalent
-  SDPA document mask (Flex has no backward on CPU).
+  masked by ``sequence_ids`` (CUDA). CPU uses an equivalent SDPA document mask
+  (Flex has no backward on CPU).
 - ``mouse_core.models.kv_policy``: grow-then-rebuild helpers
   (``resolve_cache_bounds``, ``rebuild_starts``, ``cache_needs_rebuild``) for
   cached inference. Examples ``03``, ``07``, and ``09`` use ``max_cache`` +
@@ -66,7 +121,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ``NumericEmbedder`` / ``TextEmbedder``: CPU ``prepare`` builds ``TokenBatch``;
   ``forward`` only does typed GPU embedding gathers / static Fourier →
   ``embeds [L, D]``. ``Model.forward`` accepts ``TokenBatch`` or raw steps
-  (online); pools to ``[B, S]`` via ``step_token_indices``.
+  (online); pools via ``prediction_indices`` to flat ``[N, D]`` (train) or
+  rectangular ``[B, S, D]`` (cached decode).
 - `DataLoader` background workers are now **threads** on free-threaded CPython
   (`3.14t`) so `num_workers > 1` uses multiple CPU cores while sharing the HF
   Dataset snapshot and prepared ``TokenBatch`` objects in-process (no
@@ -84,11 +140,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `examples/09_train_online_grpo.ipynb`: branched online GRPO — trunk growth, `deepcopy` env forks at many context lengths `L`, stochastic completions, group z-score advantages.
 - `PpoObjective`: clipped PPO with GAE over the same done-code discounts and pack-segment masking as the DQN family. Reads `predictions["action"]` (logits) and `predictions["value"]` (scalar V); optional `objective_data["old_log_prob"]` for multi-epoch updates (inject via `batch_field`). Helpers: `sample_discrete_action`, `batch_field`.
 - `examples/08_train_online_ppo.ipynb`: online on-policy PPO (`DiscreteActionHead` + scalar `value` head, stochastic rollouts with stored behavior log-probs).
-- `TextEmbedder`: step fields → pretrained embeddings via a whole-step ``format`` template plus modality kinds ``text`` (value → string via per-field ``format`` → tokenizer), ``token`` (integer id → single ``embed_tokens`` row), or ``image`` (vision span). No learnable scratch tokens (those remain ``NumericEmbedder``-only); heads read the last token of each step. ``col_values`` dtypes are inferred from the batch data. Optional `skip` omits that field's fragment/span (literals such as commas stay). Emits flat `[B, L, D]` embeds plus `step_token_indices`. See `examples/07_train_offline_text.ipynb`.
+- `TextEmbedder`: step fields → pretrained embeddings via a whole-step ``format`` template plus modality kinds ``text`` (value → string via per-field ``format`` → tokenizer), ``token`` (integer id → single ``embed_tokens`` row), or ``image`` (vision span). No learnable scratch tokens (those remain ``NumericEmbedder``-only); heads read the last token of each step. ``col_values`` dtypes are inferred from the batch data. Optional `skip` omits that field's fragment/span (literals such as commas stay). Emits flat `[B, L, D]` embeds plus `prediction_indices`. See `examples/07_train_offline_text.ipynb`.
 - `examples/07_train_offline_text.ipynb`: offline DQN with `TextEmbedder` (`token` action + `text` fields); documents `type: "image"` for vision-language checkpoints.
 
 ### Changed
-- `StepEmbedder` renamed to `NumericEmbedder` (no alias). Modality field `absent` renamed to `skip`: matching values omit that modality from the step's fusion instead of embedding a sentinel. Both `NumericEmbedder` and `TextEmbedder` pack variable-length per-step spans into flat `embeds [B, L, D]` with `step_token_indices [B, S]` (no fixed tokens-per-step / `[B, S, T, D]` axis). `Model` / Flex decode derive token counts and pad masks from indices only. `TextEmbedder` does not truncate per step (no `max_tokens_per_step`); sequence-length limits belong at the sequence / context level if needed.
+- `StepEmbedder` renamed to `NumericEmbedder` (no alias). Modality field `absent` renamed to `skip`: matching values omit that modality from the step's fusion instead of embedding a sentinel. Both `NumericEmbedder` and `TextEmbedder` pack variable-length per-step spans into flat `embeds [B, L, D]` with `prediction_indices [B, S]` (no fixed tokens-per-step / `[B, S, T, D]` axis). `Model` / Flex decode derive token counts and pad masks from indices only. `TextEmbedder` does not truncate per step (no `max_tokens_per_step`); sequence-length limits belong at the sequence / context level if needed.
 - `DataLoader` accepts ``pad=True`` as an alternative to ``pack=True`` (mutually exclusive). Short store suffixes are right-padded by repeating the last real row; each pad step gets a unique ``segment_id`` so attention/RoPE and TD objectives isolate pads the same way as pack seams. Short stores are allowed at construction when either ``pack`` or ``pad`` is set.
 - `DataLoader.next_batch()` now returns `(batch, segment_ids)` instead of injecting an `is_seam` flag into row dicts. With `pack=True`, `segment_ids` label which independently sampled pack slice each step came from (`0`, `1`, … within a sequence); with `pad=True`, the real suffix shares id `0` and each pad step gets its own id; with neither, every id is `0`. `Model.forward(..., segment_ids=...)` builds a same-segment causal attention mask, resets RoPE `position_ids` at each new segment, and places `segment_id` in `objective_data`. TD objectives (`DqnObjective`, `LayerwiseDqnObjective`, `VecDqnObjective`) exclude pairs whose adjacent steps have different `segment_id` values. Example notebooks updated (no `"is_seam"` in `keep_fields`).
 
@@ -196,7 +252,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Augmenter` now provides the public training-time augmentation path for raw `DataLoader` batches, configured by modality specs that use `field` plus an augmentation `type`. A modality `field` may name multiple fields to share the same sampled permutation and per-step mask decision, linear numeric fields use `scale_in_low`, `scale_out_low`, `scale_in_high`, and `scale_out_high` endpoint pairs to derive the reward/value affine transform, and `DataLoader(..., augmenter=augment)` runs augmentation inside the sampling path so worker processes can prepare augmented batches.
 - `StepEmbedder` modality specs may now use a tuple/list `field` to encode multiple raw fields with the same modality settings. Learnable scratch modalities no longer need a fake data field; use `{"type": "learnable", "tokens": N}`.
 - Notebook 01 now collects expert demonstrations using `q_star_source={"provider": "env_q_star"}` and a curriculum policy (`oracle_prob` 0 → 0.5 → 1.0 across three collection phases).
-- `Encoder.forward` now returns a third value `step_token_indices [B, S]` — the absolute flat-sequence position of the prediction token for each step. `Encoder.pool_step_reprs` now takes this tensor instead of `batch_size`, enabling future variable-token-count modalities without any change to the pooling logic.
+- `Encoder.forward` now returns a third value `prediction_indices [B, S]` — the absolute flat-sequence position of the prediction token for each step. `Encoder.pool_step_reprs` now takes this tensor instead of `batch_size`, enabling future variable-token-count modalities without any change to the pooling logic.
 
 ### Changed
 - `push_stores_to_hub(clear=True)` now replaces the full dataset repository contents instead of only clearing dataset shard/card files.

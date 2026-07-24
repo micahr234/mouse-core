@@ -38,37 +38,32 @@ class Encoder(nn.Module, ABC):
     @property
     @abstractmethod
     def tokens_per_step(self) -> int:
-        """Capacity hint; real layout comes from ``step_token_indices``."""
+        """Capacity hint; real layout comes from ``prediction_indices``."""
         ...
 
     @abstractmethod
-    def prepare(
-        self,
-        batch: list[list[dict]],
-        segment_ids: list[list[int]] | None = None,
-    ) -> TokenBatch:
-        """CPU: raw ``[B][S]`` steps → flat :class:`TokenBatch` (no padding)."""
+    def prepare(self, batch: list[list[dict]]) -> TokenBatch:
+        """CPU: ragged ``[B][len_b]`` steps → flat :class:`TokenBatch` (no padding)."""
         ...
 
     def make_preparer(self) -> Callable[..., TokenBatch]:
-        """Return a ``(batch, segment_ids=None) -> TokenBatch`` callable for workers."""
+        """Return a ``(batch) -> TokenBatch`` callable for workers."""
         return self.prepare
 
     @abstractmethod
     def forward(
         self, token_batch: TokenBatch
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor], torch.Tensor]:
-        """Embed ``TokenBatch`` → ``(embeds [L, D], col_values, step_token_indices [B, S])``."""
+        """Embed ``TokenBatch`` → ``(embeds [L, D], col_values, prediction_indices [N])``."""
         ...
 
     @abstractmethod
-    def pool_step_reprs(self, h: torch.Tensor, step_token_indices: torch.Tensor) -> torch.Tensor:
-        """Gather prediction tokens → ``[B, S, D]``.
+    def pool_step_reprs(self, h: torch.Tensor, prediction_indices: torch.Tensor) -> torch.Tensor:
+        """Gather prediction tokens → ``[N, D]`` (train) or ``[B, S, D]`` (decode).
 
         ``h`` is ``[L, D]`` (flat packed) or ``[B, L, D]`` (decode).
-        ``step_token_indices`` is ``[B, S]`` absolute indices into the token axis
-        of ``h`` (for flat ``[L, D]``, indices are in ``0 .. L-1`` and ``B`` is
-        recovered from the indices tensor shape).
+        Train: ``prediction_indices`` is ``[N]`` absolute indices into ``0 .. L-1``.
+        Decode: ``prediction_indices`` is ``[B, S]`` into the token axis of ``h``.
         """
         ...
 
@@ -89,10 +84,7 @@ class ModalitySpec:
     field: str | Sequence[str] | None = None
     vocab_size: int | None = None
     dim: int | None = None
-    size: int | None = None
     tokens: int | None = None
-    in_min: float | None = None
-    in_max: float | None = None
     std: float | None = None
     skip: Any = None
     required: bool = True
@@ -170,42 +162,15 @@ class NumericEmbedder(Encoder):
 
     def __init__(
         self,
+        *,
         hidden_dim: int,
         modalities: list[dict[str, Any] | ModalitySpec] | None = None,
-        *,
         fourier_min: float = 0.01,
         fourier_max: float = 10.0,
         std: float = 0.02,
         image_tokenizer: Callable[[Any], Sequence[int]] | None = None,
-        # Removed knobs (accepted only to fault clearly):
-        token_data_len: int | None = None,
-        modality_fusion: str | None = None,
-        include_type_token: bool | None = None,
-        type_embedding_std: float | None = None,
-        method: str | None = None,
     ) -> None:
         super().__init__()
-        if token_data_len is not None:
-            raise TypeError(
-                "token_data_len was removed; discrete/rff emit one token, "
-                "continuous emits one token per component, learnable uses tokens="
-            )
-        if modality_fusion is not None:
-            raise TypeError(
-                "modality_fusion was removed; tokens are always concatenated in "
-                "modality declaration order"
-            )
-        if include_type_token:
-            raise TypeError(
-                "include_type_token was removed; use distinct token_types "
-                "(embedding tables) instead"
-            )
-        if type_embedding_std is not None and include_type_token:
-            raise TypeError("type_embedding_std was removed with include_type_token")
-        if method is not None:
-            raise TypeError("per-modality method= was removed; reals use static Fourier only")
-        # include_type_token=False / type_embedding_std ignored (legacy call sites)
-
         self._hidden_dim = int(hidden_dim)
         self.fourier_min = float(fourier_min)
         self.fourier_max = float(fourier_max)
@@ -215,16 +180,12 @@ class NumericEmbedder(Encoder):
         raw = modalities or []
         self.modalities: list[ModalitySpec] = []
         for i, m in enumerate(raw):
-            spec = m if isinstance(m, ModalitySpec) else ModalitySpec(**{
-                k: v for k, v in m.items()
-                if k not in ("method", "include_type_token")  # removed knobs
-            })
+            spec = m if isinstance(m, ModalitySpec) else ModalitySpec(**m)
             self.modalities.extend(_expand_modality_spec(spec, fallback_field=f"__learnable_{i}"))
 
         if any(s.type == "image" for s in self.modalities) and image_tokenizer is None:
             raise TypeError(
-                "NumericEmbedder with type='image' modalities requires image_tokenizer=; "
-                "raw pixel embedding was removed"
+                "NumericEmbedder with type='image' modalities requires image_tokenizer="
             )
 
         self._meta: list[_ModalityMeta] = []
@@ -235,7 +196,7 @@ class NumericEmbedder(Encoder):
             assert isinstance(spec.field, str)
             k = spec.type
             if k == "discrete":
-                vs = int(spec.vocab_size or spec.size or 0)
+                vs = int(spec.vocab_size or 0)
                 if vs <= 0:
                     raise ValueError(f"discrete modality {spec.field!r} requires vocab_size=")
                 meta = _ModalityMeta(spec=spec, type_id=type_id, kind=_KIND_DISCRETE, vocab_size=vs)
@@ -243,7 +204,7 @@ class NumericEmbedder(Encoder):
                 self._meta.append(meta)
                 type_id += 1
             elif k in ("rff", "continuous"):
-                dim = 1 if k == "rff" else int(spec.dim or spec.size or 0)
+                dim = 1 if k == "rff" else int(spec.dim or 0)
                 if dim <= 0:
                     raise ValueError(f"continuous modality {spec.field!r} requires dim=")
                 max_freq_sets = max(max_freq_sets, dim)
@@ -289,9 +250,10 @@ class NumericEmbedder(Encoder):
             output_scale=rff_scale,
         )
         self._n_types = type_id
-        self._learnable_fields = {
-            m.spec.field for m in self._meta if m.kind == _KIND_LEARNABLE
-        }
+        self._learnable_fields: set[str] = set()
+        for m in self._meta:
+            if m.kind == _KIND_LEARNABLE and isinstance(m.spec.field, str):
+                self._learnable_fields.add(m.spec.field)
 
     @property
     def hidden_dim(self) -> int:
@@ -318,21 +280,14 @@ class NumericEmbedder(Encoder):
         image_tokenizer = self.image_tokenizer
         learnable_fields = set(self._learnable_fields)
 
-        def _prepare(
-            batch: list[list[dict]],
-            segment_ids: list[list[int]] | None = None,
-        ) -> TokenBatch:
-            return _prepare_numeric(batch, segment_ids, meta, image_tokenizer, learnable_fields)
+        def _prepare(batch: list[list[dict]]) -> TokenBatch:
+            return _prepare_numeric(batch, meta, image_tokenizer, learnable_fields)
 
         return _prepare
 
-    def prepare(
-        self,
-        batch: list[list[dict]],
-        segment_ids: list[list[int]] | None = None,
-    ) -> TokenBatch:
+    def prepare(self, batch: list[list[dict]]) -> TokenBatch:
         return _prepare_numeric(
-            batch, segment_ids, self._meta, self.image_tokenizer, self._learnable_fields
+            batch, self._meta, self.image_tokenizer, self._learnable_fields
         )
 
     def forward(
@@ -367,40 +322,31 @@ class NumericEmbedder(Encoder):
                 embeds[mask] = self.fourier(scalars[mask], ids[mask]).to(dtype=dtype)
 
         col_values = t["col_values"]
-        sti = t["step_token_indices"].view(token_batch.B, token_batch.S)
-        return embeds, col_values, sti
+        prediction_indices = t["prediction_indices"]
+        return embeds, col_values, prediction_indices
 
-    def pool_step_reprs(self, h: torch.Tensor, step_token_indices: torch.Tensor) -> torch.Tensor:
+    def pool_step_reprs(self, h: torch.Tensor, prediction_indices: torch.Tensor) -> torch.Tensor:
         D = self._hidden_dim
         if h.ndim == 2:
-            # Flat packed [L, D]
-            idx = step_token_indices.reshape(-1)
-            return h[idx].view(*step_token_indices.shape, D)
-        # [B, L, D] decode layout
-        B, S = step_token_indices.shape
-        idx = step_token_indices.unsqueeze(-1).expand(B, S, D)
+            # Flat packed [L, D]; prediction_indices [N]
+            return h[prediction_indices.reshape(-1)]
+        # [B, L, D] decode layout; prediction_indices [B, S]
+        B, S = prediction_indices.shape
+        idx = prediction_indices.unsqueeze(-1).expand(B, S, D)
         return h.gather(1, idx)
 
 
 def _prepare_numeric(
     batch: list[list[dict]],
-    segment_ids: list[list[int]] | None,
     meta: list[_ModalityMeta],
     image_tokenizer: Callable[[Any], Sequence[int]] | None,
     learnable_fields: set[str],
 ) -> TokenBatch:
     B = len(batch)
-    S = len(batch[0]) if B > 0 else 0
-    for b, rows in enumerate(batch):
-        if len(rows) != S:
-            raise ValueError(
-                f"all rows must have the same number of steps; row 0 has {S}, "
-                f"row {b} has {len(rows)}"
-            )
-    if segment_ids is None:
-        segment_ids = [[0] * S for _ in range(B)]
-    if len(segment_ids) != B:
-        raise ValueError("segment_ids batch size must match batch")
+    step_counts = np.asarray([len(rows) for rows in batch], dtype=np.int64)
+    N = int(step_counts.sum()) if B > 0 else 0
+    if B > 0 and (step_counts < 0).any():
+        raise ValueError("sequence step counts must be non-negative")
 
     # col_values accumulation
     non_learnable = [m for m in meta if m.kind != _KIND_LEARNABLE]
@@ -411,15 +357,12 @@ def _prepare_numeric(
     tok_scalars: list[float] = []
     seq_ids: list[int] = []
     step_ids: list[int] = []
-    seg_ids: list[int] = []
-    step_token_indices = np.zeros(B * S, dtype=np.int64)
+    prediction_indices = np.zeros(N, dtype=np.int64)
+    flat_step = 0
 
     for b in range(B):
-        if len(segment_ids[b]) != S:
-            raise ValueError(f"segment_ids[{b}] length must match S={S}")
-        for s in range(S):
+        for s in range(int(step_counts[b])):
             row = batch[b][s]
-            flat_step = b * S + s
             step_start = len(tok_types)
 
             for m in meta:
@@ -431,8 +374,7 @@ def _prepare_numeric(
                         tok_ids.append(i)
                         tok_scalars.append(0.0)
                         seq_ids.append(b)
-                        step_ids.append(flat_step)
-                        seg_ids.append(int(segment_ids[b][s]))
+                        step_ids.append(s)
                     continue
 
                 value = row.get(field)
@@ -454,8 +396,7 @@ def _prepare_numeric(
                     tok_ids.append(int(_unwrap_scalar(value)))
                     tok_scalars.append(0.0)
                     seq_ids.append(b)
-                    step_ids.append(flat_step)
-                    seg_ids.append(int(segment_ids[b][s]))
+                    step_ids.append(s)
                 elif m.kind == _KIND_FOURIER:
                     if m.dim == 1:
                         vals = [float(_unwrap_scalar(value))]
@@ -470,8 +411,7 @@ def _prepare_numeric(
                         tok_ids.append(i)  # freq bank index
                         tok_scalars.append(v)
                         seq_ids.append(b)
-                        step_ids.append(flat_step)
-                        seg_ids.append(int(segment_ids[b][s]))
+                        step_ids.append(s)
                 elif m.kind == _KIND_IMAGE:
                     if image_tokenizer is None:
                         raise RuntimeError("image_tokenizer is not configured")
@@ -483,8 +423,7 @@ def _prepare_numeric(
                         tok_ids.append(int(tid))
                         tok_scalars.append(0.0)
                         seq_ids.append(b)
-                        step_ids.append(flat_step)
-                        seg_ids.append(int(segment_ids[b][s]))
+                        step_ids.append(s)
 
             step_end = len(tok_types)
             if step_end == step_start:
@@ -492,9 +431,10 @@ def _prepare_numeric(
                     "step has no tokens after skips; ensure at least one modality "
                     "is present (e.g. add a learnable modality)"
                 )
-            step_token_indices[flat_step] = step_end - 1
+            prediction_indices[flat_step] = step_end - 1
+            flat_step += 1
 
-    # Build col_values [B, S] / [B, S, dim]
+    # Build col_values [N] / [N, dim]
     col_values: dict[str, np.ndarray] = {}
     for m in non_learnable:
         field = str(m.spec.field)
@@ -512,22 +452,28 @@ def _prepare_numeric(
                         else float(_unwrap_scalar(v))
                     )
             dtype = np.int64 if m.kind == _KIND_DISCRETE else np.float32
-            col_values[field] = np.asarray(out, dtype=dtype).reshape(B, S)
+            col_values[field] = np.asarray(out, dtype=dtype)
         elif m.kind == _KIND_FOURIER:
-            buf = np.zeros((B * S, m.dim), dtype=np.float32)
+            buf = np.zeros((N, m.dim), dtype=np.float32)
             for i, v in enumerate(values):
                 if v is None:
                     continue
                 a = np.asarray(v, dtype=np.float32).ravel()
                 d = min(a.size, m.dim)
                 buf[i, :d] = a[:d]
-            col_values[field] = buf.reshape(B, S, m.dim)
+            col_values[field] = buf
         elif m.kind == _KIND_IMAGE:
             # Store a placeholder int grid; objectives rarely need raw images.
-            col_values[field] = np.zeros((B, S), dtype=np.int64)
+            col_values[field] = np.zeros(N, dtype=np.int64)
 
-    if B == 0 or S == 0:
-        return empty_token_batch(B, S)
+    # Per-step sequence ownership for flat objectives.
+    if N > 0:
+        col_values["sequence_id"] = np.repeat(
+            np.arange(B, dtype=np.int64), step_counts
+        )
+
+    if B == 0 or N == 0:
+        return empty_token_batch(B)
 
     return TokenBatch(
         token_types=np.asarray(tok_types, dtype=np.int64),
@@ -535,18 +481,7 @@ def _prepare_numeric(
         scalars=np.asarray(tok_scalars, dtype=np.float32),
         sequence_ids=np.asarray(seq_ids, dtype=np.int64),
         step_ids=np.asarray(step_ids, dtype=np.int64),
-        segment_ids=np.asarray(seg_ids, dtype=np.int64),
-        step_token_indices=step_token_indices,
+        prediction_indices=prediction_indices,
         col_values=col_values,
         B=B,
-        S=S,
     )
-
-
-# Back-compat names removed from public use but some tests may import —
-# keep DiscreteEmbedder as a thin ScaledEmbedding alias for imports that break soft.
-class DiscreteEmbedder(ScaledEmbedding):
-    """Embedding table for discrete token ids (used internally / tests)."""
-
-    def __init__(self, vocab_size: int, hidden_dim: int, embedding_std: float = 0.02) -> None:
-        super().__init__(vocab_size, hidden_dim, scale=embedding_std)

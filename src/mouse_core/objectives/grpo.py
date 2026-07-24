@@ -11,8 +11,8 @@ from mouse_core.objectives.dqn import _valid_transitions
 
 
 def group_relative_advantages(
-    rewards: torch.Tensor,
     *,
+    rewards: torch.Tensor,
     eps: float = 1e-8,
 ) -> torch.Tensor:
     """Z-score rewards within one GRPO group.
@@ -52,7 +52,7 @@ class GrpoObjective(Objective):
 
     Requires a policy head only:
 
-    * ``predictions["action"]`` — ``[B, S, A]`` discrete policy logits
+    * ``predictions["action"]`` — ``[N, A]`` discrete policy logits
 
     Advantages are **not** estimated from a learned baseline. The caller
     computes them with :func:`group_relative_advantages` over a group of
@@ -65,15 +65,14 @@ class GrpoObjective(Objective):
             for row in rows:                     # or suffix-only
                 row["advantage"] = float(adv[g])
 
-        predictions, objective_data, _ = model(batch, segment_ids=segment_ids)
+        predictions, objective_data, _ = model(batch)
         objective_data["old_log_prob"] = batch_field(batch, "old_log_prob", ...)
         objective_data["advantage"] = batch_field(batch, "advantage", ...)
         loss, metrics = objective(objective_data, predictions)
 
     Timing matches :class:`~mouse_core.objectives.dqn.DqnObjective`: token
-    ``t`` is state ``s_t``; action / behavior log-prob / advantage at ``t+1``
-    describe the transition out of ``s_t``. Pack-mode ``segment_id`` seams
-    are excluded.
+    ``i`` is state ``s_i``; action / behavior log-prob / advantage at ``i+1``
+    describe the transition out of ``s_i``. Cross-sequence pairs are excluded.
 
     Args:
         clip_eps: PPO-style ratio clip ε.
@@ -111,12 +110,12 @@ class GrpoObjective(Objective):
     ) -> tuple[torch.Tensor, dict[str, float]]:
         logits: torch.Tensor = predictions[self.predictions_key]
 
-        if logits.ndim != 3:
+        if logits.ndim != 2:
             raise ValueError(
-                f"GRPO expects {self.predictions_key!r} logits shape [B, S, A], "
+                f"GRPO expects {self.predictions_key!r} logits shape [N, A], "
                 f"got {tuple(logits.shape)}."
             )
-        B, S, A = logits.shape
+        N, A = logits.shape
         device = logits.device
         dtype = logits.dtype
 
@@ -128,15 +127,15 @@ class GrpoObjective(Objective):
             logits = logits[..., : self.num_actions]
             A = self.num_actions
 
-        if S < 2:
-            raise ValueError("Not enough valid steps in data for GRPO (need S >= 2).")
+        if N < 2:
+            raise ValueError("Not enough valid steps in data for GRPO (need N >= 2).")
 
         action = objective_data[self.action_key]
         if action.dtype != torch.int64:
             raise TypeError(f"action must be int64, got {action.dtype}.")
-        if action.shape != torch.Size([B, S]):
+        if action.shape != torch.Size([N]):
             raise ValueError(
-                f"GRPO objective expects action shape [{B}, {S}], "
+                f"GRPO objective expects action shape [{N}], "
                 f"got {tuple(action.shape)}."
             )
 
@@ -147,17 +146,17 @@ class GrpoObjective(Objective):
                 "batch_field)."
             )
         advantage_full = objective_data[self.advantage_key]
-        if advantage_full.shape != torch.Size([B, S]):
+        if advantage_full.shape != torch.Size([N]):
             raise ValueError(
-                f"GRPO expects {self.advantage_key!r} shape [{B}, {S}], "
+                f"GRPO expects {self.advantage_key!r} shape [{N}], "
                 f"got {tuple(advantage_full.shape)}."
             )
-        advantage = advantage_full[:, 1:].to(dtype=dtype)
+        advantage = advantage_full[1:].to(dtype=dtype)
 
-        valid = _valid_transitions(objective_data, B, S, device)
+        valid = _valid_transitions(objective_data, N, device)
 
-        next_actions = action[:, 1:]
-        curr_logits = logits[:, :-1, :]
+        next_actions = action[1:]
+        curr_logits = logits[:-1, :]
 
         log_probs_all = F.log_softmax(curr_logits, dim=-1)
         new_log_prob = log_probs_all.gather(
@@ -166,12 +165,12 @@ class GrpoObjective(Objective):
 
         if self.old_log_prob_key in objective_data.keys():
             old_log_prob_full = objective_data[self.old_log_prob_key]
-            if old_log_prob_full.shape != torch.Size([B, S]):
+            if old_log_prob_full.shape != torch.Size([N]):
                 raise ValueError(
-                    f"GRPO expects {self.old_log_prob_key!r} shape [{B}, {S}], "
+                    f"GRPO expects {self.old_log_prob_key!r} shape [{N}], "
                     f"got {tuple(old_log_prob_full.shape)}."
                 )
-            old_log_prob = old_log_prob_full[:, 1:].to(dtype=dtype)
+            old_log_prob = old_log_prob_full[1:].to(dtype=dtype)
         else:
             old_log_prob = new_log_prob.detach()
 

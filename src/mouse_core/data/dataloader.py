@@ -1,11 +1,12 @@
-"""DataLoader — sample steps, optionally augment, then build a TokenBatch.
+"""DataLoader — sample ragged windows, optionally augment, then build a TokenBatch.
 
 A ``Datastore`` is a flat sequence of arbitrary rows. The loader samples
-contiguous windows of ``S`` steps for ``B`` sequences, runs an optional
-augmenter on the raw ``[B][S]`` dicts, then calls an encoder ``preparer`` to
-produce a flat concatenated :class:`~mouse_core.models.embedding.token_batch.TokenBatch`
-(no padding). Workers run sample → augment → prepare so the training process
-mostly feeds the GPU.
+``B`` sequences, each a contiguous store window of length ``1 .. sequence_length``
+(a max), runs an optional augmenter on the raw ``[B][len_b]`` dicts, then calls
+an encoder ``preparer`` to produce a flat concatenated
+:class:`~mouse_core.models.embedding.token_batch.TokenBatch` (no padding).
+Workers run sample → augment → prepare so the training process mostly feeds
+the GPU.
 
 Usage
 -----
@@ -39,7 +40,7 @@ if TYPE_CHECKING:
 
 
 BatchAugmenter = Callable[[list[list[dict]]], list[list[dict]]]
-BatchPreparer = Callable[..., Any]  # (batch, segment_ids) -> TokenBatch
+BatchPreparer = Callable[[list[list[dict]]], Any]  # batch -> TokenBatch
 
 _FREE_THREADING_HINT = (
     "DataLoader(num_workers>0) requires a free-threaded CPython build with the "
@@ -68,60 +69,28 @@ class _SnapshotConfig:
     probs: np.ndarray
     sequence_length: int
     batch_size: int
-    pack: bool
-    pad: bool
 
 
 def _fetch_sequence(
     cfg: _SnapshotConfig,
     rng: np.random.Generator,
-) -> tuple[list[dict], list[int]]:
-    """Fetch exactly ``sequence_length`` steps and their segment IDs."""
+) -> list[dict]:
+    """Fetch one contiguous window of length ``1 .. sequence_length``."""
     if sum(cfg.ns) == 0:
         raise ValueError("Cannot sample batches: all stores are empty.")
 
-    S = cfg.sequence_length
-    steps: list[dict] = []
-    segment_ids: list[int] = []
-    seg = 0
+    S_max = cfg.sequence_length
+    store_idx = int(rng.choice(len(cfg.datasets), p=cfg.probs))
+    ds = cfg.datasets[store_idx]
+    n = cfg.ns[store_idx]
+    if n < 1:
+        raise ValueError("Cannot sample from an empty store.")
 
-    while len(steps) < S:
-        store_idx = int(rng.choice(len(cfg.datasets), p=cfg.probs))
-        ds = cfg.datasets[store_idx]
-        n = cfg.ns[store_idx]
-
-        if cfg.pack or cfg.pad:
-            start = int(rng.integers(0, n))
-        else:
-            start = int(rng.integers(0, n - S + 1))
-
-        end = min(start + (S - len(steps)), n)
-        hf_slice = ds[start:end]
-        count = end - start
-        steps.extend({k: hf_slice[k][i] for k in hf_slice} for i in range(count))
-        segment_ids.extend([seg] * count)
-
-        if cfg.pad:
-            # One real slice, then right-pad; do not stitch further segments.
-            break
-
-        if not cfg.pack:
-            # Without packing the single slice is always full; exit immediately.
-            break
-
-        seg += 1
-
-    if cfg.pad and len(steps) < S:
-        if not steps:
-            raise ValueError("Cannot pad an empty sequence: sampled zero real steps.")
-        pad_row = dict(steps[-1])
-        next_seg = seg + 1
-        while len(steps) < S:
-            steps.append(dict(pad_row))
-            segment_ids.append(next_seg)
-            next_seg += 1
-
-    return steps[:S], segment_ids[:S]
+    start = int(rng.integers(0, n))
+    end = min(start + S_max, n)
+    hf_slice = ds[start:end]
+    count = end - start
+    return [{k: hf_slice[k][i] for k in hf_slice} for i in range(count)]
 
 
 def _fetch_one_batch(
@@ -130,14 +99,12 @@ def _fetch_one_batch(
     augmenter: BatchAugmenter | None,
     preparer: BatchPreparer | None,
 ) -> Any:
-    pairs = [_fetch_sequence(cfg, rng) for _ in range(cfg.batch_size)]
-    batch = [steps for steps, _ in pairs]
-    segment_ids = [ids for _, ids in pairs]
+    batch = [_fetch_sequence(cfg, rng) for _ in range(cfg.batch_size)]
     if augmenter is not None:
         batch = augmenter(batch)
     if preparer is None:
-        return batch, segment_ids
-    return preparer(batch, segment_ids)
+        return batch
+    return preparer(batch)
 
 
 def _worker_loop(
@@ -167,7 +134,7 @@ def _worker_loop(
             return
 
 
-def _fork_augmenter(augmenter: BatchAugmenter | None, *, seed: int | None) -> BatchAugmenter | None:
+def _fork_augmenter(*, augmenter: BatchAugmenter | None, seed: int | None) -> BatchAugmenter | None:
     if augmenter is None:
         return None
     fork = getattr(augmenter, "fork", None)
@@ -177,13 +144,12 @@ def _fork_augmenter(augmenter: BatchAugmenter | None, *, seed: int | None) -> Ba
 
 
 class DataLoader:
-    """Produces batches of raw step records plus per-step segment IDs.
+    """Produces ragged batches of raw step records (or a prepared TokenBatch).
 
     Each store holds a flat sequence of arbitrary rows. The loader samples
-    contiguous windows and returns them as Python dicts without any encoding.
-    Columns are untouched; the model's encoder decides what to extract and
-    how to tensorize it. Segment IDs are returned separately from the row
-    dicts and label which independently sampled pack slice each step came from.
+    contiguous windows up to ``sequence_length`` steps and returns them as
+    Python dicts without any encoding. Columns are untouched; the model's
+    encoder decides what to extract and how to tensorize it.
 
     When multiple stores are provided, each sequence in a batch independently
     draws its store according to the computed per-store probabilities, giving
@@ -201,9 +167,11 @@ class DataLoader:
         Call :meth:`refresh` after appending new rows so sampling sees the
         latest data.
     sequence_length :
-        Length of each contiguous slice (in steps).
+        Maximum length of each contiguous window (in steps). Each sampled
+        sequence has length ``1 .. sequence_length`` depending on where it
+        starts in the store.
     batch_size :
-        How many such slices per batch.
+        How many such windows per batch.
     weights :
         One positive float per store controlling the relative probability of
         drawing from each store. ``None`` means uniform. Interpreted
@@ -219,32 +187,6 @@ class DataLoader:
         ``weight[i] * len(store_i)``.  Larger stores are drawn more often;
         ``weights`` act as multipliers on top of the size-proportional
         baseline.
-    pack :
-        If ``True``, a sequence can start at any position in a store,
-        including the last few steps. When the initial window is shorter than
-        ``sequence_length``, additional independently-sampled segments (drawn
-        from the same store distribution) are appended until the sequence is
-        full. ``next_batch`` returns parallel ``segment_ids``: within each
-        sequence the first pack slice is ``0``, the next ``1``, and so on.
-        The model uses these IDs for attention/RoPE isolation and TD
-        objectives skip pairs whose adjacent steps have different IDs. Empty
-        stores are allowed at construction and on :meth:`refresh`;
-        :meth:`next_batch` raises if every store is still empty. Mutually
-        exclusive with ``pad``.
-    pad :
-        If ``True``, a sequence can start at any position in a store. When the
-        remaining suffix is shorter than ``sequence_length``, the window is
-        right-padded by repeating the last real row until length ``S``. Each
-        padded step gets its own ``segment_id`` (continuing after the real
-        slice's id) so attention/RoPE isolate pads and TD objectives skip
-        pad transitions. Empty stores are allowed at construction and on
-        :meth:`refresh`; :meth:`next_batch` raises if every store is still
-        empty. Mutually exclusive with ``pack``.
-
-        If both ``pack`` and ``pad`` are ``False`` (default), every sequence
-        comes from a single in-store window of exactly ``sequence_length``
-        steps (all ``segment_ids`` are ``0``); stores shorter than
-        ``sequence_length`` are rejected at construction.
     prefetch :
         How many batches to keep pre-fetched in the background queue.
     num_workers :
@@ -260,27 +202,25 @@ class DataLoader:
         Each :meth:`refresh` that restarts workers draws a fresh spawn wave
         from the same ``SeedSequence`` so streams do not replay after refresh.
     augmenter :
-        Optional callable applied to each sampled raw ``[B][S]`` batch **before**
-        the preparer. With background workers, augmentation runs in the worker.
-        If the callable exposes ``fork(seed=...)``, each worker receives an
-        independent copy with its own RNG.
+        Optional callable applied to each sampled raw ``[B][len_b]`` batch
+        **before** the preparer. With background workers, augmentation runs
+        in the worker. If the callable exposes ``fork(seed=...)``, each
+        worker receives an independent copy with its own RNG.
     preparer :
-        Callable ``(batch, segment_ids) -> TokenBatch`` from
-        ``encoder.make_preparer()``. Required for training: turns raw steps into
-        a flat concatenated token stream. When ``None``, :meth:`next_batch`
-        returns ``(batch, segment_ids)`` for debugging only.
+        Callable ``(batch) -> TokenBatch`` from ``encoder.make_preparer()``.
+        Required for training: turns raw steps into a flat concatenated token
+        stream. When ``None``, :meth:`next_batch` returns the raw
+        ``list[list[dict]]`` for debugging only.
     """
 
     def __init__(
         self,
+        *,
         stores: Datastore | list[Datastore],
         sequence_length: int,
         batch_size: int,
-        *,
         weights: list[float] | None = None,
         weight_mode: str = "per_store",
-        pack: bool = False,
-        pad: bool = False,
         prefetch: int = 4,
         num_workers: int = 1,
         seed: int | None = None,
@@ -303,8 +243,8 @@ class DataLoader:
             raise TypeError("DataLoader requires a Datastore or a non-empty list of Datastores.")
         if weight_mode not in ("per_store", "per_step"):
             raise ValueError(f"weight_mode must be 'per_store' or 'per_step', got {weight_mode!r}")
-        if pack and pad:
-            raise ValueError("pack and pad are mutually exclusive; set at most one of them.")
+        if sequence_length < 1:
+            raise ValueError(f"sequence_length must be >= 1, got {sequence_length}.")
         if weights is not None:
             if len(weights) != len(stores):
                 raise ValueError(
@@ -321,8 +261,6 @@ class DataLoader:
         self.sequence_length = sequence_length
         self.batch_size = batch_size
         self.weight_mode = weight_mode
-        self.pack = pack
-        self.pad = pad
         self.seed = seed
         self.augmenter = augmenter
         self.preparer = preparer
@@ -354,7 +292,7 @@ class DataLoader:
 
     @property
     def total_batches(self) -> int:
-        """Approximate total non-overlapping windows across all stores."""
+        """Approximate total non-overlapping max-windows across all stores."""
         total_windows = sum(n // self.sequence_length for n in self._ns)
         return max(0, (total_windows + self.batch_size - 1) // self.batch_size)
 
@@ -373,21 +311,12 @@ class DataLoader:
         if self._num_workers > 0:
             self._start_workers()
 
-    def set_preparer(self, preparer: BatchPreparer | None) -> None:
-        """Attach or replace the encoder preparer (restarts workers if needed)."""
-        self.preparer = preparer
-        if self._num_workers == 0:
-            self._sync_preparer = preparer
-            return
-        self._stop_workers()
-        self._start_workers()
-
     def next_batch(self) -> Any:
         """Return the next :class:`TokenBatch` (or raw batch if no preparer).
 
         With ``preparer=`` (normal training), returns a flat concatenated
-        ``TokenBatch``. Without a preparer, returns ``(batch, segment_ids)`` as
-        ``list[list[dict]]`` / ``list[list[int]]`` for debugging.
+        ``TokenBatch``. Without a preparer, returns ``list[list[dict]]`` for
+        debugging.
         """
         if self._sync_rng is not None:
             cfg = self._snapshot_config()
@@ -427,8 +356,8 @@ class DataLoader:
             f"{s.name or '?'}({n})" for s, n in zip(self.stores, self._ns)
         )
         return (
-            f"DataLoader(stores=[{store_info}], S={self.sequence_length}, "
-            f"B={self.batch_size}, pack={self.pack}, pad={self.pad}, seed={self.seed})"
+            f"DataLoader(stores=[{store_info}], S_max={self.sequence_length}, "
+            f"B={self.batch_size}, seed={self.seed})"
         )
 
     # ------------------------------------------------------------------
@@ -442,8 +371,6 @@ class DataLoader:
             probs=self._probs.copy(),
             sequence_length=self.sequence_length,
             batch_size=self.batch_size,
-            pack=self.pack,
-            pad=self.pad,
         )
 
     def _worker_seeds(self) -> tuple[list[Any], list[int | None]]:
@@ -478,7 +405,7 @@ class DataLoader:
                     self._stop,
                     cfg,
                     sample_seeds[i],
-                    _fork_augmenter(self.augmenter, seed=augment_seeds[i]),
+                    _fork_augmenter(seed=augment_seeds[i], augmenter=self.augmenter),
                     self.preparer,
                 ),
                 daemon=True,
@@ -509,22 +436,13 @@ class DataLoader:
         self._datasets = [s.to_dataset() for s in self.stores]
         self._ns = [len(ds) for ds in self._datasets]
 
-        allow_short = self.pack or self.pad
-        if not allow_short:
-            for i, (n, s) in enumerate(zip(self._ns, self.stores)):
-                if n == 0:
-                    raise ValueError(f"Store {i} ({s!r}) is empty.")
-                if n < self.sequence_length:
-                    name = s.name or f"index {i}"
-                    raise ValueError(
-                        f"Store {name!r} has {n} steps but sequence_length={self.sequence_length}. "
-                        "Use pack=True or pad=True to allow shorter stores."
-                    )
+        # Allow stores shorter than sequence_length; only reject if all empty
+        # when sampling. Zero-length stores get zero draw probability.
         w = self._weights.copy()
         ns = np.array(self._ns, dtype=float)
         if self.weight_mode == "per_step":
             w = w * ns
-        elif allow_short:
+        else:
             w = w * (ns > 0)
         if w.sum() == 0:
             self._probs = np.ones(len(self.stores)) / len(self.stores)

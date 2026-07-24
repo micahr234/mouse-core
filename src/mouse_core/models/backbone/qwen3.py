@@ -118,8 +118,8 @@ class Qwen3Backbone(Backbone):
 
     def __init__(
         self,
-        model: Qwen3Model | None = None,
         *,
+        model: Qwen3Model | None = None,
         hidden_dim: int | None = None,
         pretrained: str | Path | None = None,
         load_weights: bool = True,
@@ -143,7 +143,7 @@ class Qwen3Backbone(Backbone):
         if pretrained is not None:
             hf_kwargs = hub_kwargs or {}
             extracted_kwargs, extracted_hidden_dim = self._config_from_pretrained(
-                pretrained,
+                repo_id_or_path=pretrained,
                 hub_kwargs=hf_kwargs,
                 overrides=config_kwargs,
             )
@@ -155,7 +155,9 @@ class Qwen3Backbone(Backbone):
             self.model = _Qwen3BackboneConfig(**extracted_kwargs).build(extracted_hidden_dim)
             self._config_kwargs = dict(extracted_kwargs)
             if load_weights:
-                self._load_pretrained_weights(pretrained, hub_kwargs=hf_kwargs)
+                self._load_pretrained_weights(
+                    repo_id_or_path=pretrained, hub_kwargs=hf_kwargs
+                )
             return
 
         if hidden_dim is None:
@@ -170,8 +172,8 @@ class Qwen3Backbone(Backbone):
 
     @staticmethod
     def _config_from_pretrained(
-        repo_id_or_path: str | Path,
         *,
+        repo_id_or_path: str | Path,
         hub_kwargs: dict[str, Any],
         overrides: dict[str, Any],
     ) -> tuple[dict[str, Any], int]:
@@ -220,15 +222,11 @@ class Qwen3Backbone(Backbone):
 
     def _load_pretrained_weights(
         self,
-        repo_id_or_path: str | Path,
         *,
+        repo_id_or_path: str | Path,
         hub_kwargs: dict[str, Any],
     ) -> None:
-        _load_transformer_weights(
-            self.model,
-            repo_id_or_path,
-            hub_kwargs=hub_kwargs,
-        )
+        _load_transformer_weights(hub_kwargs=hub_kwargs, model=self.model, repo_id_or_path=repo_id_or_path)
 
     @property
     def hidden_dim(self) -> int:

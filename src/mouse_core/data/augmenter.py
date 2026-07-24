@@ -3,7 +3,7 @@
 ``Augmenter`` runs on the raw ``list[list[dict]]`` half of a DataLoader fetch
 (before the encoder ``preparer`` builds a ``TokenBatch``). It operates on raw
 step dicts and samples augmentation parameters independently for each sequence;
-parallel ``segment_ids`` are left unchanged.
+parallel sequence lengths are left unchanged (ragged windows).
 """
 
 from __future__ import annotations
@@ -185,8 +185,8 @@ class Augmenter:
 
     def __init__(
         self,
-        modalities: Sequence[Mapping[str, Any] | SequenceAugmentModalitySpec],
         *,
+        modalities: Sequence[Mapping[str, Any] | SequenceAugmentModalitySpec],
         enabled: bool = True,
         seed: int | None = None,
         generator: np.random.Generator | None = None,
@@ -224,13 +224,7 @@ class Augmenter:
     ) -> Augmenter:
         """Create an equivalent augmenter with independent RNG state."""
 
-        return Augmenter(
-            self.modalities,
-            enabled=self.enabled,
-            seed=seed,
-            generator=generator,
-            keep_fields=self.keep_fields,
-        )
+        return Augmenter(enabled=self.enabled, seed=seed, generator=generator, keep_fields=self.keep_fields, modalities=self.modalities)
 
     def _augment_sequence(self, sequence: list[dict]) -> list[dict]:
         rows = [dict(row) for row in sequence]

@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from tensordict import TensorDict
 
 from mouse_core.models.embedding.embedding import Encoder
+from mouse_core.models.backbone.base import Backbone
 from mouse_core.models.heads.base import BaseHead
 from mouse_core.models.heads.discrete_action import DiscreteActionHead
 from mouse_core.models.heads.dqn import DiscreteActionValueHead
@@ -49,92 +50,6 @@ def _hub_repo_id_for_user(repo_id: str, token: str | bool | None = None) -> str:
     return f"{user}/{repo_id}"
 
 
-def _expand_segment_ids_to_tokens(
-    segment_ids: torch.Tensor,
-    counts: torch.Tensor,
-) -> torch.Tensor:
-    """Expand step-level segment IDs ``[B, S]`` by per-step token counts ``[B, S]``.
-
-    Result is ``[B, L]`` (batch-padded with ``-1`` for unused trailing slots).
-    """
-    from mouse_core.models.embedding.packing import expand_segment_ids
-
-    return expand_segment_ids(segment_ids, counts)
-
-
-def _segment_causal_attention_mask(
-    segment_token_ids: torch.Tensor,
-    *,
-    dtype: torch.dtype,
-    token_mask: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Additive 4D mask ``[B, 1, L, L]``: causal and same-segment only.
-
-    Allowed positions are ``0.0``; blocked positions are a large negative value
-    compatible with HuggingFace SDPA / float attention masks.
-
-    When ``token_mask`` is provided (``[B, L]`` bool, True = real token), pad
-    positions neither attend nor are attended to. Segment id ``-1`` (batch pad)
-    is also treated as non-attending.
-    """
-    # segment_token_ids: [B, L]
-    B, L = segment_token_ids.shape
-    device = segment_token_ids.device
-    q = torch.arange(L, device=device).view(1, L, 1)
-    k = torch.arange(L, device=device).view(1, 1, L)
-    causal = k <= q
-    real_seg = segment_token_ids >= 0
-    same_segment = (
-        (segment_token_ids.unsqueeze(2) == segment_token_ids.unsqueeze(1))
-        & real_seg.unsqueeze(2)
-        & real_seg.unsqueeze(1)
-    )
-    allowed = causal & same_segment  # [B, L, L]
-    if token_mask is not None:
-        if token_mask.shape != (B, L):
-            raise ValueError(
-                f"token_mask must have shape [{B}, {L}], got {tuple(token_mask.shape)}"
-            )
-        allowed = allowed & token_mask.unsqueeze(2) & token_mask.unsqueeze(1)
-    neg = torch.finfo(dtype).min
-    mask = torch.zeros(B, 1, L, L, device=device, dtype=dtype)
-    mask = mask.masked_fill(~allowed.unsqueeze(1), neg)
-    return mask
-
-
-def _segment_position_ids(
-    segment_token_ids: torch.Tensor,
-    *,
-    token_mask: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """RoPE position ids ``[B, L]`` reset to 0 at each segment boundary.
-
-    Pad tokens (``token_mask`` False or segment id ``-1``) keep position 0 and
-    are masked out of attention separately.
-    """
-    B, L = segment_token_ids.shape
-    if L == 0:
-        return torch.zeros(B, 0, dtype=torch.long, device=segment_token_ids.device)
-    real = segment_token_ids >= 0
-    if token_mask is not None:
-        real = real & token_mask
-    # Sentinel prev id so the first real token is always treated as a segment start.
-    prev = torch.cat(
-        [
-            segment_token_ids.new_full((B, 1), -1),
-            segment_token_ids[:, :-1],
-        ],
-        dim=1,
-    )
-    new_seg = (segment_token_ids != prev) & real
-    idx = torch.arange(L, device=segment_token_ids.device).view(1, L).expand(B, -1)
-    markers = torch.where(new_seg, idx, torch.full_like(idx, -1))
-    # Only accumulate starts on real tokens; pads keep markers at -1 until a real start.
-    last_start = markers.cummax(dim=1).values.clamp(min=0)
-    pos = (idx - last_start).to(torch.long)
-    return torch.where(real, pos, torch.zeros_like(pos))
-
-
 def save_model(model: "Model", path: str | Path) -> None:
     """Save a MOUSE model to a local directory.
 
@@ -159,9 +74,9 @@ def save_model(model: "Model", path: str | Path) -> None:
 
 
 def push_model_to_hub(
+    *,
     model: "Model",
     repo_id: str,
-    *,
     commit_message: str = "Upload MOUSE model",
     private: bool = False,
     clear: bool = False,
@@ -187,7 +102,7 @@ def push_model_to_hub(
 
     Example::
 
-        url = push_model_to_hub(model, "my-model", clear=True)
+        url = push_model_to_hub(model=model, repo_id="my-model", clear=True)
         print(url)
     """
     from huggingface_hub import HfApi
@@ -213,7 +128,7 @@ def push_model_to_hub(
             )
     with tempfile.TemporaryDirectory() as tmp:
         save_model(model, tmp)
-        _write_model_card(model, Path(tmp) / "README.md", repo_id=hub_repo_id)
+        _write_model_card(repo_id=hub_repo_id, model=model, path=Path(tmp) / 'README.md')
         api.upload_folder(
             repo_id=hub_repo_id,
             folder_path=tmp,
@@ -223,7 +138,12 @@ def push_model_to_hub(
     return str(repo_url)
 
 
-def _write_model_card(model: "Model", path: Path, *, repo_id: str) -> None:
+def _write_model_card(
+    *,
+    model: "Model",
+    path: Path,
+    repo_id: str,
+) -> None:
     config = _model_config(model)
     heads = config["heads"]["heads"]
     head_names = ", ".join(head["name"] for head in heads) or "none"
@@ -312,7 +232,6 @@ def _model_card_modality_table(modalities: list[dict[str, Any]]) -> str:
         field = str(modality.get("field", ""))
         modality_type = str(modality["type"])
         required = bool(modality.get("required", True))
-        allow_none = bool(modality.get("allow_none", False))
         rows.append(
             "| "
             + " | ".join([
@@ -321,7 +240,7 @@ def _model_card_modality_table(modalities: list[dict[str, Any]]) -> str:
                 "yes" if required else "no",
                 f"`{_model_card_modality_shape(modality)}`",
                 f"`{_model_card_modality_dtype(modality)}`",
-                _model_card_modality_notes(modality, allow_none=allow_none),
+                _model_card_modality_notes(modality),
             ])
             + " |"
         )
@@ -331,7 +250,7 @@ def _model_card_modality_table(modalities: list[dict[str, Any]]) -> str:
 def _model_card_modality_shape(modality: dict[str, Any]) -> str:
     modality_type = modality["type"]
     if modality_type in ("continuous", "image"):
-        dim = modality.get("dim") or modality.get("size") or "D"
+        dim = modality.get("dim") or "D"
         return f"[B, S, {dim}]"
     if modality_type == "learnable":
         return "not read from step_stream"
@@ -343,17 +262,17 @@ def _model_card_modality_dtype(modality: dict[str, Any]) -> str:
     if modality_type == "discrete":
         return "torch.long"
     if modality_type == "image":
-        return "torch.long or torch.float32"
+        return "torch.long"
     if modality_type == "learnable":
         return "n/a"
     return "torch.float32"
 
 
-def _model_card_modality_notes(modality: dict[str, Any], *, allow_none: bool) -> str:
+def _model_card_modality_notes(modality: dict[str, Any]) -> str:
     modality_type = modality["type"]
     parts: list[str] = []
     if modality_type == "discrete":
-        vocab_size = modality.get("vocab_size") or modality.get("size")
+        vocab_size = modality.get("vocab_size")
         if vocab_size is not None:
             parts.append(f"integer ids in `[0, {int(vocab_size) - 1}]`")
     elif modality_type == "rff":
@@ -361,11 +280,9 @@ def _model_card_modality_notes(modality: dict[str, Any], *, allow_none: bool) ->
     elif modality_type == "continuous":
         parts.append("vector values")
     elif modality_type == "image":
-        parts.append("pixel or patch values")
+        parts.append("token ids from an image tokenizer")
     elif modality_type == "learnable":
         parts.append("learned tokens; no input field")
-    if allow_none:
-        parts.append("`None` uses default value")
     return "; ".join(parts) or "-"
 
 
@@ -396,11 +313,10 @@ def _model_card_field_example(modality: dict[str, Any]) -> str:
     if modality_type == "rff":
         return f'"{field}": 0.0,{optional}'
     if modality_type == "continuous":
-        dim = int(modality.get("dim") or modality.get("size") or 1)
+        dim = int(modality.get("dim") or 1)
         return f'"{field}": [0.0] * {dim},{optional}'
     if modality_type == "image":
-        dim = int(modality.get("dim") or modality.get("size") or 1)
-        return f'"{field}": [0] * {dim},{optional}'
+        return f'"{field}": [0, 1, 2],{optional}'  # example token ids
     return f'"{field}": 0,{optional}'
 
 
@@ -449,8 +365,6 @@ def _public_modality_config(modality: Any) -> dict[str, Any]:
     data = _drop_none(asdict(modality))
     if data.get("type") == "learnable" and str(data.get("field", "")).startswith("__learnable_"):
         data.pop("field", None)
-    for dead in ("method", "include_type_token", "allow_none"):
-        data.pop(dead, None)
     return data
 
 
@@ -627,34 +541,16 @@ def _build_encoder_from_config(config: dict[str, Any]) -> Encoder:
     if enc_type == "numeric":
         from mouse_core.models.embedding import NumericEmbedder
 
-        kwargs = dict(config["kwargs"])
-        for dead in (
-            "token_data_len",
-            "modality_fusion",
-            "include_type_token",
-            "type_embedding_std",
-            "method",
-        ):
-            kwargs.pop(dead, None)
-        # Drop removed modality keys
-        mods = []
-        for m in kwargs.get("modalities", []):
-            m = dict(m)
-            for dead in ("method", "include_type_token", "allow_none"):
-                m.pop(dead, None)
-            mods.append(m)
-        kwargs["modalities"] = mods
-        return NumericEmbedder(**kwargs)
+        return NumericEmbedder(**config["kwargs"])
     if enc_type == "text":
         from mouse_core.models.embedding import TextEmbedder
 
-        kwargs = dict(config["kwargs"])
         # image_processor / tokenizer are not serialized; reload from pretrained.
-        return TextEmbedder(**kwargs)
+        return TextEmbedder(**config["kwargs"])
     raise ValueError(f"Unsupported encoder type {enc_type!r}.")
 
 
-def _build_backbone_from_config(config: dict[str, Any]) -> nn.Module:
+def _build_backbone_from_config(config: dict[str, Any]) -> Backbone:
     backbone_type = config.get("type")
     if backbone_type == "identity":
         from mouse_core.models.backbone import IdentityBackbone
@@ -853,7 +749,7 @@ class Model(nn.Module):
         self,
         *,
         encoder: Encoder,
-        backbone: nn.Module,
+        backbone: Backbone,
         heads: BaseHead | list[BaseHead] | Mapping[str, BaseHead | None] | None = None,
         action_head: str | None = None,
     ):
@@ -880,7 +776,7 @@ class Model(nn.Module):
             )
 
         self.encoder: Encoder = encoder
-        self.backbone: nn.Module = backbone
+        self.backbone: Backbone = backbone
 
         if heads is None:
             raise TypeError("Model requires heads (a BaseHead, list of heads, or dict of named heads).")
@@ -973,7 +869,6 @@ class Model(nn.Module):
     def forward(
         self,
         batch: Any,
-        segment_ids: list[list[int]] | None = None,
         cache: dict[str, Any] | None = None,
         use_cache: bool = False,
     ) -> tuple[TensorDict, TensorDict, dict[str, Any] | None]:
@@ -986,66 +881,39 @@ class Model(nn.Module):
         Training attention uses FlexAttention over the flat concatenated token
         stream (no cross-sequence padding). Cached decode keeps
         ``FlexDecodeSession`` with per-sequence KV caches.
+
+        Predictions / ``objective_data`` are flat over steps (``N`` steps) for
+        training; cached decode returns rectangular ``[B, S]`` tensors.
         """
         from mouse_core.models.embedding.token_batch import TokenBatch
 
         if cache is not None and not use_cache:
             raise ValueError("Passing cache= requires use_cache=True.")
 
-        raw_lengths: list[int] | None = None
         if isinstance(batch, TokenBatch):
-            if segment_ids is not None:
-                raise ValueError("segment_ids are already inside TokenBatch; do not pass them again")
             token_batch = batch
-            B, S = token_batch.B, token_batch.S
         else:
-            # Raw [B][S] steps (online / tests)
             raw_batch = cast(list[list[dict]], batch)
-            B = len(raw_batch)
-            lengths = [len(rows) for rows in raw_batch]
-            S = max(lengths, default=0)
-            ragged = any(n != S for n in lengths)
-            if ragged or use_cache:
-                if S == 0:
+            if use_cache:
+                lengths = [len(rows) for rows in raw_batch]
+                if lengths and all(n < 1 for n in lengths):
                     raise ValueError("Model.forward requires at least one non-empty row in batch.")
-                if not use_cache:
-                    raise ValueError("Ragged batches require use_cache=True (cached decoding).")
-                if ragged:
-                    pad_row = next(rows[0] for rows in raw_batch if rows)
-                    raw_batch = [
-                        [pad_row] * (S - n) + rows for rows, n in zip(raw_batch, lengths)
-                    ]
-                raw_lengths = lengths
-            if segment_ids is None:
-                segment_ids = [[0] * len(rows) for rows in raw_batch]
-            if len(segment_ids) != B:
-                raise ValueError(
-                    f"segment_ids batch size ({len(segment_ids)}) must match batch ({B})."
-                )
-            for b, (rows, ids) in enumerate(zip(raw_batch, segment_ids)):
-                if len(ids) != len(rows):
-                    raise ValueError(
-                        f"segment_ids[{b}] length ({len(ids)}) must match batch[{b}] "
-                        f"length ({len(rows)})."
-                    )
-            token_batch = self.encoder.prepare(raw_batch, segment_ids)
+            token_batch = self.encoder.prepare(raw_batch)
 
-        embeds, col_values, step_token_indices = self.encoder(token_batch)
-        # embeds: [L, D]
+        B = token_batch.B
+        step_counts_np = token_batch.step_counts()
+        N = token_batch.N
+        S_max = token_batch.S
+
+        embeds, col_values, prediction_indices = self.encoder(token_batch)
+        # embeds: [L, D]; prediction_indices: [N]
         if any(value.device != embeds.device for value in col_values.values()):
             col_values = {key: value.to(embeds.device) for key, value in col_values.items()}
 
-        # Step-level segment ids for objectives: gather from each step's last token
-        # (``step_token_indices``). Avoids a B*S Python loop of eq/any/nonzero.
         t = token_batch.to_tensors(embeds.device)
-        seg_tok = t["segment_ids"]
         sequence_ids = t["sequence_ids"]
-        if token_batch.L > 0 and S > 0:
-            segment_id_tensor = seg_tok[step_token_indices]
-        else:
-            segment_id_tensor = torch.zeros(B, S, device=embeds.device, dtype=torch.long)
-        col_values["segment_id"] = segment_id_tensor
-        objective_data = TensorDict(col_values, batch_size=(B, S))
+        if "sequence_id" not in col_values and N > 0:
+            raise ValueError("col_values must include sequence_id when N > 0")
 
         needs_layerwise = "action_value_layerwise" in self._heads
         new_cache: dict[str, Any] | None
@@ -1054,26 +922,29 @@ class Model(nn.Module):
             from mouse_core.models.embedding.packing import left_align_content
 
             batched_embeds, token_lengths, local_indices = _flat_to_batched_left_pad(
-                embeds, sequence_ids, step_token_indices, B, S, raw_lengths
+                embeds,
+                sequence_ids,
+                prediction_indices,
+                B,
+                S_max,
+                step_counts_np.tolist(),
             )
             session = cache["session"] if cache else self.backbone.decode_session(
                 batch_size=B, capacity=max(batched_embeds.shape[1], 1)
             )
-            # FlexDecode wants left-padded content in trailing columns — local_indices
-            # already account for right-pad scatter; left_align if needed.
-            flex_embeds, pool_indices = left_align_content(batched_embeds, local_indices)
-            if raw_lengths is not None:
-                from mouse_core.models.embedding.packing import real_token_lengths_from_indices
-
-                token_lengths = real_token_lengths_from_indices(
-                    local_indices, num_real_steps=raw_lengths
-                )
-            session_out = session.forward(
-                flex_embeds, token_lengths, output_hidden_states=needs_layerwise
+            flex_embeds, prediction_indices = left_align_content(
+                batched_embeds, local_indices
             )
+            # ``token_lengths`` already counts only real tokens (prepare is ragged;
+            # empty rows contribute 0). Do not re-derive from left-padded step indices.
+            session_out = session.forward(output_hidden_states=needs_layerwise, embeds=flex_embeds, lengths=token_lengths)
             new_cache = {"session": session}
-            step_token_indices = pool_indices
             h_source_batched = True
+            pred_batch_size: tuple[int, ...] = (B, S_max)
+            # Rectangular objective_data for decode (left-pad short rows).
+            objective_data = _rect_objective_data(
+                col_values, step_counts_np, B, S_max, embeds.device
+            )
         else:
             # Training: Flex packed on CUDA; SDPA mask fallback on CPU (no Flex backward).
             transformer = getattr(self.backbone, "model", None)
@@ -1085,19 +956,11 @@ class Model(nn.Module):
             if use_flex:
                 from mouse_core.models.backbone.flex_train import flex_packed_forward
 
-                session_out = flex_packed_forward(
-                    transformer,
-                    embeds,
-                    sequence_ids,
-                    seg_tok,
-                    output_hidden_states=needs_layerwise,
-                )
+                assert transformer is not None
+                session_out = flex_packed_forward(output_hidden_states=needs_layerwise, model=cast(nn.Module, transformer), embeds=embeds, sequence_ids=sequence_ids)
             else:
-                # Flat [L,D] → [1,L,D] with document/segment causal mask
-                attention_mask = _flat_segment_causal_mask(
-                    sequence_ids, seg_tok, dtype=embeds.dtype
-                )
-                position_ids = _flat_segment_position_ids(sequence_ids, seg_tok)
+                attention_mask = _flat_sequence_causal_mask(dtype=embeds.dtype, sequence_ids=sequence_ids)
+                position_ids = _flat_sequence_position_ids(sequence_ids=sequence_ids)
                 session_out = self.backbone(
                     embeds.unsqueeze(0),
                     output_hidden_states=needs_layerwise,
@@ -1114,52 +977,42 @@ class Model(nn.Module):
                     session_out = session_out.squeeze(0)
             new_cache = None
             h_source_batched = False
+            pred_batch_size = (N,)
+            objective_data = TensorDict(col_values, batch_size=[N])
 
         if needs_layerwise:
-            h, layer_hiddens = session_out
+            h, layer_hiddens = cast(
+                tuple[torch.Tensor, tuple[torch.Tensor, ...]], session_out
+            )
         else:
-            h = session_out
+            h = cast(torch.Tensor, session_out)
             layer_hiddens = None
 
-        if h_source_batched:
-            h_step = self.encoder.pool_step_reprs(h, step_token_indices)
-            if needs_layerwise:
-                assert layer_hiddens is not None
-                h_layers = torch.stack(
-                    [
-                        self.encoder.pool_step_reprs(layer_h, step_token_indices)
-                        for layer_h in layer_hiddens
-                    ],
-                    dim=1,
-                )
-                predictions = self.head(h_step, batch_size=(B, S), h_layers=h_layers)
-            else:
-                predictions = self.head(h_step, batch_size=(B, S))
+        h_step = self.encoder.pool_step_reprs(h, prediction_indices)
+        if needs_layerwise:
+            assert layer_hiddens is not None
+            # Train: each pool is [N, D] → stack [N, n_layers, D]
+            # Decode: each pool is [B, S, D] → stack [B, n_layers, S, D]
+            h_layers = torch.stack(
+                [
+                    self.encoder.pool_step_reprs(layer_h, prediction_indices)
+                    for layer_h in layer_hiddens
+                ],
+                dim=1,
+            )
+            predictions = self.head(h=h_step, batch_size=pred_batch_size, h_layers=h_layers)
         else:
-            # h is [L, D]; step_token_indices [B, S] absolute into L
-            h_step = self.encoder.pool_step_reprs(h, step_token_indices)
-            if needs_layerwise:
-                assert layer_hiddens is not None
-                h_layers = torch.stack(
-                    [
-                        self.encoder.pool_step_reprs(layer_h, step_token_indices)
-                        for layer_h in layer_hiddens
-                    ],
-                    dim=1,
-                )
-                predictions = self.head(h_step, batch_size=(B, S), h_layers=h_layers)
-            else:
-                predictions = self.head(h_step, batch_size=(B, S))
+            predictions = self.head(h=h_step, batch_size=pred_batch_size)
         return predictions, objective_data, new_cache
 
     def head(
         self,
-        h: torch.Tensor,
-        batch_size: tuple[int, int],
         *,
+        h: torch.Tensor,
+        batch_size: tuple[int, ...],
         h_layers: torch.Tensor | None = None,
     ) -> TensorDict:
-        """Run enabled heads on step representations ``[B, S, D]``."""
+        """Run enabled heads on step representations ``[N, D]`` or ``[B, S, D]``."""
         h = h.float()
         if h_layers is not None:
             h_layers = h_layers.float()
@@ -1216,13 +1069,37 @@ class Model(nn.Module):
         num_actions: int | None = None,
     ) -> torch.Tensor:
         """Select an action using ``action_head`` from the last step."""
-        raw = cast(torch.Tensor, out[self.action_head])[:, -1]
+        raw = cast(torch.Tensor, out[self.action_head])
         if self.action_head == "action_value_layerwise":
-            scores = raw[:, -1, :]
+            if raw.ndim == 4:
+                # Decode: [B, S, L, A] → last step, deepest layer
+                scores = raw[:, -1, -1, :]
+            elif raw.ndim == 3:
+                # Train flat: [N, L, A] → last step, deepest layer
+                scores = raw[-1, -1, :].unsqueeze(0)
+            else:
+                raise ValueError(
+                    f"action_value_layerwise expects [B, S, L, A] or [N, L, A], "
+                    f"got {tuple(raw.shape)}"
+                )
         elif self.action_head == "action_vector":
-            scores = vector_action_scores(raw)
+            if raw.ndim == 4:
+                scores = vector_action_scores(raw[:, -1])
+            elif raw.ndim == 3:
+                scores = vector_action_scores(raw[-1:]).squeeze(0).unsqueeze(0)
+            else:
+                raise ValueError(
+                    f"action_vector expects [B, S, A, D] or [N, A, D], got {tuple(raw.shape)}"
+                )
         else:
-            scores = raw
+            if raw.ndim == 3:
+                scores = raw[:, -1]
+            elif raw.ndim == 2:
+                scores = raw[-1].unsqueeze(0)
+            else:
+                raise ValueError(
+                    f"{self.action_head} expects [B, S, A] or [N, A], got {tuple(raw.shape)}"
+                )
         if num_actions is not None:
             scores = scores[:, :num_actions]
         if temperature == 0.0:
@@ -1247,36 +1124,86 @@ def preferred_dtype(device: torch.device | str | None = None) -> torch.dtype:
     return torch.float32
 
 
+def _rect_objective_data(
+    col_values: dict[str, torch.Tensor],
+    step_counts: Any,
+    B: int,
+    S: int,
+    device: torch.device,
+) -> TensorDict:
+    """Left-pad flat ``[N]`` col_values into rectangular ``[B, S]`` for decode."""
+    import numpy as np
+
+    counts = np.asarray(step_counts, dtype=np.int64).reshape(-1)
+    rect: dict[str, torch.Tensor] = {}
+    for key, flat in col_values.items():
+        if flat.ndim == 1:
+            out = flat.new_zeros(B, S)
+        else:
+            out = flat.new_zeros(B, S, *flat.shape[1:])
+        offset = 0
+        for b in range(B):
+            n = int(counts[b])
+            if n == 0:
+                continue
+            # Left-pad: real steps occupy trailing columns.
+            out[b, S - n :] = flat[offset : offset + n]
+            offset += n
+        rect[key] = out
+    if "sequence_id" not in rect and B > 0 and S > 0:
+        sid = torch.zeros(B, S, device=device, dtype=torch.long)
+        for b in range(B):
+            n = int(counts[b])
+            if n > 0:
+                sid[b, S - n :] = b
+        rect["sequence_id"] = sid
+    return TensorDict(rect, batch_size=(B, S))
+
+
 def _flat_to_batched_left_pad(
     embeds: torch.Tensor,
     sequence_ids: torch.Tensor,
-    step_token_indices: torch.Tensor,
+    prediction_indices: torch.Tensor,
     B: int,
     S: int,
-    raw_lengths: list[int] | None,
+    step_counts: list[int],
 ) -> tuple[torch.Tensor, list[int], torch.Tensor]:
-    """Scatter flat ``[L, D]`` embeds into right-padded ``[B, Lmax, D]``."""
+    """Scatter flat ``[L, D]`` embeds into a rectangular ``[B, Lmax, D]`` layout.
+
+    Content is packed from index 0 within each row (right-padded).
+    ``prediction_indices`` is flat ``[N]``. Returns local rectangular
+    ``prediction_indices`` ``[B, S]`` with real steps in trailing columns
+    (left-padded in the step dimension for decode).
+    """
     L, D = embeds.shape
-    lengths = [(sequence_ids == b).sum().item() for b in range(B)]
-    Lmax = max(lengths) if lengths else 0
+    token_lengths = [int((sequence_ids == b).sum().item()) for b in range(B)]
+    Lmax = max(token_lengths) if token_lengths else 0
     out = embeds.new_zeros(B, Lmax, D)
     local_indices = torch.zeros(B, S, device=embeds.device, dtype=torch.long)
+
+    # Map absolute token index → local index within its sequence.
+    local_of_abs = torch.full((L,), -1, device=embeds.device, dtype=torch.long)
     for b in range(B):
         mask = sequence_ids == b
         toks = embeds[mask]
         out[b, : toks.shape[0]] = toks
-        for s in range(S):
-            abs_i = int(step_token_indices[b, s].item())
-            if abs_i < 0 or abs_i >= L:
-                continue
-            local_indices[b, s] = int((sequence_ids[: abs_i + 1] == b).sum().item()) - 1
-    return out, lengths, local_indices
+        abs_idx = torch.where(mask)[0]
+        local_of_abs[abs_idx] = torch.arange(toks.shape[0], device=embeds.device)
+
+    flat_offset = 0
+    for b in range(B):
+        n = int(step_counts[b]) if b < len(step_counts) else S
+        for s_local in range(n):
+            abs_i = int(prediction_indices[flat_offset + s_local].item())
+            # Place into trailing step columns.
+            local_indices[b, S - n + s_local] = int(local_of_abs[abs_i].item())
+        flat_offset += n
+    return out, token_lengths, local_indices
 
 
-def _flat_segment_causal_mask(
-    sequence_ids: torch.Tensor,
-    segment_ids: torch.Tensor,
+def _flat_sequence_causal_mask(
     *,
+    sequence_ids: torch.Tensor,
     dtype: torch.dtype,
 ) -> torch.Tensor:
     """Additive attention mask ``[1, 1, L, L]`` for a packed flat sequence."""
@@ -1286,26 +1213,24 @@ def _flat_segment_causal_mask(
     kv = torch.arange(L, device=device)
     causal = kv.unsqueeze(0) <= q.unsqueeze(1)
     same_seq = sequence_ids.unsqueeze(1) == sequence_ids.unsqueeze(0)
-    same_seg = segment_ids.unsqueeze(1) == segment_ids.unsqueeze(0)
-    allow = causal & same_seq & same_seg
+    allow = causal & same_seq
     neg = torch.finfo(dtype).min
-    mask = torch.where(allow, torch.zeros((), device=device, dtype=dtype), torch.full((), neg, device=device, dtype=dtype))
+    mask = torch.where(
+        allow,
+        torch.zeros((), device=device, dtype=dtype),
+        torch.full((), neg, device=device, dtype=dtype),
+    )
     return mask.view(1, 1, L, L)
 
 
-def _flat_segment_position_ids(
-    sequence_ids: torch.Tensor,
-    segment_ids: torch.Tensor,
-) -> torch.Tensor:
-    """RoPE positions ``[1, L]`` resetting at each (sequence, segment) run."""
+def _flat_sequence_position_ids(sequence_ids: torch.Tensor) -> torch.Tensor:
+    """RoPE positions ``[1, L]`` resetting at each sequence boundary."""
     L = sequence_ids.shape[0]
     device = sequence_ids.device
     if L == 0:
         return torch.zeros(1, 0, dtype=torch.long, device=device)
     arange = torch.arange(L, device=device)
     new_run = torch.ones(L, dtype=torch.bool, device=device)
-    new_run[1:] = (sequence_ids[1:] != sequence_ids[:-1]) | (
-        segment_ids[1:] != segment_ids[:-1]
-    )
+    new_run[1:] = sequence_ids[1:] != sequence_ids[:-1]
     markers = torch.where(new_run, arange, torch.full_like(arange, -1))
     return (arange - torch.cummax(markers, dim=0).values).unsqueeze(0)

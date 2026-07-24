@@ -1,6 +1,15 @@
 from mouse_core.models.base import Model, load_model, preferred_dtype, save_model, push_model_to_hub
 from mouse_core.models.backbone import Backbone, LlamaBackbone, Qwen3Backbone, IdentityBackbone
-from mouse_core.models.heads import BaseHead, BaseHeadWithTarget, HeadSpec, SwiGLUHead, DiscreteActionHead, DiscreteActionValueHead, LayerwiseDiscreteActionValueHead, VectorActionValueHead, build_heads
+from mouse_core.models.heads import (
+    BaseHead,
+    BaseHeadWithTarget,
+    HeadSpec,
+    SwiGLUHead,
+    DiscreteActionHead,
+    DiscreteActionValueHead,
+    LayerwiseDiscreteActionValueHead,
+    VectorActionValueHead,
+)
 from mouse_core.models.embedding.embedding import Encoder, NumericEmbedder, ModalitySpec
 from mouse_core.models.embedding.text import TextEmbedder
 from mouse_core.models.embedding.token_batch import TokenBatch
@@ -25,7 +34,6 @@ __all__ = [
     "DiscreteActionValueHead",
     "LayerwiseDiscreteActionValueHead",
     "VectorActionValueHead",
-    "build_heads",
     "ModalitySpec",
     "NumericEmbedder",
     "TextEmbedder",

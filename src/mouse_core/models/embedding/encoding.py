@@ -57,6 +57,10 @@ class StaticFourierFeatures(nn.Module):
             torch.tensor(float(output_scale), dtype=dtype),
             persistent=True,
         )
+        # Narrow buffer types for type checkers (``register_buffer`` is untyped).
+        self.freqs: torch.Tensor
+        self.phases: torch.Tensor
+        self.output_scale: torch.Tensor
 
     def forward(self, x: torch.Tensor, freq_idx: torch.Tensor | int = 0) -> torch.Tensor:
         """Map scalar inputs to static Fourier embeddings.
@@ -80,15 +84,3 @@ class StaticFourierFeatures(nn.Module):
         w = freqs[freq_idx]
         b = phases[freq_idx]
         return scale * (x.unsqueeze(-1) * w + b).cos()
-
-
-# Alias kept only for older checkpoints that expect the name in state dict docs;
-# new code must use StaticFourierFeatures (no learnable weight).
-RandomFourierFeatures = StaticFourierFeatures
-
-
-class NormalizedPixel(nn.Module):
-    """Maps integer pixel values (0-255) to [-1, 1]."""
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return (x / 255.0 * 2.0) - 1.0

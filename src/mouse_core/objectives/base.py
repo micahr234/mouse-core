@@ -46,9 +46,10 @@ class Objective(ABC):
         """Compute a scalar loss and return diagnostic metrics.
 
         Args:
-            objective_data: ``TensorDict[B, S]`` of the modality tensors extracted
-                by the encoder (action, reward, done, observation, etc.).
-            predictions: ``TensorDict[B, S]`` of model head outputs from
+            objective_data: ``TensorDict[N]`` of the modality tensors extracted
+                by the encoder (action, reward, done, observation, etc.),
+                keyed by flat step index with ``sequence_id``.
+            predictions: ``TensorDict[N]`` of model head outputs from
                 :meth:`~mouse_core.models.base.Model.forward`.
 
         Returns:

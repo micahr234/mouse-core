@@ -216,12 +216,14 @@ def _build_split_datasets(splits: dict[str, list[Datastore]]) -> dict[str, Datas
 
 
 def _create_or_update_dataset_repo(
+    *,
     api: HfApi,
     repo_id: str,
-    *,
     private: bool,
 ) -> tuple[str, str]:
-    repo_url = api.create_repo(repo_id, repo_type="dataset", private=private, exist_ok=True)
+    repo_url = api.create_repo(
+        repo_id=repo_id, repo_type="dataset", private=private, exist_ok=True
+    )
     hub_repo_id = repo_url.repo_id
     # create_repo only sets visibility on creation; enforce it on every push so
     # re-pushing an existing repo with a different ``private`` value takes effect.
@@ -230,8 +232,8 @@ def _create_or_update_dataset_repo(
 
 
 def _push_dataset_dict(
-    dataset_dict: DatasetDict,
     *,
+    dataset_dict: DatasetDict,
     repo_id: str,
     commit_message: str,
     config_name: str,
@@ -244,7 +246,7 @@ def _push_dataset_dict(
     )
 
 
-def _dataset_card_for_configs(config_names: list[str], *, split: str) -> str:
+def _dataset_card_for_configs(*, config_names: list[str], split: str) -> str:
     lines = [
         "---",
         "configs:",
@@ -263,15 +265,15 @@ def _dataset_card_for_configs(config_names: list[str], *, split: str) -> str:
     return "\n".join(lines)
 
 
-def _snapshot_allow_patterns(store_names: list[str] | None, *, split: str) -> list[str]:
+def _snapshot_allow_patterns(*, store_names: list[str] | None, split: str) -> list[str]:
     if store_names is None:
         return [f"data/*/{split}-*.parquet"]
     return [f"data/{store_name}/{split}-*.parquet" for store_name in store_names]
 
 
 def _snapshot_store_repo(
-    repo_id: str,
     *,
+    repo_id: str,
     store_names: list[str] | None,
     split: str,
     revision: str | None,
@@ -281,7 +283,7 @@ def _snapshot_store_repo(
     kwargs: dict[str, Any] = {
         "repo_id": repo_id,
         "repo_type": "dataset",
-        "allow_patterns": _snapshot_allow_patterns(store_names, split=split),
+        "allow_patterns": _snapshot_allow_patterns(split=split, store_names=store_names),
         "force_download": force_download,
     }
     if revision is not None:
@@ -292,8 +294,8 @@ def _snapshot_store_repo(
 
 
 def _local_parquet_data_files(
-    snapshot_dir: Path,
     *,
+    snapshot_dir: Path,
     store_names: list[str] | None,
     split: str,
 ) -> tuple[list[str], dict[str, list[str]]]:
@@ -326,14 +328,14 @@ def _local_parquet_data_files(
 
 
 def _write_store_dataset_repo(
+    *,
     root: Path,
     prepared: list[tuple[str, Dataset]],
-    *,
     split: str,
 ) -> None:
     (root / "data").mkdir(parents=True, exist_ok=True)
     (root / datasets_config.REPOCARD_FILENAME).write_text(
-        _dataset_card_for_configs([config_name for config_name, _ in prepared], split=split),
+        _dataset_card_for_configs(split=split, config_names=[config_name for config_name, _ in prepared]),
         encoding="utf-8",
     )
 
@@ -358,8 +360,8 @@ def _repo_files_to_clear(api: HfApi, repo_id: str, addition_paths: set[str]) -> 
 
 
 def _commit_dataset_repo(
-    api: HfApi,
     *,
+    api: HfApi,
     repo_id: str,
     folder_path: Path,
     commit_message: str,
@@ -403,9 +405,9 @@ def _resolve_dataset_repo_id(repo_id: str, token: str | bool | None = None) -> s
 
 
 def load_stores_from_hub(
+    *,
     repo_id: str,
     store_names: list[str] | None = None,
-    *,
     split: str = "train",
     force_download: bool = False,
     token: str | bool | None = None,
@@ -438,19 +440,8 @@ def load_stores_from_hub(
     load_kwargs = dict(kwargs)
 
     revision = load_kwargs.pop("revision", None)
-    snapshot_dir = _snapshot_store_repo(
-        resolved_repo_id,
-        store_names=store_names,
-        split=split,
-        revision=revision,
-        token=token,
-        force_download=force_download,
-    )
-    store_names, data_files = _local_parquet_data_files(
-        snapshot_dir,
-        store_names=store_names,
-        split=split,
-    )
+    snapshot_dir = _snapshot_store_repo(store_names=store_names, split=split, revision=revision, token=token, force_download=force_download, repo_id=resolved_repo_id)
+    store_names, data_files = _local_parquet_data_files(store_names=store_names, split=split, snapshot_dir=snapshot_dir)
 
     if not store_names:
         raise ValueError(
@@ -482,9 +473,9 @@ def load_stores_from_hub(
 
 
 def push_to_hub(
+    *,
     splits: dict[str, list[Datastore]],
     repo_id: str,
-    *,
     private: bool = False,
     commit_message: str = "New rollout data",
     config_name: str = "default",
@@ -553,15 +544,10 @@ def push_to_hub(
 
     try:
         api = HfApi()
-        repo_url, hub_repo_id = _create_or_update_dataset_repo(api, repo_id, private=private)
+        repo_url, hub_repo_id = _create_or_update_dataset_repo(private=private, api=api, repo_id=repo_id)
         if clear:
             _wipe_hub_repo_data(api=api, repo_id=hub_repo_id)
-        _push_dataset_dict(
-            dataset_dict,
-            repo_id=hub_repo_id,
-            commit_message=commit_message,
-            config_name=config_name,
-        )
+        _push_dataset_dict(repo_id=hub_repo_id, commit_message=commit_message, config_name=config_name, dataset_dict=dataset_dict)
     except HfHubHTTPError as e:
         _raise_for_hub_http_error(e, repo_id)
 
@@ -571,9 +557,9 @@ def push_to_hub(
 
 
 def push_stores_to_hub(
+    *,
     stores: list[Datastore],
     repo_id: str,
-    *,
     split: str = "train",
     private: bool = False,
     commit_message: str = "New rollout data",
@@ -668,21 +654,11 @@ def push_stores_to_hub(
 
     try:
         api = HfApi()
-        repo_url, hub_repo_id = _create_or_update_dataset_repo(api, repo_id, private=private)
+        repo_url, hub_repo_id = _create_or_update_dataset_repo(private=private, api=api, repo_id=repo_id)
         with tempfile.TemporaryDirectory() as tmp:
             folder_path = Path(tmp)
-            _write_store_dataset_repo(
-                folder_path,
-                prepared,
-                split=split,
-            )
-            _commit_dataset_repo(
-                api,
-                repo_id=hub_repo_id,
-                folder_path=folder_path,
-                commit_message=commit_message,
-                clear=clear,
-            )
+            _write_store_dataset_repo(split=split, root=folder_path, prepared=prepared)
+            _commit_dataset_repo(repo_id=hub_repo_id, folder_path=folder_path, commit_message=commit_message, clear=clear, api=api)
     except HfHubHTTPError as e:
         _raise_for_hub_http_error(e, repo_id)
 

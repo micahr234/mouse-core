@@ -28,8 +28,8 @@ def gamma_from_horizon(horizon: float) -> float:
 
 
 def _build_layer_gamma_schedule(
-    num_layers: int,
     *,
+    num_layers: int,
     gamma_start: float,
     gamma_deep: float,
 ) -> list[float]:
@@ -68,11 +68,11 @@ class LayerwiseDqnObjective(Objective):
     """One-step Bellman TD objective on every backbone layer.
 
     Reads ``predictions["action_value_layerwise"]`` and
-    ``predictions["action_value_layerwise_target"]`` with shape ``[B, S, L, A]``.
+    ``predictions["action_value_layerwise_target"]`` with shape ``[N, L, A]``.
     Each layer and each done-code uses its own discount, built at construction
     from explicit shallow/deep endpoint pairs. Row pairs that straddle a
-    packed-segment boundary (different ``segment_id`` values from
-    ``DataLoader(pack=True)``) are excluded from every layer's loss.
+    sequence boundary (different ``sequence_id``) are excluded from every
+    layer's loss.
 
     Effective planning horizon is ``H(gamma) = 1 / (1 - gamma)``. Layer ``0`` uses
     each ``gamma_*_start``; the deepest layer uses the deep value
@@ -117,9 +117,6 @@ class LayerwiseDqnObjective(Objective):
         cql_scale_q_eps: Additive floor when scaling the CQL penalty.
     """
 
-    effective_horizon = staticmethod(effective_horizon)
-    gamma_from_horizon = staticmethod(gamma_from_horizon)
-
     def __init__(
         self,
         *,
@@ -162,25 +159,25 @@ class LayerwiseDqnObjective(Objective):
         build = _build_layer_gamma_schedule
         n = self.num_backbone_layers
         self.layer_gamma_step = build(
-            n, gamma_start=self.gamma_step_start, gamma_deep=self.gamma_step
+            num_layers=n, gamma_start=self.gamma_step_start, gamma_deep=self.gamma_step
         )
         self.layer_gamma_episode_terminal = build(
-            n,
+            num_layers=n,
             gamma_start=self.gamma_episode_terminal_start,
             gamma_deep=self.gamma_episode_terminal,
         )
         self.layer_gamma_episode_truncated = build(
-            n,
+            num_layers=n,
             gamma_start=self.gamma_episode_truncated_start,
             gamma_deep=self.gamma_episode_truncated,
         )
         self.layer_gamma_task_terminal = build(
-            n,
+            num_layers=n,
             gamma_start=self.gamma_task_terminal_start,
             gamma_deep=self.gamma_task_terminal,
         )
         self.layer_gamma_task_truncated = build(
-            n,
+            num_layers=n,
             gamma_start=self.gamma_task_truncated_start,
             gamma_deep=self.gamma_task_truncated,
         )
@@ -203,7 +200,12 @@ class LayerwiseDqnObjective(Objective):
         q: torch.Tensor = predictions["action_value_layerwise"]
         q_target: torch.Tensor = predictions["action_value_layerwise_target"]
 
-        B, S, L, A = q.shape
+        if q.ndim != 3:
+            raise ValueError(
+                f"Layerwise DQN expects action_value_layerwise shape [N, L, A], "
+                f"got {tuple(q.shape)}."
+            )
+        N, L, A = q.shape
         device = q.device
         value_dtype = q.dtype
 
@@ -213,40 +215,40 @@ class LayerwiseDqnObjective(Objective):
                 f"but predictions have {L}."
             )
 
-        if S < 2:
+        if N < 2:
             raise ValueError("Not enough valid q values in data.")
 
         action = objective_data[self.action_key]
         if action.dtype != torch.int64:
             raise TypeError(f"action must be int64, got {action.dtype}.")
-        if action.shape != torch.Size([B, S]):
+        if action.shape != torch.Size([N]):
             raise ValueError(
-                f"Layerwise DQN objective expects action shape [{B}, {S}], got {tuple(action.shape)}."
+                f"Layerwise DQN objective expects action shape [{N}], got {tuple(action.shape)}."
             )
 
         reward = objective_data[self.reward_key]
         if reward.dtype != torch.float32:
             raise TypeError(f"reward must be float32, got {reward.dtype}.")
-        if reward.shape != torch.Size([B, S]):
+        if reward.shape != torch.Size([N]):
             raise ValueError(
-                f"Layerwise DQN objective expects reward shape [{B}, {S}], got {tuple(reward.shape)}."
+                f"Layerwise DQN objective expects reward shape [{N}], got {tuple(reward.shape)}."
             )
 
         done = objective_data[self.done_key]
         if done.dtype != torch.int64:
             raise TypeError(f"done must be int64, got {done.dtype}.")
-        if done.shape != torch.Size([B, S]):
+        if done.shape != torch.Size([N]):
             raise ValueError(
-                f"Layerwise DQN objective expects done shape [{B}, {S}], got {tuple(done.shape)}."
+                f"Layerwise DQN objective expects done shape [{N}], got {tuple(done.shape)}."
             )
 
-        valid = _valid_transitions(objective_data, B, S, device)
+        valid = _valid_transitions(objective_data, N, device)
 
-        curr_q = q[:, :-1, :, :]              # [B, S-1, L, A]
-        next_actions = action[:, 1:]        # [B, S-1]
-        next_rewards = reward[:, 1:]        # [B, S-1]
-        next_done = done[:, 1:]               # [B, S-1]
-        next_q_target = q_target[:, 1:, :, :]  # [B, S-1, L, A]
+        curr_q = q[:-1, :, :]              # [N-1, L, A]
+        next_actions = action[1:]          # [N-1]
+        next_rewards = reward[1:]          # [N-1]
+        next_done = done[1:]               # [N-1]
+        next_q_target = q_target[1:, :, :]  # [N-1, L, A]
 
         layer_losses: list[torch.Tensor] = []
         layer_curr_max_means: list[torch.Tensor] = []
@@ -259,10 +261,10 @@ class LayerwiseDqnObjective(Objective):
                 dtype=value_dtype,
                 device=device,
             )
-            discount = gammas[next_done]  # [B, S-1]
+            discount = gammas[next_done]  # [N-1]
 
-            curr_q_layer = curr_q[:, :, layer_idx, :]
-            next_q_target_layer = next_q_target[:, :, layer_idx, :]
+            curr_q_layer = curr_q[:, layer_idx, :]
+            next_q_target_layer = next_q_target[:, layer_idx, :]
 
             q_values = curr_q_layer.gather(
                 dim=-1, index=next_actions.unsqueeze(-1)

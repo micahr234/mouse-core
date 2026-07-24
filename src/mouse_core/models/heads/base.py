@@ -47,39 +47,16 @@ import torch.nn as nn
 class HeadSpec:
     """Specification for a head to attach to a MOUSE model.
 
-    Mirrors the column-declarative style of embedding columns. Each head
-    declares its ``name`` (the key it will appear under in model outputs)
-    and ``type`` (which head implementation to use). The remaining fields
-    are options specific to that head type.
+    Supported names:
 
-    Supported semantic head types (names):
-
-    - ``"action_value"``: DiscreteActionValueHead — value per discrete action (has target net)
-    - ``"action_vector"``: VectorActionValueHead — vector per action (has target net)
-    - ``"action"``: DiscreteActionHead — discrete action logits / policy (no target net)
-    - ``"value"``: SwiGLUHead — scalar or vector value regression (e.g. PPO critic)
-
-    Common options for all:
-      - ``num_layers``, ``hidden_dim``, ``scale``, ``use_norm``
-
-    Vector-specific:
-      - ``vec_dim``, ``bias_scale`` (only for ``"action_vector"``)
-
-    A head is disabled when ``num_layers`` is 0 (or the spec is omitted).
-
-    Example::
-
-        head_kwargs = {
-            "action_head": "action_value",
-            "heads": [
-                {"name": "action_value", "num_layers": 1, "hidden_dim": 32, "scale": 0.01},
-                {"name": "action", "num_layers": 0},
-            ]
-        }
+    - ``"action_value"``: DiscreteActionValueHead
+    - ``"action_value_layerwise"``: LayerwiseDiscreteActionValueHead
+    - ``"action_vector"``: VectorActionValueHead
+    - ``"action"``: DiscreteActionHead
+    - ``"value"``: SwiGLUHead
     """
 
     name: str
-    type: str | None = None
     # Common
     hidden_dim: int | None = None
     num_layers: int | None = None
@@ -104,19 +81,6 @@ class HeadSpec:
             raise ValueError(
                 f"unknown head name {self.name!r}; expected one of {self._VALID}"
             )
-        if self.type is not None:
-            t = str(self.type).lower()
-            if t not in self._VALID:
-                raise ValueError(
-                    f"unknown head type {self.type!r} for head {self.name!r}; expected one of {self._VALID}"
-                )
-            if t != self.name:
-                raise ValueError(
-                    f"head 'type' {self.type!r} does not match 'name' {self.name!r}; "
-                    f"omit 'type' or set it equal to 'name'"
-                )
-            if t != self.type:
-                object.__setattr__(self, "type", t)
         if self.num_layers is not None and int(self.num_layers) < 0:
             raise ValueError(
                 f"head {self.name!r} has negative num_layers ({self.num_layers}); "
@@ -135,10 +99,6 @@ class HeadSpec:
             raise ValueError(f"vec_dim must be positive, got {self.vec_dim!r}")
         if self.bias_scale is not None and self.name != "action_vector":
             raise ValueError(f"bias_scale is only valid for 'action_vector' heads, got name={self.name!r}")
-
-    def effective_type(self) -> str:
-        """Return the head implementation type, defaulting to ``name``."""
-        return self.type if self.type is not None else self.name
 
 
 class BaseHead(nn.Module, ABC):

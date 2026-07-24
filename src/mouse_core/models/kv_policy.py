@@ -30,8 +30,8 @@ def resolve_cache_bounds(max_cache: int, start_cache: int | None = None) -> tupl
 
 
 def rebuild_starts(
-    ends: np.ndarray,
     *,
+    ends: np.ndarray,
     context_start: np.ndarray | int,
     start_cache: int,
     max_cache: int,

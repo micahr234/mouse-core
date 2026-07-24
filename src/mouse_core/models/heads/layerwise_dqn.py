@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import torch
 import torch.nn as nn
 
@@ -12,8 +14,10 @@ from mouse_core.models.heads.dqn import DiscreteActionValueHead
 class LayerwiseDiscreteActionValueHead(BaseHead):
     """One :class:`DiscreteActionValueHead` per backbone layer.
 
-    Expects pooled step representations stacked over layers as ``[B, L, S, D]``
-    and returns per-layer Q-values ``[B, S, L, A]``.
+    Expects pooled step representations stacked over layers as:
+
+    * train (flat): ``[N, L, D]`` → Q-values ``[N, L, A]``
+    * decode (rect): ``[B, L, S, D]`` → Q-values ``[B, S, L, A]``
     """
 
     def __init__(
@@ -52,30 +56,54 @@ class LayerwiseDiscreteActionValueHead(BaseHead):
             ]
         )
 
+    def _heads(self) -> list[DiscreteActionValueHead]:
+        return [cast(DiscreteActionValueHead, head) for head in self.layer_heads]
+
     def forward(self, h: torch.Tensor) -> torch.Tensor:
-        """Returns per-action values ``[B, S, L, A]``."""
+        """Returns per-action values ``[N, L, A]`` or ``[B, S, L, A]``."""
+        if h.ndim == 3:
+            # [N, L, D]
+            if h.shape[1] != self.num_backbone_layers:
+                raise ValueError(
+                    f"Expected {self.num_backbone_layers} backbone layers in h, got {h.shape[1]}."
+                )
+            outputs = [
+                head.forward(h[:, layer_idx]) for layer_idx, head in enumerate(self._heads())
+            ]
+            return torch.stack(outputs, dim=1)
         if h.ndim != 4:
             raise ValueError(
-                f"LayerwiseDiscreteActionValueHead expects h shape [B, L, S, D], got {tuple(h.shape)}."
+                f"LayerwiseDiscreteActionValueHead expects h shape [N, L, D] or "
+                f"[B, L, S, D], got {tuple(h.shape)}."
             )
         if h.shape[1] != self.num_backbone_layers:
             raise ValueError(
                 f"Expected {self.num_backbone_layers} backbone layers in h, got {h.shape[1]}."
             )
-        outputs = [head.forward(h[:, layer_idx]) for layer_idx, head in enumerate(self.layer_heads)]
+        outputs = [
+            head.forward(h[:, layer_idx]) for layer_idx, head in enumerate(self._heads())
+        ]
         return torch.stack(outputs, dim=2)
 
     def target_forward(self, h: torch.Tensor) -> torch.Tensor:
-        """Returns target-network Q-values ``[B, S, L, A]``."""
+        """Returns target-network Q-values ``[N, L, A]`` or ``[B, S, L, A]``."""
+        if h.ndim == 3:
+            outputs = [
+                head.target_forward(h[:, layer_idx])
+                for layer_idx, head in enumerate(self._heads())
+            ]
+            return torch.stack(outputs, dim=1)
         if h.ndim != 4:
             raise ValueError(
-                f"LayerwiseDiscreteActionValueHead expects h shape [B, L, S, D], got {tuple(h.shape)}."
+                f"LayerwiseDiscreteActionValueHead expects h shape [N, L, D] or "
+                f"[B, L, S, D], got {tuple(h.shape)}."
             )
         outputs = [
-            head.target_forward(h[:, layer_idx]) for layer_idx, head in enumerate(self.layer_heads)
+            head.target_forward(h[:, layer_idx])
+            for layer_idx, head in enumerate(self._heads())
         ]
         return torch.stack(outputs, dim=2)
 
     def polyak_update(self, tau: float) -> None:
-        for head in self.layer_heads:
+        for head in self._heads():
             head.polyak_update(tau=tau)

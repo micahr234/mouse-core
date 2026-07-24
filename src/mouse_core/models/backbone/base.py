@@ -86,9 +86,9 @@ def _quiet_transformers_load():
 
 
 def _load_transformer_weights(
+    *,
     model: nn.Module,
     repo_id_or_path: str | Path,
-    *,
     hub_kwargs: dict[str, Any],
 ) -> None:
     """Load matching transformer weights into a MOUSE backbone internals.

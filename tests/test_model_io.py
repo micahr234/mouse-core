@@ -1,186 +1,98 @@
 from __future__ import annotations
-
+from typing import cast
 import json
-
 import pytest
 import torch
-
 from mouse_core.models import Model, load_model, save_model
 from mouse_core.models.base import _write_model_card
 from mouse_core.models.backbone import IdentityBackbone, Qwen3Backbone
 from mouse_core.models.embedding import NumericEmbedder
 from mouse_core.models.heads import DiscreteActionValueHead
 
-
 def test_composed_model_roundtrip(tmp_path) -> None:
     torch.manual_seed(0)
     hidden_dim = 8
-    encoder = NumericEmbedder(
-        hidden_dim=hidden_dim,
-        modalities=[
-            {"field": "action", "type": "discrete", "vocab_size": 4},
-            {"field": "reward", "type": "rff"},
-            {"field": "done", "type": "discrete", "vocab_size": 3},
-        ],
-    )
+    encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{'field': 'action', 'type': 'discrete', 'vocab_size': 4}, {'field': 'reward', 'type': 'rff'}, {'field': 'done', 'type': 'discrete', 'vocab_size': 3}])
     backbone = IdentityBackbone(hidden_dim=hidden_dim)
-    heads = DiscreteActionValueHead(
-        in_features=hidden_dim,
-        out_features=4,
-        hidden_dim=hidden_dim,
-        num_layers=1,
-    )
+    heads = DiscreteActionValueHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1)
     model = Model(encoder=encoder, backbone=backbone, heads=heads).eval()
-
-    batch = [
-        [
-            {"action": 0, "reward": 0.0, "done": 0},
-            {"action": 1, "reward": 1.0, "done": 0},
-            {"action": 2, "reward": 2.0, "done": 1},
-        ]
-    ]
-
+    batch = [[{'action': 0, 'reward': 0.0, 'done': 0}, {'action': 1, 'reward': 1.0, 'done': 0}, {'action': 2, 'reward': 2.0, 'done': 1}]]
     expected, _, _ = model(batch)
     save_model(model, tmp_path)
     loaded = load_model(tmp_path).eval()
     actual, _, _ = loaded(batch)
-
-    # Outputs must be bit-exact after roundtrip
-    assert torch.allclose(actual["action_value"], expected["action_value"])
-    assert torch.allclose(actual["action_value_target"], expected["action_value_target"])
+    assert torch.allclose(actual['action_value'], expected['action_value'])
+    assert torch.allclose(actual['action_value_target'], expected['action_value_target'])
     assert loaded.hidden_dim == hidden_dim
-
-    # Every parameter tensor must match exactly
     orig_sd = model.state_dict()
     loaded_sd = loaded.state_dict()
-    assert set(orig_sd.keys()) == set(loaded_sd.keys()), (
-        f"state_dict key mismatch:\n"
-        f"  missing in loaded: {set(orig_sd.keys()) - set(loaded_sd.keys())}\n"
-        f"  extra in loaded:   {set(loaded_sd.keys()) - set(orig_sd.keys())}"
-    )
+    assert set(orig_sd.keys()) == set(loaded_sd.keys()), f'state_dict key mismatch:\n  missing in loaded: {set(orig_sd.keys()) - set(loaded_sd.keys())}\n  extra in loaded:   {set(loaded_sd.keys()) - set(orig_sd.keys())}'
     for key in orig_sd:
-        assert torch.equal(orig_sd[key], loaded_sd[key]), (
-            f"param {key!r} differs after save/load roundtrip"
-        )
-
-    # Config must include every encoder kwarg needed to reconstruct the model
-    with (tmp_path / "config.json").open() as fh:
+        assert torch.equal(orig_sd[key], loaded_sd[key]), f'param {key!r} differs after save/load roundtrip'
+    with (tmp_path / 'config.json').open() as fh:
         config = json.load(fh)
-    assert config["format"] == "mouse-core-model-v1"
-    assert config["backbone"]["type"] == "identity"
-    assert config["encoder"]["type"] == "numeric"
-    enc_kwargs = config["encoder"]["kwargs"]
-    for required_key in (
-        "hidden_dim", "modalities", "fourier_min", "fourier_max", "std",
-    ):
-        assert required_key in enc_kwargs, f"encoder config missing key {required_key!r}"
-    assert "modality_fusion" not in enc_kwargs
-    assert "include_type_token" not in enc_kwargs
-
+    assert config['format'] == 'mouse-core-model-v1'
+    assert config['backbone']['type'] == 'identity'
+    assert config['encoder']['type'] == 'numeric'
+    enc_kwargs = config['encoder']['kwargs']
+    for required_key in ('hidden_dim', 'modalities', 'fourier_min', 'fourier_max', 'std'):
+        assert required_key in enc_kwargs, f'encoder config missing key {required_key!r}'
+    assert 'modality_fusion' not in enc_kwargs
+    assert 'include_type_token' not in enc_kwargs
 
 def test_composed_model_roundtrip_static_fourier(tmp_path) -> None:
     """Static Fourier buffers survive save/load."""
     torch.manual_seed(42)
     hidden_dim = 8
-    encoder = NumericEmbedder(
-        hidden_dim=hidden_dim,
-        modalities=[
-            {"field": "action", "type": "discrete", "vocab_size": 4},
-            {"field": "reward", "type": "rff"},
-        ],
-    )
+    encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{'field': 'action', 'type': 'discrete', 'vocab_size': 4}, {'field': 'reward', 'type': 'rff'}])
     backbone = IdentityBackbone(hidden_dim=hidden_dim)
-    heads = DiscreteActionValueHead(
-        in_features=hidden_dim,
-        out_features=4,
-        hidden_dim=hidden_dim,
-        num_layers=1,
-    )
+    heads = DiscreteActionValueHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1)
     model = Model(encoder=encoder, backbone=backbone, heads=heads).eval()
-
-    batch = [[{"action": 1, "reward": 0.5}, {"action": 2, "reward": -0.1}]]
-
+    batch = [[{'action': 1, 'reward': 0.5}, {'action': 2, 'reward': -0.1}]]
     expected, _, _ = model(batch)
     save_model(model, tmp_path)
     loaded = load_model(tmp_path).eval()
     actual, _, _ = loaded(batch)
-
-    assert torch.allclose(actual["action_value"], expected["action_value"])
-    assert torch.equal(
-        model.encoder.fourier.get_buffer("freqs"),
-        loaded.encoder.fourier.get_buffer("freqs"),
-    )
-
+    assert torch.allclose(actual['action_value'], expected['action_value'])
+    enc = cast(NumericEmbedder, model.encoder)
+    loaded_enc = cast(NumericEmbedder, loaded.encoder)
+    assert torch.equal(enc.fourier.freqs, loaded_enc.fourier.freqs)
 
 def test_model_card_includes_usage_and_architecture(tmp_path) -> None:
-    model = Model(
-        encoder=NumericEmbedder(
-            hidden_dim=8,
-            modalities=[
-                {"field": "action", "type": "discrete", "vocab_size": 4},
-                {"field": "reward", "type": "rff"},
-                {"field": "done", "type": "discrete", "vocab_size": 3},
-            ],
-        ),
-        backbone=IdentityBackbone(hidden_dim=8),
-        heads=DiscreteActionValueHead(
-            in_features=8,
-            out_features=4,
-            hidden_dim=8,
-            num_layers=1,
-        ),
-    )
-    path = tmp_path / "README.md"
-
-    _write_model_card(model, path, repo_id="user/mouse-example-model")
-
+    model = Model(encoder=NumericEmbedder(hidden_dim=8, modalities=[{'field': 'action', 'type': 'discrete', 'vocab_size': 4}, {'field': 'reward', 'type': 'rff'}, {'field': 'done', 'type': 'discrete', 'vocab_size': 3}]), backbone=IdentityBackbone(hidden_dim=8), heads=DiscreteActionValueHead(in_features=8, out_features=4, hidden_dim=8, num_layers=1))
+    path = tmp_path / 'README.md'
+    _write_model_card(repo_id='user/mouse-example-model', model=model, path=path)
     text = path.read_text()
-    assert "library_name: mouse-core" in text
-    assert text.index("## Architecture") < text.index("### Encoder")
-    assert text.index("### Encoder") < text.index("## Install MouseCore")
-    assert text.index("## Install MouseCore") < text.index("## Load The Model")
-    assert text.index("## Load The Model") < text.index("## Run Inference")
-    assert "What This Contains" not in text
-    assert "pip install mouse-core" in text
+    assert 'library_name: mouse-core' in text
+    assert text.index('## Architecture') < text.index('### Encoder')
+    assert text.index('### Encoder') < text.index('## Install MouseCore')
+    assert text.index('## Install MouseCore') < text.index('## Load The Model')
+    assert text.index('## Load The Model') < text.index('## Run Inference')
+    assert 'What This Contains' not in text
+    assert 'pip install mouse-core' in text
     assert 'load_model("user/mouse-example-model"' in text
-    assert "list[list[dict]]" in text
-    assert "| `action` | `discrete` | yes | `[B, S]` | `torch.long` | integer ids in `[0, 3]` |" in text
+    assert 'list[list[dict]]' in text
+    assert '| `action` | `discrete` | yes | `[B, S]` | `torch.long` | integer ids in `[0, 3]` |' in text
     assert '"action": 0,' in text
     assert '"reward": 0.0,' in text
-    assert "out, step_stream, cache = model(batch)" not in text
-    assert "predictions, objective_data, cache = model(batch)" in text
-    assert "Backbone: `identity`" in text
-    assert "Heads: `action_value`" in text
-
+    assert 'out, step_stream, cache = model(batch)' not in text
+    assert 'predictions, objective_data, cache = model(batch)' in text
+    assert 'Backbone: `identity`' in text
+    assert 'Heads: `action_value`' in text
 
 def test_model_to_bfloat16_keeps_heads_float32() -> None:
     if not torch.cuda.is_available():
-        pytest.skip("CUDA required")
-
+        pytest.skip('CUDA required')
     hidden_dim = 8
-    encoder = NumericEmbedder(
-        hidden_dim=hidden_dim,
-        modalities=[
-            {"field": "action", "type": "discrete", "vocab_size": 4},
-            {"field": "reward", "type": "rff"},
-            {"field": "done", "type": "discrete", "vocab_size": 3},
-        ],
-    )
+    encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{'field': 'action', 'type': 'discrete', 'vocab_size': 4}, {'field': 'reward', 'type': 'rff'}, {'field': 'done', 'type': 'discrete', 'vocab_size': 3}])
     backbone = Qwen3Backbone(hidden_dim=hidden_dim, num_layers=1, num_heads=2)
-    heads = DiscreteActionValueHead(
-        in_features=hidden_dim,
-        out_features=4,
-        hidden_dim=hidden_dim,
-        num_layers=1,
-    )
+    heads = DiscreteActionValueHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1)
     model = Model(encoder=encoder, backbone=backbone, heads=heads).eval()
-    model = model.to(device=torch.device("cuda"), dtype=torch.bfloat16)
-
+    model = model.to(device=torch.device('cuda'), dtype=torch.bfloat16)
     assert next(model.encoder.parameters()).dtype == torch.bfloat16
     assert next(model.backbone.parameters()).dtype == torch.bfloat16
     assert next(model.heads.parameters()).dtype == torch.float32
-
-    batch = [[{"action": 0, "reward": 0.0, "done": 0}]]
+    batch = [[{'action': 0, 'reward': 0.0, 'done': 0}]]
     with torch.no_grad():
         preds, _, _ = model(batch, use_cache=True)
-    assert preds["action_value"].dtype == torch.float32
+    assert preds['action_value'].dtype == torch.float32

@@ -13,41 +13,36 @@ from mouse_core.objectives.dqn import _valid_transitions
 
 
 def batch_field(
+    *,
     batch: list[list[dict[str, Any]]],
     key: str,
-    *,
     dtype: torch.dtype = torch.float32,
     device: torch.device | None = None,
 ) -> torch.Tensor:
-    """Extract a scalar field from nested ``[B][S]`` row dicts into a ``[B, S]`` tensor.
+    """Extract a scalar field from nested ``[B][len_b]`` row dicts into a flat ``[N]`` tensor.
 
     Used to inject rollout-only columns (e.g. ``old_log_prob``) into
     ``objective_data`` without declaring them as encoder modalities.
+    Steps are concatenated in sequence order (same as ``TokenBatch`` / Model).
     """
     if not batch:
         raise ValueError("batch_field: batch is empty.")
-    B = len(batch)
-    S = len(batch[0])
-    if S == 0:
-        raise ValueError("batch_field: sequences are empty.")
-    out = torch.empty(B, S, dtype=dtype, device=device)
+    values: list[Any] = []
     for b, rows in enumerate(batch):
-        if len(rows) != S:
-            raise ValueError(
-                f"batch_field: ragged batch — row {b} has length {len(rows)}, expected {S}."
-            )
+        if not rows:
+            raise ValueError(f"batch_field: sequence {b} is empty.")
         for s, row in enumerate(rows):
             if key not in row:
                 raise KeyError(
                     f"batch_field: row [{b}][{s}] is missing key {key!r}."
                 )
-            out[b, s] = row[key]
-    return out
+            values.append(row[key])
+    return torch.tensor(values, dtype=dtype, device=device)
 
 
 def sample_discrete_action(
-    logits: torch.Tensor,
     *,
+    logits: torch.Tensor,
     num_actions: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Sample actions from a categorical policy and return ``(actions, log_probs)``.
@@ -78,26 +73,26 @@ def _gae_advantages(
     """Generalized advantage estimation over valid consecutive pairs.
 
     Args:
-        rewards: ``[B, S-1]`` rewards for transitions out of states ``0..S-2``.
-        values: ``[B, S]`` value predictions ``V(s_t)``.
-        discounts: ``[B, S-1]`` per-transition discount (from done-code gammas).
-        valid: ``[B, S-1]`` mask — False at pack-segment seams.
+        rewards: ``[N-1]`` rewards for transitions out of states ``0..N-2``.
+        values: ``[N]`` value predictions ``V(s_i)``.
+        discounts: ``[N-1]`` per-transition discount (from done-code gammas).
+        valid: ``[N-1]`` mask — False at sequence boundaries.
         gae_lambda: GAE λ.
 
     Returns:
-        ``(advantages, returns)`` each ``[B, S-1]``. Invalid positions are zero.
+        ``(advantages, returns)`` each ``[N-1]``. Invalid positions are zero.
     """
-    B, T = rewards.shape
+    T = rewards.shape[0]
     device = rewards.device
     dtype = rewards.dtype
-    advantages = torch.zeros(B, T, device=device, dtype=dtype)
-    gae = torch.zeros(B, device=device, dtype=dtype)
+    advantages = torch.zeros(T, device=device, dtype=dtype)
+    gae = torch.zeros((), device=device, dtype=dtype)
     for t in range(T - 1, -1, -1):
-        delta = rewards[:, t] + discounts[:, t] * values[:, t + 1] - values[:, t]
-        gae = delta + discounts[:, t] * gae_lambda * gae
-        gae = torch.where(valid[:, t], gae, torch.zeros_like(gae))
-        advantages[:, t] = gae
-    returns = advantages + values[:, :-1]
+        delta = rewards[t] + discounts[t] * values[t + 1] - values[t]
+        gae = delta + discounts[t] * gae_lambda * gae
+        gae = torch.where(valid[t], gae, torch.zeros_like(gae))
+        advantages[t] = gae
+    returns = advantages + values[:-1]
     return advantages, returns
 
 
@@ -109,14 +104,14 @@ class PpoObjective(Objective):
 
     Requires dual heads on the model:
 
-    * ``predictions["action"]`` — ``[B, S, A]`` discrete policy logits
-    * ``predictions["value"]`` — ``[B, S, 1]`` or ``[B, S]`` scalar state values
+    * ``predictions["action"]`` — ``[N, A]`` discrete policy logits
+    * ``predictions["value"]`` — ``[N, 1]`` or ``[N]`` scalar state values
 
-    Every consecutive pair ``(t, t+1)`` is a decision point, using the same
-    timing convention as :class:`~mouse_core.objectives.dqn.DqnObjective`:
-    token ``t`` encodes state ``s_t``, and the action / reward / done / behavior
-    log-prob stored at ``t+1`` describe the transition out of ``s_t``. Pack-mode
-    ``segment_id`` seams are excluded.
+    Every consecutive pair ``(i, i+1)`` that shares a ``sequence_id`` is a
+    decision point, using the same timing convention as
+    :class:`~mouse_core.objectives.dqn.DqnObjective`: token ``i`` encodes state
+    ``s_i``, and the action / reward / done / behavior log-prob stored at
+    ``i+1`` describe the transition out of ``s_i``.
 
     Done-code discounts match the DQN table (``gamma_step`` for ``done==0``, …,
     ``gamma_task_truncated`` for ``done==4``).
@@ -124,7 +119,7 @@ class PpoObjective(Objective):
     For multi-epoch PPO, store behavior log-probs during rollout (same step as
     ``action``) and inject them before the objective call::
 
-        predictions, objective_data, _ = model(batch, segment_ids=segment_ids)
+        predictions, objective_data, _ = model(batch)
         objective_data["old_log_prob"] = batch_field(
             batch, "old_log_prob", device=objective_data.device
         )
@@ -202,12 +197,12 @@ class PpoObjective(Objective):
         logits: torch.Tensor = predictions[self.predictions_key]
         values_raw: torch.Tensor = predictions[self.value_key]
 
-        if logits.ndim != 3:
+        if logits.ndim != 2:
             raise ValueError(
-                f"PPO expects {self.predictions_key!r} logits shape [B, S, A], "
+                f"PPO expects {self.predictions_key!r} logits shape [N, A], "
                 f"got {tuple(logits.shape)}."
             )
-        B, S, A = logits.shape
+        N, A = logits.shape
         device = logits.device
         dtype = logits.dtype
 
@@ -219,57 +214,56 @@ class PpoObjective(Objective):
             logits = logits[..., : self.num_actions]
             A = self.num_actions
 
-        if values_raw.shape[:2] != torch.Size([B, S]):
+        if values_raw.shape[0] != N:
             raise ValueError(
-                f"PPO expects {self.value_key!r} leading shape [{B}, {S}], "
+                f"PPO expects {self.value_key!r} leading size [{N}], "
                 f"got {tuple(values_raw.shape)}."
             )
-        if values_raw.ndim == 3 and values_raw.shape[-1] == 1:
+        if values_raw.ndim == 2 and values_raw.shape[-1] == 1:
             values = values_raw.squeeze(-1)
-        elif values_raw.ndim == 2:
+        elif values_raw.ndim == 1:
             values = values_raw
         else:
             raise ValueError(
-                f"PPO expects {self.value_key!r} shape [{B}, {S}] or [{B}, {S}, 1], "
+                f"PPO expects {self.value_key!r} shape [{N}] or [{N}, 1], "
                 f"got {tuple(values_raw.shape)}."
             )
         values = values.to(dtype=dtype)
 
-        if S < 2:
-            raise ValueError("Not enough valid steps in data for PPO (need S >= 2).")
+        if N < 2:
+            raise ValueError("Not enough valid steps in data for PPO (need N >= 2).")
 
         action = objective_data[self.action_key]
         if action.dtype != torch.int64:
             raise TypeError(f"action must be int64, got {action.dtype}.")
-        if action.shape != torch.Size([B, S]):
+        if action.shape != torch.Size([N]):
             raise ValueError(
-                f"PPO objective expects action shape [{B}, {S}], got {tuple(action.shape)}."
+                f"PPO objective expects action shape [{N}], got {tuple(action.shape)}."
             )
 
         reward = objective_data[self.reward_key]
         if reward.dtype != torch.float32:
             raise TypeError(f"reward must be float32, got {reward.dtype}.")
-        if reward.shape != torch.Size([B, S]):
+        if reward.shape != torch.Size([N]):
             raise ValueError(
-                f"PPO objective expects reward shape [{B}, {S}], got {tuple(reward.shape)}."
+                f"PPO objective expects reward shape [{N}], got {tuple(reward.shape)}."
             )
 
         done = objective_data[self.done_key]
         if done.dtype != torch.int64:
             raise TypeError(f"done must be int64, got {done.dtype}.")
-        if done.shape != torch.Size([B, S]):
+        if done.shape != torch.Size([N]):
             raise ValueError(
-                f"PPO objective expects done shape [{B}, {S}], got {tuple(done.shape)}."
+                f"PPO objective expects done shape [{N}], got {tuple(done.shape)}."
             )
 
-        valid = _valid_transitions(objective_data, B, S, device)
+        valid = _valid_transitions(objective_data, N, device)
 
-        # Transition out of state t is described by fields stored at t+1.
-        next_actions = action[:, 1:]
-        next_rewards = reward[:, 1:].to(dtype=dtype)
-        next_done = done[:, 1:]
-        curr_logits = logits[:, :-1, :]
-        curr_values = values[:, :-1]
+        next_actions = action[1:]
+        next_rewards = reward[1:].to(dtype=dtype)
+        next_done = done[1:]
+        curr_logits = logits[:-1, :]
+        curr_values = values[:-1]
 
         gammas = torch.tensor(
             [
@@ -299,12 +293,12 @@ class PpoObjective(Objective):
 
         if self.old_log_prob_key in objective_data.keys():
             old_log_prob_full = objective_data[self.old_log_prob_key]
-            if old_log_prob_full.shape != torch.Size([B, S]):
+            if old_log_prob_full.shape != torch.Size([N]):
                 raise ValueError(
-                    f"PPO expects {self.old_log_prob_key!r} shape [{B}, {S}], "
+                    f"PPO expects {self.old_log_prob_key!r} shape [{N}], "
                     f"got {tuple(old_log_prob_full.shape)}."
                 )
-            old_log_prob = old_log_prob_full[:, 1:].to(dtype=dtype)
+            old_log_prob = old_log_prob_full[1:].to(dtype=dtype)
         else:
             old_log_prob = new_log_prob.detach()
 
@@ -332,7 +326,6 @@ class PpoObjective(Objective):
                 ((ratio[valid] - 1.0).abs() > self.clip_eps).to(dtype=dtype).mean()
             )
             approx_kl = (old_log_prob[valid] - new_log_prob[valid]).mean()
-            # Explained variance of returns by value predictions.
             ret_v = returns[valid]
             val_v = curr_values[valid]
             ret_var = ret_v.var(correction=0)

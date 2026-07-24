@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import warnings
+from typing import Any, cast
 
 import torch
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
@@ -48,57 +49,56 @@ def _get_flex_kernel(device: torch.device, dtype: torch.dtype) -> _FlexKernel:
 
 
 def flex_packed_forward(
+    *,
     model: torch.nn.Module,
     embeds: torch.Tensor,
     sequence_ids: torch.Tensor,
-    segment_ids: torch.Tensor,
-    *,
     output_hidden_states: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
     """Full prefill over a flat packed sequence ``embeds [L, D]``.
 
-    Attention is causal within positions that share both ``sequence_ids`` and
-    ``segment_ids``. No cross-sequence padding.
+    Attention is causal within positions that share ``sequence_ids``.
+    No cross-sequence padding.
 
-    RoPE positions reset at each new (sequence, segment) run (contiguous
-    positions within a segment get 0,1,2,…).
+    RoPE positions reset at each new sequence run (contiguous positions
+    within a sequence get 0,1,2,…).
     """
     if embeds.ndim != 2:
         raise ValueError(f"embeds must be [L, D], got shape {tuple(embeds.shape)}")
     L, _D = embeds.shape
-    if sequence_ids.shape != (L,) or segment_ids.shape != (L,):
-        raise ValueError("sequence_ids and segment_ids must have shape [L]")
+    if sequence_ids.shape != (L,):
+        raise ValueError("sequence_ids must have shape [L]")
 
-    param = next(model.parameters())
+    # HF decoder stacks are ``nn.Module``; pyright treats children as Tensor|Module.
+    hf = cast(Any, model)
+    param = next(hf.parameters())
     device, dtype = param.device, param.dtype
-    cfg = model.config
-    n_heads = cfg.num_attention_heads
-    n_kv_heads = cfg.num_key_value_heads
-    head_dim = cfg.head_dim
+    cfg = hf.config
+    n_heads = int(cfg.num_attention_heads)
+    n_kv_heads = int(cfg.num_key_value_heads)
+    head_dim = int(cfg.head_dim)
 
     x = embeds.to(device=device, dtype=dtype).unsqueeze(0)  # [1, L, D]
     seq = sequence_ids.to(device=device)
-    seg = segment_ids.to(device=device)
 
-    # Per-token RoPE position within its (sequence, segment) run.
+    # Per-token RoPE position within its sequence run.
     # Sync-free: cummax of run-start markers, no host .item() for n_runs.
     position_ids = torch.zeros(L, dtype=torch.long, device=device)
     if L > 0:
         arange = torch.arange(L, device=device)
         new_run = torch.ones(L, dtype=torch.bool, device=device)
-        new_run[1:] = (seq[1:] != seq[:-1]) | (seg[1:] != seg[:-1])
+        new_run[1:] = seq[1:] != seq[:-1]
         markers = torch.where(new_run, arange, torch.full_like(arange, -1))
         position_ids = arange - torch.cummax(markers, dim=0).values
 
     # mask_mod closes over tensors via holder to avoid issues.
-    holder = {"seq": seq, "seg": seg}
+    holder = {"seq": seq}
     compile_masks = _use_flex_compile(device, dtype)
 
     def mask_mod(b, h, q_idx, kv_idx):
         return (
             (kv_idx <= q_idx)
             & (holder["seq"][q_idx] == holder["seq"][kv_idx])
-            & (holder["seg"][q_idx] == holder["seg"][kv_idx])
         )
 
     global _warned_unfused
@@ -126,11 +126,11 @@ def flex_packed_forward(
 
     flex = _get_flex_kernel(device, dtype)
     pos = position_ids.unsqueeze(0)  # [1, L]
-    cos, sin = model.rotary_emb(x, pos)
+    cos, sin = hf.rotary_emb(x, pos)
 
     h = x
     layer_hiddens: list[torch.Tensor] = []
-    for layer in model.layers:
+    for layer in hf.layers:
         residual = h
         hn = layer.input_layernorm(h)
         attn = layer.self_attn
@@ -151,7 +151,7 @@ def flex_packed_forward(
         if output_hidden_states:
             layer_hiddens.append(h.squeeze(0))
 
-    h = model.norm(h).squeeze(0)  # [L, D]
+    h = hf.norm(h).squeeze(0)  # [L, D]
     if output_hidden_states:
         return h, tuple(layer_hiddens)
     return h

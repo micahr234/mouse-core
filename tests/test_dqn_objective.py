@@ -1,160 +1,69 @@
 """Tests for DQN objective on synthetic tensors."""
-
 from __future__ import annotations
-
 import torch
 from tensordict import TensorDict
-
 from mouse_core.objectives import DqnObjective
 
-
 def test_dqn_objective_runs() -> None:
-    b, s, a = 2, 4, 3
-    step_stream = TensorDict(
-        {
-            "action": torch.randint(0, a, (b, s)),
-            "reward": torch.randn(b, s),
-            "done": torch.zeros(b, s, dtype=torch.long),
-        },
-        batch_size=(b, s),
-    )
-    out = TensorDict(
-        {
-            "action_value": torch.randn(b, s, a),
-            "action_value_target": torch.randn(b, s, a),
-        },
-        batch_size=(b, s),
-    )
+    n, a = (8, 3)
+    step_stream = TensorDict({'action': torch.randint(0, a, (n,)), 'reward': torch.randn(n), 'done': torch.zeros(n, dtype=torch.long), 'sequence_id': torch.tensor([0, 0, 0, 0, 1, 1, 1, 1])}, batch_size=[n])
+    out = TensorDict({'action_value': torch.randn(n, a), 'action_value_target': torch.randn(n, a)}, batch_size=[n])
     objective = DqnObjective(gamma_step=0.99)
     loss, metrics = objective(step_stream, out)
     assert loss.ndim == 0
-    assert "action_value" in metrics
-    assert metrics["action_value"] >= 0.0
-
+    assert 'action_value' in metrics
+    assert metrics['action_value'] >= 0.0
 
 def test_dqn_objective_rejects_wrong_action_shape() -> None:
-    b, s, a = 2, 4, 3
-    step_stream = TensorDict(
-        {
-            "action": torch.randint(0, a, (b, s, 1)),
-            "reward": torch.randn(b, s),
-            "done": torch.zeros(b, s, dtype=torch.long),
-        },
-        batch_size=(b, s),
-    )
-    out = TensorDict(
-        {
-            "action_value": torch.randn(b, s, a),
-            "action_value_target": torch.randn(b, s, a),
-        },
-        batch_size=(b, s),
-    )
+    n, a = (4, 3)
+    step_stream = TensorDict({'action': torch.randint(0, a, (n, 1)), 'reward': torch.randn(n), 'done': torch.zeros(n, dtype=torch.long)}, batch_size=[n])
+    out = TensorDict({'action_value': torch.randn(n, a), 'action_value_target': torch.randn(n, a)}, batch_size=[n])
     try:
         DqnObjective(gamma_step=0.99)(step_stream, out)
     except ValueError:
         pass
     else:
-        raise AssertionError("expected ValueError for action shape [B, S, 1]")
-
+        raise AssertionError('expected ValueError for action shape [N, 1]')
 
 def test_dqn_objective_requires_min_sequence() -> None:
-    step_stream = TensorDict(
-        {
-            "action": torch.zeros(1, 1, dtype=torch.long),
-            "reward": torch.zeros(1, 1),
-            "done": torch.zeros(1, 1, dtype=torch.long),
-        },
-        batch_size=(1, 1),
-    )
-    out = TensorDict(
-        {"action_value": torch.zeros(1, 1, 2), "action_value_target": torch.zeros(1, 1, 2)},
-        batch_size=(1, 1),
-    )
+    step_stream = TensorDict({'action': torch.zeros(1, dtype=torch.long), 'reward': torch.zeros(1), 'done': torch.zeros(1, dtype=torch.long)}, batch_size=[1])
+    out = TensorDict({'action_value': torch.zeros(1, 2), 'action_value_target': torch.zeros(1, 2)}, batch_size=[1])
     try:
         DqnObjective()(step_stream, out)
     except ValueError as e:
-        assert "Not enough" in str(e)
+        assert 'Not enough' in str(e)
     else:
-        raise AssertionError("expected ValueError for S < 2")
-
+        raise AssertionError('expected ValueError for N < 2')
 
 def test_dqn_objective_trains_on_terminal_transitions() -> None:
     """Transitions *from* terminal states must contribute to the loss."""
-    # Sequence: s0 (running) → s1 (episode terminal, done=1) → s2 (reset).
-    # The transition out of s1 (stored at t+2) should still be trained.
-    # With gamma_episode_terminal=0.0 the td_target for that transition is
-    # just reward[2], so the loss on it is (q(s1, a2) - reward[2])^2.
-    step_stream = TensorDict(
-        {
-            "action": torch.tensor([[0, 1, 0]]),
-            "reward": torch.tensor([[0.0, 1.0, 5.0]]),
-            "done": torch.tensor([[0, 1, 0]]),
-        },
-        batch_size=(1, 3),
-    )
-    out = TensorDict(
-        {
-            "action_value": torch.tensor([[[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]]]),
-            "action_value_target": torch.zeros(1, 3, 2),
-        },
-        batch_size=(1, 3),
-    )
-
+    step_stream = TensorDict({'action': torch.tensor([0, 1, 0]), 'reward': torch.tensor([0.0, 1.0, 5.0]), 'done': torch.tensor([0, 1, 0])}, batch_size=[3])
+    out = TensorDict({'action_value': torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]]), 'action_value_target': torch.zeros(3, 2)}, batch_size=[3])
     loss, _ = DqnObjective(gamma_step=0.0, gamma_episode_terminal=0.0)(step_stream, out)
+    assert abs(loss.item() - 2.5) < 1e-05
 
-    # Two transitions:
-    #   t=0: q(s0, a=1)=2.0, td_target=reward[1]+0=1.0  → (2-1)^2 = 1.0
-    #   t=1: q(s1, a=0)=3.0, td_target=reward[2]+0=5.0  → (3-5)^2 = 4.0
-    # mean = 2.5
-    assert abs(loss.item() - 2.5) < 1e-5
+def _sequence_fixture(sequence_id: list[int]) -> tuple[TensorDict, TensorDict]:
+    step_stream = TensorDict({'action': torch.tensor([0, 1, 0]), 'reward': torch.tensor([0.0, 1.0, 5.0]), 'done': torch.tensor([0, 0, 0]), 'sequence_id': torch.tensor(sequence_id)}, batch_size=[3])
+    out = TensorDict({'action_value': torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]]), 'action_value_target': torch.zeros(3, 2)}, batch_size=[3])
+    return (step_stream, out)
 
-
-def _segment_fixture(segment_id: list[int]) -> tuple[TensorDict, TensorDict]:
-    step_stream = TensorDict(
-        {
-            "action": torch.tensor([[0, 1, 0]]),
-            "reward": torch.tensor([[0.0, 1.0, 5.0]]),
-            "done": torch.tensor([[0, 0, 0]]),
-            "segment_id": torch.tensor([segment_id]),
-        },
-        batch_size=(1, 3),
-    )
-    out = TensorDict(
-        {
-            "action_value": torch.tensor([[[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]]]),
-            "action_value_target": torch.zeros(1, 3, 2),
-        },
-        batch_size=(1, 3),
-    )
-    return step_stream, out
-
-
-def test_dqn_objective_skips_transitions_across_pack_segments() -> None:
-    """A pair whose steps belong to different pack segments is not a transition."""
-    # Rows 0 and 1 are different segments, so only the (1, 2) pair contributes:
-    # (3 - 5)^2 = 4.0.
-    step_stream, out = _segment_fixture([0, 1, 1])
-
+def test_dqn_objective_skips_transitions_across_sequences() -> None:
+    """A pair whose steps belong to different sequences is not a transition."""
+    step_stream, out = _sequence_fixture([0, 1, 1])
     loss, metrics = DqnObjective(gamma_step=0.0)(step_stream, out)
+    assert abs(loss.item() - 4.0) < 1e-05
+    assert abs(metrics['q_values_mean'] - 3.0) < 1e-05
 
-    assert abs(loss.item() - 4.0) < 1e-5
-    assert abs(metrics["q_values_mean"] - 3.0) < 1e-5  # max online Q at current state
-
-
-def test_dqn_objective_without_segment_breaks_trains_all_pairs() -> None:
-    step_stream, out = _segment_fixture([0, 0, 0])
-
+def test_dqn_objective_without_sequence_breaks_trains_all_pairs() -> None:
+    step_stream, out = _sequence_fixture([0, 0, 0])
     loss, _ = DqnObjective(gamma_step=0.0)(step_stream, out)
+    assert abs(loss.item() - 2.5) < 1e-05
 
-    assert abs(loss.item() - 2.5) < 1e-5
-
-
-def test_dqn_objective_raises_when_all_pairs_cross_segments() -> None:
-    step_stream, out = _segment_fixture([0, 1, 2])
-
+def test_dqn_objective_raises_when_all_pairs_cross_sequences() -> None:
+    step_stream, out = _sequence_fixture([0, 1, 2])
     try:
         DqnObjective(gamma_step=0.0)(step_stream, out)
     except ValueError as e:
-        assert "packed-segment" in str(e)
+        assert 'sequence boundary' in str(e)
     else:
-        raise AssertionError("expected ValueError when every pair crosses a segment boundary")
+        raise AssertionError('expected ValueError when every pair crosses a sequence boundary')

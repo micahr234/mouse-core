@@ -11,30 +11,30 @@ from mouse_core.objectives.base import Objective
 
 def _valid_transitions(
     objective_data: TensorDict,
-    B: int,
-    S: int,
-    device: torch.device,
+    N: int,
+    device: torch.device | str | None,
 ) -> torch.Tensor:
-    """Boolean ``[B, S-1]`` mask: True where the pair ``(t, t+1)`` is a real transition.
+    """Boolean ``[N-1]`` mask: True where the pair ``(i, i+1)`` is a real transition.
 
-    ``DataLoader(pack=True)`` stitches sequences from independently sampled
-    segments and labels each step with a ``segment_id``. A pair whose adjacent
-    steps have different IDs straddles two unrelated slices, so it must not be
-    trained on. Batches without a ``segment_id`` column (manual batches that
-    never went through ``Model.forward``) are fully valid.
+    Adjacent steps belonging to different sequences (different ``sequence_id``)
+    are excluded. Batches without a ``sequence_id`` column are fully valid.
     """
-    valid = torch.ones(B, S - 1, dtype=torch.bool, device=device)
-    if "segment_id" in objective_data.keys():
-        segment_id = objective_data["segment_id"]
-        if segment_id.shape != torch.Size([B, S]):
+    if device is None:
+        device = torch.device("cpu")
+    if N < 2:
+        return torch.zeros(0, dtype=torch.bool, device=device)
+    valid = torch.ones(N - 1, dtype=torch.bool, device=device)
+    if "sequence_id" in objective_data.keys():
+        sequence_id = objective_data["sequence_id"]
+        if sequence_id.shape != torch.Size([N]):
             raise ValueError(
-                f"segment_id must have shape [{B}, {S}], got {tuple(segment_id.shape)}."
+                f"sequence_id must have shape [{N}], got {tuple(sequence_id.shape)}."
             )
-        valid &= segment_id[:, 1:] == segment_id[:, :-1]
+        valid &= sequence_id[1:] == sequence_id[:-1]
         if not valid.any():
             raise ValueError(
                 "No valid transitions: every consecutive pair in the batch "
-                "crosses a packed-segment boundary."
+                "crosses a sequence boundary."
             )
     return valid
 
@@ -45,12 +45,9 @@ class DqnObjective(Objective):
     Instantiate with hyperparameters, then call with
     ``(objective_data, predictions)`` to compute the loss.
 
-    Every consecutive pair ``(t, t+1)`` within a sampled sequence is a valid
-    TD transition, unless ``objective_data`` carries pack-mode ``segment_id``
-    values and the two steps belong to different pack slices — those pairs
-    straddle independently sampled slices and are excluded from the loss. The
-    done code stored at ``t+1`` determines the discount applied to the
-    bootstrap value:
+    Every consecutive pair ``(i, i+1)`` that shares a ``sequence_id`` is a valid
+    TD transition. Cross-sequence pairs are excluded. The done code stored at
+    ``i+1`` determines the discount applied to the bootstrap value:
 
     +------+--------------------------------------+------------------------------+
     | done | Meaning                              | Discount parameter           |
@@ -124,42 +121,46 @@ class DqnObjective(Objective):
         q: torch.Tensor = predictions["action_value"]
         q_target: torch.Tensor = predictions["action_value_target"]
 
-        B, S, A = q.shape
+        if q.ndim != 2:
+            raise ValueError(
+                f"DQN expects action_value shape [N, A], got {tuple(q.shape)}."
+            )
+        N, A = q.shape
         device = q.device
         value_dtype = q.dtype
 
-        if S < 2:
+        if N < 2:
             raise ValueError("Not enough valid q values in data.")
 
         action = objective_data[self.action_key]
         if action.dtype != torch.int64:
             raise TypeError(f"action must be int64, got {action.dtype}.")
-        if action.shape != torch.Size([B, S]):
-            raise ValueError(f"DQN objective expects action shape [{B}, {S}], got {tuple(action.shape)}.")
+        if action.shape != torch.Size([N]):
+            raise ValueError(f"DQN objective expects action shape [{N}], got {tuple(action.shape)}.")
 
         reward = objective_data[self.reward_key]
         if reward.dtype != torch.float32:
             raise TypeError(f"reward must be float32, got {reward.dtype}.")
-        if reward.shape != torch.Size([B, S]):
-            raise ValueError(f"DQN objective expects reward shape [{B}, {S}], got {tuple(reward.shape)}.")
+        if reward.shape != torch.Size([N]):
+            raise ValueError(f"DQN objective expects reward shape [{N}], got {tuple(reward.shape)}.")
 
         done = objective_data[self.done_key]
         if done.dtype != torch.int64:
             raise TypeError(f"done must be int64, got {done.dtype}.")
-        if done.shape != torch.Size([B, S]):
-            raise ValueError(f"DQN objective expects done shape [{B}, {S}], got {tuple(done.shape)}.")
+        if done.shape != torch.Size([N]):
+            raise ValueError(f"DQN objective expects done shape [{N}], got {tuple(done.shape)}.")
 
-        valid = _valid_transitions(objective_data, B, S, device)
+        valid = _valid_transitions(objective_data, N, device)
 
-        # Each token at position t encodes (obs_t, action_{t-1}, reward_{t-1}, done_{t-1}),
-        # i.e. the action, reward, and done stored at t are the ones that *produced* obs_t,
-        # not the ones taken *from* obs_t.  The transition out of state t is therefore
-        # described by the fields stored at t+1.
-        curr_q        = q[:, :-1, :]              # [B, S-1, A]  Q(s_t)
-        next_actions  = action[:, 1:]             # [B, S-1]     a_t (stored at t+1)
-        next_rewards  = reward[:, 1:]             # [B, S-1]     r_t (stored at t+1)
-        next_done     = done[:, 1:]  # [B, S-1]  done code at t+1
-        next_q_target = q_target[:, 1:, :]        # [B, S-1, A]  Q_target(s_{t+1})
+        # Each token at position i encodes (obs_i, action_{i-1}, reward_{i-1}, done_{i-1}),
+        # i.e. the action, reward, and done stored at i are the ones that *produced* obs_i,
+        # not the ones taken *from* obs_i.  The transition out of state i is therefore
+        # described by the fields stored at i+1.
+        curr_q = q[:-1, :]              # [N-1, A]  Q(s_i)
+        next_actions = action[1:]       # [N-1]     a_i (stored at i+1)
+        next_rewards = reward[1:]       # [N-1]     r_i (stored at i+1)
+        next_done = done[1:]            # [N-1]     done code at i+1
+        next_q_target = q_target[1:, :]  # [N-1, A]  Q_target(s_{i+1})
 
         # Vectorized discount: one gamma per done code (0–4).
         gammas = torch.tensor(
@@ -173,10 +174,10 @@ class DqnObjective(Objective):
             dtype=value_dtype,
             device=device,
         )
-        discount = gammas[next_done]  # [B, S-1]
+        discount = gammas[next_done]  # [N-1]
 
-        q_values          = curr_q.gather(dim=-1, index=next_actions.unsqueeze(-1)).squeeze(-1)  # [B, S-1]
-        next_max_q_target = next_q_target.amax(dim=-1)                                           # [B, S-1]
+        q_values = curr_q.gather(dim=-1, index=next_actions.unsqueeze(-1)).squeeze(-1)  # [N-1]
+        next_max_q_target = next_q_target.amax(dim=-1)                                  # [N-1]
 
         td_target = next_rewards + discount * next_max_q_target
 
@@ -184,14 +185,14 @@ class DqnObjective(Objective):
 
         cql_penalty_mean: torch.Tensor | None = None
         if self.cql_weight > 0.0:
-            q_scale      = (td_target.abs() + self.cql_scale_q_eps).detach()
-            cql_penalty  = torch.logsumexp(curr_q, dim=-1) - q_values
-            loss         = loss + self.cql_weight * q_scale * cql_penalty
+            q_scale = (td_target.abs() + self.cql_scale_q_eps).detach()
+            cql_penalty = torch.logsumexp(curr_q, dim=-1) - q_values
+            loss = loss + self.cql_weight * q_scale * cql_penalty
             cql_penalty_mean = cql_penalty.detach()[valid].mean()
 
         loss = loss[valid].mean()
 
-        curr_max_q = curr_q.amax(dim=-1)  # [B, S-1]  max online Q at s_t
+        curr_max_q = curr_q.amax(dim=-1)  # [N-1]  max online Q at s_i
         curr_max_det = curr_max_q.detach()[valid]
         curr_max_std = (
             curr_max_det.std()

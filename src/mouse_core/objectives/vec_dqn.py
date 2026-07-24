@@ -17,13 +17,13 @@ class VecDqnObjective(Objective):
     """Vector-DQN cosine-similarity objective with a frozen target network.
 
     Reads ``predictions["action_vector"]`` and ``predictions["action_vector_target"]``
-    (shape ``[B, S, A, D]``) from the model's vector action-value head.
+    (shape ``[N, A, D]``) from the model's vector action-value head.
     Boundary rows are not used as current states because the following row may
     be a reset frame whose input action was ignored. When a transition ends at a
-    boundary and a reset row is available inside the sampled sequence, that reset
-    row supplies the target vector. Row pairs that straddle a packed-segment
-    boundary (different ``segment_id`` values) are excluded, as are boundary
-    transitions whose substitute target row belongs to a different segment.
+    boundary and a reset row is available inside the same sequence, that reset
+    row supplies the target vector. Row pairs that straddle a sequence
+    boundary (different ``sequence_id``) are excluded, as are boundary
+    transitions whose substitute target row belongs to a different sequence.
 
     Args:
         tau: Polyak coefficient for target-network updates.
@@ -71,17 +71,24 @@ class VecDqnObjective(Objective):
         online_vecs: torch.Tensor = predictions["action_vector"]
         target_vecs: torch.Tensor = predictions["action_vector_target"]
 
-        B, S, A, D = online_vecs.shape
+        if online_vecs.ndim != 3:
+            raise ValueError(
+                f"VecDqnObjective expects action_vector shape [N, A, D], "
+                f"got {tuple(online_vecs.shape)}."
+            )
+        N, A, D = online_vecs.shape
         dtype = torch.float32
 
-        if S < 2:
+        if N < 2:
             raise ValueError("Not enough valid vec_dqn vectors in data.")
 
         action = objective_data[self.action_key].to(dtype=torch.long)
-        if action.ndim == 3 and action.shape[-1] == 1:
+        if action.ndim == 2 and action.shape[-1] == 1:
             action = action.squeeze(-1)
-        if action.ndim != 2:
-            raise ValueError(f"VecDqnObjective expects action shape [B, S], got {tuple(action.shape)}.")
+        if action.ndim != 1:
+            raise ValueError(
+                f"VecDqnObjective expects action shape [N], got {tuple(action.shape)}."
+            )
         if self.use_episodic_reward:
             if "reward_episodic" not in objective_data.keys():
                 raise KeyError(
@@ -95,59 +102,53 @@ class VecDqnObjective(Objective):
         online_vecs = online_vecs.to(dtype=dtype)
         target_vecs = target_vecs.to(dtype=dtype)
 
-        # Each token at position t encodes (obs_t, action_{t-1}, reward_{t-1}, done_{t-1}),
-        # i.e. the action and reward stored at t are the ones that *produced* obs_t, not
-        # the ones taken *from* obs_t.  Therefore the action, reward, and done that
-        # correspond to the transition out of state t are stored one step ahead at t+1.
-        curr_vecs = online_vecs[:, :-1, :, :]   # [B, S-1, A, D]  vecs(s_t)
-        # Cloned because the boundary substitution below writes into it; a plain
-        # slice is a view that would mutate predictions["action_vector_target"].
-        next_vecs = target_vecs[:, 1:, :, :].clone()  # [B, S-1, A, D]  vecs_target(s_{t+1})
-        next_actions = action[:, 1:]             # [B, S-1]         a_t (stored at t+1)
-        next_rewards = reward[:, 1:]             # [B, S-1]         r_t (stored at t+1)
+        curr_vecs = online_vecs[:-1, :, :]   # [N-1, A, D]
+        next_vecs = target_vecs[1:, :, :].clone()  # [N-1, A, D]
+        next_actions = action[1:]             # [N-1]
+        next_rewards = reward[1:]             # [N-1]
 
-        boundary_at_next = done[:, 1:] != 0
-        if S > 2:
-            next_vecs[:, :-1, :, :] = torch.where(
-                boundary_at_next[:, :-1].view(B, S - 2, 1, 1),
-                target_vecs[:, 2:, :, :],
-                next_vecs[:, :-1, :, :],
+        boundary_at_next = done[1:] != 0
+        if N > 2:
+            next_vecs[:-1, :, :] = torch.where(
+                boundary_at_next[:-1].view(N - 2, 1, 1),
+                target_vecs[2:, :, :],
+                next_vecs[:-1, :, :],
             )
-        valid_transition = done[:, :-1] == 0
-        valid_transition[:, -1] = valid_transition[:, -1] & ~boundary_at_next[:, -1]
+        valid_transition = done[:-1] == 0
+        valid_transition[-1] = valid_transition[-1] & ~boundary_at_next[-1]
 
-        # Exclude pairs straddling a packed-segment boundary (different
-        # segment_id), and boundary transitions whose substituted target row
-        # (t+2) belongs to a different segment — that row is an unrelated slice.
-        valid_transition &= _valid_transitions(objective_data, B, S, device=done.device)
-        if S > 2 and "segment_id" in objective_data.keys():
-            segment_id = objective_data["segment_id"]
-            substitute_differs = segment_id[:, 2:] != segment_id[:, 1:-1]
-            valid_transition[:, :-1] &= ~(boundary_at_next[:, :-1] & substitute_differs)
+        valid_transition &= _valid_transitions(objective_data, N, device=done.device)
+        if N > 2 and "sequence_id" in objective_data.keys():
+            sequence_id = objective_data["sequence_id"]
+            substitute_differs = sequence_id[2:] != sequence_id[1:-1]
+            valid_transition[:-1] &= ~(boundary_at_next[:-1] & substitute_differs)
 
         if not valid_transition.any():
             raise ValueError("VecDqnObjective: batch contains no valid transitions.")
 
-        action_idx_exp = next_actions.unsqueeze(-1).unsqueeze(-1).expand(B, S - 1, 1, D)
-        curr_action_vecs = curr_vecs.gather(dim=2, index=action_idx_exp).squeeze(2)  # [B, S-1, D]
+        action_idx_exp = next_actions.unsqueeze(-1).unsqueeze(-1).expand(N - 1, 1, D)
+        curr_action_vecs = curr_vecs.gather(dim=1, index=action_idx_exp).squeeze(1)  # [N-1, D]
 
-        greedy_idx = vector_action_scores(next_vecs).argmax(dim=-1)                        # [B, S-1]
-        greedy_idx_exp = greedy_idx.unsqueeze(-1).unsqueeze(-1).expand(B, S - 1, 1, D)
-        next_action_vecs = next_vecs.gather(dim=2, index=greedy_idx_exp).squeeze(2)  # [B, S-1, D]
+        greedy_idx = vector_action_scores(next_vecs).argmax(dim=-1)  # [N-1]
+        greedy_idx_exp = greedy_idx.unsqueeze(-1).unsqueeze(-1).expand(N - 1, 1, D)
+        next_action_vecs = next_vecs.gather(dim=1, index=greedy_idx_exp).squeeze(1)  # [N-1, D]
 
-        if self.normalize_reward_mean:
-            next_rewards = next_rewards - next_rewards.mean(dim=1, keepdim=True)
-        if self.normalize_reward_std:
-            next_rewards = (next_rewards / (next_rewards.std(dim=1, keepdim=True) + self.normalize_reward_eps)) * self.normalize_reward_std_target
+        if self.normalize_reward_mean or self.normalize_reward_std:
+            sid = (
+                objective_data["sequence_id"][:-1]
+                if "sequence_id" in objective_data.keys()
+                else torch.zeros(N - 1, dtype=torch.long, device=next_rewards.device)
+            )
+            next_rewards = _normalize_per_sequence(do_mean=self.normalize_reward_mean, do_std=self.normalize_reward_std, eps=self.normalize_reward_eps, std_target=self.normalize_reward_std_target, x=next_rewards, sequence_id=sid)
 
-        theta = next_rewards * self.reward_scale + self.reward_shift          # [B, S-1]
-        rotated = rope_rotate(x=next_action_vecs, theta=theta)                # [B, S-1, D]
+        theta = next_rewards * self.reward_scale + self.reward_shift          # [N-1]
+        rotated = rope_rotate(x=next_action_vecs, theta=theta)                # [N-1, D]
 
-        cosine_sim = F.cosine_similarity(curr_action_vecs, rotated.detach(), dim=-1)  # [B, S-1]
+        cosine_sim = F.cosine_similarity(curr_action_vecs, rotated.detach(), dim=-1)  # [N-1]
         loss = (1.0 - cosine_sim)[valid_transition].mean()
 
-        curr_scores = vector_action_scores(curr_vecs).abs() / math.pi  # [B, S-1, A]
-        curr_max_score = curr_scores.amax(dim=-1)  # [B, S-1]
+        curr_scores = vector_action_scores(curr_vecs).abs() / math.pi  # [N-1, A]
+        curr_max_score = curr_scores.amax(dim=-1)  # [N-1]
         curr_max_det = curr_max_score.detach()[valid_transition]
         named: dict[str, torch.Tensor] = {
             "action_vector": loss.detach(),
@@ -157,3 +158,25 @@ class VecDqnObjective(Objective):
         }
         metrics: dict[str, float] = dict(zip(named, torch.stack(list(named.values())).tolist()))
         return loss, metrics
+
+
+def _normalize_per_sequence(
+    *,
+    x: torch.Tensor,
+    sequence_id: torch.Tensor,
+    do_mean: bool,
+    do_std: bool,
+    eps: float,
+    std_target: float,
+) -> torch.Tensor:
+    """Normalize ``x [N]`` within each ``sequence_id`` group."""
+    out = x.clone()
+    for sid in sequence_id.unique():
+        mask = sequence_id == sid
+        chunk = out[mask]
+        if do_mean:
+            chunk = chunk - chunk.mean()
+        if do_std:
+            chunk = (chunk / (chunk.std() + eps)) * std_target
+        out[mask] = chunk
+    return out
