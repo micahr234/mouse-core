@@ -64,6 +64,30 @@ def test_dqn_objective_raises_when_all_pairs_cross_sequences() -> None:
     try:
         DqnObjective(gamma_step=0.0)(step_stream, out)
     except ValueError as e:
-        assert 'sequence boundary' in str(e)
+        assert 'sequence or grouping boundary' in str(e)
     else:
         raise AssertionError('expected ValueError when every pair crosses a sequence boundary')
+
+def test_dqn_objective_skips_transitions_across_tasks() -> None:
+    """A pair whose steps belong to different tasks is not a transition."""
+    step_stream = TensorDict(
+        {
+            'action': torch.tensor([0, 1, 0]),
+            'reward': torch.tensor([0.0, 1.0, 5.0]),
+            'done': torch.tensor([0, 3, 0]),
+            'sequence_id': torch.tensor([0, 0, 0]),
+            'grouping_id': torch.tensor([0, 0, 1]),
+        },
+        batch_size=[3],
+    )
+    out = TensorDict(
+        {
+            'action_value': torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]]),
+            'action_value_target': torch.zeros(3, 2),
+        },
+        batch_size=[3],
+    )
+    # Only pair (0,1) is valid (same task); pair (1,2) crosses grouping_id.
+    loss, metrics = DqnObjective(gamma_step=0.0, grouping_field="grouping_id")(step_stream, out)
+    assert abs(loss.item() - 1.0) < 1e-05
+    assert abs(metrics['q_values_mean'] - 2.0) < 1e-05

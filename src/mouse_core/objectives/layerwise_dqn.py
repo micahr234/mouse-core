@@ -71,8 +71,8 @@ class LayerwiseDqnObjective(Objective):
     ``predictions["action_value_layerwise_target"]`` with shape ``[N, L, A]``.
     Each layer and each done-code uses its own discount, built at construction
     from explicit shallow/deep endpoint pairs. Row pairs that straddle a
-    sequence boundary (different ``sequence_id``) are excluded from every
-    layer's loss.
+    sequence or grouping boundary (different ``sequence_id`` / ``grouping_field``
+    column when set) are excluded from every layer's loss.
 
     Effective planning horizon is ``H(gamma) = 1 / (1 - gamma)``. Layer ``0`` uses
     each ``gamma_*_start``; the deepest layer uses the deep value
@@ -137,6 +137,7 @@ class LayerwiseDqnObjective(Objective):
         done_key: str = "done",
         cql_weight: float = 0.0,
         cql_scale_q_eps: float = 1.0,
+        grouping_field: str | None = None,
     ) -> None:
         self.num_backbone_layers = int(num_backbone_layers)
         self.gamma_step_start = float(gamma_step_start)
@@ -155,6 +156,7 @@ class LayerwiseDqnObjective(Objective):
         self.done_key = done_key
         self.cql_weight = cql_weight
         self.cql_scale_q_eps = cql_scale_q_eps
+        self.grouping_field = grouping_field
 
         build = _build_layer_gamma_schedule
         n = self.num_backbone_layers
@@ -242,7 +244,7 @@ class LayerwiseDqnObjective(Objective):
                 f"Layerwise DQN objective expects done shape [{N}], got {tuple(done.shape)}."
             )
 
-        valid = _valid_transitions(objective_data, N, device)
+        valid = _valid_transitions(objective_data, N, device, grouping_field=self.grouping_field)
 
         curr_q = q[:-1, :, :]              # [N-1, L, A]
         next_actions = action[1:]          # [N-1]

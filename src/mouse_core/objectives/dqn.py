@@ -13,17 +13,21 @@ def _valid_transitions(
     objective_data: TensorDict,
     N: int,
     device: torch.device | str | None,
+    *,
+    grouping_field: str | None = None,
 ) -> torch.Tensor:
     """Boolean ``[N-1]`` mask: True where the pair ``(i, i+1)`` is a real transition.
 
     Adjacent steps belonging to different sequences (different ``sequence_id``)
-    are excluded. Batches without a ``sequence_id`` column are fully valid.
+    or different grouping runs (``grouping_field`` column) are excluded. Batches
+    without those columns skip the corresponding check.
     """
     if device is None:
         device = torch.device("cpu")
     if N < 2:
         return torch.zeros(0, dtype=torch.bool, device=device)
     valid = torch.ones(N - 1, dtype=torch.bool, device=device)
+    used_grouping = False
     if "sequence_id" in objective_data.keys():
         sequence_id = objective_data["sequence_id"]
         if sequence_id.shape != torch.Size([N]):
@@ -31,11 +35,19 @@ def _valid_transitions(
                 f"sequence_id must have shape [{N}], got {tuple(sequence_id.shape)}."
             )
         valid &= sequence_id[1:] == sequence_id[:-1]
-        if not valid.any():
+    if grouping_field is not None and grouping_field in objective_data.keys():
+        grouping = objective_data[grouping_field]
+        if grouping.shape != torch.Size([N]):
             raise ValueError(
-                "No valid transitions: every consecutive pair in the batch "
-                "crosses a sequence boundary."
+                f"{grouping_field} must have shape [{N}], got {tuple(grouping.shape)}."
             )
+        valid &= grouping[1:] == grouping[:-1]
+        used_grouping = True
+    if ("sequence_id" in objective_data.keys() or used_grouping) and (not valid.any()):
+        raise ValueError(
+            "No valid transitions: every consecutive pair in the batch "
+            "crosses a sequence or grouping boundary."
+        )
     return valid
 
 
@@ -45,8 +57,9 @@ class DqnObjective(Objective):
     Instantiate with hyperparameters, then call with
     ``(objective_data, predictions)`` to compute the loss.
 
-    Every consecutive pair ``(i, i+1)`` that shares a ``sequence_id`` is a valid
-    TD transition. Cross-sequence pairs are excluded. The done code stored at
+    Every consecutive pair ``(i, i+1)`` that shares ``sequence_id`` and
+    ``grouping_field`` (when set and present) is a valid TD transition.
+    Cross-sequence and cross-grouping pairs are excluded. The done code stored at
     ``i+1`` determines the discount applied to the bootstrap value:
 
     +------+--------------------------------------+------------------------------+
@@ -98,6 +111,7 @@ class DqnObjective(Objective):
         action_key: str = "action",
         reward_key: str = "reward",
         done_key: str = "done",
+        grouping_field: str | None = None,
         cql_weight: float = 0.0,
         cql_scale_q_eps: float = 1.0,
     ) -> None:
@@ -110,6 +124,7 @@ class DqnObjective(Objective):
         self.action_key = action_key
         self.reward_key = reward_key
         self.done_key = done_key
+        self.grouping_field = grouping_field
         self.cql_weight = cql_weight
         self.cql_scale_q_eps = cql_scale_q_eps
 
@@ -150,7 +165,9 @@ class DqnObjective(Objective):
         if done.shape != torch.Size([N]):
             raise ValueError(f"DQN objective expects done shape [{N}], got {tuple(done.shape)}.")
 
-        valid = _valid_transitions(objective_data, N, device)
+        valid = _valid_transitions(
+            objective_data, N, device, grouping_field=self.grouping_field
+        )
 
         # Each token at position i encodes (obs_i, action_{i-1}, reward_{i-1}, done_{i-1}),
         # i.e. the action, reward, and done stored at i are the ones that *produced* obs_i,

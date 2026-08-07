@@ -7,11 +7,135 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- ``StepTokens``: tokenizer output for one step (token arrays + scalar
+  ``grouping_id`` + ``step_fields``). ``pack_token_batch(...)`` builds a
+  ``TokenBatch`` from many steps (assigns ``sequence_ids``, expands
+  ``grouping_ids``, computes ``prediction_indices``).
+- ``Augmenter.reseed()`` advances the draw generation so every ``seed_field``
+  key gets a new permute/scale/shift set (stable within a generation).
+  ``compose(...).reseed()`` forwards to stages that define ``reseed``;
+  ``DataLoader`` calls ``transform.reseed()`` once at the start of each batch
+  fetch.
+- ``augment: bool = True`` keyword on ``Augmenter.__call__`` and composed
+  transforms (``compose`` forwards it to stages whose signature declares it).
+  Eval / decode call ``transform(step, augment=False)`` so the model sees raw
+  values — no eval-time reseeding, and chosen actions mean the same thing to
+  the env as to the model.
+- Required ``input_field`` / ``output_field`` on ``Augmenter`` and ``Grouper``
+  (same names ⇒ in-place; different ⇒ rename / copy).
+- ``Selector(fields=...)``: last rename stage — input→output map of step keys
+  (replaces ``Filter(keep_fields=...)``).
+- Tokenizer / embedder modalities use a single ``field=`` (modality name = step
+  key after Selector). Learnable numeric embedder modalities remain field-free.
+- Separate tokenizer vs embedder modality spec types
+  (``NumericTokenizerModalitySpec`` / ``TextTokenizerModalitySpec`` vs
+  ``NumericEmbedderModalitySpec`` / ``TextEmbedderModalitySpec``). Packing knobs
+  (``skip``, ``required``) stay on tokenizers; ``vocab_size`` / ``std`` stay on
+  embedders. Alignment is by modality **name** (``field``), not list order.
+- ``StepTokens`` / ``TokenBatch`` ``modality_names`` + ``modality_map`` (name →
+  type/dim). Per-token ``modality_ids`` index the name table; type/kind is looked
+  up from the map (no per-token ``kinds`` array).
+- Tokenizer ``step_fields=`` keep-list: only listed step keys are copied into
+  ``StepTokens.step_fields`` / ``objective_data`` (modalities are not auto-copied).
+- Required ``grouping_field`` on ``StepTokens`` / ``TokenBatch``,
+  ``NumericTokenizer``, and ``TextTokenizer``. Grouper ``output_field`` should
+  match; int coercion for attention happens only when packing
+  ``TokenBatch.grouping_ids``.
+- Objectives (DQN / Layerwise / PPO / GRPO) take
+  ``grouping_field: str | None = None`` (``None`` ⇒ no grouping filter).
+
+### Changed
+- ``Grouper`` copies ``step[input_field]`` onto ``output_field`` as-is (no int
+  cast; no ``field=None → grouping_id=0`` path). For no isolation, stamp a
+  constant column and point both fields at it, or ensure ``grouping_field`` is
+  already on the step before tokenize.
+- Per-step data pipeline under ``mouse_core.data`` (compose on raw steps, then
+  pack, then embed): ``augmenter → grouper → selector → tokenizer → pack → embedder``.
+  * ``compose(*stages)`` — thread a step through callables; ``reseed()`` forwards
+  * ``Augmenter`` — ``dict → dict`` (required ``seed_field=``; draws keyed by that
+    id within a ``reseed`` generation; usable in train and eval)
+  * ``Grouper`` — ``dict → dict`` via ``input_field`` / ``output_field``
+  * ``Selector`` — ``dict → dict`` (``fields`` input→output map; include Grouper
+    ``output_field``; last rename stage)
+  * ``NumericTokenizer`` / ``TextTokenizer`` — ``dict → StepTokens`` (one step;
+    ``field=`` modalities; require ``grouping_field=``)
+  * ``pack_token_batch(...)`` — join per-step ``StepTokens`` into a ``TokenBatch``
+    (optional ``batch_size=`` for empty decode rows; steps must share
+    ``grouping_field``)
+  Construct tokenizers with the data pipeline; construct embedders separately.
+  Tokenizer vs embedder modality configs may differ (e.g. packing ``skip`` vs
+  embedder ``vocab_size`` / ``std``) so long as shared names agree on type.
+- ``DataLoader(transform=...)``: required ``dict → StepTokens`` callable; loader
+  samples windows, maps ``transform`` per step, and packs into a ``TokenBatch``.
+  Optional ``index_field=`` stamps absolute store offsets under a caller-chosen
+  key (never a hardcoded field name).
+- Payload fields ``modality_ids`` / ``ids`` / ``values`` (was ``token_types`` /
+  ``token_ids`` / ``scalars``). Tokenizer emits discrete ids or continuous
+  values; embedder maps them. Token type comes from ``modality_map`` by name.
+- ``TokenBatch.step_fields`` (was ``col_values``): step-level objective columns
+  ``[N]`` / ``[N, dim]``, including ``sequence_id`` and ``grouping_field``.
+  Tokenizer ``step_fields=`` selects which raw step keys are packed (replaces
+  ``extra_fields`` for PPO/GRPO columns such as ``old_log_prob`` / ``advantage``).
+- ``TokenBatch.grouping_ids`` ``[L]`` (attention array) plus step-level
+  ``step_fields[grouping_field]``: same id may attend, different ids never attend.
+  Absolute ids typically come from ``Grouper(input_field=..., output_field=...)``
+  matching tokenizer ``grouping_field``; FlexDecode masks by equality (no
+  relative remapping / boundary advance).
+- ``NumericEmbedder`` / ``TextEmbedder`` tables keyed by modality name; forward
+  validates batch ``modality_map`` names/types against the embedder config.
+- ``FlexDecodeSession.reset_rows``: zero selected per-sequence decode lengths so
+  a cleared stream can restart without rebuilding the whole batch.
+
 ### Removed
+- Vector-DQN, entirely: ``VecDqnObjective``, ``VectorActionValueHead``,
+  ``vector_action_scores``, ``rope_rotate``, the ``"action_vector"`` head name
+  (with ``HeadSpec.vec_dim`` / ``bias_scale`` and
+  ``polyak_update(action_vector_tau=)``), example notebook
+  ``05_train_offline_vec_dqn.ipynb``, and its tests.
+- ``concat_token_batches`` (replaced by ``pack_token_batch`` over ``StepTokens``).
+- Shared ``ModalitySpec`` / ``TextModalitySpec`` and tokenizer/embedder
+  ``input_field`` / ``output_field`` pairs (use ``field=``; rename with Selector).
+- ``Filter`` / ``Filter(keep_fields=...)`` (use ``Selector(fields=...)``).
+- ``Grouper(field=...)`` / ``Grouper()`` constant-zero path (use required
+  ``input_field`` / ``output_field``; stamp a constant column for no isolation).
+- ``Augmenter`` without ``seed_field`` (and the per-call streaming ``generator``
+  path); draws are always keyed by ``seed_field`` so steps that share an id
+  share permute/scale/shift.
+- ``Augmenter(keep_fields=...)`` (use :class:`~mouse_core.data.selector.Selector`).
+- ``Encoder.prepare`` / ``make_preparer`` and ``DataLoader(preparer=)`` (replaced by
+  data-pipeline tokenizers and ``DataLoader(transform=)``).
+- ``DataLoader`` stage kwargs ``augmenter=`` / ``filter=`` / ``grouper=`` /
+  ``tokenizer=`` (compose outside; pass ``transform=``).
+- Batch-level stage APIs (``list[list[dict]]`` entrypoints) — stages are per-step only.
+- ``Grouper`` ``type`` / ``boundary`` / ``boundary_values`` / ``is_boundary_value``
+  and decode ``TokenBatch.grouper`` / ``row_grouping_id`` / boundary advance
+  (copy ``input_field`` → ``output_field`` only).
+- ``build_numeric_embedder`` / ``build_text_embedder`` and ``Encoder.make_tokenizer`` (tokenizer and embedder are constructed separately).
+- ``TokenBatch.token_types`` / ``token_ids`` / ``scalars`` (renamed; no aliases).
+- Hard-coded ``done in (3, 4)`` / ``isolate_tasks`` mask-id logic.
+- ``AttentionGrouping`` / ``attention_grouping=`` (renamed to ``Grouper``).
+- ``TokenBatch.task_ids`` / ``col_values["task_id"]`` and later ``mask_ids`` /
+  ``mask_id`` (renamed to ``grouping_ids`` / ``grouping_id``; assigned by calling
+  ``Grouper``).
+- ``TokenBatch.step_ids`` (unused; step↔token mapping uses ``prediction_indices``).
+- Example ``model.backbone.model.compile()`` calls. CUDA train/decode never invoke
+  the HuggingFace ``model.forward`` (they use FlexAttention packed train /
+  ``FlexDecodeSession``); compiling the HF module was a no-op. FlexAttention
+  still compiles itself under bf16/fp16.
+- ``Model.forward`` / embedder ``forward`` raw ``list[list[dict]]`` fallback — both
+  accept ``TokenBatch`` only. Online / eval: ``pack_token_batch([transform(s) for s in ...])``.
+- Optional ``DataLoader`` tokenizer / raw ``next_batch()`` return — ``transform=`` is
+  required and ``next_batch()`` always returns a ``TokenBatch``.
+- ``batch_field`` helper and tokenizer/embedder ``extra_fields`` (replaced by
+  tokenizer ``step_fields=`` keep-list).
+- Per-token ``TokenBatch.kinds`` / ``KIND_DISCRETE`` / ``KIND_CONTINUOUS`` on the
+  batch (kind comes from ``modality_map`` by name).
 - ``DataLoader`` ``pack`` / ``pad`` flags and train-time ``segment_ids`` plumbing.
+- ``TokenBatch.col_values`` (renamed to ``step_fields``).
   Packing/padding short windows and pack-seam isolation are gone (one public path).
 - ``TokenBatch.lengths``: per-sequence step counts are derived from
-  ``col_values["sequence_id"]`` + ``B`` via ``TokenBatch.step_counts()``
+  ``step_fields["sequence_id"]`` + ``B`` via ``TokenBatch.step_counts()``
   (``step_counts_from_sequence_id``).
 - Dead packing helpers (``pack_and_pad_rows``, ``pack_live_step_tokens``,
   ``counts_from_prediction_indices``, …); only ``left_align_content`` remains.
@@ -23,6 +147,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and unused ``ModalitySpec`` fields (``size``, ``in_min``, ``in_max``).
 
 ### Changed
+- Tokenizer and embedder are constructed independently (no paired ``build_*`` / ``make_tokenizer``). Examples define ``transform`` + ``DataLoader`` before the ``Model``.
+- ``TokenBatch`` lives in ``mouse_core.data`` (with augmenter / tokenizer /
+  grouper). Embedders are parameter-only ``nn.Module``s over that batch.
 - Public constructors and helpers are **keyword-only** (``def f(*, ...)`` / ``def m(self, *, ...)``):
   ``Model``, encoders, backbones, objectives, ``DataLoader``, hub push/load helpers,
   ``Model.head``, ``FlexDecodeSession.forward``, and related utilities. Call sites must
@@ -32,21 +159,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``__call__`` still works.
 - Training batches are **ragged**: ``sequence_length`` is a max window length;
   each of ``B`` sequences is one contiguous store slice of length ``1 .. S_max``.
-  ``DataLoader.next_batch()`` with a preparer returns a ``TokenBatch``; without a
-  preparer it returns ``list[list[dict]]`` only (no ``segment_ids``).
+  ``DataLoader(transform=...).next_batch()`` always returns a ``TokenBatch``.
 - ``step_token_indices`` renamed to ``prediction_indices`` (and
   ``counts_from_step_token_indices`` → ``counts_from_prediction_indices``).
-- ``TokenBatch`` / ``Encoder.prepare``: variable per-sequence step counts; flat
-  ``prediction_indices`` ``[N]``, ``col_values`` ``[N]`` (+ ``sequence_id``).
+- ``TokenBatch``: variable per-sequence step counts; flat
+  ``prediction_indices`` ``[N]``, ``step_fields`` ``[N]`` (+ ``sequence_id``).
   No stored ``lengths`` / ``segment_ids`` fields.
 - ``Model.forward`` training path: predictions and ``objective_data`` are flat
   ``TensorDict[N]`` (``N = len(prediction_indices)``). Flex / CPU document
-  attention masks by ``sequence_ids`` only (causal within sequence). Cached
-  decode stays rectangular ``[B, S]``.
-- Objectives (DQN / Layerwise / Vec / PPO / GRPO): flat ``x[:-1]`` / ``x[1:]`` with
-  valid pairs where ``sequence_id[i] == sequence_id[i+1]``.
+  attention masks by ``(sequence_ids, grouping_ids)`` (causal within the same
+  grouping-id run). Cached decode applies the same isolation (per-slot grouping-id
+  buffer + mask; RoPE resets per grouping-id run). Cached decode stays rectangular
+  ``[B, S]``.
+- Objectives (DQN / Layerwise / PPO / GRPO): flat ``x[:-1]`` / ``x[1:]`` with
+  valid pairs where ``sequence_id[i] == sequence_id[i+1]`` and, when
+  ``grouping_field=`` is set, ``objective_data[grouping_field]`` matches across
+  the pair.
+- Example notebooks build ``transform = compose(augmenter, grouper, selector,
+  tokenizer)`` (online typically omits augmenter/selector), pass
+  ``DataLoader(transform=transform)``, and reuse the same ``transform`` for
+  eval / online decode via ``pack_token_batch([transform(s, augment=False) for s in ...])``.
+  ``Grouper(input_field="task_index", output_field="grouping_id")`` with matching
+  tokenizer ``grouping_field=``; tokenizer and embedder modality lists stay
+  separate (``field=``); field keep/rename uses ``Selector(fields=...)``.
+- Example notebook constants renamed: ``MAX_EPISODE_STEPS`` →
+  ``MAX_STEPS_PER_EPISODE``, ``EPISODES_PER_TASK`` → ``MAX_EPISODES_PER_TASK``
+  (env kwargs ``max_episode_steps`` / ``episodes_per_task`` unchanged).
+- Example ``run_eval`` is a lockstep **env-step** budget: ``EVAL_STEPS`` /
+  ``num_steps`` (not tasks). Contexts persist across cycles so a window may
+  finish zero or many tasks; scores come from ``env.metrics`` (cleared at the
+  start of each call). Attention is task-isolated by mask, so task boundaries
+  do not clear context or reset/rebuild KV. The KV cache is rebuilt once at the
+  start of each call from persisted contexts (trimmed to ``max_cache``), then
+  only when the grow/``max_cache`` policy requires. Training notebooks share
+  one identical ``run_eval``; inference adds frame capture on the same contract.
 
 ### Fixed
+- ``Augmenter`` mask decisions are drawn per step (one Bernoulli draw per
+  modality per call) instead of once per ``seed_field`` key per generation,
+  which masked a modality for every step of a task across a whole batch.
+- ``Augmenter.reseed()`` discards the draw cache; previously it kept entries
+  for every past ``(generation, key)`` pair and grew without bound over
+  training.
+- Tokenizers raise ``KeyError`` when a ``step_fields`` key is missing from a
+  step instead of silently filling ``0.0`` (which trained objectives on zero
+  ``old_log_prob`` / ``advantage`` columns). Notebooks ``07`` / ``08`` stamp
+  the objective-only columns explicitly on eval and in-flight rollout rows.
+- Online rollouts (``03``, ``07``) bound the KV cache with the same
+  grow-then-rebuild ``kv_policy`` as ``run_eval`` (``max_cache`` /
+  ``start_cache``); previously ``run_rollout`` grew one cache across the whole
+  call. Rollout contexts are plain lists trimmed to ``max_cache`` per call
+  (the ``deque(maxlen=...)`` contexts are gone).
+- ``Augmenter`` draws are seeded with a stable digest instead of Python's
+  per-process salted ``hash()``, so ``Augmenter(seed=...)`` (and mask draws)
+  reproduce across interpreter runs.
+- Offline example notebooks (``02``, ``04``, ``06``) no longer augment at eval:
+  ``pack_rows`` passes ``augment=False``. Previously the model chose actions in
+  the augmenter's permuted label space while the env executed them as raw ids,
+  so the executed action was not the one the model selected.
+- ``08_train_online_grpo.ipynb`` forks on a persistent per-trunk step counter.
+  The old ``len(context) % BRANCH_EVERY`` trigger saturated once the context
+  deque reached ``MAX_CONTEXT`` (a multiple of ``BRANCH_EVERY``) and then
+  forked a full GRPO group on every trunk step.
+- ``09_inference.ipynb`` runs again: added the missing ``numpy`` and
+  ``mouse_core.models.kv_policy`` imports and fixed the ``eval_env`` /
+  ``env`` naming mismatch.
+- Example ``run_eval`` now appends each step to ``contexts`` immediately after
+  ``env.step``, so the last transition of a call is not dropped across eval
+  cycles (previously append ran only at the start of the next iteration).
 - Flex train / flat RoPE positions use a sync-free ``cummax`` run reset (no
   ``.item()`` for run count). Embedder type scatters skip host ``.any()`` checks.
 
@@ -58,7 +238,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ``flex_packed_forward`` caches the compiled FlexAttention kernel per device/dtype
   instead of recreating ``torch.compile(flex_attention)`` every step.
 - Example notebooks: inference moved to ``09_inference.ipynb`` (was ``04``);
-  layerwise / vec / text / PPO / GRPO training notebooks renumbered to ``04``–``08``.
+  layerwise / text / PPO / GRPO training notebooks renumbered to ``04`` /
+  ``06``–``08`` (``05`` was the vec-DQN notebook, since removed).
   All training notebooks run greedy held-out eval on a separate ``GroupEnv``
   (seed stream offset by ``EVAL_SEED_OFFSET``), with eval helpers defined locally
   in each notebook.
@@ -83,6 +264,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Example ``run_eval`` / ``run_rollout`` keep row **contexts** across cycle
   calls and rebuild the **KV cache** from those contexts each call (cache does
   not persist between calls).
+- ``examples/01_collect_dataset.ipynb`` ramps ``oracle_prob`` linearly from
+  ``ORACLE_PROB_START`` (default ``0.0``) to ``ORACLE_PROB_END`` (default ``1.0``).
+- ``NumericEmbedder`` modality type ``rff`` renamed to ``fourier`` (static
+  Fourier features; not random). No ``rff`` alias.
 
 ### Added
 - ``preferred_dtype(device)``: returns ``torch.bfloat16`` on CUDA and
@@ -112,7 +297,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   static Fourier; images require an image tokenizer (``image_tokenizer=``).
 - `action_modality` / `observation_modalities` helpers and `NumericEmbedder.infer_max_num_actions`.
   Modalities are declared with generic ``ModalitySpec`` field names and types
-  (``discrete`` / ``continuous`` / ``image`` / …); env-specific field naming belongs
+  (``discrete`` / ``fourier`` / ``continuous`` / ``image`` / …); env-specific field naming belongs
   at the call site.
 - Padded ``embeds [B, L, D]`` training path and SDPA segment float masks for
   training (replaced by flat concat + Flex / document mask).

@@ -1,19 +1,39 @@
-"""Tests for sequence-isolated attention masks and RoPE position ids."""
 from __future__ import annotations
+
+"""Tests for sequence/grouping-id-isolated attention masks and RoPE position ids."""
+
 import torch
-from mouse_core.models.base import Model, _flat_sequence_causal_mask, _flat_sequence_position_ids
+
+from mouse_core.data import Grouper
 from mouse_core.models.backbone import IdentityBackbone
+from mouse_core.models.base import Model, _flat_sequence_causal_mask, _flat_sequence_position_ids
 from mouse_core.models.embedding import NumericEmbedder
 from mouse_core.models.heads.dqn import DiscreteActionValueHead
+from tests._token_batch_helpers import batch_to_token_batch, tok_from_encoder
+
+_tok = tok_from_encoder
+
 
 def test_flat_sequence_position_ids_reset_per_sequence() -> None:
     sequence_ids = torch.tensor([0, 0, 0, 1, 1, 2])
-    pos = _flat_sequence_position_ids(sequence_ids=sequence_ids)
+    grouping_ids = torch.zeros_like(sequence_ids)
+    pos = _flat_sequence_position_ids(sequence_ids=sequence_ids, grouping_ids=grouping_ids)
     assert pos.tolist() == [[0, 1, 2, 0, 1, 0]]
+
+
+def test_flat_sequence_position_ids_reset_per_grouping_id() -> None:
+    sequence_ids = torch.zeros(6, dtype=torch.long)
+    grouping_ids = torch.tensor([0, 0, 0, 1, 1, 2])
+    pos = _flat_sequence_position_ids(sequence_ids=sequence_ids, grouping_ids=grouping_ids)
+    assert pos.tolist() == [[0, 1, 2, 0, 1, 0]]
+
 
 def test_flat_sequence_causal_mask_blocks_cross_sequence() -> None:
     sequence_ids = torch.tensor([0, 0, 1, 1])
-    mask = _flat_sequence_causal_mask(dtype=torch.float32, sequence_ids=sequence_ids)
+    grouping_ids = torch.zeros_like(sequence_ids)
+    mask = _flat_sequence_causal_mask(
+        dtype=torch.float32, sequence_ids=sequence_ids, grouping_ids=grouping_ids
+    )
     assert mask.shape == (1, 1, 4, 4)
     assert mask[0, 0, 0, 0] == 0.0
     assert mask[0, 0, 1, 0] == 0.0
@@ -26,17 +46,79 @@ def test_flat_sequence_causal_mask_blocks_cross_sequence() -> None:
     assert mask[0, 0, 3, 2] == 0.0
     assert mask[0, 0, 3, 3] == 0.0
 
+
+def test_flat_sequence_causal_mask_blocks_cross_grouping_id() -> None:
+    sequence_ids = torch.zeros(4, dtype=torch.long)
+    grouping_ids = torch.tensor([0, 0, 1, 1])
+    mask = _flat_sequence_causal_mask(
+        dtype=torch.float32, sequence_ids=sequence_ids, grouping_ids=grouping_ids
+    )
+    assert mask[0, 0, 1, 0] == 0.0
+    assert mask[0, 0, 2, 0] < 0.0
+    assert mask[0, 0, 2, 1] < 0.0
+    assert mask[0, 0, 3, 2] == 0.0
+
+
 def test_model_forward_injects_sequence_id_and_runs_flat() -> None:
-    encoder = NumericEmbedder(hidden_dim=8, modalities=[{'field': 'action', 'type': 'discrete', 'vocab_size': 4}])
+    encoder = NumericEmbedder(
+        hidden_dim=8, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4}]
+    )
     backbone = IdentityBackbone(hidden_dim=8)
-    model = Model(encoder=encoder, backbone=backbone, heads=DiscreteActionValueHead(in_features=8, out_features=4, hidden_dim=8, num_layers=1))
-    batch = [[{'action': i % 4} for i in range(3)], [{'action': 1}, {'action': 2}]]
-    predictions, objective_data, _ = model(batch)
-    assert 'sequence_id' in objective_data.keys()
-    assert objective_data['sequence_id'].tolist() == [0, 0, 0, 1, 1]
-    assert predictions['action_value'].shape == (5, 4)
-    tb = encoder.prepare(batch)
+    model = Model(
+        encoder=encoder,
+        backbone=backbone,
+        heads=DiscreteActionValueHead(
+            in_features=8, out_features=4, hidden_dim=8, num_layers=1
+        ),
+    )
+    batch = [[{"action": i % 4} for i in range(3)], [{"action": 1}, {"action": 2}]]
+    tb = batch_to_token_batch(_tok(model.encoder), batch)
+    predictions, objective_data, _ = model(tb)
+    assert "sequence_id" in objective_data.keys()
+    assert objective_data["sequence_id"].tolist() == [0, 0, 0, 1, 1]
+    assert objective_data["grouping_id"].tolist() == [0, 0, 0, 0, 0]
+    assert predictions["action_value"].shape == (5, 4)
     assert tb.N == 5
     assert list(tb.step_counts()) == [3, 2]
+    assert list(tb.grouping_ids) == [0] * tb.L
     preds2, _, _ = model(tb)
-    assert preds2['action_value'].shape == (5, 4)
+    assert preds2["action_value"].shape == (5, 4)
+
+
+def test_prepare_derives_grouping_ids_from_field() -> None:
+    encoder = NumericEmbedder(
+        hidden_dim=8,
+        modalities=[
+            {"type": 'discrete', "field": "action", "vocab_size": 4},
+            {"type": 'discrete', "field": "done", "vocab_size": 5},
+        ],
+    )
+    batch = [
+        [
+            {"action": 0, "done": 0, "task_index": 0},
+            {"action": 1, "done": 3, "task_index": 0},
+            {"action": 2, "done": 0, "task_index": 1},
+            {"action": 3, "done": 1, "task_index": 1},
+            {"action": 0, "done": 4, "task_index": 1},
+            {"action": 1, "done": 0, "task_index": 2},
+        ]
+    ]
+    tb = batch_to_token_batch(
+        _tok(encoder), batch, grouper=Grouper(input_field="task_index", output_field="grouping_id")
+    )
+    assert tb.step_fields["grouping_id"].tolist() == [0, 0, 1, 1, 1, 2]
+    assert list(tb.grouping_ids) == [0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 2, 2]
+
+
+def test_constant_grouper_ignores_done_boundaries() -> None:
+    encoder = NumericEmbedder(
+        hidden_dim=8,
+        modalities=[
+            {"type": 'discrete', "field": "action", "vocab_size": 4},
+            {"type": 'discrete', "field": "done", "vocab_size": 5},
+        ],
+    )
+    batch = [[{"action": 0, "done": 3}, {"action": 1, "done": 0}]]
+    tb = batch_to_token_batch(_tok(encoder), batch)
+    assert tb.step_fields["grouping_id"].tolist() == [0, 0]
+    assert list(tb.grouping_ids) == [0] * tb.L

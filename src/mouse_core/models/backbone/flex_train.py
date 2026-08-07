@@ -53,21 +53,24 @@ def flex_packed_forward(
     model: torch.nn.Module,
     embeds: torch.Tensor,
     sequence_ids: torch.Tensor,
+    grouping_ids: torch.Tensor,
     output_hidden_states: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
     """Full prefill over a flat packed sequence ``embeds [L, D]``.
 
-    Attention is causal within positions that share ``sequence_ids``.
-    No cross-sequence padding.
+    Attention is causal within positions that share both ``sequence_ids`` and
+    ``grouping_ids``. No cross-sequence padding.
 
-    RoPE positions reset at each new sequence run (contiguous positions
-    within a sequence get 0,1,2,…).
+    RoPE positions reset whenever the ``(sequence, mask)`` run changes
+    (contiguous positions within a run get 0,1,2,…).
     """
     if embeds.ndim != 2:
         raise ValueError(f"embeds must be [L, D], got shape {tuple(embeds.shape)}")
     L, _D = embeds.shape
     if sequence_ids.shape != (L,):
         raise ValueError("sequence_ids must have shape [L]")
+    if grouping_ids.shape != (L,):
+        raise ValueError("grouping_ids must have shape [L]")
 
     # HF decoder stacks are ``nn.Module``; pyright treats children as Tensor|Module.
     hf = cast(Any, model)
@@ -80,25 +83,27 @@ def flex_packed_forward(
 
     x = embeds.to(device=device, dtype=dtype).unsqueeze(0)  # [1, L, D]
     seq = sequence_ids.to(device=device)
+    mask = grouping_ids.to(device=device)
 
-    # Per-token RoPE position within its sequence run.
+    # Per-token RoPE position within its (sequence, mask) run.
     # Sync-free: cummax of run-start markers, no host .item() for n_runs.
     position_ids = torch.zeros(L, dtype=torch.long, device=device)
     if L > 0:
         arange = torch.arange(L, device=device)
         new_run = torch.ones(L, dtype=torch.bool, device=device)
-        new_run[1:] = seq[1:] != seq[:-1]
+        new_run[1:] = (seq[1:] != seq[:-1]) | (mask[1:] != mask[:-1])
         markers = torch.where(new_run, arange, torch.full_like(arange, -1))
         position_ids = arange - torch.cummax(markers, dim=0).values
 
     # mask_mod closes over tensors via holder to avoid issues.
-    holder = {"seq": seq}
+    holder = {"seq": seq, "mask": mask}
     compile_masks = _use_flex_compile(device, dtype)
 
     def mask_mod(b, h, q_idx, kv_idx):
         return (
             (kv_idx <= q_idx)
             & (holder["seq"][q_idx] == holder["seq"][kv_idx])
+            & (holder["mask"][q_idx] == holder["mask"][kv_idx])
         )
 
     global _warned_unfused

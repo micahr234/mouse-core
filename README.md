@@ -51,7 +51,7 @@ mouse-core gives you three building blocks for in-context RL. Compose them in yo
 
 * **Data** (`mouse_core.data`) — stores sequential rows in `Datastore` and batches contiguous windows with `DataLoader`.
 * **Models** (`mouse_core.models`) — encoder + backbone (`LlamaBackbone`, `Qwen3Backbone`, or `IdentityBackbone`) + output heads (`DiscreteActionHead`, `DiscreteActionValueHead`, …).
-* **Objectives** (`mouse_core.objectives`) — training losses such as DQN, VecDQN, PPO, GRPO, SP, and SV.
+* **Objectives** (`mouse_core.objectives`) — training losses such as DQN, PPO, GRPO, SP, and SV.
 
 Backbone loading has one public path: instantiate the backbone. For example, `LlamaBackbone(pretrained="meta-llama/Llama-3.2-1B", num_layers=2)` reads the pretrained config, loads matching transformer weights, and exposes `backbone.hidden_dim` for the encoder and heads.
 
@@ -66,7 +66,6 @@ The [example notebooks](examples/) are the primary documentation. Work through t
 | [02 — Train offline](examples/02_train_offline.ipynb) | Offline replay baseline, model architecture, DQN training, held-out env eval *(recommended first training run)* |
 | [03 — Train online](examples/03_train_online.ipynb) | Live `mouse-gym` rollouts, in-memory replay, DQN updates, separate eval envs |
 | [04 — Layerwise DQN offline](examples/04_train_offline_layerwise_dqn.ipynb) | Same offline loop as `02`, with per-layer Q heads and `LayerwiseDqnObjective` |
-| [05 — Vector-DQN offline](examples/05_train_offline_vec_dqn.ipynb) | Same offline loop as `02`, with 2D action vectors and `VecDqnObjective` |
 | [06 — TextEmbedder offline](examples/06_train_offline_text.ipynb) | Same offline loop as `02`, with `TextEmbedder` (`token` + `text`; `image` documented for VL checkpoints) |
 | [07 — Train online PPO](examples/07_train_online_ppo.ipynb) | Online on-policy PPO (`DiscreteActionHead` + value head, `PpoObjective` with GAE) |
 | [08 — Train online GRPO](examples/08_train_online_grpo.ipynb) | Branched GRPO: fork env+context at many `L`, group-relative advantages, `GrpoObjective` |

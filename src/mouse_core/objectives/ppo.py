@@ -2,42 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 import torch
 import torch.nn.functional as F
 from tensordict import TensorDict
 
 from mouse_core.objectives.base import Objective
 from mouse_core.objectives.dqn import _valid_transitions
-
-
-def batch_field(
-    *,
-    batch: list[list[dict[str, Any]]],
-    key: str,
-    dtype: torch.dtype = torch.float32,
-    device: torch.device | None = None,
-) -> torch.Tensor:
-    """Extract a scalar field from nested ``[B][len_b]`` row dicts into a flat ``[N]`` tensor.
-
-    Used to inject rollout-only columns (e.g. ``old_log_prob``) into
-    ``objective_data`` without declaring them as encoder modalities.
-    Steps are concatenated in sequence order (same as ``TokenBatch`` / Model).
-    """
-    if not batch:
-        raise ValueError("batch_field: batch is empty.")
-    values: list[Any] = []
-    for b, rows in enumerate(batch):
-        if not rows:
-            raise ValueError(f"batch_field: sequence {b} is empty.")
-        for s, row in enumerate(rows):
-            if key not in row:
-                raise KeyError(
-                    f"batch_field: row [{b}][{s}] is missing key {key!r}."
-                )
-            values.append(row[key])
-    return torch.tensor(values, dtype=dtype, device=device)
 
 
 def sample_discrete_action(
@@ -107,8 +77,9 @@ class PpoObjective(Objective):
     * ``predictions["action"]`` — ``[N, A]`` discrete policy logits
     * ``predictions["value"]`` — ``[N, 1]`` or ``[N]`` scalar state values
 
-    Every consecutive pair ``(i, i+1)`` that shares a ``sequence_id`` is a
-    decision point, using the same timing convention as
+    Every consecutive pair ``(i, i+1)`` that shares ``sequence_id`` and (when
+    ``grouping_field=`` is set) the same grouping column is a decision point,
+    using the same timing convention as
     :class:`~mouse_core.objectives.dqn.DqnObjective`: token ``i`` encodes state
     ``s_i``, and the action / reward / done / behavior log-prob stored at
     ``i+1`` describe the transition out of ``s_i``.
@@ -116,13 +87,15 @@ class PpoObjective(Objective):
     Done-code discounts match the DQN table (``gamma_step`` for ``done==0``, …,
     ``gamma_task_truncated`` for ``done==4``).
 
-    For multi-epoch PPO, store behavior log-probs during rollout (same step as
-    ``action``) and inject them before the objective call::
+    For multi-epoch PPO, stamp behavior log-probs on rollout rows (same step as
+    ``action``) and include them in the tokenizer ``step_fields`` keep-list so
+    they land in ``objective_data``::
 
-        predictions, objective_data, _ = model(batch)
-        objective_data["old_log_prob"] = batch_field(
-            batch, "old_log_prob", device=objective_data.device
+        tokenizer = NumericTokenizer(
+            ...,
+            step_fields=["action", "reward", "done", "old_log_prob"],
         )
+        predictions, objective_data, _ = model(batch)  # TokenBatch
         loss, metrics = objective(objective_data, predictions)
 
     When ``old_log_prob`` is absent, the detached current log-probs are used
@@ -170,6 +143,7 @@ class PpoObjective(Objective):
         predictions_key: str = "action",
         value_key: str = "value",
         num_actions: int | None = None,
+        grouping_field: str | None = None,
     ) -> None:
         self.gamma_step = gamma_step
         self.gamma_episode_terminal = gamma_episode_terminal
@@ -188,6 +162,7 @@ class PpoObjective(Objective):
         self.predictions_key = predictions_key
         self.value_key = value_key
         self.num_actions = num_actions
+        self.grouping_field = grouping_field
 
     def __call__(
         self,
@@ -257,7 +232,7 @@ class PpoObjective(Objective):
                 f"PPO objective expects done shape [{N}], got {tuple(done.shape)}."
             )
 
-        valid = _valid_transitions(objective_data, N, device)
+        valid = _valid_transitions(objective_data, N, device, grouping_field=self.grouping_field)
 
         next_actions = action[1:]
         next_rewards = reward[1:].to(dtype=dtype)

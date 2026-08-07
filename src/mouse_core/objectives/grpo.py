@@ -65,14 +65,23 @@ class GrpoObjective(Objective):
             for row in rows:                     # or suffix-only
                 row["advantage"] = float(adv[g])
 
-        predictions, objective_data, _ = model(batch)
-        objective_data["old_log_prob"] = batch_field(batch, "old_log_prob", ...)
-        objective_data["advantage"] = batch_field(batch, "advantage", ...)
+        tokenizer = NumericTokenizer(
+            ...,
+            step_fields=[
+                "action",
+                "reward",
+                "done",
+                "old_log_prob",
+                "advantage",
+            ],
+        )
+        predictions, objective_data, _ = model(batch)  # TokenBatch
         loss, metrics = objective(objective_data, predictions)
 
     Timing matches :class:`~mouse_core.objectives.dqn.DqnObjective`: token
     ``i`` is state ``s_i``; action / behavior log-prob / advantage at ``i+1``
-    describe the transition out of ``s_i``. Cross-sequence pairs are excluded.
+    describe the transition out of ``s_i``. Cross-sequence and cross-task pairs
+    are excluded.
 
     Args:
         clip_eps: PPO-style ratio clip ε.
@@ -94,6 +103,7 @@ class GrpoObjective(Objective):
         advantage_key: str = "advantage",
         predictions_key: str = "action",
         num_actions: int | None = None,
+        grouping_field: str | None = None,
     ) -> None:
         self.clip_eps = clip_eps
         self.ent_coef = ent_coef
@@ -102,6 +112,7 @@ class GrpoObjective(Objective):
         self.advantage_key = advantage_key
         self.predictions_key = predictions_key
         self.num_actions = num_actions
+        self.grouping_field = grouping_field
 
     def __call__(
         self,
@@ -142,8 +153,8 @@ class GrpoObjective(Objective):
         if self.advantage_key not in objective_data.keys():
             raise KeyError(
                 f"GRPO requires objective_data[{self.advantage_key!r}] "
-                "(stamp group-relative advantages onto rows, then inject with "
-                "batch_field)."
+                "(stamp group-relative advantages onto rows, then include them "
+                "in tokenizer step_fields)."
             )
         advantage_full = objective_data[self.advantage_key]
         if advantage_full.shape != torch.Size([N]):
@@ -153,7 +164,7 @@ class GrpoObjective(Objective):
             )
         advantage = advantage_full[1:].to(dtype=dtype)
 
-        valid = _valid_transitions(objective_data, N, device)
+        valid = _valid_transitions(objective_data, N, device, grouping_field=self.grouping_field)
 
         next_actions = action[1:]
         curr_logits = logits[:-1, :]

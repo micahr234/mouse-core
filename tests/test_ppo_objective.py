@@ -2,7 +2,7 @@
 from __future__ import annotations
 import torch
 from tensordict import TensorDict
-from mouse_core.objectives import PpoObjective, batch_field, sample_discrete_action
+from mouse_core.objectives import PpoObjective, sample_discrete_action
 
 def _ppo_batch(*, n: int=8, a: int=3, with_old_log_prob: bool=True, sequence_id: list[int] | None=None) -> tuple[TensorDict, TensorDict]:
     action = torch.randint(0, a, (n,))
@@ -77,7 +77,7 @@ def test_ppo_objective_raises_when_all_pairs_cross_sequences() -> None:
     try:
         PpoObjective()(objective_data, predictions)
     except ValueError as e:
-        assert 'sequence boundary' in str(e)
+        assert 'sequence or grouping boundary' in str(e)
     else:
         raise AssertionError('expected ValueError when every pair crosses a sequence boundary')
 
@@ -86,9 +86,3 @@ def test_sample_discrete_action_shapes() -> None:
     actions, log_probs = sample_discrete_action(num_actions=3, logits=logits)
     assert actions.shape == (4,)
     assert log_probs.shape == (4,)
-
-def test_batch_field_flat_ragged() -> None:
-    batch = [[{'old_log_prob': 0.1}, {'old_log_prob': 0.2}], [{'old_log_prob': 0.3}]]
-    out = batch_field(batch=batch, key='old_log_prob')
-    assert out.shape == (3,)
-    assert torch.allclose(out, torch.tensor([0.1, 0.2, 0.3]))

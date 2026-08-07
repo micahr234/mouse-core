@@ -51,7 +51,6 @@ class HeadSpec:
 
     - ``"action_value"``: DiscreteActionValueHead
     - ``"action_value_layerwise"``: LayerwiseDiscreteActionValueHead
-    - ``"action_vector"``: VectorActionValueHead
     - ``"action"``: DiscreteActionHead
     - ``"value"``: SwiGLUHead
     """
@@ -64,14 +63,10 @@ class HeadSpec:
     use_norm: bool | None = None
     # Layerwise action value specific
     num_backbone_layers: int | None = None
-    # Vector action value specific
-    vec_dim: int | None = None
-    bias_scale: float | None = None
 
     _VALID: ClassVar[tuple[str, ...]] = (
         "action_value",
         "action_value_layerwise",
-        "action_vector",
         "action",
         "value",
     )
@@ -93,12 +88,6 @@ class HeadSpec:
             )
         if self.num_backbone_layers is not None and int(self.num_backbone_layers) <= 0:
             raise ValueError(f"num_backbone_layers must be positive, got {self.num_backbone_layers!r}")
-        if self.vec_dim is not None and self.name != "action_vector":
-            raise ValueError(f"vec_dim is only valid for 'action_vector' heads, got name={self.name!r}")
-        if self.vec_dim is not None and int(self.vec_dim) <= 0:
-            raise ValueError(f"vec_dim must be positive, got {self.vec_dim!r}")
-        if self.bias_scale is not None and self.name != "action_vector":
-            raise ValueError(f"bias_scale is only valid for 'action_vector' heads, got name={self.name!r}")
 
 
 class BaseHead(nn.Module, ABC):
@@ -129,7 +118,7 @@ class BaseHeadWithTarget(BaseHead):
     """Base for heads that maintain an EMA target network alongside the online head.
 
     Subclass this when your head needs a slowly-updated target copy for stable
-    bootstrap targets (e.g. DQN, VecDQN).
+    bootstrap targets (e.g. DQN).
 
     **Usage:** build ``self.online`` in ``__init__``, then call
     :meth:`_init_target` to create and freeze the target copy automatically.

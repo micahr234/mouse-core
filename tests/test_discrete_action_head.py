@@ -5,7 +5,11 @@ from mouse_core.models import Model, load_model, save_model
 from mouse_core.models.backbone import IdentityBackbone
 from mouse_core.models.base import Model as ModelClass
 from mouse_core.models.embedding import NumericEmbedder
+from mouse_core.data import NumericTokenizer
 from mouse_core.models.heads import DiscreteActionHead
+from tests._token_batch_helpers import batch_to_token_batch, tok_from_encoder
+
+_tok = tok_from_encoder
 
 def test_discrete_action_head_forward_shape() -> None:
     head = DiscreteActionHead(in_features=8, out_features=4, hidden_dim=8, num_layers=1)
@@ -19,13 +23,13 @@ def test_infer_head_name_is_action() -> None:
 def test_discrete_action_head_save_load_roundtrip(tmp_path) -> None:
     torch.manual_seed(0)
     hidden_dim = 8
-    encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{'field': 'action', 'type': 'discrete', 'vocab_size': 4}, {'field': 'reward', 'type': 'rff'}])
+    encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4}, {"type": 'fourier', "field": "reward"}])
     model = Model(encoder=encoder, backbone=IdentityBackbone(hidden_dim=hidden_dim), heads=DiscreteActionHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1)).eval()
     batch = [[{'action': 0, 'reward': 0.0}, {'action': 1, 'reward': 1.0}]]
-    expected, _, _ = model(batch)
+    expected, _, _ = model(batch_to_token_batch(_tok(model.encoder), batch))
     save_model(model, tmp_path)
     loaded = load_model(tmp_path).eval()
-    actual, _, _ = loaded(batch)
+    actual, _, _ = loaded(batch_to_token_batch(_tok(loaded.encoder), batch))
     assert torch.allclose(actual['action'], expected['action'])
     assert loaded.action_head == 'action'
     with (tmp_path / 'config.json').open() as fh:

@@ -8,11 +8,14 @@ from mouse_core.models.heads import (
     DiscreteActionHead,
     DiscreteActionValueHead,
     LayerwiseDiscreteActionValueHead,
-    VectorActionValueHead,
 )
-from mouse_core.models.embedding.embedding import Encoder, NumericEmbedder, ModalitySpec
+from mouse_core.data.token_batch import TokenBatch
+from mouse_core.models.embedding.embedding import Encoder, NumericEmbedder
+from mouse_core.models.embedding.modality import (
+    NumericEmbedderModalitySpec,
+    TextEmbedderModalitySpec,
+)
 from mouse_core.models.embedding.text import TextEmbedder
-from mouse_core.models.embedding.token_batch import TokenBatch
 from mouse_core.models.kv_policy import cache_needs_rebuild, rebuild_starts, resolve_cache_bounds
 
 __all__ = [
@@ -33,8 +36,8 @@ __all__ = [
     "DiscreteActionHead",
     "DiscreteActionValueHead",
     "LayerwiseDiscreteActionValueHead",
-    "VectorActionValueHead",
-    "ModalitySpec",
+    "NumericEmbedderModalitySpec",
+    "TextEmbedderModalitySpec",
     "NumericEmbedder",
     "TextEmbedder",
     "TokenBatch",
