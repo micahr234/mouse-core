@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- ``examples/05_train_offline_sv.ipynb``: offline supervised-value training
+  (``SvObjective`` regresses ``action_value`` onto ``info_q_star``). Action and
+  ``info_q_star`` share one ``Augmenter`` permute so the vector stays aligned
+  with remapped action ids.
+- ``examples/10_train_offline_sp.ipynb``: offline supervised-policy training
+  (``SpObjective`` CE onto ``argmax(info_q_star)`` with ``DiscreteActionHead``).
+  Same shared action / ``info_q_star`` permute as SV.
 - ``StepTokens``: tokenizer output for one step (token arrays + scalar
   ``grouping_id`` + ``step_fields``). ``pack_token_batch(...)`` builds a
   ``TokenBatch`` from many steps (assigns ``sequence_ids``, expands
@@ -46,6 +53,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``grouping_field: str | None = None`` (``None`` ⇒ no grouping filter).
 
 ### Changed
+- ``examples/02_train_offline.ipynb`` renamed to
+  ``examples/02_train_offline_dqn.ipynb``.
+- ``examples/03_train_online.ipynb`` renamed to
+  ``examples/03_train_online_dqn.ipynb``.
+- ``examples/06_train_offline_text.ipynb`` renamed to
+  ``examples/06_train_offline_text_dqn.ipynb``.
 - ``Grouper`` copies ``step[input_field]`` onto ``output_field`` as-is (no int
   cast; no ``field=None → grouping_id=0`` path). For no isolation, stamp a
   constant column and point both fields at it, or ensure ``grouping_field`` is
@@ -427,6 +440,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `SpObjective` now supports `-inf` padded invalid actions in `info_q_star` while still rejecting NaN and `+inf` targets.
 - `examples/04_inference.ipynb` now renders only the replay envs created with `render_mode="rgb_array"`, avoiding Gymnasium render-mode warnings from non-video evaluation envs.
 - `examples/02_train_offline.ipynb` now passes AdamW beta coefficients with PyTorch's supported `betas` keyword.
+- Offline / online DQN examples now pass ``grouping_field="grouping_id"`` into
+  ``DqnObjective`` / ``LayerwiseDqnObjective`` so TD pairs do not cross task
+  boundaries (attention was already isolated; the objective was not).
 
 ## [0.4.0] - 2026-06-25
 

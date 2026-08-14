@@ -11,7 +11,7 @@
 
 ## News 📰
 
-- **2026-06-26 — Offline training works.** [`examples/02_train_offline.ipynb`](examples/02_train_offline.ipynb) now trains a full `Qwen/Qwen3-0.6B` MOUSE model from Hub replay data and reaches strong FrozenLake performance. Push the checkpoint, then evaluate in [`examples/09_inference.ipynb`](examples/09_inference.ipynb).
+- **2026-06-26 — Offline training works.** [`examples/02_train_offline_dqn.ipynb`](examples/02_train_offline_dqn.ipynb) now trains a full `Qwen/Qwen3-0.6B` MOUSE model from Hub replay data and reaches strong FrozenLake performance. Push the checkpoint, then evaluate in [`examples/09_inference.ipynb`](examples/09_inference.ipynb).
 
 See [CHANGELOG.md](CHANGELOG.md) for the full release history.
 
@@ -63,13 +63,15 @@ The [example notebooks](examples/) are the primary documentation. Work through t
 | Notebook | What it covers |
 |----------|----------------|
 | [01 — Collect dataset](examples/01_collect_dataset.ipynb) | `Datastore`, collecting transitions, pushing to the Hub |
-| [02 — Train offline](examples/02_train_offline.ipynb) | Offline replay baseline, model architecture, DQN training, held-out env eval *(recommended first training run)* |
-| [03 — Train online](examples/03_train_online.ipynb) | Live `mouse-gym` rollouts, in-memory replay, DQN updates, separate eval envs |
+| [02 — Train offline DQN](examples/02_train_offline_dqn.ipynb) | Offline replay baseline, model architecture, DQN training, held-out env eval |
+| [03 — Train online DQN](examples/03_train_online_dqn.ipynb) | Live `mouse-gym` rollouts, in-memory replay, DQN updates, separate eval envs |
 | [04 — Layerwise DQN offline](examples/04_train_offline_layerwise_dqn.ipynb) | Same offline loop as `02`, with per-layer Q heads and `LayerwiseDqnObjective` |
-| [06 — TextEmbedder offline](examples/06_train_offline_text.ipynb) | Same offline loop as `02`, with `TextEmbedder` (`token` + `text`; `image` documented for VL checkpoints) |
+| [05 — Train offline SV](examples/05_train_offline_sv.ipynb) | Same offline loop as `02`, regressing the action-value head onto `info_q_star` with `SvObjective` |
+| [06 — TextEmbedder offline DQN](examples/06_train_offline_text_dqn.ipynb) | Same offline loop as `02`, with `TextEmbedder` (`token` + `text`; `image` documented for VL checkpoints) |
 | [07 — Train online PPO](examples/07_train_online_ppo.ipynb) | Online on-policy PPO (`DiscreteActionHead` + value head, `PpoObjective` with GAE) |
 | [08 — Train online GRPO](examples/08_train_online_grpo.ipynb) | Branched GRPO: fork env+context at many `L`, group-relative advantages, `GrpoObjective` |
 | [09 — Inference](examples/09_inference.ipynb) | Batched FlexAttention cached inference with grow-then-rebuild (`max_cache` / `start_cache`), loading a Hub checkpoint after training |
+| [10 — Train offline SP](examples/10_train_offline_sp.ipynb) | Same offline loop as `05`, but `SpObjective` CE onto `argmax(info_q_star)` with `DiscreteActionHead` *(ranking check)* |
 
 ### Example dependencies
 

@@ -17,11 +17,43 @@ import torch.nn as nn
 from tensordict import TensorDict
 from mouse_core.models import Model
 from mouse_core.models.backbone import LlamaBackbone, Qwen3Backbone
+from mouse_core.models.backbone.flex_decode import _decode_rope_positions
 from mouse_core.models.embedding import NumericEmbedder
 from mouse_core.data import NumericTokenizer
 from mouse_core.models.heads import DiscreteActionValueHead
 from mouse_core.data import Grouper
 from tests._token_batch_helpers import batch_to_token_batch, tok_from_encoder
+
+
+def _loop_decode_rope_positions(
+    chunk_grouping_ids: torch.Tensor,
+    real: torch.Tensor,
+    cached_grouping_ids: torch.Tensor,
+    prior_lengths: torch.Tensor,
+) -> torch.Tensor:
+    """Reference: the previous per-row / per-token Python loop."""
+    B, S = chunk_grouping_ids.shape
+    rope_pos = torch.zeros(B, S, dtype=torch.long, device=chunk_grouping_ids.device)
+    n = real.sum(dim=1)
+    for b in range(B):
+        nb = int(n[b].item())
+        if nb == 0:
+            continue
+        start = S - nb
+        row_mids = chunk_grouping_ids[b, start:S]
+        pl = int(prior_lengths[b].item())
+        if pl > 0:
+            cached = cached_grouping_ids[b, :pl]
+            bases = torch.zeros(nb, dtype=torch.long, device=chunk_grouping_ids.device)
+            for i in range(nb):
+                bases[i] = (cached == row_mids[i]).sum()
+        else:
+            bases = torch.zeros(nb, dtype=torch.long, device=chunk_grouping_ids.device)
+        local = torch.zeros(nb, dtype=torch.long, device=chunk_grouping_ids.device)
+        for i in range(nb):
+            local[i] = (row_mids[:i] == row_mids[i]).sum()
+        rope_pos[b, start:S] = bases + local
+    return rope_pos
 
 _tok = tok_from_encoder
 
@@ -365,3 +397,44 @@ def test_decode_task_mask_isolates_without_reset(backbone_cls) -> None:
             collected.append(preds['action_value'][:, -1])
         got = torch.stack(collected, dim=1)
     assert torch.allclose(got, _as_rect(ref), atol=1e-05)
+
+
+def test_decode_rope_positions_matches_loop_and_ignores_pads() -> None:
+    """Vectorized RoPE positions must match the old loop, including empty rows
+    and pad columns whose grouping id collides with a real token (must not count)."""
+    cached = torch.tensor(
+        [
+            [0, 0, 1, 1, 0, 0],
+            [2, 2, 2, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0],
+        ],
+        dtype=torch.long,
+    )
+    prior = torch.tensor([4, 3, 0], dtype=torch.long)
+    # Left-padded chunk: row0 two new gid-1 tokens; row1 one gid-2; row2 empty.
+    chunk = torch.tensor(
+        [
+            [0, 1, 1],
+            [0, 0, 2],
+            [0, 0, 0],
+        ],
+        dtype=torch.long,
+    )
+    real = torch.tensor(
+        [
+            [False, True, True],
+            [False, False, True],
+            [False, False, False],
+        ]
+    )
+    got = _decode_rope_positions(
+        chunk_grouping_ids=chunk,
+        real=real,
+        cached_grouping_ids=cached,
+        prior_lengths=prior,
+    )
+    ref = _loop_decode_rope_positions(chunk, real, cached, prior)
+    assert torch.equal(got, ref)
+    # row0: cache has two gid-1 slots; chunk adds 0 then 1 → positions 2, 3.
+    # Pad gid 0 must not contribute. row1: three cached gid-2 → position 3.
+    assert got.tolist() == [[0, 2, 3], [0, 0, 3], [0, 0, 0]]

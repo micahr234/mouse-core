@@ -1,4 +1,4 @@
-"""Tests for online training loop semantics (examples/03_train_online.ipynb)."""
+"""Tests for online training loop semantics (examples/03_train_online_dqn.ipynb)."""
 from __future__ import annotations
 
 def simulate_online_loop(*, gradient_steps: int, env_steps_per_cycle: int, steps_per_env: int, gradient_steps_per_cycle: int, learning_starts: int, num_envs: int=10000) -> dict[str, int]:

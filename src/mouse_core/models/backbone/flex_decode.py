@@ -56,6 +56,36 @@ def _use_flex_compile(device: torch.device, dtype: torch.dtype) -> bool:
     return device.type == "cuda" and dtype in _COMPILED_DTYPES
 
 
+def _decode_rope_positions(
+    *,
+    chunk_grouping_ids: torch.Tensor,
+    real: torch.Tensor,
+    cached_grouping_ids: torch.Tensor,
+    prior_lengths: torch.Tensor,
+) -> torch.Tensor:
+    """Per-token RoPE positions for a left-padded decode chunk.
+
+    Position = (same-``grouping_id`` count in the cache prefix) + (earlier
+    real tokens in this chunk with the same id). Pad columns stay 0.
+    Equivalent to a per-run counter when a grouping id does not recur after
+    another id (the ``task_index`` pattern).
+    """
+    _B, S = chunk_grouping_ids.shape
+    cap = cached_grouping_ids.shape[-1]
+    device = chunk_grouping_ids.device
+    col = torch.arange(S, device=device)
+    kv = torch.arange(cap, device=device)
+
+    same_chunk = chunk_grouping_ids.unsqueeze(-1) == chunk_grouping_ids.unsqueeze(-2)
+    earlier = col[:, None] > col[None, :]
+    local = (same_chunk & real.unsqueeze(-1) & real.unsqueeze(-2) & earlier).sum(-1)
+
+    cached_valid = kv.unsqueeze(0) < prior_lengths.unsqueeze(1)
+    same_cache = chunk_grouping_ids.unsqueeze(-1) == cached_grouping_ids.unsqueeze(1)
+    bases = (same_cache & cached_valid.unsqueeze(1)).sum(-1)
+    return torch.where(real, bases + local, torch.zeros_like(local))
+
+
 class _FlexKernel:
     """Call flex_attention; compile on CUDA bf16/fp16, fall back to eager on failure."""
 
@@ -252,29 +282,17 @@ class FlexDecodeSession:
         # this chunk's slots (queries may attend within the new prefix).
         self.grouping_ids[real_rows, cache_slots] = mid[real_rows, real_cols]
 
-        # RoPE is per (sequence, mask) run: count prior same-mask tokens in
-        # the cache, then add the in-chunk offset among same-mask tokens.
-        rope_pos = torch.zeros(B, S, dtype=torch.long, device=self.device)
-        if real_rows.numel() > 0:
-            prior_len = self.lengths
-            for b in range(B):
-                nb = int(n[b].item())
-                if nb == 0:
-                    continue
-                start = S - nb
-                row_mids = mid[b, start:S]
-                pl = int(prior_len[b].item())
-                if pl > 0:
-                    cached = self.grouping_ids[b, :pl]
-                    bases = torch.zeros(nb, dtype=torch.long, device=self.device)
-                    for i in range(nb):
-                        bases[i] = (cached == row_mids[i]).sum()
-                else:
-                    bases = torch.zeros(nb, dtype=torch.long, device=self.device)
-                local = torch.zeros(nb, dtype=torch.long, device=self.device)
-                for i in range(nb):
-                    local[i] = (row_mids[:i] == row_mids[i]).sum()
-                rope_pos[b, start:S] = bases + local
+        # RoPE is per (sequence, mask) run: same-id count in the cache prefix
+        # plus earlier same-id tokens in this chunk. Vectorized — no per-row
+        # host sync. ``grouping_ids`` already includes this chunk's writes;
+        # ``self.lengths`` is still the prior length, so new slots are not
+        # double-counted (they appear in the in-chunk term instead).
+        rope_pos = _decode_rope_positions(
+            chunk_grouping_ids=mid,
+            real=col >= pad,
+            cached_grouping_ids=self.grouping_ids,
+            prior_lengths=self.lengths,
+        )
 
         block_mask = create_block_mask(
             self._mask_mod, B=B, H=None, Q_LEN=S, KV_LEN=self.cap,
