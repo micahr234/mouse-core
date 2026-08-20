@@ -2,7 +2,7 @@
 
 I/O
 ---
-* **in:** ``dict`` (one step; must include ``grouping_field`` (from Grouper ``output_field``))
+* **in:** ``dict`` (one step; must include ``grouping_field`` (a Grouper output name))
 * **out:** :class:`~mouse_core.data.token_batch.StepTokens`
 
 Tokens are tagged by modality name (``__text__`` / ``__vision__``). Pack many
@@ -41,7 +41,10 @@ class TextTokenizer:
     """CPU packer: format + HF/image tokenization → :class:`StepTokens`.
 
     Construct independently of the embedder. Alignment is by modality **name**
-    (``__text__`` / ``__vision__``). ``step_fields=`` is an explicit keep-list.
+    (``__text__`` / ``__vision__``). ``step_fields=`` is an explicit keep-list
+    of step dict keys copied into ``StepTokens.step_fields`` (modalities are
+    not auto-copied). TD / PPO / GRPO objectives read ``action``, ``reward``,
+    ``episode_done``, and ``task_done`` from that keep-list.
     """
 
     def __init__(

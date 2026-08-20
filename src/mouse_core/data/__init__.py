@@ -3,7 +3,7 @@ from mouse_core.data.datastore import Datastore
 from mouse_core.data.hub import load_stores_from_hub, push_stores_to_hub, push_to_hub
 from mouse_core.data.augmenter import (
     Augmenter,
-    SequenceAugmentModalitySpec,
+    SequenceAugmentFieldSpec,
 )
 from mouse_core.data.compose import compose
 from mouse_core.data.grouper import Grouper
@@ -30,7 +30,7 @@ __all__ = [
     "compose",
     "DataLoader",
     "Datastore",
-    "SequenceAugmentModalitySpec",
+    "SequenceAugmentFieldSpec",
     "NumericTokenizerModalitySpec",
     "TextTokenizerModalitySpec",
     "NumericTokenizer",

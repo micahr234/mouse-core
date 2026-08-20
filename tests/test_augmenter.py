@@ -5,7 +5,7 @@ import copy
 import numpy as np
 import pytest
 
-from mouse_core.data import Augmenter, Selector, SequenceAugmentModalitySpec, compose
+from mouse_core.data import Augmenter, Selector, SequenceAugmentFieldSpec, compose
 from mouse_core.data.augmenter import _stable_hash
 
 
@@ -29,7 +29,7 @@ def test_disabled_augmenter_returns_input_step() -> None:
     augment = Augmenter(
         enabled=False,
         seed_field="task_index",
-        modalities=[
+        fields=[
             {"type": 'linear', "input_field": 'reward', "output_field": 'reward', "scale_in_low": 0.0, "scale_out_low": 0.0, "scale_in_high": 1.0, "scale_out_high": 2.0}
         ],
     )
@@ -41,7 +41,7 @@ def test_linear_scale_endpoints_copy_without_mutating_input() -> None:
     original = copy.deepcopy(step)
     augment = Augmenter(
         seed_field="task_index",
-        modalities=[
+        fields=[
             {"type": 'linear', "input_field": 'reward', "output_field": 'reward', "scale_in_low": 0.0, "scale_out_low": 1.0, "scale_in_high": 1.0, "scale_out_high": 3.0},
             {"type": 'linear', "input_field": 'obs_continuous', "output_field": 'obs_continuous', "scale_in_low": 0.0, "scale_out_low": -1.0, "scale_in_high": 1.0, "scale_out_high": 2.0},
         ]
@@ -57,7 +57,7 @@ def test_mask_probabilities_apply_to_configured_fields() -> None:
     step = {
         "action": 3,
         "reward": 1.5,
-        "done": 4,
+        "episode_done": 2,
         "observation": 7,
         "pixels": [10, 20],
         "step_index": 12,
@@ -66,10 +66,10 @@ def test_mask_probabilities_apply_to_configured_fields() -> None:
     augment = Augmenter(
         seed=0,
         seed_field="task_index",
-        modalities=[
+        fields=[
             {"type": 'discrete', "input_field": 'action', "output_field": 'action', "mask_prob": 1.0},
             {"type": 'linear', "input_field": 'reward', "output_field": 'reward', "mask_prob": 1.0},
-            {"type": 'discrete', "input_field": 'done', "output_field": 'done', "mask_prob": 1.0},
+            {"type": 'discrete', "input_field": 'episode_done', "output_field": 'episode_done', "mask_prob": 1.0},
             {"type": 'discrete', "input_field": 'observation', "output_field": 'observation', "mask_prob": 1.0},
             {"type": 'image', "input_field": 'pixels', "output_field": 'pixels', "mask_prob": 1.0},
             {"type": 'discrete', "input_field": 'step_index', "output_field": 'step_index', "mask_prob": 1.0},
@@ -79,7 +79,7 @@ def test_mask_probabilities_apply_to_configured_fields() -> None:
     assert out == {
         "action": 0,
         "reward": 0.0,
-        "done": 0,
+        "episode_done": 0,
         "observation": 0,
         "pixels": [0, 0],
         "step_index": 0,
@@ -95,7 +95,7 @@ def test_shared_action_permutation_also_permutates_action_value_targets() -> Non
     augment = Augmenter(
         seed=0,
         seed_field="task_index",
-        modalities=[
+        fields=[
             {"type": 'discrete', "input_field": ('action', 'prev_action', 'info_q_star'), "output_field": ('action', 'prev_action', 'info_q_star'), "vocab_size": 3, "permute": True}
         ],
     )
@@ -109,7 +109,7 @@ def test_mask_decisions_vary_per_step_within_one_generation() -> None:
     augment = Augmenter(
         seed=0,
         seed_field="task_index",
-        modalities=[{"type": 'discrete', "input_field": 'action', "output_field": 'action', "mask_prob": 0.5}],
+        fields=[{"type": 'discrete', "input_field": 'action', "output_field": 'action', "mask_prob": 0.5}],
     )
     # Same seed key, same generation: masking must still be a per-step draw.
     outs = [augment({"action": 3, "task_index": 0})["action"] for _ in range(64)]
@@ -120,7 +120,7 @@ def test_reseed_replaces_draw_cache() -> None:
     augment = Augmenter(
         seed=0,
         seed_field="task_index",
-        modalities=[
+        fields=[
             {"type": 'discrete', "input_field": 'action', "output_field": 'action', "vocab_size": 10, "permute": True}
         ],
     )
@@ -134,22 +134,22 @@ def test_reseed_replaces_draw_cache() -> None:
 
 
 def test_multi_field_mask_uses_one_decision_per_step() -> None:
-    step = {"action": 3, "done": 4, "task_index": 0}
+    step = {"action": 3, "episode_done": 2, "task_index": 0}
     augment = Augmenter(
         seed=0,
         seed_field="task_index",
-        modalities=[{"type": 'discrete', "input_field": ('action', 'done'), "output_field": ('action', 'done'), "mask_prob": 0.5}],
+        fields=[{"type": 'discrete', "input_field": ('action', 'episode_done'), "output_field": ('action', 'episode_done'), "mask_prob": 0.5}],
     )
     out = augment(step)
     # One mask decision for the multi-field modality; either both kept or both zeroed.
-    assert (out["action"], out["done"]) in {(3, 4), (0, 0)}
+    assert (out["action"], out["episode_done"]) in {(3, 2), (0, 0)}
 
 
 def test_seed_field_shares_draws_across_steps() -> None:
     augment = Augmenter(
         seed=0,
         seed_field="task_index",
-        modalities=[
+        fields=[
             {"type": 'discrete', "input_field": 'action', "output_field": 'action', "vocab_size": 10, "permute": True}
         ],
     )
@@ -166,7 +166,7 @@ def test_reseed_changes_draws_for_same_key() -> None:
     augment = Augmenter(
         seed=0,
         seed_field="task_index",
-        modalities=[
+        fields=[
             {"type": "discrete", "input_field": "action", "output_field": "action", "vocab_size": 10, "permute": True}
         ],
     )
@@ -186,13 +186,18 @@ def test_compose_reseed_forwards_to_augmenter() -> None:
     augment = Augmenter(
         seed=0,
         seed_field="task_index",
-        modalities=[
+        fields=[
             {"type": "discrete", "input_field": "action", "output_field": "action", "vocab_size": 10, "permute": True}
         ],
     )
     transform = compose(
         augment,
-        Selector(fields={"action": "action", "task_index": "task_index"}),
+        Selector(
+            fields=[
+                {"input_field": "action", "output_field": "action"},
+                {"input_field": "task_index", "output_field": "task_index"},
+            ]
+        ),
     )
     assert augment._generation == 0
     transform.reseed()
@@ -207,7 +212,7 @@ def test_compose_reseed_forwards_to_augmenter() -> None:
 def test_missing_seed_field_raises() -> None:
     augment = Augmenter(
         seed_field="task_index",
-        modalities=[
+        fields=[
             {"type": 'discrete', "input_field": 'action', "output_field": 'action', "vocab_size": 10, "permute": True}
         ],
     )
@@ -216,20 +221,20 @@ def test_missing_seed_field_raises() -> None:
 
 
 def test_discrete_and_done_permutations_use_configured_vocab_sizes() -> None:
-    step = {"done": 2, "observation": 1, "task_index": 0}
+    step = {"episode_done": 2, "observation": 1, "task_index": 0}
     rng = _rng_for_key(seed=0, seed_field="task_index", key=0)
-    done_perm = rng.permutation(5)
+    done_perm = rng.permutation(3)
     obs_perm = rng.permutation(4)
     augment = Augmenter(
         seed=0,
         seed_field="task_index",
-        modalities=[
-            {"type": 'discrete', "input_field": 'done', "output_field": 'done', "vocab_size": 5, "permute": True},
+        fields=[
+            {"type": 'discrete', "input_field": 'episode_done', "output_field": 'episode_done', "vocab_size": 3, "permute": True},
             {"type": 'discrete', "input_field": 'observation', "output_field": 'observation', "vocab_size": 4, "permute": True},
         ],
     )
     out = augment(step)
-    assert out["done"] == int(done_perm[2])
+    assert out["episode_done"] == int(done_perm[2])
     assert out["observation"] == int(obs_perm[1])
 
 
@@ -237,7 +242,7 @@ def test_image_scale_shift_clamps_to_pixel_range() -> None:
     step = {"obs_image": [-10, 10, 300], "task_index": 0}
     augment = Augmenter(
         seed_field="task_index",
-        modalities=[
+        fields=[
             {"type": 'image', "input_field": 'obs_image', "output_field": 'obs_image', "scale_mean": 2.0, "shift_mean": 10.0}
         ]
     )
@@ -248,7 +253,7 @@ def test_augmenter_rename_writes_output_keeps_input() -> None:
     step = {"reward": 1.0, "task_index": 0}
     augment = Augmenter(
         seed_field="task_index",
-        modalities=[
+        fields=[
             {
                 "type": "linear",
                 "input_field": "reward",
@@ -269,19 +274,19 @@ def test_augmenter_rejects_legacy_field_key() -> None:
     with pytest.raises(TypeError, match="input_field"):
         Augmenter(
             seed_field="task_index",
-            modalities=[{"field": "reward", "type": "linear", "mask_prob": 0.0}],
+            fields=[{"field": "reward", "type": "linear", "mask_prob": 0.0}],
         )
 
 
 def test_invalid_mask_probability_raises() -> None:
     with pytest.raises(ValueError, match="reward"):
-        SequenceAugmentModalitySpec(input_field="reward",
+        SequenceAugmentFieldSpec(input_field="reward",
             output_field="reward", type="linear", mask_prob=1.1)
 
 
 def test_linear_scale_endpoints_must_be_complete() -> None:
     with pytest.raises(ValueError, match="scale_in_low"):
-        SequenceAugmentModalitySpec(
+        SequenceAugmentFieldSpec(
             input_field="reward",
             output_field="reward", type="linear", scale_in_low=0.0, scale_out_low=0.0
         )
@@ -289,7 +294,7 @@ def test_linear_scale_endpoints_must_be_complete() -> None:
 
 def test_discrete_scale_shift_raises() -> None:
     with pytest.raises(ValueError, match="only apply to type='image'"):
-        SequenceAugmentModalitySpec(
+        SequenceAugmentFieldSpec(
             input_field="observation",
             output_field="observation",
             type="discrete",
@@ -301,7 +306,7 @@ def test_discrete_scale_shift_raises() -> None:
 
 def test_linear_scale_input_endpoints_must_differ() -> None:
     with pytest.raises(ValueError, match="must differ"):
-        SequenceAugmentModalitySpec(
+        SequenceAugmentFieldSpec(
             input_field="reward",
             output_field="reward",
             type="linear",

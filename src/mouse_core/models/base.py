@@ -206,9 +206,12 @@ saved model.
 ```python
 from mouse_core.data import Grouper, NumericTokenizer, compose, pack_token_batch
 
-grouper = Grouper(input_field="task_index", output_field="grouping_id")
+grouper = Grouper(
+    fields=[{{"input_field": "task_index", "output_field": "grouping_id"}}],
+)
 tokenizer = NumericTokenizer(
     modalities=[...],  # field=; match embedder slots
+    step_fields=["action", "reward", "episode_done", "task_done"],
     grouping_field="grouping_id",
 )
 transform = compose(grouper, tokenizer)  # plus selector/augmenter as needed

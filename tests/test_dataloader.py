@@ -28,12 +28,23 @@ from tests._token_batch_helpers import tok_from_encoder
 def _store_with_actions() -> Datastore:
     store = Datastore()
     for action in range(8):
-        store.append({"action": action + 1, "reward": float(action), "done": 0})
+        store.append(
+            {
+                "action": action + 1,
+                "reward": float(action),
+                "episode_done": 0,
+                "task_done": 0,
+            }
+        )
     return store
 
 
 def _tokenizer(*, step_fields: list[str] | None = None) -> NumericTokenizer:
-    keep = step_fields if step_fields is not None else ["action", "reward"]
+    keep = (
+        step_fields
+        if step_fields is not None
+        else ["action", "reward", "episode_done", "task_done"]
+    )
     return NumericTokenizer(
         modalities=[
             {"type": 'discrete', "field": "action"},
@@ -86,7 +97,7 @@ def test_dataloader_applies_augmenter_before_returning_batch() -> None:
 
     augmenter = Augmenter(
         seed_field="task_index",
-        modalities=[
+        fields=[
             {
                 "type": "discrete",
                 "input_field": "action",
@@ -117,7 +128,7 @@ def test_dataloader_reseeds_transform_each_batch() -> None:
     augmenter = Augmenter(
         seed=0,
         seed_field="task_index",
-        modalities=[
+        fields=[
             {
                 "type": "discrete",
                 "input_field": "action",
@@ -193,12 +204,12 @@ def test_dataloader_snapshots_loaded_source_and_appended_rows() -> None:
     store.from_dataset(
         Dataset.from_list(
             [
-                {"action": 1, "reward": 0.0, "done": 0},
-                {"action": 2, "reward": 0.0, "done": 0},
+                {"action": 1, "reward": 0.0, "episode_done": 0, "task_done": 0},
+                {"action": 2, "reward": 0.0, "episode_done": 0, "task_done": 0},
             ]
         )
     )
-    store.append({"action": 3, "reward": 0.0, "done": 0})
+    store.append({"action": 3, "reward": 0.0, "episode_done": 0, "task_done": 0})
     loader = _loader(sequence_length=3, batch_size=1, num_workers=0, seed=0, stores=store)
     tb = loader.next_batch()
     actions = [int(a) for a in tb.step_fields["action"]]
@@ -262,10 +273,10 @@ def test_dataloader_index_field_stamps_store_offset() -> None:
 def test_dataloader_refresh_picks_up_appended_rows() -> None:
     store = Datastore()
     for action in (1, 2, 3):
-        store.append({"action": action, "reward": 0.0, "done": 0})
+        store.append({"action": action, "reward": 0.0, "episode_done": 0, "task_done": 0})
     loader = _loader(sequence_length=3, batch_size=1, num_workers=0, stores=store)
     loader.next_batch()
-    store.append({"action": 4, "reward": 0.0, "done": 0})
+    store.append({"action": 4, "reward": 0.0, "episode_done": 0, "task_done": 0})
     batch_before_refresh = loader.next_batch()
     assert all(int(a) != 4 for a in batch_before_refresh.step_fields["action"])
     loader.refresh()
@@ -280,12 +291,12 @@ def test_dataloader_refresh_picks_up_appended_rows() -> None:
 def test_dataloader_refresh_drains_prefetch_queue_and_updates_store_sizes() -> None:
     store = Datastore()
     for action in range(3):
-        store.append({"action": action, "reward": 0.0, "done": 0})
+        store.append({"action": action, "reward": 0.0, "episode_done": 0, "task_done": 0})
     loader = _loader(sequence_length=2, batch_size=1, num_workers=1, prefetch=2, stores=store)
     try:
         loader.next_batch()
         assert loader._ns == [3]
-        store.append({"action": 99, "reward": 0.0, "done": 0})
+        store.append({"action": 99, "reward": 0.0, "episode_done": 0, "task_done": 0})
         loader.refresh()
         assert loader._ns == [4]
     finally:
@@ -295,7 +306,7 @@ def test_dataloader_refresh_drains_prefetch_queue_and_updates_store_sizes() -> N
 def test_dataloader_ragged_windows_up_to_max_length() -> None:
     store = Datastore()
     for action in (1, 2, 3):
-        store.append({"action": action, "reward": 0.0, "done": 0})
+        store.append({"action": action, "reward": 0.0, "episode_done": 0, "task_done": 0})
     loader = _loader(sequence_length=8, batch_size=1, num_workers=0, seed=0, stores=store)
     tb = loader.next_batch()
     n = int(tb.step_counts()[0])
@@ -306,7 +317,7 @@ def test_dataloader_ragged_windows_up_to_max_length() -> None:
 
 def test_dataloader_allows_short_stores() -> None:
     store = Datastore()
-    store.append({"action": 7, "reward": 1.0, "done": 0})
+    store.append({"action": 7, "reward": 1.0, "episode_done": 0, "task_done": 0})
     loader = _loader(sequence_length=4, batch_size=1, num_workers=0, stores=store)
     tb = loader.next_batch()
     assert int(tb.step_counts()[0]) == 1
@@ -319,7 +330,7 @@ def test_dataloader_allows_empty_stores_until_sampling() -> None:
     try:
         with pytest.raises(ValueError, match="all stores are empty"):
             loader.next_batch()
-        store.append({"action": 1, "reward": 0.0, "done": 0})
+        store.append({"action": 1, "reward": 0.0, "episode_done": 0, "task_done": 0})
         loader.refresh()
         tb = loader.next_batch()
         assert int(tb.step_counts()[0]) == 1

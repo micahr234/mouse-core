@@ -38,6 +38,10 @@ class NumericTokenizer:
     step dict keys copied into ``StepTokens.step_fields`` (modalities are not
     auto-copied). Rename step keys with :class:`~mouse_core.data.selector.Selector`
     before tokenize.
+
+    TD / PPO / GRPO objectives read ``action``, ``reward``, ``episode_done``,
+    and ``task_done`` from that keep-list (plus extras such as ``old_log_prob``).
+    Those columns must also survive Selector.
     """
 
     def __init__(

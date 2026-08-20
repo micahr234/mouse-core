@@ -72,7 +72,7 @@ class _ScalarDraw:
 
 
 @dataclass(frozen=True)
-class SequenceAugmentModalitySpec:
+class SequenceAugmentFieldSpec:
     """Specification for augmenting one raw step-record field.
 
     Each spec has required ``input_field`` / ``output_field`` and a ``type``.
@@ -101,41 +101,41 @@ class SequenceAugmentModalitySpec:
     mask_value: Any = None
 
     def __post_init__(self) -> None:
-        modality_type = self.type.lower()
-        if modality_type not in ("discrete", "linear", "image"):
+        kind = self.type.lower()
+        if kind not in ("discrete", "linear", "image"):
             raise ValueError(
-                f"unknown augment type {self.type!r} for modality {self.input_field!r}; "
+                f"unknown augment type {self.type!r} for field {self.input_field!r}; "
                 "expected one of ('discrete', 'linear', 'image')."
             )
-        object.__setattr__(self, "type", modality_type)
+        object.__setattr__(self, "type", kind)
         in_f = (self.input_field,) if isinstance(self.input_field, str) else tuple(self.input_field)
         out_f = (self.output_field,) if isinstance(self.output_field, str) else tuple(self.output_field)
         if len(in_f) != len(out_f):
             raise ValueError(
-                f"modality {self.input_field!r}: input_field/output_field arity mismatch"
+                f"field {self.input_field!r}: input_field/output_field arity mismatch"
             )
         if not 0.0 <= self.mask_prob <= 1.0:
-            raise ValueError(f"mask_prob for modality {self.input_field!r} must be in [0, 1], got {self.mask_prob}.")
+            raise ValueError(f"mask_prob for field {self.input_field!r} must be in [0, 1], got {self.mask_prob}.")
         if self.permute:
-            if modality_type != "discrete":
-                raise ValueError(f"modality {self.input_field!r}: permute=True requires type='discrete'.")
+            if kind != "discrete":
+                raise ValueError(f"field {self.input_field!r}: permute=True requires type='discrete'.")
             if self.vocab_size is None or self.vocab_size <= 0:
-                raise ValueError(f"modality {self.input_field!r}: vocab_size must be positive when permute=True.")
+                raise ValueError(f"field {self.input_field!r}: vocab_size must be positive when permute=True.")
         if self.vocab_size is not None and self.vocab_size <= 0:
-            raise ValueError(f"modality {self.input_field!r}: vocab_size must be positive.")
+            raise ValueError(f"field {self.input_field!r}: vocab_size must be positive.")
         self.linear_transform()
         self.scale_spec()
         self.shift_spec()
         if self._uses_direct_scale_shift():
             if self.type == "linear":
                 raise ValueError(
-                    f"modality {self.input_field!r}: linear augmentation uses scale_in_low, "
+                    f"field {self.input_field!r}: linear augmentation uses scale_in_low, "
                     "scale_out_low, scale_in_high, and scale_out_high."
                 )
             if self.type == "discrete":
                 raise ValueError(
-                    f"modality {self.input_field!r}: scale/shift parameters only apply to "
-                    "type='image'; discrete modalities support permute, mask_prob, "
+                    f"field {self.input_field!r}: scale/shift parameters only apply to "
+                    "type='image'; discrete fields support permute, mask_prob, "
                     "and mask_value."
                 )
 
@@ -180,11 +180,11 @@ class SequenceAugmentModalitySpec:
             return (1.0, 0.0)
         if self.type != "linear":
             raise ValueError(
-                f"modality {self.input_field!r}: scale_in_*/scale_out_* endpoints require type='linear'."
+                f"field {self.input_field!r}: scale_in_*/scale_out_* endpoints require type='linear'."
             )
         if any(value is None for value in endpoints):
             raise ValueError(
-                f"modality {self.input_field!r}: set scale_in_low, scale_out_low, scale_in_high, "
+                f"field {self.input_field!r}: set scale_in_low, scale_out_low, scale_in_high, "
                 "and scale_out_high together."
             )
         scale_in_low = self.scale_in_low
@@ -200,7 +200,7 @@ class SequenceAugmentModalitySpec:
         in_high = float(scale_in_high)
         out_high = float(scale_out_high)
         if in_low == in_high:
-            raise ValueError(f"modality {self.input_field!r}: scale_in_low and scale_in_high must differ.")
+            raise ValueError(f"field {self.input_field!r}: scale_in_low and scale_in_high must differ.")
         scale = (out_high - out_low) / (in_high - in_low)
         shift = out_low - in_low * scale
         return (scale, shift)
@@ -224,20 +224,20 @@ class Augmenter:
     field's value so steps that share an id (e.g. the same task) share draws
     within one :meth:`reseed` generation. Call :meth:`reseed` to advance to a
     new draw set for every key. Mask decisions (``mask_prob``) are drawn
-    independently per step (one draw per modality per call), from a stream
+    independently per step (one draw per field spec per call), from a stream
     seeded by the base seed and generation.
     """
 
     def __init__(
         self,
         *,
-        modalities: Sequence[Mapping[str, Any] | SequenceAugmentModalitySpec],
+        fields: Sequence[Mapping[str, Any] | SequenceAugmentFieldSpec],
         seed_field: str,
         enabled: bool = True,
         seed: int | None = None,
     ) -> None:
         self.enabled = enabled
-        self.modalities = tuple(_coerce_modality(spec) for spec in modalities)
+        self.fields = tuple(_coerce_field(spec) for spec in fields)
         self.seed_field = seed_field
         self._base_seed = seed
         self._generation = 0
@@ -253,11 +253,11 @@ class Augmenter:
         """
         if not augment:
             return step
-        if not (self.enabled and any(spec.is_active() for spec in self.modalities)):
+        if not (self.enabled and any(spec.is_active() for spec in self.fields)):
             return step
         row = dict(step)
         draws = self._draws_for_step(row)
-        for index, spec in enumerate(self.modalities):
+        for index, spec in enumerate(self.fields):
             draw = draws[index]
             mask_this_step = self._sample_mask(spec)
             for in_f, out_f in zip(spec.input_fields, spec.output_fields):
@@ -296,7 +296,7 @@ class Augmenter:
         return Augmenter(
             enabled=self.enabled,
             seed=seed,
-            modalities=self.modalities,
+            fields=self.fields,
             seed_field=self.seed_field,
         )
 
@@ -330,15 +330,15 @@ class Augmenter:
             )
         )
         draws = {
-            index: self._draw_modality(spec, rng)
-            for index, spec in enumerate(self.modalities)
+            index: self._draw_field(spec, rng)
+            for index, spec in enumerate(self.fields)
         }
         self._draw_cache[cache_key] = draws
         return draws
 
-    def _draw_modality(
+    def _draw_field(
         self,
-        spec: SequenceAugmentModalitySpec,
+        spec: SequenceAugmentFieldSpec,
         rng: np.random.Generator,
     ) -> dict[str, Any]:
         if spec.permute:
@@ -368,7 +368,7 @@ class Augmenter:
             ),
         }
 
-    def _apply_permutation(self, spec: SequenceAugmentModalitySpec, draw: dict[str, Any], value: Any) -> Any:
+    def _apply_permutation(self, spec: SequenceAugmentFieldSpec, draw: dict[str, Any], value: Any) -> Any:
         perm = draw["perm"]
         if perm is None:
             return value
@@ -380,7 +380,7 @@ class Augmenter:
             raise ValueError(f"Cannot permute {spec.input_field!r} value {idx}; expected it in [0, {len(perm)}).")
         return int(perm[idx])
 
-    def _apply_scale_shift(self, spec: SequenceAugmentModalitySpec, draw: dict[str, Any], value: Any) -> Any:
+    def _apply_scale_shift(self, spec: SequenceAugmentFieldSpec, draw: dict[str, Any], value: Any) -> Any:
         scale = float(draw["scale"])
         shift = float(draw["shift"])
         if scale == 1.0 and shift == 0.0:
@@ -408,13 +408,13 @@ class Augmenter:
             self._tls.mask_rng_generation = generation
         return rng
 
-    def _sample_mask(self, spec: SequenceAugmentModalitySpec) -> bool:
+    def _sample_mask(self, spec: SequenceAugmentFieldSpec) -> bool:
         if spec.mask_prob <= 0.0:
             return False
         return bool(self._mask_rng().random() < spec.mask_prob)
 
     def _mask_or_value(
-        self, spec: SequenceAugmentModalitySpec, value: Any, mask: bool
+        self, spec: SequenceAugmentFieldSpec, value: Any, mask: bool
     ) -> Any:
         if not mask:
             return value
@@ -423,15 +423,15 @@ class Augmenter:
         return _zero_like(value)
 
 
-def _coerce_modality(spec: Mapping[str, Any] | SequenceAugmentModalitySpec) -> SequenceAugmentModalitySpec:
-    if isinstance(spec, SequenceAugmentModalitySpec):
+def _coerce_field(spec: Mapping[str, Any] | SequenceAugmentFieldSpec) -> SequenceAugmentFieldSpec:
+    if isinstance(spec, SequenceAugmentFieldSpec):
         return spec
     data = dict(spec)
     if "field" in data and "input_field" not in data:
         raise TypeError(
-            "Augmenter modalities use input_field=/output_field= (not field=)"
+            "Augmenter fields use input_field=/output_field= (not field=)"
         )
-    return SequenceAugmentModalitySpec(**data)
+    return SequenceAugmentFieldSpec(**data)
 
 
 def _scale_shift_value(value: Any, scale: float, shift: float) -> Any:

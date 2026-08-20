@@ -49,11 +49,11 @@ class _FakeHfApi:
 def _store(*actions: int, name: str | None=None) -> Datastore:
     store = Datastore(name=name)
     for i, action in enumerate(actions):
-        store.append({'observation': {'discrete': i}, 'action': {'discrete': action}, 'reward': float(i), 'done': 0, 'step_index': i})
+        store.append({'observation': {'discrete': i}, 'action': {'discrete': action}, 'reward': float(i), 'episode_done': 0, 'task_done': 0, 'step_index': i})
     return store
 
 def _loaded_store_datasets() -> dict[str, Dataset]:
-    return {'cartpole': Dataset.from_list([{'observation': {'discrete': 1}, 'action': {'discrete': 1}, 'reward': 1.0, 'done': 0, 'step_index': 0}]), 'lunar': Dataset.from_list([{'observation': {'discrete': 2}, 'action': {'discrete': 2}, 'reward': 2.0, 'done': 0, 'step_index': 0}])}
+    return {'cartpole': Dataset.from_list([{'observation': {'discrete': 1}, 'action': {'discrete': 1}, 'reward': 1.0, 'episode_done': 0, 'task_done': 0, 'step_index': 0}]), 'lunar': Dataset.from_list([{'observation': {'discrete': 2}, 'action': {'discrete': 2}, 'reward': 2.0, 'episode_done': 0, 'task_done': 0, 'step_index': 0}])}
 
 def _write_snapshot(root: Path, *store_names: str, split: str='train') -> Path:
     for store_name in store_names:
@@ -109,7 +109,7 @@ def test_load_stores_from_hub_scopes_short_names(monkeypatch: pytest.MonkeyPatch
 
     def fake_load_dataset(path: str, **kwargs):
         calls.append((path, kwargs))
-        return {'config': Dataset.from_list([{'observation': {'discrete': 0}, 'action': {'discrete': 0}, 'reward': 0.0, 'done': 0, 'step_index': 0}])}
+        return {'config': Dataset.from_list([{'observation': {'discrete': 0}, 'action': {'discrete': 0}, 'reward': 0.0, 'episode_done': 0, 'task_done': 0, 'step_index': 0}])}
 
     def fake_snapshot(*, repo_id: str, store_names: list[str] | None, split: str, revision: str | None, token: str | bool | None, force_download: bool=False):
         snapshot_calls.append((repo_id, store_names, split, revision, token))

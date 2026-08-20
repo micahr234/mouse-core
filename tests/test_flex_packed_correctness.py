@@ -172,7 +172,8 @@ def test_model_train_isolates_tasks_within_sequence() -> None:
         hidden_dim=backbone.hidden_dim,
         modalities=[
             {"type": 'discrete', "field": "action", "vocab_size": 4},
-            {"type": 'discrete', "field": "done", "vocab_size": 5},
+            {"type": 'discrete', "field": "episode_done", "vocab_size": 3},
+            {"type": 'discrete', "field": "task_done", "vocab_size": 3},
             {'type': 'learnable', 'tokens': 1},
         ],
     )
@@ -184,16 +185,16 @@ def test_model_train_isolates_tasks_within_sequence() -> None:
     )
     model = Model(encoder=encoder, backbone=backbone, heads=head).eval()
     task0 = [
-        {'action': 0, 'done': 0, 'task_index': 0},
-        {'action': 1, 'done': 0, 'task_index': 0},
-        {'action': 2, 'done': 3, 'task_index': 0},
+        {'action': 0, 'episode_done': 0, 'task_done': 0, 'task_index': 0},
+        {'action': 1, 'episode_done': 0, 'task_done': 0, 'task_index': 0},
+        {'action': 2, 'episode_done': 1, 'task_done': 2, 'task_index': 0},
     ]
     task1 = [
-        {'action': 3, 'done': 0, 'task_index': 1},
-        {'action': 1, 'done': 0, 'task_index': 1},
+        {'action': 3, 'episode_done': 0, 'task_done': 0, 'task_index': 1},
+        {'action': 1, 'episode_done': 0, 'task_done': 0, 'task_index': 1},
     ]
     with torch.no_grad():
-        grouping = Grouper(input_field="task_index", output_field="grouping_id")
+        grouping = Grouper(fields=[{"input_field": "task_index", "output_field": "grouping_id"}])
         tb_both = batch_to_token_batch(_tok(encoder), [task0 + task1], grouper=grouping)
         tb_t1 = batch_to_token_batch(_tok(encoder), [task1], grouper=grouping)
         preds_both, od, _ = model(tb_both)

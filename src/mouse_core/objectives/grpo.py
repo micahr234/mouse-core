@@ -70,7 +70,8 @@ class GrpoObjective(Objective):
             step_fields=[
                 "action",
                 "reward",
-                "done",
+                "episode_done",
+                "task_done",
                 "old_log_prob",
                 "advantage",
             ],

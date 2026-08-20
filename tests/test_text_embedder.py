@@ -23,9 +23,10 @@ _DEFAULT_MODALITIES = [
     {"type": 'token', "field": "action"},
     {"type": 'text', "field": "observation", "format": 'observation={observation}'},
     {"type": 'text', "field": "reward", "format": 'reward={reward}', "skip": 0.0},
-    {"type": 'text', "field": "done", "format": 'done={done}', "skip": 0},
+    {"type": 'text', "field": "episode_done", "format": 'episode_done={episode_done}', "skip": 0},
+    {"type": 'text', "field": "task_done", "format": 'task_done={task_done}', "skip": 0},
 ]
-_DEFAULT_FORMAT = "<action={action},{observation},{reward},{done}>"
+_DEFAULT_FORMAT = "<action={action},{observation},{reward},{episode_done},{task_done}>"
 
 
 def _text_pair(hidden_dim: int = 8, **kwargs):
@@ -40,7 +41,7 @@ def _text_pair(hidden_dim: int = 8, **kwargs):
     image_processor = kwargs.pop("image_processor", None)
     step_fields = kwargs.pop(
         "step_fields",
-        ["action", "observation", "reward", "done"],
+        ["action", "observation", "reward", "episode_done", "task_done"],
     )
     tokenizer = TextTokenizer(
         modalities=modalities,
@@ -68,8 +69,8 @@ def test_text_embedder_skip_omits_value_keeps_commas() -> None:
     tokenizer, enc = _text_pair()
     batch = [
         [
-            {"observation": 1, "action": 0, "reward": 0.0, "done": 0},
-            {"observation": 2, "action": 1, "reward": 1.0, "done": 1},
+            {"observation": 1, "action": 0, "reward": 0.0, "episode_done": 0, "task_done": 0},
+            {"observation": 2, "action": 1, "reward": 1.0, "episode_done": 1, "task_done": 0},
         ]
     ]
     embeds, step_fields, indices = enc(batch_to_token_batch(tokenizer, batch))
@@ -98,9 +99,9 @@ def test_text_embedder_skip_omits_value_keeps_commas() -> None:
         emb.weight[0] = 7.0
     tokenizer2, enc2 = _text_pair(tokenizer=_CaptureTok(), embed_tokens=emb)
     out, _, _ = enc2(
-        batch_to_token_batch(tokenizer2, [[{"observation": 1, "action": 0, "reward": 0.0, "done": 0}]])
+        batch_to_token_batch(tokenizer2, [[{"observation": 1, "action": 0, "reward": 0.0, "episode_done": 0, "task_done": 0}]])
     )
-    assert seen == ["<action=", ",observation=1,,>"]
+    assert seen == ["<action=", ",observation=1,,,>"]
     matches = (out == 7.0).all(dim=-1)
     assert int(matches.sum().item()) == 1
 

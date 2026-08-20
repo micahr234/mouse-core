@@ -65,17 +65,17 @@ def _as_rect(preds: torch.Tensor) -> torch.Tensor:
 
 def _tiny_model(backbone_cls, tokens: int=1) -> Model:
     hidden_dim = 16
-    encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4}, {"type": 'fourier', "field": "reward"}, {"type": 'discrete', "field": "done", "vocab_size": 5}])
+    encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4}, {"type": 'fourier', "field": "reward"}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3}, {"type": 'discrete', "field": "task_done", "vocab_size": 3}])
     backbone = backbone_cls(hidden_dim=hidden_dim, num_layers=2, num_heads=2)
     head = DiscreteActionValueHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1)
     return Model(encoder=encoder, backbone=backbone, heads=head).eval()
 
 def _steps(n: int, start: int=0) -> list[dict]:
-    return [{'action': i % 4, 'reward': float(i), 'done': int(i % 7 == 6)} for i in range(start, start + n)]
+    return [{'action': i % 4, 'reward': float(i), 'episode_done': int(i % 7 == 6), 'task_done': 0} for i in range(start, start + n)]
 
 
 def _fwd(model: Model, rows: list[list[dict]], **kwargs):
-    grouper = Grouper(input_field="task_index", output_field="grouping_id")
+    grouper = Grouper(fields=[{"input_field": "task_index", "output_field": "grouping_id"}])
     # Ensure absolute grouping ids exist on every step.
     patched = [
         [{**step, "task_index": step.get("task_index", 0)} for step in seq]
@@ -220,11 +220,11 @@ def test_concat_fusion_ragged_chunks_match_unbatched() -> None:
     blocks, and the mask must expand to exactly that many tokens per step."""
     torch.manual_seed(6)
     hidden_dim = 16
-    encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4}, {"type": 'fourier', "field": "reward"}, {"type": 'discrete', "field": "done", "vocab_size": 5}, {'type': 'learnable', 'tokens': 1}])
+    encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4}, {"type": 'fourier', "field": "reward"}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3}, {"type": 'discrete', "field": "task_done", "vocab_size": 3}, {'type': 'learnable', 'tokens': 1}])
     backbone = Qwen3Backbone(hidden_dim=hidden_dim, num_layers=2, num_heads=2)
     head = DiscreteActionValueHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1)
     model = Model(encoder=encoder, backbone=backbone, heads=head).eval()
-    assert model.encoder.tokens_per_step == 4
+    assert model.encoder.tokens_per_step == 5
     chunk_lengths = [[1, 4, 2], [3, 0, 1], [2, 2, 3]]
     totals = [sum((call[b] for call in chunk_lengths)) for b in range(3)]
     rows = [_steps(totals[b], start=b * 10) for b in range(3)]
@@ -376,14 +376,14 @@ def test_decode_task_mask_isolates_without_reset(backbone_cls) -> None:
     torch.manual_seed(8)
     model = _tiny_model(backbone_cls)
     task0 = [
-        {'action': 0, 'reward': 0.0, 'done': 0, 'task_index': 0},
-        {'action': 1, 'reward': 1.0, 'done': 0, 'task_index': 0},
-        {'action': 2, 'reward': 2.0, 'done': 3, 'task_index': 0},
+        {'action': 0, 'reward': 0.0, 'episode_done': 0, 'task_done': 0, 'task_index': 0},
+        {'action': 1, 'reward': 1.0, 'episode_done': 0, 'task_done': 0, 'task_index': 0},
+        {'action': 2, 'reward': 2.0, 'episode_done': 1, 'task_done': 2, 'task_index': 0},
     ]
     task1 = [
-        {'action': 3, 'reward': 3.0, 'done': 0, 'task_index': 1},
-        {'action': 1, 'reward': 4.0, 'done': 0, 'task_index': 1},
-        {'action': 0, 'reward': 5.0, 'done': 0, 'task_index': 1},
+        {'action': 3, 'reward': 3.0, 'episode_done': 0, 'task_done': 0, 'task_index': 1},
+        {'action': 1, 'reward': 4.0, 'episode_done': 0, 'task_done': 0, 'task_index': 1},
+        {'action': 0, 'reward': 5.0, 'episode_done': 0, 'task_done': 0, 'task_index': 1},
     ]
     with torch.no_grad():
         ref = _fwd(model, [task1])[0]['action_value']

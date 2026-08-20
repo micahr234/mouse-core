@@ -23,11 +23,11 @@ This installs the package in editable mode with the `dev` and `all` extras (`all
 
 ### Temporary `PYTHON_GIL=0` (remove when possible)
 
-`scripts/install.sh` and CI set `PYTHON_GIL=0` so the free-threaded interpreter **keeps the GIL off** after imports. Today `transformers` still pins `tokenizers<=0.23.0`, and those builds re-enable the GIL on import. `tokenizers>=0.23.1` declares free-threading support, but we cannot depend on it until `transformers` allows that version.
+`scripts/install.sh` and CI set `PYTHON_GIL=0` so the free-threaded interpreter **keeps the GIL off** after imports. `tokenizers>=0.23.1` declares `Py_MOD_GIL_NOT_USED`. Triton still does not, so importing `triton._C.libtriton` (pulled in by torch) would otherwise re-enable the GIL.
 
-**Follow-up:** when `transformers` accepts `tokenizers>=0.23.1`, pin that pair, drop `PYTHON_GIL=0` from [`scripts/install.sh`](scripts/install.sh) and [`.github/workflows/ci.yml`](.github/workflows/ci.yml), and tighten the DataLoader free-threading hint accordingly.
+**Follow-up:** when Triton declares `Py_MOD_GIL_NOT_USED`, drop `PYTHON_GIL=0` from [`scripts/install.sh`](scripts/install.sh) and [`.github/workflows/ci.yml`](.github/workflows/ci.yml). When a PyPI `transformers>=5.16.0` exists, replace the git ``main`` pin in [`pyproject.toml`](pyproject.toml) with that version specifier.
 
-**Risk:** forcing the GIL off skips CPython’s “this extension did not opt in” safety brake. That is fine for our usual path (read-only HF Dataset slices + numeric prepare). It is riskier if multiple worker threads concurrently mutate shared C-extension state — the main case here is a shared Hugging Face `tokenizer` under `TextEmbedder` prepare. Prefer `num_workers=0` for text prepare until the follow-up lands, or treat multi-worker text as experimental.
+**Risk:** forcing the GIL off skips CPython’s “this extension did not opt in” safety brake. That is fine for our usual path (read-only HF Dataset slices + numeric / text prepare). Triton’s autotune cache is still racy under `GIL=0` if Python threads launch kernels concurrently.
 
 The package lives at `src/mouse_core/` (standard src layout) and is imported as `mouse_core`.
 

@@ -7,7 +7,11 @@ import torch.nn.functional as F
 from tensordict import TensorDict
 
 from mouse_core.objectives.base import Objective
-from mouse_core.objectives.dqn import _valid_transitions
+from mouse_core.objectives.dqn import (
+    _boundary_discounts,
+    _require_done_codes,
+    _valid_transitions,
+)
 
 
 def sample_discrete_action(
@@ -45,7 +49,7 @@ def _gae_advantages(
     Args:
         rewards: ``[N-1]`` rewards for transitions out of states ``0..N-2``.
         values: ``[N]`` value predictions ``V(s_i)``.
-        discounts: ``[N-1]`` per-transition discount (from done-code gammas).
+        discounts: ``[N-1]`` per-transition discount (from episode/task done codes).
         valid: ``[N-1]`` mask — False at sequence boundaries.
         gae_lambda: GAE λ.
 
@@ -81,11 +85,11 @@ class PpoObjective(Objective):
     ``grouping_field=`` is set) the same grouping column is a decision point,
     using the same timing convention as
     :class:`~mouse_core.objectives.dqn.DqnObjective`: token ``i`` encodes state
-    ``s_i``, and the action / reward / done / behavior log-prob stored at
-    ``i+1`` describe the transition out of ``s_i``.
+    ``s_i``, and the action / reward / episode-done / task-done / behavior
+    log-prob stored at ``i+1`` describe the transition out of ``s_i``.
 
-    Done-code discounts match the DQN table (``gamma_step`` for ``done==0``, …,
-    ``gamma_task_truncated`` for ``done==4``).
+    Discounts match the DQN table: the bootstrap is multiplied by the episode
+    gamma, then by the task gamma (``1.0`` when ``task_done==0``).
 
     For multi-epoch PPO, stamp behavior log-probs on rollout rows (same step as
     ``action``) and include them in the tokenizer ``step_fields`` keep-list so
@@ -93,7 +97,13 @@ class PpoObjective(Objective):
 
         tokenizer = NumericTokenizer(
             ...,
-            step_fields=["action", "reward", "done", "old_log_prob"],
+            step_fields=[
+                "action",
+                "reward",
+                "episode_done",
+                "task_done",
+                "old_log_prob",
+            ],
         )
         predictions, objective_data, _ = model(batch)  # TokenBatch
         loss, metrics = objective(objective_data, predictions)
@@ -102,13 +112,14 @@ class PpoObjective(Objective):
     (ratio = 1) — suitable for a single pass over a freshly collected batch.
 
     Args:
-        gamma_step: Discount for running transitions (``done == 0``).
-        gamma_episode_terminal: Discount when an episode ends inside a task
-            (``done == 1``).
-        gamma_episode_truncated: Discount when an episode is truncated inside a
-            task (``done == 2``).
-        gamma_task_terminal: Discount when a task ends (``done == 3``).
-        gamma_task_truncated: Discount when a task is truncated (``done == 4``).
+        gamma_step: Discount for running transitions (``episode_done == 0``).
+        gamma_episode_terminal: Discount when an episode ends (``episode_done == 1``).
+        gamma_episode_truncated: Discount when an episode is truncated
+            (``episode_done == 2``).
+        gamma_task_terminal: Extra discount when a task ends (``task_done == 1``);
+            multiplies the episode discount. ``task_done == 0`` uses ``1.0``.
+        gamma_task_truncated: Extra discount when a task is truncated
+            (``task_done == 2``); multiplies the episode discount.
         gae_lambda: GAE λ (``1.0`` = Monte Carlo returns within the discount).
         clip_eps: PPO ratio clip ε.
         vf_coef: Weight on the value-function MSE term.
@@ -116,7 +127,8 @@ class PpoObjective(Objective):
         normalize_advantage: If True, standardize advantages over valid pairs.
         action_key: Key in ``objective_data`` for integer actions.
         reward_key: Key in ``objective_data`` for rewards.
-        done_key: Key in ``objective_data`` for done codes.
+        episode_done_key: Key in ``objective_data`` for episode-done codes.
+        task_done_key: Key in ``objective_data`` for task-done codes.
         old_log_prob_key: Key in ``objective_data`` for behavior log-probs.
         predictions_key: Key in ``predictions`` for policy logits.
         value_key: Key in ``predictions`` for scalar values.
@@ -138,7 +150,8 @@ class PpoObjective(Objective):
         normalize_advantage: bool = True,
         action_key: str = "action",
         reward_key: str = "reward",
-        done_key: str = "done",
+        episode_done_key: str = "episode_done",
+        task_done_key: str = "task_done",
         old_log_prob_key: str = "old_log_prob",
         predictions_key: str = "action",
         value_key: str = "value",
@@ -157,7 +170,8 @@ class PpoObjective(Objective):
         self.normalize_advantage = normalize_advantage
         self.action_key = action_key
         self.reward_key = reward_key
-        self.done_key = done_key
+        self.episode_done_key = episode_done_key
+        self.task_done_key = task_done_key
         self.old_log_prob_key = old_log_prob_key
         self.predictions_key = predictions_key
         self.value_key = value_key
@@ -224,34 +238,31 @@ class PpoObjective(Objective):
                 f"PPO objective expects reward shape [{N}], got {tuple(reward.shape)}."
             )
 
-        done = objective_data[self.done_key]
-        if done.dtype != torch.int64:
-            raise TypeError(f"done must be int64, got {done.dtype}.")
-        if done.shape != torch.Size([N]):
-            raise ValueError(
-                f"PPO objective expects done shape [{N}], got {tuple(done.shape)}."
-            )
+        episode_done, task_done = _require_done_codes(
+            objective_data,
+            episode_done_key=self.episode_done_key,
+            task_done_key=self.task_done_key,
+            N=N,
+        )
 
         valid = _valid_transitions(objective_data, N, device, grouping_field=self.grouping_field)
 
         next_actions = action[1:]
         next_rewards = reward[1:].to(dtype=dtype)
-        next_done = done[1:]
         curr_logits = logits[:-1, :]
         curr_values = values[:-1]
 
-        gammas = torch.tensor(
-            [
-                self.gamma_step,
-                self.gamma_episode_terminal,
-                self.gamma_episode_truncated,
-                self.gamma_task_terminal,
-                self.gamma_task_truncated,
-            ],
+        discounts = _boundary_discounts(
+            episode_done=episode_done[1:],
+            task_done=task_done[1:],
+            gamma_step=self.gamma_step,
+            gamma_episode_terminal=self.gamma_episode_terminal,
+            gamma_episode_truncated=self.gamma_episode_truncated,
+            gamma_task_terminal=self.gamma_task_terminal,
+            gamma_task_truncated=self.gamma_task_truncated,
             dtype=dtype,
             device=device,
         )
-        discounts = gammas[next_done]
 
         advantages, returns = _gae_advantages(
             rewards=next_rewards,

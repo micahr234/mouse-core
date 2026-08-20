@@ -73,10 +73,9 @@ setup_venv() {
     
     success "Virtual environment created"
 
-    # TEMPORARY: transformers still pins tokenizers<=0.23.0, which re-enables the
-    # GIL on import. tokenizers>=0.23.1 is free-thread-safe but blocked by that pin.
-    # When transformers allows tokenizers>=0.23.1, remove this PYTHON_GIL=0 export
-    # (and the matching CI env) — see CONTRIBUTING.md.
+    # TEMPORARY: Triton still re-enables the GIL on import (no Py_mod_gil slot).
+    # tokenizers>=0.23.1 is free-thread-safe. Drop PYTHON_GIL=0 when Triton
+    # declares Py_MOD_GIL_NOT_USED — see CONTRIBUTING.md.
     if ! grep -qxF 'export PYTHON_GIL=0' .venv/bin/activate 2>/dev/null; then
         echo 'export PYTHON_GIL=0' >> .venv/bin/activate
     fi

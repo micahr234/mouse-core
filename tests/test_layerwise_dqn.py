@@ -14,7 +14,7 @@ from tests._token_batch_helpers import batch_to_token_batch, tok_from_encoder
 _tok = tok_from_encoder
 
 def _tiny_batch() -> list[list[dict]]:
-    return [[{'action': 0, 'observation': 1, 'reward': 0.0, 'done': 0}, {'action': 1, 'observation': 2, 'reward': 1.0, 'done': 0}, {'action': 0, 'observation': 3, 'reward': 0.5, 'done': 0}]]
+    return [[{'action': 0, 'observation': 1, 'reward': 0.0, 'episode_done': 0, 'task_done': 0}, {'action': 1, 'observation': 2, 'reward': 1.0, 'episode_done': 0, 'task_done': 0}, {'action': 0, 'observation': 3, 'reward': 0.5, 'episode_done': 0, 'task_done': 0}]]
 
 def test_layerwise_head_forward_shape() -> None:
     head = LayerwiseDiscreteActionValueHead(num_backbone_layers=2, in_features=8, out_features=4, hidden_dim=8, num_layers=1, scale=0.1)
@@ -26,7 +26,7 @@ def test_layerwise_head_forward_shape() -> None:
 
 def test_model_layerwise_forward_and_objective() -> None:
     backbone = Qwen3Backbone(hidden_dim=16, num_layers=2, num_heads=2)
-    encoder = NumericEmbedder(hidden_dim=backbone.hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02}, {"type": 'discrete', "field": "observation", "vocab_size": 8, "std": 0.02}, {"type": 'fourier', "field": "reward", "std": 0.02}, {"type": 'discrete', "field": "done", "vocab_size": 5, "std": 0.02}])
+    encoder = NumericEmbedder(hidden_dim=backbone.hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02}, {"type": 'discrete', "field": "observation", "vocab_size": 8, "std": 0.02}, {"type": 'fourier', "field": "reward", "std": 0.02}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3, "std": 0.02}, {"type": 'discrete', "field": "task_done", "vocab_size": 3, "std": 0.02}])
     head = LayerwiseDiscreteActionValueHead(num_backbone_layers=2, in_features=backbone.hidden_dim, out_features=4, hidden_dim=backbone.hidden_dim, num_layers=1, scale=0.1)
     model = Model(encoder=encoder, backbone=backbone, heads=head)
     batch = _tiny_batch()
@@ -43,7 +43,7 @@ def test_model_layerwise_forward_and_objective() -> None:
 
 def test_layerwise_objective_q_metrics_use_curr_max_q() -> None:
     """q_values_mean and layer_q_mean report max online Q at the current state."""
-    step_stream = TensorDict({'action': torch.tensor([0, 1, 0]), 'reward': torch.tensor([0.0, 1.0, 5.0]), 'done': torch.tensor([0, 0, 0])}, batch_size=[3])
+    step_stream = TensorDict({'action': torch.tensor([0, 1, 0]), 'reward': torch.tensor([0.0, 1.0, 5.0]), 'episode_done': torch.tensor([0, 0, 0]), 'task_done': torch.tensor([0, 0, 0])}, batch_size=[3])
     out = TensorDict({'action_value_layerwise': torch.tensor([[[0.0, 2.0], [3.0, 0.0]], [[0.0, 0.0], [0.0, 0.0]], [[0.0, 0.0], [0.0, 0.0]]]), 'action_value_layerwise_target': torch.zeros(3, 2, 2)}, batch_size=[3])
     _, metrics = LayerwiseDqnObjective(num_backbone_layers=2, gamma_step_start=0.0, gamma_step=0.0)(step_stream, out)
     assert abs(metrics['q_values_mean'] - 1.5) < 1e-05

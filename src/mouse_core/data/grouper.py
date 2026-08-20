@@ -1,37 +1,40 @@
-"""Grouper — copy ``input_field`` onto ``output_field`` on one step.
+"""Grouper — copy listed fields onto output names on one step.
 
 I/O
 ---
 * **in:** ``dict`` (one step)
-* **out:** ``dict`` (copy with ``output_field`` set from ``input_field``)
+* **out:** ``dict`` (copy with mapped keys set; other keys left in place)
 
-Both ``input_field`` and ``output_field`` are required. Values are copied as-is
-(no int cast). Same names replace the key in place.
+``fields`` is a list of ``{input_field, output_field}`` dicts. Values are
+copied as-is (no int cast). Same names replace the key in place; different
+names write the output and leave the input.
 
-The tokenizer's ``grouping_field`` should match ``output_field`` when this
-column is used for attention isolation.
+The tokenizer's ``grouping_field`` should match a Grouper output name when
+this column is used for attention isolation.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from typing import Any
 
+from mouse_core.data.io_fields import coerce_io_fields
 from mouse_core.data.modality import unwrap_scalar
 
 
-@dataclass(frozen=True)
 class Grouper:
-    """Callable that copies one step field onto another name."""
+    """Callable that copies listed inputs onto output names."""
 
-    input_field: str
-    output_field: str
+    def __init__(self, *, fields: Sequence[Mapping[str, Any]]) -> None:
+        self.fields = coerce_io_fields(fields, who="Grouper")
 
     def __call__(self, step: dict) -> dict:
-        if self.input_field not in step:
-            raise KeyError(
-                f"Grouper input_field {self.input_field!r} missing from step "
-                f"(have {sorted(step)})"
-            )
         out = dict(step)
-        out[self.output_field] = unwrap_scalar(step[self.input_field])
+        for in_name, out_name in self.fields:
+            if in_name not in step:
+                raise KeyError(
+                    f"Grouper input field {in_name!r} missing from step "
+                    f"(have {sorted(step)})"
+                )
+            out[out_name] = unwrap_scalar(step[in_name])
         return out

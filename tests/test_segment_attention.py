@@ -90,24 +90,25 @@ def test_prepare_derives_grouping_ids_from_field() -> None:
         hidden_dim=8,
         modalities=[
             {"type": 'discrete', "field": "action", "vocab_size": 4},
-            {"type": 'discrete', "field": "done", "vocab_size": 5},
+            {"type": 'discrete', "field": "episode_done", "vocab_size": 3},
+            {"type": 'discrete', "field": "task_done", "vocab_size": 3},
         ],
     )
     batch = [
         [
-            {"action": 0, "done": 0, "task_index": 0},
-            {"action": 1, "done": 3, "task_index": 0},
-            {"action": 2, "done": 0, "task_index": 1},
-            {"action": 3, "done": 1, "task_index": 1},
-            {"action": 0, "done": 4, "task_index": 1},
-            {"action": 1, "done": 0, "task_index": 2},
+            {"action": 0, "episode_done": 0, "task_done": 0, "task_index": 0},
+            {"action": 1, "episode_done": 1, "task_done": 2, "task_index": 0},
+            {"action": 2, "episode_done": 0, "task_done": 0, "task_index": 1},
+            {"action": 3, "episode_done": 1, "task_done": 0, "task_index": 1},
+            {"action": 0, "episode_done": 2, "task_done": 2, "task_index": 1},
+            {"action": 1, "episode_done": 0, "task_done": 0, "task_index": 2},
         ]
     ]
     tb = batch_to_token_batch(
-        _tok(encoder), batch, grouper=Grouper(input_field="task_index", output_field="grouping_id")
+        _tok(encoder), batch, grouper=Grouper(fields=[{"input_field": "task_index", "output_field": "grouping_id"}])
     )
     assert tb.step_fields["grouping_id"].tolist() == [0, 0, 1, 1, 1, 2]
-    assert list(tb.grouping_ids) == [0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 2, 2]
+    assert list(tb.grouping_ids) == [0] * 6 + [1] * 9 + [2] * 3
 
 
 def test_constant_grouper_ignores_done_boundaries() -> None:
@@ -115,10 +116,11 @@ def test_constant_grouper_ignores_done_boundaries() -> None:
         hidden_dim=8,
         modalities=[
             {"type": 'discrete', "field": "action", "vocab_size": 4},
-            {"type": 'discrete', "field": "done", "vocab_size": 5},
+            {"type": 'discrete', "field": "episode_done", "vocab_size": 3},
+            {"type": 'discrete', "field": "task_done", "vocab_size": 3},
         ],
     )
-    batch = [[{"action": 0, "done": 3}, {"action": 1, "done": 0}]]
+    batch = [[{"action": 0, "episode_done": 1, "task_done": 2}, {"action": 1, "episode_done": 0, "task_done": 0}]]
     tb = batch_to_token_batch(_tok(encoder), batch)
     assert tb.step_fields["grouping_id"].tolist() == [0, 0]
     assert list(tb.grouping_ids) == [0] * tb.L

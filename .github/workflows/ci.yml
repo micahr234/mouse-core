@@ -13,9 +13,8 @@ jobs:
   test:
     runs-on: ubuntu-latest
     env:
-      # TEMPORARY: keep GIL off while transformers pins tokenizers<=0.23.0
-      # (those wheels re-enable the GIL). Remove once transformers allows
-      # tokenizers>=0.23.1 — see CONTRIBUTING.md.
+      # TEMPORARY: keep GIL off while Triton re-enables it on import.
+      # Remove once Triton declares Py_MOD_GIL_NOT_USED — see CONTRIBUTING.md.
       PYTHON_GIL: "0"
     steps:
       - uses: actions/checkout@v6

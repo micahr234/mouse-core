@@ -8,7 +8,11 @@ import torch
 from tensordict import TensorDict
 
 from mouse_core.objectives.base import Objective
-from mouse_core.objectives.dqn import _valid_transitions
+from mouse_core.objectives.dqn import (
+    _boundary_discounts,
+    _require_done_codes,
+    _valid_transitions,
+)
 
 
 def effective_horizon(gamma: float) -> float:
@@ -69,10 +73,12 @@ class LayerwiseDqnObjective(Objective):
 
     Reads ``predictions["action_value_layerwise"]`` and
     ``predictions["action_value_layerwise_target"]`` with shape ``[N, L, A]``.
-    Each layer and each done-code uses its own discount, built at construction
+    Each layer and each episode/task done-code uses its own discount, built at construction
     from explicit shallow/deep endpoint pairs. Row pairs that straddle a
     sequence or grouping boundary (different ``sequence_id`` / ``grouping_field``
-    column when set) are excluded from every layer's loss.
+    column when set) are excluded from every layer's loss. ``action``,
+    ``reward``, ``episode_done``, and ``task_done`` must be in the tokenizer
+    ``step_fields`` keep-list.
 
     Effective planning horizon is ``H(gamma) = 1 / (1 - gamma)``. Layer ``0`` uses
     each ``gamma_*_start``; the deepest layer uses the deep value
@@ -99,20 +105,22 @@ class LayerwiseDqnObjective(Objective):
 
     Args:
         num_backbone_layers: Number of transformer blocks (and Q heads).
-        gamma_step_start: Step discount at layer 0 (``done == 0``).
+        gamma_step_start: Step discount at layer 0 (``episode_done == 0``).
         gamma_step: Step discount at the deepest layer.
         gamma_episode_terminal_start: Episode-terminal discount at layer 0.
         gamma_episode_terminal: Episode-terminal discount at the deepest layer.
         gamma_episode_truncated_start: Episode-truncated discount at layer 0.
         gamma_episode_truncated: Episode-truncated discount at the deepest layer.
-        gamma_task_terminal_start: Task-terminal discount at layer 0.
-        gamma_task_terminal: Task-terminal discount at the deepest layer.
-        gamma_task_truncated_start: Task-truncated discount at layer 0.
-        gamma_task_truncated: Task-truncated discount at the deepest layer.
+        gamma_task_terminal_start: Task-terminal extra discount at layer 0
+            (multiplies the episode discount; ``task_done == 0`` uses ``1.0``).
+        gamma_task_terminal: Task-terminal extra discount at the deepest layer.
+        gamma_task_truncated_start: Task-truncated extra discount at layer 0.
+        gamma_task_truncated: Task-truncated extra discount at the deepest layer.
         tau: Polyak coefficient for target-network updates.
         action_key: Key in ``objective_data`` for the integer action.
         reward_key: Key in ``objective_data`` for per-step reward.
-        done_key: Key in ``objective_data`` for the integer done code.
+        episode_done_key: Key in ``objective_data`` for the episode-done code.
+        task_done_key: Key in ``objective_data`` for the task-done code.
         cql_weight: CQL penalty coefficient; ``0.0`` disables CQL.
         cql_scale_q_eps: Additive floor when scaling the CQL penalty.
     """
@@ -134,7 +142,8 @@ class LayerwiseDqnObjective(Objective):
         tau: float = 0.01,
         action_key: str = "action",
         reward_key: str = "reward",
-        done_key: str = "done",
+        episode_done_key: str = "episode_done",
+        task_done_key: str = "task_done",
         cql_weight: float = 0.0,
         cql_scale_q_eps: float = 1.0,
         grouping_field: str | None = None,
@@ -153,7 +162,8 @@ class LayerwiseDqnObjective(Objective):
         self.tau = tau
         self.action_key = action_key
         self.reward_key = reward_key
-        self.done_key = done_key
+        self.episode_done_key = episode_done_key
+        self.task_done_key = task_done_key
         self.cql_weight = cql_weight
         self.cql_scale_q_eps = cql_scale_q_eps
         self.grouping_field = grouping_field
@@ -183,16 +193,6 @@ class LayerwiseDqnObjective(Objective):
             gamma_start=self.gamma_task_truncated_start,
             gamma_deep=self.gamma_task_truncated,
         )
-        self.layer_done_gammas: list[list[float]] = [
-            [
-                self.layer_gamma_step[layer_idx],
-                self.layer_gamma_episode_terminal[layer_idx],
-                self.layer_gamma_episode_truncated[layer_idx],
-                self.layer_gamma_task_terminal[layer_idx],
-                self.layer_gamma_task_truncated[layer_idx],
-            ]
-            for layer_idx in range(n)
-        ]
 
     def __call__(
         self,
@@ -236,20 +236,20 @@ class LayerwiseDqnObjective(Objective):
                 f"Layerwise DQN objective expects reward shape [{N}], got {tuple(reward.shape)}."
             )
 
-        done = objective_data[self.done_key]
-        if done.dtype != torch.int64:
-            raise TypeError(f"done must be int64, got {done.dtype}.")
-        if done.shape != torch.Size([N]):
-            raise ValueError(
-                f"Layerwise DQN objective expects done shape [{N}], got {tuple(done.shape)}."
-            )
+        episode_done, task_done = _require_done_codes(
+            objective_data,
+            episode_done_key=self.episode_done_key,
+            task_done_key=self.task_done_key,
+            N=N,
+        )
 
         valid = _valid_transitions(objective_data, N, device, grouping_field=self.grouping_field)
 
         curr_q = q[:-1, :, :]              # [N-1, L, A]
         next_actions = action[1:]          # [N-1]
         next_rewards = reward[1:]          # [N-1]
-        next_done = done[1:]               # [N-1]
+        next_episode_done = episode_done[1:]
+        next_task_done = task_done[1:]
         next_q_target = q_target[1:, :, :]  # [N-1, L, A]
 
         layer_losses: list[torch.Tensor] = []
@@ -258,12 +258,17 @@ class LayerwiseDqnObjective(Objective):
         deepest_curr_max_q: torch.Tensor | None = None
 
         for layer_idx in range(L):
-            gammas = torch.tensor(
-                self.layer_done_gammas[layer_idx],
+            discount = _boundary_discounts(
+                episode_done=next_episode_done,
+                task_done=next_task_done,
+                gamma_step=self.layer_gamma_step[layer_idx],
+                gamma_episode_terminal=self.layer_gamma_episode_terminal[layer_idx],
+                gamma_episode_truncated=self.layer_gamma_episode_truncated[layer_idx],
+                gamma_task_terminal=self.layer_gamma_task_terminal[layer_idx],
+                gamma_task_truncated=self.layer_gamma_task_truncated[layer_idx],
                 dtype=value_dtype,
                 device=device,
             )
-            discount = gammas[next_done]  # [N-1]
 
             curr_q_layer = curr_q[:, layer_idx, :]
             next_q_target_layer = next_q_target[:, layer_idx, :]

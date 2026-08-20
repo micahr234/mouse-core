@@ -6,7 +6,7 @@ from mouse_core.data import (
     Grouper,
     NumericTokenizer,
     NumericTokenizerModalitySpec,
-    SequenceAugmentModalitySpec,
+    SequenceAugmentFieldSpec,
     TextTokenizer,
     TextTokenizerModalitySpec,
     StepTokens,
@@ -31,7 +31,7 @@ def test_public_data_exports() -> None:
     assert TextTokenizer is not None
     assert NumericTokenizerModalitySpec is not None
     assert TextTokenizerModalitySpec is not None
-    assert SequenceAugmentModalitySpec is not None
+    assert SequenceAugmentFieldSpec is not None
     assert StepTokens is not None
     assert TokenBatch is not None
     assert compose is not None
