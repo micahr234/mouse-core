@@ -53,3 +53,11 @@ def test_grpo_objective_skips_sequence_boundaries() -> None:
     predictions = TensorDict({'action': torch.tensor([[20.0, -20.0], [20.0, -20.0], [20.0, -20.0]])}, batch_size=[3])
     loss, _ = GrpoObjective(ent_coef=0.0)(objective_data, predictions)
     assert abs(loss.item() - -2.0) < 0.001
+
+
+def test_grpo_objective_all_out_of_run_pairs_yield_zero_loss() -> None:
+    objective_data = TensorDict({'action': torch.tensor([0, 1, 0]), 'old_log_prob': torch.zeros(3), 'advantage': torch.tensor([9.0, 9.0, 2.0]), 'sequence_id': torch.tensor([0, 1, 2])}, batch_size=[3])
+    predictions = TensorDict({'action': torch.zeros(3, 2)}, batch_size=[3])
+    loss, metrics = GrpoObjective(ent_coef=0.0)(objective_data, predictions)
+    assert abs(loss.item()) < 1e-05
+    assert abs(metrics['advantage_mean']) < 1e-05

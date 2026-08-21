@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from tensordict import TensorDict
 
 from mouse_core.objectives.base import Objective
-from mouse_core.objectives.dqn import _valid_transitions
+from mouse_core.objectives.dqn import _pair_weight, _weighted_mean
 
 
 def group_relative_advantages(
@@ -81,8 +81,10 @@ class GrpoObjective(Objective):
 
     Timing matches :class:`~mouse_core.objectives.dqn.DqnObjective`: token
     ``i`` is state ``s_i``; action / behavior log-prob / advantage at ``i+1``
-    describe the transition out of ``s_i``. Cross-sequence and cross-task pairs
-    are excluded.
+    describe the transition out of ``s_i``. A run is the same ``sequence_id``
+    and, when ``grouping_field=`` is set, the same grouping column. Neighbor
+    reads must stay in-run: out-of-run pairs are multiplied by ``0``
+    (all-zero weights → loss ``0``).
 
     Args:
         clip_eps: PPO-style ratio clip ε.
@@ -165,7 +167,13 @@ class GrpoObjective(Objective):
             )
         advantage = advantage_full[1:].to(dtype=dtype)
 
-        valid = _valid_transitions(objective_data, N, device, grouping_field=self.grouping_field)
+        pair_weight = _pair_weight(
+            objective_data,
+            N,
+            device,
+            grouping_field=self.grouping_field,
+            dtype=dtype,
+        )
 
         next_actions = action[1:]
         curr_logits = logits[:-1, :]
@@ -189,16 +197,18 @@ class GrpoObjective(Objective):
         ratio = (new_log_prob - old_log_prob).exp()
         surr1 = ratio * advantage
         surr2 = ratio.clamp(1.0 - self.clip_eps, 1.0 + self.clip_eps) * advantage
-        policy_loss = -torch.min(surr1, surr2)[valid].mean()
+        policy_loss = _weighted_mean(-torch.min(surr1, surr2), pair_weight)
 
-        entropy = -(log_probs_all.exp() * log_probs_all).sum(dim=-1)[valid].mean()
+        entropy = _weighted_mean(
+            -(log_probs_all.exp() * log_probs_all).sum(dim=-1), pair_weight
+        )
         loss = policy_loss - self.ent_coef * entropy
 
         with torch.no_grad():
-            clipfrac = (
-                ((ratio[valid] - 1.0).abs() > self.clip_eps).to(dtype=dtype).mean()
+            clipfrac = _weighted_mean(
+                ((ratio - 1.0).abs() > self.clip_eps).to(dtype=dtype), pair_weight
             )
-            approx_kl = (old_log_prob[valid] - new_log_prob[valid]).mean()
+            approx_kl = _weighted_mean(old_log_prob - new_log_prob, pair_weight)
 
         named: dict[str, torch.Tensor] = {
             "grpo": loss.detach(),
@@ -206,7 +216,7 @@ class GrpoObjective(Objective):
             "entropy": entropy.detach(),
             "approx_kl": approx_kl,
             "clipfrac": clipfrac,
-            "advantage_mean": advantage[valid].mean(),
+            "advantage_mean": _weighted_mean(advantage, pair_weight),
         }
         metrics: dict[str, float] = dict(
             zip(named, torch.stack(list(named.values())).tolist())

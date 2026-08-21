@@ -10,8 +10,10 @@ from tensordict import TensorDict
 from mouse_core.objectives.base import Objective
 from mouse_core.objectives.dqn import (
     _boundary_discounts,
+    _in_run_stats,
+    _pair_weight,
     _require_done_codes,
-    _valid_transitions,
+    _weighted_mean,
 )
 
 
@@ -74,9 +76,11 @@ class LayerwiseDqnObjective(Objective):
     Reads ``predictions["action_value_layerwise"]`` and
     ``predictions["action_value_layerwise_target"]`` with shape ``[N, L, A]``.
     Each layer and each episode/task done-code uses its own discount, built at construction
-    from explicit shallow/deep endpoint pairs. Row pairs that straddle a
-    sequence or grouping boundary (different ``sequence_id`` / ``grouping_field``
-    column when set) are excluded from every layer's loss. ``action``,
+    from explicit shallow/deep endpoint pairs. A run is the same
+    ``sequence_id`` and, when ``grouping_field`` is set and present, the same
+    grouping column. Neighbor reads must stay in-run: out-of-run pairs are
+    multiplied by ``0`` on every layer (all-zero weights → loss ``0``).
+    ``action``,
     ``reward``, ``episode_done``, and ``task_done`` must be in the tokenizer
     ``objective_fields`` keep-list.
 
@@ -243,7 +247,13 @@ class LayerwiseDqnObjective(Objective):
             N=N,
         )
 
-        valid = _valid_transitions(objective_data, N, device, grouping_field=self.grouping_field)
+        pair_weight = _pair_weight(
+            objective_data,
+            N,
+            device,
+            grouping_field=self.grouping_field,
+            dtype=value_dtype,
+        )
 
         curr_q = q[:-1, :, :]              # [N-1, L, A]
         next_actions = action[1:]          # [N-1]
@@ -286,10 +296,10 @@ class LayerwiseDqnObjective(Objective):
                 q_scale = (td_target.abs() + self.cql_scale_q_eps).detach()
                 cql_penalty = torch.logsumexp(curr_q_layer, dim=-1) - q_values
                 loss = loss + self.cql_weight * q_scale * cql_penalty
-                cql_penalties.append(cql_penalty.detach()[valid].mean())
+                cql_penalties.append(_weighted_mean(cql_penalty.detach(), pair_weight))
 
-            layer_losses.append(loss[valid].mean())
-            layer_curr_max_means.append(curr_max_q.detach()[valid].mean())
+            layer_losses.append(_weighted_mean(loss, pair_weight))
+            layer_curr_max_means.append(_weighted_mean(curr_max_q.detach(), pair_weight))
             if layer_idx == L - 1:
                 deepest_curr_max_q = curr_max_q
 
@@ -299,18 +309,15 @@ class LayerwiseDqnObjective(Objective):
             raise RuntimeError(
                 "Layerwise DQN objective did not compute deepest-layer current-state max Q values."
             )
-        curr_max_det = deepest_curr_max_q.detach()[valid]
-        curr_max_std = (
-            curr_max_det.std()
-            if curr_max_det.numel() > 1
-            else torch.zeros((), device=device, dtype=value_dtype)
+        q_mean, q_std, q_min, q_max = _in_run_stats(
+            deepest_curr_max_q.detach(), pair_weight
         )
 
         named: dict[str, torch.Tensor] = {
-            "q_values_mean": curr_max_det.mean(),
-            "q_values_std": curr_max_std,
-            "q_values_min": curr_max_det.min(),
-            "q_values_max": curr_max_det.max(),
+            "q_values_mean": q_mean,
+            "q_values_std": q_std,
+            "q_values_min": q_min,
+            "q_values_max": q_max,
             "action_value_layerwise": total_loss.detach(),
         }
         for layer_idx, gamma in enumerate(self.layer_gamma_step):

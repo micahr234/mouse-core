@@ -65,46 +65,60 @@ def _boundary_discounts(
     return episode_gammas[episode_done] * task_gammas[task_done]
 
 
-def _valid_transitions(
+def _pair_weight(
     objective_data: TensorDict,
     N: int,
     device: torch.device | str | None,
     *,
     grouping_field: str | None = None,
+    dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    """Boolean ``[N-1]`` mask: True where the pair ``(i, i+1)`` is a real transition.
+    """``[N-1]`` weights: ``1.0`` when ``(i, i+1)`` share a run, else ``0.0``.
 
-    Adjacent steps belonging to different sequences (different ``sequence_id``)
-    or different grouping runs (``grouping_field`` column) are excluded. Batches
-    without those columns skip the corresponding check.
+    A run is the same ``sequence_id`` and, when ``grouping_field`` is set and
+    present, the same grouping column. Batches without those columns skip the
+    corresponding check (every pair stays weight ``1``).
     """
     if device is None:
         device = torch.device("cpu")
     if N < 2:
-        return torch.zeros(0, dtype=torch.bool, device=device)
-    valid = torch.ones(N - 1, dtype=torch.bool, device=device)
-    used_grouping = False
+        return torch.zeros(0, dtype=dtype, device=device)
+    same_run = torch.ones(N - 1, dtype=torch.bool, device=device)
     if "sequence_id" in objective_data.keys():
         sequence_id = objective_data["sequence_id"]
         if sequence_id.shape != torch.Size([N]):
             raise ValueError(
                 f"sequence_id must have shape [{N}], got {tuple(sequence_id.shape)}."
             )
-        valid &= sequence_id[1:] == sequence_id[:-1]
+        same_run &= sequence_id[1:] == sequence_id[:-1]
     if grouping_field is not None and grouping_field in objective_data.keys():
         grouping = objective_data[grouping_field]
         if grouping.shape != torch.Size([N]):
             raise ValueError(
                 f"{grouping_field} must have shape [{N}], got {tuple(grouping.shape)}."
             )
-        valid &= grouping[1:] == grouping[:-1]
-        used_grouping = True
-    if ("sequence_id" in objective_data.keys() or used_grouping) and (not valid.any()):
-        raise ValueError(
-            "No valid transitions: every consecutive pair in the batch "
-            "crosses a sequence or grouping boundary."
-        )
-    return valid
+        same_run &= grouping[1:] == grouping[:-1]
+    return same_run.to(dtype=dtype)
+
+
+def _weighted_mean(values: torch.Tensor, pair_weight: torch.Tensor) -> torch.Tensor:
+    """``(w * x).sum() / w.sum().clamp(min=1)``. All-zero weights yield ``0``."""
+    weight = pair_weight.to(dtype=values.dtype)
+    return (weight * values).sum() / weight.sum().clamp(min=1)
+
+
+def _in_run_stats(
+    values: torch.Tensor,
+    pair_weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Mean / std / min / max over in-run pairs. All-zero weights yield zeros."""
+    in_run = pair_weight > 0
+    zero = values.new_zeros(())
+    if not bool(in_run.any()):
+        return zero, zero, zero, zero
+    selected = values[in_run]
+    std = selected.std() if selected.numel() > 1 else zero
+    return selected.mean(), std, selected.min(), selected.max()
 
 
 class DqnObjective(Objective):
@@ -113,10 +127,17 @@ class DqnObjective(Objective):
     Instantiate with hyperparameters, then call with
     ``(objective_data, predictions)`` to compute the loss.
 
-    Every consecutive pair ``(i, i+1)`` that shares ``sequence_id`` and
-    ``grouping_field`` (when set and present) is a valid TD transition.
-    Cross-sequence and cross-grouping pairs are excluded. The
-    ``episode_done`` / ``task_done`` codes stored at ``i+1`` determine the
+    A **run** is the same ``sequence_id`` and, when ``grouping_field`` is set
+    and present, the same grouping column (typically ``task_index``). Neighbor
+    reads (action / reward / done / next Q at ``i+1``) must stay in-run: an
+    out-of-run pair still has a loss term, but it is multiplied by ``0`` so
+    output ``i`` does not affect the scalar loss or the gradient. If every
+    weight is ``0`` the loss is ``0``. Episode resets inside a run
+    (``episode_done`` 1/2, then a reset frame) are still in-run and may train.
+    Gamma is the Bellman discount from the done codes at ``i+1`` inside a
+    same-run pair — it is not a run mask.
+
+    The ``episode_done`` / ``task_done`` codes stored at ``i+1`` determine the
     discount applied to the bootstrap value. Both factors always multiply:
     ``V ← episode_gamma * task_gamma * V``. ``task_done == 0`` uses task
     factor ``1.0``.
@@ -249,8 +270,12 @@ class DqnObjective(Objective):
             N=N,
         )
 
-        valid = _valid_transitions(
-            objective_data, N, device, grouping_field=self.grouping_field
+        pair_weight = _pair_weight(
+            objective_data,
+            N,
+            device,
+            grouping_field=self.grouping_field,
+            dtype=value_dtype,
         )
 
         # Each token at position i encodes (obs_i, action_{i-1}, reward_{i-1},
@@ -287,22 +312,17 @@ class DqnObjective(Objective):
             q_scale = (td_target.abs() + self.cql_scale_q_eps).detach()
             cql_penalty = torch.logsumexp(curr_q, dim=-1) - q_values
             loss = loss + self.cql_weight * q_scale * cql_penalty
-            cql_penalty_mean = cql_penalty.detach()[valid].mean()
+            cql_penalty_mean = _weighted_mean(cql_penalty.detach(), pair_weight)
 
-        loss = loss[valid].mean()
+        loss = _weighted_mean(loss, pair_weight)
 
         curr_max_q = curr_q.amax(dim=-1)  # [N-1]  max online Q at s_i
-        curr_max_det = curr_max_q.detach()[valid]
-        curr_max_std = (
-            curr_max_det.std()
-            if curr_max_det.numel() > 1
-            else torch.zeros((), device=device, dtype=value_dtype)
-        )
+        q_mean, q_std, q_min, q_max = _in_run_stats(curr_max_q.detach(), pair_weight)
         named: dict[str, torch.Tensor] = {
-            "q_values_mean":   curr_max_det.mean(),
-            "q_values_std":    curr_max_std,
-            "q_values_min":    curr_max_det.min(),
-            "q_values_max":    curr_max_det.max(),
+            "q_values_mean":   q_mean,
+            "q_values_std":    q_std,
+            "q_values_min":    q_min,
+            "q_values_max":    q_max,
             "action_value":    loss.detach(),
         }
         if cql_penalty_mean is not None:

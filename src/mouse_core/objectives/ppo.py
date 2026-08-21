@@ -9,8 +9,9 @@ from tensordict import TensorDict
 from mouse_core.objectives.base import Objective
 from mouse_core.objectives.dqn import (
     _boundary_discounts,
+    _pair_weight,
     _require_done_codes,
-    _valid_transitions,
+    _weighted_mean,
 )
 
 
@@ -50,7 +51,8 @@ def _gae_advantages(
         rewards: ``[N-1]`` rewards for transitions out of states ``0..N-2``.
         values: ``[N]`` value predictions ``V(s_i)``.
         discounts: ``[N-1]`` per-transition discount (from episode/task done codes).
-        valid: ``[N-1]`` mask — False at sequence boundaries.
+        valid: ``[N-1]`` mask — False at run boundaries (different
+            ``sequence_id`` or grouping).
         gae_lambda: GAE λ.
 
     Returns:
@@ -81,12 +83,13 @@ class PpoObjective(Objective):
     * ``predictions["action"]`` — ``[N, A]`` discrete policy logits
     * ``predictions["value"]`` — ``[N, 1]`` or ``[N]`` scalar state values
 
-    Every consecutive pair ``(i, i+1)`` that shares ``sequence_id`` and (when
-    ``grouping_field=`` is set) the same grouping column is a decision point,
-    using the same timing convention as
-    :class:`~mouse_core.objectives.dqn.DqnObjective`: token ``i`` encodes state
-    ``s_i``, and the action / reward / episode-done / task-done / behavior
-    log-prob stored at ``i+1`` describe the transition out of ``s_i``.
+    A run is the same ``sequence_id`` and, when ``grouping_field=`` is set,
+    the same grouping column. Neighbor reads must stay in-run: out-of-run
+    pairs are multiplied by ``0`` (all-zero weights → loss ``0``). Timing
+    matches :class:`~mouse_core.objectives.dqn.DqnObjective`: token ``i``
+    encodes state ``s_i``, and the action / reward / episode-done /
+    task-done / behavior log-prob stored at ``i+1`` describe the transition
+    out of ``s_i``.
 
     Discounts match the DQN table: the bootstrap is multiplied by the episode
     gamma, then by the task gamma (``1.0`` when ``task_done==0``).
@@ -246,7 +249,14 @@ class PpoObjective(Objective):
             N=N,
         )
 
-        valid = _valid_transitions(objective_data, N, device, grouping_field=self.grouping_field)
+        pair_weight = _pair_weight(
+            objective_data,
+            N,
+            device,
+            grouping_field=self.grouping_field,
+            dtype=dtype,
+        )
+        valid = pair_weight > 0
 
         next_actions = action[1:]
         next_rewards = reward[1:].to(dtype=dtype)
@@ -300,24 +310,29 @@ class PpoObjective(Objective):
         ratio = (new_log_prob - old_log_prob).exp()
         surr1 = ratio * adv
         surr2 = ratio.clamp(1.0 - self.clip_eps, 1.0 + self.clip_eps) * adv
-        policy_loss = -torch.min(surr1, surr2)[valid].mean()
+        policy_loss = _weighted_mean(-torch.min(surr1, surr2), pair_weight)
 
-        value_loss = ((curr_values - returns.detach()) ** 2)[valid].mean()
+        value_loss = _weighted_mean((curr_values - returns.detach()) ** 2, pair_weight)
 
-        entropy = -(log_probs_all.exp() * log_probs_all).sum(dim=-1)[valid].mean()
+        entropy = _weighted_mean(
+            -(log_probs_all.exp() * log_probs_all).sum(dim=-1), pair_weight
+        )
 
         loss = policy_loss + self.vf_coef * value_loss - self.ent_coef * entropy
 
         with torch.no_grad():
-            clipfrac = (
-                ((ratio[valid] - 1.0).abs() > self.clip_eps).to(dtype=dtype).mean()
+            clipfrac = _weighted_mean(
+                ((ratio - 1.0).abs() > self.clip_eps).to(dtype=dtype), pair_weight
             )
-            approx_kl = (old_log_prob[valid] - new_log_prob[valid]).mean()
+            approx_kl = _weighted_mean(old_log_prob - new_log_prob, pair_weight)
             ret_v = returns[valid]
             val_v = curr_values[valid]
-            ret_var = ret_v.var(correction=0)
-            if ret_var > 0:
-                explained_var = 1.0 - ((ret_v - val_v) ** 2).mean() / ret_var
+            if ret_v.numel() > 0:
+                ret_var = ret_v.var(correction=0)
+                if ret_var > 0:
+                    explained_var = 1.0 - ((ret_v - val_v) ** 2).mean() / ret_var
+                else:
+                    explained_var = torch.zeros((), device=device, dtype=dtype)
             else:
                 explained_var = torch.zeros((), device=device, dtype=dtype)
 
@@ -329,8 +344,8 @@ class PpoObjective(Objective):
             "approx_kl": approx_kl,
             "clipfrac": clipfrac,
             "explained_variance": explained_var,
-            "advantage_mean": advantages[valid].mean(),
-            "value_mean": curr_values[valid].mean(),
+            "advantage_mean": _weighted_mean(advantages, pair_weight),
+            "value_mean": _weighted_mean(curr_values, pair_weight),
         }
         metrics: dict[str, float] = dict(
             zip(named, torch.stack(list(named.values())).tolist())

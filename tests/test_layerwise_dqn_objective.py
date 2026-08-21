@@ -47,6 +47,31 @@ def test_layerwise_dqn_objective_skips_transitions_across_sequences() -> None:
     loss_after, _ = objective(corrupted, out)
     assert torch.allclose(loss_before, loss_after)
 
+def test_layerwise_dqn_all_out_of_run_pairs_yield_zero_loss() -> None:
+    step_stream = TensorDict(
+        {
+            'action': torch.zeros(3, dtype=torch.long),
+            'reward': torch.zeros(3),
+            'episode_done': torch.zeros(3, dtype=torch.long),
+            'task_done': torch.zeros(3, dtype=torch.long),
+            'sequence_id': torch.tensor([0, 1, 2]),
+        },
+        batch_size=[3],
+    )
+    out = TensorDict(
+        {
+            'action_value_layerwise': torch.randn(3, 2, 2),
+            'action_value_layerwise_target': torch.randn(3, 2, 2),
+        },
+        batch_size=[3],
+    )
+    loss, metrics = LayerwiseDqnObjective(
+        num_backbone_layers=2, gamma_step_start=0.0, gamma_step=0.99
+    )(step_stream, out)
+    assert abs(loss.item()) < 1e-05
+    assert abs(metrics['q_values_mean']) < 1e-05
+
+
 def test_layerwise_dqn_objective_rejects_layer_mismatch() -> None:
     step_stream = TensorDict({'action': torch.zeros(3, dtype=torch.long), 'reward': torch.zeros(3), 'episode_done': torch.zeros(3, dtype=torch.long), 'task_done': torch.zeros(3, dtype=torch.long)}, batch_size=[3])
     out = TensorDict({'action_value_layerwise': torch.zeros(3, 2, 2), 'action_value_layerwise_target': torch.zeros(3, 2, 2)}, batch_size=[3])

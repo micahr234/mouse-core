@@ -72,15 +72,12 @@ def test_ppo_objective_skips_transitions_across_sequences() -> None:
     loss, _ = PpoObjective(gamma_step=0.0, gae_lambda=1.0, vf_coef=1.0, ent_coef=0.0, normalize_advantage=False)(objective_data, predictions)
     assert abs(loss.item() - 6.0) < 0.001
 
-def test_ppo_objective_raises_when_all_pairs_cross_sequences() -> None:
+def test_ppo_objective_all_out_of_run_pairs_yield_zero_loss() -> None:
     objective_data = TensorDict({'action': torch.tensor([0, 1, 0]), 'reward': torch.tensor([0.0, 1.0, 5.0]), 'episode_done': torch.tensor([0, 0, 0]), 'task_done': torch.tensor([0, 0, 0]), 'sequence_id': torch.tensor([0, 1, 2])}, batch_size=[3])
     predictions = TensorDict({'action': torch.zeros(3, 2), 'value': torch.zeros(3, 1)}, batch_size=[3])
-    try:
-        PpoObjective()(objective_data, predictions)
-    except ValueError as e:
-        assert 'sequence or grouping boundary' in str(e)
-    else:
-        raise AssertionError('expected ValueError when every pair crosses a sequence boundary')
+    loss, metrics = PpoObjective()(objective_data, predictions)
+    assert abs(loss.item()) < 1e-05
+    assert abs(metrics['advantage_mean']) < 1e-05
 
 def test_sample_discrete_action_shapes() -> None:
     logits = torch.randn(4, 5)

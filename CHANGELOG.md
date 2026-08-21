@@ -56,6 +56,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``grouping_field: str | None = None`` (``None`` ⇒ no grouping filter).
 
 ### Changed
+- Transition objectives (DQN / layerwise DQN / PPO / GRPO) treat a **run** as
+  matching ``sequence_id`` and ``grouping_id``. Neighbor reads that would leave
+  that run are multiplied by ``0`` (weighted mean; all-zero weights → loss
+  ``0``) instead of dropping pairs and raising when none remain. Episode resets
+  inside a run still train. SP / SV stay same-row.
 - Tokenizer ``input_fields=`` and ``objective_fields=`` use
   ``input_field`` dicts (optional ``output_field``; no ``field=`` / string
   keep-list). Omitted ``output_field`` defaults to ``input_field`` on
@@ -269,9 +274,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   buffer + mask; RoPE resets per grouping-id run). Cached decode stays rectangular
   ``[B, S]``.
 - Objectives (DQN / Layerwise / PPO / GRPO): flat ``x[:-1]`` / ``x[1:]`` with
-  valid pairs where ``sequence_id[i] == sequence_id[i+1]`` and, when
+  pair weight ``1`` when ``sequence_id[i] == sequence_id[i+1]`` and, when
   ``grouping_field=`` is set, ``objective_data[grouping_field]`` matches across
-  the pair.
+  the pair; otherwise weight ``0``. All-zero weights yield loss ``0``.
 - Example notebooks build ``train_transform = compose(augmenter, selector,
   tokenizer)`` and ``eval_transform = compose(selector, tokenizer)``
   (online typically uses one tokenizer), pass

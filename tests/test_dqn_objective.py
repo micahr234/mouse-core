@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 from tensordict import TensorDict
 from mouse_core.objectives import DqnObjective
+from mouse_core.objectives.dqn import _pair_weight, _weighted_mean
 
 def test_dqn_objective_runs() -> None:
     n, a = (8, 3)
@@ -59,14 +60,11 @@ def test_dqn_objective_without_sequence_breaks_trains_all_pairs() -> None:
     loss, _ = DqnObjective(gamma_step=0.0)(step_stream, out)
     assert abs(loss.item() - 2.5) < 1e-05
 
-def test_dqn_objective_raises_when_all_pairs_cross_sequences() -> None:
+def test_dqn_objective_all_out_of_run_pairs_yield_zero_loss() -> None:
     step_stream, out = _sequence_fixture([0, 1, 2])
-    try:
-        DqnObjective(gamma_step=0.0)(step_stream, out)
-    except ValueError as e:
-        assert 'sequence or grouping boundary' in str(e)
-    else:
-        raise AssertionError('expected ValueError when every pair crosses a sequence boundary')
+    loss, metrics = DqnObjective(gamma_step=0.0)(step_stream, out)
+    assert abs(loss.item()) < 1e-05
+    assert abs(metrics['q_values_mean']) < 1e-05
 
 def test_dqn_objective_skips_transitions_across_tasks() -> None:
     """A pair whose steps belong to different tasks is not a transition."""
@@ -92,6 +90,76 @@ def test_dqn_objective_skips_transitions_across_tasks() -> None:
     loss, metrics = DqnObjective(gamma_step=0.0, grouping_field="grouping_id")(step_stream, out)
     assert abs(loss.item() - 1.0) < 1e-05
     assert abs(metrics['q_values_mean'] - 2.0) < 1e-05
+
+
+def test_pair_weight_zeros_window_cut_and_task_change() -> None:
+    """Last output of a window or grouping run has weight 0; in-run reset stays 1."""
+    window = TensorDict(
+        {
+            'sequence_id': torch.tensor([0, 0, 1, 1]),
+            'task_index': torch.tensor([0, 0, 0, 0]),
+        },
+        batch_size=[4],
+    )
+    assert torch.equal(
+        _pair_weight(window, 4, 'cpu', grouping_field='task_index'),
+        torch.tensor([1.0, 0.0, 1.0]),
+    )
+
+    task_change = TensorDict(
+        {
+            'sequence_id': torch.tensor([0, 0, 0]),
+            'task_index': torch.tensor([0, 0, 1]),
+        },
+        batch_size=[3],
+    )
+    assert torch.equal(
+        _pair_weight(task_change, 3, 'cpu', grouping_field='task_index'),
+        torch.tensor([1.0, 0.0]),
+    )
+
+    reset = TensorDict(
+        {
+            'sequence_id': torch.tensor([0, 0, 0]),
+            'task_index': torch.tensor([0, 0, 0]),
+            'episode_done': torch.tensor([0, 1, 0]),
+        },
+        batch_size=[3],
+    )
+    assert torch.equal(
+        _pair_weight(reset, 3, 'cpu', grouping_field='task_index'),
+        torch.tensor([1.0, 1.0]),
+    )
+
+
+def test_weighted_mean_all_zero_is_zero() -> None:
+    assert abs(_weighted_mean(torch.tensor([3.0, 4.0]), torch.zeros(2)).item()) < 1e-05
+
+
+def test_dqn_same_run_episode_reset_trains_both_pairs() -> None:
+    """live→terminal→reset with the same sequence_id and task_index still trains."""
+    step_stream = TensorDict(
+        {
+            'action': torch.tensor([0, 1, 0]),
+            'reward': torch.tensor([0.0, 1.0, 5.0]),
+            'episode_done': torch.tensor([0, 1, 0]),
+            'task_done': torch.tensor([0, 0, 0]),
+            'sequence_id': torch.tensor([0, 0, 0]),
+            'task_index': torch.tensor([0, 0, 0]),
+        },
+        batch_size=[3],
+    )
+    out = TensorDict(
+        {
+            'action_value': torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]]),
+            'action_value_target': torch.zeros(3, 2),
+        },
+        batch_size=[3],
+    )
+    loss, _ = DqnObjective(
+        gamma_step=0.0, gamma_episode_terminal=0.0, grouping_field='task_index'
+    )(step_stream, out)
+    assert abs(loss.item() - 2.5) < 1e-05
 
 
 def test_dqn_objective_multiplies_episode_and_task_gammas() -> None:
