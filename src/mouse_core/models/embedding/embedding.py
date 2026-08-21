@@ -45,7 +45,7 @@ class Encoder(nn.Module, ABC):
     def forward(
         self, token_batch: TokenBatch
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor], torch.Tensor]:
-        """Embed ``TokenBatch`` → ``(embeds [L, D], step_fields, prediction_indices [N])``."""
+        """Embed ``TokenBatch`` → ``(embeds [L, D], objective_fields, prediction_indices [N])``."""
         ...
 
     @abstractmethod
@@ -185,9 +185,9 @@ class NumericEmbedder(Encoder):
                 elif meta.kind == KIND_FOURIER:
                     embeds[mask] = self.fourier(values[mask], ids[mask]).to(dtype=dtype)
 
-        step_fields = dict(t["step_fields"])
+        objective_fields = dict(t["objective_fields"])
         prediction_indices = t["prediction_indices"]
-        return embeds, step_fields, prediction_indices
+        return embeds, objective_fields, prediction_indices
 
     def pool_step_reprs(self, h: torch.Tensor, prediction_indices: torch.Tensor) -> torch.Tensor:
         D = self._hidden_dim

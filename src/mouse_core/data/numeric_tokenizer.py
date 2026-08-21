@@ -5,7 +5,7 @@ I/O
 * **in:** ``dict`` (one step; must include ``grouping_field``)
 * **out:** :class:`~mouse_core.data.token_batch.StepTokens`
 
-Tokens are tagged by modality **name** (``field``). Pack many steps with
+Tokens are tagged by input-field **name** (``field``). Pack many steps with
 :func:`~mouse_core.data.token_batch.pack_token_batch`.
 """
 
@@ -33,33 +33,36 @@ from mouse_core.data.token_batch import ModalityInfo, StepTokens
 class NumericTokenizer:
     """CPU packer: one step dict → :class:`StepTokens`.
 
-    Construct independently of the embedder. Alignment is by modality **name**
-    (``field``), not list order. ``step_fields=`` is an explicit keep-list of
-    step dict keys copied into ``StepTokens.step_fields`` (modalities are not
-    auto-copied). Rename step keys with :class:`~mouse_core.data.selector.Selector`
-    before tokenize.
+    Construct independently of the embedder. Alignment is by input-field **name**
+    (``field``), not list order. ``input_fields=`` are the tokens fed to the
+    transformer. ``objective_fields=`` is an explicit keep-list of step dict keys
+    copied into ``StepTokens.objective_fields`` (input fields are not
+    auto-copied).     Rename step keys with :class:`~mouse_core.data.selector.Selector`
+    before tokenize. ``grouping_field`` names the step key used for attention
+    isolation (typically ``task_index``).
 
     TD / PPO / GRPO objectives read ``action``, ``reward``, ``episode_done``,
     and ``task_done`` from that keep-list (plus extras such as ``old_log_prob``).
-    Those columns must also survive Selector.
+    ``task_done`` is an objective column only — it is not an input field and is
+    not fed to the transformer. Those columns must also survive Selector.
     """
 
     def __init__(
         self,
         *,
-        modalities: list[dict[str, Any] | NumericTokenizerModalitySpec] | None = None,
+        input_fields: list[dict[str, Any] | NumericTokenizerModalitySpec] | None = None,
         grouping_field: str,
         image_tokenizer: Callable[[Any], Sequence[int]] | None = None,
-        step_fields: Sequence[str] | None = None,
+        objective_fields: Sequence[str] | None = None,
     ) -> None:
         if not grouping_field:
             raise ValueError("NumericTokenizer requires a non-empty grouping_field")
-        specs, meta = resolve_tokenizer_numeric_modalities(modalities)
+        specs, meta = resolve_tokenizer_numeric_modalities(input_fields)
         if any(m.kind == KIND_IMAGE for m in meta) and image_tokenizer is None:
             raise TypeError(
-                "NumericTokenizer with type='image' modalities requires image_tokenizer="
+                "NumericTokenizer with type='image' input_fields requires image_tokenizer="
             )
-        self.modalities: list[NumericTokenizerModalitySpec] = list(specs)
+        self.input_fields: list[NumericTokenizerModalitySpec] = list(specs)
         self._meta: tuple[TokenizerModalityMeta, ...] = tuple(meta)
         self.modality_names: tuple[str, ...] = tuple(m.name for m in meta)
         self.modality_map: dict[str, ModalityInfo] = {
@@ -76,7 +79,7 @@ class NumericTokenizer:
         self._name_to_index = {n: i for i, n in enumerate(self.modality_names)}
         self.grouping_field = grouping_field
         self.image_tokenizer = image_tokenizer
-        self.step_fields: tuple[str, ...] = tuple(step_fields or ())
+        self.objective_fields: tuple[str, ...] = tuple(objective_fields or ())
 
     def __call__(self, step: dict) -> StepTokens:
         if not isinstance(step, dict):
@@ -90,7 +93,7 @@ class NumericTokenizer:
             self.modality_names,
             self.modality_map,
             self.image_tokenizer,
-            self.step_fields,
+            self.objective_fields,
             grouping_field=self.grouping_field,
         )
 
@@ -101,7 +104,7 @@ def _copy_keep_fields(
 ) -> dict[str, Any]:
     """Copy keep-list columns from the step.
 
-    Every ``step_fields`` key must be present (and not ``None``) on the step.
+    Every ``objective_fields`` key must be present (and not ``None``) on the step.
     There is no silent default: a missing objective column (e.g.
     ``old_log_prob`` or ``advantage``) would otherwise train on zeros.
     """
@@ -110,7 +113,7 @@ def _copy_keep_fields(
         value = row.get(field)
         if value is None:
             raise KeyError(
-                f"step_fields key {field!r} is missing from step "
+                f"objective_fields key {field!r} is missing from step "
                 f"(have {sorted(row)}); stamp it on the row before tokenizing"
             )
         if isinstance(value, (list, tuple)):
@@ -141,7 +144,7 @@ def _tokenize_numeric_step(
     modality_names: tuple[str, ...],
     modality_map: dict[str, ModalityInfo],
     image_tokenizer: Callable[[Any], Sequence[int]] | None,
-    step_fields_keep: Sequence[str],
+    objective_fields_keep: Sequence[str],
     *,
     grouping_field: str,
 ) -> StepTokens:
@@ -174,7 +177,7 @@ def _tokenize_numeric_step(
         if value is None:
             if spec.required:
                 raise KeyError(
-                    f"Required modality field {field!r} is missing from step"
+                    f"Required input field {field!r} is missing from step"
                 )
             continue
         if spec.skip is not None and values_equal(value, spec.skip):
@@ -206,8 +209,8 @@ def _tokenize_numeric_step(
 
     if not modality_ids:
         raise ValueError(
-            "step has no tokens after skips; ensure at least one modality "
-            "is present (e.g. add a learnable modality)"
+            "step has no tokens after skips; ensure at least one input field "
+            "is present (e.g. add a learnable input field)"
         )
 
     return StepTokens(
@@ -218,5 +221,5 @@ def _tokenize_numeric_step(
         modality_map=dict(modality_map),
         grouping_id=gid,
         grouping_field=grouping_field,
-        step_fields=_copy_keep_fields(row, step_fields_keep),
+        objective_fields=_copy_keep_fields(row, objective_fields_keep),
     )

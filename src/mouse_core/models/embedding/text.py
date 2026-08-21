@@ -181,9 +181,9 @@ class TextEmbedder(Encoder):
                 if bool(mask.any()):
                     embeds[mask] = self.embed_tokens(ids[mask]).to(dtype=dtype)
 
-        step_fields = dict(t["step_fields"])
+        objective_fields = dict(t["objective_fields"])
         prediction_indices = t["prediction_indices"]
-        return embeds, step_fields, prediction_indices
+        return embeds, objective_fields, prediction_indices
 
     def pool_step_reprs(self, h: torch.Tensor, prediction_indices: torch.Tensor) -> torch.Tensor:
         D = self._hidden_dim

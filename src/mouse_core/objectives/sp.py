@@ -149,11 +149,28 @@ def sp_soft_ce(
     return per_row.mean()
 
 
+def _skip_mask(mask: torch.Tensor, n_rows: int) -> torch.Tensor:
+    """True where the mask is nonzero (bool True counts as skip)."""
+    values = mask.reshape(-1)
+    if values.shape[0] != n_rows:
+        raise ValueError(
+            f"mask length ({values.shape[0]}) must match flattened target rows ({n_rows})."
+        )
+    if values.dtype == torch.bool:
+        return values
+    return values != 0
+
+
 class SpObjective(Objective):
     """Supervised policy objective distilling per-action Q targets into action logits.
 
     Reads ``predictions[predictions_key]`` (shape ``[B, S, A]``) and compares against
     ``objective_data[targets_key]`` (same shape).
+
+    ``info_q_star`` is Q of taking an action *from the current observation* (the
+    next action). Rows where ``mask_key`` is True or any nonzero number are
+    dropped. Pass ``mask_key="episode_done"`` to skip both terminated and
+    truncated steps (the episode is over; there is no next action to imitate).
 
     Args:
         loss_type: Which distillation loss to apply.  ``"ce"`` uses the argmax of
@@ -166,6 +183,9 @@ class SpObjective(Objective):
         targets_key: Key in ``objective_data`` that holds ``[B, S, A]`` Q targets
             (default ``"info_q_star"`` from env expert Q; use e.g. ``"action_value"``
             for teacher-model distillation).
+        mask_key: Key in ``objective_data`` for a per-row skip mask (bool True
+            or any nonzero number). ``None`` disables the skip (e.g. teacher-logit
+            distillation with no mask column).
     """
 
     def __init__(
@@ -176,12 +196,14 @@ class SpObjective(Objective):
         label_smoothing: float = 0.0,
         predictions_key: str = "action",
         targets_key: str = "info_q_star",
+        mask_key: str | None = "episode_done",
     ) -> None:
         self.loss_type = loss_type
         self.temperature = temperature
         self.label_smoothing = label_smoothing
         self.predictions_key = predictions_key
         self.targets_key = targets_key
+        self.mask_key = mask_key
 
     def __call__(
         self,
@@ -203,9 +225,14 @@ class SpObjective(Objective):
             raise ValueError(f"SpObjective: {self.targets_key!r} contains +inf values.")
 
         valid_rows = torch.isfinite(q_targets).any(dim=-1)
+        if self.mask_key is not None:
+            valid_rows = valid_rows & ~_skip_mask(
+                objective_data[self.mask_key], q_targets.shape[0]
+            )
         if not valid_rows.any():
             raise ValueError(
-                f"SpObjective: {self.targets_key!r} contains no finite action targets."
+                "SpObjective: no rows left after applying the skip mask "
+                f"and dropping non-finite {self.targets_key!r} targets."
             )
         logits = logits[valid_rows]
         q_targets = q_targets[valid_rows]

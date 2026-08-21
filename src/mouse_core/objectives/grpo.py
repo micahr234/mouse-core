@@ -67,7 +67,7 @@ class GrpoObjective(Objective):
 
         tokenizer = NumericTokenizer(
             ...,
-            step_fields=[
+            objective_fields=[
                 "action",
                 "reward",
                 "episode_done",
@@ -78,6 +78,9 @@ class GrpoObjective(Objective):
         )
         predictions, objective_data, _ = model(batch)  # TokenBatch
         loss, metrics = objective(objective_data, predictions)
+
+    ``task_done``, ``old_log_prob``, and ``advantage`` are objective columns
+    only — not tokenizer input fields or embedder modalities.
 
     Timing matches :class:`~mouse_core.objectives.dqn.DqnObjective`: token
     ``i`` is state ``s_i``; action / behavior log-prob / advantage at ``i+1``
@@ -155,7 +158,7 @@ class GrpoObjective(Objective):
             raise KeyError(
                 f"GRPO requires objective_data[{self.advantage_key!r}] "
                 "(stamp group-relative advantages onto rows, then include them "
-                "in tokenizer step_fields)."
+                "in tokenizer objective_fields)."
             )
         advantage_full = objective_data[self.advantage_key]
         if advantage_full.shape != torch.Size([N]):

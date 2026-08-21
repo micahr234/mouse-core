@@ -122,11 +122,13 @@ class DqnObjective(Objective):
     factor ``1.0``.
 
     Those columns arrive in ``objective_data`` only if they are listed in the
-    tokenizer ``step_fields`` keep-list (modalities are not auto-copied)::
+    tokenizer ``objective_fields`` keep-list (input fields are not auto-copied).
+    ``task_done`` is an objective column only — do not add it as a tokenizer
+    input field or embedder modality, or it will be fed to the transformer::
 
         tokenizer = NumericTokenizer(
             ...,
-            step_fields=[
+            objective_fields=[
                 "action",
                 "reward",
                 "episode_done",

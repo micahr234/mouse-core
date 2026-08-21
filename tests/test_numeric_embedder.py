@@ -28,9 +28,9 @@ def test_numeric_embedder_ignores_is_seam_in_row_dicts() -> None:
     with_seam = [[{"action": 0, "is_seam": 0}, {"action": 1, "is_seam": 1}]]
     without_seam = [[{"action": 0}, {"action": 1}]]
     embeds, step_fields, _ = encoder(_tb(encoder, with_seam))
-    plain_embeds, plain_step_fields, _ = encoder(_tb(encoder, without_seam))
+    plain_embeds, plain_objective_fields, _ = encoder(_tb(encoder, without_seam))
     assert "is_seam" not in step_fields
-    assert "is_seam" not in plain_step_fields
+    assert "is_seam" not in plain_objective_fields
     assert torch.equal(embeds, plain_embeds)
 
 
@@ -43,7 +43,7 @@ def test_numeric_embedder_faults_on_missing_required_modality() -> None:
         ],
     )
     batch = _batch([{"reward": 0.5}])
-    with pytest.raises(KeyError, match="Required modality field 'action' is missing"):
+    with pytest.raises(KeyError, match="Required input field 'action' is missing"):
         _tb(encoder, batch)
 
 
@@ -56,7 +56,7 @@ def test_numeric_embedder_keeps_optional_missing_modality() -> None:
         ],
     )
     tokenizer = NumericTokenizer(
-        modalities=[
+        input_fields=[
             {
                 "type": "discrete",
                 "field": "action",
@@ -72,7 +72,7 @@ def test_numeric_embedder_keeps_optional_missing_modality() -> None:
     assert prediction_indices.shape == (1,)
 
 
-def test_numeric_embedder_returns_step_fields() -> None:
+def test_numeric_embedder_returns_objective_fields() -> None:
     encoder = _enc(
         hidden_dim=8,
         modalities=[
@@ -194,12 +194,12 @@ def test_numeric_embedder_skip_shortens_step() -> None:
         ],
     )
     tokenizer = NumericTokenizer(
-        modalities=[
+        input_fields=[
             {"type": "discrete", "field": "action"},
             {"type": "fourier", "field": "reward", "skip": 0.0},
             {"type": "learnable", "tokens": 1},
         ],
-        step_fields=["action", "reward"],
+        objective_fields=["action", "reward"],
         grouping_field="grouping_id",
     )
     batch = [[{"action": 1, "reward": 0.0}, {"action": 2, "reward": 1.5}]]
@@ -211,7 +211,7 @@ def test_numeric_embedder_skip_shortens_step() -> None:
 
 def test_numeric_tokenizer_image_requires_callable() -> None:
     with pytest.raises(TypeError, match="image_tokenizer"):
-        NumericTokenizer(modalities=[{"type": 'image', "field": "img"}], grouping_field="grouping_id")
+        NumericTokenizer(input_fields=[{"type": 'image', "field": "img"}], grouping_field="grouping_id")
     enc = _enc(hidden_dim=8, modalities=[{"type": 'image', "field": "img", "vocab_size": 32}])
     assert enc.tokens_per_step >= 1
 
@@ -243,14 +243,14 @@ def test_static_fourier_no_parameters() -> None:
     assert y.shape == (2, 8)
 
 
-def test_numeric_embedder_extra_fields_in_step_fields() -> None:
+def test_numeric_embedder_extra_fields_in_objective_fields() -> None:
     encoder = _enc(
         hidden_dim=8,
         modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4}],
     )
     tokenizer = NumericTokenizer(
-        modalities=[{"type": "discrete", "field": "action"}],
-        step_fields=["action", "old_log_prob"],
+        input_fields=[{"type": "discrete", "field": "action"}],
+        objective_fields=["action", "old_log_prob"],
         grouping_field="grouping_id",
     )
     batch = [
@@ -258,7 +258,34 @@ def test_numeric_embedder_extra_fields_in_step_fields() -> None:
     ]
     tb = batch_to_token_batch(tokenizer, batch)
     assert tb.L == 2
-    assert tb.step_fields["old_log_prob"].tolist() == pytest.approx([0.25, -1.5])
+    assert tb.objective_fields["old_log_prob"].tolist() == pytest.approx([0.25, -1.5])
     embeds, step_fields, _ = encoder(tb)
     assert embeds.shape == (2, 8)
     assert step_fields["old_log_prob"].tolist() == pytest.approx([0.25, -1.5])
+
+
+def test_task_done_is_objective_field_not_input_field() -> None:
+    """task_done is an objective column; it is not a transformer input token."""
+    encoder = _enc(
+        hidden_dim=8,
+        modalities=[
+            {"type": "discrete", "field": "action", "vocab_size": 4},
+            {"type": "discrete", "field": "episode_done", "vocab_size": 3},
+        ],
+    )
+    tokenizer = NumericTokenizer(
+        input_fields=[
+            {"type": "discrete", "field": "action"},
+            {"type": "discrete", "field": "episode_done"},
+        ],
+        objective_fields=["action", "episode_done", "task_done"],
+        grouping_field="grouping_id",
+    )
+    batch = [[{"action": 1, "episode_done": 0, "task_done": 2}]]
+    tb = batch_to_token_batch(tokenizer, batch)
+    assert "task_done" not in tb.modality_names
+    assert tb.L == 2
+    assert tb.objective_fields["task_done"].tolist() == [2]
+    embeds, step_fields, _ = encoder(tb)
+    assert embeds.shape == (2, 8)
+    assert step_fields["task_done"].tolist() == [2]

@@ -9,14 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - ``examples/05_train_offline_sv.ipynb``: offline supervised-value training
-  (``SvObjective`` regresses ``action_value`` onto ``info_q_star``). Action and
-  ``info_q_star`` share one ``Augmenter`` permute so the vector stays aligned
-  with remapped action ids.
+  (``SvObjective`` regresses ``action_value`` onto ``info_q_star``). The action
+  permute spec sets ``input_vector_field`` / ``output_vector_field`` to
+  ``info_q_star`` so the vector stays aligned with remapped action ids.
 - ``examples/10_train_offline_sp.ipynb``: offline supervised-policy training
   (``SpObjective`` CE onto ``argmax(info_q_star)`` with ``DiscreteActionHead``).
-  Same shared action / ``info_q_star`` permute as SV.
+  Same action vector-field permute as SV.
 - ``StepTokens``: tokenizer output for one step (token arrays + scalar
-  ``grouping_id`` + ``step_fields``). ``pack_token_batch(...)`` builds a
+  ``grouping_id`` + ``objective_fields``). ``pack_token_batch(...)`` builds a
   ``TokenBatch`` from many steps (assigns ``sequence_ids``, expands
   ``grouping_ids``, computes ``prediction_indices``).
 - ``Augmenter.reseed()`` advances the draw generation so every ``seed_field``
@@ -29,10 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Eval / decode call ``transform(step, augment=False)`` so the model sees raw
   values — no eval-time reseeding, and chosen actions mean the same thing to
   the env as to the model.
-- Required ``input_field`` / ``output_field`` on each ``Augmenter``,
-  ``Grouper``, and ``Selector`` field spec (same names ⇒ in-place; different
-  ⇒ write output and leave input). Grouper copies mapped keys and leaves
-  other step keys; Selector keeps only listed keys.
+- Required ``input_field`` / ``output_field`` on each ``Augmenter`` and
+  ``Selector`` field spec (same names ⇒ in-place; different ⇒ write output
+  and leave input). Selector keeps only listed keys.
 - Tokenizer / embedder modalities use a single ``field=`` (modality name = step
   key after Selector). Learnable numeric embedder modalities remain field-free.
 - Separate tokenizer vs embedder modality spec types
@@ -43,22 +42,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ``StepTokens`` / ``TokenBatch`` ``modality_names`` + ``modality_map`` (name →
   type/dim). Per-token ``modality_ids`` index the name table; type/kind is looked
   up from the map (no per-token ``kinds`` array).
-- Tokenizer ``step_fields=`` keep-list: only listed step keys are copied into
-  ``StepTokens.step_fields`` / ``objective_data`` (modalities are not auto-copied).
+- Tokenizer ``objective_fields=`` keep-list: only listed step keys are copied into
+  ``StepTokens.objective_fields`` / ``objective_data`` (input fields are not auto-copied).
 - Required ``grouping_field`` on ``StepTokens`` / ``TokenBatch``,
-  ``NumericTokenizer``, and ``TextTokenizer``. A Grouper output name should
-  match; int coercion for attention happens only when packing
-  ``TokenBatch.grouping_ids``.
+  ``NumericTokenizer``, and ``TextTokenizer``. It names the step key used for
+  attention isolation (typically ``task_index``). Int coercion happens when
+  packing ``TokenBatch.grouping_ids``.
 - Objectives (DQN / Layerwise / PPO / GRPO) take
   ``grouping_field: str | None = None`` (``None`` ⇒ no grouping filter).
 
 ### Changed
+- ``SpObjective`` takes ``mask_key`` (default ``"episode_done"``) and drops
+  rows where that column is True or any nonzero number. With mouse-gym
+  ``episode_done`` that skips both terminated (``1``) and truncated (``2``)
+  steps — the episode is over, so there is no next action to imitate. Pass
+  ``mask_key=None`` to disable.
+- Discrete ``Augmenter`` field specs take optional ``input_vector_field`` /
+  ``output_vector_field`` (name or list) for id-indexed vectors such as
+  ``info_q_star``. Those vectors share the spec's permutation (inverse-permuted
+  along the last axis). ``input_field`` is always remapped as ids; vector layout
+  is not inferred from array shape. Offline example notebooks that use
+  ``Augmenter`` (``02``, ``04``, ``05``, ``06``, ``10``) set both vector keys
+  on the action permute spec.
 - Dict→dict pipeline stages take ``fields=`` as a list of
-  ``{input_field, output_field}`` dicts; tokenizer / embedder keep
-  ``modalities=``. ``Augmenter(fields=...)`` (was ``modalities=``);
+  ``{input_field, output_field}`` dicts; tokenizer takes ``input_fields=`` and
+  embedder keeps ``modalities=``. ``Augmenter(fields=...)`` (was ``modalities=``);
   ``SequenceAugmentFieldSpec`` (was ``SequenceAugmentModalitySpec``);
-  ``Grouper`` / ``Selector`` use the same list-of-dicts shape (not a
-  name→name mapping).
+  ``Selector`` uses the same list-of-dicts shape (not a name→name mapping).
 - Depend on ``tokenizers>=0.23.1`` (free-threaded wheels; no upper bound).
   ``transformers`` tracks git ``main`` (``5.16.0.dev0``) until a PyPI release
   allows that tokenizers range. Other dependency floors raised to current
@@ -75,9 +85,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   episode of a task emits both. ``DqnObjective``, ``LayerwiseDqnObjective``,
   and ``PpoObjective`` take ``episode_done_key`` / ``task_done_key`` (no
   ``done_key``). The bootstrap is ``episode_gamma * task_gamma * V``
-  (``task_done == 0`` uses task factor ``1.0``). Example notebooks embed both
-  fields with ``vocab_size=3``. The ``examples`` extra tracks
-  ``mouse-gym`` ``main`` on GitHub.
+  (``task_done == 0`` uses task factor ``1.0``). Example notebooks embed
+  ``episode_done`` as a discrete modality (``vocab_size=3``); ``task_done`` is a
+  tokenizer ``objective_fields`` column for the objective and is not a transformer
+  input. The ``examples`` extra tracks ``mouse-gym`` ``main`` on GitHub.
+- ``task_done`` stays in tokenizer ``objective_fields`` so TD / PPO / GRPO can read
+  it, but it is not a tokenizer input field or embedder modality and is not passed
+  into the transformer. ``episode_done`` remains a discrete input field / modality.
+- Tokenizer ``modalities=`` renamed to ``input_fields=`` (transformer tokens).
+  Tokenizer ``step_fields=`` and ``StepTokens`` / ``TokenBatch`` ``.step_fields``
+  renamed to ``objective_fields=`` / ``.objective_fields`` (loss columns).
+  Embedder ``modalities=`` is unchanged.
 - Aligned with the post-1.0.0 mouse-gym seed: ``EnvConfig.seed`` (one draw
   per task, passed to ``reset(seed=...)`` only at task start). Example
   notebooks still use Procedural FrozenLake ``map_seed`` plus
@@ -91,23 +109,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``examples/03_train_online_dqn.ipynb``.
 - ``examples/06_train_offline_text.ipynb`` renamed to
   ``examples/06_train_offline_text_dqn.ipynb``.
-- ``Grouper`` copies ``fields`` input keys onto output names as-is (no int
-  cast; no ``field=None → grouping_id=0`` path). For no isolation, stamp a
-  constant column and point both names at it, or ensure ``grouping_field`` is
-  already on the step before tokenize.
 - Per-step data pipeline under ``mouse_core.data`` (compose on raw steps, then
-  pack, then embed): ``augmenter → grouper → selector → tokenizer → pack → embedder``.
+  pack, then embed): ``augmenter → selector → tokenizer → pack → embedder``.
   * ``compose(*stages)`` — thread a step through callables; ``reseed()`` forwards
   * ``Augmenter`` — ``dict → dict`` (``fields=`` specs with ``input_field`` /
     ``output_field``; required ``seed_field=``; draws keyed by that id within a
     ``reseed`` generation; usable in train and eval)
-  * ``Grouper`` — ``dict → dict`` (``fields=`` ``input_field`` /
-    ``output_field`` copy for attention isolation)
   * ``Selector`` — ``dict → dict`` (``fields=`` ``input_field`` /
-    ``output_field`` keep/rename; include Grouper output names; last rename
+    ``output_field`` keep/rename; include ``grouping_field``; last rename
     stage)
   * ``NumericTokenizer`` / ``TextTokenizer`` — ``dict → StepTokens`` (one step;
-    ``field=`` modalities; require ``grouping_field=``)
+    ``field=`` input fields; require ``grouping_field=``)
   * ``pack_token_batch(...)`` — join per-step ``StepTokens`` into a ``TokenBatch``
     (optional ``batch_size=`` for empty decode rows; steps must share
     ``grouping_field``)
@@ -121,15 +133,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Payload fields ``modality_ids`` / ``ids`` / ``values`` (was ``token_types`` /
   ``token_ids`` / ``scalars``). Tokenizer emits discrete ids or continuous
   values; embedder maps them. Token type comes from ``modality_map`` by name.
-- ``TokenBatch.step_fields`` (was ``col_values``): step-level objective columns
-  ``[N]`` / ``[N, dim]``, including ``sequence_id`` and ``grouping_field``.
-  Tokenizer ``step_fields=`` selects which raw step keys are packed (replaces
-  ``extra_fields`` for PPO/GRPO columns such as ``old_log_prob`` / ``advantage``).
+- ``TokenBatch.objective_fields`` (was ``col_values``, then ``step_fields``):
+  step-level objective columns ``[N]`` / ``[N, dim]``, including ``sequence_id``
+  and ``grouping_field``. Tokenizer ``objective_fields=`` selects which raw step
+  keys are packed (replaces ``extra_fields`` for PPO/GRPO columns such as
+  ``old_log_prob`` / ``advantage``).
 - ``TokenBatch.grouping_ids`` ``[L]`` (attention array) plus step-level
-  ``step_fields[grouping_field]``: same id may attend, different ids never attend.
-  Absolute ids typically come from ``Grouper(fields=[{"input_field": ...,
-  "output_field": ...}])`` matching tokenizer ``grouping_field``; FlexDecode
-  masks by equality (no relative remapping / boundary advance).
+  ``objective_fields[grouping_field]``: same id may attend, different ids never attend.
+  Absolute ids typically come from the tokenizer ``grouping_field`` (typically
+  ``task_index``); FlexDecode masks by equality (no relative remapping /
+  boundary advance).
 - ``NumericEmbedder`` / ``TextEmbedder`` tables keyed by modality name; forward
   validates batch ``modality_map`` names/types against the embedder config.
 - ``FlexDecodeSession.reset_rows``: zero selected per-sequence decode lengths so
@@ -137,14 +150,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Example notebooks, model-card tokenizer snippet, and tokenizer / objective
-  docs list ``episode_done`` and ``task_done`` in ``step_fields=`` (modalities
-  are not auto-copied into ``objective_data``).
+  docs list ``episode_done`` and ``task_done`` in ``objective_fields=`` (input
+  fields are not auto-copied into ``objective_data``).
 - ``examples/08_train_online_grpo.ipynb`` stops a branch on ``task_done != 0``
   instead of the old 5-code ``done in (3, 4)``.
-- Model-card Grouper example escapes the ``fields=[{...}]`` dict so card
+- Model-card tokenizer snippet no longer embeds a Grouper example, so card
   generation no longer raises ``ValueError`` on the f-string.
 
 ### Removed
+- ``Grouper``. Tokenizer ``grouping_field=`` names the step key used for
+  attention isolation (typically ``task_index``). Keep that key through
+  Selector. For no isolation, stamp a constant column on the step.
 - Combined 5-code ``done`` step field and objective ``done_key`` (use
   ``episode_done`` / ``task_done`` and ``episode_done_key`` / ``task_done_key``).
 - Vector-DQN, entirely: ``VecDqnObjective``, ``VectorActionValueHead``,
@@ -156,8 +172,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Shared ``ModalitySpec`` / ``TextModalitySpec`` and tokenizer/embedder
   ``input_field`` / ``output_field`` pairs (use ``field=``; rename with Selector).
 - ``Filter`` / ``Filter(keep_fields=...)`` (use ``Selector(fields=...)``).
-- ``Grouper(field=...)`` / ``Grouper()`` constant-zero path (use required
-  ``Grouper(fields=[...])``; stamp a constant column for no isolation).
 - ``Augmenter`` without ``seed_field`` (and the per-call streaming ``generator``
   path); draws are always keyed by ``seed_field`` so steps that share an id
   share permute/scale/shift.
@@ -187,14 +201,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Optional ``DataLoader`` tokenizer / raw ``next_batch()`` return — ``transform=`` is
   required and ``next_batch()`` always returns a ``TokenBatch``.
 - ``batch_field`` helper and tokenizer/embedder ``extra_fields`` (replaced by
-  tokenizer ``step_fields=`` keep-list).
+  tokenizer ``objective_fields=`` keep-list).
 - Per-token ``TokenBatch.kinds`` / ``KIND_DISCRETE`` / ``KIND_CONTINUOUS`` on the
   batch (kind comes from ``modality_map`` by name).
 - ``DataLoader`` ``pack`` / ``pad`` flags and train-time ``segment_ids`` plumbing.
-- ``TokenBatch.col_values`` (renamed to ``step_fields``).
+- ``TokenBatch.col_values`` (renamed to ``objective_fields``).
   Packing/padding short windows and pack-seam isolation are gone (one public path).
 - ``TokenBatch.lengths``: per-sequence step counts are derived from
-  ``step_fields["sequence_id"]`` + ``B`` via ``TokenBatch.step_counts()``
+  ``objective_fields["sequence_id"]`` + ``B`` via ``TokenBatch.step_counts()``
   (``step_counts_from_sequence_id``).
 - Dead packing helpers (``pack_and_pad_rows``, ``pack_live_step_tokens``,
   ``counts_from_prediction_indices``, …); only ``left_align_content`` remains.
@@ -222,7 +236,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ``step_token_indices`` renamed to ``prediction_indices`` (and
   ``counts_from_step_token_indices`` → ``counts_from_prediction_indices``).
 - ``TokenBatch``: variable per-sequence step counts; flat
-  ``prediction_indices`` ``[N]``, ``step_fields`` ``[N]`` (+ ``sequence_id``).
+  ``prediction_indices`` ``[N]``, ``objective_fields`` ``[N]`` (+ ``sequence_id``).
   No stored ``lengths`` / ``segment_ids`` fields.
 - ``Model.forward`` training path: predictions and ``objective_data`` are flat
   ``TensorDict[N]`` (``N = len(prediction_indices)``). Flex / CPU document
@@ -234,14 +248,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   valid pairs where ``sequence_id[i] == sequence_id[i+1]`` and, when
   ``grouping_field=`` is set, ``objective_data[grouping_field]`` matches across
   the pair.
-- Example notebooks build ``transform = compose(augmenter, grouper, selector,
+- Example notebooks build ``transform = compose(augmenter, selector,
   tokenizer)`` (online typically omits augmenter/selector), pass
   ``DataLoader(transform=transform)``, and reuse the same ``transform`` for
   eval / online decode via ``pack_token_batch([transform(s, augment=False) for s in ...])``.
-  ``Grouper(fields=[{"input_field": "task_index", "output_field":
-  "grouping_id"}])`` with matching tokenizer ``grouping_field=``; tokenizer
-  and embedder modality lists stay separate (``field=``); field keep/rename
-  uses ``Selector(fields=[...])``.
+  Tokenizer ``grouping_field="task_index"``; tokenizer and embedder modality
+  lists stay separate (``field=``); field keep/rename uses
+  ``Selector(fields=[...])``.
 - Example notebook constants renamed: ``MAX_EPISODE_STEPS`` →
   ``MAX_STEPS_PER_EPISODE``, ``EPISODES_PER_TASK`` → ``MAX_EPISODES_PER_TASK``
   (env kwargs ``max_episode_steps`` / ``episodes_per_task`` unchanged).
@@ -261,7 +274,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ``Augmenter.reseed()`` discards the draw cache; previously it kept entries
   for every past ``(generation, key)`` pair and grew without bound over
   training.
-- Tokenizers raise ``KeyError`` when a ``step_fields`` key is missing from a
+- Tokenizers raise ``KeyError`` when an ``objective_fields`` key is missing from a
   step instead of silently filling ``0.0`` (which trained objectives on zero
   ``old_log_prob`` / ``advantage`` columns). Notebooks ``07`` / ``08`` stamp
   the objective-only columns explicitly on eval and in-flight rollout rows.

@@ -5,13 +5,13 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import asdict, is_dataclass
 
-from mouse_core.data import Grouper, NumericTokenizer, compose, pack_token_batch
+from mouse_core.data import NumericTokenizer, compose, pack_token_batch
 from mouse_core.data.token_batch import StepTokens, TokenBatch
 
 DEFAULT_GROUPING_FIELD = "grouping_id"
 
 
-def _tokenizer_modalities_from_encoder(encoder) -> list[dict]:
+def _tokenizer_input_fields_from_encoder(encoder) -> list[dict]:
     """Map embedder modality specs to tokenizer packing specs (by name)."""
     out: list[dict] = []
     for m in encoder.modalities:
@@ -35,29 +35,29 @@ def tok_from_encoder(
     encoder,
     *,
     grouping_field: str = DEFAULT_GROUPING_FIELD,
-    step_fields: list[str] | None = None,
+    objective_fields: list[str] | None = None,
     **kwargs,
 ) -> NumericTokenizer:
     # Default keep-list: non-learnable modality names (common for tests/objectives).
-    if step_fields is None:
-        step_fields = []
+    if objective_fields is None:
+        objective_fields = []
         for m in encoder.modalities:
             data = asdict(m) if is_dataclass(m) else dict(m)
             if str(data["type"]).lower() == "learnable":
                 continue
             name = data.get("field")
             if isinstance(name, str):
-                step_fields.append(name)
+                objective_fields.append(name)
     return NumericTokenizer(
-        modalities=_tokenizer_modalities_from_encoder(encoder),
-        step_fields=step_fields,
+        input_fields=_tokenizer_input_fields_from_encoder(encoder),
+        objective_fields=objective_fields,
         grouping_field=grouping_field,
         **kwargs,
     )
 
 
 def _ensure_grouping_field(step: dict, grouping_field: str) -> dict:
-    """Stamp a constant grouping value when no Grouper ran (no isolation)."""
+    """Stamp a constant grouping value when the step has no isolation column."""
     if grouping_field in step:
         return step
     out = dict(step)
@@ -69,17 +69,13 @@ def batch_to_token_batch(
     tokenizer: Callable[[dict], StepTokens],
     batch: list[list[dict]],
     *,
-    grouper: Grouper | None = None,
     grouping_field: str = DEFAULT_GROUPING_FIELD,
 ) -> TokenBatch:
     """Tokenize a ragged ``list[list[dict]]`` with per-step transform + pack."""
-    if grouper is None:
-        transform = compose(
-            lambda step: _ensure_grouping_field(step, grouping_field),
-            tokenizer,
-        )
-    else:
-        transform = compose(grouper, tokenizer)
+    transform = compose(
+        lambda step: _ensure_grouping_field(step, grouping_field),
+        tokenizer,
+    )
     steps: list[StepTokens] = []
     sids: list[int] = []
     for b, seq in enumerate(batch):

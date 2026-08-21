@@ -13,7 +13,7 @@ import torch
 def _reject_io_fields(data: dict[str, Any], *, who: str) -> None:
     if "input_field" in data or "output_field" in data:
         raise TypeError(
-            f"{who} modalities use field= (not input_field=/output_field=); "
+            f"{who} input_fields use field= (not input_field=/output_field=); "
             "rename with Selector before tokenize"
         )
 
@@ -162,10 +162,10 @@ class TokenizerModalityMeta:
 
 
 def resolve_tokenizer_numeric_modalities(
-    modalities: list[dict[str, Any] | NumericTokenizerModalitySpec] | None = None,
+    input_fields: list[dict[str, Any] | NumericTokenizerModalitySpec] | None = None,
 ) -> tuple[list[NumericTokenizerModalitySpec], list[TokenizerModalityMeta]]:
-    """Expand tokenizer modality specs; each slot is keyed by ``field`` name."""
-    raw = modalities or []
+    """Expand tokenizer input-field specs; each slot is keyed by ``field`` name."""
+    raw = input_fields or []
     specs: list[NumericTokenizerModalitySpec] = []
     for i, m in enumerate(raw):
         if isinstance(m, NumericTokenizerModalitySpec):

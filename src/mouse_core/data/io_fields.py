@@ -1,4 +1,4 @@
-"""Shared coerce for Grouper / Selector ``fields=`` lists."""
+"""Shared coerce for Selector ``fields=`` lists."""
 
 from __future__ import annotations
 

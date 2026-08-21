@@ -96,13 +96,112 @@ def test_shared_action_permutation_also_permutates_action_value_targets() -> Non
         seed=0,
         seed_field="task_index",
         fields=[
-            {"type": 'discrete', "input_field": ('action', 'prev_action', 'info_q_star'), "output_field": ('action', 'prev_action', 'info_q_star'), "vocab_size": 3, "permute": True}
+            {
+                "type": "discrete",
+                "input_field": ("action", "prev_action"),
+                "output_field": ("action", "prev_action"),
+                "input_vector_field": "info_q_star",
+                "output_vector_field": "info_q_star",
+                "vocab_size": 3,
+                "permute": True,
+            }
         ],
     )
     out = augment(step)
     assert out["action"] == int(expected_perm[0])
     assert out["prev_action"] == int(expected_perm[1])
     assert out["info_q_star"] == np.take([10.0, 20.0, 30.0], expected_inverse).tolist()
+
+
+def test_input_vector_field_is_skipped_when_absent() -> None:
+    expected_perm = _rng_for_key(seed=0, seed_field="task_index", key=0).permutation(3)
+    augment = Augmenter(
+        seed=0,
+        seed_field="task_index",
+        fields=[
+            {
+                "type": "discrete",
+                "input_field": "action",
+                "output_field": "action",
+                "input_vector_field": "info_q_star",
+                "output_vector_field": "info_q_star",
+                "vocab_size": 3,
+                "permute": True,
+            }
+        ],
+    )
+    out = augment({"action": 0, "task_index": 0})
+    assert out["action"] == int(expected_perm[0])
+    assert "info_q_star" not in out
+
+
+def test_mask_does_not_zero_vector_field() -> None:
+    expected_perm = _rng_for_key(seed=0, seed_field="task_index", key=0).permutation(3)
+    expected_inverse = np.empty_like(expected_perm)
+    expected_inverse[expected_perm] = np.arange(len(expected_perm))
+    augment = Augmenter(
+        seed=0,
+        seed_field="task_index",
+        fields=[
+            {
+                "type": "discrete",
+                "input_field": "action",
+                "output_field": "action",
+                "input_vector_field": "info_q_star",
+                "output_vector_field": "info_q_star",
+                "vocab_size": 3,
+                "permute": True,
+                "mask_prob": 1.0,
+            }
+        ],
+    )
+    out = augment({"action": 0, "info_q_star": [10.0, 20.0, 30.0], "task_index": 0})
+    assert out["action"] == 0
+    assert out["info_q_star"] == np.take([10.0, 20.0, 30.0], expected_inverse).tolist()
+
+
+def test_vector_rename_writes_output_keeps_input() -> None:
+    expected_perm = _rng_for_key(seed=0, seed_field="task_index", key=0).permutation(3)
+    expected_inverse = np.empty_like(expected_perm)
+    expected_inverse[expected_perm] = np.arange(len(expected_perm))
+    q = [10.0, 20.0, 30.0]
+    augment = Augmenter(
+        seed=0,
+        seed_field="task_index",
+        fields=[
+            {
+                "type": "discrete",
+                "input_field": "action",
+                "output_field": "action",
+                "input_vector_field": "info_q_star",
+                "output_vector_field": "q_star_aug",
+                "vocab_size": 3,
+                "permute": True,
+            }
+        ],
+    )
+    out = augment({"action": 0, "info_q_star": q, "task_index": 0})
+    assert out["info_q_star"] == q
+    assert out["q_star_aug"] == np.take(q, expected_inverse).tolist()
+    assert out["action"] == int(expected_perm[0])
+
+
+def test_vector_on_input_field_raises() -> None:
+    augment = Augmenter(
+        seed=0,
+        seed_field="task_index",
+        fields=[
+            {
+                "type": "discrete",
+                "input_field": "info_q_star",
+                "output_field": "info_q_star",
+                "vocab_size": 3,
+                "permute": True,
+            }
+        ],
+    )
+    with pytest.raises(ValueError, match="input_vector_field"):
+        augment({"info_q_star": [10.0, 20.0, 30.0], "task_index": 0})
 
 
 def test_mask_decisions_vary_per_step_within_one_generation() -> None:
@@ -314,4 +413,54 @@ def test_linear_scale_input_endpoints_must_differ() -> None:
             scale_out_low=0.0,
             scale_in_high=1.0,
             scale_out_high=2.0,
+        )
+
+
+def test_input_vector_field_requires_permute() -> None:
+    with pytest.raises(ValueError, match="input_vector_field requires permute"):
+        SequenceAugmentFieldSpec(
+            input_field="action",
+            output_field="action",
+            type="discrete",
+            vocab_size=3,
+            input_vector_field="info_q_star",
+            output_vector_field="info_q_star",
+        )
+
+
+def test_input_vector_field_must_not_overlap_input_field() -> None:
+    with pytest.raises(ValueError, match="also appear on input_field"):
+        SequenceAugmentFieldSpec(
+            input_field=("action", "info_q_star"),
+            output_field=("action", "info_q_star"),
+            type="discrete",
+            vocab_size=3,
+            permute=True,
+            input_vector_field="info_q_star",
+            output_vector_field="info_q_star",
+        )
+
+
+def test_vector_fields_require_both() -> None:
+    with pytest.raises(ValueError, match="input_vector_field and output_vector_field"):
+        SequenceAugmentFieldSpec(
+            input_field="action",
+            output_field="action",
+            type="discrete",
+            vocab_size=3,
+            permute=True,
+            input_vector_field="info_q_star",
+        )
+
+
+def test_vector_field_arity_mismatch() -> None:
+    with pytest.raises(ValueError, match="arity mismatch"):
+        SequenceAugmentFieldSpec(
+            input_field="action",
+            output_field="action",
+            type="discrete",
+            vocab_size=3,
+            permute=True,
+            input_vector_field=("info_q_star", "info_q_star_2"),
+            output_vector_field="info_q_star",
         )

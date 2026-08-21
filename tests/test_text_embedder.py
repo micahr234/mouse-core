@@ -24,9 +24,8 @@ _DEFAULT_MODALITIES = [
     {"type": 'text', "field": "observation", "format": 'observation={observation}'},
     {"type": 'text', "field": "reward", "format": 'reward={reward}', "skip": 0.0},
     {"type": 'text', "field": "episode_done", "format": 'episode_done={episode_done}', "skip": 0},
-    {"type": 'text', "field": "task_done", "format": 'task_done={task_done}', "skip": 0},
 ]
-_DEFAULT_FORMAT = "<action={action},{observation},{reward},{episode_done},{task_done}>"
+_DEFAULT_FORMAT = "<action={action},{observation},{reward},{episode_done}>"
 
 
 def _text_pair(hidden_dim: int = 8, **kwargs):
@@ -39,16 +38,16 @@ def _text_pair(hidden_dim: int = 8, **kwargs):
     format_str = kwargs.pop("format", _DEFAULT_FORMAT)
     modalities = kwargs.pop("modalities", list(_DEFAULT_MODALITIES))
     image_processor = kwargs.pop("image_processor", None)
-    step_fields = kwargs.pop(
-        "step_fields",
+    objective_fields = kwargs.pop(
+        "objective_fields",
         ["action", "observation", "reward", "episode_done", "task_done"],
     )
     tokenizer = TextTokenizer(
-        modalities=modalities,
+        input_fields=modalities,
         format=format_str,
         tokenizer=hf_tok,
         image_processor=image_processor,
-        step_fields=step_fields,
+        objective_fields=objective_fields,
         grouping_field="grouping_id",
     )
     embedder_modalities = [
@@ -101,7 +100,7 @@ def test_text_embedder_skip_omits_value_keeps_commas() -> None:
     out, _, _ = enc2(
         batch_to_token_batch(tokenizer2, [[{"observation": 1, "action": 0, "reward": 0.0, "episode_done": 0, "task_done": 0}]])
     )
-    assert seen == ["<action=", ",observation=1,,,>"]
+    assert seen == ["<action=", ",observation=1,,>"]
     matches = (out == 7.0).all(dim=-1)
     assert int(matches.sum().item()) == 1
 
@@ -184,7 +183,7 @@ def test_text_embedder_image_token_ids() -> None:
             {"type": 'text', "field": "observation", "format": '{observation}'},
             {"type": 'image', "field": "pixels"},
         ],
-        step_fields=["observation", "pixels"],
+        objective_fields=["observation", "pixels"],
     )
     batch = [[{"observation": 3, "pixels": [1, 2, 3]}]]
     embeds, step_fields, indices = enc(batch_to_token_batch(tokenizer, batch))

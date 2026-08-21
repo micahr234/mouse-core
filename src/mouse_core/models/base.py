@@ -199,22 +199,19 @@ model = (
 
 Training and inference both take a `TokenBatch`. Training typically uses
 `DataLoader(transform=transform)`. Online / inference uses the same per-step
-`transform` (compose augmenter/grouper/selector/tokenizer → `StepTokens`) and
+`transform` (compose augmenter/selector/tokenizer → `StepTokens`) and
 `pack_token_batch` when combining steps. The tokenizer is not part of the
 saved model.
 
 ```python
-from mouse_core.data import Grouper, NumericTokenizer, compose, pack_token_batch
+from mouse_core.data import NumericTokenizer, compose, pack_token_batch
 
-grouper = Grouper(
-    fields=[{{"input_field": "task_index", "output_field": "grouping_id"}}],
-)
 tokenizer = NumericTokenizer(
-    modalities=[...],  # field=; match embedder slots
-    step_fields=["action", "reward", "episode_done", "task_done"],
-    grouping_field="grouping_id",
+    input_fields=[...],  # field=; match embedder slots
+    objective_fields=["action", "reward", "episode_done", "task_done"],
+    grouping_field="task_index",
 )
-transform = compose(grouper, tokenizer)  # plus selector/augmenter as needed
+transform = tokenizer  # plus compose(augmenter, selector, tokenizer) as needed
 
 {objective_data_example}
 
@@ -226,7 +223,7 @@ with torch.no_grad():
 ```
 
 `model()` returns `(predictions, objective_data, cache)`. `objective_data` is a
-`TensorDict[B, S]` of the modality tensors extracted by the encoder — pass it
+`TensorDict[B, S]` of the tokenizer `objective_fields` extracted by the encoder — pass it
 to objectives during training. For cached incremental rollout, keep `cache` and
 pass it back on the next call with `use_cache=True`. Cached batch rows may have
 different lengths on every call (e.g. envs emitting different numbers of steps
@@ -540,7 +537,7 @@ def _build_model_from_config(config: dict[str, Any]) -> "Model":
 def _build_encoder_from_config(config: dict[str, Any]) -> Encoder:
     enc_type = config.get("type")
     kwargs = dict(config.get("kwargs") or {})
-    kwargs.pop("extra_fields", None)  # removed; step_fields live on the tokenizer
+    kwargs.pop("extra_fields", None)  # removed; objective_fields live on the tokenizer
     if enc_type == "numeric":
         from mouse_core.models.embedding import NumericEmbedder
 
@@ -896,18 +893,18 @@ class Model(nn.Module):
         if use_cache and B > 0 and N == 0:
             raise ValueError("Model.forward requires at least one non-empty row in batch.")
 
-        embeds, step_fields, prediction_indices = self.encoder(token_batch)
+        embeds, objective_fields, prediction_indices = self.encoder(token_batch)
         # embeds: [L, D]; prediction_indices: [N]
-        if any(value.device != embeds.device for value in step_fields.values()):
-            step_fields = {
-                key: value.to(embeds.device) for key, value in step_fields.items()
+        if any(value.device != embeds.device for value in objective_fields.values()):
+            objective_fields = {
+                key: value.to(embeds.device) for key, value in objective_fields.items()
             }
 
         t = token_batch.to_tensors(embeds.device)
         sequence_ids = t["sequence_ids"]
         grouping_ids = t["grouping_ids"]
-        if "sequence_id" not in step_fields and N > 0:
-            raise ValueError("step_fields must include sequence_id when N > 0")
+        if "sequence_id" not in objective_fields and N > 0:
+            raise ValueError("objective_fields must include sequence_id when N > 0")
 
         needs_layerwise = "action_value_layerwise" in self._heads
         new_cache: dict[str, Any] | None
@@ -952,7 +949,7 @@ class Model(nn.Module):
             pred_batch_size: tuple[int, ...] = (B, S_max)
             # Rectangular objective_data for decode (left-pad short rows).
             objective_data = _rect_objective_data(
-                step_fields, step_counts_np, B, S_max, embeds.device
+                objective_fields, step_counts_np, B, S_max, embeds.device
             )
         else:
             # Training: Flex packed on CUDA; SDPA mask fallback on CPU (no Flex backward).
@@ -1000,7 +997,7 @@ class Model(nn.Module):
             new_cache = None
             h_source_batched = False
             pred_batch_size = (N,)
-            objective_data = TensorDict(step_fields, batch_size=[N])
+            objective_data = TensorDict(objective_fields, batch_size=[N])
 
         if needs_layerwise:
             h, layer_hiddens = cast(
@@ -1127,18 +1124,18 @@ def preferred_dtype(device: torch.device | str | None = None) -> torch.dtype:
 
 
 def _rect_objective_data(
-    step_fields: dict[str, torch.Tensor],
+    objective_fields: dict[str, torch.Tensor],
     step_counts: Any,
     B: int,
     S: int,
     device: torch.device,
 ) -> TensorDict:
-    """Left-pad flat ``[N]`` step_fields into rectangular ``[B, S]`` for decode."""
+    """Left-pad flat ``[N]`` objective_fields into rectangular ``[B, S]`` for decode."""
     import numpy as np
 
     counts = np.asarray(step_counts, dtype=np.int64).reshape(-1)
     rect: dict[str, torch.Tensor] = {}
-    for key, flat in step_fields.items():
+    for key, flat in objective_fields.items():
         if flat.ndim == 1:
             out = flat.new_zeros(B, S)
         else:

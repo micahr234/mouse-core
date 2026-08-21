@@ -19,9 +19,7 @@ from mouse_core.models import Model
 from mouse_core.models.backbone import LlamaBackbone, Qwen3Backbone
 from mouse_core.models.backbone.flex_decode import _decode_rope_positions
 from mouse_core.models.embedding import NumericEmbedder
-from mouse_core.data import NumericTokenizer
 from mouse_core.models.heads import DiscreteActionValueHead
-from mouse_core.data import Grouper
 from tests._token_batch_helpers import batch_to_token_batch, tok_from_encoder
 
 
@@ -65,7 +63,7 @@ def _as_rect(preds: torch.Tensor) -> torch.Tensor:
 
 def _tiny_model(backbone_cls, tokens: int=1) -> Model:
     hidden_dim = 16
-    encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4}, {"type": 'fourier', "field": "reward"}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3}, {"type": 'discrete', "field": "task_done", "vocab_size": 3}])
+    encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4}, {"type": 'fourier', "field": "reward"}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3}])
     backbone = backbone_cls(hidden_dim=hidden_dim, num_layers=2, num_heads=2)
     head = DiscreteActionValueHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1)
     return Model(encoder=encoder, backbone=backbone, heads=head).eval()
@@ -75,13 +73,15 @@ def _steps(n: int, start: int=0) -> list[dict]:
 
 
 def _fwd(model: Model, rows: list[list[dict]], **kwargs):
-    grouper = Grouper(fields=[{"input_field": "task_index", "output_field": "grouping_id"}])
-    # Ensure absolute grouping ids exist on every step.
     patched = [
         [{**step, "task_index": step.get("task_index", 0)} for step in seq]
         for seq in rows
     ]
-    tb = batch_to_token_batch(_tok(model.encoder), patched, grouper=grouper)
+    tb = batch_to_token_batch(
+        _tok(model.encoder, grouping_field="task_index"),
+        patched,
+        grouping_field="task_index",
+    )
     return model(tb, **kwargs)
 
 @pytest.mark.parametrize('backbone_cls', [Qwen3Backbone, LlamaBackbone])
@@ -220,11 +220,11 @@ def test_concat_fusion_ragged_chunks_match_unbatched() -> None:
     blocks, and the mask must expand to exactly that many tokens per step."""
     torch.manual_seed(6)
     hidden_dim = 16
-    encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4}, {"type": 'fourier', "field": "reward"}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3}, {"type": 'discrete', "field": "task_done", "vocab_size": 3}, {'type': 'learnable', 'tokens': 1}])
+    encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4}, {"type": 'fourier', "field": "reward"}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3}, {'type': 'learnable', 'tokens': 1}])
     backbone = Qwen3Backbone(hidden_dim=hidden_dim, num_layers=2, num_heads=2)
     head = DiscreteActionValueHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1)
     model = Model(encoder=encoder, backbone=backbone, heads=head).eval()
-    assert model.encoder.tokens_per_step == 5
+    assert model.encoder.tokens_per_step == 4
     chunk_lengths = [[1, 4, 2], [3, 0, 1], [2, 2, 3]]
     totals = [sum((call[b] for call in chunk_lengths)) for b in range(3)]
     rows = [_steps(totals[b], start=b * 10) for b in range(3)]

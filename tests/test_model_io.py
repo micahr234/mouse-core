@@ -16,7 +16,7 @@ _tok = tok_from_encoder
 def test_composed_model_roundtrip(tmp_path) -> None:
     torch.manual_seed(0)
     hidden_dim = 8
-    encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4}, {"type": 'fourier', "field": "reward"}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3}, {"type": 'discrete', "field": "task_done", "vocab_size": 3}])
+    encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4}, {"type": 'fourier', "field": "reward"}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3}])
     backbone = IdentityBackbone(hidden_dim=hidden_dim)
     heads = DiscreteActionValueHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1)
     model = Model(encoder=encoder, backbone=backbone, heads=heads).eval()
@@ -63,7 +63,7 @@ def test_composed_model_roundtrip_static_fourier(tmp_path) -> None:
     assert torch.equal(enc.fourier.freqs, loaded_enc.fourier.freqs)
 
 def test_model_card_includes_usage_and_architecture(tmp_path) -> None:
-    model = Model(encoder=NumericEmbedder(hidden_dim=8, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4}, {"type": 'fourier', "field": "reward"}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3}, {"type": 'discrete', "field": "task_done", "vocab_size": 3}]), backbone=IdentityBackbone(hidden_dim=8), heads=DiscreteActionValueHead(in_features=8, out_features=4, hidden_dim=8, num_layers=1))
+    model = Model(encoder=NumericEmbedder(hidden_dim=8, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4}, {"type": 'fourier', "field": "reward"}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3}]), backbone=IdentityBackbone(hidden_dim=8), heads=DiscreteActionValueHead(in_features=8, out_features=4, hidden_dim=8, num_layers=1))
     path = tmp_path / 'README.md'
     _write_model_card(repo_id='user/mouse-example-model', model=model, path=path)
     text = path.read_text()
@@ -80,12 +80,12 @@ def test_model_card_includes_usage_and_architecture(tmp_path) -> None:
     assert '"action": 0,' in text
     assert '"reward": 0.0,' in text
     assert 'out, step_stream, cache = model(batch)' not in text
-    assert 'Grouper' in text
     assert 'compose' in text
     assert 'pack_token_batch' in text
     assert 'DataLoader(transform=transform)' in text
-    assert 'transform = compose' in text
-    assert 'step_fields=["action", "reward", "episode_done", "task_done"]' in text
+    assert 'transform = tokenizer' in text
+    assert 'grouping_field="task_index"' in text
+    assert 'objective_fields=["action", "reward", "episode_done", "task_done"]' in text
     assert 'token_batch.grouper' not in text
     assert 'boundary_values' not in text
     assert 'Backbone: `identity`' in text
@@ -95,7 +95,7 @@ def test_model_to_bfloat16_keeps_heads_float32() -> None:
     if not torch.cuda.is_available():
         pytest.skip('CUDA required')
     hidden_dim = 8
-    encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4}, {"type": 'fourier', "field": "reward"}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3}, {"type": 'discrete', "field": "task_done", "vocab_size": 3}])
+    encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4}, {"type": 'fourier', "field": "reward"}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3}])
     backbone = Qwen3Backbone(hidden_dim=hidden_dim, num_layers=1, num_heads=2)
     heads = DiscreteActionValueHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1)
     model = Model(encoder=encoder, backbone=backbone, heads=heads).eval()

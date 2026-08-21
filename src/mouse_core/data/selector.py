@@ -7,8 +7,8 @@ I/O
 
 ``fields`` is a list of ``{input_field, output_field}`` dicts. This is the last
 pipeline stage that remaps field names; tokenizers and embedders use a single
-``field`` name thereafter. Include each Grouper output name in ``fields`` when
-a :class:`Grouper` runs earlier in the composed pipeline.
+``field`` name thereafter. Include the tokenizer ``grouping_field`` in ``fields``
+so attention isolation survives this keep-list.
 """
 
 from __future__ import annotations

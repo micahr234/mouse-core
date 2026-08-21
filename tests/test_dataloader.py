@@ -16,7 +16,6 @@ from mouse_core.data import (
     Augmenter,
     DataLoader,
     Datastore,
-    Grouper,
     NumericTokenizer,
     compose,
 )
@@ -39,18 +38,18 @@ def _store_with_actions() -> Datastore:
     return store
 
 
-def _tokenizer(*, step_fields: list[str] | None = None) -> NumericTokenizer:
+def _tokenizer(*, objective_fields: list[str] | None = None) -> NumericTokenizer:
     keep = (
-        step_fields
-        if step_fields is not None
+        objective_fields
+        if objective_fields is not None
         else ["action", "reward", "episode_done", "task_done"]
     )
     return NumericTokenizer(
-        modalities=[
+        input_fields=[
             {"type": 'discrete', "field": "action"},
             {"type": 'fourier', "field": "reward"},
         ],
-        step_fields=keep,
+        objective_fields=keep,
         grouping_field="grouping_id",
     )
 
@@ -116,7 +115,7 @@ def test_dataloader_applies_augmenter_before_returning_batch() -> None:
     )
     tb = loader.next_batch()
     assert isinstance(tb, TokenBatch)
-    assert all(int(a) == 0 for a in tb.step_fields["action"])
+    assert all(int(a) == 0 for a in tb.objective_fields["action"])
 
 
 def test_dataloader_reseeds_transform_each_batch() -> None:
@@ -169,7 +168,7 @@ class _ThreadMarkerTransform:
 
 @pytest.mark.skipif(not _free_threading_ok(), reason="free-threading (GIL disabled) required")
 def test_dataloader_runs_transform_in_worker_thread() -> None:
-    marker = _ThreadMarkerTransform(_tokenizer(step_fields=["action", "reward", "transform_thread"]))
+    marker = _ThreadMarkerTransform(_tokenizer(objective_fields=["action", "reward", "transform_thread"]))
     loader = DataLoader(
         sequence_length=3,
         batch_size=2,
@@ -212,7 +211,7 @@ def test_dataloader_snapshots_loaded_source_and_appended_rows() -> None:
     store.append({"action": 3, "reward": 0.0, "episode_done": 0, "task_done": 0})
     loader = _loader(sequence_length=3, batch_size=1, num_workers=0, seed=0, stores=store)
     tb = loader.next_batch()
-    actions = [int(a) for a in tb.step_fields["action"]]
+    actions = [int(a) for a in tb.objective_fields["action"]]
     assert 1 <= len(actions) <= 3
     assert actions == list(range(actions[0], actions[0] + len(actions)))
     assert set(actions) <= {1, 2, 3}
@@ -225,7 +224,7 @@ def _tb_signature(tb: TokenBatch) -> tuple:
         tb.N,
         tuple(tb.modality_ids.tolist()),
         tuple(tb.ids.tolist()),
-        tuple(np.asarray(tb.step_fields["action"]).tolist()),
+        tuple(np.asarray(tb.objective_fields["action"]).tolist()),
     )
 
 
@@ -278,12 +277,12 @@ def test_dataloader_refresh_picks_up_appended_rows() -> None:
     loader.next_batch()
     store.append({"action": 4, "reward": 0.0, "episode_done": 0, "task_done": 0})
     batch_before_refresh = loader.next_batch()
-    assert all(int(a) != 4 for a in batch_before_refresh.step_fields["action"])
+    assert all(int(a) != 4 for a in batch_before_refresh.objective_fields["action"])
     loader.refresh()
     seen: set[int] = set()
     for _ in range(40):
         tb = loader.next_batch()
-        seen.update(int(a) for a in tb.step_fields["action"])
+        seen.update(int(a) for a in tb.objective_fields["action"])
     assert 4 in seen
 
 
@@ -311,7 +310,7 @@ def test_dataloader_ragged_windows_up_to_max_length() -> None:
     tb = loader.next_batch()
     n = int(tb.step_counts()[0])
     assert 1 <= n <= 3
-    actions = [int(a) for a in tb.step_fields["action"]]
+    actions = [int(a) for a in tb.objective_fields["action"]]
     assert actions == list(range(actions[0], actions[0] + len(actions)))
 
 
@@ -321,7 +320,7 @@ def test_dataloader_allows_short_stores() -> None:
     loader = _loader(sequence_length=4, batch_size=1, num_workers=0, stores=store)
     tb = loader.next_batch()
     assert int(tb.step_counts()[0]) == 1
-    assert int(tb.step_fields["action"][0]) == 7
+    assert int(tb.objective_fields["action"][0]) == 7
 
 
 def test_dataloader_allows_empty_stores_until_sampling() -> None:

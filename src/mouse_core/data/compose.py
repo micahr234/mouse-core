@@ -48,7 +48,7 @@ def compose(*stages: Callable[[Any], Any]) -> _Compose:
 
     Typical train/eval pipeline::
 
-        transform = compose(augmenter, grouper, selector, tokenizer)
+        transform = compose(augmenter, selector, tokenizer)
         step_tokens = transform(step)                 # train: augmented
         transform.reseed()                            # new draws for the next batch
         step_tokens = transform(step, augment=False)  # eval / decode: raw values

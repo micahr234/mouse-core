@@ -8,11 +8,14 @@ I/O
 Field keep/rename is :class:`~mouse_core.data.selector.Selector`, not this class.
 Compose in pipeline order::
 
-    transform = compose(augmenter, grouper, selector, tokenizer)
+    transform = compose(augmenter, selector, tokenizer)
 
 Permute/scale/shift draws are keyed by ``seed_field`` so steps sharing that
 id share draws within one :meth:`Augmenter.reseed` generation. Mask decisions
 (``mask_prob``) are drawn independently per step.
+Discrete permute specs remap ``input_field`` ids; optional
+``input_vector_field`` / ``output_vector_field`` vectors share that
+permutation (inverse-permuted along the last axis).
 ``DataLoader`` calls ``transform.reseed()`` once per batch. Eval / decode
 should pass ``augment=False`` to skip augmentation entirely (raw values reach
 the model, and no reseeding is needed).
@@ -37,6 +40,14 @@ def _stable_hash(*parts: Any) -> int:
     """
     digest = hashlib.blake2s(repr(parts).encode("utf-8"), digest_size=4).digest()
     return int.from_bytes(digest, "little")
+
+
+def _field_names(value: str | Sequence[str] | None) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        return (value,)
+    return tuple(value)
 
 
 @dataclass(frozen=True)
@@ -78,11 +89,21 @@ class SequenceAugmentFieldSpec:
     Each spec has required ``input_field`` / ``output_field`` and a ``type``.
     Same names replace in place; different names write outputs and leave inputs.
     Augmentation ``type`` values describe raw-data behavior, not embedding.
+
+    For ``type='discrete'`` with ``permute=True``, ``input_field`` values are
+    ids in ``[0, vocab_size)`` remapped by the sampled permutation.
+    ``input_vector_field`` / ``output_vector_field`` name optional id-indexed
+    vectors (for example ``info_q_star``) that share that permutation: each
+    vector is reordered so ``values[perm[i]]`` stays aligned with remapped ids.
+    Same names replace in place; different names write outputs and leave inputs.
+    Vector layout is never inferred from array shape.
     """
 
     type: Literal["discrete", "linear", "image"]
     input_field: str | Sequence[str]
     output_field: str | Sequence[str]
+    input_vector_field: str | Sequence[str] | None = None
+    output_vector_field: str | Sequence[str] | None = None
     vocab_size: int | None = None
     mask_prob: float = 0.0
     scale_in_low: float | None = None
@@ -108,11 +129,23 @@ class SequenceAugmentFieldSpec:
                 "expected one of ('discrete', 'linear', 'image')."
             )
         object.__setattr__(self, "type", kind)
-        in_f = (self.input_field,) if isinstance(self.input_field, str) else tuple(self.input_field)
-        out_f = (self.output_field,) if isinstance(self.output_field, str) else tuple(self.output_field)
+        in_f = _field_names(self.input_field)
+        out_f = _field_names(self.output_field)
         if len(in_f) != len(out_f):
             raise ValueError(
                 f"field {self.input_field!r}: input_field/output_field arity mismatch"
+            )
+        in_v = _field_names(self.input_vector_field)
+        out_v = _field_names(self.output_vector_field)
+        if bool(in_v) != bool(out_v):
+            raise ValueError(
+                f"field {self.input_field!r}: set input_vector_field and "
+                "output_vector_field together."
+            )
+        if len(in_v) != len(out_v):
+            raise ValueError(
+                f"field {self.input_field!r}: input_vector_field/output_vector_field "
+                "arity mismatch"
             )
         if not 0.0 <= self.mask_prob <= 1.0:
             raise ValueError(f"mask_prob for field {self.input_field!r} must be in [0, 1], got {self.mask_prob}.")
@@ -121,6 +154,18 @@ class SequenceAugmentFieldSpec:
                 raise ValueError(f"field {self.input_field!r}: permute=True requires type='discrete'.")
             if self.vocab_size is None or self.vocab_size <= 0:
                 raise ValueError(f"field {self.input_field!r}: vocab_size must be positive when permute=True.")
+        if in_v:
+            if not self.permute:
+                raise ValueError(
+                    f"field {self.input_field!r}: input_vector_field requires permute=True."
+                )
+            overlap = set(in_f) & set(in_v)
+            if overlap:
+                raise ValueError(
+                    f"field {self.input_field!r}: input_vector_field names "
+                    f"{sorted(overlap)} also appear on input_field; put ids on "
+                    "input_field and id-indexed vectors on input_vector_field."
+                )
         if self.vocab_size is not None and self.vocab_size <= 0:
             raise ValueError(f"field {self.input_field!r}: vocab_size must be positive.")
         self.linear_transform()
@@ -141,15 +186,19 @@ class SequenceAugmentFieldSpec:
 
     @property
     def input_fields(self) -> tuple[str, ...]:
-        if isinstance(self.input_field, str):
-            return (self.input_field,)
-        return tuple(self.input_field)
+        return _field_names(self.input_field)
 
     @property
     def output_fields(self) -> tuple[str, ...]:
-        if isinstance(self.output_field, str):
-            return (self.output_field,)
-        return tuple(self.output_field)
+        return _field_names(self.output_field)
+
+    @property
+    def input_vector_fields(self) -> tuple[str, ...]:
+        return _field_names(self.input_vector_field)
+
+    @property
+    def output_vector_fields(self) -> tuple[str, ...]:
+        return _field_names(self.output_vector_field)
 
     def scale_spec(self) -> _ScalarDraw:
         return _ScalarDraw(self.scale_mean, self.scale_std, self.scale_low, self.scale_high)
@@ -226,6 +275,10 @@ class Augmenter:
     new draw set for every key. Mask decisions (``mask_prob``) are drawn
     independently per step (one draw per field spec per call), from a stream
     seeded by the base seed and generation.
+    Discrete ``permute=True`` specs remap ``input_field`` ids; set
+    ``input_vector_field`` / ``output_vector_field`` for id-indexed vectors
+    that must stay aligned with those ids (they share the same sampled
+    permutation).
     """
 
     def __init__(
@@ -267,6 +320,10 @@ class Augmenter:
                 value = self._apply_permutation(spec, draw, value)
                 value = self._apply_scale_shift(spec, draw, value)
                 row[out_f] = self._mask_or_value(spec, value, mask_this_step)
+            for in_f, out_f in zip(spec.input_vector_fields, spec.output_vector_fields):
+                if in_f not in row:
+                    continue
+                row[out_f] = self._apply_value_permutation(spec, draw, row[in_f])
         return row
 
     def reseed(self, seed: int | None = None) -> None:
@@ -373,12 +430,24 @@ class Augmenter:
         if perm is None:
             return value
         arr = np.asarray(value)
-        if arr.ndim > 0 and arr.shape[-1] == len(perm):
-            return _permute_action_values(value, draw["inverse_perm"])
+        if arr.ndim > 0:
+            raise ValueError(
+                f"Cannot permute {spec.input_field!r} as an id; got array of "
+                f"shape {arr.shape}. Put id-indexed vectors on "
+                "input_vector_field=/output_vector_field=."
+            )
         idx = int(value)
         if idx < 0 or idx >= len(perm):
             raise ValueError(f"Cannot permute {spec.input_field!r} value {idx}; expected it in [0, {len(perm)}).")
         return int(perm[idx])
+
+    def _apply_value_permutation(
+        self, spec: SequenceAugmentFieldSpec, draw: dict[str, Any], value: Any
+    ) -> Any:
+        inverse_perm = draw["inverse_perm"]
+        if inverse_perm is None:
+            return _copy_value(value)
+        return _permute_indexed_values(spec, value, inverse_perm)
 
     def _apply_scale_shift(self, spec: SequenceAugmentFieldSpec, draw: dict[str, Any], value: Any) -> Any:
         scale = float(draw["scale"])
@@ -477,11 +546,15 @@ def _inverse_permutation(perm: np.ndarray) -> np.ndarray:
     return inverse
 
 
-def _permute_action_values(value: Any, inverse_perm: np.ndarray) -> Any:
+def _permute_indexed_values(
+    spec: SequenceAugmentFieldSpec, value: Any, inverse_perm: np.ndarray
+) -> Any:
     arr = np.asarray(value)
-    if arr.shape[-1] != len(inverse_perm):
+    if arr.ndim == 0 or arr.shape[-1] != len(inverse_perm):
+        width = arr.shape[-1] if arr.ndim > 0 else 1
         raise ValueError(
-            f"Cannot permute action values with width {arr.shape[-1]}; expected {len(inverse_perm)} values."
+            f"Cannot permute {spec.input_vector_field!r} with width {width}; "
+            f"expected {len(inverse_perm)} values."
         )
     out = np.take(arr, inverse_perm, axis=-1)
     if out.ndim == 0:

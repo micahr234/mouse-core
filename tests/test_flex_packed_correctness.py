@@ -9,7 +9,6 @@ from mouse_core.models.backbone.flex_train import flex_packed_forward
 from mouse_core.models.backbone.qwen3 import Qwen3Backbone
 from mouse_core.models.base import Model, _flat_sequence_causal_mask, _flat_sequence_position_ids
 from mouse_core.models.embedding import NumericEmbedder
-from mouse_core.data import Grouper, NumericTokenizer
 from mouse_core.models.heads.dqn import DiscreteActionValueHead
 from tests._token_batch_helpers import batch_to_token_batch, tok_from_encoder
 
@@ -91,8 +90,8 @@ def test_prepare_sequence_id_col_matches_step_counts() -> None:
     batch = [[{'action': s % 4, 'reward': float(s)} for s in range(5)], [{'action': 1, 'reward': 0.0}, {'action': 2, 'reward': 1.0}, {'action': 3, 'reward': 2.0}]]
     tb = batch_to_token_batch(_tok(encoder), batch)
     assert list(tb.step_counts()) == [5, 3]
-    assert tb.step_fields['sequence_id'].tolist() == [0, 0, 0, 0, 0, 1, 1, 1]
-    assert tb.step_fields['grouping_id'].tolist() == [0] * 8
+    assert tb.objective_fields['sequence_id'].tolist() == [0, 0, 0, 0, 0, 1, 1, 1]
+    assert tb.objective_fields['grouping_id'].tolist() == [0] * 8
     assert tb.prediction_indices.shape == (8,)
     assert list(tb.sequence_ids[tb.prediction_indices]).count(0) == 5
     assert list(tb.sequence_ids[tb.prediction_indices]).count(1) == 3
@@ -173,7 +172,6 @@ def test_model_train_isolates_tasks_within_sequence() -> None:
         modalities=[
             {"type": 'discrete', "field": "action", "vocab_size": 4},
             {"type": 'discrete', "field": "episode_done", "vocab_size": 3},
-            {"type": 'discrete', "field": "task_done", "vocab_size": 3},
             {'type': 'learnable', 'tokens': 1},
         ],
     )
@@ -194,12 +192,19 @@ def test_model_train_isolates_tasks_within_sequence() -> None:
         {'action': 1, 'episode_done': 0, 'task_done': 0, 'task_index': 1},
     ]
     with torch.no_grad():
-        grouping = Grouper(fields=[{"input_field": "task_index", "output_field": "grouping_id"}])
-        tb_both = batch_to_token_batch(_tok(encoder), [task0 + task1], grouper=grouping)
-        tb_t1 = batch_to_token_batch(_tok(encoder), [task1], grouper=grouping)
+        tb_both = batch_to_token_batch(
+            _tok(encoder, grouping_field="task_index"),
+            [task0 + task1],
+            grouping_field="task_index",
+        )
+        tb_t1 = batch_to_token_batch(
+            _tok(encoder, grouping_field="task_index"),
+            [task1],
+            grouping_field="task_index",
+        )
         preds_both, od, _ = model(tb_both)
         preds_t1, _, _ = model(tb_t1)
-    assert od['grouping_id'].tolist() == [0, 0, 0, 1, 1]
+    assert od['task_index'].tolist() == [0, 0, 0, 1, 1]
     # Current-task suffix predictions match a fresh single-task forward.
     assert torch.allclose(
         preds_both['action_value'][3:],

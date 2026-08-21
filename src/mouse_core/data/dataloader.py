@@ -6,7 +6,7 @@ A ``Datastore`` is a flat sequence of arbitrary rows. The loader samples
 :class:`~mouse_core.data.token_batch.StepTokens` into a
 :class:`~mouse_core.data.token_batch.TokenBatch`.
 
-The loader is stage-agnostic: compose augmenter / grouper / selector / tokenizer
+The loader is stage-agnostic: compose augmenter / selector / tokenizer
 (or any ``dict → StepTokens`` callable) outside and pass the result as
 ``transform=``. At the start of each batch fetch, if ``transform`` defines
 ``reseed()``, it is called once (so an :class:`~mouse_core.data.augmenter.Augmenter`
@@ -16,7 +16,7 @@ Usage
 -----
 ::
 
-    transform = compose(augmenter, grouper, selector, tokenizer)
+    transform = compose(augmenter, selector, tokenizer)
     loader = DataLoader(
         stores=store,
         sequence_length=64,

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import torch
 
-from mouse_core.data import Grouper
 from mouse_core.models.backbone import IdentityBackbone
 from mouse_core.models.base import Model, _flat_sequence_causal_mask, _flat_sequence_position_ids
 from mouse_core.models.embedding import NumericEmbedder
@@ -91,7 +90,6 @@ def test_prepare_derives_grouping_ids_from_field() -> None:
         modalities=[
             {"type": 'discrete', "field": "action", "vocab_size": 4},
             {"type": 'discrete', "field": "episode_done", "vocab_size": 3},
-            {"type": 'discrete', "field": "task_done", "vocab_size": 3},
         ],
     )
     batch = [
@@ -105,22 +103,23 @@ def test_prepare_derives_grouping_ids_from_field() -> None:
         ]
     ]
     tb = batch_to_token_batch(
-        _tok(encoder), batch, grouper=Grouper(fields=[{"input_field": "task_index", "output_field": "grouping_id"}])
+        _tok(encoder, grouping_field="task_index"),
+        batch,
+        grouping_field="task_index",
     )
-    assert tb.step_fields["grouping_id"].tolist() == [0, 0, 1, 1, 1, 2]
-    assert list(tb.grouping_ids) == [0] * 6 + [1] * 9 + [2] * 3
+    assert tb.objective_fields["task_index"].tolist() == [0, 0, 1, 1, 1, 2]
+    assert list(tb.grouping_ids) == [0] * 4 + [1] * 6 + [2] * 2
 
 
-def test_constant_grouper_ignores_done_boundaries() -> None:
+def test_missing_grouping_field_stamps_zero() -> None:
     encoder = NumericEmbedder(
         hidden_dim=8,
         modalities=[
             {"type": 'discrete', "field": "action", "vocab_size": 4},
             {"type": 'discrete', "field": "episode_done", "vocab_size": 3},
-            {"type": 'discrete', "field": "task_done", "vocab_size": 3},
         ],
     )
     batch = [[{"action": 0, "episode_done": 1, "task_done": 2}, {"action": 1, "episode_done": 0, "task_done": 0}]]
     tb = batch_to_token_batch(_tok(encoder), batch)
-    assert tb.step_fields["grouping_id"].tolist() == [0, 0]
+    assert tb.objective_fields["grouping_id"].tolist() == [0, 0]
     assert list(tb.grouping_ids) == [0] * tb.L

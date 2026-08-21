@@ -26,11 +26,19 @@ def test_layerwise_head_forward_shape() -> None:
 
 def test_model_layerwise_forward_and_objective() -> None:
     backbone = Qwen3Backbone(hidden_dim=16, num_layers=2, num_heads=2)
-    encoder = NumericEmbedder(hidden_dim=backbone.hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02}, {"type": 'discrete', "field": "observation", "vocab_size": 8, "std": 0.02}, {"type": 'fourier', "field": "reward", "std": 0.02}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3, "std": 0.02}, {"type": 'discrete', "field": "task_done", "vocab_size": 3, "std": 0.02}])
+    encoder = NumericEmbedder(hidden_dim=backbone.hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02}, {"type": 'discrete', "field": "observation", "vocab_size": 8, "std": 0.02}, {"type": 'fourier', "field": "reward", "std": 0.02}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3, "std": 0.02}])
     head = LayerwiseDiscreteActionValueHead(num_backbone_layers=2, in_features=backbone.hidden_dim, out_features=4, hidden_dim=backbone.hidden_dim, num_layers=1, scale=0.1)
     model = Model(encoder=encoder, backbone=backbone, heads=head)
     batch = _tiny_batch()
-    predictions, objective_data, _ = model(batch_to_token_batch(_tok(model.encoder), batch))
+    predictions, objective_data, _ = model(
+        batch_to_token_batch(
+            _tok(
+                model.encoder,
+                objective_fields=["action", "observation", "reward", "episode_done", "task_done"],
+            ),
+            batch,
+        )
+    )
     assert 'action_value_layerwise' in predictions.keys()
     assert predictions['action_value_layerwise'].shape[-2:] == (2, 4)
     objective = LayerwiseDqnObjective(num_backbone_layers=2, gamma_step_start=0.0, gamma_step=0.99, tau=0.1)

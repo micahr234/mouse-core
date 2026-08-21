@@ -46,7 +46,7 @@ class Objective(ABC):
         """Compute a scalar loss and return diagnostic metrics.
 
         Args:
-            objective_data: ``TensorDict[N]`` of tokenizer ``step_fields``
+            objective_data: ``TensorDict[N]`` of tokenizer ``objective_fields``
                 (``action``, ``reward``, ``episode_done``, ``task_done``, …),
                 keyed by flat step index with ``sequence_id``.
             predictions: ``TensorDict[N]`` of model head outputs from

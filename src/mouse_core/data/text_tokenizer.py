@@ -2,7 +2,7 @@
 
 I/O
 ---
-* **in:** ``dict`` (one step; must include ``grouping_field`` (a Grouper output name))
+* **in:** ``dict`` (one step; must include ``grouping_field``)
 * **out:** :class:`~mouse_core.data.token_batch.StepTokens`
 
 Tokens are tagged by modality name (``__text__`` / ``__vision__``). Pack many
@@ -41,27 +41,30 @@ class TextTokenizer:
     """CPU packer: format + HF/image tokenization → :class:`StepTokens`.
 
     Construct independently of the embedder. Alignment is by modality **name**
-    (``__text__`` / ``__vision__``). ``step_fields=`` is an explicit keep-list
-    of step dict keys copied into ``StepTokens.step_fields`` (modalities are
-    not auto-copied). TD / PPO / GRPO objectives read ``action``, ``reward``,
-    ``episode_done``, and ``task_done`` from that keep-list.
+    (``__text__`` / ``__vision__``). ``input_fields=`` are the tokens fed to the
+    transformer. ``objective_fields=`` is an explicit keep-list of step dict keys
+    copied into ``StepTokens.objective_fields`` (input fields are not
+    auto-copied). TD / PPO / GRPO objectives read ``action``, ``reward``,
+    ``episode_done``, and ``task_done`` from that keep-list. ``task_done`` is an
+    objective column only — it is not interpolated into the step format and is
+    not fed to the transformer.
     """
 
     def __init__(
         self,
         *,
-        modalities: list[dict | TextTokenizerModalitySpec] | None = None,
+        input_fields: list[dict | TextTokenizerModalitySpec] | None = None,
         grouping_field: str,
         format: str | None = None,
         tokenizer=None,
         image_processor=None,
-        step_fields: Sequence[str] | None = None,
+        objective_fields: Sequence[str] | None = None,
         pretrained: str | Path | None = None,
         hub_kwargs: dict | None = None,
     ) -> None:
         if not grouping_field:
             raise ValueError("TextTokenizer requires a non-empty grouping_field")
-        raw = modalities or []
+        raw = input_fields or []
         specs: list[TextTokenizerModalitySpec] = []
         for m in raw:
             if isinstance(m, TextTokenizerModalitySpec):
@@ -70,7 +73,7 @@ class TextTokenizer:
                 data = dict(m)
                 if "input_field" in data or "output_field" in data:
                     raise TypeError(
-                        "tokenizer modalities use field= "
+                        "tokenizer input_fields use field= "
                         "(not input_field=/output_field=); "
                         "rename with Selector before tokenize"
                     )
@@ -83,11 +86,11 @@ class TextTokenizer:
         needs_format = has_text or has_image or has_token
         if needs_format and format is None:
             raise TypeError(
-                "TextTokenizer requires format= when text, token, or image modalities "
+                "TextTokenizer requires format= when text, token, or image input_fields "
                 "are declared"
             )
         if format is not None and not (has_text or has_token or has_image):
-            raise TypeError("format= requires at least one text, token, or image modality")
+            raise TypeError("format= requires at least one text, token, or image input field")
 
         text_by_field = {
             s.field: s
@@ -115,7 +118,7 @@ class TextTokenizer:
                     and name not in image_by_field
                 ):
                     raise ValueError(
-                        f"format placeholder {{{name}}} has no matching text/token/image modality"
+                        f"format placeholder {{{name}}} has no matching text/token/image input field"
                     )
 
         needs_tokenizer = format is not None and has_text
@@ -126,14 +129,14 @@ class TextTokenizer:
 
             tok = AutoTokenizer.from_pretrained(pretrained, **dict(hub_kwargs or {}))
         elif needs_tokenizer:
-            raise TypeError("TextTokenizer with text modalities requires tokenizer= or pretrained=")
+            raise TypeError("TextTokenizer with text input_fields requires tokenizer= or pretrained=")
         else:
             tok = None
 
         if has_image:
             if image_processor is None or not callable(image_processor):
                 raise TypeError(
-                    "TextTokenizer with image modalities requires image_processor= "
+                    "TextTokenizer with image input_fields requires image_processor= "
                     "callable that returns discrete token ids"
                 )
 
@@ -147,14 +150,14 @@ class TextTokenizer:
             mmap[NAME_VISION] = ModalityInfo(type="image")
 
         self.format = format
-        self.modalities: tuple[TextTokenizerModalitySpec, ...] = tuple(specs)
+        self.input_fields: tuple[TextTokenizerModalitySpec, ...] = tuple(specs)
         self.grouping_field = grouping_field
         self._text_by_field = text_by_field
         self._token_by_field = token_by_field
         self._image_by_field = image_by_field
         self.tokenizer = tok
         self.image_processor = image_processor
-        self.step_fields: tuple[str, ...] = tuple(step_fields or ())
+        self.objective_fields: tuple[str, ...] = tuple(objective_fields or ())
         self.modality_names: tuple[str, ...] = tuple(names)
         self.modality_map: dict[str, ModalityInfo] = mmap
         self._name_to_index = {n: i for i, n in enumerate(self.modality_names)}
@@ -172,7 +175,7 @@ class TextTokenizer:
             image_by_field=self._image_by_field,
             tokenizer=self.tokenizer,
             image_processor=self.image_processor,
-            step_fields_keep=self.step_fields,
+            objective_fields_keep=self.objective_fields,
             grouping_field=self.grouping_field,
             name_to_index=self._name_to_index,
             modality_names=self.modality_names,
@@ -247,7 +250,7 @@ def _tokenize_text_step(
     image_by_field: dict[str, TextTokenizerModalitySpec],
     tokenizer: Any,
     image_processor: Any,
-    step_fields_keep: Sequence[str],
+    objective_fields_keep: Sequence[str],
     grouping_field: str,
     name_to_index: dict[str, int],
     modality_names: tuple[str, ...],
@@ -354,5 +357,5 @@ def _tokenize_text_step(
         modality_map=dict(modality_map),
         grouping_id=gid,
         grouping_field=grouping_field,
-        step_fields=_copy_keep_fields(row, step_fields_keep),
+        objective_fields=_copy_keep_fields(row, objective_fields_keep),
     )

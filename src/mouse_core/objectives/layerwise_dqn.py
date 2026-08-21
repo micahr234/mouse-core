@@ -78,7 +78,7 @@ class LayerwiseDqnObjective(Objective):
     sequence or grouping boundary (different ``sequence_id`` / ``grouping_field``
     column when set) are excluded from every layer's loss. ``action``,
     ``reward``, ``episode_done``, and ``task_done`` must be in the tokenizer
-    ``step_fields`` keep-list.
+    ``objective_fields`` keep-list.
 
     Effective planning horizon is ``H(gamma) = 1 / (1 - gamma)``. Layer ``0`` uses
     each ``gamma_*_start``; the deepest layer uses the deep value

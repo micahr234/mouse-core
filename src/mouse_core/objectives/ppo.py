@@ -91,13 +91,14 @@ class PpoObjective(Objective):
     Discounts match the DQN table: the bootstrap is multiplied by the episode
     gamma, then by the task gamma (``1.0`` when ``task_done==0``).
 
-    For multi-epoch PPO, stamp behavior log-probs on rollout rows (same step as
-    ``action``) and include them in the tokenizer ``step_fields`` keep-list so
-    they land in ``objective_data``::
+    ``task_done`` and ``old_log_prob`` are objective columns only — not
+    tokenizer or embedder input. Stamp behavior log-probs on rollout rows
+    (same step as ``action``) and include them in the tokenizer ``objective_fields``
+    keep-list so they land in ``objective_data``::
 
         tokenizer = NumericTokenizer(
             ...,
-            step_fields=[
+            objective_fields=[
                 "action",
                 "reward",
                 "episode_done",
