@@ -125,6 +125,11 @@ class NumericEmbedder(Encoder):
                 scale = m.spec.std if m.spec.std is not None else std
                 self._tables[m.name] = ScaledEmbedding(vs, hidden_dim, scale=scale)
 
+        self._fourier_std: dict[str, float] = {
+            m.name: float(m.spec.std if m.spec.std is not None else std)
+            for m in self._meta
+            if m.kind == KIND_FOURIER
+        }
         fourier_scale = float(std) / (0.5 ** 0.5)
         self.fourier = StaticFourierFeatures(
             num_features=hidden_dim,
@@ -183,7 +188,11 @@ class NumericEmbedder(Encoder):
                 if meta.kind in (KIND_DISCRETE, KIND_LEARNABLE, KIND_IMAGE):
                     embeds[mask] = self._tables[name](ids[mask]).to(dtype=dtype)
                 elif meta.kind == KIND_FOURIER:
-                    embeds[mask] = self.fourier(values[mask], ids[mask]).to(dtype=dtype)
+                    feat = self.fourier(values[mask], ids[mask])
+                    mod_std = self._fourier_std[name]
+                    if self.std != 0.0 and mod_std != self.std:
+                        feat = feat * (mod_std / self.std)
+                    embeds[mask] = feat.to(dtype=dtype)
 
         objective_fields = dict(t["objective_fields"])
         prediction_indices = t["prediction_indices"]

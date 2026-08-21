@@ -68,19 +68,16 @@ class GrpoObjective(Objective):
         tokenizer = NumericTokenizer(
             ...,
             objective_fields=[
-                "action",
-                "reward",
-                "episode_done",
-                "task_done",
-                "old_log_prob",
-                "advantage",
+                {"input_field": "action"},
+                {"input_field": "old_log_prob"},
+                {"input_field": "advantage"},
             ],
         )
         predictions, objective_data, _ = model(batch)  # TokenBatch
         loss, metrics = objective(objective_data, predictions)
 
-    ``task_done``, ``old_log_prob``, and ``advantage`` are objective columns
-    only — not tokenizer input fields or embedder modalities.
+    ``old_log_prob`` and ``advantage`` are objective columns only — not
+    tokenizer input fields or embedder modalities.
 
     Timing matches :class:`~mouse_core.objectives.dqn.DqnObjective`: token
     ``i`` is state ``s_i``; action / behavior log-prob / advantage at ``i+1``

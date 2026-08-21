@@ -281,6 +281,28 @@ def test_reseed_changes_draws_for_same_key() -> None:
     assert after["action"] == augment({"action": 0, "task_index": 7})["action"]
 
 
+def test_eval_compose_omits_augmenter() -> None:
+    augment = Augmenter(
+        seed=0,
+        seed_field="task_index",
+        fields=[
+            {"type": "discrete", "input_field": "action", "output_field": "action", "vocab_size": 10, "permute": True}
+        ],
+    )
+    selector = Selector(
+        fields=[
+            {"input_field": "action", "output_field": "action"},
+            {"input_field": "task_index", "output_field": "task_index"},
+        ]
+    )
+    train_transform = compose(augment, selector)
+    eval_transform = compose(selector)
+    step = {"action": 0, "task_index": 7}
+    assert eval_transform(step) == {"action": 0, "task_index": 7}
+    assert train_transform(step) == selector(augment(step))
+    assert train_transform is not eval_transform
+
+
 def test_compose_reseed_forwards_to_augmenter() -> None:
     augment = Augmenter(
         seed=0,
@@ -441,15 +463,26 @@ def test_input_vector_field_must_not_overlap_input_field() -> None:
         )
 
 
-def test_vector_fields_require_both() -> None:
-    with pytest.raises(ValueError, match="input_vector_field and output_vector_field"):
+def test_output_vector_field_defaults_to_input() -> None:
+    spec = SequenceAugmentFieldSpec(
+        input_field="action",
+        type="discrete",
+        vocab_size=3,
+        permute=True,
+        input_vector_field="info_q_star",
+    )
+    assert spec.output_field == "action"
+    assert spec.output_vector_field == "info_q_star"
+
+
+def test_output_vector_field_requires_input() -> None:
+    with pytest.raises(ValueError, match="output_vector_field requires"):
         SequenceAugmentFieldSpec(
             input_field="action",
-            output_field="action",
             type="discrete",
             vocab_size=3,
             permute=True,
-            input_vector_field="info_q_star",
+            output_vector_field="info_q_star",
         )
 
 

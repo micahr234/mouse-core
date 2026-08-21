@@ -8,7 +8,8 @@ I/O
 Field keep/rename is :class:`~mouse_core.data.selector.Selector`, not this class.
 Compose in pipeline order::
 
-    transform = compose(augmenter, selector, tokenizer)
+    train_transform = compose(augmenter, selector, tokenizer)
+    eval_transform = compose(selector, tokenizer)
 
 Permute/scale/shift draws are keyed by ``seed_field`` so steps sharing that
 id share draws within one :meth:`Augmenter.reseed` generation. Mask decisions
@@ -16,9 +17,9 @@ id share draws within one :meth:`Augmenter.reseed` generation. Mask decisions
 Discrete permute specs remap ``input_field`` ids; optional
 ``input_vector_field`` / ``output_vector_field`` vectors share that
 permutation (inverse-permuted along the last axis).
-``DataLoader`` calls ``transform.reseed()`` once per batch. Eval / decode
-should pass ``augment=False`` to skip augmentation entirely (raw values reach
-the model, and no reseeding is needed).
+``DataLoader`` calls ``train_transform.reseed()`` once per batch. Eval /
+decode uses a second compose that omits the augmenter so raw values reach
+the model.
 """
 
 from __future__ import annotations
@@ -86,22 +87,24 @@ class _ScalarDraw:
 class SequenceAugmentFieldSpec:
     """Specification for augmenting one raw step-record field.
 
-    Each spec has required ``input_field`` / ``output_field`` and a ``type``.
-    Same names replace in place; different names write outputs and leave inputs.
+    Each spec has required ``input_field`` and a ``type``. Omitted
+    ``output_field`` defaults to ``input_field``. Different names write
+    outputs and leave inputs.
     Augmentation ``type`` values describe raw-data behavior, not embedding.
 
     For ``type='discrete'`` with ``permute=True``, ``input_field`` values are
     ids in ``[0, vocab_size)`` remapped by the sampled permutation.
-    ``input_vector_field`` / ``output_vector_field`` name optional id-indexed
-    vectors (for example ``info_q_star``) that share that permutation: each
-    vector is reordered so ``values[perm[i]]`` stays aligned with remapped ids.
-    Same names replace in place; different names write outputs and leave inputs.
+    ``input_vector_field`` names optional id-indexed vectors (for example
+    ``info_q_star``) that share that permutation: each vector is reordered so
+    ``values[perm[i]]`` stays aligned with remapped ids. Omitted
+    ``output_vector_field`` defaults to ``input_vector_field``. Different
+    names write outputs and leave inputs.
     Vector layout is never inferred from array shape.
     """
 
     type: Literal["discrete", "linear", "image"]
     input_field: str | Sequence[str]
-    output_field: str | Sequence[str]
+    output_field: str | Sequence[str] | None = None
     input_vector_field: str | Sequence[str] | None = None
     output_vector_field: str | Sequence[str] | None = None
     vocab_size: int | None = None
@@ -129,6 +132,10 @@ class SequenceAugmentFieldSpec:
                 "expected one of ('discrete', 'linear', 'image')."
             )
         object.__setattr__(self, "type", kind)
+        if self.output_field is None:
+            object.__setattr__(self, "output_field", self.input_field)
+        if self.input_vector_field is not None and self.output_vector_field is None:
+            object.__setattr__(self, "output_vector_field", self.input_vector_field)
         in_f = _field_names(self.input_field)
         out_f = _field_names(self.output_field)
         if len(in_f) != len(out_f):
@@ -139,8 +146,8 @@ class SequenceAugmentFieldSpec:
         out_v = _field_names(self.output_vector_field)
         if bool(in_v) != bool(out_v):
             raise ValueError(
-                f"field {self.input_field!r}: set input_vector_field and "
-                "output_vector_field together."
+                f"field {self.input_field!r}: output_vector_field requires "
+                "input_vector_field"
             )
         if len(in_v) != len(out_v):
             raise ValueError(
@@ -298,14 +305,8 @@ class Augmenter:
         self._tls = threading.local()
         self._draw_cache: dict[tuple[int, Any], dict[int, dict[str, Any]]] = {}
 
-    def __call__(self, step: dict, *, augment: bool = True) -> dict:
-        """Return an augmented copy of ``step``.
-
-        Pass ``augment=False`` to skip augmentation and return ``step``
-        unchanged (the eval / decode path; no reseeding needed).
-        """
-        if not augment:
-            return step
+    def __call__(self, step: dict) -> dict:
+        """Return an augmented copy of ``step``."""
         if not (self.enabled and any(spec.is_active() for spec in self.fields)):
             return step
         row = dict(step)
@@ -498,7 +499,7 @@ def _coerce_field(spec: Mapping[str, Any] | SequenceAugmentFieldSpec) -> Sequenc
     data = dict(spec)
     if "field" in data and "input_field" not in data:
         raise TypeError(
-            "Augmenter fields use input_field=/output_field= (not field=)"
+            "Augmenter fields use input_field= (optional output_field=; not field=)"
         )
     return SequenceAugmentFieldSpec(**data)
 

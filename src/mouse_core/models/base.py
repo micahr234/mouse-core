@@ -198,8 +198,8 @@ model = (
 ## Run Inference
 
 Training and inference both take a `TokenBatch`. Training typically uses
-`DataLoader(transform=transform)`. Online / inference uses the same per-step
-`transform` (compose augmenter/selector/tokenizer → `StepTokens`) and
+`DataLoader(transform=train_transform)`. Online / inference uses a per-step
+`eval_transform` (compose selector/tokenizer, no augmenter → `StepTokens`) and
 `pack_token_batch` when combining steps. The tokenizer is not part of the
 saved model.
 
@@ -207,16 +207,21 @@ saved model.
 from mouse_core.data import NumericTokenizer, compose, pack_token_batch
 
 tokenizer = NumericTokenizer(
-    input_fields=[...],  # field=; match embedder slots
-    objective_fields=["action", "reward", "episode_done", "task_done"],
+    input_fields=[...],  # input_field=; optional output_field= matches embedder field=
+    objective_fields=[
+        {{"input_field": "action"}},
+        {{"input_field": "reward"}},
+        {{"input_field": "episode_done"}},
+        {{"input_field": "task_done"}},
+    ],
     grouping_field="task_index",
 )
-transform = tokenizer  # plus compose(augmenter, selector, tokenizer) as needed
+eval_transform = tokenizer  # plus compose(selector, tokenizer) as needed
 
 {objective_data_example}
 
 with torch.no_grad():
-    steps = [transform(step) for step in batch[0]]
+    steps = [eval_transform(step) for step in batch[0]]
     token_batch = pack_token_batch(steps, sequence_ids=[0] * len(steps))
     predictions, _, cache = model(token_batch)
     action = model.get_action(predictions, temperature=0.0)
@@ -309,7 +314,7 @@ batch = [[
 {body}
     }}
 ]]
-steps = [transform(batch[0][0])]  # per-step StepTokens; pack_token_batch for many
+steps = [eval_transform(batch[0][0])]  # per-step StepTokens; pack_token_batch for many
 token_batch = pack_token_batch(steps, sequence_ids=[0])
 predictions, objective_data, cache = model(token_batch)"""
 
@@ -861,9 +866,10 @@ class Model(nn.Module):
         """Run a full forward pass over a :class:`TokenBatch`.
 
         Training: pass a ``TokenBatch`` from ``DataLoader(transform=...)``.
-        Online / inference: ``model(pack_token_batch([transform(step)], sequence_ids=[0]),
-        use_cache=True)`` or ``model(pack_token_batch(steps, sequence_ids=...),
-        use_cache=True)`` (optionally ragged; empty-only batches raise).
+        Online / inference: ``model(pack_token_batch([eval_transform(step)],
+        sequence_ids=[0]), use_cache=True)`` or
+        ``model(pack_token_batch(steps, sequence_ids=...), use_cache=True)``
+        (optionally ragged; empty-only batches raise).
 
         Training attention uses FlexAttention over the flat concatenated token
         stream (causal within the same ``(sequence_id, grouping_id)`` run). Cached

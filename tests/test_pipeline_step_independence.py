@@ -14,7 +14,17 @@ from mouse_core.data import (
 
 
 def _io(*pairs: tuple[str, str]) -> list[dict[str, str]]:
-    return [{"input_field": src, "output_field": dst} for src, dst in pairs]
+    fields: list[dict[str, str]] = []
+    for src, dst in pairs:
+        spec = {"input_field": src}
+        if dst != src:
+            spec["output_field"] = dst
+        fields.append(spec)
+    return fields
+
+
+def _tok_in(*names: str, type: str = "discrete") -> list[dict[str, str]]:
+    return [{"type": type, "input_field": name} for name in names]
 
 
 def _rows() -> list[dict]:
@@ -49,11 +59,8 @@ def test_selector_concat_matches_full() -> None:
 def test_selector_renames_before_tokenizer() -> None:
     selector = Selector(fields=_io(("act", "action"), ("obs", "observation"), ("task_index", "task_index")))
     tokenizer = NumericTokenizer(
-        input_fields=[
-            {"type": "discrete", "field": "action"},
-            {"type": "discrete", "field": "observation"},
-        ],
-        objective_fields=["action", "observation"],
+        input_fields=_tok_in("action", "observation"),
+        objective_fields=_io(("action", "action"), ("observation", "observation")),
         grouping_field="task_index",
     )
     transform = compose(selector, tokenizer)
@@ -66,42 +73,61 @@ def test_selector_renames_before_tokenizer() -> None:
 
 def test_missing_objective_fields_key_raises() -> None:
     tokenizer = NumericTokenizer(
-        input_fields=[{"type": "discrete", "field": "action"}],
-        objective_fields=["action", "old_log_prob"],
+        input_fields=_tok_in("action"),
+        objective_fields=_io(("action", "action"), ("old_log_prob", "old_log_prob")),
         grouping_field="task_index",
     )
     with pytest.raises(KeyError, match="old_log_prob"):
         tokenizer({"action": 1, "task_index": 0})
 
 
-def test_tokenizer_rejects_legacy_io_keys() -> None:
-    try:
+def test_tokenizer_rejects_legacy_field_key() -> None:
+    with pytest.raises(TypeError, match="input_field=/output_field="):
         NumericTokenizer(
-            input_fields=[
-                {
-                    "type": "discrete",
-                    "input_field": "action",
-                    "output_field": "action",
-                }
-            ],
+            input_fields=[{"type": "discrete", "field": "action"}],
             grouping_field="task_index",
         )
-    except TypeError as e:
-        assert "field=" in str(e)
-    else:
-        raise AssertionError("expected TypeError for input_field=/output_field=")
+
+
+def test_tokenizer_output_defaults_to_input() -> None:
+    tokenizer = NumericTokenizer(
+        input_fields=_tok_in("action"),
+        objective_fields=_io(("reward", "reward")),
+        grouping_field="task_index",
+    )
+    tokens = tokenizer({"action": 2, "reward": 0.5, "task_index": 0})
+    assert tokens.modality_names == ("action",)
+    assert tokens.objective_fields["reward"] == pytest.approx(0.5)
+
+
+def test_tokenizer_renames_input_and_objective_fields() -> None:
+    tokenizer = NumericTokenizer(
+        input_fields=[
+            {"type": "discrete", "input_field": "act", "output_field": "action"},
+        ],
+        objective_fields=_io(("q", "info_q_star")),
+        grouping_field="task_index",
+    )
+    tokens = tokenizer({"act": 3, "q": 1.5, "task_index": 0})
+    assert tokens.modality_names == ("action",)
+    assert tokens.objective_fields["info_q_star"] == pytest.approx(1.5)
 
 
 def test_tokenizer_full_matches_per_step_concat() -> None:
     """Full-window pack == head/tail step lists packed together."""
     tokenizer = NumericTokenizer(
         input_fields=[
-            {"type": "discrete", "field": "action"},
-            {"type": "discrete", "field": "observation"},
-            {"type": "fourier", "field": "reward"},
-            {"type": "discrete", "field": "episode_done"},
+            *_tok_in("action", "observation"),
+            *_tok_in("reward", type="fourier"),
+            *_tok_in("episode_done"),
         ],
-        objective_fields=["action", "observation", "reward", "episode_done", "task_done"],
+        objective_fields=_io(
+            ("action", "action"),
+            ("observation", "observation"),
+            ("reward", "reward"),
+            ("episode_done", "episode_done"),
+            ("task_done", "task_done"),
+        ),
         grouping_field="task_index",
     )
     rows = _rows()
@@ -132,12 +158,17 @@ def test_pipeline_without_augmenter_full_matches_head_plus_tail_tokens() -> None
     )
     tokenizer = NumericTokenizer(
         input_fields=[
-            {"type": "discrete", "field": "action"},
-            {"type": "discrete", "field": "observation"},
-            {"type": "fourier", "field": "reward"},
-            {"type": "discrete", "field": "episode_done"},
+            *_tok_in("action", "observation"),
+            *_tok_in("reward", type="fourier"),
+            *_tok_in("episode_done"),
         ],
-        objective_fields=["action", "observation", "reward", "episode_done", "task_done"],
+        objective_fields=_io(
+            ("action", "action"),
+            ("observation", "observation"),
+            ("reward", "reward"),
+            ("episode_done", "episode_done"),
+            ("task_done", "task_done"),
+        ),
         grouping_field="task_index",
     )
     transform = compose(selector, tokenizer)

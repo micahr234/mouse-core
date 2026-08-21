@@ -14,7 +14,11 @@ import torch
 import torch.nn as nn
 from transformers import LlamaConfig, LlamaModel
 
-from mouse_core.models.backbone.base import Backbone, _load_transformer_weights
+from mouse_core.models.backbone.base import (
+    Backbone,
+    _load_transformer_weights,
+    _rope_parameters_from_config,
+)
 
 
 def _disable_cudnn_sdp() -> None:
@@ -207,6 +211,9 @@ class LlamaBackbone(Backbone):
             rms_norm_eps=getattr(hf_cfg, "rms_norm_eps", 1e-5),
             attention_bias=getattr(hf_cfg, "attention_bias", False),
         )
+        rope_parameters = _rope_parameters_from_config(hf_cfg)
+        if rope_parameters is not None:
+            backbone_kwargs["rope_parameters"] = rope_parameters
         backbone_kwargs.update(overrides)
         return backbone_kwargs, int(hf_cfg.hidden_size)
 

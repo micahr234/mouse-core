@@ -8,9 +8,16 @@ from mouse_core.data import Augmenter, Selector
 def _selector(*pairs: tuple[str, str]) -> Selector:
     return Selector(
         fields=[
-            {"input_field": src, "output_field": dst} for src, dst in pairs
+            {"input_field": src, **({"output_field": dst} if dst != src else {})}
+            for src, dst in pairs
         ]
     )
+
+
+def test_selector_output_defaults_to_input() -> None:
+    step = {"obs": 0, "action": 1}
+    result = Selector(fields=[{"input_field": "obs"}, {"input_field": "action"}])(step)
+    assert result == {"obs": 0, "action": 1}
 
 
 def test_selector_keeps_listed_keys() -> None:

@@ -129,10 +129,10 @@ class DqnObjective(Objective):
         tokenizer = NumericTokenizer(
             ...,
             objective_fields=[
-                "action",
-                "reward",
-                "episode_done",
-                "task_done",
+                {"input_field": "action"},
+                {"input_field": "reward"},
+                {"input_field": "episode_done"},
+                {"input_field": "task_done"},
             ],
         )
 

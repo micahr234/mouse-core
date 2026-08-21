@@ -85,6 +85,20 @@ def _quiet_transformers_load():
         transformers_logging.set_verbosity(verbosity)
 
 
+def _rope_parameters_from_config(hf_cfg: Any) -> dict[str, Any] | None:
+    """Plain ``rope_parameters`` dict from a HuggingFace config, or ``None``.
+
+    Pretrained Qwen3 / Llama checkpoints store RoPE base frequency here
+    (e.g. Qwen3-0.6B uses ``rope_theta=1e6``). The backbone builder must copy
+    it: ``Qwen3Config`` / ``LlamaConfig`` default to ``1e4``, and RoPE
+    frequencies are computed from config (not loaded as weights).
+    """
+    rope = getattr(hf_cfg, "rope_parameters", None)
+    if rope is None:
+        return None
+    return dict(rope)
+
+
 def _load_transformer_weights(
     *,
     model: nn.Module,

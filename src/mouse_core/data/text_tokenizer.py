@@ -19,6 +19,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from mouse_core.data.io_fields import coerce_io_fields
 from mouse_core.data.modality import (
     TextTokenizerModalitySpec,
     expand_tokenizer_text_spec,
@@ -42,7 +43,9 @@ class TextTokenizer:
 
     Construct independently of the embedder. Alignment is by modality **name**
     (``__text__`` / ``__vision__``). ``input_fields=`` are the tokens fed to the
-    transformer. ``objective_fields=`` is an explicit keep-list of step dict keys
+    transformer (each ``{type, input_field}``; optional ``output_field``).
+    ``objective_fields=`` is a list of ``{input_field}`` dicts (optional
+    ``output_field``; defaults to the input name)
     copied into ``StepTokens.objective_fields`` (input fields are not
     auto-copied). TD / PPO / GRPO objectives read ``action``, ``reward``,
     ``episode_done``, and ``task_done`` from that keep-list. ``task_done`` is an
@@ -58,7 +61,7 @@ class TextTokenizer:
         format: str | None = None,
         tokenizer=None,
         image_processor=None,
-        objective_fields: Sequence[str] | None = None,
+        objective_fields: Sequence[dict[str, Any]] | None = None,
         pretrained: str | Path | None = None,
         hub_kwargs: dict | None = None,
     ) -> None:
@@ -71,11 +74,10 @@ class TextTokenizer:
                 spec = m
             else:
                 data = dict(m)
-                if "input_field" in data or "output_field" in data:
+                if "field" in data and "input_field" not in data:
                     raise TypeError(
-                        "tokenizer input_fields use field= "
-                        "(not input_field=/output_field=); "
-                        "rename with Selector before tokenize"
+                        "tokenizer input_fields use input_field=/output_field= "
+                        "(not field=)"
                     )
                 spec = TextTokenizerModalitySpec(**data)
             specs.extend(expand_tokenizer_text_spec(spec))
@@ -93,19 +95,19 @@ class TextTokenizer:
             raise TypeError("format= requires at least one text, token, or image input field")
 
         text_by_field = {
-            s.field: s
+            s.output_field: s
             for s in specs
-            if s.type == "text" and isinstance(s.field, str)
+            if s.type == "text" and isinstance(s.output_field, str)
         }
         token_by_field = {
-            s.field: s
+            s.output_field: s
             for s in specs
-            if s.type == "token" and isinstance(s.field, str)
+            if s.type == "token" and isinstance(s.output_field, str)
         }
         image_by_field = {
-            s.field: s
+            s.output_field: s
             for s in specs
-            if s.type == "image" and isinstance(s.field, str)
+            if s.type == "image" and isinstance(s.output_field, str)
         }
 
         if format is not None:
@@ -157,7 +159,11 @@ class TextTokenizer:
         self._image_by_field = image_by_field
         self.tokenizer = tok
         self.image_processor = image_processor
-        self.objective_fields: tuple[str, ...] = tuple(objective_fields or ())
+        self.objective_fields: tuple[tuple[str, str], ...] = coerce_io_fields(
+            objective_fields or (),
+            who="tokenizer objective_fields",
+            allow_empty=True,
+        )
         self.modality_names: tuple[str, ...] = tuple(names)
         self.modality_map: dict[str, ModalityInfo] = mmap
         self._name_to_index = {n: i for i, n in enumerate(self.modality_names)}
@@ -183,12 +189,14 @@ class TextTokenizer:
         )
 
 
-def _copy_keep_fields(row: dict, keep: Sequence[str]) -> dict[str, Any]:
+def _copy_keep_fields(
+    row: dict, pairs: Sequence[tuple[str, str]]
+) -> dict[str, Any]:
     out: dict[str, Any] = {}
-    for field in keep:
-        value = row.get(field)
+    for in_name, out_name in pairs:
+        value = row.get(in_name)
         if value is None:
-            out[field] = 0
+            out[out_name] = 0
             continue
         if isinstance(value, torch.Tensor):
             arr = value.detach().cpu().numpy()
@@ -196,31 +204,32 @@ def _copy_keep_fields(row: dict, keep: Sequence[str]) -> dict[str, Any]:
             arr = np.asarray(value)
         if arr.ndim >= 1 and arr.size != 1:
             if np.issubdtype(arr.dtype, np.floating):
-                out[field] = arr.astype(np.float32).ravel()
+                out[out_name] = arr.astype(np.float32).ravel()
             elif arr.dtype == np.uint8:
-                out[field] = arr.astype(np.uint8).ravel()
+                out[out_name] = arr.astype(np.uint8).ravel()
             else:
-                out[field] = arr.astype(np.int64).ravel()
+                out[out_name] = arr.astype(np.int64).ravel()
         else:
             sample = unwrap_scalar(value)
             if isinstance(sample, (float, np.floating)):
-                out[field] = float(sample)
+                out[out_name] = float(sample)
             else:
-                out[field] = int(sample)
+                out[out_name] = int(sample)
     return out
 
 
 def _field_text_value(spec: TextTokenizerModalitySpec, row: dict[str, Any]) -> str | None:
-    assert isinstance(spec.field, str)
+    assert isinstance(spec.input_field, str)
+    assert isinstance(spec.output_field, str)
     assert spec.format is not None
-    value = row.get(spec.field)
+    value = row.get(spec.input_field)
     if value is None:
         if spec.required:
-            raise KeyError(f"Required modality {spec.field!r} is missing")
+            raise KeyError(f"Required modality {spec.input_field!r} is missing")
         return None
     if spec.skip is not None and values_equal(value, spec.skip):
         return None
-    return spec.format.format_map({spec.field: unwrap_scalar(value)})
+    return spec.format.format_map({spec.output_field: unwrap_scalar(value)})
 
 
 def _tokenize_ids(tokenizer: Any, text: str) -> list[int]:
@@ -250,7 +259,7 @@ def _tokenize_text_step(
     image_by_field: dict[str, TextTokenizerModalitySpec],
     tokenizer: Any,
     image_processor: Any,
-    objective_fields_keep: Sequence[str],
+    objective_fields_keep: Sequence[tuple[str, str]],
     grouping_field: str,
     name_to_index: dict[str, int],
     modality_names: tuple[str, ...],
@@ -298,17 +307,19 @@ def _tokenize_text_step(
                 flush_text()
                 if name in token_by_field:
                     spec = token_by_field[name]
-                    value = row.get(name)
+                    value = row.get(spec.input_field)
                     if value is None:
                         if spec.required:
-                            raise KeyError(f"Required modality {name!r} is missing")
+                            raise KeyError(
+                                f"Required modality {spec.input_field!r} is missing"
+                            )
                         continue
                     if spec.skip is not None and values_equal(value, spec.skip):
                         continue
                     _emit([int(unwrap_scalar(value))], name=NAME_TEXT)
                 else:
                     spec = image_by_field[name]
-                    value = row.get(name)
+                    value = row.get(spec.input_field)
                     if value is None:
                         if spec.required:
                             raise KeyError(f"Required modality {name!r} is missing")

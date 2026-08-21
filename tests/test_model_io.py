@@ -82,10 +82,10 @@ def test_model_card_includes_usage_and_architecture(tmp_path) -> None:
     assert 'out, step_stream, cache = model(batch)' not in text
     assert 'compose' in text
     assert 'pack_token_batch' in text
-    assert 'DataLoader(transform=transform)' in text
-    assert 'transform = tokenizer' in text
+    assert 'DataLoader(transform=train_transform)' in text
+    assert 'eval_transform = tokenizer' in text
     assert 'grouping_field="task_index"' in text
-    assert 'objective_fields=["action", "reward", "episode_done", "task_done"]' in text
+    assert '{"input_field": "action"}' in text
     assert 'token_batch.grouper' not in text
     assert 'boundary_values' not in text
     assert 'Backbone: `identity`' in text

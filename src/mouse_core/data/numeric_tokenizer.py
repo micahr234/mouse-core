@@ -5,7 +5,7 @@ I/O
 * **in:** ``dict`` (one step; must include ``grouping_field``)
 * **out:** :class:`~mouse_core.data.token_batch.StepTokens`
 
-Tokens are tagged by input-field **name** (``field``). Pack many steps with
+Tokens are tagged by ``output_field`` (modality name). Pack many steps with
 :func:`~mouse_core.data.token_batch.pack_token_batch`.
 """
 
@@ -16,6 +16,7 @@ from typing import Any
 
 import numpy as np
 
+from mouse_core.data.io_fields import coerce_io_fields
 from mouse_core.data.modality import (
     KIND_DISCRETE,
     KIND_FOURIER,
@@ -33,18 +34,19 @@ from mouse_core.data.token_batch import ModalityInfo, StepTokens
 class NumericTokenizer:
     """CPU packer: one step dict → :class:`StepTokens`.
 
-    Construct independently of the embedder. Alignment is by input-field **name**
-    (``field``), not list order. ``input_fields=`` are the tokens fed to the
-    transformer. ``objective_fields=`` is an explicit keep-list of step dict keys
+    Construct independently of the embedder. Alignment is by ``output_field``
+    name, not list order. ``input_fields=`` are the tokens fed to the
+    transformer (each ``{type, input_field}``; optional ``output_field``).
+    ``objective_fields=`` is a list of ``{input_field}`` dicts (optional
+    ``output_field``; defaults to the input name)
     copied into ``StepTokens.objective_fields`` (input fields are not
-    auto-copied).     Rename step keys with :class:`~mouse_core.data.selector.Selector`
-    before tokenize. ``grouping_field`` names the step key used for attention
+    auto-copied). ``grouping_field`` names the step key used for attention
     isolation (typically ``task_index``).
 
     TD / PPO / GRPO objectives read ``action``, ``reward``, ``episode_done``,
     and ``task_done`` from that keep-list (plus extras such as ``old_log_prob``).
     ``task_done`` is an objective column only — it is not an input field and is
-    not fed to the transformer. Those columns must also survive Selector.
+    not fed to the transformer.
     """
 
     def __init__(
@@ -53,7 +55,7 @@ class NumericTokenizer:
         input_fields: list[dict[str, Any] | NumericTokenizerModalitySpec] | None = None,
         grouping_field: str,
         image_tokenizer: Callable[[Any], Sequence[int]] | None = None,
-        objective_fields: Sequence[str] | None = None,
+        objective_fields: Sequence[dict[str, Any]] | None = None,
     ) -> None:
         if not grouping_field:
             raise ValueError("NumericTokenizer requires a non-empty grouping_field")
@@ -79,7 +81,11 @@ class NumericTokenizer:
         self._name_to_index = {n: i for i, n in enumerate(self.modality_names)}
         self.grouping_field = grouping_field
         self.image_tokenizer = image_tokenizer
-        self.objective_fields: tuple[str, ...] = tuple(objective_fields or ())
+        self.objective_fields: tuple[tuple[str, str], ...] = coerce_io_fields(
+            objective_fields or (),
+            who="tokenizer objective_fields",
+            allow_empty=True,
+        )
 
     def __call__(self, step: dict) -> StepTokens:
         if not isinstance(step, dict):
@@ -100,40 +106,40 @@ class NumericTokenizer:
 
 def _copy_keep_fields(
     row: dict,
-    keep: Sequence[str],
+    pairs: Sequence[tuple[str, str]],
 ) -> dict[str, Any]:
-    """Copy keep-list columns from the step.
+    """Copy ``input_field`` → ``output_field`` columns from the step.
 
-    Every ``objective_fields`` key must be present (and not ``None``) on the step.
-    There is no silent default: a missing objective column (e.g.
+    Every ``objective_fields`` input must be present (and not ``None``) on the
+    step. There is no silent default: a missing objective column (e.g.
     ``old_log_prob`` or ``advantage``) would otherwise train on zeros.
     """
     out: dict[str, Any] = {}
-    for field in keep:
-        value = row.get(field)
+    for in_name, out_name in pairs:
+        value = row.get(in_name)
         if value is None:
             raise KeyError(
-                f"objective_fields key {field!r} is missing from step "
+                f"objective_fields input {in_name!r} is missing from step "
                 f"(have {sorted(row)}); stamp it on the row before tokenizing"
             )
         if isinstance(value, (list, tuple)):
             arr = np.asarray(value)
             if np.issubdtype(arr.dtype, np.floating):
-                out[field] = arr.astype(np.float32).ravel()
+                out[out_name] = arr.astype(np.float32).ravel()
             else:
-                out[field] = arr.astype(np.int64).ravel()
+                out[out_name] = arr.astype(np.int64).ravel()
             continue
         if isinstance(value, np.ndarray) and value.ndim > 0:
             if np.issubdtype(value.dtype, np.floating):
-                out[field] = value.astype(np.float32).ravel()
+                out[out_name] = value.astype(np.float32).ravel()
             else:
-                out[field] = value.astype(np.int64).ravel()
+                out[out_name] = value.astype(np.int64).ravel()
             continue
         sample = unwrap_scalar(value)
         if isinstance(sample, (float, np.floating)):
-            out[field] = float(sample)
+            out[out_name] = float(sample)
         else:
-            out[field] = int(sample)
+            out[out_name] = int(sample)
     return out
 
 
@@ -144,7 +150,7 @@ def _tokenize_numeric_step(
     modality_names: tuple[str, ...],
     modality_map: dict[str, ModalityInfo],
     image_tokenizer: Callable[[Any], Sequence[int]] | None,
-    objective_fields_keep: Sequence[str],
+    objective_fields_keep: Sequence[tuple[str, str]],
     *,
     grouping_field: str,
 ) -> StepTokens:
@@ -165,7 +171,6 @@ def _tokenize_numeric_step(
         values.append(value)
 
     for m in meta:
-        field = str(m.spec.field)
         name = m.name
         spec = m.spec
         if m.kind == KIND_LEARNABLE:
@@ -173,11 +178,12 @@ def _tokenize_numeric_step(
                 _emit(name=name, token_id=i)
             continue
 
-        value = row.get(field)
+        in_name = str(spec.input_field)
+        value = row.get(in_name)
         if value is None:
             if spec.required:
                 raise KeyError(
-                    f"Required input field {field!r} is missing from step"
+                    f"Required input field {in_name!r} is missing from step"
                 )
             continue
         if spec.skip is not None and values_equal(value, spec.skip):
@@ -202,7 +208,7 @@ def _tokenize_numeric_step(
             img_ids = list(image_tokenizer(value))
             if not img_ids:
                 raise ValueError(
-                    f"image tokenizer returned no tokens for {field!r}"
+                    f"image tokenizer returned no tokens for {in_name!r}"
                 )
             for tid in img_ids:
                 _emit(name=name, token_id=int(tid))

@@ -23,7 +23,7 @@ def _tokenizer_input_fields_from_encoder(encoder) -> list[dict]:
         name = data.get("field")
         entry: dict = {
             "type": kind,
-            "field": name,
+            "input_field": name,
         }
         if data.get("dim") is not None:
             entry["dim"] = data["dim"]
@@ -35,7 +35,7 @@ def tok_from_encoder(
     encoder,
     *,
     grouping_field: str = DEFAULT_GROUPING_FIELD,
-    objective_fields: list[str] | None = None,
+    objective_fields: list[dict[str, str]] | list[str] | None = None,
     **kwargs,
 ) -> NumericTokenizer:
     # Default keep-list: non-learnable modality names (common for tests/objectives).
@@ -47,7 +47,9 @@ def tok_from_encoder(
                 continue
             name = data.get("field")
             if isinstance(name, str):
-                objective_fields.append(name)
+                objective_fields.append({"input_field": name})
+    elif objective_fields and isinstance(objective_fields[0], str):
+        objective_fields = [{"input_field": name} for name in objective_fields]
     return NumericTokenizer(
         input_fields=_tokenizer_input_fields_from_encoder(encoder),
         objective_fields=objective_fields,

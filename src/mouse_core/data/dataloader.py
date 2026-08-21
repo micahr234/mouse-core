@@ -16,12 +16,12 @@ Usage
 -----
 ::
 
-    transform = compose(augmenter, selector, tokenizer)
+    train_transform = compose(augmenter, selector, tokenizer)
     loader = DataLoader(
         stores=store,
         sequence_length=64,
         batch_size=8,
-        transform=transform,
+        transform=train_transform,
     )
     token_batch = loader.next_batch()
 """

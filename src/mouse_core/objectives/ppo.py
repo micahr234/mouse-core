@@ -99,11 +99,11 @@ class PpoObjective(Objective):
         tokenizer = NumericTokenizer(
             ...,
             objective_fields=[
-                "action",
-                "reward",
-                "episode_done",
-                "task_done",
-                "old_log_prob",
+                {"input_field": "action"},
+                {"input_field": "reward"},
+                {"input_field": "episode_done"},
+                {"input_field": "task_done"},
+                {"input_field": "old_log_prob"},
             ],
         )
         predictions, objective_data, _ = model(batch)  # TokenBatch

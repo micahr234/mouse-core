@@ -3,7 +3,7 @@ import warnings
 from typing import Any, cast
 import pytest
 import torch
-from transformers import LlamaConfig, LlamaModel
+from transformers import LlamaConfig, LlamaModel, Qwen3Config, Qwen3Model
 from mouse_core.models.backbone import LlamaBackbone, Qwen3Backbone
 
 def _save_tiny_llama(tmp_path) -> LlamaModel:
@@ -35,3 +35,22 @@ def test_llama_backbone_warns_on_unloaded_tensors(tmp_path) -> None:
 def test_qwen3_backbone_direct_constructor_exposes_hidden_dim() -> None:
     backbone = Qwen3Backbone(hidden_dim=8, num_layers=1, num_heads=2)
     assert backbone.hidden_dim == 8
+
+
+def test_qwen3_backbone_copies_pretrained_rope_parameters(tmp_path) -> None:
+    """RoPE is computed from config, so pretrained rope_theta must be copied."""
+    config = Qwen3Config(
+        vocab_size=16,
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=4,
+        max_position_embeddings=32,
+        rope_parameters={"rope_theta": 123456.0, "rope_type": "default"},
+    )
+    Qwen3Model(config).save_pretrained(tmp_path)
+    backbone = Qwen3Backbone(pretrained=tmp_path)
+    assert backbone.model.config.rope_parameters["rope_theta"] == 123456.0
+    assert backbone._config_kwargs["rope_parameters"]["rope_theta"] == 123456.0

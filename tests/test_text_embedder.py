@@ -20,12 +20,26 @@ class _FakeTokenizer:
 
 
 _DEFAULT_MODALITIES = [
-    {"type": 'token', "field": "action"},
-    {"type": 'text', "field": "observation", "format": 'observation={observation}'},
-    {"type": 'text', "field": "reward", "format": 'reward={reward}', "skip": 0.0},
-    {"type": 'text', "field": "episode_done", "format": 'episode_done={episode_done}', "skip": 0},
+    {"type": "token", "field": "action"},
+    {"type": "text", "field": "observation", "format": "observation={observation}"},
+    {"type": "text", "field": "reward", "format": "reward={reward}", "skip": 0.0},
+    {"type": "text", "field": "episode_done", "format": "episode_done={episode_done}", "skip": 0},
 ]
 _DEFAULT_FORMAT = "<action={action},{observation},{reward},{episode_done}>"
+
+
+def _tokenizer_fields(modalities: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    for modality in modalities:
+        data = dict(modality)
+        if "field" in data:
+            data["input_field"] = data.pop("field")
+        out.append(data)
+    return out
+
+
+def _obj(*names: str) -> list[dict[str, str]]:
+    return [{"input_field": name} for name in names]
 
 
 def _text_pair(hidden_dim: int = 8, **kwargs):
@@ -40,10 +54,10 @@ def _text_pair(hidden_dim: int = 8, **kwargs):
     image_processor = kwargs.pop("image_processor", None)
     objective_fields = kwargs.pop(
         "objective_fields",
-        ["action", "observation", "reward", "episode_done", "task_done"],
+        _obj("action", "observation", "reward", "episode_done", "task_done"),
     )
     tokenizer = TextTokenizer(
-        input_fields=modalities,
+        input_fields=_tokenizer_fields(modalities),
         format=format_str,
         tokenizer=hf_tok,
         image_processor=image_processor,
@@ -183,7 +197,7 @@ def test_text_embedder_image_token_ids() -> None:
             {"type": 'text', "field": "observation", "format": '{observation}'},
             {"type": 'image', "field": "pixels"},
         ],
-        objective_fields=["observation", "pixels"],
+        objective_fields=_obj("observation", "pixels"),
     )
     batch = [[{"observation": 3, "pixels": [1, 2, 3]}]]
     embeds, step_fields, indices = enc(batch_to_token_batch(tokenizer, batch))

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from typing import Any, ClassVar
 
@@ -10,11 +9,10 @@ import numpy as np
 import torch
 
 
-def _reject_io_fields(data: dict[str, Any], *, who: str) -> None:
-    if "input_field" in data or "output_field" in data:
+def _reject_legacy_field_key(data: dict[str, Any], *, who: str) -> None:
+    if "field" in data and "input_field" not in data:
         raise TypeError(
-            f"{who} input_fields use field= (not input_field=/output_field=); "
-            "rename with Selector before tokenize"
+            f"{who} input_fields use input_field=/output_field= (not field=)"
         )
 
 
@@ -29,11 +27,13 @@ class NumericTokenizerModalitySpec:
       * ``image`` — image tokenizer → discrete visual token ids
       * ``learnable`` — ``tokens`` scratch rows (no step I/O)
 
-    ``field`` is both the step key and the modality name (fixed after Selector).
+    ``input_field`` is the step key; ``output_field`` is the modality name
+    (embedder alignment). Omitted ``output_field`` defaults to ``input_field``.
     """
 
     type: str
-    field: str | Sequence[str] | None = None
+    input_field: str | None = None
+    output_field: str | None = None
     dim: int | None = None
     tokens: int | None = None
     skip: Any = None
@@ -52,14 +52,22 @@ class NumericTokenizerModalitySpec:
         if k not in self._VALID_TYPES:
             raise ValueError(
                 f"unknown modality type {self.type!r} for modality "
-                f"{self.field!r}; expected one of {self._VALID_TYPES}"
+                f"{self.output_field!r}; expected one of {self._VALID_TYPES}"
             )
         object.__setattr__(self, "type", k)
         if k == "learnable":
             object.__setattr__(self, "required", False)
+            if self.input_field is not None:
+                raise TypeError(
+                    "learnable tokenizer modalities have no input_field="
+                )
             return
-        if self.field is None:
-            raise ValueError(f"tokenizer modality type={k!r} requires field=")
+        if not self.input_field:
+            raise ValueError(
+                f"tokenizer modality type={k!r} requires input_field="
+            )
+        if not self.output_field:
+            object.__setattr__(self, "output_field", self.input_field)
 
 
 @dataclass
@@ -67,7 +75,8 @@ class TextTokenizerModalitySpec:
     """Modality for :class:`~mouse_core.data.text_tokenizer.TextTokenizer`."""
 
     type: str
-    field: str | Sequence[str] | None = None
+    input_field: str | None = None
+    output_field: str | None = None
     format: str | None = None
     skip: Any = None
     required: bool = True
@@ -82,16 +91,20 @@ class TextTokenizerModalitySpec:
                 f"expected one of {self._VALID_TYPES}"
             )
         object.__setattr__(self, "type", k)
-        if self.field is None:
+        if not self.input_field:
             raise ValueError(
-                f"text tokenizer modality type={k!r} requires field="
+                f"text tokenizer modality type={k!r} requires input_field="
             )
+        if not self.output_field:
+            object.__setattr__(self, "output_field", self.input_field)
         if k == "text":
             if not self.format:
-                raise ValueError(f"text modality {self.field!r} requires format=")
+                raise ValueError(
+                    f"text modality {self.output_field!r} requires format="
+                )
         elif k == "token" and self.format is not None:
             raise ValueError(
-                f"token modality {self.field!r} must not set format= "
+                f"token modality {self.output_field!r} must not set format= "
                 "(the integer value selects embed_tokens[id] directly)"
             )
 
@@ -120,33 +133,25 @@ def values_equal(a: Any, b: Any) -> bool:
     return unwrap_scalar(a) == unwrap_scalar(b)
 
 
-def field_names(field: str | Sequence[str] | None) -> tuple[str, ...]:
-    if field is None:
-        return ()
-    if isinstance(field, str):
-        return (field,)
-    return tuple(field)
-
-
 def expand_tokenizer_numeric_spec(
     spec: NumericTokenizerModalitySpec, *, learnable_index: int
 ) -> list[NumericTokenizerModalitySpec]:
     if spec.type == "learnable":
         name = f"__learnable_{learnable_index}"
-        return [replace(spec, field=name)]
-    names = field_names(spec.field)
-    if not names:
-        raise ValueError("input-backed tokenizer modalities must set field=")
-    return [replace(spec, field=name) for name in names]
+        return [replace(spec, output_field=name)]
+    if not spec.input_field or not spec.output_field:
+        raise ValueError(
+            "input-backed tokenizer modalities must set input_field="
+        )
+    return [spec]
 
 
 def expand_tokenizer_text_spec(
     spec: TextTokenizerModalitySpec,
 ) -> list[TextTokenizerModalitySpec]:
-    names = field_names(spec.field)
-    if not names:
-        raise ValueError("text/token/image modalities must set field=")
-    return [replace(spec, field=name) for name in names]
+    if not spec.input_field or not spec.output_field:
+        raise ValueError("text/token/image modalities must set input_field=")
+    return [spec]
 
 
 @dataclass(frozen=True)
@@ -164,7 +169,7 @@ class TokenizerModalityMeta:
 def resolve_tokenizer_numeric_modalities(
     input_fields: list[dict[str, Any] | NumericTokenizerModalitySpec] | None = None,
 ) -> tuple[list[NumericTokenizerModalitySpec], list[TokenizerModalityMeta]]:
-    """Expand tokenizer input-field specs; each slot is keyed by ``field`` name."""
+    """Expand tokenizer input-field specs; each slot is keyed by ``output_field``."""
     raw = input_fields or []
     specs: list[NumericTokenizerModalitySpec] = []
     for i, m in enumerate(raw):
@@ -172,15 +177,16 @@ def resolve_tokenizer_numeric_modalities(
             spec = m
         else:
             data = dict(m)
-            _reject_io_fields(data, who="tokenizer")
+            _reject_legacy_field_key(data, who="tokenizer")
             spec = NumericTokenizerModalitySpec(**data)
         specs.extend(expand_tokenizer_numeric_spec(spec, learnable_index=i))
 
     meta: list[TokenizerModalityMeta] = []
     seen: set[str] = set()
     for spec in specs:
-        assert isinstance(spec.field, str)
-        name = str(spec.field)
+        name = str(spec.output_field)
+        if not name:
+            raise ValueError("tokenizer modality is missing output_field=")
         if name in seen:
             raise ValueError(f"duplicate tokenizer modality name {name!r}")
         seen.add(name)
@@ -193,7 +199,7 @@ def resolve_tokenizer_numeric_modalities(
             dim = 1 if k == "fourier" else int(spec.dim or 0)
             if dim <= 0:
                 raise ValueError(
-                    f"continuous modality {spec.field!r} requires dim="
+                    f"continuous modality {spec.output_field!r} requires dim="
                 )
             meta.append(
                 TokenizerModalityMeta(

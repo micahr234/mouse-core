@@ -14,7 +14,11 @@ import torch
 import torch.nn as nn
 from transformers import Qwen3Config, Qwen3Model
 
-from mouse_core.models.backbone.base import Backbone, _load_transformer_weights
+from mouse_core.models.backbone.base import (
+    Backbone,
+    _load_transformer_weights,
+    _rope_parameters_from_config,
+)
 
 
 def _disable_cudnn_sdp() -> None:
@@ -198,6 +202,9 @@ class Qwen3Backbone(Backbone):
             attention_bias=getattr(hf_cfg, "attention_bias", False),
             use_sliding_window=getattr(hf_cfg, "use_sliding_window", False),
         )
+        rope_parameters = _rope_parameters_from_config(hf_cfg)
+        if rope_parameters is not None:
+            backbone_kwargs["rope_parameters"] = rope_parameters
         backbone_kwargs.update(overrides)
         return backbone_kwargs, int(hf_cfg.hidden_size)
 

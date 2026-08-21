@@ -59,10 +59,11 @@ def test_numeric_embedder_keeps_optional_missing_modality() -> None:
         input_fields=[
             {
                 "type": "discrete",
-                "field": "action",
+                "input_field": "action",
+                "output_field": "action",
                 "required": False,
             },
-            {"type": "fourier", "field": "reward"},
+            {"type": "fourier", "input_field": "reward", "output_field": "reward"},
         ],
         grouping_field="grouping_id",
     )
@@ -195,11 +196,14 @@ def test_numeric_embedder_skip_shortens_step() -> None:
     )
     tokenizer = NumericTokenizer(
         input_fields=[
-            {"type": "discrete", "field": "action"},
-            {"type": "fourier", "field": "reward", "skip": 0.0},
+            {"type": "discrete", "input_field": "action", "output_field": "action"},
+            {"type": "fourier", "input_field": "reward", "output_field": "reward", "skip": 0.0},
             {"type": "learnable", "tokens": 1},
         ],
-        objective_fields=["action", "reward"],
+        objective_fields=[
+            {"input_field": "action", "output_field": "action"},
+            {"input_field": "reward", "output_field": "reward"},
+        ],
         grouping_field="grouping_id",
     )
     batch = [[{"action": 1, "reward": 0.0}, {"action": 2, "reward": 1.5}]]
@@ -211,7 +215,12 @@ def test_numeric_embedder_skip_shortens_step() -> None:
 
 def test_numeric_tokenizer_image_requires_callable() -> None:
     with pytest.raises(TypeError, match="image_tokenizer"):
-        NumericTokenizer(input_fields=[{"type": 'image', "field": "img"}], grouping_field="grouping_id")
+        NumericTokenizer(
+            input_fields=[
+                {"type": "image", "input_field": "img", "output_field": "img"}
+            ],
+            grouping_field="grouping_id",
+        )
     enc = _enc(hidden_dim=8, modalities=[{"type": 'image', "field": "img", "vocab_size": 32}])
     assert enc.tokens_per_step >= 1
 
@@ -234,6 +243,36 @@ def test_numeric_embedder_prepare_token_batch() -> None:
     assert prediction_indices.shape == (2,)
 
 
+def test_numeric_embedder_fourier_honors_per_modality_std() -> None:
+    """Fourier ``std=`` must scale that field's embeddings, not only the global default."""
+    encoder = _enc(
+        hidden_dim=64,
+        std=0.02,
+        modalities=[
+            {"type": "fourier", "field": "reward", "std": 0.02},
+            {"type": "fourier", "field": "bonus", "std": 0.10},
+        ],
+    )
+    tokenizer = NumericTokenizer(
+        input_fields=[
+            {"type": "fourier", "input_field": "reward"},
+            {"type": "fourier", "input_field": "bonus"},
+        ],
+        grouping_field="grouping_id",
+    )
+    rewards = [float(x) for x in range(-4, 5)]
+    batch = [[{"reward": r, "bonus": r} for r in rewards]]
+    tb = batch_to_token_batch(tokenizer, batch)
+    embeds, _, _ = encoder(tb)
+    names = tokenizer.modality_names
+    reward_emb = embeds[torch.from_numpy(tb.modality_ids == names.index("reward"))]
+    bonus_emb = embeds[torch.from_numpy(tb.modality_ids == names.index("bonus"))]
+    reward_rms = float(reward_emb.pow(2).mean().sqrt().item())
+    bonus_rms = float(bonus_emb.pow(2).mean().sqrt().item())
+    assert reward_rms == pytest.approx(0.02, abs=0.008)
+    assert bonus_rms == pytest.approx(0.10, abs=0.03)
+
+
 def test_static_fourier_no_parameters() -> None:
     from mouse_core.models.embedding import StaticFourierFeatures
 
@@ -249,8 +288,13 @@ def test_numeric_embedder_extra_fields_in_objective_fields() -> None:
         modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4}],
     )
     tokenizer = NumericTokenizer(
-        input_fields=[{"type": "discrete", "field": "action"}],
-        objective_fields=["action", "old_log_prob"],
+        input_fields=[
+            {"type": "discrete", "input_field": "action", "output_field": "action"}
+        ],
+        objective_fields=[
+            {"input_field": "action", "output_field": "action"},
+            {"input_field": "old_log_prob", "output_field": "old_log_prob"},
+        ],
         grouping_field="grouping_id",
     )
     batch = [
@@ -275,10 +319,18 @@ def test_task_done_is_objective_field_not_input_field() -> None:
     )
     tokenizer = NumericTokenizer(
         input_fields=[
-            {"type": "discrete", "field": "action"},
-            {"type": "discrete", "field": "episode_done"},
+            {"type": "discrete", "input_field": "action", "output_field": "action"},
+            {
+                "type": "discrete",
+                "input_field": "episode_done",
+                "output_field": "episode_done",
+            },
         ],
-        objective_fields=["action", "episode_done", "task_done"],
+        objective_fields=[
+            {"input_field": "action", "output_field": "action"},
+            {"input_field": "episode_done", "output_field": "episode_done"},
+            {"input_field": "task_done", "output_field": "task_done"},
+        ],
         grouping_field="grouping_id",
     )
     batch = [[{"action": 1, "episode_done": 0, "task_done": 2}]]

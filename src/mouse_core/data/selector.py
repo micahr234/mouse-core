@@ -5,10 +5,10 @@ I/O
 * **in:** ``dict`` (one step)
 * **out:** ``dict`` (only mapped keys, under their output names)
 
-``fields`` is a list of ``{input_field, output_field}`` dicts. This is the last
-pipeline stage that remaps field names; tokenizers and embedders use a single
-``field`` name thereafter. Include the tokenizer ``grouping_field`` in ``fields``
-so attention isolation survives this keep-list.
+``fields`` is a list of ``{input_field}`` dicts. Omitted ``output_field``
+defaults to ``input_field``. Tokenizers can rename again the same way.
+Include the tokenizer ``grouping_field`` in ``fields`` so attention
+isolation survives this keep-list.
 """
 
 from __future__ import annotations

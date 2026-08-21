@@ -38,16 +38,20 @@ def _store_with_actions() -> Datastore:
     return store
 
 
-def _tokenizer(*, objective_fields: list[str] | None = None) -> NumericTokenizer:
+def _obj(*names: str) -> list[dict[str, str]]:
+    return [{"input_field": name} for name in names]
+
+
+def _tokenizer(*, objective_fields: list[dict[str, str]] | None = None) -> NumericTokenizer:
     keep = (
         objective_fields
         if objective_fields is not None
-        else ["action", "reward", "episode_done", "task_done"]
+        else _obj("action", "reward", "episode_done", "task_done")
     )
     return NumericTokenizer(
         input_fields=[
-            {"type": 'discrete', "field": "action"},
-            {"type": 'fourier', "field": "reward"},
+            {"type": "discrete", "input_field": "action"},
+            {"type": "fourier", "input_field": "reward"},
         ],
         objective_fields=keep,
         grouping_field="grouping_id",
@@ -168,7 +172,9 @@ class _ThreadMarkerTransform:
 
 @pytest.mark.skipif(not _free_threading_ok(), reason="free-threading (GIL disabled) required")
 def test_dataloader_runs_transform_in_worker_thread() -> None:
-    marker = _ThreadMarkerTransform(_tokenizer(objective_fields=["action", "reward", "transform_thread"]))
+    marker = _ThreadMarkerTransform(
+        _tokenizer(objective_fields=_obj("action", "reward", "transform_thread"))
+    )
     loader = DataLoader(
         sequence_length=3,
         batch_size=2,
