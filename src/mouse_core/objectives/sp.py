@@ -12,6 +12,38 @@ from tensordict import TensorDict
 from mouse_core.objectives.base import Objective
 
 
+def _argmax_random_tie(q_targets: torch.Tensor) -> torch.Tensor:
+    """Index of a uniformly random finite maximizer per row.
+
+    ``-inf`` padding is never selected. Rows with no finite entry fall through
+    to ``argmax`` of an all-``-inf`` mask (index 0), matching ``torch.argmax``.
+    """
+    finite = torch.isfinite(q_targets)
+    q = q_targets.masked_fill(~finite, -torch.inf)
+    is_max = finite & (q == q.max(dim=-1, keepdim=True).values)
+    scores = torch.rand(q.shape, device=q.device, dtype=torch.float32)
+    return scores.masked_fill(~is_max, -torch.inf).argmax(dim=-1)
+
+
+def sp_ce(
+    q_targets: torch.Tensor,
+    logits: torch.Tensor,
+    label_smoothing: float = 0.0,
+) -> torch.Tensor:
+    """Hard CE onto a uniformly random argmax of ``q_targets`` (aligned rows).
+
+    When several finite actions share the maximum Q, one is sampled uniformly
+    each call so the label is not biased toward the lowest index.
+
+    Args:
+        q_targets: ``[N, A]`` teacher Q-values.
+        logits: ``[N, A]`` student action logits.
+        label_smoothing: Passed through to ``F.cross_entropy``.
+    """
+    target_actions = _argmax_random_tie(q_targets)
+    return F.cross_entropy(logits, target_actions, label_smoothing=label_smoothing)
+
+
 def _soft_distributions(
     q_targets: torch.Tensor,
     logits: torch.Tensor,
@@ -173,9 +205,9 @@ class SpObjective(Objective):
     truncated steps (the episode is over; there is no next action to imitate).
 
     Args:
-        loss_type: Which distillation loss to apply.  ``"ce"`` uses the argmax of
-            ``targets_key`` as a hard label; the soft variants treat it as a
-            distribution.
+        loss_type: Which distillation loss to apply.  ``"ce"`` uses a uniformly
+            random argmax of ``targets_key`` as a hard label (ties broken at
+            random each forward); the soft variants treat it as a distribution.
         temperature: Softmax temperature applied to targets before soft losses
             (ignored for ``"ce"``).
         label_smoothing: Label-smoothing coefficient (applied to hard ``"ce"`` only).
@@ -238,8 +270,7 @@ class SpObjective(Objective):
         q_targets = q_targets[valid_rows]
 
         if self.loss_type == "ce":
-            target_actions = q_targets.masked_fill(~torch.isfinite(q_targets), -torch.inf).argmax(dim=-1).to(dtype=torch.long)
-            loss = F.cross_entropy(logits, target_actions, label_smoothing=self.label_smoothing)
+            loss = sp_ce(q_targets=q_targets, logits=logits, label_smoothing=self.label_smoothing)
         elif self.loss_type == "ce-soft-fwd":
             loss = sp_soft_ce(q_targets=q_targets, logits=logits, temperature=temp, label_smoothing=self.label_smoothing, direction="fwd")
         elif self.loss_type == "ce-soft-bwd":

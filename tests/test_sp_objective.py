@@ -4,6 +4,7 @@ import torch
 from tensordict import TensorDict
 
 from mouse_core.objectives import SpObjective
+from mouse_core.objectives.sp import _argmax_random_tie, sp_ce
 
 
 def _episode_done(*shape: int, fill: int = 0) -> torch.Tensor:
@@ -95,6 +96,33 @@ def test_sp_objective_soft_losses_ignore_padded_student_logits() -> None:
     for direction in ("kl-fwd", "kl-bwd"):
         loss, _ = SpObjective(loss_type=direction)(objective_data, matching)
         assert loss.item() < 1e-06, direction
+
+
+def test_argmax_random_tie_unique_max_is_deterministic() -> None:
+    q = torch.tensor([[0.0, 2.0, 1.0, -torch.inf], [3.0, 1.0, 3.0 - 1e-6, -torch.inf]])
+    for _ in range(20):
+        assert _argmax_random_tie(q).tolist() == [1, 0]
+
+
+def test_argmax_random_tie_samples_uniformly_among_maxima() -> None:
+    torch.manual_seed(0)
+    q = torch.tensor([[1.0, 1.0, 0.5, -torch.inf]])
+    seen = {_argmax_random_tie(q).item() for _ in range(80)}
+    assert seen == {0, 1}
+
+
+def test_argmax_random_tie_never_selects_padding() -> None:
+    torch.manual_seed(0)
+    q = torch.tensor([[-torch.inf, 2.0, 2.0]])
+    for _ in range(40):
+        assert _argmax_random_tie(q).item() in (1, 2)
+
+
+def test_sp_ce_matches_cross_entropy_on_unique_max() -> None:
+    q = torch.tensor([[0.0, 2.0, 1.0]])
+    logits = torch.tensor([[0.5, -1.0, 2.0]])
+    expected = torch.nn.functional.cross_entropy(logits, torch.tensor([1]))
+    assert torch.allclose(sp_ce(q, logits), expected)
 
 
 def test_sp_objective_custom_targets_key() -> None:

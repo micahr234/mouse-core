@@ -72,7 +72,7 @@ The [example notebooks](examples/) are the primary documentation. Work through t
 | [07 — Train online PPO](examples/07_train_online_ppo.ipynb) | Online on-policy PPO (`DiscreteActionHead` + value head, `PpoObjective` with GAE) |
 | [08 — Train online GRPO](examples/08_train_online_grpo.ipynb) | Branched GRPO: fork env+context at many `L`, group-relative advantages, `GrpoObjective` |
 | [09 — Inference](examples/09_inference.ipynb) | Batched FlexAttention cached inference with grow-then-rebuild (`max_cache` / `start_cache`), loading a Hub checkpoint after training |
-| [10 — Train offline SP](examples/10_train_offline_sp.ipynb) | Same offline loop as `05`, but `SpObjective` CE onto `argmax(info_q_star)` with `DiscreteActionHead` *(ranking check)* |
+| [10 — Train offline SP](examples/10_train_offline_sp.ipynb) | Same offline loop as `05`, but `SpObjective` CE onto a random argmax of `info_q_star` with `DiscreteActionHead` *(ranking check)* |
 
 ### Example dependencies
 

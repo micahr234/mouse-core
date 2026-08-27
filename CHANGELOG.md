@@ -13,8 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   permute spec sets ``input_vector_field`` / ``output_vector_field`` to
   ``info_q_star`` so the vector stays aligned with remapped action ids.
 - ``examples/10_train_offline_sp.ipynb``: offline supervised-policy training
-  (``SpObjective`` CE onto ``argmax(info_q_star)`` with ``DiscreteActionHead``).
-  Same action vector-field permute as SV.
+  (``SpObjective`` CE onto a random argmax of ``info_q_star`` with
+  ``DiscreteActionHead``). Same action vector-field permute as SV.
 - ``StepTokens``: tokenizer output for one step (token arrays + scalar
   ``grouping_id`` + ``objective_fields``). ``pack_token_batch(...)`` builds a
   ``TokenBatch`` from many steps (assigns ``sequence_ids``, expands
@@ -56,6 +56,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``grouping_field: str | None = None`` (``None`` ⇒ no grouping filter).
 
 ### Changed
+- ``SpObjective`` hard ``"ce"`` (``sp_ce``) samples uniformly among tied
+  argmax actions instead of always taking the lowest index.
 - Transition objectives (DQN / layerwise DQN / PPO / GRPO) treat a **run** as
   matching ``sequence_id`` and ``grouping_id``. Neighbor reads that would leave
   that run are multiplied by ``0`` (weighted mean; all-zero weights → loss
