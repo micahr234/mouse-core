@@ -19,11 +19,11 @@ classifiers = [
 dependencies = [
     "torch>=2.13.0",
     "numpy>=2.5.2",
-    "transformers @ git+https://github.com/huggingface/transformers.git@main",
+    "transformers>=5.16.1",
     "tokenizers>=0.23.1",
     "tensordict>=0.14.0",
     "datasets>=5.0.1",
-    "huggingface_hub>=1.28.0",
+    "huggingface_hub>=1.29.0",
 ]
 
 [project.urls]
@@ -46,7 +46,7 @@ all = [
 dev = [
     "pyright>=1.1.411",
     "pytest>=9.1.1",
-    "build>=1.5.0",
+    "build>=1.6.0",
     "twine>=7.0.0",
 ]
 

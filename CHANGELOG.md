@@ -92,12 +92,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``input_fields=`` and embedder keeps ``modalities=``. ``Augmenter(fields=...)`` (was ``modalities=``);
   ``SequenceAugmentFieldSpec`` (was ``SequenceAugmentModalitySpec``);
   ``Selector`` uses the same list-of-dicts shape (not a name→name mapping).
-- Depend on ``tokenizers>=0.23.1`` (free-threaded wheels; no upper bound).
-  ``transformers`` tracks git ``main`` (``5.16.0.dev0``) until a PyPI release
-  allows that tokenizers range. Other dependency floors raised to current
-  PyPI latest (``torch>=2.13.0``, ``numpy>=2.5.2``, ``tensordict>=0.14.0``,
-  ``datasets>=5.0.1``, ``huggingface_hub>=1.28.0``, ``matplotlib>=3.11.1``,
-  ``twine>=7.0.0``, ``setuptools>=84.0.0``). ``PYTHON_GIL=0`` stays because
+- Depend on ``tokenizers>=0.23.1`` (free-threaded wheels; no upper bound)
+  and ``transformers>=5.16.1`` (PyPI; allows that tokenizers range). Other
+  dependency floors raised to current PyPI latest (``torch>=2.13.0``,
+  ``numpy>=2.5.2``, ``tensordict>=0.14.0``, ``datasets>=5.0.1``,
+  ``huggingface_hub>=1.29.0``, ``matplotlib>=3.11.1``, ``twine>=7.0.0``,
+  ``setuptools>=84.0.0``, ``build>=1.6.0``). ``PYTHON_GIL=0`` stays because
   Triton still re-enables the GIL on import.
 - Numeric example notebooks use ``DataLoader`` prefetch workers (default
   ``num_workers=1``) instead of pinning ``0``. The text DQN example stays at
