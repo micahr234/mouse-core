@@ -122,10 +122,13 @@ def _in_run_stats(
 
 
 class DqnObjective(Objective):
-    """One-step Bellman TD objective with a frozen target network.
+    """One-step Bellman TD objective with a delayed target network.
 
     Instantiate with hyperparameters, then call with
-    ``(objective_data, predictions)`` to compute the loss.
+    ``(objective_data, predictions)`` to compute the loss. Fill
+    ``predictions["action_value_target"]`` via
+    :meth:`~mouse_core.polyak.PolyakAverager.write_targets` after the online
+    forward.
 
     A **run** is the same ``sequence_id`` and, when ``grouping_field`` is set
     and present, the same grouping column (typically ``task_index``). Neighbor
@@ -189,9 +192,6 @@ class DqnObjective(Objective):
         gamma_task_truncated: Extra discount when the task is truncated
             (``task_done == 2``; last episode of ``episodes_per_task``).
             Multiplies the episode discount. ``0.0`` zeros the bootstrap.
-        tau: Polyak coefficient for target-network updates.
-            Pass to ``model.polyak_update(action_value_tau=objective.tau)`` after
-            each optimizer step.
         action_key: Key in ``objective_data`` that holds the integer action.
         reward_key: Key in ``objective_data`` that holds the per-step reward.
         episode_done_key: Key in ``objective_data`` for the episode-done code.
@@ -209,7 +209,6 @@ class DqnObjective(Objective):
         gamma_episode_truncated: float = 0.0,
         gamma_task_terminal: float = 0.0,
         gamma_task_truncated: float = 0.0,
-        tau: float = 0.01,
         action_key: str = "action",
         reward_key: str = "reward",
         episode_done_key: str = "episode_done",
@@ -223,7 +222,6 @@ class DqnObjective(Objective):
         self.gamma_episode_truncated = gamma_episode_truncated
         self.gamma_task_terminal = gamma_task_terminal
         self.gamma_task_truncated = gamma_task_truncated
-        self.tau = tau
         self.action_key = action_key
         self.reward_key = reward_key
         self.episode_done_key = episode_done_key

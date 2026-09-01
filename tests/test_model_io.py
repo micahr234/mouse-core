@@ -26,7 +26,6 @@ def test_composed_model_roundtrip(tmp_path) -> None:
     loaded = load_model(tmp_path).eval()
     actual, _, _ = loaded(batch_to_token_batch(_tok(loaded.encoder), batch))
     assert torch.allclose(actual['action_value'], expected['action_value'])
-    assert torch.allclose(actual['action_value_target'], expected['action_value_target'])
     assert loaded.hidden_dim == hidden_dim
     orig_sd = model.state_dict()
     loaded_sd = loaded.state_dict()

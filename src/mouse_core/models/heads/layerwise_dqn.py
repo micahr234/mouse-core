@@ -84,26 +84,3 @@ class LayerwiseDiscreteActionValueHead(BaseHead):
             head.forward(h[:, layer_idx]) for layer_idx, head in enumerate(self._heads())
         ]
         return torch.stack(outputs, dim=2)
-
-    def target_forward(self, h: torch.Tensor) -> torch.Tensor:
-        """Returns target-network Q-values ``[N, L, A]`` or ``[B, S, L, A]``."""
-        if h.ndim == 3:
-            outputs = [
-                head.target_forward(h[:, layer_idx])
-                for layer_idx, head in enumerate(self._heads())
-            ]
-            return torch.stack(outputs, dim=1)
-        if h.ndim != 4:
-            raise ValueError(
-                f"LayerwiseDiscreteActionValueHead expects h shape [N, L, D] or "
-                f"[B, L, S, D], got {tuple(h.shape)}."
-            )
-        outputs = [
-            head.target_forward(h[:, layer_idx])
-            for layer_idx, head in enumerate(self._heads())
-        ]
-        return torch.stack(outputs, dim=2)
-
-    def polyak_update(self, tau: float) -> None:
-        for head in self._heads():
-            head.polyak_update(tau=tau)

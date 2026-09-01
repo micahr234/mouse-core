@@ -1,8 +1,10 @@
 from importlib.metadata import version
 
 from mouse_core.models import Model, load_model
-from mouse_core.models.heads import BaseHead, BaseHeadWithTarget
+from mouse_core.models.heads import BaseHead
 from mouse_core.objectives import Objective
+from mouse_core.optim import AdamW, AdamWFp32
+from mouse_core.polyak import PolyakAverager
 
 __version__ = version("mouse-core")
 
@@ -11,6 +13,8 @@ __all__ = [
     "Model",
     "load_model",
     "BaseHead",
-    "BaseHeadWithTarget",
     "Objective",
+    "AdamW",
+    "AdamWFp32",
+    "PolyakAverager",
 ]

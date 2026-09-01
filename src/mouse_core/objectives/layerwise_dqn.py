@@ -75,6 +75,8 @@ class LayerwiseDqnObjective(Objective):
 
     Reads ``predictions["action_value_layerwise"]`` and
     ``predictions["action_value_layerwise_target"]`` with shape ``[N, L, A]``.
+    Fill the target tensor via
+    :meth:`~mouse_core.polyak.PolyakAverager.write_targets`.
     Each layer and each episode/task done-code uses its own discount, built at construction
     from explicit shallow/deep endpoint pairs. A run is the same
     ``sequence_id`` and, when ``grouping_field`` is set and present, the same
@@ -120,7 +122,6 @@ class LayerwiseDqnObjective(Objective):
         gamma_task_terminal: Task-terminal extra discount at the deepest layer.
         gamma_task_truncated_start: Task-truncated extra discount at layer 0.
         gamma_task_truncated: Task-truncated extra discount at the deepest layer.
-        tau: Polyak coefficient for target-network updates.
         action_key: Key in ``objective_data`` for the integer action.
         reward_key: Key in ``objective_data`` for per-step reward.
         episode_done_key: Key in ``objective_data`` for the episode-done code.
@@ -143,7 +144,6 @@ class LayerwiseDqnObjective(Objective):
         gamma_task_terminal: float = 0.0,
         gamma_task_truncated_start: float = 0.0,
         gamma_task_truncated: float = 0.0,
-        tau: float = 0.01,
         action_key: str = "action",
         reward_key: str = "reward",
         episode_done_key: str = "episode_done",
@@ -163,7 +163,6 @@ class LayerwiseDqnObjective(Objective):
         self.gamma_task_terminal = float(gamma_task_terminal)
         self.gamma_task_truncated_start = float(gamma_task_truncated_start)
         self.gamma_task_truncated = float(gamma_task_truncated)
-        self.tau = tau
         self.action_key = action_key
         self.reward_key = reward_key
         self.episode_done_key = episode_done_key

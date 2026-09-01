@@ -92,7 +92,7 @@ Without these, install fails with errors like `library 'SDL2' not found` or `lib
 
 Each notebook explains the relevant concepts inline. API details live in the Python docstrings (`load_model`, `Datastore`, `DqnObjective`, etc.).
 
-On CUDA, place models with `model.to(device=device, dtype=preferred_dtype(device))` so the encoder/backbone run in **bfloat16** and FlexAttention compiles; output heads stay float32. CPU stays float32.
+On CUDA, place models with `model.to(device=device, dtype=preferred_dtype(device))` so the encoder/backbone run in **bfloat16** and FlexAttention compiles; output heads stay float32. CPU stays float32. Train with `AdamW(...)`, or `AdamWFp32(...)` to keep **fp32 master weights** (and fp32 AdamW state) so updates smaller than a bf16 ULP accumulate instead of rounding away.
 
 
 ## Contributing 🔧

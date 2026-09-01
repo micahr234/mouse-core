@@ -2,13 +2,13 @@ from mouse_core.models.base import Model, load_model, preferred_dtype, save_mode
 from mouse_core.models.backbone import Backbone, LlamaBackbone, Qwen3Backbone, IdentityBackbone
 from mouse_core.models.heads import (
     BaseHead,
-    BaseHeadWithTarget,
     HeadSpec,
     SwiGLUHead,
     DiscreteActionHead,
     DiscreteActionValueHead,
     LayerwiseDiscreteActionValueHead,
 )
+from mouse_core.polyak import PolyakAverager
 from mouse_core.data.token_batch import TokenBatch
 from mouse_core.models.embedding.embedding import Encoder, NumericEmbedder
 from mouse_core.models.embedding.modality import (
@@ -30,8 +30,8 @@ __all__ = [
     "Qwen3Backbone",
     "IdentityBackbone",
     "BaseHead",
-    "BaseHeadWithTarget",
     "HeadSpec",
+    "PolyakAverager",
     "SwiGLUHead",
     "DiscreteActionHead",
     "DiscreteActionValueHead",

@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- ``AdamW`` and ``AdamWFp32``: same defaults (``lr``, ``betas``, ``fused``).
+  ``AdamW`` is stock; ``AdamWFp32`` keeps fp32 master weights (and fp32
+  AdamW state) for non-fp32 compute parameters so updates smaller than a
+  bf16 ULP accumulate. Heads are already fp32 and are stepped in place.
+  Training notebooks use ``AdamW``; swap the class to opt into masters.
+- ``PolyakAverager``: delayed copy of a DQN ``Model`` used next to the
+  optimizer. ``scope="head"`` (default) snaps encoder/backbone to current
+  weights on each target forward and Polyak-averages only the heads;
+  ``scope="model"`` Polyak-averages the full stack and recomputes target Q
+  through delayed encoder/backbone weights. DQN notebooks expose
+  ``POLYAK_SCOPE`` / ``POLYAK_TAU``.
 - ``examples/05_train_offline_sv.ipynb``: offline supervised-value training
   (``SvObjective`` regresses ``action_value`` onto ``info_q_star``). The action
   permute spec sets ``input_vector_field`` / ``output_vector_field`` to
@@ -56,6 +67,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``grouping_field: str | None = None`` (``None`` ⇒ no grouping filter).
 
 ### Changed
+- DQN target Q is no longer inside ``Model`` or the action-value heads.
+  ``DqnObjective`` / ``LayerwiseDqnObjective`` no longer take ``tau``.
+  After ``optimizer.step()``, call ``averager.update()``; fill
+  ``*_target`` keys with ``averager.write_targets(batch, predictions)``.
+  ``BaseHeadWithTarget`` is removed; ``DiscreteActionValueHead`` is a
+  ``SwiGLUHead``.
 - Example notebooks are short usage docs, not full experiments. Training
   notebooks no longer build a held-out ``GroupEnv`` or call ``run_eval``;
   score a saved checkpoint in ``examples/09_inference.ipynb``. Default

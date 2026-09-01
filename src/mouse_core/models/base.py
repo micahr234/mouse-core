@@ -655,6 +655,8 @@ class Model(nn.Module):
         model = Model(encoder=encoder, backbone=backbone, heads=heads)
 
     The backbone is independent; it does not know about the encoder or heads.
+    DQN target Q is a delayed :class:`~mouse_core.polyak.PolyakAverager` copy,
+    not a second stack inside this module.
     """
 
     _VALID_HEADS = ("action_value", "action_value_layerwise", "action", "value")
@@ -828,8 +830,6 @@ class Model(nn.Module):
         self.max_num_actions: int = 0
         for _name, h in self.heads.items():
             out = getattr(h, "out_features", None)
-            if out is None and hasattr(h, "online"):
-                out = getattr(h.online, "out_features", None)
             if isinstance(out, int) and out > 0:
                 self.max_num_actions = out
                 break
@@ -852,6 +852,81 @@ class Model(nn.Module):
             self.heads.to(*args_no_dtype, dtype=torch.float32, **kwargs_no_dtype)
             return self
         return super().to(*args, **kwargs)
+
+    def _train_backbone_forward(
+        self,
+        backbone: Backbone,
+        embeds: torch.Tensor,
+        sequence_ids: torch.Tensor,
+        grouping_ids: torch.Tensor,
+        needs_layerwise: bool,
+    ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+        """Training backbone pass: Flex packed on CUDA, SDPA mask on CPU."""
+        transformer = getattr(backbone, "model", None)
+        use_flex = (
+            transformer is not None
+            and hasattr(transformer, "layers")
+            and embeds.device.type == "cuda"
+        )
+        if use_flex:
+            from mouse_core.models.backbone.flex_train import flex_packed_forward
+
+            assert transformer is not None
+            return flex_packed_forward(
+                output_hidden_states=needs_layerwise,
+                model=cast(nn.Module, transformer),
+                embeds=embeds,
+                sequence_ids=sequence_ids,
+                grouping_ids=grouping_ids,
+            )
+        attention_mask = _flat_sequence_causal_mask(
+            dtype=embeds.dtype,
+            sequence_ids=sequence_ids,
+            grouping_ids=grouping_ids,
+        )
+        position_ids = _flat_sequence_position_ids(
+            sequence_ids=sequence_ids,
+            grouping_ids=grouping_ids,
+        )
+        session_out = backbone(
+            embeds.unsqueeze(0),
+            output_hidden_states=needs_layerwise,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+        )
+        if needs_layerwise:
+            h0, layers = session_out
+            if h0.ndim == 3:
+                h0 = h0.squeeze(0)
+            layers = tuple(x.squeeze(0) if x.ndim == 3 else x for x in layers)
+            return (h0, layers)
+        if isinstance(session_out, torch.Tensor) and session_out.ndim == 3:
+            return session_out.squeeze(0)
+        return session_out
+
+    def _pool_backbone_out(
+        self,
+        encoder: Encoder,
+        session_out: torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, ...]],
+        prediction_indices: torch.Tensor,
+        needs_layerwise: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Pool backbone hidden states to per-step representations."""
+        if needs_layerwise:
+            h, layer_hiddens = cast(
+                tuple[torch.Tensor, tuple[torch.Tensor, ...]], session_out
+            )
+            h_step = encoder.pool_step_reprs(h, prediction_indices)
+            h_layers = torch.stack(
+                [
+                    encoder.pool_step_reprs(layer_h, prediction_indices)
+                    for layer_h in layer_hiddens
+                ],
+                dim=1,
+            )
+            return h_step, h_layers
+        h = cast(torch.Tensor, session_out)
+        return encoder.pool_step_reprs(h, prediction_indices), None
 
     # ------------------------------------------------------------------
     # Forward
@@ -959,75 +1034,26 @@ class Model(nn.Module):
             )
         else:
             # Training: Flex packed on CUDA; SDPA mask fallback on CPU (no Flex backward).
-            transformer = getattr(self.backbone, "model", None)
-            use_flex = (
-                transformer is not None
-                and hasattr(transformer, "layers")
-                and embeds.device.type == "cuda"
+            session_out = self._train_backbone_forward(
+                self.backbone,
+                embeds,
+                sequence_ids,
+                grouping_ids,
+                needs_layerwise,
             )
-            if use_flex:
-                from mouse_core.models.backbone.flex_train import flex_packed_forward
-
-                assert transformer is not None
-                session_out = flex_packed_forward(
-                    output_hidden_states=needs_layerwise,
-                    model=cast(nn.Module, transformer),
-                    embeds=embeds,
-                    sequence_ids=sequence_ids,
-                    grouping_ids=grouping_ids,
-                )
-            else:
-                attention_mask = _flat_sequence_causal_mask(
-                    dtype=embeds.dtype,
-                    sequence_ids=sequence_ids,
-                    grouping_ids=grouping_ids,
-                )
-                position_ids = _flat_sequence_position_ids(
-                    sequence_ids=sequence_ids,
-                    grouping_ids=grouping_ids,
-                )
-                session_out = self.backbone(
-                    embeds.unsqueeze(0),
-                    output_hidden_states=needs_layerwise,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                )
-                if needs_layerwise:
-                    h0, layers = session_out
-                    if h0.ndim == 3:
-                        h0 = h0.squeeze(0)
-                    layers = tuple(x.squeeze(0) if x.ndim == 3 else x for x in layers)
-                    session_out = (h0, layers)
-                elif isinstance(session_out, torch.Tensor) and session_out.ndim == 3:
-                    session_out = session_out.squeeze(0)
             new_cache = None
             h_source_batched = False
             pred_batch_size = (N,)
             objective_data = TensorDict(objective_fields, batch_size=[N])
 
-        if needs_layerwise:
-            h, layer_hiddens = cast(
-                tuple[torch.Tensor, tuple[torch.Tensor, ...]], session_out
-            )
-        else:
-            h = cast(torch.Tensor, session_out)
-            layer_hiddens = None
-
-        h_step = self.encoder.pool_step_reprs(h, prediction_indices)
-        if needs_layerwise:
-            assert layer_hiddens is not None
-            # Train: each pool is [N, D] → stack [N, n_layers, D]
-            # Decode: each pool is [B, S, D] → stack [B, n_layers, S, D]
-            h_layers = torch.stack(
-                [
-                    self.encoder.pool_step_reprs(layer_h, prediction_indices)
-                    for layer_h in layer_hiddens
-                ],
-                dim=1,
-            )
-            predictions = self.head(h=h_step, batch_size=pred_batch_size, h_layers=h_layers)
-        else:
-            predictions = self.head(h=h_step, batch_size=pred_batch_size)
+        h_step, h_layers = self._pool_backbone_out(
+            self.encoder, session_out, prediction_indices, needs_layerwise
+        )
+        predictions = self.head(
+            h=h_step,
+            batch_size=pred_batch_size,
+            h_layers=h_layers,
+        )
         return predictions, objective_data, new_cache
 
     def head(
@@ -1047,34 +1073,11 @@ class Model(nn.Module):
                 if h_layers is None:
                     raise ValueError("action_value_layerwise head requires h_layers from Model.forward.")
                 tensors["action_value_layerwise"] = head_fn.forward(h_layers)
-                if hasattr(head_fn, "target_forward"):
-                    tf = getattr(head_fn, "target_forward")
-                    tensors["action_value_layerwise_target"] = tf(h_layers)
             elif name == "action_value":
                 tensors["action_value"] = head_fn.forward(h)
-                if hasattr(head_fn, "target_forward"):
-                    tf = getattr(head_fn, "target_forward")
-                    tensors["action_value_target"] = tf(h)
             else:
                 tensors[name] = head_fn.forward(h)
         return TensorDict(tensors, batch_size=batch_size)
-
-    def polyak_update(
-        self,
-        action_value_tau: float = 0.0,
-        action_value_layerwise_tau: float = 0.0,
-    ) -> None:
-        """Soft-update target heads (for heads that support targets)."""
-        if "action_value" in self._heads:
-            hd = self._heads["action_value"]
-            if hasattr(hd, "polyak_update"):
-                pu = getattr(hd, "polyak_update")
-                pu(tau=action_value_tau)
-        if "action_value_layerwise" in self._heads:
-            hl = self._heads["action_value_layerwise"]
-            if hasattr(hl, "polyak_update"):
-                pu = getattr(hl, "polyak_update")
-                pu(tau=action_value_layerwise_tau)
 
     def get_action(
         self,
@@ -1118,7 +1121,9 @@ def preferred_dtype(device: torch.device | str | None = None) -> torch.dtype:
     """Compute dtype for encoder/backbone: ``bfloat16`` on CUDA, else ``float32``.
 
     Pass to ``Model.to(device=..., dtype=preferred_dtype(device))``. Heads stay
-    float32 via :meth:`Model.to`. CUDA FlexAttention only fuses for bf16/fp16.
+    float32 via :meth:`Model.to`. Train with :class:`mouse_core.AdamW`, or
+    :class:`mouse_core.AdamWFp32` to keep fp32 masters of bf16 weights.
+    CUDA FlexAttention only fuses for bf16/fp16.
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
