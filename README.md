@@ -59,19 +59,19 @@ Backbone loading has one public path: instantiate the backbone. For example, `Ll
 
 ## Quick start 🚀
 
-The [example notebooks](examples/) are the primary documentation. Work through them in order:
+The [example notebooks](examples/) are short usage docs, not full experiments. Work through them in order, then evaluate a saved checkpoint in `09`. Full training runs live in **[mouse-experiment](https://github.com/micahr234/mouse-experiment)**.
 
 | Notebook | What it covers |
 |----------|----------------|
 | [01 — Collect dataset](examples/01_collect_dataset.ipynb) | `Datastore`, collecting transitions, pushing to the Hub |
-| [02 — Train offline DQN](examples/02_train_offline_dqn.ipynb) | Offline replay baseline, model architecture, DQN training, held-out env eval |
-| [03 — Train online DQN](examples/03_train_online_dqn.ipynb) | Live `mouse-gym` rollouts, in-memory replay, DQN updates, separate eval envs |
+| [02 — Train offline DQN](examples/02_train_offline_dqn.ipynb) | Offline replay baseline, model architecture, DQN training |
+| [03 — Train online DQN](examples/03_train_online_dqn.ipynb) | Live `mouse-gym` rollouts, in-memory replay, DQN updates |
 | [04 — Layerwise DQN offline](examples/04_train_offline_layerwise_dqn.ipynb) | Same offline loop as `02`, with per-layer Q heads and `LayerwiseDqnObjective` |
 | [05 — Train offline SV](examples/05_train_offline_sv.ipynb) | Same offline loop as `02`, regressing the action-value head onto `info_q_star` with `SvObjective` |
 | [06 — TextEmbedder offline DQN](examples/06_train_offline_text_dqn.ipynb) | Same offline loop as `02`, with `TextEmbedder` (`token` + `text`; `image` documented for VL checkpoints) |
 | [07 — Train online PPO](examples/07_train_online_ppo.ipynb) | Online on-policy PPO (`DiscreteActionHead` + value head, `PpoObjective` with GAE) |
 | [08 — Train online GRPO](examples/08_train_online_grpo.ipynb) | Branched GRPO: fork env+context at many `L`, group-relative advantages, `GrpoObjective` |
-| [09 — Inference](examples/09_inference.ipynb) | Batched FlexAttention cached inference with grow-then-rebuild (`max_cache` / `start_cache`), loading a Hub checkpoint after training |
+| [09 — Inference](examples/09_inference.ipynb) | Evaluation: load a Hub checkpoint and run batched FlexAttention cached inference (`max_cache` / `start_cache`) |
 | [10 — Train offline SP](examples/10_train_offline_sp.ipynb) | Same offline loop as `05`, but `SpObjective` CE onto a random argmax of `info_q_star` with `DiscreteActionHead` *(ranking check)* |
 
 ### Example dependencies

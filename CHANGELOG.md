@@ -56,6 +56,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``grouping_field: str | None = None`` (``None`` ⇒ no grouping filter).
 
 ### Changed
+- Example notebooks are short usage docs, not full experiments. Training
+  notebooks no longer build a held-out ``GroupEnv`` or call ``run_eval``;
+  score a saved checkpoint in ``examples/09_inference.ipynb``. Default
+  cycle / step / env budgets are documentation-scale. Full runs belong in
+  [mouse-experiment](https://github.com/micahr234/mouse-experiment).
 - ``SpObjective`` hard ``"ce"`` (``sp_ce``) samples uniformly among tied
   argmax actions instead of always taking the lowest index.
 - Transition objectives (DQN / layerwise DQN / PPO / GRPO) treat a **run** as
