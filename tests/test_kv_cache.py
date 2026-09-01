@@ -82,7 +82,8 @@ def _fwd(model: Model, rows: list[list[dict]], **kwargs):
         patched,
         grouping_field="task_index",
     )
-    return model(tb, **kwargs)
+    preds, averager_inputs = model(tb, **kwargs)
+    return preds, averager_inputs.cache
 
 @pytest.mark.parametrize('backbone_cls', [Qwen3Backbone, LlamaBackbone])
 def test_chunked_cached_forward_matches_full_forward(backbone_cls) -> None:
@@ -90,11 +91,11 @@ def test_chunked_cached_forward_matches_full_forward(backbone_cls) -> None:
     model = _tiny_model(backbone_cls)
     steps = _steps(6)
     with torch.no_grad():
-        full, _, _ = _fwd(model, [steps])
+        full, _ = _fwd(model, [steps])
         cache = None
         chunk_preds = []
         for lo, hi in ((0, 3), (3, 4), (4, 6)):
-            preds, _, cache = _fwd(model, [steps[lo:hi]], cache=cache, use_cache=True)
+            preds, cache = _fwd(model, [steps[lo:hi]], cache=cache, use_cache=True)
             chunk_preds.append(preds['action_value'])
         incremental = torch.cat(chunk_preds, dim=1)
     full_q = _as_rect(full['action_value'])
@@ -107,11 +108,11 @@ def test_step_by_step_cached_rollout_matches_full_forward() -> None:
     model = _tiny_model(Qwen3Backbone)
     steps = _steps(5)
     with torch.no_grad():
-        full, _, _ = _fwd(model, [steps])
+        full, _ = _fwd(model, [steps])
         cache = None
         last_step_preds = []
         for step in steps:
-            preds, _, cache = _fwd(model, [[step]], cache=cache, use_cache=True)
+            preds, cache = _fwd(model, [[step]], cache=cache, use_cache=True)
             last_step_preds.append(preds['action_value'][:, -1])
         incremental = torch.stack(last_step_preds, dim=1)
     assert torch.allclose(incremental, _as_rect(full['action_value']), atol=1e-05)
@@ -131,14 +132,14 @@ def test_batched_cached_rollout_matches_per_row_rollout() -> None:
             cache = None
             preds_per_step = []
             for step in row:
-                preds, _, cache = _fwd(model, [[step]], cache=cache, use_cache=True)
+                preds, cache = _fwd(model, [[step]], cache=cache, use_cache=True)
                 preds_per_step.append(preds['action_value'][0, -1])
             per_row.append(torch.stack(preds_per_step))
         reference = torch.stack(per_row)
         cache = None
         batched_per_step = []
         for s in range(6):
-            preds, _, cache = _fwd(model, [[row[s]] for row in rows], cache=cache, use_cache=True)
+            preds, cache = _fwd(model, [[row[s]] for row in rows], cache=cache, use_cache=True)
             batched_per_step.append(preds['action_value'][:, -1])
         batched = torch.stack(batched_per_step, dim=1)
     assert torch.allclose(batched, reference, atol=1e-05)
@@ -169,7 +170,7 @@ def test_ragged_batched_chunks_match_unbatched(backbone_cls, tokens) -> None:
             for b, n in enumerate(lengths):
                 batch.append(rows[b][consumed[b]:consumed[b] + n])
                 consumed[b] += n
-            step_preds, _, cache = _fwd(model, batch, cache=cache, use_cache=True)
+            step_preds, cache = _fwd(model, batch, cache=cache, use_cache=True)
             preds = step_preds
             padded_len = max(lengths)
             for b, n in enumerate(lengths):
@@ -204,7 +205,7 @@ def test_empty_first_chunk_then_real_rows_match_unbatched(backbone_cls) -> None:
         for lengths in chunk_lengths:
             batch = [rows[b][consumed[b]:consumed[b] + n] for b, n in enumerate(lengths)]
             consumed = [c + n for c, n in zip(consumed, lengths)]
-            preds, _, cache = _fwd(model, batch, cache=cache, use_cache=True)
+            preds, cache = _fwd(model, batch, cache=cache, use_cache=True)
             assert torch.isfinite(preds['action_value']).all(), 'NaN/inf leaked from masked padding'
             padded_len = max(lengths)
             for b, n in enumerate(lengths):
@@ -236,7 +237,7 @@ def test_concat_fusion_ragged_chunks_match_unbatched() -> None:
         for lengths in chunk_lengths:
             batch = [rows[b][consumed[b]:consumed[b] + n] for b, n in enumerate(lengths)]
             consumed = [c + n for c, n in zip(consumed, lengths)]
-            preds, _, cache = _fwd(model, batch, cache=cache, use_cache=True)
+            preds, cache = _fwd(model, batch, cache=cache, use_cache=True)
             padded_len = max(lengths)
             for b, n in enumerate(lengths):
                 collected[b].append(preds['action_value'][b, padded_len - n:])
@@ -273,7 +274,7 @@ def test_ragged_decode_fuzz(backbone_cls, seed) -> None:
             lengths = [int(schedule[call, b].item()) for b in range(B)]
             batch = [rows[b][consumed[b]:consumed[b] + n] for b, n in enumerate(lengths)]
             consumed = [c + n for c, n in zip(consumed, lengths)]
-            preds, _, cache = _fwd(model, batch, cache=cache, use_cache=True)
+            preds, cache = _fwd(model, batch, cache=cache, use_cache=True)
             assert torch.isfinite(preds['action_value']).all()
             padded_len = max(lengths)
             for b, n in enumerate(lengths):
@@ -288,7 +289,7 @@ def test_cache_without_use_cache_raises() -> None:
     mutated by every call, so a read-only pass over an existing cache cannot exist."""
     model = _tiny_model(Qwen3Backbone)
     with torch.no_grad():
-        _, _, cache = _fwd(model, [_steps(2)], use_cache=True)
+        _, cache = _fwd(model, [_steps(2)], use_cache=True)
         with pytest.raises(ValueError, match='use_cache'):
             _fwd(model, [_steps(1, start=2)], cache=cache)
 
@@ -300,13 +301,13 @@ def test_uniform_then_ragged_cached_decode() -> None:
     with torch.no_grad():
         reference = [_fwd(model, [row])[0]['action_value'] for row in rows]
         cache = None
-        preds, _, cache = _fwd(model, [row[:2] for row in rows], cache=cache, use_cache=True)
+        preds, cache = _fwd(model, [row[:2] for row in rows], cache=cache, use_cache=True)
         collected = [[preds['action_value'][b]] for b in range(2)]
         consumed = [2, 2]
         for lengths in ([3, 1], [1, 3]):
             batch = [rows[b][consumed[b]:consumed[b] + n] for b, n in enumerate(lengths)]
             consumed = [c + n for c, n in zip(consumed, lengths)]
-            preds, _, cache = _fwd(model, batch, cache=cache, use_cache=True)
+            preds, cache = _fwd(model, batch, cache=cache, use_cache=True)
             padded_len = max(lengths)
             for b, n in enumerate(lengths):
                 collected[b].append(preds['action_value'][b, padded_len - n:])
@@ -330,7 +331,7 @@ def test_reset_rows_restarts_one_sequence_without_rebuild(backbone_cls) -> None:
         ref0 = _fwd(model, [row0_b])[0]['action_value']
         ref1 = _fwd(model, [row1])[0]['action_value']
         cache = None
-        preds, _, cache = _fwd(model, [row0_a, row1[:4]], use_cache=True)
+        preds, cache = _fwd(model, [row0_a, row1[:4]], use_cache=True)
         assert cache is not None
         cache['session'].reset_rows([0])
         collected0: list[torch.Tensor] = []
@@ -340,7 +341,7 @@ def test_reset_rows_restarts_one_sequence_without_rebuild(backbone_cls) -> None:
             ([2, 2], [row0_b[:2], row1[4:6]]),
             ([1, 1], [row0_b[2:], row1[6:]]),
         ):
-            preds, _, cache = _fwd(model, batch, cache=cache, use_cache=True)
+            preds, cache = _fwd(model, batch, cache=cache, use_cache=True)
             padded = max(lengths)
             collected0.append(preds['action_value'][0, padded - lengths[0] :])
             collected1.append(preds['action_value'][1, padded - lengths[1] :])
@@ -388,12 +389,12 @@ def test_decode_task_mask_isolates_without_reset(backbone_cls) -> None:
     with torch.no_grad():
         ref = _fwd(model, [task1])[0]['action_value']
         cache = None
-        _, _, cache = _fwd(model, [task0], use_cache=True)
+        _, cache = _fwd(model, [task0], use_cache=True)
         assert cache is not None
         # Deliberately do NOT call reset_rows — isolation comes from the mask.
         collected: list[torch.Tensor] = []
         for step in task1:
-            preds, _, cache = _fwd(model, [[step]], cache=cache, use_cache=True)
+            preds, cache = _fwd(model, [[step]], cache=cache, use_cache=True)
             collected.append(preds['action_value'][:, -1])
         got = torch.stack(collected, dim=1)
     assert torch.allclose(got, _as_rect(ref), atol=1e-05)

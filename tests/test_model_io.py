@@ -21,10 +21,10 @@ def test_composed_model_roundtrip(tmp_path) -> None:
     heads = DiscreteActionValueHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1)
     model = Model(encoder=encoder, backbone=backbone, heads=heads).eval()
     batch = [[{'action': 0, 'reward': 0.0, 'episode_done': 0, 'task_done': 0}, {'action': 1, 'reward': 1.0, 'episode_done': 0, 'task_done': 0}, {'action': 2, 'reward': 2.0, 'episode_done': 1, 'task_done': 0}]]
-    expected, _, _ = model(batch_to_token_batch(_tok(model.encoder), batch))
+    expected, _ = model(batch_to_token_batch(_tok(model.encoder), batch))
     save_model(model, tmp_path)
     loaded = load_model(tmp_path).eval()
-    actual, _, _ = loaded(batch_to_token_batch(_tok(loaded.encoder), batch))
+    actual, _ = loaded(batch_to_token_batch(_tok(loaded.encoder), batch))
     assert torch.allclose(actual['action_value'], expected['action_value'])
     assert loaded.hidden_dim == hidden_dim
     orig_sd = model.state_dict()
@@ -52,10 +52,10 @@ def test_composed_model_roundtrip_static_fourier(tmp_path) -> None:
     heads = DiscreteActionValueHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1)
     model = Model(encoder=encoder, backbone=backbone, heads=heads).eval()
     batch = [[{'action': 1, 'reward': 0.5}, {'action': 2, 'reward': -0.1}]]
-    expected, _, _ = model(batch_to_token_batch(_tok(model.encoder), batch))
+    expected, _ = model(batch_to_token_batch(_tok(model.encoder), batch))
     save_model(model, tmp_path)
     loaded = load_model(tmp_path).eval()
-    actual, _, _ = loaded(batch_to_token_batch(_tok(loaded.encoder), batch))
+    actual, _ = loaded(batch_to_token_batch(_tok(loaded.encoder), batch))
     assert torch.allclose(actual['action_value'], expected['action_value'])
     enc = cast(NumericEmbedder, model.encoder)
     loaded_enc = cast(NumericEmbedder, loaded.encoder)
@@ -104,5 +104,5 @@ def test_model_to_bfloat16_keeps_heads_float32() -> None:
     assert next(model.heads.parameters()).dtype == torch.float32
     batch = [[{'action': 0, 'reward': 0.0, 'episode_done': 0, 'task_done': 0}]]
     with torch.no_grad():
-        preds, _, _ = model(batch_to_token_batch(_tok(model.encoder), batch), use_cache=True)
+        preds, _ = model(batch_to_token_batch(_tok(model.encoder), batch), use_cache=True)
     assert preds['action_value'].dtype == torch.float32

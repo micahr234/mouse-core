@@ -125,10 +125,10 @@ class DqnObjective(Objective):
     """One-step Bellman TD objective with a delayed target network.
 
     Instantiate with hyperparameters, then call with
-    ``(objective_data, predictions)`` to compute the loss. Fill
-    ``predictions["action_value_target"]`` via
-    :meth:`~mouse_core.polyak.PolyakAverager.write_targets` after the online
-    forward.
+    ``(objective_data, predictions, delayed_predictions)``. Online Q is
+    ``predictions["action_value"]``; bootstrap Q is
+    ``delayed_predictions["action_value"]`` from
+    ``averager(averager_inputs)``.
 
     A **run** is the same ``sequence_id`` and, when ``grouping_field`` is set
     and present, the same grouping column (typically ``task_index``). Neighbor
@@ -234,9 +234,10 @@ class DqnObjective(Objective):
         self,
         objective_data: TensorDict,
         predictions: TensorDict,
+        delayed_predictions: TensorDict,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         q: torch.Tensor = predictions["action_value"]
-        q_target: torch.Tensor = predictions["action_value_target"]
+        q_target: torch.Tensor = delayed_predictions["action_value"]
 
         if q.ndim != 2:
             raise ValueError(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+import torch
 
 from mouse_core.data import (
     NumericTokenizer,
@@ -131,17 +132,17 @@ def test_tokenizer_full_matches_per_step_concat() -> None:
         grouping_field="task_index",
     )
     rows = _rows()
-    full = pack_token_batch([tokenizer(step) for step in rows])
+    full, full_obj = pack_token_batch([tokenizer(step) for step in rows])
     head = [tokenizer(s) for s in rows[:3]]
     tail = [tokenizer(s) for s in rows[3:]]
-    cat = pack_token_batch(head + tail)
+    cat, cat_obj = pack_token_batch(head + tail)
     assert np.array_equal(full.modality_ids, cat.modality_ids)
     assert np.array_equal(full.ids, cat.ids)
     assert np.allclose(full.values, cat.values)
     assert np.array_equal(full.grouping_ids, cat.grouping_ids)
     assert np.array_equal(full.prediction_indices, cat.prediction_indices)
     for key in ("action", "observation", "reward", "episode_done", "task_done", "task_index"):
-        assert np.array_equal(full.objective_fields[key], cat.objective_fields[key])
+        assert torch.equal(full_obj[key], cat_obj[key])
 
 
 def test_pipeline_without_augmenter_full_matches_head_plus_tail_tokens() -> None:
@@ -173,10 +174,10 @@ def test_pipeline_without_augmenter_full_matches_head_plus_tail_tokens() -> None
     )
     transform = compose(selector, tokenizer)
     rows = _rows()
-    full = pack_token_batch([transform(s) for s in rows])
+    full, _ = pack_token_batch([transform(s) for s in rows])
     head = [transform(s) for s in rows[:-1]]
     tail = transform(rows[-1])
-    cat = pack_token_batch(head + [tail])
+    cat, _ = pack_token_batch(head + [tail])
     assert np.array_equal(full.modality_ids, cat.modality_ids)
     assert np.array_equal(full.ids, cat.ids)
     assert np.array_equal(full.grouping_ids, cat.grouping_ids)

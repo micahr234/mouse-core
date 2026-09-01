@@ -8,7 +8,7 @@ from mouse_core.models.backbone import IdentityBackbone
 from mouse_core.models.base import Model, _flat_sequence_causal_mask, _flat_sequence_position_ids
 from mouse_core.models.embedding import NumericEmbedder
 from mouse_core.models.heads.dqn import DiscreteActionValueHead
-from tests._token_batch_helpers import batch_to_token_batch, tok_from_encoder
+from tests._token_batch_helpers import batch_to_packed, batch_to_token_batch, tok_from_encoder
 
 _tok = tok_from_encoder
 
@@ -71,8 +71,8 @@ def test_model_forward_injects_sequence_id_and_runs_flat() -> None:
         ),
     )
     batch = [[{"action": i % 4} for i in range(3)], [{"action": 1}, {"action": 2}]]
-    tb = batch_to_token_batch(_tok(model.encoder), batch)
-    predictions, objective_data, _ = model(tb)
+    tb, objective_data = batch_to_packed(_tok(model.encoder), batch)
+    predictions, _ = model(tb)
     assert "sequence_id" in objective_data.keys()
     assert objective_data["sequence_id"].tolist() == [0, 0, 0, 1, 1]
     assert objective_data["grouping_id"].tolist() == [0, 0, 0, 0, 0]
@@ -80,7 +80,7 @@ def test_model_forward_injects_sequence_id_and_runs_flat() -> None:
     assert tb.N == 5
     assert list(tb.step_counts()) == [3, 2]
     assert list(tb.grouping_ids) == [0] * tb.L
-    preds2, _, _ = model(tb)
+    preds2, _ = model(tb)
     assert preds2["action_value"].shape == (5, 4)
 
 
@@ -102,12 +102,12 @@ def test_prepare_derives_grouping_ids_from_field() -> None:
             {"action": 1, "episode_done": 0, "task_done": 0, "task_index": 2},
         ]
     ]
-    tb = batch_to_token_batch(
+    tb, objective_data = batch_to_packed(
         _tok(encoder, grouping_field="task_index"),
         batch,
         grouping_field="task_index",
     )
-    assert tb.objective_fields["task_index"].tolist() == [0, 0, 1, 1, 1, 2]
+    assert objective_data["task_index"].tolist() == [0, 0, 1, 1, 1, 2]
     assert list(tb.grouping_ids) == [0] * 4 + [1] * 6 + [2] * 2
 
 
@@ -120,6 +120,6 @@ def test_missing_grouping_field_stamps_zero() -> None:
         ],
     )
     batch = [[{"action": 0, "episode_done": 1, "task_done": 2}, {"action": 1, "episode_done": 0, "task_done": 0}]]
-    tb = batch_to_token_batch(_tok(encoder), batch)
-    assert tb.objective_fields["grouping_id"].tolist() == [0, 0]
+    tb, objective_data = batch_to_packed(_tok(encoder), batch)
+    assert objective_data["grouping_id"].tolist() == [0, 0]
     assert list(tb.grouping_ids) == [0] * tb.L

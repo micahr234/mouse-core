@@ -13,12 +13,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   AdamW state) for non-fp32 compute parameters so updates smaller than a
   bf16 ULP accumulate. Heads are already fp32 and are stepped in place.
   Training notebooks use ``AdamW``; swap the class to opt into masters.
-- ``PolyakAverager``: delayed copy of a DQN ``Model`` used next to the
-  optimizer. ``scope="head"`` (default) snaps encoder/backbone to current
-  weights on each target forward and Polyak-averages only the heads;
-  ``scope="model"`` Polyak-averages the full stack and recomputes target Q
-  through delayed encoder/backbone weights. DQN notebooks expose
-  ``POLYAK_SCOPE`` / ``POLYAK_TAU``.
+- ``PolyakAverager``: delayed DQN weights next to the optimizer.
+  ``scope="head"`` (default) copies only the heads (not encoder/backbone)
+  and reuses the online pooled representation. ``scope="model"`` copies
+  the full stack and recomputes representations. ``Model.forward``
+  returns ``(predictions, averager_inputs)``; delayed Q is
+  ``averager(averager_inputs)``. DQN notebooks use ``scope="head"``;
+  ``examples/11_train_offline_dqn_model_delay.ipynb`` shows
+  ``scope="model"``.
 - ``examples/05_train_offline_sv.ipynb``: offline supervised-value training
   (``SvObjective`` regresses ``action_value`` onto ``info_q_star``). The action
   permute spec sets ``input_vector_field`` / ``output_vector_field`` to
@@ -26,6 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ``examples/10_train_offline_sp.ipynb``: offline supervised-policy training
   (``SpObjective`` CE onto a random argmax of ``info_q_star`` with
   ``DiscreteActionHead``). Same action vector-field permute as SV.
+- ``examples/11_train_offline_dqn_model_delay.ipynb``: same offline DQN
+  loop as ``02``, with ``PolyakAverager(scope="model")`` delaying the
+  encoder, backbone, and Q head.
 - ``StepTokens``: tokenizer output for one step (token arrays + scalar
   ``grouping_id`` + ``objective_fields``). ``pack_token_batch(...)`` builds a
   ``TokenBatch`` from many steps (assigns ``sequence_ids``, expands
@@ -67,10 +72,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``grouping_field: str | None = None`` (``None`` ⇒ no grouping filter).
 
 ### Changed
+- ``Model.head(h=...)`` takes one pooled tensor. Pooled head input from
+  ``forward`` is ``averager_inputs.h`` (last-layer ``[N, D]``, or stacked
+  layers ``[N, L, D]`` when a layerwise Q head is enabled). ``h_layers``
+  and ``model.h`` are removed.
+- ``PolyakAverager(scope="head")`` deep-copies only the heads, not the
+  encoder or backbone. ``Model.forward`` returns
+  ``(predictions, averager_inputs)``. Delayed Q is
+  ``averager(averager_inputs)`` (head scope uses ``averager_inputs.h``
+  and does not rerun encoder/backbone; model scope recomputes from
+  ``averager_inputs.batch``). ``averager_inputs.h`` is detached so
+  gradients cannot flow back through the averager. Online and delayed
+  forwards run in ``train()``; delayed weights stay frozen (``no_grad``).
+- ``DataLoader.next_batch()`` and ``pack_token_batch(...)`` return
+  ``(inputs, objective_data)``. ``inputs`` is the ``TokenBatch``;
+  ``objective_data`` is a CPU ``TensorDict`` of tokenizer
+  ``objective_fields`` (plus ``sequence_id`` and the grouping column).
+  ``Model.forward`` / embedders take ``TokenBatch`` only and return
+  ``(predictions, averager_inputs)``. Move ``objective_data`` onto the
+  model device before the objective.
 - DQN target Q is no longer inside ``Model`` or the action-value heads.
   ``DqnObjective`` / ``LayerwiseDqnObjective`` no longer take ``tau``.
-  After ``optimizer.step()``, call ``averager.update()``; fill
-  ``*_target`` keys with ``averager.write_targets(batch, predictions)``.
+  After ``optimizer.step()``, call ``averager.update()``.
+  ``DqnObjective`` / ``LayerwiseDqnObjective`` take
+  ``(objective_data, predictions, delayed_predictions)`` — delayed Q is
+  ``delayed_predictions["action_value"]`` (or ``action_value_layerwise``)
+  from ``averager(averager_inputs)``.
   ``BaseHeadWithTarget`` is removed; ``DiscreteActionValueHead`` is a
   ``SwiGLUHead``.
 - Example notebooks are short usage docs, not full experiments. Training

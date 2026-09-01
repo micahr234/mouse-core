@@ -73,6 +73,7 @@ The [example notebooks](examples/) are short usage docs, not full experiments. W
 | [08 — Train online GRPO](examples/08_train_online_grpo.ipynb) | Branched GRPO: fork env+context at many `L`, group-relative advantages, `GrpoObjective` |
 | [09 — Inference](examples/09_inference.ipynb) | Evaluation: load a Hub checkpoint and run batched FlexAttention cached inference (`max_cache` / `start_cache`) |
 | [10 — Train offline SP](examples/10_train_offline_sp.ipynb) | Same offline loop as `05`, but `SpObjective` CE onto a random argmax of `info_q_star` with `DiscreteActionHead` *(ranking check)* |
+| [11 — Offline DQN, full-model delay](examples/11_train_offline_dqn_model_delay.ipynb) | Same offline loop as `02`, with `PolyakAverager(scope="model")` delaying encoder, backbone, and Q head |
 
 ### Example dependencies
 

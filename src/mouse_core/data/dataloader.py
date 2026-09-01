@@ -4,7 +4,8 @@ A ``Datastore`` is a flat sequence of arbitrary rows. The loader samples
 ``B`` sequences, each a contiguous store window of length ``1 .. sequence_length``
 (a max), runs ``transform(step)`` on every step, and packs the resulting
 :class:`~mouse_core.data.token_batch.StepTokens` into a
-:class:`~mouse_core.data.token_batch.TokenBatch`.
+:class:`~mouse_core.data.token_batch.TokenBatch` plus a CPU
+:class:`~tensordict.TensorDict` of step-level objective columns.
 
 The loader is stage-agnostic: compose augmenter / selector / tokenizer
 (or any ``dict → StepTokens`` callable) outside and pass the result as
@@ -23,7 +24,7 @@ Usage
         batch_size=8,
         transform=train_transform,
     )
-    token_batch = loader.next_batch()
+    inputs, objective_data = loader.next_batch()
 """
 
 from __future__ import annotations
@@ -37,6 +38,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
+
+from tensordict import TensorDict
 
 from mouse_core.data.token_batch import StepTokens, TokenBatch, pack_token_batch
 
@@ -106,7 +109,7 @@ def _fetch_one_batch(
     cfg: _SnapshotConfig,
     rng: np.random.Generator,
     transform: StepTransform,
-) -> TokenBatch:
+) -> tuple[TokenBatch, TensorDict]:
     reseed = getattr(transform, "reseed", None)
     if callable(reseed):
         reseed()
@@ -266,8 +269,13 @@ class DataLoader:
         if self._num_workers > 0:
             self._start_workers()
 
-    def next_batch(self) -> TokenBatch:
-        """Return the next prepared :class:`TokenBatch`."""
+    def next_batch(self) -> tuple[TokenBatch, TensorDict]:
+        """Return ``(inputs, objective_data)``.
+
+        ``inputs`` is the packed :class:`TokenBatch`. ``objective_data``
+        is a CPU :class:`~tensordict.TensorDict` of tokenizer
+        ``objective_fields`` (plus ``sequence_id`` and the grouping column).
+        """
         if self._sync_rng is not None:
             cfg = self._snapshot_config()
             assert self._sync_transform is not None

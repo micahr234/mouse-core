@@ -10,7 +10,7 @@ from mouse_core.models.backbone.qwen3 import Qwen3Backbone
 from mouse_core.models.base import Model, _flat_sequence_causal_mask, _flat_sequence_position_ids
 from mouse_core.models.embedding import NumericEmbedder
 from mouse_core.models.heads.dqn import DiscreteActionValueHead
-from tests._token_batch_helpers import batch_to_token_batch, tok_from_encoder
+from tests._token_batch_helpers import batch_to_packed, batch_to_token_batch, tok_from_encoder
 
 _tok = tok_from_encoder
 
@@ -88,10 +88,10 @@ def test_flex_train_position_ids_match_legacy_on_device() -> None:
 def test_prepare_sequence_id_col_matches_step_counts() -> None:
     encoder = NumericEmbedder(hidden_dim=8, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4}, {"type": 'fourier', "field": "reward"}, {'type': 'learnable', 'tokens': 1}])
     batch = [[{'action': s % 4, 'reward': float(s)} for s in range(5)], [{'action': 1, 'reward': 0.0}, {'action': 2, 'reward': 1.0}, {'action': 3, 'reward': 2.0}]]
-    tb = batch_to_token_batch(_tok(encoder), batch)
+    tb, objective_data = batch_to_packed(_tok(encoder), batch)
     assert list(tb.step_counts()) == [5, 3]
-    assert tb.objective_fields['sequence_id'].tolist() == [0, 0, 0, 0, 0, 1, 1, 1]
-    assert tb.objective_fields['grouping_id'].tolist() == [0] * 8
+    assert objective_data['sequence_id'].tolist() == [0, 0, 0, 0, 0, 1, 1, 1]
+    assert objective_data['grouping_id'].tolist() == [0] * 8
     assert tb.prediction_indices.shape == (8,)
     assert list(tb.sequence_ids[tb.prediction_indices]).count(0) == 5
     assert list(tb.sequence_ids[tb.prediction_indices]).count(1) == 3
@@ -153,15 +153,16 @@ def test_model_flex_forward_stable_under_sequence_isolation() -> None:
     batch = [[{'action': i % 4} for i in range(3)], [{'action': i % 4} for i in range(3)]]
     tb = batch_to_token_batch(_tok(encoder), batch)
     with torch.no_grad():
-        preds0, od0, _ = model(tb)
+        preds0, _ = model(tb)
         batch_corrupt = [[{'action': 3} for _ in range(3)], [{'action': i % 4} for i in range(3)]]
         tb_c = batch_to_token_batch(_tok(encoder), batch_corrupt)
-        preds1, _, _ = model(tb_c)
+        preds1, _ = model(tb_c)
     q0 = preds0['action_value']
     q1 = preds1['action_value']
     assert torch.allclose(q0[3:], q1[3:], atol=1e-05, rtol=1e-05)
     assert not torch.allclose(q0[:3], q1[:3], atol=1e-05, rtol=1e-05)
-    assert od0['sequence_id'].tolist() == [0, 0, 0, 1, 1, 1]
+    assert tb.N == 6
+    assert list(tb.sequence_ids[tb.prediction_indices]) == [0, 0, 0, 1, 1, 1]
 
 def test_model_train_isolates_tasks_within_sequence() -> None:
     """Packed train forward on a two-task window matches a single-task suffix forward."""
@@ -192,7 +193,7 @@ def test_model_train_isolates_tasks_within_sequence() -> None:
         {'action': 1, 'episode_done': 0, 'task_done': 0, 'task_index': 1},
     ]
     with torch.no_grad():
-        tb_both = batch_to_token_batch(
+        tb_both, od = batch_to_packed(
             _tok(encoder, grouping_field="task_index"),
             [task0 + task1],
             grouping_field="task_index",
@@ -202,8 +203,8 @@ def test_model_train_isolates_tasks_within_sequence() -> None:
             [task1],
             grouping_field="task_index",
         )
-        preds_both, od, _ = model(tb_both)
-        preds_t1, _, _ = model(tb_t1)
+        preds_both, _ = model(tb_both)
+        preds_t1, _ = model(tb_t1)
     assert od['task_index'].tolist() == [0, 0, 0, 1, 1]
     # Current-task suffix predictions match a fresh single-task forward.
     assert torch.allclose(

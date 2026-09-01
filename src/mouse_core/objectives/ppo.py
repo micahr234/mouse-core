@@ -109,8 +109,9 @@ class PpoObjective(Objective):
                 {"input_field": "old_log_prob"},
             ],
         )
-        predictions, objective_data, _ = model(batch)  # TokenBatch
-        loss, metrics = objective(objective_data, predictions)
+        inputs, objective_data = loader.next_batch()
+        predictions, _ = model(inputs)
+        loss, metrics = objective(objective_data.to(device), predictions)
 
     When ``old_log_prob`` is absent, the detached current log-probs are used
     (ratio = 1) — suitable for a single pass over a freshly collected batch.

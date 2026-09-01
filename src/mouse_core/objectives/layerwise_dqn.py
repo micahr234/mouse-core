@@ -74,9 +74,8 @@ class LayerwiseDqnObjective(Objective):
     """One-step Bellman TD objective on every backbone layer.
 
     Reads ``predictions["action_value_layerwise"]`` and
-    ``predictions["action_value_layerwise_target"]`` with shape ``[N, L, A]``.
-    Fill the target tensor via
-    :meth:`~mouse_core.polyak.PolyakAverager.write_targets`.
+    ``delayed_predictions["action_value_layerwise"]`` with shape ``[N, L, A]``.
+    Delayed Q comes from ``averager(averager_inputs)``.
     Each layer and each episode/task done-code uses its own discount, built at construction
     from explicit shallow/deep endpoint pairs. A run is the same
     ``sequence_id`` and, when ``grouping_field`` is set and present, the same
@@ -201,9 +200,10 @@ class LayerwiseDqnObjective(Objective):
         self,
         objective_data: TensorDict,
         predictions: TensorDict,
+        delayed_predictions: TensorDict,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         q: torch.Tensor = predictions["action_value_layerwise"]
-        q_target: torch.Tensor = predictions["action_value_layerwise_target"]
+        q_target: torch.Tensor = delayed_predictions["action_value_layerwise"]
 
         if q.ndim != 3:
             raise ValueError(

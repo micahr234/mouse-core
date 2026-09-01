@@ -25,9 +25,10 @@ def test_layerwise_dqn_objective_linear_horizon() -> None:
 def test_layerwise_dqn_objective_runs() -> None:
     n, layers, a = (8, 3, 3)
     step_stream = TensorDict({'action': torch.randint(0, a, (n,)), 'reward': torch.randn(n), 'episode_done': torch.zeros(n, dtype=torch.long), 'task_done': torch.zeros(n, dtype=torch.long), 'sequence_id': torch.tensor([0, 0, 0, 0, 1, 1, 1, 1])}, batch_size=[n])
-    out = TensorDict({'action_value_layerwise': torch.randn(n, layers, a), 'action_value_layerwise_target': torch.randn(n, layers, a)}, batch_size=[n])
+    predictions = TensorDict({'action_value_layerwise': torch.randn(n, layers, a)}, batch_size=[n])
+    delayed = TensorDict({'action_value_layerwise': torch.randn(n, layers, a)}, batch_size=[n])
     objective = LayerwiseDqnObjective(num_backbone_layers=layers, gamma_step_start=0.0, gamma_step=0.99)
-    loss, metrics = objective(step_stream, out)
+    loss, metrics = objective(step_stream, predictions, delayed)
     assert loss.ndim == 0
     assert 'action_value_layerwise' in metrics
     assert metrics['layer_0_gamma_step'] < metrics['layer_2_gamma_step']
@@ -39,12 +40,13 @@ def test_layerwise_dqn_objective_skips_transitions_across_sequences() -> None:
     n, layers, a = (5, 2, 3)
     torch.manual_seed(0)
     step_stream = TensorDict({'action': torch.randint(0, a, (n,)), 'reward': torch.randn(n), 'episode_done': torch.zeros(n, dtype=torch.long), 'task_done': torch.zeros(n, dtype=torch.long), 'sequence_id': torch.tensor([0, 0, 1, 1, 1])}, batch_size=[n])
-    out = TensorDict({'action_value_layerwise': torch.randn(n, layers, a), 'action_value_layerwise_target': torch.randn(n, layers, a)}, batch_size=[n])
+    predictions = TensorDict({'action_value_layerwise': torch.randn(n, layers, a)}, batch_size=[n])
+    delayed = TensorDict({'action_value_layerwise': torch.randn(n, layers, a)}, batch_size=[n])
     objective = LayerwiseDqnObjective(num_backbone_layers=layers, gamma_step_start=0.0, gamma_step=0.99)
-    loss_before, _ = objective(step_stream, out)
+    loss_before, _ = objective(step_stream, predictions, delayed)
     corrupted = step_stream.clone()
     corrupted['reward'][2] = 1000000.0
-    loss_after, _ = objective(corrupted, out)
+    loss_after, _ = objective(corrupted, predictions, delayed)
     assert torch.allclose(loss_before, loss_after)
 
 def test_layerwise_dqn_all_out_of_run_pairs_yield_zero_loss() -> None:
@@ -58,26 +60,22 @@ def test_layerwise_dqn_all_out_of_run_pairs_yield_zero_loss() -> None:
         },
         batch_size=[3],
     )
-    out = TensorDict(
-        {
-            'action_value_layerwise': torch.randn(3, 2, 2),
-            'action_value_layerwise_target': torch.randn(3, 2, 2),
-        },
-        batch_size=[3],
-    )
+    predictions = TensorDict({'action_value_layerwise': torch.randn(3, 2, 2)}, batch_size=[3])
+    delayed = TensorDict({'action_value_layerwise': torch.randn(3, 2, 2)}, batch_size=[3])
     loss, metrics = LayerwiseDqnObjective(
         num_backbone_layers=2, gamma_step_start=0.0, gamma_step=0.99
-    )(step_stream, out)
+    )(step_stream, predictions, delayed)
     assert abs(loss.item()) < 1e-05
     assert abs(metrics['q_values_mean']) < 1e-05
 
 
 def test_layerwise_dqn_objective_rejects_layer_mismatch() -> None:
     step_stream = TensorDict({'action': torch.zeros(3, dtype=torch.long), 'reward': torch.zeros(3), 'episode_done': torch.zeros(3, dtype=torch.long), 'task_done': torch.zeros(3, dtype=torch.long)}, batch_size=[3])
-    out = TensorDict({'action_value_layerwise': torch.zeros(3, 2, 2), 'action_value_layerwise_target': torch.zeros(3, 2, 2)}, batch_size=[3])
+    predictions = TensorDict({'action_value_layerwise': torch.zeros(3, 2, 2)}, batch_size=[3])
+    delayed = TensorDict({'action_value_layerwise': torch.zeros(3, 2, 2)}, batch_size=[3])
     objective = LayerwiseDqnObjective(num_backbone_layers=3, gamma_step_start=0.0, gamma_step=0.99)
     try:
-        objective(step_stream, out)
+        objective(step_stream, predictions, delayed)
     except ValueError as exc:
         assert 'expects 3 Q layers' in str(exc)
     else:

@@ -8,6 +8,7 @@ from typing import Any
 
 import numpy as np
 import torch
+from tensordict import TensorDict
 
 
 @dataclass(frozen=True)
@@ -114,8 +115,8 @@ class TokenBatch:
     Built by :func:`pack_token_batch` from many :class:`StepTokens`. Length ``L``
     is the total number of tokens across all sequences and steps. Step-level
     fields use ``N = len(prediction_indices)`` (ragged windows allowed).
-    Per-sequence step counts are derived from ``objective_fields["sequence_id"]`` +
-    ``B`` (see :meth:`step_counts`); they are not stored separately.
+    Per-sequence step counts are derived from ``sequence_ids[prediction_indices]``
+    + ``B`` (see :meth:`step_counts`); they are not stored separately.
 
     Token type/kind is looked up via ``modality_map[modality_names[modality_ids[i]]]``:
 
@@ -131,7 +132,6 @@ class TokenBatch:
         sequence_ids: ``[L]`` int64 — which of the ``B`` sequences each token belongs to.
         grouping_ids: ``[L]`` int64 — attention group within the sequence.
         prediction_indices: ``[N]`` int64 — index of each step's prediction token.
-        objective_fields: step-level arrays for objectives.
         B: Number of sequences.
         grouping_field: Name of the grouping column.
     """
@@ -145,7 +145,6 @@ class TokenBatch:
     grouping_ids: np.ndarray
     prediction_indices: np.ndarray
     grouping_field: str
-    objective_fields: dict[str, np.ndarray] = field(default_factory=dict)
     B: int = 0
 
     def __post_init__(self) -> None:
@@ -176,26 +175,20 @@ class TokenBatch:
         pred = np.asarray(self.prediction_indices, dtype=np.int64).reshape(-1)
         object.__setattr__(self, "prediction_indices", pred)
         n = int(pred.shape[0])
+        if n > 0:
+            if L == 0:
+                raise ValueError("prediction_indices require L > 0 when N > 0")
+            if int(pred.min()) < 0 or int(pred.max()) >= L:
+                raise ValueError(
+                    f"prediction_indices must be in [0, {L}), got "
+                    f"min={int(pred.min())} max={int(pred.max())}"
+                )
         counts = self.step_counts()
         if int(counts.sum()) != n:
             raise ValueError(
                 f"prediction_indices length [{n}] must equal sum of step counts "
-                f"from sequence_id [{int(counts.sum())}] (B={self.B})"
+                f"from sequence_ids [{int(counts.sum())}] (B={self.B})"
             )
-        sid = self.objective_fields.get("sequence_id")
-        if n > 0:
-            if sid is None:
-                raise ValueError("objective_fields must include sequence_id when N > 0")
-            sid_arr = np.asarray(sid, dtype=np.int64).reshape(-1)
-            if sid_arr.shape != (n,):
-                raise ValueError(
-                    f"sequence_id must have shape [{n}], got {sid_arr.shape}"
-                )
-            if self.grouping_field not in self.objective_fields:
-                raise ValueError(
-                    f"objective_fields must include grouping_field {self.grouping_field!r} "
-                    "when N > 0"
-                )
 
     @property
     def L(self) -> int:
@@ -214,9 +207,12 @@ class TokenBatch:
         return int(counts.max()) if counts.size else 0
 
     def step_counts(self) -> np.ndarray:
-        """Steps per sequence ``[B]``, derived from ``objective_fields["sequence_id"]``."""
+        """Steps per sequence ``[B]``, from ``sequence_ids[prediction_indices]``."""
+        if self.N == 0:
+            return np.zeros(self.B, dtype=np.int64)
         return step_counts_from_sequence_id(
-            self.objective_fields.get("sequence_id"), self.B
+            np.asarray(self.sequence_ids, dtype=np.int64)[self.prediction_indices],
+            self.B,
         )
 
     def to_tensors(self, device: torch.device | str | None = None) -> dict[str, Any]:
@@ -229,14 +225,6 @@ class TokenBatch:
         def _float(a: np.ndarray) -> torch.Tensor:
             return torch.from_numpy(np.asarray(a, dtype=np.float32)).to(dev)
 
-        fields: dict[str, torch.Tensor] = {}
-        for k, v in self.objective_fields.items():
-            arr = np.asarray(v)
-            if np.issubdtype(arr.dtype, np.floating):
-                fields[k] = torch.from_numpy(arr.astype(np.float32)).to(dev)
-            else:
-                fields[k] = torch.from_numpy(arr.astype(np.int64)).to(dev)
-
         return {
             "modality_ids": _long(self.modality_ids),
             "ids": _long(self.ids),
@@ -246,7 +234,6 @@ class TokenBatch:
             "sequence_ids": _long(self.sequence_ids),
             "grouping_ids": _long(self.grouping_ids),
             "prediction_indices": _long(self.prediction_indices),
-            "objective_fields": fields,
             "B": self.B,
             "grouping_field": self.grouping_field,
         }
@@ -273,7 +260,6 @@ def empty_token_batch(
         grouping_ids=np.zeros(0, dtype=np.int64),
         prediction_indices=np.zeros(0, dtype=np.int64),
         grouping_field=grouping_field,
-        objective_fields={},
         B=B,
     )
 
@@ -337,26 +323,39 @@ def _stack_objective_fields(
     return out
 
 
+def _fields_to_tensordict(fields: dict[str, np.ndarray], n: int) -> TensorDict:
+    """CPU ``TensorDict[N]`` from stacked numpy objective columns."""
+    tensors: dict[str, torch.Tensor] = {}
+    for k, v in fields.items():
+        arr = np.asarray(v)
+        if np.issubdtype(arr.dtype, np.floating):
+            tensors[k] = torch.from_numpy(arr.astype(np.float32, copy=False))
+        else:
+            tensors[k] = torch.from_numpy(arr.astype(np.int64, copy=False))
+    return TensorDict(tensors, batch_size=[n])
+
+
 def pack_token_batch(
     steps: Sequence[StepTokens],
     *,
     sequence_ids: Sequence[int] | None = None,
     batch_size: int | None = None,
     grouping_field: str | None = None,
-) -> TokenBatch:
-    """Pack per-step :class:`StepTokens` into a flat :class:`TokenBatch`.
+) -> tuple[TokenBatch, TensorDict]:
+    """Pack per-step :class:`StepTokens` into model and objective inputs.
 
     All steps must share the same ``modality_names``, ``modality_map``, and
-    ``grouping_field``.
+    ``grouping_field``. Returns ``(inputs, objective_data)``.
     """
+    empty_objective = TensorDict({}, batch_size=[0])
     if not steps:
         if grouping_field is None:
             raise ValueError(
                 "pack_token_batch of empty steps requires grouping_field="
             )
         if batch_size is None:
-            return empty_token_batch(0, grouping_field=grouping_field)
-        return empty_token_batch(batch_size, grouping_field=grouping_field)
+            return empty_token_batch(0, grouping_field=grouping_field), empty_objective
+        return empty_token_batch(batch_size, grouping_field=grouping_field), empty_objective
 
     gf = steps[0].grouping_field
     names = steps[0].modality_names
@@ -416,11 +415,17 @@ def pack_token_batch(
         B = int(batch_size)
 
     if offset == 0:
-        return empty_token_batch(
-            B, grouping_field=gf, modality_names=names, modality_map=mmap
+        return (
+            empty_token_batch(
+                B, grouping_field=gf, modality_names=names, modality_map=mmap
+            ),
+            empty_objective,
         )
 
-    return TokenBatch(
+    fields = _stack_objective_fields(
+        steps, sequence_ids=seq_per_step, grouping_field=gf
+    )
+    inputs = TokenBatch(
         modality_ids=np.concatenate(modality_ids),
         ids=np.concatenate(ids),
         values=np.concatenate(values),
@@ -430,8 +435,6 @@ def pack_token_batch(
         grouping_ids=np.concatenate(grouping_ids),
         prediction_indices=np.asarray(prediction_indices, dtype=np.int64),
         grouping_field=gf,
-        objective_fields=_stack_objective_fields(
-            steps, sequence_ids=seq_per_step, grouping_field=gf
-        ),
         B=B,
     )
+    return inputs, _fields_to_tensordict(fields, inputs.N)

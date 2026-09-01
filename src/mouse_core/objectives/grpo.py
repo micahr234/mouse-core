@@ -73,8 +73,9 @@ class GrpoObjective(Objective):
                 {"input_field": "advantage"},
             ],
         )
-        predictions, objective_data, _ = model(batch)  # TokenBatch
-        loss, metrics = objective(objective_data, predictions)
+        inputs, objective_data = loader.next_batch()
+        predictions, _ = model(inputs)
+        loss, metrics = objective(objective_data.to(device), predictions)
 
     ``old_log_prob`` and ``advantage`` are objective columns only — not
     tokenizer input fields or embedder modalities.

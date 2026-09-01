@@ -117,9 +117,9 @@ def test_dataloader_applies_augmenter_before_returning_batch() -> None:
         num_workers=0,
         transform=compose(_stamp_task, augmenter, _stamp_grouping, _tokenizer()),
     )
-    tb = loader.next_batch()
+    tb, obj = loader.next_batch()
     assert isinstance(tb, TokenBatch)
-    assert all(int(a) == 0 for a in tb.objective_fields["action"])
+    assert all(int(a) == 0 for a in obj["action"])
 
 
 def test_dataloader_reseeds_transform_each_batch() -> None:
@@ -185,7 +185,7 @@ def test_dataloader_runs_transform_in_worker_thread() -> None:
         stores=_store_with_actions(),
     )
     try:
-        tb = loader.next_batch()
+        tb, _ = loader.next_batch()
     finally:
         loader.close()
     assert isinstance(tb, TokenBatch)
@@ -216,21 +216,22 @@ def test_dataloader_snapshots_loaded_source_and_appended_rows() -> None:
     )
     store.append({"action": 3, "reward": 0.0, "episode_done": 0, "task_done": 0})
     loader = _loader(sequence_length=3, batch_size=1, num_workers=0, seed=0, stores=store)
-    tb = loader.next_batch()
-    actions = [int(a) for a in tb.objective_fields["action"]]
+    tb, obj = loader.next_batch()
+    actions = [int(a) for a in obj["action"]]
     assert 1 <= len(actions) <= 3
     assert actions == list(range(actions[0], actions[0] + len(actions)))
     assert set(actions) <= {1, 2, 3}
 
 
-def _tb_signature(tb: TokenBatch) -> tuple:
+def _tb_signature(packed: tuple[TokenBatch, object]) -> tuple:
+    tb, obj = packed
     return (
         tb.B,
         tb.L,
         tb.N,
         tuple(tb.modality_ids.tolist()),
         tuple(tb.ids.tolist()),
-        tuple(np.asarray(tb.objective_fields["action"]).tolist()),
+        tuple(np.asarray(obj["action"].detach().cpu().numpy()).tolist()),
     )
 
 
@@ -282,13 +283,13 @@ def test_dataloader_refresh_picks_up_appended_rows() -> None:
     loader = _loader(sequence_length=3, batch_size=1, num_workers=0, stores=store)
     loader.next_batch()
     store.append({"action": 4, "reward": 0.0, "episode_done": 0, "task_done": 0})
-    batch_before_refresh = loader.next_batch()
-    assert all(int(a) != 4 for a in batch_before_refresh.objective_fields["action"])
+    _, obj_before = loader.next_batch()
+    assert all(int(a) != 4 for a in obj_before["action"])
     loader.refresh()
     seen: set[int] = set()
     for _ in range(40):
-        tb = loader.next_batch()
-        seen.update(int(a) for a in tb.objective_fields["action"])
+        _, obj = loader.next_batch()
+        seen.update(int(a) for a in obj["action"])
     assert 4 in seen
 
 
@@ -313,10 +314,10 @@ def test_dataloader_ragged_windows_up_to_max_length() -> None:
     for action in (1, 2, 3):
         store.append({"action": action, "reward": 0.0, "episode_done": 0, "task_done": 0})
     loader = _loader(sequence_length=8, batch_size=1, num_workers=0, seed=0, stores=store)
-    tb = loader.next_batch()
+    tb, obj = loader.next_batch()
     n = int(tb.step_counts()[0])
     assert 1 <= n <= 3
-    actions = [int(a) for a in tb.objective_fields["action"]]
+    actions = [int(a) for a in obj["action"]]
     assert actions == list(range(actions[0], actions[0] + len(actions)))
 
 
@@ -324,9 +325,9 @@ def test_dataloader_allows_short_stores() -> None:
     store = Datastore()
     store.append({"action": 7, "reward": 1.0, "episode_done": 0, "task_done": 0})
     loader = _loader(sequence_length=4, batch_size=1, num_workers=0, stores=store)
-    tb = loader.next_batch()
+    tb, obj = loader.next_batch()
     assert int(tb.step_counts()[0]) == 1
-    assert int(tb.objective_fields["action"][0]) == 7
+    assert int(obj["action"][0]) == 7
 
 
 def test_dataloader_allows_empty_stores_until_sampling() -> None:
@@ -337,7 +338,7 @@ def test_dataloader_allows_empty_stores_until_sampling() -> None:
             loader.next_batch()
         store.append({"action": 1, "reward": 0.0, "episode_done": 0, "task_done": 0})
         loader.refresh()
-        tb = loader.next_batch()
+        tb, _ = loader.next_batch()
         assert int(tb.step_counts()[0]) == 1
     finally:
         loader.close()
@@ -359,14 +360,14 @@ def test_dataloader_transform_returns_token_batch() -> None:
         stores=_store_with_actions(),
     )
     try:
-        tb = loader.next_batch()
+        tb, obj = loader.next_batch()
         assert tb.B == 2
         assert int(tb.step_counts().sum()) == tb.N
         assert tb.N >= 2
         assert all(1 <= int(n) <= 3 for n in tb.step_counts())
-        embeds, step_fields, prediction_indices = encoder(tb)
+        embeds, prediction_indices = encoder(tb)
         assert embeds.shape == (tb.L, 8)
         assert prediction_indices.shape == (tb.N,)
-        assert "sequence_id" in step_fields
+        assert "sequence_id" in obj.keys()
     finally:
         loader.close()

@@ -26,10 +26,10 @@ def test_discrete_action_head_save_load_roundtrip(tmp_path) -> None:
     encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4}, {"type": 'fourier', "field": "reward"}])
     model = Model(encoder=encoder, backbone=IdentityBackbone(hidden_dim=hidden_dim), heads=DiscreteActionHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1)).eval()
     batch = [[{'action': 0, 'reward': 0.0}, {'action': 1, 'reward': 1.0}]]
-    expected, _, _ = model(batch_to_token_batch(_tok(model.encoder), batch))
+    expected, _ = model(batch_to_token_batch(_tok(model.encoder), batch))
     save_model(model, tmp_path)
     loaded = load_model(tmp_path).eval()
-    actual, _, _ = loaded(batch_to_token_batch(_tok(loaded.encoder), batch))
+    actual, _ = loaded(batch_to_token_batch(_tok(loaded.encoder), batch))
     assert torch.allclose(actual['action'], expected['action'])
     assert loaded.action_head == 'action'
     with (tmp_path / 'config.json').open() as fh:

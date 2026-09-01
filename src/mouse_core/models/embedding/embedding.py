@@ -44,8 +44,8 @@ class Encoder(nn.Module, ABC):
     @abstractmethod
     def forward(
         self, token_batch: TokenBatch
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor], torch.Tensor]:
-        """Embed ``TokenBatch`` → ``(embeds [L, D], objective_fields, prediction_indices [N])``."""
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Embed ``TokenBatch`` → ``(embeds [L, D], prediction_indices [N])``."""
         ...
 
     @abstractmethod
@@ -160,7 +160,7 @@ class NumericEmbedder(Encoder):
 
     def forward(
         self, token_batch: TokenBatch
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor], torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         try:
             device = next(self.parameters()).device
             dtype = next(self.parameters()).dtype
@@ -194,9 +194,7 @@ class NumericEmbedder(Encoder):
                         feat = feat * (mod_std / self.std)
                     embeds[mask] = feat.to(dtype=dtype)
 
-        objective_fields = dict(t["objective_fields"])
-        prediction_indices = t["prediction_indices"]
-        return embeds, objective_fields, prediction_indices
+        return embeds, t["prediction_indices"]
 
     def pool_step_reprs(self, h: torch.Tensor, prediction_indices: torch.Tensor) -> torch.Tensor:
         D = self._hidden_dim

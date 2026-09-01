@@ -3,9 +3,9 @@ from __future__ import annotations
 import json
 import tempfile
 from collections.abc import Mapping
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.nn as nn
@@ -19,6 +19,9 @@ from mouse_core.models.heads.discrete_action import DiscreteActionHead
 from mouse_core.models.heads.dqn import DiscreteActionValueHead
 from mouse_core.models.heads.layerwise_dqn import LayerwiseDiscreteActionValueHead
 from mouse_core.models.heads.swiglu import SwiGLUHead
+
+if TYPE_CHECKING:
+    from mouse_core.data.token_batch import TokenBatch
 
 def _backbone_num_layers(backbone: nn.Module) -> int | None:
     """Return transformer block count when the backbone exposes block layers."""
@@ -222,18 +225,19 @@ eval_transform = tokenizer  # plus compose(selector, tokenizer) as needed
 
 with torch.no_grad():
     steps = [eval_transform(step) for step in batch[0]]
-    token_batch = pack_token_batch(steps, sequence_ids=[0] * len(steps))
-    predictions, _, cache = model(token_batch)
+    inputs, _ = pack_token_batch(steps, sequence_ids=[0] * len(steps))
+    predictions, averager_inputs = model(inputs)
     action = model.get_action(predictions, temperature=0.0)
 ```
 
-`model()` returns `(predictions, objective_data, cache)`. `objective_data` is a
-`TensorDict[B, S]` of the tokenizer `objective_fields` extracted by the encoder — pass it
-to objectives during training. For cached incremental rollout, keep `cache` and
-pass it back on the next call with `use_cache=True`. Cached batch rows may have
-different lengths on every call (e.g. envs emitting different numbers of steps
-between model calls): decoding runs through a FlexAttention session carried in
-the cache, so each row decodes exactly as it would alone.
+`model()` returns `(predictions, averager_inputs)`. `pack_token_batch` /
+`DataLoader.next_batch()` return `(inputs, objective_data)`; pass
+`objective_data` to objectives during training. For cached incremental
+rollout, pass ``averager_inputs`` back as ``cache=`` with `use_cache=True`.
+Cached batch rows may have different
+lengths on every call (e.g. envs emitting different numbers of steps between
+model calls): decoding runs through a FlexAttention session carried in the
+cache, so each row decodes exactly as it would alone.
 """
     path.write_text(text, encoding="utf-8")
 
@@ -315,8 +319,8 @@ batch = [[
     }}
 ]]
 steps = [eval_transform(batch[0][0])]  # per-step StepTokens; pack_token_batch for many
-token_batch = pack_token_batch(steps, sequence_ids=[0])
-predictions, objective_data, cache = model(token_batch)"""
+inputs, objective_data = pack_token_batch(steps, sequence_ids=[0])
+predictions, averager_inputs = model(inputs)"""
 
 
 def _model_card_field_example(modality: dict[str, Any]) -> str:
@@ -620,6 +624,47 @@ def _build_heads_from_config(heads: list[dict[str, Any]]) -> dict[str, BaseHead]
     return built
 
 
+def _run_heads(
+    heads: dict[str, BaseHead],
+    h: torch.Tensor,
+    batch_size: tuple[int, ...] | None,
+) -> TensorDict:
+    """Run ``heads`` on pooled ``h``. Layerwise ``h`` is ``[N, L, D]`` or ``[B, L, S, D]``."""
+    if batch_size is None:
+        if "action_value_layerwise" in heads:
+            if h.ndim == 3:
+                batch_size = (int(h.shape[0]),)
+            elif h.ndim == 4:
+                batch_size = (int(h.shape[0]), int(h.shape[2]))
+            else:
+                batch_size = tuple(h.shape[:-1])
+        else:
+            batch_size = tuple(h.shape[:-1])
+    h = h.float()
+    tensors: dict[str, torch.Tensor] = {}
+    for name, head_fn in heads.items():
+        tensors[name] = head_fn.forward(h)
+    return TensorDict(tensors, batch_size=batch_size)
+
+
+@dataclass
+class AveragerInputs:
+    """Per-forward extras for delayed Q and incremental decode.
+
+    Pass to :class:`~mouse_core.polyak.PolyakAverager`: head scope uses ``h``,
+    model scope uses ``batch``. Incremental decode uses ``cache`` (or pass this
+    object back as ``cache=``). ``h`` is always detached so gradients cannot
+    flow back through the averager.
+    """
+
+    h: torch.Tensor
+    batch: TokenBatch
+    cache: dict[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        self.h = self.h.detach()
+
+
 class Model(nn.Module):
     """Composable MOUSE model: encoder, backbone, and heads as distinct sections.
 
@@ -655,8 +700,10 @@ class Model(nn.Module):
         model = Model(encoder=encoder, backbone=backbone, heads=heads)
 
     The backbone is independent; it does not know about the encoder or heads.
-    DQN target Q is a delayed :class:`~mouse_core.polyak.PolyakAverager` copy,
-    not a second stack inside this module.
+    DQN target Q is ``averager(averager_inputs)`` where ``averager_inputs``
+    comes from that same ``model(inputs)`` call. Pooled head input
+    is ``averager_inputs.h`` (last-layer ``[N, D]``, or stacked layers
+    ``[N, L, D]`` when a layerwise head is enabled).
     """
 
     _VALID_HEADS = ("action_value", "action_value_layerwise", "action", "value")
@@ -910,23 +957,21 @@ class Model(nn.Module):
         session_out: torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, ...]],
         prediction_indices: torch.Tensor,
         needs_layerwise: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Pool backbone hidden states to per-step representations."""
+    ) -> torch.Tensor:
+        """Pool backbone hidden states to the tensor :meth:`head` consumes."""
         if needs_layerwise:
-            h, layer_hiddens = cast(
+            _, layer_hiddens = cast(
                 tuple[torch.Tensor, tuple[torch.Tensor, ...]], session_out
             )
-            h_step = encoder.pool_step_reprs(h, prediction_indices)
-            h_layers = torch.stack(
+            return torch.stack(
                 [
                     encoder.pool_step_reprs(layer_h, prediction_indices)
                     for layer_h in layer_hiddens
                 ],
                 dim=1,
             )
-            return h_step, h_layers
         h = cast(torch.Tensor, session_out)
-        return encoder.pool_step_reprs(h, prediction_indices), None
+        return encoder.pool_step_reprs(h, prediction_indices)
 
     # ------------------------------------------------------------------
     # Forward
@@ -935,24 +980,26 @@ class Model(nn.Module):
     def forward(
         self,
         batch: TokenBatch,
-        cache: dict[str, Any] | None = None,
+        cache: dict[str, Any] | AveragerInputs | None = None,
         use_cache: bool = False,
-    ) -> tuple[TensorDict, TensorDict, dict[str, Any] | None]:
+    ) -> tuple[TensorDict, AveragerInputs]:
         """Run a full forward pass over a :class:`TokenBatch`.
 
-        Training: pass a ``TokenBatch`` from ``DataLoader(transform=...)``.
-        Online / inference: ``model(pack_token_batch([eval_transform(step)],
-        sequence_ids=[0]), use_cache=True)`` or
-        ``model(pack_token_batch(steps, sequence_ids=...), use_cache=True)``
-        (optionally ragged; empty-only batches raise).
+        Training: ``inputs, objective_data = loader.next_batch()`` then
+        ``predictions, averager_inputs = model(inputs)``. Delayed DQN
+        targets are ``averager(averager_inputs)``. Online / inference:
+        ``inputs, _ = pack_token_batch([eval_transform(step)],
+        sequence_ids=[0])`` then ``model(inputs, use_cache=True)``
+        (optionally ragged; empty-only batches raise). Pass the returned
+        :class:`AveragerInputs` (or its ``.cache``) back as ``cache=``.
 
         Training attention uses FlexAttention over the flat concatenated token
         stream (causal within the same ``(sequence_id, grouping_id)`` run). Cached
         decode keeps ``FlexDecodeSession`` with per-sequence KV caches and the
         same grouping-id isolation.
 
-        Predictions / ``objective_data`` are flat over steps (``N`` steps) for
-        training; cached decode returns rectangular ``[B, S]`` tensors.
+        Predictions are flat over steps (``N`` steps) for training; cached
+        decode returns rectangular ``[B, S]`` tensors.
         """
         from mouse_core.data.token_batch import TokenBatch as _TokenBatch
 
@@ -962,6 +1009,8 @@ class Model(nn.Module):
                 "Use pack_token_batch([transform(step)], ...) "
                 "or DataLoader(transform=...)."
             )
+        if isinstance(cache, AveragerInputs):
+            cache = cache.cache
         if cache is not None and not use_cache:
             raise ValueError("Passing cache= requires use_cache=True.")
 
@@ -974,18 +1023,12 @@ class Model(nn.Module):
         if use_cache and B > 0 and N == 0:
             raise ValueError("Model.forward requires at least one non-empty row in batch.")
 
-        embeds, objective_fields, prediction_indices = self.encoder(token_batch)
+        embeds, prediction_indices = self.encoder(token_batch)
         # embeds: [L, D]; prediction_indices: [N]
-        if any(value.device != embeds.device for value in objective_fields.values()):
-            objective_fields = {
-                key: value.to(embeds.device) for key, value in objective_fields.items()
-            }
 
         t = token_batch.to_tensors(embeds.device)
         sequence_ids = t["sequence_ids"]
         grouping_ids = t["grouping_ids"]
-        if "sequence_id" not in objective_fields and N > 0:
-            raise ValueError("objective_fields must include sequence_id when N > 0")
 
         needs_layerwise = "action_value_layerwise" in self._heads
         new_cache: dict[str, Any] | None
@@ -1026,12 +1069,7 @@ class Model(nn.Module):
                 grouping_ids=flex_grouping_ids,
             )
             new_cache = {"session": session}
-            h_source_batched = True
             pred_batch_size: tuple[int, ...] = (B, S_max)
-            # Rectangular objective_data for decode (left-pad short rows).
-            objective_data = _rect_objective_data(
-                objective_fields, step_counts_np, B, S_max, embeds.device
-            )
         else:
             # Training: Flex packed on CUDA; SDPA mask fallback on CPU (no Flex backward).
             session_out = self._train_backbone_forward(
@@ -1042,42 +1080,27 @@ class Model(nn.Module):
                 needs_layerwise,
             )
             new_cache = None
-            h_source_batched = False
             pred_batch_size = (N,)
-            objective_data = TensorDict(objective_fields, batch_size=[N])
 
-        h_step, h_layers = self._pool_backbone_out(
+        h = self._pool_backbone_out(
             self.encoder, session_out, prediction_indices, needs_layerwise
         )
-        predictions = self.head(
-            h=h_step,
-            batch_size=pred_batch_size,
-            h_layers=h_layers,
-        )
-        return predictions, objective_data, new_cache
+        predictions = self.head(h=h, batch_size=pred_batch_size)
+        return predictions, AveragerInputs(h=h, batch=token_batch, cache=new_cache)
 
     def head(
         self,
         *,
         h: torch.Tensor,
-        batch_size: tuple[int, ...],
-        h_layers: torch.Tensor | None = None,
+        batch_size: tuple[int, ...] | None = None,
     ) -> TensorDict:
-        """Run enabled heads on step representations ``[N, D]`` or ``[B, S, D]``."""
-        h = h.float()
-        if h_layers is not None:
-            h_layers = h_layers.float()
-        tensors: dict[str, torch.Tensor] = {}
-        for name, head_fn in self._heads.items():
-            if name == "action_value_layerwise":
-                if h_layers is None:
-                    raise ValueError("action_value_layerwise head requires h_layers from Model.forward.")
-                tensors["action_value_layerwise"] = head_fn.forward(h_layers)
-            elif name == "action_value":
-                tensors["action_value"] = head_fn.forward(h)
-            else:
-                tensors[name] = head_fn.forward(h)
-        return TensorDict(tensors, batch_size=batch_size)
+        """Run enabled heads on pooled ``h``.
+
+        Regular heads take last-layer ``[N, D]`` or ``[B, S, D]``. A layerwise
+        Q head takes stacked layers ``[N, L, D]`` or ``[B, L, S, D]``.
+        ``batch_size`` defaults from ``h`` (step axis only for layerwise).
+        """
+        return _run_heads(self._heads, h, batch_size)
 
     def get_action(
         self,
@@ -1132,42 +1155,6 @@ def preferred_dtype(device: torch.device | str | None = None) -> torch.dtype:
     if device.type == "cuda":
         return torch.bfloat16
     return torch.float32
-
-
-def _rect_objective_data(
-    objective_fields: dict[str, torch.Tensor],
-    step_counts: Any,
-    B: int,
-    S: int,
-    device: torch.device,
-) -> TensorDict:
-    """Left-pad flat ``[N]`` objective_fields into rectangular ``[B, S]`` for decode."""
-    import numpy as np
-
-    counts = np.asarray(step_counts, dtype=np.int64).reshape(-1)
-    rect: dict[str, torch.Tensor] = {}
-    for key, flat in objective_fields.items():
-        if flat.ndim == 1:
-            out = flat.new_zeros(B, S)
-        else:
-            out = flat.new_zeros(B, S, *flat.shape[1:])
-        offset = 0
-        for b in range(B):
-            n = int(counts[b])
-            if n == 0:
-                continue
-            # Left-pad: real steps occupy trailing columns.
-            out[b, S - n :] = flat[offset : offset + n]
-            offset += n
-        rect[key] = out
-    if "sequence_id" not in rect and B > 0 and S > 0:
-        sid = torch.zeros(B, S, device=device, dtype=torch.long)
-        for b in range(B):
-            n = int(counts[b])
-            if n > 0:
-                sid[b, S - n :] = b
-        rect["sequence_id"] = sid
-    return TensorDict(rect, batch_size=(B, S))
 
 
 def _flat_to_batched_left_pad(

@@ -1,9 +1,14 @@
-"""Polyak averaging of a delayed model, used next to the optimizer.
+"""Polyak averaging of delayed DQN heads (or a delayed full model).
 
-DQN target Q comes from a second ``Model`` owned by :class:`PolyakAverager`.
-After each ``optimizer.step()``, call :meth:`PolyakAverager.update`. Before the
-loss, call :meth:`PolyakAverager.write_targets` so the objective sees
-``action_value_target`` (or ``action_value_layerwise_target``).
+After each ``optimizer.step()``, call :meth:`PolyakAverager.update`.
+After the online forward::
+
+    predictions, averager_inputs = model(inputs)
+    delayed_predictions = averager(averager_inputs)
+
+``scope="head"`` runs delayed heads on ``averager_inputs.h``.
+``scope="model"`` recomputes representations through a delayed copy of the
+full stack on ``averager_inputs.batch``.
 """
 
 from __future__ import annotations
@@ -15,14 +20,10 @@ import torch
 import torch.nn as nn
 from tensordict import TensorDict
 
-from mouse_core.data.token_batch import TokenBatch
-from mouse_core.models.base import Model
+from mouse_core.models.base import AveragerInputs, Model, _run_heads
+from mouse_core.models.heads.base import BaseHead
 
 _DQN_HEADS = ("action_value", "action_value_layerwise")
-_TARGET_KEY = {
-    "action_value": "action_value_target",
-    "action_value_layerwise": "action_value_layerwise_target",
-}
 
 
 def _polyak_copy(online: nn.Module, delayed: nn.Module, tau: float) -> None:
@@ -33,19 +34,39 @@ def _polyak_copy(online: nn.Module, delayed: nn.Module, tau: float) -> None:
         delayed_p.data.copy_(tau * online_p.data + (1.0 - tau) * delayed_p.data)
 
 
-class PolyakAverager:
-    """Delayed copy of ``model`` for TD bootstrap targets.
+class _DelayedHeads(nn.Module):
+    """Frozen copy of ``Model.heads`` with the same ``.head(h=)`` entry point."""
 
-    Construct after ``model.to(...)``. The delayed network stays in ``eval``.
+    def __init__(self, heads: nn.ModuleDict) -> None:
+        super().__init__()
+        self.heads = heads
+        self._heads: dict[str, BaseHead] = {str(name): heads[name] for name in heads}
+
+    def head(
+        self,
+        *,
+        h: torch.Tensor,
+        batch_size: tuple[int, ...] | None = None,
+    ) -> TensorDict:
+        return _run_heads(self._heads, h, batch_size)
+
+
+class PolyakAverager:
+    """Delayed DQN weights for TD bootstrap targets.
+
+    Construct after ``model.to(...)``. After the online forward, delayed Q is
+    ``averager(averager_inputs)``.     ``scope="head"`` copies only the heads;
+    ``scope="model"`` copies the full encoder/backbone/heads stack.
+    Delayed modules run in ``train()`` under ``no_grad``.
+    Call :meth:`update` after each ``optimizer.step()``.
 
     Args:
         model: Online model (must have an ``action_value`` or
             ``action_value_layerwise`` head).
-        scope: ``"head"`` snaps encoder/backbone to the current weights on
-            every :meth:`write_targets` and Polyak-averages only the heads on
-            :meth:`update`. ``"model"`` Polyak-averages encoder, backbone, and
-            heads; :meth:`write_targets` recomputes representations through
-            those delayed weights.
+        scope: ``"head"`` Polyak-averages only the heads on :meth:`update`
+            and reads ``averager_inputs.h``. ``"model"`` Polyak-averages
+            encoder, backbone, and heads and recomputes representations
+            from ``averager_inputs.batch``.
         tau: Interpolation factor in ``[0, 1]`` applied on :meth:`update`.
     """
 
@@ -62,36 +83,41 @@ class PolyakAverager:
             raise ValueError(
                 "PolyakAverager requires a DQN-style action-value head."
             )
-        self.model = model
+        self._online = model
         self.scope: Literal["head", "model"] = scope
         self.tau = float(tau)
-        self.delayed = copy.deepcopy(model)
-        self.delayed.requires_grad_(False)
-        self.delayed.eval()
+        if scope == "head":
+            delayed_heads = copy.deepcopy(model.heads)
+            delayed_heads.requires_grad_(False)
+            self.model: Model | _DelayedHeads = _DelayedHeads(delayed_heads)
+        else:
+            self.model = copy.deepcopy(model)
+            self.model.requires_grad_(False)
+        self.model.train()
+
+    def __call__(self, averager_inputs: AveragerInputs) -> TensorDict:
+        """Delayed head outputs from a :class:`~mouse_core.models.base.AveragerInputs`.
+
+        ``scope="head"`` applies delayed heads to ``averager_inputs.h`` (no
+        second encoder/backbone pass). ``scope="model"`` runs the delayed
+        stack on ``averager_inputs.batch``. Both run in ``train()`` under
+        ``torch.no_grad()``.
+        """
+        if not isinstance(averager_inputs, AveragerInputs):
+            raise TypeError(
+                "averager(...) expects AveragerInputs from model(inputs), "
+                f"got {type(averager_inputs).__name__}."
+            )
+        self.model.train()
+        with torch.no_grad():
+            if self.scope == "model":
+                delayed, _ = self.model(averager_inputs.batch)
+                return delayed
+            return self.model.head(h=averager_inputs.h.detach())
 
     def update(self) -> None:
         """Move delayed weights toward the online model after an optimizer step."""
         if self.scope == "model":
-            _polyak_copy(self.model, self.delayed, self.tau)
+            _polyak_copy(self._online, self.model, self.tau)
             return
-        _polyak_copy(self.model.heads, self.delayed.heads, self.tau)
-
-    def write_targets(self, batch: TokenBatch, predictions: TensorDict) -> TensorDict:
-        """Run the delayed model and write ``*_target`` keys into ``predictions``.
-
-        When ``scope == "head"``, encoder and backbone are copied from the
-        online model first so target Q uses current representations and
-        delayed heads. When ``scope == "model"``, the delayed encoder and
-        backbone are left as last :meth:`update`'d, so representations are
-        recomputed through delayed weights.
-        """
-        if self.scope == "head":
-            _polyak_copy(self.model.encoder, self.delayed.encoder, tau=1.0)
-            _polyak_copy(self.model.backbone, self.delayed.backbone, tau=1.0)
-        self.delayed.eval()
-        with torch.no_grad():
-            delayed_pred, _, _ = self.delayed(batch)
-        for name, target_key in _TARGET_KEY.items():
-            if name in delayed_pred.keys():
-                predictions[target_key] = delayed_pred[name]
-        return predictions
+        _polyak_copy(self._online.heads, self.model.heads, self.tau)

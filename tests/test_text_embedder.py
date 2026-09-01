@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 from mouse_core.data import TextTokenizer
-from tests._token_batch_helpers import batch_to_token_batch
+from tests._token_batch_helpers import batch_to_packed, batch_to_token_batch
 from mouse_core.models import Model
 from mouse_core.models.backbone import IdentityBackbone
 from mouse_core.models.embedding import TextEmbedder
@@ -86,10 +86,11 @@ def test_text_embedder_skip_omits_value_keeps_commas() -> None:
             {"observation": 2, "action": 1, "reward": 1.0, "episode_done": 1, "task_done": 0},
         ]
     ]
-    embeds, step_fields, indices = enc(batch_to_token_batch(tokenizer, batch))
-    assert step_fields["reward"].dtype == torch.float32
-    assert step_fields["action"].dtype == torch.int64
-    assert step_fields["reward"].tolist() == [0.0, 1.0]
+    tb, obj = batch_to_packed(tokenizer, batch)
+    embeds, indices = enc(tb)
+    assert obj["reward"].dtype == torch.float32
+    assert obj["action"].dtype == torch.int64
+    assert obj["reward"].tolist() == [0.0, 1.0]
     assert embeds.ndim == 2 and embeds.shape[1] == 8
     c0 = int(indices[0].item()) + 1
     c1 = int(indices[1].item()) - int(indices[0].item())
@@ -111,7 +112,7 @@ def test_text_embedder_skip_omits_value_keeps_commas() -> None:
         emb.weight.zero_()
         emb.weight[0] = 7.0
     tokenizer2, enc2 = _text_pair(tokenizer=_CaptureTok(), embed_tokens=emb)
-    out, _, _ = enc2(
+    out, _ = enc2(
         batch_to_token_batch(tokenizer2, [[{"observation": 1, "action": 0, "reward": 0.0, "episode_done": 0, "task_done": 0}]])
     )
     assert seen == ["<action=", ",observation=1,,>"]
@@ -131,7 +132,7 @@ def test_token_modality_is_single_embed_row() -> None:
         format="{action}",
         modalities=[{"type": 'token', "field": "action"}],
     )
-    embeds, _, indices = enc(batch_to_token_batch(tokenizer, [[{"action": 16}]]))
+    embeds, indices = enc(batch_to_token_batch(tokenizer, [[{"action": 16}]]))
     assert embeds.shape[0] == 1
     assert int(indices[0].item()) == 0
     assert torch.equal(embeds[0], emb.weight[16])
@@ -200,8 +201,9 @@ def test_text_embedder_image_token_ids() -> None:
         objective_fields=_obj("observation", "pixels"),
     )
     batch = [[{"observation": 3, "pixels": [1, 2, 3]}]]
-    embeds, step_fields, indices = enc(batch_to_token_batch(tokenizer, batch))
-    assert "pixels" in step_fields
+    tb, obj = batch_to_packed(tokenizer, batch)
+    embeds, indices = enc(tb)
+    assert "pixels" in obj.keys()
     assert embeds.ndim == 2 and embeds.shape[1] == D
     assert int(indices[0].item()) + 1 == embeds.shape[0]
 

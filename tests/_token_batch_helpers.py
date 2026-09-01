@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import asdict, is_dataclass
 
+from tensordict import TensorDict
+
 from mouse_core.data import NumericTokenizer, compose, pack_token_batch
 from mouse_core.data.token_batch import StepTokens, TokenBatch
 
@@ -67,13 +69,13 @@ def _ensure_grouping_field(step: dict, grouping_field: str) -> dict:
     return out
 
 
-def batch_to_token_batch(
+def batch_to_packed(
     tokenizer: Callable[[dict], StepTokens],
     batch: list[list[dict]],
     *,
     grouping_field: str = DEFAULT_GROUPING_FIELD,
-) -> TokenBatch:
-    """Tokenize a ragged ``list[list[dict]]`` with per-step transform + pack."""
+) -> tuple[TokenBatch, TensorDict]:
+    """Tokenize a ragged ``list[list[dict]]`` into ``(inputs, objective_data)``."""
     transform = compose(
         lambda step: _ensure_grouping_field(step, grouping_field),
         tokenizer,
@@ -90,3 +92,16 @@ def batch_to_token_batch(
         batch_size=len(batch),
         grouping_field=grouping_field,
     )
+
+
+def batch_to_token_batch(
+    tokenizer: Callable[[dict], StepTokens],
+    batch: list[list[dict]],
+    *,
+    grouping_field: str = DEFAULT_GROUPING_FIELD,
+) -> TokenBatch:
+    """Tokenize a ragged ``list[list[dict]]`` to model inputs only."""
+    inputs, _ = batch_to_packed(
+        tokenizer, batch, grouping_field=grouping_field
+    )
+    return inputs

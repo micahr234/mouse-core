@@ -147,7 +147,7 @@ class TextEmbedder(Encoder):
 
     def forward(
         self, token_batch: TokenBatch
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor], torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         device = self.embed_tokens.weight.device
         dtype = self.embed_tokens.weight.dtype
         t = token_batch.to_tensors(device)
@@ -181,9 +181,7 @@ class TextEmbedder(Encoder):
                 if bool(mask.any()):
                     embeds[mask] = self.embed_tokens(ids[mask]).to(dtype=dtype)
 
-        objective_fields = dict(t["objective_fields"])
-        prediction_indices = t["prediction_indices"]
-        return embeds, objective_fields, prediction_indices
+        return embeds, t["prediction_indices"]
 
     def pool_step_reprs(self, h: torch.Tensor, prediction_indices: torch.Tensor) -> torch.Tensor:
         D = self._hidden_dim

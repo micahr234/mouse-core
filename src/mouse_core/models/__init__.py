@@ -1,4 +1,11 @@
-from mouse_core.models.base import Model, load_model, preferred_dtype, save_model, push_model_to_hub
+from mouse_core.models.base import (
+    AveragerInputs,
+    Model,
+    load_model,
+    preferred_dtype,
+    save_model,
+    push_model_to_hub,
+)
 from mouse_core.models.backbone import Backbone, LlamaBackbone, Qwen3Backbone, IdentityBackbone
 from mouse_core.models.heads import (
     BaseHead,
@@ -19,6 +26,7 @@ from mouse_core.models.embedding.text import TextEmbedder
 from mouse_core.models.kv_policy import cache_needs_rebuild, rebuild_starts, resolve_cache_bounds
 
 __all__ = [
+    "AveragerInputs",
     "Model",
     "load_model",
     "preferred_dtype",
