@@ -56,19 +56,24 @@ def _gae_advantages(
         gae_lambda: GAE λ.
 
     Returns:
-        ``(advantages, returns)`` each ``[N-1]``. Invalid positions are zero.
+        ``(advantages, returns)`` each ``[N-1]``, detached from autograd:
+        both are regression / weighting targets, so the policy surrogate must
+        not differentiate through the value head via the advantage. Invalid
+        positions are zero.
     """
-    T = rewards.shape[0]
-    device = rewards.device
-    dtype = rewards.dtype
-    advantages = torch.zeros(T, device=device, dtype=dtype)
-    gae = torch.zeros((), device=device, dtype=dtype)
-    for t in range(T - 1, -1, -1):
-        delta = rewards[t] + discounts[t] * values[t + 1] - values[t]
-        gae = delta + discounts[t] * gae_lambda * gae
-        gae = torch.where(valid[t], gae, torch.zeros_like(gae))
-        advantages[t] = gae
-    returns = advantages + values[:-1]
+    with torch.no_grad():
+        values = values.detach()
+        T = rewards.shape[0]
+        device = rewards.device
+        dtype = rewards.dtype
+        advantages = torch.zeros(T, device=device, dtype=dtype)
+        gae = torch.zeros((), device=device, dtype=dtype)
+        for t in range(T - 1, -1, -1):
+            delta = rewards[t] + discounts[t] * values[t + 1] - values[t]
+            gae = delta + discounts[t] * gae_lambda * gae
+            gae = torch.where(valid[t], gae, torch.zeros_like(gae))
+            advantages[t] = gae
+        returns = advantages + values[:-1]
     return advantages, returns
 
 

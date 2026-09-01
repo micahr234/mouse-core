@@ -172,9 +172,7 @@ class _ThreadMarkerTransform:
 
 @pytest.mark.skipif(not _free_threading_ok(), reason="free-threading (GIL disabled) required")
 def test_dataloader_runs_transform_in_worker_thread() -> None:
-    marker = _ThreadMarkerTransform(
-        _tokenizer(objective_fields=_obj("action", "reward", "transform_thread"))
-    )
+    marker = _ThreadMarkerTransform(_tokenizer(objective_fields=_obj("action", "reward")))
     loader = DataLoader(
         sequence_length=3,
         batch_size=2,
@@ -191,6 +189,49 @@ def test_dataloader_runs_transform_in_worker_thread() -> None:
     assert isinstance(tb, TokenBatch)
     assert marker.captured
     assert all(row["transform_thread"] == "DataLoader-0" for row in marker.captured)
+
+
+@pytest.mark.skipif(not _free_threading_ok(), reason="free-threading (GIL disabled) required")
+def test_dataloader_worker_error_surfaces_even_with_full_prefetch_queue() -> None:
+    """A transform that fails after a few good batches must raise the real error."""
+    tokenizer = _tokenizer()
+    calls = 0
+    lock = threading.Lock()
+
+    def _failing(step: dict) -> StepTokens:
+        nonlocal calls
+        with lock:
+            calls += 1
+            n = calls
+        if n > 6:
+            raise ValueError("boom from worker")
+        return tokenizer(_stamp_grouping(step))
+
+    loader = DataLoader(
+        sequence_length=1,
+        batch_size=1,
+        num_workers=1,
+        prefetch=2,
+        seed=0,
+        transform=_failing,
+        stores=_store_with_actions(),
+    )
+    try:
+        with pytest.raises(RuntimeError, match="prefetch worker raised") as info:
+            for _ in range(20):
+                loader.next_batch()
+        assert isinstance(info.value.__cause__, ValueError)
+        assert "boom from worker" in str(info.value.__cause__)
+    finally:
+        loader.close()
+
+
+def test_dataloader_validates_batch_size_and_prefetch() -> None:
+    store = _store_with_actions()
+    with pytest.raises(ValueError, match="batch_size must be >= 1"):
+        _loader(sequence_length=3, batch_size=0, num_workers=0, stores=store)
+    with pytest.raises(ValueError, match="prefetch must be >= 1"):
+        _loader(sequence_length=3, batch_size=1, num_workers=0, prefetch=0, stores=store)
 
 
 def test_dataloader_num_workers_requires_free_threading() -> None:

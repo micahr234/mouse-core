@@ -20,9 +20,11 @@ How it works:
   computed-and-discarded, so each sequence's decode cost scales with its own
   history rather than the batch maximum.
 * RoPE positions are per-``(sequence, grouping_id)`` token counters, so a new
-  grouping-id run starts at position 0 even if older-run KV slots remain (those
-  slots are masked out). Within a grouping-id run, decode matches a private-cache
-  forward (pinned by ``tests/test_kv_cache.py``).
+  grouping id starts at position 0 even if other-id KV slots remain (those
+  slots are masked out), and an id that recurs later continues its own
+  counter. This is the same rule the uncached train paths use
+  (:func:`packed_rope_positions`), so decode matches a full forward
+  (pinned by ``tests/test_kv_cache.py``).
 * :meth:`reset_rows` zeros selected ``lengths`` so a cleared stream (e.g. task
   boundary) can restart at position 0 without rebuilding the rest of the batch.
 
@@ -56,6 +58,41 @@ def _use_flex_compile(device: torch.device, dtype: torch.dtype) -> bool:
     return device.type == "cuda" and dtype in _COMPILED_DTYPES
 
 
+def packed_rope_positions(
+    *,
+    sequence_ids: torch.Tensor,
+    grouping_ids: torch.Tensor,
+) -> torch.Tensor:
+    """RoPE position of every token in a flat packed stream ``[L]``.
+
+    Position = number of earlier tokens with the same ``(sequence_id,
+    grouping_id)``. This is the counting rule cached decode uses
+    (:func:`_decode_rope_positions`) and the same neighbourhood the attention
+    masks allow (causal within the same sequence and grouping id, regardless
+    of contiguity), so a grouping id that recurs after another id continues
+    its own position counter instead of restarting at 0. Sync-free: one
+    stable sort plus a cummax, no host ``.item()``.
+    """
+    L = sequence_ids.shape[0]
+    device = sequence_ids.device
+    if L == 0:
+        return torch.zeros(0, dtype=torch.long, device=device)
+    seq = sequence_ids.to(device=device, dtype=torch.long)
+    grp = grouping_ids.to(device=device, dtype=torch.long)
+    grp = grp - grp.min()
+    key = seq * (grp.max() + 1) + grp  # unique per (sequence, grouping) pair
+    order = torch.argsort(key, stable=True)
+    sorted_key = key[order]
+    arange = torch.arange(L, device=device)
+    new_run = torch.ones(L, dtype=torch.bool, device=device)
+    new_run[1:] = sorted_key[1:] != sorted_key[:-1]
+    markers = torch.where(new_run, arange, torch.full_like(arange, -1))
+    sorted_pos = arange - torch.cummax(markers, dim=0).values
+    positions = torch.empty(L, dtype=torch.long, device=device)
+    positions[order] = sorted_pos
+    return positions
+
+
 def _decode_rope_positions(
     *,
     chunk_grouping_ids: torch.Tensor,
@@ -66,9 +103,8 @@ def _decode_rope_positions(
     """Per-token RoPE positions for a left-padded decode chunk.
 
     Position = (same-``grouping_id`` count in the cache prefix) + (earlier
-    real tokens in this chunk with the same id). Pad columns stay 0.
-    Equivalent to a per-run counter when a grouping id does not recur after
-    another id (the ``task_index`` pattern).
+    real tokens in this chunk with the same id). Pad columns stay 0. Matches
+    :func:`packed_rope_positions` on the equivalent flat stream.
     """
     _B, S = chunk_grouping_ids.shape
     cap = cached_grouping_ids.shape[-1]

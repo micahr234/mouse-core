@@ -112,29 +112,33 @@ def _load_transformer_weights(
     :class:`~mouse_core.models.embedding.TextEmbedder`) and replace
     the final norm with ``Identity``, so those pretrained keys are skipped.
 
-    Warns with the names of any other backbone tensors that did not receive
-    pretrained weights (missing from the checkpoint or shape-mismatched), so a
-    config/checkpoint mismatch cannot silently leave the model random-init.
+    Warns in both directions: backbone tensors that did not receive pretrained
+    weights (missing from the checkpoint or shape-mismatched, so they keep
+    their random init), and checkpoint tensors the backbone has no slot for
+    (beyond the layers dropped by ``num_layers=``). Either means the config
+    and checkpoint disagree, and neither may pass silently.
     """
     from transformers import AutoModel
 
     with _quiet_transformers_load():
         pretrained = AutoModel.from_pretrained(repo_id_or_path, **hub_kwargs)
     target_state = model.state_dict()
+    pretrained_state = pretrained.state_dict()
+    skipped_prefixes = ("embed_tokens",)
+    skipped_keys = ("norm.weight", "norm.bias")
     loadable = {
         key: value
-        for key, value in pretrained.state_dict().items()
+        for key, value in pretrained_state.items()
         if key in target_state
         and target_state[key].shape == value.shape
-        and not key.startswith("embed_tokens")
-        and key not in ("norm.weight", "norm.bias")
+        and not key.startswith(skipped_prefixes)
+        and key not in skipped_keys
     }
 
-    intentionally_skipped = ("embed_tokens",)
     not_loaded = [
         key
         for key in target_state
-        if key not in loadable and not key.startswith(intentionally_skipped)
+        if key not in loadable and not key.startswith(skipped_prefixes)
     ]
     if not_loaded:
         warnings.warn(
@@ -144,6 +148,35 @@ def _load_transformer_weights(
             stacklevel=2,
         )
 
+    kept_layers = _layer_count(model)
+    unconsumed = [
+        key
+        for key in pretrained_state
+        if key not in loadable
+        and not key.startswith(skipped_prefixes)
+        and key not in skipped_keys
+        and not _is_dropped_layer_key(key, kept_layers)
+    ]
+    if unconsumed:
+        warnings.warn(
+            f"{len(unconsumed)} pretrained tensors from {str(repo_id_or_path)!r} "
+            f"have no matching backbone tensor and were dropped: {unconsumed}",
+            stacklevel=2,
+        )
+
     model.load_state_dict(loadable, strict=False)
 
     del pretrained
+
+
+def _layer_count(model: nn.Module) -> int | None:
+    layers = getattr(model, "layers", None)
+    return len(layers) if layers is not None else None
+
+
+def _is_dropped_layer_key(key: str, kept_layers: int | None) -> bool:
+    """True for ``layers.<i>.*`` keys past the truncated depth (``num_layers=``)."""
+    if kept_layers is None or not key.startswith("layers."):
+        return False
+    index = key.split(".", 2)[1]
+    return index.isdigit() and int(index) >= kept_layers

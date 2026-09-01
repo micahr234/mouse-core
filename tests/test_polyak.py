@@ -101,6 +101,26 @@ def test_polyak_tau_is_convex_combination() -> None:
     assert torch.allclose(delayed, torch.full_like(delayed, 0.5))
 
 
+def test_polyak_small_tau_accumulates_in_bf16() -> None:
+    torch.manual_seed(0)
+    model = _tiny_model().to(dtype=torch.bfloat16)
+    online = next(model.encoder.parameters())
+    online.data.fill_(0.9)
+    tau = 0.0005
+    averager = PolyakAverager(model, scope="model", tau=tau)
+    delayed = next(averager.model.encoder.parameters())
+    assert delayed.dtype == torch.bfloat16
+    online.data.fill_(1.0)
+    steps = 2000
+    for _ in range(steps):
+        averager.update()
+    # Direct bf16 lerp would stay at ~0.898 forever; fp32 accumulation converges.
+    expected = 1.0 - 0.1 * (1.0 - tau) ** steps
+    assert torch.allclose(
+        delayed.float(), torch.full_like(delayed.float(), expected), atol=1e-2
+    )
+
+
 def test_averager_without_dqn_head_raises() -> None:
     hidden_dim = 8
     encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=_MODALITIES)

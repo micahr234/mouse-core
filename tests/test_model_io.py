@@ -43,6 +43,44 @@ def test_composed_model_roundtrip(tmp_path) -> None:
     assert 'modality_fusion' not in enc_kwargs
     assert 'include_type_token' not in enc_kwargs
 
+def test_roundtrip_multi_field_spec_before_learnable(tmp_path) -> None:
+    """Learnable table names must not depend on the raw (unexpanded) spec index."""
+    torch.manual_seed(0)
+    hidden_dim = 8
+    encoder = NumericEmbedder(
+        hidden_dim=hidden_dim,
+        modalities=[
+            {"type": 'discrete', "field": ("action", "prev_action"), "vocab_size": 4},
+            {"type": 'learnable', "tokens": 2},
+            {"type": 'fourier', "field": "reward"},
+            {"type": 'learnable'},
+        ],
+    )
+    assert "encoder._tables.__learnable_0.weight" in {f"encoder.{k}" for k in encoder.state_dict()}
+    assert "encoder._tables.__learnable_1.weight" in {f"encoder.{k}" for k in encoder.state_dict()}
+    backbone = IdentityBackbone(hidden_dim=hidden_dim)
+    heads = DiscreteActionValueHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1)
+    model = Model(encoder=encoder, backbone=backbone, heads=heads).eval()
+    tokenizer = NumericTokenizer(
+        input_fields=[
+            {"type": "discrete", "input_field": "action"},
+            {"type": "discrete", "input_field": "prev_action"},
+            {"type": "learnable", "tokens": 2},
+            {"type": "fourier", "input_field": "reward"},
+            {"type": "learnable"},
+        ],
+        objective_fields=[],
+        grouping_field="task_index",
+    )
+    batch = [[{'action': 0, 'prev_action': 1, 'reward': 0.5, 'task_index': 0}, {'action': 2, 'prev_action': 0, 'reward': 1.0, 'task_index': 0}]]
+    expected, _ = model(batch_to_token_batch(tokenizer, batch, grouping_field="task_index"))
+    save_model(model, tmp_path)
+    loaded = load_model(tmp_path).eval()
+    assert set(model.state_dict()) == set(loaded.state_dict())
+    actual, _ = loaded(batch_to_token_batch(tokenizer, batch, grouping_field="task_index"))
+    assert torch.allclose(actual['action_value'], expected['action_value'])
+
+
 def test_composed_model_roundtrip_static_fourier(tmp_path) -> None:
     """Static Fourier buffers survive save/load."""
     torch.manual_seed(42)
@@ -89,6 +127,33 @@ def test_model_card_includes_usage_and_architecture(tmp_path) -> None:
     assert 'boundary_values' not in text
     assert 'Backbone: `identity`' in text
     assert 'Heads: `action_value`' in text
+
+@pytest.mark.parametrize(
+    "cast",
+    [
+        lambda m: m.to(torch.bfloat16),
+        lambda m: m.to(dtype=torch.bfloat16),
+        lambda m: m.to("cpu", torch.bfloat16),
+        lambda m: m.to(device="cpu", dtype=torch.bfloat16),
+        lambda m: m.to(torch.zeros(1, dtype=torch.bfloat16)),
+        lambda m: m.bfloat16(),
+        lambda m: m.to(dtype=torch.bfloat16).to("cpu"),
+    ],
+    ids=["pos-dtype", "kw-dtype", "pos-device-dtype", "kw-device-dtype", "tensor", "bfloat16()", "then-device"],
+)
+def test_model_to_every_form_keeps_heads_float32(cast) -> None:
+    hidden_dim = 8
+    encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4}, {"type": 'fourier', "field": "reward"}])
+    backbone = IdentityBackbone(hidden_dim=hidden_dim)
+    heads = DiscreteActionValueHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1)
+    model = cast(Model(encoder=encoder, backbone=backbone, heads=heads).eval())
+    assert {p.dtype for p in model.encoder.parameters()} == {torch.bfloat16}
+    assert {p.dtype for p in model.heads.parameters()} == {torch.float32}
+    batch = [[{'action': 0, 'reward': 0.5, 'task_index': 0}, {'action': 1, 'reward': 1.0, 'task_index': 0}]]
+    with torch.no_grad():
+        preds, _ = model(batch_to_token_batch(_tok(model.encoder), batch))
+    assert preds['action_value'].dtype == torch.float32
+
 
 def test_model_to_bfloat16_keeps_heads_float32() -> None:
     if not torch.cuda.is_available():

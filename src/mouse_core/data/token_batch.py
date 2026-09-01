@@ -172,6 +172,19 @@ class TokenBatch:
                     f"modality_ids must be in [0, {len(names)}), got "
                     f"min={int(mids.min())} max={int(mids.max())}"
                 )
+        if L > 0:
+            sids = np.asarray(self.sequence_ids, dtype=np.int64)
+            if int(sids.min()) < 0 or int(sids.max()) >= self.B:
+                raise ValueError(
+                    f"sequence_ids must be in [0, {self.B}), got "
+                    f"min={int(sids.min())} max={int(sids.max())}"
+                )
+            if bool(np.any(sids[1:] < sids[:-1])):
+                raise ValueError(
+                    "sequence_ids must be non-decreasing: every sequence's tokens "
+                    "must form one contiguous block, in sequence order (the model "
+                    "walks prediction_indices row by row and pads per block)."
+                )
         pred = np.asarray(self.prediction_indices, dtype=np.int64).reshape(-1)
         object.__setattr__(self, "prediction_indices", pred)
         n = int(pred.shape[0])
@@ -298,18 +311,34 @@ def _stack_objective_fields(
     for key in sorted(keys):
         raw = [st.objective_fields.get(key) for st in steps]
         arrays = [_as_field_array(v) if v is not None else None for v in raw]
-        proto = next((a for a in arrays if a is not None), np.asarray(0, dtype=np.int64))
-        if proto.ndim == 0:
-            fill = 0.0 if np.issubdtype(proto.dtype, np.floating) else 0
-            dtype = np.float32 if np.issubdtype(proto.dtype, np.floating) else np.int64
-            buf = np.empty(n, dtype=dtype)
+        present = [a for a in arrays if a is not None]
+        if not present:
+            out[key] = np.zeros(n, dtype=np.int64)
+            continue
+        # Column dtype is decided by *every* step, not the first one: a single
+        # float anywhere makes the column float32, so int-typed steps can
+        # never truncate later float values.
+        dtype = (
+            np.float32
+            if any(np.issubdtype(a.dtype, np.floating) for a in present)
+            else np.int64
+        )
+        ndims = {a.ndim for a in present}
+        if len(ndims) != 1:
+            raise ValueError(
+                f"objective field {key!r} mixes array ranks {sorted(ndims)} across "
+                "steps; every step must provide the same rank."
+            )
+        ndim = ndims.pop()
+        if ndim == 0:
+            buf = np.zeros(n, dtype=dtype)
             for i, a in enumerate(arrays):
-                buf[i] = fill if a is None else a.reshape(())
+                if a is not None:
+                    buf[i] = a.reshape(())
             out[key] = buf
         else:
-            shapes = [a.shape for a in arrays if a is not None]
-            max_shape = tuple(max(s[d] for s in shapes) for d in range(proto.ndim))
-            dtype = np.float32 if np.issubdtype(proto.dtype, np.floating) else proto.dtype
+            shapes = [a.shape for a in present]
+            max_shape = tuple(max(s[d] for s in shapes) for d in range(ndim))
             buf = np.zeros((n, *max_shape), dtype=dtype)
             for i, a in enumerate(arrays):
                 if a is None:

@@ -81,6 +81,12 @@ class AdamW:
     def step(self) -> None:
         self._inner.step()
 
+    def state_dict(self) -> dict[str, Any]:
+        return {"inner": self._inner.state_dict()}
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        self._inner.load_state_dict(state["inner"])
+
 
 class AdamWFp32:
     """AdamW with fp32 master weights for non-fp32 compute parameters.
@@ -94,6 +100,12 @@ class AdamWFp32:
     Pure-bf16 AdamW re-rounds the weight every step, so updates below half
     a bf16 ULP (~``|w| / 512``) never land. Masters accumulate those
     updates until they cross the threshold.
+
+    The masters are the source of truth once the optimizer exists: every
+    ``step`` writes them back over the compute parameters. Load model
+    weights *before* constructing the optimizer; to resume training use
+    :meth:`state_dict` / :meth:`load_state_dict`, which carry the masters
+    (and re-sync the compute parameters to them) alongside the AdamW moments.
 
     ``fused`` defaults to CUDA from the first trainable parameter.
     """
@@ -141,4 +153,28 @@ class AdamWFp32:
         self._inner.step()
         with torch.no_grad():
             for compute, master in self._synced:
+                compute.copy_(master)
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "inner": self._inner.state_dict(),
+            "masters": [master.detach().clone() for _, master in self._synced],
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        masters = state["masters"]
+        if len(masters) != len(self._synced):
+            raise ValueError(
+                f"state_dict has {len(masters)} master tensors, optimizer has "
+                f"{len(self._synced)} non-fp32 parameters"
+            )
+        self._inner.load_state_dict(state["inner"])
+        with torch.no_grad():
+            for (compute, master), saved in zip(self._synced, masters):
+                if saved.shape != master.shape:
+                    raise ValueError(
+                        f"master shape {tuple(saved.shape)} does not match parameter "
+                        f"shape {tuple(master.shape)}"
+                    )
+                master.copy_(saved)
                 compute.copy_(master)

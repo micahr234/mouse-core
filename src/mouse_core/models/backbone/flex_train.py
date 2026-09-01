@@ -9,6 +9,8 @@ import torch
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
 
+from mouse_core.models.backbone.flex_decode import packed_rope_positions
+
 _BLOCK_SIZE = 128
 _COMPILED_DTYPES = frozenset({torch.bfloat16, torch.float16})
 _kernel_cache: dict[tuple[str, int | None, torch.dtype], "_FlexKernel"] = {}
@@ -61,8 +63,9 @@ def flex_packed_forward(
     Attention is causal within positions that share both ``sequence_ids`` and
     ``grouping_ids``. No cross-sequence padding.
 
-    RoPE positions reset whenever the ``(sequence, mask)`` run changes
-    (contiguous positions within a run get 0,1,2,…).
+    RoPE positions count earlier tokens with the same ``(sequence,
+    grouping_id)`` (see :func:`packed_rope_positions`), matching the
+    attention neighbourhood and the cached-decode counter.
     """
     if embeds.ndim != 2:
         raise ValueError(f"embeds must be [L, D], got shape {tuple(embeds.shape)}")
@@ -85,15 +88,7 @@ def flex_packed_forward(
     seq = sequence_ids.to(device=device)
     mask = grouping_ids.to(device=device)
 
-    # Per-token RoPE position within its (sequence, mask) run.
-    # Sync-free: cummax of run-start markers, no host .item() for n_runs.
-    position_ids = torch.zeros(L, dtype=torch.long, device=device)
-    if L > 0:
-        arange = torch.arange(L, device=device)
-        new_run = torch.ones(L, dtype=torch.bool, device=device)
-        new_run[1:] = (seq[1:] != seq[:-1]) | (mask[1:] != mask[:-1])
-        markers = torch.where(new_run, arange, torch.full_like(arange, -1))
-        position_ids = arange - torch.cummax(markers, dim=0).values
+    position_ids = packed_rope_positions(sequence_ids=seq, grouping_ids=mask)
 
     # mask_mod closes over tensors via holder to avoid issues.
     holder = {"seq": seq, "mask": mask}

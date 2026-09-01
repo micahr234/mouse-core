@@ -35,7 +35,7 @@ import sysconfig
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -132,9 +132,28 @@ def _fetch_one_batch(
     )
 
 
+class _WorkerFailure:
+    """First exception raised by any worker, delivered out-of-band.
+
+    Errors do not travel through the (bounded) result queue: when the queue is
+    full of good batches a queued error could be dropped or only surface after
+    the consumer drains everything already prefetched.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.exc: BaseException | None = None
+
+    def record(self, exc: BaseException) -> None:
+        with self._lock:
+            if self.exc is None:
+                self.exc = exc
+
+
 def _worker_loop(
     result_queue: queue.Queue,
     stop_event: threading.Event,
+    failure: _WorkerFailure,
     cfg: _SnapshotConfig,
     sample_seed: Any,
     transform: StepTransform,
@@ -144,18 +163,15 @@ def _worker_loop(
     while not stop_event.is_set():
         try:
             item = _fetch_one_batch(cfg, rng, transform)
-            while not stop_event.is_set():
-                try:
-                    result_queue.put(("ok", item), timeout=0.05)
-                    break
-                except queue.Full:
-                    pass
         except Exception as exc:  # noqa: BLE001
-            try:
-                result_queue.put(("err", exc), timeout=1.0)
-            except Exception:  # noqa: BLE001
-                pass
+            failure.record(exc)
             return
+        while not stop_event.is_set():
+            try:
+                result_queue.put(item, timeout=0.05)
+                break
+            except queue.Full:
+                pass
 
 
 class DataLoader:
@@ -201,7 +217,7 @@ class DataLoader:
         self._workers: list[threading.Thread] = []
         self._sync_rng: np.random.Generator | None = None
         self._sync_transform: StepTransform | None = None
-        self._worker_error: BaseException | None = None
+        self._failure = _WorkerFailure()
 
         if isinstance(stores, _DS):
             stores = [stores]
@@ -216,6 +232,10 @@ class DataLoader:
             raise ValueError(f"weight_mode must be 'per_store' or 'per_step', got {weight_mode!r}")
         if sequence_length < 1:
             raise ValueError(f"sequence_length must be >= 1, got {sequence_length}.")
+        if batch_size < 1:
+            raise ValueError(f"batch_size must be >= 1, got {batch_size}.")
+        if prefetch < 1:
+            raise ValueError(f"prefetch must be >= 1, got {prefetch}.")
         if weights is not None:
             if len(weights) != len(stores):
                 raise ValueError(
@@ -282,18 +302,13 @@ class DataLoader:
             return _fetch_one_batch(cfg, self._sync_rng, self._sync_transform)
         assert self._result_queue is not None
         while True:
-            if self._worker_error is not None:
-                raise RuntimeError("A prefetch worker raised an exception.") from self._worker_error
+            if self._failure.exc is not None:
+                raise RuntimeError("A prefetch worker raised an exception.") from self._failure.exc
             try:
-                kind, payload = self._result_queue.get(timeout=0.05)
+                return self._result_queue.get(timeout=0.05)
             except queue.Empty:
-                if not any(w.is_alive() for w in self._workers):
+                if self._failure.exc is None and not any(w.is_alive() for w in self._workers):
                     raise RuntimeError("All prefetch workers stopped unexpectedly.")
-                continue
-            if kind == "err":
-                self._worker_error = cast(BaseException, payload)
-                raise RuntimeError("A prefetch worker raised an exception.") from self._worker_error
-            return payload
 
     def close(self) -> None:
         """Stop background workers and drain the queue."""
@@ -335,7 +350,7 @@ class DataLoader:
 
     def _start_workers(self) -> None:
         assert self._num_workers > 0
-        self._worker_error = None
+        self._failure = _WorkerFailure()
         self._result_queue = queue.Queue(maxsize=self._prefetch)
         self._stop = threading.Event()
         cfg = self._snapshot_config()
@@ -347,6 +362,7 @@ class DataLoader:
                 args=(
                     self._result_queue,
                     self._stop,
+                    self._failure,
                     cfg,
                     sample_seeds[i],
                     self.transform,

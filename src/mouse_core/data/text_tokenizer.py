@@ -22,20 +22,17 @@ import torch
 from mouse_core.data.io_fields import coerce_io_fields
 from mouse_core.data.modality import (
     TextTokenizerModalitySpec,
+    copy_keep_fields,
     expand_tokenizer_text_spec,
     unwrap_scalar,
     values_equal,
 )
 from mouse_core.data.token_batch import ModalityInfo, StepTokens
 
-# Stable modality names for text vs vision discrete streams.
+# Stable modality names for text vs vision discrete streams. Resolve local
+# indices via ``StepTokens.modality_names`` / ``modality_map``; they are not fixed.
 NAME_TEXT = "__text__"
 NAME_VISION = "__vision__"
-
-# Back-compat integer indices into modality_names when both are present.
-# Prefer resolving via modality_names / modality_map.
-MODALITY_TEXT = 0
-MODALITY_VISION = 1
 
 
 class TextTokenizer:
@@ -189,35 +186,6 @@ class TextTokenizer:
         )
 
 
-def _copy_keep_fields(
-    row: dict, pairs: Sequence[tuple[str, str]]
-) -> dict[str, Any]:
-    out: dict[str, Any] = {}
-    for in_name, out_name in pairs:
-        value = row.get(in_name)
-        if value is None:
-            out[out_name] = 0
-            continue
-        if isinstance(value, torch.Tensor):
-            arr = value.detach().cpu().numpy()
-        else:
-            arr = np.asarray(value)
-        if arr.ndim >= 1 and arr.size != 1:
-            if np.issubdtype(arr.dtype, np.floating):
-                out[out_name] = arr.astype(np.float32).ravel()
-            elif arr.dtype == np.uint8:
-                out[out_name] = arr.astype(np.uint8).ravel()
-            else:
-                out[out_name] = arr.astype(np.int64).ravel()
-        else:
-            sample = unwrap_scalar(value)
-            if isinstance(sample, (float, np.floating)):
-                out[out_name] = float(sample)
-            else:
-                out[out_name] = int(sample)
-    return out
-
-
 def _field_text_value(spec: TextTokenizerModalitySpec, row: dict[str, Any]) -> str | None:
     assert isinstance(spec.input_field, str)
     assert isinstance(spec.output_field, str)
@@ -368,5 +336,5 @@ def _tokenize_text_step(
         modality_map=dict(modality_map),
         grouping_id=gid,
         grouping_field=grouping_field,
-        objective_fields=_copy_keep_fields(row, objective_fields_keep),
+        objective_fields=copy_keep_fields(row, objective_fields_keep),
     )

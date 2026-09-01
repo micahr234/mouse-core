@@ -17,16 +17,16 @@ push (e.g. by editing on the Hub) or manage the card separately.
 
 See https://huggingface.co/docs/datasets/repository_structure
 
-Public API
-----------
-``load_stores_from_hub(repo_id, split=...)``
+Public API (all arguments are keyword-only)
+--------------------------------------------
+``load_stores_from_hub(repo_id=..., split=...)``
     Load named stores from Hub dataset configs in one batched parquet read,
     discovering names by default.
 
-``push_to_hub(splits, repo_id, config_name=...)``
+``push_to_hub(splits=..., repo_id=..., config_name=...)``
     Push splits under a named config (subset/bin).
 
-``push_stores_to_hub(stores, repo_id, split=...)``
+``push_stores_to_hub(stores=..., repo_id=..., split=...)``
     Single-split convenience with one config per named store.
 """
 
@@ -501,7 +501,7 @@ def push_to_hub(
         Use this to organize your data into different "bins" (e.g. different
         collection runs, different environment families, different policies).
         Default is ``"default"``. When loading later use
-        ``load_stores_from_hub(repo, [config_name], split=...)``.
+        ``load_stores_from_hub(repo_id=repo, store_names=[config_name], split=...)``.
     clear :
         If ``True`` (default), totally wipe the dataset before uploading:
         every existing parquet shard (all configs, not just ``config_name``),
@@ -523,13 +523,13 @@ def push_to_hub(
         from mouse_core.data.hub import push_to_hub
 
         url = push_to_hub(
-            {"train": [train_store], "eval": [eval_store]},
+            splits={"train": [train_store], "eval": [eval_store]},
             repo_id="your-org/your-dataset",
         )
 
         # Using a config/subset as a "bin"
         url = push_to_hub(
-            {"train": [store]},
+            splits={"train": [store]},
             repo_id="your-org/your-dataset",
             config_name="cartpole_ppo_expert",
         )
@@ -571,9 +571,9 @@ def push_stores_to_hub(
     every store belongs to the same split but should live in its own config.
 
     Every store must have a non-empty ``store.name``. Each store is pushed
-    under that config name, and can later be loaded with the standard HF loader::
+    under that config name, and can later be loaded with::
 
-        load_stores_from_hub(repo_id, [store.name], split=split)
+        load_stores_from_hub(repo_id=repo_id, store_names=[store.name], split=split)
 
     Parameters
     ----------
@@ -608,14 +608,14 @@ def push_stores_to_hub(
         from mouse_core.data import Datastore, push_stores_to_hub
 
         url = push_stores_to_hub(
-            [Datastore(name="cartpole_v1_ppo_202406")],
+            stores=[Datastore(name="cartpole_v1_ppo_202406")],
             repo_id="your-org/your-dataset",
             split="train",
         )
 
         # Save each store under its own named subset/bin
         url = push_stores_to_hub(
-            [cartpole_store, lunar_store],
+            stores=[cartpole_store, lunar_store],
             repo_id="your-org/your-dataset",
             split="train",
         )

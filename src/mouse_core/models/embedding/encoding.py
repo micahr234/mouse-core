@@ -17,7 +17,15 @@ class StaticFourierFeatures(nn.Module):
 
     ``num_freq_sets`` independent banks support one bank per vector coordinate
     (selected via ``freq_idx``).
+
+    The frequency / phase tables and the ``cos`` evaluation are always fp32
+    and stay fp32 through ``module.to(dtype=...)``: with ω up to ``1/in_min``,
+    bf16 rounding of ω or of the phase ``ω x + b`` is worth radians of error,
+    so a reduced-precision module would emit mostly noise for larger ``|x|``.
+    Callers cast the returned features to their compute dtype.
     """
+
+    _FP32_BUFFERS = ("freqs", "phases", "output_scale")
 
     def __init__(
         self,
@@ -26,7 +34,6 @@ class StaticFourierFeatures(nn.Module):
         in_max: float = 1e2,
         num_freq_sets: int = 1,
         output_scale: float = 1.0,
-        dtype: torch.dtype = torch.float32,
     ) -> None:
         super().__init__()
         if num_features <= 0:
@@ -38,6 +45,7 @@ class StaticFourierFeatures(nn.Module):
         if num_freq_sets < 1:
             raise ValueError("num_freq_sets must be >= 1")
 
+        dtype = torch.float32
         log_w_min = math.log(1.0 / in_max)
         log_w_max = math.log(1.0 / in_min)
         # Fixed log-spaced frequencies (not random).
@@ -62,6 +70,18 @@ class StaticFourierFeatures(nn.Module):
         self.phases: torch.Tensor
         self.output_scale: torch.Tensor
 
+    def _apply(self, fn, recurse: bool = True):  # type: ignore[override]
+        # ``module.to(dtype=bf16)`` / ``.half()`` route through here. Keep the
+        # device move but restore the exact fp32 tables (not an up-cast of the
+        # rounded values).
+        saved = {name: self._buffers[name] for name in self._FP32_BUFFERS}
+        super()._apply(fn, recurse)
+        for name, original in saved.items():
+            moved = self._buffers[name]
+            if original is not None and moved is not None and moved.dtype != torch.float32:
+                self._buffers[name] = original.to(device=moved.device)
+        return self
+
     def forward(self, x: torch.Tensor, freq_idx: torch.Tensor | int = 0) -> torch.Tensor:
         """Map scalar inputs to static Fourier embeddings.
 
@@ -70,7 +90,7 @@ class StaticFourierFeatures(nn.Module):
             freq_idx: Frequency bank index (int or same shape as ``x``).
 
         Returns:
-            ``(*batch, num_features)``.
+            ``(*batch, num_features)`` fp32 features.
         """
         if isinstance(freq_idx, torch.Tensor) and freq_idx.shape != x.shape:
             raise ValueError(
@@ -80,7 +100,7 @@ class StaticFourierFeatures(nn.Module):
         freqs = self.get_buffer("freqs")
         phases = self.get_buffer("phases")
         scale = self.get_buffer("output_scale")
-        x = x.to(dtype=freqs.dtype)
+        x = x.to(dtype=torch.float32)
         w = freqs[freq_idx]
         b = phases[freq_idx]
         return scale * (x.unsqueeze(-1) * w + b).cos()

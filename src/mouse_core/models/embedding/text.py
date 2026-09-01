@@ -24,6 +24,11 @@ class TextEmbedder(Encoder):
     Token packing lives in :class:`~mouse_core.data.text_tokenizer.TextTokenizer`
     (constructed separately). Alignment is by modality name (``__text__`` /
     ``__vision__``). This module only looks up ``embed_tokens``.
+
+    The table comes from exactly one of ``embed_tokens=`` (an existing
+    ``nn.Embedding``), ``pretrained=`` (copied from a Hub checkpoint), or
+    ``vocab_size=`` (a fresh table, used by ``load_model`` so the saved
+    ``state_dict`` provides the weights without re-downloading the checkpoint).
     """
 
     def __init__(
@@ -34,6 +39,8 @@ class TextEmbedder(Encoder):
         format: str | None = None,
         pretrained: str | Path | None = None,
         embed_tokens: nn.Embedding | None = None,
+        vocab_size: int | None = None,
+        padding_idx: int | None = None,
         hub_kwargs: dict | None = None,
         freeze_embeddings: bool = False,
     ) -> None:
@@ -113,6 +120,20 @@ class TextEmbedder(Encoder):
             expected_names.add(NAME_VISION)
         self._expected_names = frozenset(expected_names)
 
+        sources = [
+            name
+            for name, given in (
+                ("embed_tokens", embed_tokens is not None),
+                ("pretrained", pretrained is not None),
+                ("vocab_size", vocab_size is not None),
+            )
+            if given
+        ]
+        if len(sources) != 1:
+            raise TypeError(
+                "TextEmbedder requires exactly one of embed_tokens=, pretrained=, "
+                f"or vocab_size= (got {sources or 'none'})"
+            )
         if embed_tokens is not None:
             if embed_tokens.embedding_dim != hidden_dim:
                 raise ValueError(
@@ -124,10 +145,22 @@ class TextEmbedder(Encoder):
                 pretrained=pretrained, hidden_dim=hidden_dim, hub_kwargs=self._hub_kwargs
             )
         else:
-            raise TypeError("TextEmbedder requires pretrained= or embed_tokens=")
+            assert vocab_size is not None
+            if vocab_size <= 0:
+                raise ValueError(f"vocab_size must be > 0, got {vocab_size}")
+            self.embed_tokens = nn.Embedding(int(vocab_size), hidden_dim, padding_idx=padding_idx)
 
         if freeze_embeddings:
             self.embed_tokens.weight.requires_grad_(False)
+
+    @property
+    def vocab_size(self) -> int:
+        return int(self.embed_tokens.num_embeddings)
+
+    @property
+    def padding_idx(self) -> int | None:
+        idx = self.embed_tokens.padding_idx
+        return None if idx is None else int(idx)
 
     @property
     def pretrained(self) -> str | Path | None:

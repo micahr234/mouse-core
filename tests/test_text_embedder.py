@@ -131,6 +131,7 @@ def test_token_modality_is_single_embed_row() -> None:
         embed_tokens=emb,
         format="{action}",
         modalities=[{"type": 'token', "field": "action"}],
+        objective_fields=_obj("action"),
     )
     embeds, indices = enc(batch_to_token_batch(tokenizer, [[{"action": 16}]]))
     assert embeds.shape[0] == 1
@@ -177,6 +178,7 @@ def test_text_embedder_field_format_in_step_template() -> None:
             {"type": 'text', "field": "observation", "format": 'o={observation}'},
             {"type": 'text', "field": "action", "format": 'a={action}'},
         ],
+        objective_fields=_obj("action"),
     )
     enc(batch_to_token_batch(tokenizer, [[{"observation": 3, "action": 2}]]))
     assert seen == ["<o=3|a=2>"]
@@ -233,6 +235,64 @@ def test_text_embedder_save_load(tmp_path) -> None:
     assert cfg["type"] == "text"
     assert cfg["kwargs"]["format"] == "<action={action}>"
     assert cfg["kwargs"]["modalities"][0]["type"] == "token"
+    assert cfg["kwargs"]["vocab_size"] == 32
     assert "std" not in cfg["kwargs"]
     assert "separator" not in cfg["kwargs"]
-    assert model is not None
+
+    from mouse_core.models import load_model, save_model
+
+    tokenizer, _ = _text_pair(
+        hidden_dim=D,
+        embed_tokens=emb,
+        format="<action={action}>",
+        modalities=[{"type": 'token', "field": "action"}],
+        objective_fields=_obj("action"),
+    )
+    batch = [[{"action": 1}, {"action": 3}]]
+    model.eval()
+    expected, _ = model(batch_to_token_batch(tokenizer, batch))
+    save_model(model, tmp_path)
+    loaded = load_model(tmp_path).eval()
+    assert isinstance(loaded.encoder, TextEmbedder)
+    assert loaded.encoder.vocab_size == 32
+    assert torch.equal(loaded.encoder.embed_tokens.weight, emb.weight)
+    actual, _ = loaded(batch_to_token_batch(tokenizer, batch))
+    assert torch.allclose(actual["action_value"], expected["action_value"])
+
+
+def test_text_tokenizer_missing_objective_field_raises() -> None:
+    import pytest
+
+    tokenizer, _ = _text_pair(objective_fields=_obj("action", "old_log_prob"))
+    step = {"action": 1, "observation": "x", "reward": 1.0, "episode_done": 0, "grouping_id": 0}
+    with pytest.raises(KeyError, match="old_log_prob"):
+        tokenizer(step)
+
+
+def test_text_tokenizer_keeps_length_one_vector_as_vector() -> None:
+    import numpy as np
+
+    tokenizer, _ = _text_pair(objective_fields=_obj("action", "q"))
+    step = {"action": 1, "observation": "x", "reward": 1.0, "episode_done": 0, "grouping_id": 0, "q": np.array([0.5])}
+    st = tokenizer(step)
+    assert isinstance(st.objective_fields["q"], np.ndarray)
+    assert st.objective_fields["q"].shape == (1,)
+
+
+def test_text_embedder_requires_exactly_one_table_source() -> None:
+    import pytest
+
+    with pytest.raises(TypeError, match="exactly one of"):
+        TextEmbedder(hidden_dim=8, modalities=[{"type": "token", "field": "a"}], format="{a}")
+    with pytest.raises(TypeError, match="exactly one of"):
+        TextEmbedder(
+            hidden_dim=8,
+            modalities=[{"type": "token", "field": "a"}],
+            format="{a}",
+            embed_tokens=nn.Embedding(4, 8),
+            vocab_size=4,
+        )
+    enc = TextEmbedder(
+        hidden_dim=8, modalities=[{"type": "token", "field": "a"}], format="{a}", vocab_size=4
+    )
+    assert enc.embed_tokens.weight.shape == (4, 8)

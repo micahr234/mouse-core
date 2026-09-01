@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   AdamW state) for non-fp32 compute parameters so updates smaller than a
   bf16 ULP accumulate. Heads are already fp32 and are stepped in place.
   Training notebooks use ``AdamW``; swap the class to opt into masters.
+  Both expose ``state_dict()`` / ``load_state_dict()``; ``AdamWFp32`` saves
+  the fp32 masters and re-syncs the compute parameters to them on load, so
+  a resumed run keeps its sub-ULP progress. Load model weights before
+  constructing ``AdamWFp32`` — the masters are the source of truth from then
+  on and every ``step`` writes them back over the compute parameters.
 - ``PolyakAverager``: delayed DQN weights next to the optimizer.
   ``scope="head"`` (default) copies only the heads (not encoder/backbone)
   and reuses the online pooled representation. ``scope="model"`` copies
@@ -236,8 +241,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of the old 5-code ``done in (3, 4)``.
 - Model-card tokenizer snippet no longer embeds a Grouper example, so card
   generation no longer raises ``ValueError`` on the f-string.
+- ``PpoObjective``: GAE advantages and returns are detached. The policy
+  surrogate no longer backpropagates through the value head via the
+  advantage (previously the value head received a spurious policy gradient
+  even with ``vf_coef=0``).
+- ``PolyakAverager``: interpolation is accumulated in fp32 shadows for bf16
+  delayed weights. With a small ``tau`` (e.g. ``5e-4``) a direct bf16 lerp
+  rounded every update away and the delayed encoder/backbone never moved.
+- ``StaticFourierFeatures`` keeps its frequency/phase tables in fp32 through
+  ``module.to(dtype=bfloat16)`` and evaluates ``cos(ωx + b)`` in fp32. Under
+  bf16 the phase carried radians of error for ``|x| ≳ 1``, so Fourier
+  (reward / continuous) embeddings were mostly noise on the recommended CUDA
+  bf16 configuration. Callers cast the fp32 features to the compute dtype.
+- ``Model.to`` parses every ``nn.Module.to`` call form (positional
+  ``dtype``, ``to(device, dtype)``, ``to(tensor)``, ``.bfloat16()``/``.half()``)
+  and always keeps the heads fp32. ``model.to(torch.bfloat16)`` previously
+  cast the heads too and the fp32 head input then failed with a dtype error.
+- RoPE positions use one rule everywhere — the count of earlier tokens with
+  the same ``(sequence, grouping_id)`` — in the CPU/eager train path, the
+  FlexAttention train path, and cached decode. Training previously reset the
+  counter per contiguous run, so a grouping id that recurred after another id
+  got different positions in training than in inference.
+- ``TokenBatch`` validates ``sequence_ids``: in ``[0, B)`` and non-decreasing
+  (each sequence one contiguous block, in order). Interleaved ids used to be
+  silently mis-padded in the batched path.
+- Objective columns take their dtype from every step, not the first one: a
+  float value anywhere makes the column float32. Previously an int-typed
+  first step (e.g. ``reward=0``) made the column int64 and truncated later
+  float rewards. Mixed ranks in one column now raise ``ValueError``.
+- Learnable modality tables are named by their ordinal among learnable
+  specs (``__learnable_0``, ``__learnable_1``, …) in both the embedder and
+  the tokenizer. Naming by raw list index broke ``load_model`` (missing /
+  unexpected ``state_dict`` keys) whenever a multi-field spec preceded a
+  learnable one.
+- ``TextEmbedder`` save/load: ``save_model`` records ``vocab_size`` /
+  ``padding_idx`` and ``load_model`` rebuilds the table from them (no Hub
+  download), so models built with ``embed_tokens=`` round-trip. Exactly one
+  of ``embed_tokens=`` / ``pretrained=`` / ``vocab_size=`` must be given.
+- ``Qwen3Backbone(pretrained=...)`` only accepts ``model_type == "qwen3"``
+  configs (Qwen2 / MoE checkpoints built a partially-matching model whose
+  own weights were dropped). Pretrained loading also warns about checkpoint
+  tensors with no matching backbone tensor (beyond layers dropped by
+  ``num_layers=``), not just backbone tensors left random-init.
+- ``TextTokenizer`` and ``NumericTokenizer`` share one ``objective_fields``
+  copy rule: a missing input raises ``KeyError`` (the text tokenizer used to
+  fill ``0`` silently), length-1 vectors stay vectors, and non-numeric values
+  raise ``TypeError``.
+- ``continuous`` modalities raise ``ValueError`` when a step value's length
+  differs from ``dim=`` (short vectors were zero-padded, long ones truncated).
+- ``skip=`` on a vector (``continuous``) modality compares elementwise
+  (``True`` when every element matches a scalar ``skip`` or a same-shape
+  vector) instead of raising on ambiguous array truth.
+- ``DataLoader``: worker exceptions are delivered out-of-band and surface on
+  the next ``next_batch()`` with the original exception as ``__cause__``,
+  even when the prefetch queue is full (previously the error could be dropped
+  and only ``"All prefetch workers stopped unexpectedly"`` remained).
+  ``batch_size < 1`` and ``prefetch < 1`` raise ``ValueError`` (``prefetch=0``
+  used to mean an unbounded queue).
+- ``Datastore.__getitem__`` accepts an int / slice / index array, supports
+  negative indices, raises ``IndexError`` when out of range (instead of
+  ``TypeError`` / ``AttributeError``), and returns copied rows so callers
+  cannot mutate the store through the result.
+- Hub / ``Datastore`` docstring examples call the keyword-only functions with
+  keywords (the positional forms raised ``TypeError``); the stale
+  ``encode_hf_rows`` reference is gone.
 
 ### Removed
+- ``TextTokenizer.MODALITY_TEXT`` / ``MODALITY_VISION`` integer constants.
+  They were wrong whenever only an image modality was declared (vision was
+  local index 0); resolve indices via ``StepTokens.modality_names``.
+- ``StaticFourierFeatures(dtype=...)``: the tables are always fp32.
 - ``Grouper``. Tokenizer ``grouping_field=`` names the step key used for
   attention isolation (typically ``task_index``). Keep that key through
   Selector. For no isolation, stamp a constant column on the step.

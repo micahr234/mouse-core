@@ -102,6 +102,59 @@ def test_chunked_cached_forward_matches_full_forward(backbone_cls) -> None:
     assert incremental.shape == full_q.shape
     assert torch.allclose(incremental, full_q, atol=1e-05), 'cached incremental decode diverged from full forward — RoPE cache positions are not being inferred correctly'
 
+@pytest.mark.parametrize('backbone_cls', [Qwen3Backbone, LlamaBackbone])
+def test_recurring_grouping_id_matches_between_full_and_cached(backbone_cls) -> None:
+    """A grouping id that reappears after another id must use one position rule everywhere."""
+    torch.manual_seed(3)
+    model = _tiny_model(backbone_cls)
+    steps = _steps(6)
+    for step, task in zip(steps, (0, 0, 1, 1, 0, 0)):
+        step["task_index"] = task
+    with torch.no_grad():
+        full, _ = _fwd(model, [steps])
+        cache = None
+        last_step_preds = []
+        for step in steps:
+            preds, cache = _fwd(model, [[step]], cache=cache, use_cache=True)
+            last_step_preds.append(preds['action_value'][:, -1])
+        incremental = torch.stack(last_step_preds, dim=1)
+    assert torch.allclose(incremental, _as_rect(full['action_value']), atol=1e-05)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='compiled Flex train/decode paths are CUDA bf16')
+def test_cuda_bf16_flex_train_matches_cached_decode_with_recurring_ids() -> None:
+    """Recommended config end to end: compiled Flex train forward == Flex cached decode."""
+    torch.manual_seed(4)
+    model = _tiny_model(Qwen3Backbone).to(device=torch.device('cuda'), dtype=torch.bfloat16)
+    steps = _steps(8)
+    for step, task in zip(steps, (0, 0, 1, 1, 0, 0, 2, 0)):
+        step["task_index"] = task
+    with torch.no_grad():
+        full, _ = _fwd(model, [steps])
+        cache = None
+        last_step_preds = []
+        for step in steps:
+            preds, cache = _fwd(model, [[step]], cache=cache, use_cache=True)
+            last_step_preds.append(preds['action_value'][:, -1])
+        incremental = torch.stack(last_step_preds, dim=1)
+    full_q = _as_rect(full['action_value'])
+    assert full_q.dtype == torch.float32
+    assert torch.allclose(incremental, full_q, atol=0.05), (incremental - full_q).abs().max().item()
+
+
+def test_packed_rope_positions_count_same_group_tokens() -> None:
+    from mouse_core.models.backbone.flex_decode import packed_rope_positions
+
+    seq = torch.tensor([0, 0, 0, 0, 0, 0, 1, 1, 1])
+    grp = torch.tensor([0, 0, 1, 1, 0, 0, 5, 5, 3])
+    pos = packed_rope_positions(sequence_ids=seq, grouping_ids=grp)
+    assert pos.tolist() == [0, 1, 0, 1, 2, 3, 0, 1, 0]
+    assert packed_rope_positions(
+        sequence_ids=torch.zeros(0, dtype=torch.long),
+        grouping_ids=torch.zeros(0, dtype=torch.long),
+    ).shape == (0,)
+
+
 def test_step_by_step_cached_rollout_matches_full_forward() -> None:
     """One step at a time, as in the inference notebooks."""
     torch.manual_seed(1)

@@ -13,8 +13,8 @@ You select and load data with the real ``datasets.load_dataset`` (configs,
 splits, globs, etc.) and hand the resulting Dataset to ``from_dataset``.
 
 The store's main added value is mixing loaded history with new appends and
-feeding slices to ``DataLoader`` (or ``encode_hf_rows``) so they can be turned
-into model batches. All other I/O is standard Hugging Face Dataset / DatasetDict.
+feeding contiguous windows to ``DataLoader`` so they can be turned into model
+batches. All other I/O is standard Hugging Face Dataset / DatasetDict.
 """
 
 from __future__ import annotations
@@ -105,36 +105,43 @@ class Datastore:
             return list(self._rows[0].keys())
         return []
 
-    def __getitem__(self, indices: Any) -> list[dict]:
-        """Return raw step records for the given indices as a list of dicts.
+    def __getitem__(self, indices: int | slice | Any) -> list[dict]:
+        """Return raw step records for ``indices`` as a list of (copied) dicts.
 
+        Accepts an int, a slice, or any sequence/array of ints. Negative
+        indices count from the end; out-of-range indices raise ``IndexError``.
+        Rows are copies, so mutating a returned dict never alters the store.
         Most training code goes through DataLoader instead.
         """
+        n = len(self)
+        if isinstance(indices, slice):
+            idx = np.arange(*indices.indices(n), dtype=np.int64)
+        else:
+            idx = np.asarray(indices, dtype=np.int64).ravel()
+            if idx.size:
+                if int(idx.min()) < -n or int(idx.max()) >= n:
+                    raise IndexError(
+                        f"Datastore index out of range for store of length {n}: "
+                        f"min={int(idx.min())} max={int(idx.max())}"
+                    )
+                idx = np.where(idx < 0, idx + n, idx)
+        if idx.size == 0:
+            return []
+
         src_len = self._src_len
-        idx = np.asarray(indices).ravel()
-
-        if self._buf_len == 0:
-            return _hf_batch_to_rows(self._source[idx.tolist()])  # type: ignore[index]
-
-        if src_len == 0:
-            return [self._rows[int(i)] for i in idx]
-
-        # Mixed: collect from both segments, preserving original order.
         src_mask = idx < src_len
-        buf_mask = ~src_mask
-
         result: list[dict] = [{}] * len(idx)
 
         if src_mask.any():
+            assert self._source is not None
             src_rows = _hf_batch_to_rows(
                 self._source[idx[src_mask].tolist()]  # type: ignore[index]
             )
             for k, pos in enumerate(np.where(src_mask)[0]):
                 result[pos] = src_rows[k]
 
-        if buf_mask.any():
-            for k, pos in enumerate(np.where(buf_mask)[0]):
-                result[pos] = self._rows[int(idx[pos]) - src_len]
+        for pos in np.where(~src_mask)[0]:
+            result[pos] = dict(self._rows[int(idx[pos]) - src_len])
 
         return result
 
@@ -177,7 +184,7 @@ class Datastore:
         before calling this method, either with ``load_stores_from_hub`` or
         directly with ``datasets.load_dataset`` for custom loading workflows.
         This method just takes ownership of the rows so they can be mixed with
-        later appends and fed to the batch encoder.
+        later appends and sampled by ``DataLoader``.
 
         If you pass a DatasetDict its contents are concatenated (the store is
         a flat sequence). Use separate stores if you want to keep logical
@@ -187,10 +194,13 @@ class Datastore:
 
         Examples::
 
-            stores = load_stores_from_hub(
-                "my-rollouts",
-                split="train",
-            )
+            from datasets import load_dataset
+
+            store = Datastore(name="cartpole")
+            store.from_dataset(load_dataset("your-org/your-dataset", "cartpole", split="train"))
+
+            # Or, for stores written by ``push_stores_to_hub``:
+            stores = load_stores_from_hub(repo_id="your-org/your-dataset", split="train")
         """
         if isinstance(ds, datasets.DatasetDict):
             # Concatenate whatever splits are present, in the dict's iteration order.

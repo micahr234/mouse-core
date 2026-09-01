@@ -138,6 +138,10 @@ class NumericEmbedder(Encoder):
             num_freq_sets=max_freq_sets,
             output_scale=fourier_scale,
         )
+        # Follows ``.to(device/dtype)`` so an encoder with no learnable tables
+        # (fourier-only) still knows its compute dtype and device.
+        self.register_buffer("_anchor", torch.zeros(0), persistent=False)
+        self._anchor: torch.Tensor
 
     @property
     def hidden_dim(self) -> int:
@@ -161,12 +165,9 @@ class NumericEmbedder(Encoder):
     def forward(
         self, token_batch: TokenBatch
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        try:
-            device = next(self.parameters()).device
-            dtype = next(self.parameters()).dtype
-        except StopIteration:
-            device = self.fourier.get_buffer("freqs").device
-            dtype = self.fourier.get_buffer("freqs").dtype
+        anchor = self.get_buffer("_anchor")
+        device = anchor.device
+        dtype = anchor.dtype
         t = token_batch.to_tensors(device)
         modality_ids = t["modality_ids"]
         ids = t["ids"]

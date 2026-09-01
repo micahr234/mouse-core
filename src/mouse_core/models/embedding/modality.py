@@ -114,6 +114,14 @@ class EmbedderModalityMeta:
 def expand_embedder_numeric_spec(
     spec: NumericEmbedderModalitySpec, *, learnable_index: int
 ) -> list[NumericEmbedderModalitySpec]:
+    """Expand one spec into one spec per field name.
+
+    ``learnable_index`` is the ordinal among *learnable* specs (0 for the
+    first learnable, 1 for the second, …). It must not depend on the position
+    in the full list: the saved config stores the expanded list, where a
+    multi-field spec occupies several slots, so a raw index would shift on
+    reload and the table's ``state_dict`` key would no longer match.
+    """
     if spec.type == "learnable":
         name = f"__learnable_{learnable_index}"
         return [replace(spec, field=name)]
@@ -157,7 +165,8 @@ def resolve_embedder_numeric_modalities(
     """Expand embedder modality specs keyed by ``field`` name."""
     raw = _coerce_numeric_modalities(modalities)
     specs: list[NumericEmbedderModalitySpec] = []
-    for i, m in enumerate(raw):
+    n_learnable = 0
+    for m in raw:
         if isinstance(m, NumericEmbedderModalitySpec):
             spec = m
         else:
@@ -170,7 +179,9 @@ def resolve_embedder_numeric_modalities(
                         "(tokenizer packing knob)"
                     )
             spec = NumericEmbedderModalitySpec(**data)
-        specs.extend(expand_embedder_numeric_spec(spec, learnable_index=i))
+        specs.extend(expand_embedder_numeric_spec(spec, learnable_index=n_learnable))
+        if spec.type == "learnable":
+            n_learnable += 1
 
     meta: list[EmbedderModalityMeta] = []
     seen: set[str] = set()

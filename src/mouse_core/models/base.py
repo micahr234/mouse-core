@@ -14,6 +14,7 @@ from tensordict import TensorDict
 
 from mouse_core.models.embedding.embedding import Encoder
 from mouse_core.models.backbone.base import Backbone
+from mouse_core.models.backbone.flex_decode import packed_rope_positions
 from mouse_core.models.heads.base import BaseHead
 from mouse_core.models.heads.discrete_action import DiscreteActionHead
 from mouse_core.models.heads.dqn import DiscreteActionValueHead
@@ -373,6 +374,8 @@ def _encoder_config(encoder: Encoder) -> dict[str, Any]:
                 "modalities": [_public_modality_config(modality) for modality in encoder.modalities],
                 "pretrained": encoder.pretrained,
                 "format": encoder.format,
+                "vocab_size": encoder.vocab_size,
+                "padding_idx": encoder.padding_idx,
             },
         }
     raise TypeError(
@@ -555,8 +558,13 @@ def _build_encoder_from_config(config: dict[str, Any]) -> Encoder:
         from mouse_core.models.embedding import TextEmbedder
 
         # HF tokenizer / image_processor are not part of the embedder; rebuild
-        # TextTokenizer separately for the data pipeline after load.
-        return TextEmbedder(**kwargs)
+        # TextTokenizer separately for the data pipeline after load. The table
+        # weights come from the saved state_dict, so build a fresh table of the
+        # saved size instead of re-downloading ``pretrained``.
+        pretrained = kwargs.pop("pretrained", None)
+        encoder = TextEmbedder(**kwargs)
+        encoder.pretrained = pretrained
+        return encoder
     raise ValueError(f"Unsupported encoder type {enc_type!r}.")
 
 
@@ -884,21 +892,37 @@ class Model(nn.Module):
     def to(self, *args: Any, **kwargs: Any) -> "Model":
         """Move/cast the model; output heads always stay float32.
 
+        Accepts every ``nn.Module.to`` form (``to(device)``, ``to(dtype)``,
+        ``to(device, dtype)``, ``to(tensor)``, keyword variants). Only the
+        encoder and backbone take the requested dtype; heads are cast to
+        float32 so ``_run_heads`` (which feeds them fp32 features) matches.
+
         On CUDA, prefer ``model.to(device=device, dtype=preferred_dtype(device))``
         so the encoder/backbone run in bfloat16 and FlexAttention compiles.
         """
-        dtype_kw = kwargs.get("dtype")
-        dtype_arg = args[0] if len(args) == 1 and isinstance(args[0], torch.dtype) else None
-        target_dtype = dtype_kw or dtype_arg
-        if target_dtype is not None and target_dtype != torch.float32:
-            kwargs_no_dtype = {k: v for k, v in kwargs.items() if k != "dtype"}
-            args_no_dtype = () if dtype_arg is not None else args
-            super().to(*args_no_dtype, **kwargs_no_dtype)
-            self.encoder.to(*args_no_dtype, dtype=target_dtype, **kwargs_no_dtype)
-            self.backbone.to(*args_no_dtype, dtype=target_dtype, **kwargs_no_dtype)
-            self.heads.to(*args_no_dtype, dtype=torch.float32, **kwargs_no_dtype)
-            return self
-        return super().to(*args, **kwargs)
+        device, dtype, non_blocking, memory_format = torch._C._nn._parse_to(*args, **kwargs)
+        if dtype is None or dtype == torch.float32:
+            return super().to(*args, **kwargs)
+        if not dtype.is_floating_point:
+            raise TypeError(f"Model.to only accepts floating point dtypes, got {dtype}.")
+        common: dict[str, Any] = {"non_blocking": non_blocking}
+        if device is not None:
+            common["device"] = device
+        if memory_format is not None:
+            common["memory_format"] = memory_format
+        self.encoder.to(dtype=dtype, **common)
+        self.backbone.to(dtype=dtype, **common)
+        self.heads.to(dtype=torch.float32, **common)
+        return self
+
+    def half(self) -> "Model":
+        return self.to(torch.float16)
+
+    def bfloat16(self) -> "Model":
+        return self.to(torch.bfloat16)
+
+    def double(self) -> "Model":
+        return self.to(torch.float64)
 
     def _train_backbone_forward(
         self,
@@ -1234,15 +1258,11 @@ def _flat_sequence_position_ids(
     sequence_ids: torch.Tensor,
     grouping_ids: torch.Tensor,
 ) -> torch.Tensor:
-    """RoPE positions ``[1, L]`` resetting at each ``(sequence, grouping_id)`` boundary."""
-    L = sequence_ids.shape[0]
-    device = sequence_ids.device
-    if L == 0:
-        return torch.zeros(1, 0, dtype=torch.long, device=device)
-    arange = torch.arange(L, device=device)
-    new_run = torch.ones(L, dtype=torch.bool, device=device)
-    new_run[1:] = (sequence_ids[1:] != sequence_ids[:-1]) | (
-        grouping_ids[1:] != grouping_ids[:-1]
-    )
-    markers = torch.where(new_run, arange, torch.full_like(arange, -1))
-    return (arange - torch.cummax(markers, dim=0).values).unsqueeze(0)
+    """RoPE positions ``[1, L]``: count of earlier same-``(sequence, grouping_id)`` tokens.
+
+    Same rule as the FlexAttention train path and cached decode, so all three
+    agree even when a grouping id recurs after a different one.
+    """
+    return packed_rope_positions(
+        sequence_ids=sequence_ids, grouping_ids=grouping_ids
+    ).unsqueeze(0)

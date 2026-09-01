@@ -290,6 +290,36 @@ def test_static_fourier_no_parameters() -> None:
     assert y.shape == (2, 8)
 
 
+def test_static_fourier_stays_fp32_under_bf16_cast() -> None:
+    from mouse_core.models.embedding import StaticFourierFeatures
+
+    ref = StaticFourierFeatures(num_features=64, in_min=0.01, in_max=100.0)
+    cast = StaticFourierFeatures(num_features=64, in_min=0.01, in_max=100.0).to(
+        dtype=torch.bfloat16
+    )
+    assert cast.freqs.dtype == torch.float32
+    assert cast.phases.dtype == torch.float32
+    x = torch.tensor([1.0, 3.7, 10.0])
+    a = ref(x)
+    b = cast(x)
+    assert b.dtype == torch.float32
+    assert torch.allclose(a, b)
+
+
+def test_numeric_embedder_bf16_keeps_fourier_precision() -> None:
+    torch.manual_seed(0)
+    fp32 = _enc(hidden_dim=64, modalities=[{"type": "fourier", "field": "reward"}])
+    bf16 = _enc(hidden_dim=64, modalities=[{"type": "fourier", "field": "reward"}]).to(
+        dtype=torch.bfloat16
+    )
+    batch = _tb(fp32, [[{"reward": 10.0, "task_index": 0}]])
+    ref, _ = fp32(batch)
+    out, _ = bf16(batch)
+    assert out.dtype == torch.bfloat16
+    err = (out.float() - ref).abs().max().item()
+    assert err < 0.02, err
+
+
 def test_numeric_embedder_extra_fields_in_objective_fields() -> None:
     encoder = _enc(
         hidden_dim=8,

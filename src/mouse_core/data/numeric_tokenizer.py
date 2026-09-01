@@ -24,6 +24,7 @@ from mouse_core.data.modality import (
     KIND_LEARNABLE,
     NumericTokenizerModalitySpec,
     TokenizerModalityMeta,
+    copy_keep_fields,
     resolve_tokenizer_numeric_modalities,
     unwrap_scalar,
     values_equal,
@@ -104,45 +105,6 @@ class NumericTokenizer:
         )
 
 
-def _copy_keep_fields(
-    row: dict,
-    pairs: Sequence[tuple[str, str]],
-) -> dict[str, Any]:
-    """Copy ``input_field`` → ``output_field`` columns from the step.
-
-    Every ``objective_fields`` input must be present (and not ``None``) on the
-    step. There is no silent default: a missing objective column (e.g.
-    ``old_log_prob`` or ``advantage``) would otherwise train on zeros.
-    """
-    out: dict[str, Any] = {}
-    for in_name, out_name in pairs:
-        value = row.get(in_name)
-        if value is None:
-            raise KeyError(
-                f"objective_fields input {in_name!r} is missing from step "
-                f"(have {sorted(row)}); stamp it on the row before tokenizing"
-            )
-        if isinstance(value, (list, tuple)):
-            arr = np.asarray(value)
-            if np.issubdtype(arr.dtype, np.floating):
-                out[out_name] = arr.astype(np.float32).ravel()
-            else:
-                out[out_name] = arr.astype(np.int64).ravel()
-            continue
-        if isinstance(value, np.ndarray) and value.ndim > 0:
-            if np.issubdtype(value.dtype, np.floating):
-                out[out_name] = value.astype(np.float32).ravel()
-            else:
-                out[out_name] = value.astype(np.int64).ravel()
-            continue
-        sample = unwrap_scalar(value)
-        if isinstance(sample, (float, np.floating)):
-            out[out_name] = float(sample)
-        else:
-            out[out_name] = int(sample)
-    return out
-
-
 def _tokenize_numeric_step(
     row: dict,
     meta: Sequence[TokenizerModalityMeta],
@@ -196,10 +158,12 @@ def _tokenize_numeric_step(
                 vals = [float(unwrap_scalar(value))]
             else:
                 arr = np.asarray(value, dtype=np.float32).ravel()
-                if arr.size < m.dim:
-                    pad = np.zeros(m.dim - arr.size, dtype=np.float32)
-                    arr = np.concatenate([arr, pad])
-                vals = [float(arr[i]) for i in range(m.dim)]
+                if arr.size != m.dim:
+                    raise ValueError(
+                        f"continuous field {in_name!r} declared dim={m.dim} but the "
+                        f"step value has {arr.size} elements"
+                    )
+                vals = [float(v) for v in arr]
             for i, v in enumerate(vals):
                 _emit(name=name, token_id=i, value=v)
         elif m.kind == KIND_IMAGE:
@@ -227,5 +191,5 @@ def _tokenize_numeric_step(
         modality_map=dict(modality_map),
         grouping_id=gid,
         grouping_field=grouping_field,
-        objective_fields=_copy_keep_fields(row, objective_fields_keep),
+        objective_fields=copy_keep_fields(row, objective_fields_keep),
     )

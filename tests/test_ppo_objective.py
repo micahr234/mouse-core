@@ -79,6 +79,19 @@ def test_ppo_objective_all_out_of_run_pairs_yield_zero_loss() -> None:
     assert abs(loss.item()) < 1e-05
     assert abs(metrics['advantage_mean']) < 1e-05
 
+def test_ppo_policy_loss_does_not_backprop_into_values() -> None:
+    torch.manual_seed(0)
+    objective_data, predictions = _ppo_batch(n=6, a=3)
+    predictions['action'] = predictions['action'].clone().requires_grad_(True)
+    predictions['value'] = predictions['value'].clone().requires_grad_(True)
+    objective = PpoObjective(vf_coef=0.0, ent_coef=0.0, normalize_advantage=True)
+    loss, _ = objective(objective_data, predictions)
+    loss.backward()
+    assert predictions['action'].grad is not None
+    assert predictions['action'].grad.abs().sum() > 0
+    assert predictions['value'].grad is None or torch.all(predictions['value'].grad == 0)
+
+
 def test_sample_discrete_action_shapes() -> None:
     logits = torch.randn(4, 5)
     actions, log_probs = sample_discrete_action(num_actions=3, logits=logits)

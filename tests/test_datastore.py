@@ -77,6 +77,34 @@ def test_dataset_roundtrip() -> None:
     assert [r['action'] for r in rows] == [0, 1, 0]
     assert rows[2]['reward'] == 2.0
 
+def test_getitem_out_of_range_raises_index_error() -> None:
+    import pytest
+
+    store = Datastore()
+    for i in range(3):
+        store.append({'action': i})
+    with pytest.raises(IndexError):
+        store[3]
+    with pytest.raises(IndexError):
+        store[[0, 5]]
+    with pytest.raises(IndexError):
+        store[-4]
+    assert store[-1][0]['action'] == 2
+    assert Datastore()[[]] == []
+    assert Datastore()[0:5] == []
+
+
+def test_getitem_slice_and_copies() -> None:
+    store = Datastore()
+    for i in range(5):
+        store.append({'action': i})
+    assert [r['action'] for r in store[1:4]] == [1, 2, 3]
+    assert [r['action'] for r in store[::2]] == [0, 2, 4]
+    rows = store[[0]]
+    rows[0]['action'] = 99
+    assert store[0][0]['action'] == 0
+
+
 def test_getitem_mixed_source_and_buffer() -> None:
     """Rows from the HF source and from the append buffer interleave correctly."""
     store = Datastore()

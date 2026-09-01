@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from typing import Any, ClassVar
 
@@ -130,12 +131,78 @@ def unwrap_scalar(value: Any) -> Any:
 
 
 def values_equal(a: Any, b: Any) -> bool:
-    return unwrap_scalar(a) == unwrap_scalar(b)
+    """Scalar-or-array equality that always yields a Python ``bool``.
+
+    Vectors (``list`` / ``ndarray`` / ``Tensor`` with ``ndim > 0``) compare
+    elementwise against ``b`` (which may be a scalar broadcast over every
+    element, or a same-shape vector); ``True`` only when every element matches.
+    """
+    a = unwrap_scalar(a)
+    b = unwrap_scalar(b)
+    if isinstance(a, torch.Tensor):
+        a = a.detach().cpu().numpy()
+    if isinstance(b, torch.Tensor):
+        b = b.detach().cpu().numpy()
+    if isinstance(a, (list, tuple, np.ndarray)) or isinstance(b, (list, tuple, np.ndarray)):
+        arr_a = np.asarray(a)
+        arr_b = np.asarray(b)
+        if arr_b.ndim > 0 and arr_a.shape != arr_b.shape:
+            return False
+        return bool(np.all(arr_a == arr_b))
+    return bool(a == b)
+
+
+def copy_keep_fields(
+    row: dict,
+    pairs: Sequence[tuple[str, str]],
+) -> dict[str, Any]:
+    """Copy ``input_field`` → ``output_field`` objective columns from a step.
+
+    Shared by :class:`~mouse_core.data.numeric_tokenizer.NumericTokenizer` and
+    :class:`~mouse_core.data.text_tokenizer.TextTokenizer`. Every listed input
+    must be present (and not ``None``) on the step: there is no silent default,
+    since a missing objective column (``old_log_prob``, ``advantage``, …) would
+    otherwise train on zeros. Vectors (any length, including 1) stay vectors;
+    scalars become ``float`` / ``int``.
+    """
+    out: dict[str, Any] = {}
+    for in_name, out_name in pairs:
+        value = row.get(in_name)
+        if value is None:
+            raise KeyError(
+                f"objective_fields input {in_name!r} is missing from step "
+                f"(have {sorted(row)}); stamp it on the row before tokenizing"
+            )
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu().numpy()
+        if isinstance(value, (list, tuple)):
+            value = np.asarray(value)
+        if isinstance(value, np.ndarray) and value.ndim > 0:
+            if np.issubdtype(value.dtype, np.floating):
+                out[out_name] = value.astype(np.float32).ravel()
+            elif np.issubdtype(value.dtype, np.integer) or value.dtype == np.bool_:
+                out[out_name] = value.astype(np.int64).ravel()
+            else:
+                raise TypeError(
+                    f"objective_fields input {in_name!r} must be numeric, got dtype {value.dtype}"
+                )
+            continue
+        sample = unwrap_scalar(value)
+        if isinstance(sample, (float, np.floating)):
+            out[out_name] = float(sample)
+        elif isinstance(sample, (bool, int, np.integer)):
+            out[out_name] = int(sample)
+        else:
+            raise TypeError(
+                f"objective_fields input {in_name!r} must be numeric, got {type(sample).__name__}"
+            )
+    return out
 
 
 def expand_tokenizer_numeric_spec(
     spec: NumericTokenizerModalitySpec, *, learnable_index: int
 ) -> list[NumericTokenizerModalitySpec]:
+    """``learnable_index`` is the ordinal among learnable specs (matches the embedder)."""
     if spec.type == "learnable":
         name = f"__learnable_{learnable_index}"
         return [replace(spec, output_field=name)]
@@ -172,14 +239,17 @@ def resolve_tokenizer_numeric_modalities(
     """Expand tokenizer input-field specs; each slot is keyed by ``output_field``."""
     raw = input_fields or []
     specs: list[NumericTokenizerModalitySpec] = []
-    for i, m in enumerate(raw):
+    n_learnable = 0
+    for m in raw:
         if isinstance(m, NumericTokenizerModalitySpec):
             spec = m
         else:
             data = dict(m)
             _reject_legacy_field_key(data, who="tokenizer")
             spec = NumericTokenizerModalitySpec(**data)
-        specs.extend(expand_tokenizer_numeric_spec(spec, learnable_index=i))
+        specs.extend(expand_tokenizer_numeric_spec(spec, learnable_index=n_learnable))
+        if spec.type == "learnable":
+            n_learnable += 1
 
     meta: list[TokenizerModalityMeta] = []
     seen: set[str] = set()

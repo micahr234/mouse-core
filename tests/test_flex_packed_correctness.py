@@ -60,30 +60,51 @@ def test_flat_sequence_position_ids_match_legacy(device: str) -> None:
         ref = _legacy_flat_sequence_position_ids(seq, task)
         assert torch.equal(got, ref), f'mismatch at L={L} device={device}'
 
-def test_flex_train_position_ids_match_legacy_on_device() -> None:
-    """Reproduce flex_train's inlined cummax formula vs legacy."""
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    L = 200
+@pytest.mark.parametrize('device', ['cpu'] + (['cuda'] if torch.cuda.is_available() else []))
+def test_packed_rope_positions_match_brute_force_with_recurring_ids(device: str) -> None:
+    """Shared train-path rule == count of earlier same-(sequence, grouping) tokens."""
+    from mouse_core.models.backbone.flex_decode import packed_rope_positions
+
     rng = np.random.default_rng(1)
-    seq = torch.zeros(L, dtype=torch.long, device=device)
-    task = torch.zeros(L, dtype=torch.long, device=device)
-    s_id = 0
-    t_id = 0
-    for i in range(L):
-        if i > 0 and rng.random() < 0.1:
-            s_id += 1
-            t_id = 0
-        elif i > 0 and rng.random() < 0.08:
-            t_id += 1
-        seq[i] = s_id
-        task[i] = t_id
-    arange = torch.arange(L, device=device)
-    new_run = torch.ones(L, dtype=torch.bool, device=device)
-    new_run[1:] = (seq[1:] != seq[:-1]) | (task[1:] != task[:-1])
-    markers = torch.where(new_run, arange, torch.full_like(arange, -1))
-    got = arange - torch.cummax(markers, dim=0).values
-    ref = _legacy_flat_sequence_position_ids(seq, task).squeeze(0)
-    assert torch.equal(got, ref)
+    for L in (1, 50, 200, 300):
+        seq = torch.as_tensor(np.sort(rng.integers(0, 4, size=L)), device=device)
+        grp = torch.as_tensor(rng.integers(0, 3, size=L), device=device)  # ids recur freely
+        got = packed_rope_positions(sequence_ids=seq, grouping_ids=grp)
+        same = (seq[:, None] == seq[None, :]) & (grp[:, None] == grp[None, :])
+        earlier = torch.arange(L, device=device)[None, :] < torch.arange(L, device=device)[:, None]
+        ref = (same & earlier).sum(-1)
+        assert torch.equal(got, ref), f'mismatch at L={L} device={device}'
+        assert torch.equal(_flat_sequence_position_ids(sequence_ids=seq, grouping_ids=grp).squeeze(0), ref)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='compiled Flex path is CUDA bf16 only')
+@pytest.mark.parametrize('L', [12, 300], ids=['L<block', 'L>block'])
+def test_flex_packed_bf16_matches_fp32_sdpa_within_bf16_noise(L: int) -> None:
+    """Compiled bf16 Flex train forward (both BLOCK_SIZE regimes, recurring ids) ≈ fp32 SDPA."""
+    torch.manual_seed(0)
+    device = torch.device('cuda')
+    bb32 = Qwen3Backbone(hidden_dim=64, num_layers=2, num_heads=4, num_key_value_heads=4).to(device)
+    bb16 = Qwen3Backbone(hidden_dim=64, num_layers=2, num_heads=4, num_key_value_heads=4).to(device)
+    bb16.load_state_dict(bb32.state_dict())
+    bb16.to(torch.bfloat16)
+    embeds = torch.randn(L, 64, device=device)
+    sequence_ids = torch.arange(L, device=device) * 3 // L
+    grouping_ids = (torch.arange(L, device=device) // 7) % 2
+    with torch.no_grad():
+        h_flex = cast(torch.Tensor, flex_packed_forward(
+            model=bb16.model, embeds=embeds.to(torch.bfloat16),
+            sequence_ids=sequence_ids, grouping_ids=grouping_ids,
+        )).float()
+        attention_mask = _flat_sequence_causal_mask(dtype=torch.float32, sequence_ids=sequence_ids, grouping_ids=grouping_ids)
+        position_ids = _flat_sequence_position_ids(sequence_ids=sequence_ids, grouping_ids=grouping_ids)
+        h_ref = cast(torch.Tensor, bb32(embeds.unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)).squeeze(0)
+        h_ref16 = cast(torch.Tensor, bb16(
+            embeds.to(torch.bfloat16).unsqueeze(0),
+            attention_mask=attention_mask.to(torch.bfloat16), position_ids=position_ids,
+        )).squeeze(0).float()
+    flex_err = (h_flex - h_ref).abs().max().item()
+    bf16_floor = (h_ref16 - h_ref).abs().max().item()
+    assert flex_err <= 2.0 * bf16_floor + 1e-3, f'flex err {flex_err} vs bf16 SDPA floor {bf16_floor}'
 
 def test_prepare_sequence_id_col_matches_step_counts() -> None:
     encoder = NumericEmbedder(hidden_dim=8, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4}, {"type": 'fourier', "field": "reward"}, {'type': 'learnable', 'tokens': 1}])

@@ -26,12 +26,39 @@ from mouse_core.models.heads.base import BaseHead
 _DQN_HEADS = ("action_value", "action_value_layerwise")
 
 
-def _polyak_copy(online: nn.Module, delayed: nn.Module, tau: float) -> None:
-    """Soft-update ``delayed`` toward ``online``: θ ← τ·θ_online + (1−τ)·θ_delayed."""
-    if tau <= 0.0:
-        return
-    for online_p, delayed_p in zip(online.parameters(), delayed.parameters(), strict=True):
-        delayed_p.data.copy_(tau * online_p.data + (1.0 - tau) * delayed_p.data)
+class _PolyakState:
+    """Pairs online/delayed parameters and lerps them in fp32.
+
+    A small ``tau`` times the online/delayed gap is far below half a bf16 ULP
+    (~``|w| / 512``), so lerping directly in a bf16 parameter rounds every
+    update away and the delayed copy never moves. Non-fp32 delayed parameters
+    therefore get a persistent fp32 shadow: the interpolation happens on the
+    shadow and the result is cast into the delayed parameter each update.
+    """
+
+    def __init__(self, online: nn.Module, delayed: nn.Module) -> None:
+        self._pairs: list[tuple[nn.Parameter, nn.Parameter, torch.Tensor | None]] = []
+        for online_p, delayed_p in zip(
+            online.parameters(), delayed.parameters(), strict=True
+        ):
+            shadow = (
+                None
+                if delayed_p.dtype == torch.float32
+                else delayed_p.detach().to(dtype=torch.float32).clone()
+            )
+            self._pairs.append((online_p, delayed_p, shadow))
+
+    @torch.no_grad()
+    def update(self, tau: float) -> None:
+        """θ_delayed ← τ·θ_online + (1−τ)·θ_delayed, accumulated in fp32."""
+        if tau <= 0.0:
+            return
+        for online_p, delayed_p, shadow in self._pairs:
+            if shadow is None:
+                delayed_p.lerp_(online_p.to(dtype=delayed_p.dtype), tau)
+                continue
+            shadow.lerp_(online_p.to(dtype=torch.float32), tau)
+            delayed_p.copy_(shadow)
 
 
 class _DelayedHeads(nn.Module):
@@ -90,9 +117,11 @@ class PolyakAverager:
             delayed_heads = copy.deepcopy(model.heads)
             delayed_heads.requires_grad_(False)
             self.model: Model | _DelayedHeads = _DelayedHeads(delayed_heads)
+            self._state = _PolyakState(model.heads, delayed_heads)
         else:
             self.model = copy.deepcopy(model)
             self.model.requires_grad_(False)
+            self._state = _PolyakState(model, self.model)
         self.model.train()
 
     def __call__(self, averager_inputs: AveragerInputs) -> TensorDict:
@@ -116,8 +145,9 @@ class PolyakAverager:
             return self.model.head(h=averager_inputs.h.detach())
 
     def update(self) -> None:
-        """Move delayed weights toward the online model after an optimizer step."""
-        if self.scope == "model":
-            _polyak_copy(self._online, self.model, self.tau)
-            return
-        _polyak_copy(self._online.heads, self.model.heads, self.tau)
+        """Move delayed weights toward the online model after an optimizer step.
+
+        Interpolation is accumulated in fp32 even when the delayed modules are
+        bf16, so small ``tau`` updates are not rounded away.
+        """
+        self._state.update(self.tau)

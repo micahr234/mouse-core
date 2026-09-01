@@ -185,10 +185,13 @@ class Qwen3Backbone(Backbone):
 
         hf_cfg = AutoConfig.from_pretrained(repo_id_or_path, **hub_kwargs)
         model_type = getattr(hf_cfg, "model_type", "").lower()
-        if "qwen3" not in model_type and "qwen" not in model_type:
+        if model_type != "qwen3":
+            # Qwen2 (attention biases, no q/k norm) and the MoE variants would
+            # build a Qwen3Model whose tensors only partially match, silently
+            # dropping the checkpoint's own weights.
             raise ValueError(
-                f"Qwen3Backbone can only load Qwen configs, got model_type={model_type!r} "
-                f"from {repo_id_or_path!r}."
+                f"Qwen3Backbone can only load model_type='qwen3' configs, got "
+                f"model_type={model_type!r} from {repo_id_or_path!r}."
             )
 
         backbone_kwargs: dict[str, Any] = dict(
