@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- ``AdamW.zero_grad`` and ``AdamWFp32.zero_grad`` accept ``set_to_none``
+  (default ``True``), matching ``torch.optim.Optimizer.zero_grad``.
+  ``AdamWFp32`` also clears fp32 master grads.
 - ``AdamW`` and ``AdamWFp32``: same defaults (``lr``, ``betas``, ``fused``).
   ``AdamW`` is stock; ``AdamWFp32`` keeps fp32 master weights (and fp32
   AdamW state) for non-fp32 compute parameters so updates smaller than a

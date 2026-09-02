@@ -25,6 +25,15 @@ Skip the changelog for:
 - Test-only changes
 - Doc typo fixes (no behavior change)
 
+## Style
+
+Same header, sections, and markup in every mouse repo.
+
+- File header: Keep a Changelog + SemVer (see `CHANGELOG.md`).
+- Markdown only. Inline code is ``name``. Never Sphinx roles
+  (``:meth:``, ``:class:``, ``:func:``).
+- Section order: Added, Changed, Removed, Fixed. Omit empty sections.
+
 ## Format
 
 Always add new work to `## [Unreleased]` — never add new entries to an already dated release block.

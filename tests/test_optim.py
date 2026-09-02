@@ -132,6 +132,47 @@ def test_adamw_state_dict_roundtrip() -> None:
     assert len(opt2._inner.state) == 1
 
 
+def test_zero_grad_set_to_none() -> None:
+    for cls in (AdamW, AdamWFp32):
+        p = torch.nn.Parameter(torch.ones(4, dtype=torch.bfloat16))
+        opt = cls([p], lr=1e-2, fused=False)
+        p.grad = torch.ones_like(p)
+        opt.zero_grad(set_to_none=True)
+        assert p.grad is None
+
+
+def test_zero_grad_zeros_in_place() -> None:
+    for cls in (AdamW, AdamWFp32):
+        p = torch.nn.Parameter(torch.ones(4, dtype=torch.bfloat16))
+        opt = cls([p], lr=1e-2, fused=False)
+        p.grad = torch.ones_like(p)
+        held = p.grad
+        opt.zero_grad(set_to_none=False)
+        assert p.grad is held
+        assert torch.equal(p.grad, torch.zeros_like(p))
+
+
+def test_zero_grad_default_drops_grad() -> None:
+    for cls in (AdamW, AdamWFp32):
+        p = torch.nn.Parameter(torch.ones(4, dtype=torch.bfloat16))
+        opt = cls([p], lr=1e-2, fused=False)
+        p.grad = torch.ones_like(p)
+        opt.zero_grad()
+        assert p.grad is None
+
+
+def test_adamw_fp32_zero_grad_clears_masters() -> None:
+    p = torch.nn.Parameter(torch.ones(4, dtype=torch.bfloat16))
+    opt = AdamWFp32([p], lr=1e-2, fused=False)
+    p.grad = torch.ones_like(p)
+    opt.step()
+    _, master = opt._synced[0]
+    assert master.grad is not None
+    opt.zero_grad(set_to_none=True)
+    assert p.grad is None
+    assert master.grad is None
+
+
 def test_skips_frozen_params() -> None:
     trainable = torch.nn.Parameter(torch.ones(4, dtype=torch.bfloat16))
     frozen = torch.nn.Parameter(torch.ones(4, dtype=torch.bfloat16))

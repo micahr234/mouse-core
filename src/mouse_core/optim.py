@@ -44,6 +44,21 @@ def _write_grad(dst: nn.Parameter, src: torch.Tensor | None) -> None:
     dst.grad.copy_(src)
 
 
+def _zero_grad(params: Iterable[nn.Parameter], *, set_to_none: bool) -> None:
+    for param in params:
+        grad = param.grad
+        if grad is None:
+            continue
+        if set_to_none:
+            param.grad = None
+            continue
+        if grad.grad_fn is not None:
+            grad.detach_()
+        else:
+            grad.requires_grad_(False)
+        grad.zero_()
+
+
 class AdamW:
     """Stock AdamW. Same defaults as :class:`AdamWFp32`, no master copies.
 
@@ -74,9 +89,9 @@ class AdamW:
     def param_groups(self) -> list[dict[str, Any]]:
         return self._inner.param_groups
 
-    def zero_grad(self) -> None:
-        for param in self._params:
-            param.grad = None
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        """Clear parameter grads. ``set_to_none`` matches :meth:`torch.optim.Optimizer.zero_grad`."""
+        _zero_grad(self._params, set_to_none=set_to_none)
 
     def step(self) -> None:
         self._inner.step()
@@ -143,9 +158,10 @@ class AdamWFp32:
     def param_groups(self) -> list[dict[str, Any]]:
         return self._inner.param_groups
 
-    def zero_grad(self) -> None:
-        for param in self._params:
-            param.grad = None
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        """Clear compute (and master) grads. ``set_to_none`` matches :meth:`torch.optim.Optimizer.zero_grad`."""
+        _zero_grad(self._params, set_to_none=set_to_none)
+        _zero_grad((master for _, master in self._synced), set_to_none=set_to_none)
 
     def step(self) -> None:
         for compute, master in self._synced:
