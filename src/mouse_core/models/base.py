@@ -659,18 +659,28 @@ def _run_heads(
 class AveragerInputs:
     """Per-forward extras for delayed Q and incremental decode.
 
-    Pass to :class:`~mouse_core.polyak.PolyakAverager`: head scope uses ``h``,
-    model scope uses ``batch``. Incremental decode uses ``cache`` (or pass this
-    object back as ``cache=``). ``h`` is always detached so gradients cannot
+    Pass to :class:`~mouse_core.polyak.PolyakAverager`. A delayed section
+    with tau ``0`` reuses the matching activation when its inputs are not
+    from a delayed net: encoder skips to ``embeds``, backbone skips to
+    ``h``, heads skip to ``predictions``. A delayed encoder reads
+    ``batch``. Incremental decode uses ``cache`` (or pass this object
+    back as ``cache=``). Activations are detached so gradients cannot
     flow back through the averager.
     """
 
     h: torch.Tensor
     batch: TokenBatch
     cache: dict[str, Any] | None = None
+    embeds: torch.Tensor | None = None
+    prediction_indices: torch.Tensor | None = None
+    predictions: TensorDict | None = None
 
     def __post_init__(self) -> None:
         self.h = self.h.detach()
+        if self.embeds is not None:
+            self.embeds = self.embeds.detach()
+        if self.predictions is not None:
+            self.predictions = self.predictions.detach()
 
 
 class Model(nn.Module):
@@ -711,7 +721,9 @@ class Model(nn.Module):
     DQN target Q is ``averager(averager_inputs)`` where ``averager_inputs``
     comes from that same ``model(inputs)`` call. Pooled head input
     is ``averager_inputs.h`` (last-layer ``[N, D]``, or stacked layers
-    ``[N, L, D]`` when a layerwise head is enabled).
+    ``[N, L, D]`` when a layerwise head is enabled). Encoder output is
+    ``averager_inputs.embeds`` so a delayed backbone can skip a zero-tau
+    encoder.
     """
 
     _VALID_HEADS = ("action_value", "action_value_layerwise", "action", "value")
@@ -1110,7 +1122,14 @@ class Model(nn.Module):
             self.encoder, session_out, prediction_indices, needs_layerwise
         )
         predictions = self.head(h=h, batch_size=pred_batch_size)
-        return predictions, AveragerInputs(h=h, batch=token_batch, cache=new_cache)
+        return predictions, AveragerInputs(
+            h=h,
+            batch=token_batch,
+            cache=new_cache,
+            embeds=embeds,
+            prediction_indices=prediction_indices,
+            predictions=predictions,
+        )
 
     def head(
         self,

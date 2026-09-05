@@ -36,7 +36,7 @@ def test_model_layerwise_forward_and_objective() -> None:
         ),
         batch,
     )
-    averager = PolyakAverager(model, scope="head", tau=0.1)
+    averager = PolyakAverager(model, tau_head=0.1)
     predictions, averager_inputs = model(token_batch)
     delayed_predictions = averager(averager_inputs)
     assert 'action_value_layerwise' in predictions.keys()

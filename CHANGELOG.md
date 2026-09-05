@@ -21,14 +21,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a resumed run keeps its sub-ULP progress. Load model weights before
   constructing ``AdamWFp32`` — the masters are the source of truth from then
   on and every ``step`` writes them back over the compute parameters.
-- ``PolyakAverager``: delayed DQN weights next to the optimizer.
-  ``scope="head"`` (default) copies only the heads (not encoder/backbone)
-  and reuses the online pooled representation. ``scope="model"`` copies
-  the full stack and recomputes representations. ``Model.forward``
-  returns ``(predictions, averager_inputs)``; delayed Q is
-  ``averager(averager_inputs)``. DQN notebooks use ``scope="head"``;
-  ``examples/11_train_offline_dqn_model_delay.ipynb`` shows
-  ``scope="model"``.
+- ``PolyakAverager``: delayed DQN weights next to the optimizer, with
+  independent ``tau_encoder``, ``tau_backbone``, and ``tau_head``.
+  ``0`` (the encoder/backbone default) means that section is not delayed
+  and is not recomputed when its inputs are already online.
+  ``Model.forward`` returns ``(predictions, averager_inputs)``; delayed Q
+  is ``averager(averager_inputs)``. DQN notebooks delay the head
+  (``tau_head=``); ``examples/11_train_offline_dqn_model_delay.ipynb``
+  delays encoder, backbone, and head.
 - ``examples/05_train_offline_sv.ipynb``: offline supervised-value training
   (``SvObjective`` regresses ``action_value`` onto ``info_q_star``). The action
   permute spec sets ``input_vector_field`` / ``output_vector_field`` to
@@ -37,8 +37,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (``SpObjective`` CE onto a random argmax of ``info_q_star`` with
   ``DiscreteActionHead``). Same action vector-field permute as SV.
 - ``examples/11_train_offline_dqn_model_delay.ipynb``: same offline DQN
-  loop as ``02``, with ``PolyakAverager(scope="model")`` delaying the
-  encoder, backbone, and Q head.
+  loop as ``02``, with ``PolyakAverager`` delaying the encoder, backbone,
+  and Q head (nonzero ``tau_encoder`` / ``tau_backbone`` / ``tau_head``).
 - ``StepTokens``: tokenizer output for one step (token arrays + scalar
   ``grouping_id`` + ``objective_fields``). ``pack_token_batch(...)`` builds a
   ``TokenBatch`` from many steps (assigns ``sequence_ids``, expands
@@ -84,14 +84,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``forward`` is ``averager_inputs.h`` (last-layer ``[N, D]``, or stacked
   layers ``[N, L, D]`` when a layerwise Q head is enabled). ``h_layers``
   and ``model.h`` are removed.
-- ``PolyakAverager(scope="head")`` deep-copies only the heads, not the
-  encoder or backbone. ``Model.forward`` returns
-  ``(predictions, averager_inputs)``. Delayed Q is
-  ``averager(averager_inputs)`` (head scope uses ``averager_inputs.h``
-  and does not rerun encoder/backbone; model scope recomputes from
-  ``averager_inputs.batch``). ``averager_inputs.h`` is detached so
-  gradients cannot flow back through the averager. Online and delayed
-  forwards run in ``train()``; delayed weights stay frozen (``no_grad``).
+- ``PolyakAverager`` deep-copies only sections with a positive tau.
+  ``Model.forward`` returns ``(predictions, averager_inputs)`` including
+  detached ``embeds``, ``h``, and ``predictions``. Delayed Q is
+  ``averager(averager_inputs)``: a zero-tau encoder reuses
+  ``embeds``, a zero-tau backbone reuses ``h`` when the encoder was
+  also online, and a zero-tau head reuses ``predictions`` when both
+  were online. Online and delayed forwards run in ``train()``; delayed
+  weights stay frozen (``no_grad``).
 - ``DataLoader.next_batch()`` and ``pack_token_batch(...)`` return
   ``(inputs, objective_data)``. ``inputs`` is the ``TokenBatch``;
   ``objective_data`` is a CPU ``TensorDict`` of tokenizer
