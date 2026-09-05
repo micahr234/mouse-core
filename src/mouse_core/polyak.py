@@ -7,8 +7,10 @@ After the online forward::
     delayed_predictions = averager(averager_inputs)
 
 Each of ``tau_encoder``, ``tau_backbone``, and ``tau_head`` is independent.
-A zero tau means that section is not delayed: if its inputs are also not
-from a delayed section, that path is not recomputed.
+``θ_delayed ← τ·θ_online + (1−τ)·θ_delayed``, so ``τ = 1`` is a perfect copy
+of the online section: if its inputs are also not from a delayed section,
+that path is not recomputed. ``τ = 0`` freezes the snapshot taken at
+construction.
 """
 
 from __future__ import annotations
@@ -77,24 +79,30 @@ def _head_map(heads: nn.ModuleDict) -> dict[str, BaseHead]:
     return {str(name): heads[name] for name in heads}
 
 
+def _online_section(tau: float) -> bool:
+    """``τ >= 1`` is a perfect copy of the online weights: no delayed module."""
+    return tau >= 1.0
+
+
 class PolyakAverager:
     """Delayed DQN weights for TD bootstrap targets.
 
     Construct after ``model.to(...)``. After the online forward, delayed Q is
     ``averager(averager_inputs)``. Each section has its own interpolation
-    factor; ``0`` means that section is not delayed. Delayed modules run in
-    ``train()`` under ``no_grad``. Call :meth:`update` after each
+    factor. ``1`` is a perfect copy of the online section (no delayed
+    module). ``0`` freezes the construction-time snapshot. Delayed modules
+    run in ``train()`` under ``no_grad``. Call :meth:`update` after each
     ``optimizer.step()``.
 
-    A delayed forward starts at the first delayed section and reuses the
-    online activations above it:
+    A delayed forward starts at the first delayed section (``τ < 1``) and
+    reuses the online activations above it:
 
-    - ``tau_encoder > 0`` recomputes embeddings from ``averager_inputs.batch``.
-    - else if ``tau_backbone > 0``, the delayed backbone reads
+    - ``tau_encoder < 1`` recomputes embeddings from ``averager_inputs.batch``.
+    - else if ``tau_backbone < 1``, the delayed backbone reads
       ``averager_inputs.embeds`` (no second encoder pass).
     - else delayed heads read ``averager_inputs.h`` (no second
       encoder/backbone pass).
-    - if every tau is ``0``, delayed Q is ``averager_inputs.predictions``.
+    - if every tau is ``1``, delayed Q is ``averager_inputs.predictions``.
 
     When a later section is delayed but an earlier one is not, the online
     module runs on the delayed inputs (those inputs *are* from a delayed
@@ -103,21 +111,24 @@ class PolyakAverager:
     Args:
         model: Online model (must have an ``action_value`` or
             ``action_value_layerwise`` head).
-        tau_encoder: Interpolation factor for the encoder. ``0`` keeps the
-            online encoder (and skips it when backbone inputs are online).
-        tau_backbone: Interpolation factor for the backbone. ``0`` keeps the
-            online backbone (and skips it when head inputs are online).
-        tau_head: Interpolation factor for the heads. ``0`` keeps the online
-            heads (and skips them when their inputs are online).
+        tau_encoder: Interpolation factor for the encoder. ``1`` (default)
+            keeps the online encoder (and skips it when backbone inputs are
+            online). ``0`` freezes the encoder snapshot.
+        tau_backbone: Interpolation factor for the backbone. ``1`` (default)
+            keeps the online backbone (and skips it when head inputs are
+            online). ``0`` freezes the backbone snapshot.
+        tau_head: Interpolation factor for the heads. ``1`` (default)
+            keeps the online heads (and skips them when their inputs are
+            online). ``0`` freezes the head snapshot.
     """
 
     def __init__(
         self,
         model: Model,
         *,
-        tau_encoder: float = 0.0,
-        tau_backbone: float = 0.0,
-        tau_head: float = 0.01,
+        tau_encoder: float = 1.0,
+        tau_backbone: float = 1.0,
+        tau_head: float = 1.0,
     ) -> None:
         if not any(name in model._heads for name in _DQN_HEADS):
             raise ValueError(
@@ -133,13 +144,13 @@ class PolyakAverager:
         self._encoder_state: _PolyakState | None = None
         self._backbone_state: _PolyakState | None = None
         self._head_state: _PolyakState | None = None
-        if self.tau_encoder > 0.0:
+        if not _online_section(self.tau_encoder):
             self.encoder = _copy_delayed(model.encoder)
             self._encoder_state = _PolyakState(model.encoder, self.encoder)
-        if self.tau_backbone > 0.0:
+        if not _online_section(self.tau_backbone):
             self.backbone = _copy_delayed(model.backbone)
             self._backbone_state = _PolyakState(model.backbone, self.backbone)
-        if self.tau_head > 0.0:
+        if not _online_section(self.tau_head):
             self.heads = _copy_delayed(model.heads)
             self._head_state = _PolyakState(model.heads, self.heads)
 
@@ -156,7 +167,7 @@ class PolyakAverager:
     def __call__(self, averager_inputs: AveragerInputs) -> TensorDict:
         """Delayed head outputs from a :class:`~mouse_core.models.base.AveragerInputs`.
 
-        Sections with tau ``0`` reuse the matching online activation when
+        Sections with tau ``1`` reuse the matching online activation when
         their inputs are not from a delayed section. Delayed modules run in
         ``train()`` under ``torch.no_grad()``.
         """
@@ -204,7 +215,7 @@ class PolyakAverager:
                 or averager_inputs.prediction_indices is None
             ):
                 raise ValueError(
-                    "Delayed backbone with tau_encoder=0 needs "
+                    "Delayed backbone with tau_encoder=1 needs "
                     "AveragerInputs.embeds from model(inputs)."
                 )
             embeds = averager_inputs.embeds
@@ -231,7 +242,8 @@ class PolyakAverager:
 
         Interpolation is accumulated in fp32 even when the delayed modules are
         bf16, so small ``tau`` updates are not rounded away. Sections with
-        tau ``0`` have no delayed copy and are skipped.
+        tau ``1`` have no delayed copy and are skipped; tau ``0`` keeps the
+        frozen snapshot.
         """
         if self._encoder_state is not None:
             self._encoder_state.update(self.tau_encoder)

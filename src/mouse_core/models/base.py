@@ -659,13 +659,14 @@ def _run_heads(
 class AveragerInputs:
     """Per-forward extras for delayed Q and incremental decode.
 
-    Pass to :class:`~mouse_core.polyak.PolyakAverager`. A delayed section
-    with tau ``0`` reuses the matching activation when its inputs are not
-    from a delayed net: encoder skips to ``embeds``, backbone skips to
-    ``h``, heads skip to ``predictions``. A delayed encoder reads
-    ``batch``. Incremental decode uses ``cache`` (or pass this object
-    back as ``cache=``). Activations are detached so gradients cannot
-    flow back through the averager.
+    Pass to :class:`~mouse_core.polyak.PolyakAverager`. A section with tau
+    ``1`` is a perfect copy of the online weights and reuses the matching
+    activation when its inputs are not from a delayed net: encoder skips
+    to ``embeds``, backbone skips to ``h``, heads skip to
+    ``predictions``. A delayed encoder (``τ < 1``) reads ``batch``.
+    Incremental decode uses ``cache`` (or pass this object back as
+    ``cache=``). Activations are detached so gradients cannot flow back
+    through the averager.
     """
 
     h: torch.Tensor
@@ -722,7 +723,7 @@ class Model(nn.Module):
     comes from that same ``model(inputs)`` call. Pooled head input
     is ``averager_inputs.h`` (last-layer ``[N, D]``, or stacked layers
     ``[N, L, D]`` when a layerwise head is enabled). Encoder output is
-    ``averager_inputs.embeds`` so a delayed backbone can skip a zero-tau
+    ``averager_inputs.embeds`` so a delayed backbone can skip a tau-1
     encoder.
     """
 
