@@ -93,7 +93,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tau-1 backbone reuses ``h`` when the encoder was also online, and a
   tau-1 head reuses ``predictions`` when both were online. ``tau = 0``
   keeps a frozen snapshot and still recomputes. Online and delayed
-  forwards run in ``train()``; delayed weights stay frozen (``no_grad``).
+  forwards run in ``train()``; the delayed forward is ``no_grad``.
 - ``DataLoader.next_batch()`` and ``pack_token_batch(...)`` return
   ``(inputs, objective_data)``. ``inputs`` is the ``TokenBatch``;
   ``objective_data`` is a CPU ``TensorDict`` of tokenizer
@@ -232,6 +232,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a cleared stream can restart without rebuilding the whole batch.
 
 ### Fixed
+- ``DqnObjective`` / ``LayerwiseDqnObjective`` detach delayed Q before
+  the Bellman target, so a gradient tape on the delayed tensor cannot
+  flow into the TD error.
+- ``PolyakAverager`` delayed forward is entirely ``torch.no_grad``, so
+  delayed Q never records an autograd graph — including when a tau-1
+  section reuses an online module on delayed inputs. All-tau-1 returns
+  ``averager_inputs.predictions`` and does not rerun the online head.
 - ``Qwen3Backbone(pretrained=...)`` and ``LlamaBackbone(pretrained=...)`` copy
   ``rope_parameters`` from the HuggingFace config. Without this, Qwen3-0.6B
   was built with default ``rope_theta=1e4`` instead of the checkpoint's

@@ -183,3 +183,24 @@ def test_dqn_objective_multiplies_episode_and_task_gammas() -> None:
         gamma_task_truncated=0.4,
     )(step_stream, predictions, delayed)
     assert abs(loss.item() - 1.0) < 1e-05
+
+
+def test_dqn_objective_does_not_backprop_through_delayed_q() -> None:
+    """Bootstrap Q is a constant: delayed Q must not receive a gradient."""
+    n, a = 4, 2
+    step_stream = TensorDict(
+        {
+            "action": torch.zeros(n, dtype=torch.long),
+            "reward": torch.ones(n),
+            "episode_done": torch.zeros(n, dtype=torch.long),
+            "task_done": torch.zeros(n, dtype=torch.long),
+        },
+        batch_size=[n],
+    )
+    online = torch.randn(n, a, requires_grad=True)
+    delayed = torch.randn(n, a, requires_grad=True)
+    predictions, delayed_td = _q(online, delayed)
+    loss, _ = DqnObjective(gamma_step=1.0)(step_stream, predictions, delayed_td)
+    loss.backward()
+    assert online.grad is not None
+    assert delayed.grad is None

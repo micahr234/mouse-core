@@ -75,7 +75,8 @@ class LayerwiseDqnObjective(Objective):
 
     Reads ``predictions["action_value_layerwise"]`` and
     ``delayed_predictions["action_value_layerwise"]`` with shape ``[N, L, A]``.
-    Delayed Q comes from ``averager(averager_inputs)``.
+    Delayed Q comes from ``averager(averager_inputs)`` and is detached
+    before the Bellman target, so the TD error does not backprop through it.
     Each layer and each episode/task done-code uses its own discount, built at construction
     from explicit shallow/deep endpoint pairs. A run is the same
     ``sequence_id`` and, when ``grouping_field`` is set and present, the same
@@ -203,7 +204,7 @@ class LayerwiseDqnObjective(Objective):
         delayed_predictions: TensorDict,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         q: torch.Tensor = predictions["action_value_layerwise"]
-        q_target: torch.Tensor = delayed_predictions["action_value_layerwise"]
+        q_target: torch.Tensor = delayed_predictions["action_value_layerwise"].detach()
 
         if q.ndim != 3:
             raise ValueError(

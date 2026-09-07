@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import pytest
@@ -405,3 +406,65 @@ def test_averager_inputs_are_detached() -> None:
     averager = PolyakAverager(model, tau_head=0.01)
     delayed = averager(averager_inputs)
     assert not delayed["action_value"].requires_grad
+    assert delayed["action_value"].grad_fn is None
+
+
+def _assert_no_autograd_graph(fn: Callable[[], Any]) -> None:
+    saved = {"n": 0}
+
+    def pack(tensor: torch.Tensor) -> torch.Tensor:
+        saved["n"] += 1
+        return tensor
+
+    def unpack(tensor: torch.Tensor) -> torch.Tensor:
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
+        out = fn()
+    q = out["action_value"]
+    assert saved["n"] == 0
+    assert not q.requires_grad
+    assert q.grad_fn is None
+
+
+@pytest.mark.parametrize(
+    "taus",
+    [
+        {"tau_encoder": 0.01, "tau_backbone": 0.01, "tau_head": 0.01},
+        {"tau_encoder": 0.0, "tau_backbone": 1.0, "tau_head": 1.0},
+        {"tau_encoder": 1.0, "tau_backbone": 0.0, "tau_head": 1.0},
+        {"tau_encoder": 1.0, "tau_backbone": 1.0, "tau_head": 0.01},
+        {"tau_encoder": 1.0, "tau_backbone": 1.0, "tau_head": 1.0},
+    ],
+    ids=[
+        "all-delayed",
+        "encoder-delayed-online-rest",
+        "backbone-delayed-online-rest",
+        "head-delayed",
+        "all-tau-one",
+    ],
+)
+def test_delayed_forward_does_not_build_autograd_graph(taus: dict[str, float]) -> None:
+    """Delayed Q is a constant: the delayed path must not save tensors for backward."""
+    model = _tiny_model(scaled_backbone=True).train()
+    averager = PolyakAverager(model, **taus)
+    _, averager_inputs = model(_token_batch(model))
+    _assert_no_autograd_graph(lambda: averager(averager_inputs))
+
+
+def test_all_one_tau_requires_predictions() -> None:
+    model = _tiny_model().train()
+    averager = PolyakAverager(
+        model, tau_encoder=1.0, tau_backbone=1.0, tau_head=1.0
+    )
+    _, averager_inputs = model(_token_batch(model))
+    head_calls = _count_calls(model.heads["action_value"])
+    missing = AveragerInputs(
+        h=averager_inputs.h,
+        batch=averager_inputs.batch,
+        embeds=averager_inputs.embeds,
+        prediction_indices=averager_inputs.prediction_indices,
+    )
+    with pytest.raises(ValueError, match="predictions"):
+        averager(missing)
+    assert head_calls["n"] == 0

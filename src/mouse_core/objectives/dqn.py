@@ -128,7 +128,8 @@ class DqnObjective(Objective):
     ``(objective_data, predictions, delayed_predictions)``. Online Q is
     ``predictions["action_value"]``; bootstrap Q is
     ``delayed_predictions["action_value"]`` from
-    ``averager(averager_inputs)``.
+    ``averager(averager_inputs)``. The delayed tensor is detached before
+    the Bellman target, so the TD error does not backprop through it.
 
     A **run** is the same ``sequence_id`` and, when ``grouping_field`` is set
     and present, the same grouping column (typically ``task_index``). Neighbor
@@ -237,7 +238,7 @@ class DqnObjective(Objective):
         delayed_predictions: TensorDict,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         q: torch.Tensor = predictions["action_value"]
-        q_target: torch.Tensor = delayed_predictions["action_value"]
+        q_target: torch.Tensor = delayed_predictions["action_value"].detach()
 
         if q.ndim != 2:
             raise ValueError(

@@ -91,8 +91,9 @@ class PolyakAverager:
     ``averager(averager_inputs)``. Each section has its own interpolation
     factor. ``1`` is a perfect copy of the online section (no delayed
     module). ``0`` freezes the construction-time snapshot. Delayed modules
-    run in ``train()`` under ``no_grad``. Call :meth:`update` after each
-    ``optimizer.step()``.
+    run in ``train()``. The delayed forward is ``torch.no_grad`` (no
+    autograd graph, including when a tau-1 section reuses an online
+    module). Call :meth:`update` after each ``optimizer.step()``.
 
     A delayed forward starts at the first delayed section (``τ < 1``) and
     reuses the online activations above it:
@@ -164,12 +165,14 @@ class PolyakAverager:
             modules.append(self.heads)
         return modules
 
+    @torch.no_grad()
     def __call__(self, averager_inputs: AveragerInputs) -> TensorDict:
         """Delayed head outputs from a :class:`~mouse_core.models.base.AveragerInputs`.
 
         Sections with tau ``1`` reuse the matching online activation when
-        their inputs are not from a delayed section. Delayed modules run in
-        ``train()`` under ``torch.no_grad()``.
+        their inputs are not from a delayed section. The whole call is
+        ``torch.no_grad`` so a tau-1 online module on delayed inputs does
+        not record autograd. Delayed modules run in ``train()``.
         """
         if not isinstance(averager_inputs, AveragerInputs):
             raise TypeError(
@@ -180,24 +183,26 @@ class PolyakAverager:
         delay_backbone = self.backbone is not None
         delay_head = self.heads is not None
         if not delay_encoder and not delay_backbone and not delay_head:
-            if averager_inputs.predictions is not None:
-                return averager_inputs.predictions
-            return self._online.head(h=averager_inputs.h)
+            if averager_inputs.predictions is None:
+                raise ValueError(
+                    "Every tau is 1: delayed Q is AveragerInputs.predictions "
+                    "from model(inputs); nothing is recomputed."
+                )
+            return averager_inputs.predictions
 
         for module in self._delayed_modules():
             module.train()
-        with torch.no_grad():
-            recompute_backbone = delay_encoder or delay_backbone
-            if not recompute_backbone:
-                h = averager_inputs.h
-            else:
-                h = self._delayed_h(
-                    averager_inputs, delay_encoder=delay_encoder
-                )
-            if delay_head:
-                assert self.heads is not None
-                return _run_heads(_head_map(self.heads), h, None)
-            return self._online.head(h=h)
+        recompute_backbone = delay_encoder or delay_backbone
+        if not recompute_backbone:
+            h = averager_inputs.h
+        else:
+            h = self._delayed_h(
+                averager_inputs, delay_encoder=delay_encoder
+            )
+        if delay_head:
+            assert self.heads is not None
+            return _run_heads(_head_map(self.heads), h, None)
+        return self._online.head(h=h)
 
     def _delayed_h(
         self,

@@ -80,3 +80,27 @@ def test_layerwise_dqn_objective_rejects_layer_mismatch() -> None:
         assert 'expects 3 Q layers' in str(exc)
     else:
         raise AssertionError('expected ValueError for layer count mismatch')
+
+
+def test_layerwise_dqn_objective_does_not_backprop_through_delayed_q() -> None:
+    """Bootstrap Q is a constant: delayed Q must not receive a gradient."""
+    n, layers, a = 4, 2, 2
+    step_stream = TensorDict(
+        {
+            "action": torch.zeros(n, dtype=torch.long),
+            "reward": torch.ones(n),
+            "episode_done": torch.zeros(n, dtype=torch.long),
+            "task_done": torch.zeros(n, dtype=torch.long),
+        },
+        batch_size=[n],
+    )
+    online = torch.randn(n, layers, a, requires_grad=True)
+    delayed = torch.randn(n, layers, a, requires_grad=True)
+    predictions = TensorDict({"action_value_layerwise": online}, batch_size=[n])
+    delayed_td = TensorDict({"action_value_layerwise": delayed}, batch_size=[n])
+    loss, _ = LayerwiseDqnObjective(
+        num_backbone_layers=layers, gamma_step_start=1.0, gamma_step=1.0
+    )(step_stream, predictions, delayed_td)
+    loss.backward()
+    assert online.grad is not None
+    assert delayed.grad is None
