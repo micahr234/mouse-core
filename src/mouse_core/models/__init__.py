@@ -1,6 +1,8 @@
 from mouse_core.models.base import (
-    AveragerInputs,
+    DecodeCache,
     Model,
+    ModelOutput,
+    PassOutput,
     load_model,
     preferred_dtype,
     save_model,
@@ -16,7 +18,8 @@ from mouse_core.models.heads import (
     LayerwiseDiscreteActionValueHead,
 )
 from mouse_core.models.reasoner import LatentReasoner, sample_reasoning_splits
-from mouse_core.polyak import PolyakAverager
+from mouse_core.models.recurrence import Recurrence
+from mouse_core.polyak import Polyak
 from mouse_core.data.token_batch import TokenBatch
 from mouse_core.models.embedding.embedding import Encoder, NumericEmbedder
 from mouse_core.models.embedding.modality import (
@@ -27,8 +30,10 @@ from mouse_core.models.embedding.text import TextEmbedder
 from mouse_core.models.kv_policy import cache_needs_rebuild, rebuild_starts, resolve_cache_bounds
 
 __all__ = [
-    "AveragerInputs",
+    "DecodeCache",
     "Model",
+    "ModelOutput",
+    "PassOutput",
     "load_model",
     "preferred_dtype",
     "save_model",
@@ -41,7 +46,8 @@ __all__ = [
     "BaseHead",
     "HeadSpec",
     "LatentReasoner",
-    "PolyakAverager",
+    "Polyak",
+    "Recurrence",
     "sample_reasoning_splits",
     "SwiGLUHead",
     "DiscreteActionHead",

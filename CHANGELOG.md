@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- ``DqnObjective`` and ``LayerwiseDqnObjective`` target is the TD(λ) return
+  (``td_lambda``, default ``0.0`` = the one-step target; ``1.0`` = the full
+  in-run n-step return). ``watkins=True`` (Watkins's Q(λ)) also cuts the
+  trace wherever the taken action is not the online argmax (never oracle
+  ``info_q_star``) and reports ``metrics["watkins_greedy_frac"]``, the
+  in-run fraction of greedy taken actions. The trace never crosses a run
+  break; at episode / task boundaries the corresponding done-code gamma
+  multiplies both the bootstrap and the continued return (``0`` ends the
+  trace, a non-zero truncation gamma carries it through discounted).
+  Computed with a parallel scan on the device (no per-step host syncs).
+- Heads are always fp32: ``DqnObjective`` / ``LayerwiseDqnObjective`` reject
+  non-fp32 ``action_value`` and ``Polyak`` rejects non-fp32 heads (the bf16
+  shadow accumulator is gone).
 - Explicit head-output tokens. Exactly one tokenizer input field (numeric or
   text) must set ``head_output: True``; the tokens it emits are the step's
   **head-output tokens** — the positions the heads read Q / action outputs
@@ -24,10 +37,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   last head-output row. Cached decode pools each step's last head-output
   token. A ``text`` head-output field is tokenized as its own run so its
   token boundaries are exact.
-- ``NumericEmbedder`` adds a per-modality learnable type vector of shape
-  ``[D]`` to every token's content embedding (discrete lookup, Fourier
-  features, image ids, and learnable slots). Init uses that modality's
-  ``std``.
+- ``NumericEmbedder`` adds a learnable type vector to every token's content
+  embedding (discrete lookup, Fourier features, image ids, and learnable
+  slots). Every embedder modality spec must set ``positions`` (max tokens it
+  emits per step; no default): the modality owns a type table of shape
+  ``[positions, D]`` and token ``t`` receives row ``positions[t]``, so the
+  tokens of a multi-token modality (``continuous`` coordinates, ``learnable``
+  slots, ``image`` patches) each get their own type vector instead of sharing
+  one. ``positions`` must be ``>= dim`` (continuous) / ``>= tokens``
+  (learnable); the embedder raises if a step emits more tokens of a modality
+  than declared. ``NumericEmbedder.tokens_per_step`` is the sum of the
+  declared ``positions``. Init uses that modality's ``std``.
+- ``StepTokens`` / ``TokenBatch`` carry ``positions`` (``[T]`` / ``[L]``
+  int64): each token's 0-based index among its modality's tokens within its
+  step. Both tokenizers emit it (text runs of the same modality keep
+  counting across the step) and ``TokenBatch.to_tensors`` exposes it.
 - Coconut-style latent reasoning. ``LatentReasoner(hidden_dim=, num_thoughts=)``
   is an optional fourth model section (``Model(reasoner=...)``, saved and
   loaded with the checkpoint): a LayerNorm + Linear adapter that maps the
@@ -41,9 +65,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Generation costs ``num_thoughts + 1`` backbone passes per batch.
   ``sample_reasoning_splits(batch, generator)`` picks one burst step per
   sequence, uniform over steps whose next step shares the grouping.
-  ``PolyakAverager`` replays the extended stream with the thoughts detached
-  (a delayed encoder re-encodes the real tokens and splices them back in),
-  so delayed Q never backpropagates through the reasoning.
+  The heads-only delayed copy reads the online last-layer states of the
+  extended stream, which already include the thoughts.
 - Learnable modalities accept an explicit name: ``field=`` on the embedder
   spec and ``output_field=`` on the tokenizer spec (they must match).
   Unnamed learnables keep the ``__learnable_<i>`` auto-name.
@@ -52,6 +75,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``value`` on every step (flagged ``head_output: True``; Q is read from it)
   and per-batch latent reasoning bursts via ``LatentReasoner`` +
   ``sample_reasoning_splits``.
+- Recurrent-depth backbone passes as a model section:
+  ``Model(recurrence=Recurrence(hidden_dim=, num_passes=))`` (saved and
+  loaded with the checkpoint). Every forward runs the backbone
+  ``num_passes`` times; pass ``k`` reads
+  ``encodings + proj(RMSNorm(pass_{k-1}.last_hidden_state))``. The
+  adapter normalizes the recycled residual stream (on a pretrained
+  backbone it is orders of magnitude larger than the encoder embeddings
+  and compounds to ~1e5 after one raw recycle), re-injects the original
+  encodings every pass, and starts with a zero projection so at
+  construction every pass equals a plain forward. ``ModelOutput.passes``
+  holds each pass's ``last_hidden_state`` / ``predictions`` (the top-level
+  fields are the final pass) so a training loop can run the delayed heads
+  and the objective per pass and average the losses. Cached decode keeps
+  one KV session per pass, so a recurrent model is evaluated with the
+  recurrence it trained with. An alternative to ``LatentReasoner``; a
+  model has one or the other.
+- ``DecodeCache``: the object carried between ``use_cache=True`` calls
+  (``out.cache``), one ``FlexDecodeSession`` per backbone pass, with
+  ``reset_rows(rows)`` applying to every pass.
+- ``examples/13_train_offline_recurrent_dqn.ipynb``: same offline DQN loop
+  as ``02``, with a ``Recurrence`` section and the TD loss averaged over
+  ``out.passes``.
 - ``AdamW.zero_grad`` and ``AdamWFp32.zero_grad`` accept ``set_to_none``
   (default ``True``), matching ``torch.optim.Optimizer.zero_grad``.
   ``AdamWFp32`` also clears fp32 master grads.
@@ -65,15 +110,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a resumed run keeps its sub-ULP progress. Load model weights before
   constructing ``AdamWFp32`` — the masters are the source of truth from then
   on and every ``step`` writes them back over the compute parameters.
-- ``PolyakAverager``: delayed DQN weights next to the optimizer, with
-  independent ``tau_encoder``, ``tau_backbone``, and ``tau_head``.
-  All three default to ``1`` (a perfect copy of the online section,
-  not recomputed when its inputs are already online). ``0`` freezes
-  the construction-time snapshot. ``Model.forward`` returns
-  ``(predictions, averager_inputs)``; delayed Q is
-  ``averager(averager_inputs)``. DQN notebooks pass ``tau_head=``;
-  ``examples/11_train_offline_dqn_model_delay.ipynb`` delays encoder,
-  backbone, and head.
+- Delayed DQN is a heads-only ``Model`` from ``Model.delayed_copy()``,
+  interpolated with ``Polyak(online, delayed)``. Only the heads are
+  delayed: the copy runs on the online token states
+  (``delayed(last_hidden_state=out.last_hidden_state,
+  head_output_indices=out.head_output_indices,
+  hidden_states=out.hidden_states)``), so encoder, backbone, reasoning
+  latents, and recurrent passes are shared with the online forward.
+  ``polyak.update(tau)`` takes this step's factor: ``0`` keeps the delayed
+  heads frozen, ``1`` copies the online heads (the delayed output then
+  equals the online heads on the same states). ``Model.forward`` returns
+  a ``ModelOutput`` with ``predictions``, ``last_hidden_state``,
+  ``head_output_indices``, ``hidden_states``, ``passes``, and ``cache``.
+  ``Polyak`` matches parameters by name and accumulates interpolation in
+  fp32 shadows so small ``tau`` updates are not rounded away in bf16.
 - ``examples/05_train_offline_sv.ipynb``: offline supervised-value training
   (``SvObjective`` regresses ``action_value`` onto ``info_q_star``). The action
   permute spec sets ``input_vector_field`` / ``output_vector_field`` to
@@ -81,10 +131,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ``examples/10_train_offline_sp.ipynb``: offline supervised-policy training
   (``SpObjective`` CE onto a random argmax of ``info_q_star`` with
   ``DiscreteActionHead``). Same action vector-field permute as SV.
-- ``examples/11_train_offline_dqn_model_delay.ipynb``: same offline DQN
-  loop as ``02``, with ``PolyakAverager`` delaying the encoder, backbone,
-  and Q head (``tau_encoder`` / ``tau_backbone`` / ``tau_head`` all
-  ``< 1``).
 - ``StepTokens``: tokenizer output for one step (token arrays + scalar
   ``grouping_id`` + ``objective_fields``). ``pack_token_batch(...)`` builds a
   ``TokenBatch`` from many steps (assigns ``sequence_ids``, expands
@@ -126,37 +172,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``grouping_field: str | None = None`` (``None`` ⇒ no grouping filter).
 
 ### Changed
+- ``NumericEmbedder`` embedding init scale is set per modality only: every
+  modality spec must pass ``std`` (content table / Fourier features and the
+  type vector for that modality all use it) and construction raises
+  ``ValueError`` when it is missing. The embedder-wide ``std=`` kwarg (and its
+  ``0.02`` default) is gone; ``NumericEmbedder(std=...)`` is a ``TypeError``
+  and the saved encoder config no longer carries a top-level ``std``.
 - Readout tokens are ``head_output`` tokens: tokenizer flag
   ``head_output: True``, ``StepTokens.head_output_mask``,
   ``TokenBatch.head_output_indices`` / ``head_output_steps``, and
   ``objective_data["head_output_count"]``. The unreleased ``prediction*``
   names are gone. Head-emitted tensors stay ``predictions``.
-- ``Model.head(h=...)`` takes one pooled tensor. Pooled head input from
-  ``forward`` is ``averager_inputs.h`` (last-layer ``[N, D]``, or stacked
-  layers ``[N, L, D]`` when a layerwise Q head is enabled). ``h_layers``
-  and ``model.h`` are removed.
-- ``PolyakAverager`` deep-copies only sections with ``tau < 1``.
-  ``Model.forward`` returns ``(predictions, averager_inputs)`` including
-  detached ``embeds``, ``h``, and ``predictions``. Delayed Q is
-  ``averager(averager_inputs)``: a tau-1 encoder reuses ``embeds``, a
-  tau-1 backbone reuses ``h`` when the encoder was also online, and a
-  tau-1 head reuses ``predictions`` when both were online. ``tau = 0``
-  keeps a frozen snapshot and still recomputes. Online and delayed
-  forwards run in ``train()``; the delayed forward is ``no_grad``.
+- ``Model.head(h=...)`` takes one pooled tensor. Pooled head input is
+  last-layer ``[N, D]``, or stacked layers ``[N, L, D]`` when a
+  layerwise Q head is enabled. ``h_layers`` and ``model.h`` are removed.
+- ``Model.forward`` returns a ``ModelOutput`` with ``predictions``,
+  ``last_hidden_state`` (last-layer backbone output, on the autograd
+  tape), ``head_output_indices``, ``hidden_states``, per-pass
+  ``passes``, and ``cache`` (a ``DecodeCache``). A heads-only delayed
+  copy has neither encoder nor backbone and runs from
+  ``last_hidden_state=`` + ``head_output_indices=``; those arguments
+  (and ``hidden_states=``) are rejected on a normal ``batch`` forward.
+  Recurrent depth is the ``Recurrence`` section (replacing the
+  ``encodings=`` training-loop pattern and ``hidden=``). Cached decode
+  passes ``out.cache`` back as ``cache=``.
+- ``Encoder.pool_step_reprs`` is removed; ``Model`` pools head-output
+  tokens itself.
 - ``DataLoader.next_batch()`` and ``pack_token_batch(...)`` return
   ``(inputs, objective_data)``. ``inputs`` is the ``TokenBatch``;
   ``objective_data`` is a CPU ``TensorDict`` of tokenizer
   ``objective_fields`` (plus ``sequence_id`` and the grouping column).
   ``Model.forward`` / embedders take ``TokenBatch`` only and return
-  ``(predictions, averager_inputs)``. Move ``objective_data`` onto the
+  a ``ModelOutput``. Move ``objective_data`` onto the
   model device before the objective.
 - DQN target Q is no longer inside ``Model`` or the action-value heads.
   ``DqnObjective`` / ``LayerwiseDqnObjective`` no longer take ``tau``.
-  After ``optimizer.step()``, call ``averager.update()``.
+  After ``optimizer.step()``, call ``polyak.update(tau)``.
   ``DqnObjective`` / ``LayerwiseDqnObjective`` take
   ``(objective_data, predictions, delayed_predictions)`` — delayed Q is
   ``delayed_predictions["action_value"]`` (or ``action_value_layerwise``)
-  from ``averager(averager_inputs)``.
+  from the delayed model.
   ``BaseHeadWithTarget`` is removed; ``DiscreteActionValueHead`` is a
   ``SwiGLUHead``.
 - Example notebooks are short usage docs, not full experiments. Training
@@ -284,10 +339,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ``DqnObjective`` / ``LayerwiseDqnObjective`` detach delayed Q before
   the Bellman target, so a gradient tape on the delayed tensor cannot
   flow into the TD error.
-- ``PolyakAverager`` delayed forward is entirely ``torch.no_grad``, so
-  delayed Q never records an autograd graph — including when a tau-1
-  section reuses an online module on delayed inputs. All-tau-1 returns
-  ``averager_inputs.predictions`` and does not rerun the online head.
+- Delayed Q is produced by the heads-only delayed model under
+  ``torch.no_grad``, so it never records an autograd graph.
+  ``DqnObjective`` still detaches delayed Q before the Bellman target.
 - ``Qwen3Backbone(pretrained=...)`` and ``LlamaBackbone(pretrained=...)`` copy
   ``rope_parameters`` from the HuggingFace config. Without this, Qwen3-0.6B
   was built with default ``rope_theta=1e4`` instead of the checkpoint's
@@ -306,7 +360,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   surrogate no longer backpropagates through the value head via the
   advantage (previously the value head received a spurious policy gradient
   even with ``vf_coef=0``).
-- ``PolyakAverager``: interpolation is accumulated in fp32 shadows for bf16
+- ``Polyak``: interpolation is accumulated in fp32 shadows for bf16
   delayed weights. With a small ``tau`` (e.g. ``5e-4``) a direct bf16 lerp
   rounded every update away and the delayed encoder/backbone never moved.
 - ``StaticFourierFeatures`` keeps its frequency/phase tables in fp32 through

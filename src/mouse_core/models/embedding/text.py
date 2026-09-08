@@ -216,14 +216,6 @@ class TextEmbedder(Encoder):
 
         return embeds, t["head_output_indices"]
 
-    def pool_step_reprs(self, h: torch.Tensor, head_output_indices: torch.Tensor) -> torch.Tensor:
-        D = self._hidden_dim
-        if h.ndim == 2:
-            return h[head_output_indices.reshape(-1)]
-        B, S = head_output_indices.shape
-        idx = head_output_indices.unsqueeze(-1).expand(B, S, D)
-        return h.gather(1, idx)
-
 
 def _load_embed_tokens(
     *,

@@ -48,17 +48,6 @@ class Encoder(nn.Module, ABC):
         """Embed ``TokenBatch`` → ``(embeds [L, D], head_output_indices [P])``."""
         ...
 
-    @abstractmethod
-    def pool_step_reprs(self, h: torch.Tensor, head_output_indices: torch.Tensor) -> torch.Tensor:
-        """Gather head-output tokens → ``[N, D]`` (train) or ``[B, S, D]`` (decode).
-
-        ``h`` is ``[L, D]`` (flat packed) or ``[B, L, D]`` (decode).
-        Train: ``head_output_indices`` is ``[P]`` absolute indices into ``0 .. L-1``
-        (one per head-output token; a step may own several).
-        Decode: ``head_output_indices`` is ``[B, S]`` into the token axis of ``h``.
-        """
-        ...
-
 
 def _validate_batch_modalities(
     batch_map: Mapping[str, ModalityInfo],
@@ -90,8 +79,15 @@ def _validate_batch_modalities(
 class NumericEmbedder(Encoder):
     """Named embedding tables + static Fourier over a :class:`TokenBatch`.
 
-    Every modality also has a learnable type vector of shape ``[D]``, added
-    to each of that modality's content embeddings.
+    Every modality also has a learnable type table of shape
+    ``[positions, D]``; token ``t`` gets row ``TokenBatch.positions[t]`` added
+    to its content embedding, so the tokens of a multi-token modality
+    (continuous coordinates, learnable slots, image patches) are
+    distinguishable even when their content embeddings coincide.
+
+    Each modality spec must set ``std`` (init scale of its content embeddings
+    and type vectors) and ``positions`` (max tokens per step, i.e. type table
+    rows). There are no embedder-wide defaults.
     """
 
     def __init__(
@@ -103,13 +99,11 @@ class NumericEmbedder(Encoder):
         | None = None,
         fourier_min: float = 0.01,
         fourier_max: float = 10.0,
-        std: float = 0.02,
     ) -> None:
         super().__init__()
         self._hidden_dim = int(hidden_dim)
         self.fourier_min = float(fourier_min)
         self.fourier_max = float(fourier_max)
-        self.std = float(std)
 
         specs, meta = resolve_embedder_numeric_modalities(modalities)
         self.modalities: list[NumericEmbedderModalitySpec] = list(specs)
@@ -121,9 +115,10 @@ class NumericEmbedder(Encoder):
         max_freq_sets = 1
         for m in self._meta:
             max_freq_sets = max(max_freq_sets, m.freq_sets)
-            mod_std = float(m.spec.std if m.spec.std is not None else std)
+            assert m.spec.std is not None
+            mod_std = float(m.spec.std)
             self._type_vectors[m.name] = nn.Parameter(
-                torch.randn(hidden_dim) * mod_std
+                torch.randn(m.n_positions, hidden_dim) * mod_std
             )
             if m.kind in (KIND_DISCRETE, KIND_LEARNABLE, KIND_IMAGE):
                 vs = m.vocab_size if m.kind != KIND_LEARNABLE else m.n_learnable
@@ -135,17 +130,18 @@ class NumericEmbedder(Encoder):
                 self._tables[m.name] = ScaledEmbedding(vs, hidden_dim, scale=mod_std)
 
         self._fourier_std: dict[str, float] = {
-            m.name: float(m.spec.std if m.spec.std is not None else std)
+            m.name: float(m.spec.std)  # type: ignore[arg-type]
             for m in self._meta
             if m.kind == KIND_FOURIER
         }
-        fourier_scale = float(std) / (0.5 ** 0.5)
+        # ``cos`` has variance 1/2; scale so each feature has unit std, then
+        # multiply by the modality's ``std`` in ``forward``.
         self.fourier = StaticFourierFeatures(
             num_features=hidden_dim,
             in_min=fourier_min,
             in_max=fourier_max,
             num_freq_sets=max_freq_sets,
-            output_scale=fourier_scale,
+            output_scale=1.0 / (0.5 ** 0.5),
         )
         # Follows ``.to(device/dtype)`` so an encoder with no learnable tables
         # (fourier-only) still knows its compute dtype and device.
@@ -158,18 +154,8 @@ class NumericEmbedder(Encoder):
 
     @property
     def tokens_per_step(self) -> int:
-        """Max tokens if nothing is skipped (capacity hint)."""
-        total = 0
-        for m in self._meta:
-            if m.kind == KIND_DISCRETE:
-                total += 1
-            elif m.kind == KIND_FOURIER:
-                total += m.dim
-            elif m.kind == KIND_LEARNABLE:
-                total += m.n_learnable
-            elif m.kind == KIND_IMAGE:
-                total += 1  # unknown a priori; hint only
-        return total
+        """Max tokens per step: the sum of every modality's declared ``positions``."""
+        return sum(m.n_positions for m in self._meta)
 
     def forward(
         self, token_batch: TokenBatch
@@ -181,6 +167,7 @@ class NumericEmbedder(Encoder):
         modality_ids = t["modality_ids"]
         ids = t["ids"]
         values = t["values"]
+        positions = t["positions"]
         names: tuple[str, ...] = t["modality_names"]
         batch_map: dict[str, ModalityInfo] = t["modality_map"]
         _validate_batch_modalities(batch_map, self._meta)
@@ -195,25 +182,21 @@ class NumericEmbedder(Encoder):
                 if not bool(mask.any()):
                     continue
                 meta = self._meta_by_name[name]
-                type_vec = self._type_vectors[name].to(dtype=dtype)
+                pos = positions[mask]
+                type_table = self._type_vectors[name]
+                if int(pos.max()) >= type_table.shape[0]:
+                    raise ValueError(
+                        f"modality {name!r} emitted {int(pos.max()) + 1} tokens in a "
+                        f"step but the embedder declares positions={type_table.shape[0]}"
+                    )
+                type_vec = type_table[pos].to(dtype=dtype)
                 if meta.kind in (KIND_DISCRETE, KIND_LEARNABLE, KIND_IMAGE):
                     content = self._tables[name](ids[mask]).to(dtype=dtype)
                 elif meta.kind == KIND_FOURIER:
-                    feat = self.fourier(values[mask], ids[mask])
-                    mod_std = self._fourier_std[name]
-                    if self.std != 0.0 and mod_std != self.std:
-                        feat = feat * (mod_std / self.std)
+                    feat = self.fourier(values[mask], ids[mask]) * self._fourier_std[name]
                     content = feat.to(dtype=dtype)
                 else:
                     continue
                 embeds[mask] = content + type_vec
 
         return embeds, t["head_output_indices"]
-
-    def pool_step_reprs(self, h: torch.Tensor, head_output_indices: torch.Tensor) -> torch.Tensor:
-        D = self._hidden_dim
-        if h.ndim == 2:
-            return h[head_output_indices.reshape(-1)]
-        B, S = head_output_indices.shape
-        idx = head_output_indices.unsqueeze(-1).expand(B, S, D)
-        return h.gather(1, idx)

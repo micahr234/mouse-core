@@ -111,6 +111,46 @@ def test_skip_on_vector_modality_compares_elementwise() -> None:
     assert tok_vec({"action": 0, "obs": [1.0, 3.0], "task_index": 0}).T == 3
 
 
+def test_positions_index_tokens_within_modality_per_step() -> None:
+    tok = NumericTokenizer(
+        input_fields=[
+            {"type": "discrete", "input_field": "action"},
+            {"type": "continuous", "input_field": "obs", "dim": 3},
+            {"type": "learnable", "tokens": 2, "head_output": True},
+        ],
+        objective_fields=[],
+        grouping_field="task_index",
+    )
+    st = tok({"action": 1, "obs": [0.1, 0.2, 0.3], "task_index": 0})
+    assert st.positions.tolist() == [0, 0, 1, 2, 0, 1]
+    inputs, _ = pack_token_batch([st, st], sequence_ids=[0, 0], batch_size=1)
+    # Positions restart every step; they never accumulate across the sequence.
+    assert inputs.positions.tolist() == [0, 0, 1, 2, 0, 1] * 2
+    assert inputs.to_tensors()["positions"].dtype == torch.int64
+
+
+def test_negative_positions_rejected() -> None:
+    from mouse_core.data.token_batch import TokenBatch
+
+    tok = _tok()
+    inputs, _ = pack_token_batch([tok({"action": 0, "reward": 0.0, "task_index": 0})])
+    with pytest.raises(ValueError, match="positions must be >= 0"):
+        TokenBatch(
+            modality_ids=inputs.modality_ids,
+            ids=inputs.ids,
+            values=inputs.values,
+            positions=np.array([-1]),
+            modality_names=inputs.modality_names,
+            modality_map=inputs.modality_map,
+            sequence_ids=inputs.sequence_ids,
+            grouping_ids=inputs.grouping_ids,
+            head_output_indices=inputs.head_output_indices,
+            head_output_steps=inputs.head_output_steps,
+            grouping_field=inputs.grouping_field,
+            B=inputs.B,
+        )
+
+
 def test_interleaved_sequence_ids_rejected() -> None:
     tok = _tok()
     steps = [tok({"action": 0, "reward": 0.0, "task_index": 0}) for _ in range(4)]
@@ -129,6 +169,7 @@ def test_sequence_ids_out_of_range_rejected() -> None:
             modality_ids=inputs.modality_ids,
             ids=inputs.ids,
             values=inputs.values,
+            positions=inputs.positions,
             modality_names=inputs.modality_names,
             modality_map=inputs.modality_map,
             sequence_ids=inputs.sequence_ids,

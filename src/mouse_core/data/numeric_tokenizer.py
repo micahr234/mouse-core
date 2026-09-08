@@ -138,14 +138,21 @@ def _tokenize_numeric_step(
     modality_ids: list[int] = []
     ids: list[int] = []
     values: list[float] = []
+    positions: list[int] = []
     head_output_mask: list[bool] = []
 
     def _emit(
-        *, name: str, token_id: int, value: float = 0.0, head_output: bool = False
+        *,
+        name: str,
+        token_id: int,
+        position: int,
+        value: float = 0.0,
+        head_output: bool = False,
     ) -> None:
         modality_ids.append(name_to_index[name])
         ids.append(token_id)
         values.append(value)
+        positions.append(position)
         head_output_mask.append(head_output)
 
     for m in meta:
@@ -153,7 +160,7 @@ def _tokenize_numeric_step(
         spec = m.spec
         if m.kind == KIND_LEARNABLE:
             for i in range(m.n_learnable):
-                _emit(name=name, token_id=i, head_output=spec.head_output)
+                _emit(name=name, token_id=i, position=i, head_output=spec.head_output)
             continue
 
         in_name = str(spec.input_field)
@@ -171,6 +178,7 @@ def _tokenize_numeric_step(
             _emit(
                 name=name,
                 token_id=int(unwrap_scalar(value)),
+                position=0,
                 head_output=spec.head_output,
             )
         elif m.kind == KIND_FOURIER:
@@ -185,7 +193,13 @@ def _tokenize_numeric_step(
                     )
                 vals = [float(v) for v in arr]
             for i, v in enumerate(vals):
-                _emit(name=name, token_id=i, value=v, head_output=spec.head_output)
+                _emit(
+                    name=name,
+                    token_id=i,
+                    position=i,
+                    value=v,
+                    head_output=spec.head_output,
+                )
         elif m.kind == KIND_IMAGE:
             if image_tokenizer is None:
                 raise RuntimeError("image_tokenizer is not configured")
@@ -194,8 +208,13 @@ def _tokenize_numeric_step(
                 raise ValueError(
                     f"image tokenizer returned no tokens for {in_name!r}"
                 )
-            for tid in img_ids:
-                _emit(name=name, token_id=int(tid), head_output=spec.head_output)
+            for i, tid in enumerate(img_ids):
+                _emit(
+                    name=name,
+                    token_id=int(tid),
+                    position=i,
+                    head_output=spec.head_output,
+                )
 
     if not modality_ids:
         raise ValueError(
@@ -207,6 +226,7 @@ def _tokenize_numeric_step(
         modality_ids=np.asarray(modality_ids, dtype=np.int64),
         ids=np.asarray(ids, dtype=np.int64),
         values=np.asarray(values, dtype=np.float32),
+        positions=np.asarray(positions, dtype=np.int64),
         modality_names=modality_names,
         modality_map=dict(modality_map),
         grouping_id=gid,

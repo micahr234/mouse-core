@@ -16,15 +16,15 @@ _tok = tok_from_encoder
 def test_composed_model_roundtrip(tmp_path) -> None:
     torch.manual_seed(0)
     hidden_dim = 8
-    encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4}, {"type": 'fourier', "field": "reward"}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3}])
+    encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}, {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3, "std": 0.02, "positions": 1}])
     backbone = IdentityBackbone(hidden_dim=hidden_dim)
     heads = DiscreteActionValueHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1)
     model = Model(encoder=encoder, backbone=backbone, heads=heads).eval()
     batch = [[{'action': 0, 'reward': 0.0, 'episode_done': 0, 'task_done': 0}, {'action': 1, 'reward': 1.0, 'episode_done': 0, 'task_done': 0}, {'action': 2, 'reward': 2.0, 'episode_done': 1, 'task_done': 0}]]
-    expected, _ = model(batch_to_token_batch(_tok(model.encoder), batch))
+    expected = model(batch_to_token_batch(_tok(model.encoder), batch)).predictions
     save_model(model, tmp_path)
     loaded = load_model(tmp_path).eval()
-    actual, _ = loaded(batch_to_token_batch(_tok(loaded.encoder), batch))
+    actual = loaded(batch_to_token_batch(_tok(loaded.encoder), batch)).predictions
     assert torch.allclose(actual['action_value'], expected['action_value'])
     assert loaded.hidden_dim == hidden_dim
     orig_sd = model.state_dict()
@@ -38,8 +38,10 @@ def test_composed_model_roundtrip(tmp_path) -> None:
     assert config['backbone']['type'] == 'identity'
     assert config['encoder']['type'] == 'numeric'
     enc_kwargs = config['encoder']['kwargs']
-    for required_key in ('hidden_dim', 'modalities', 'fourier_min', 'fourier_max', 'std'):
+    for required_key in ('hidden_dim', 'modalities', 'fourier_min', 'fourier_max'):
         assert required_key in enc_kwargs, f'encoder config missing key {required_key!r}'
+    assert 'std' not in enc_kwargs
+    assert all(m['std'] == 0.02 for m in enc_kwargs['modalities'])
     assert 'modality_fusion' not in enc_kwargs
     assert 'include_type_token' not in enc_kwargs
 
@@ -50,10 +52,10 @@ def test_roundtrip_multi_field_spec_before_learnable(tmp_path) -> None:
     encoder = NumericEmbedder(
         hidden_dim=hidden_dim,
         modalities=[
-            {"type": 'discrete', "field": ("action", "prev_action"), "vocab_size": 4},
-            {"type": 'learnable', "tokens": 2},
-            {"type": 'fourier', "field": "reward"},
-            {"type": 'learnable'},
+            {"type": 'discrete', "field": ("action", "prev_action"), "vocab_size": 4, "std": 0.02, "positions": 1},
+            {"type": 'learnable', "tokens": 2, "std": 0.02, "positions": 2},
+            {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1},
+            {"type": 'learnable', "std": 0.02, "positions": 1},
         ],
     )
     assert "encoder._tables.__learnable_0.weight" in {f"encoder.{k}" for k in encoder.state_dict()}
@@ -73,11 +75,11 @@ def test_roundtrip_multi_field_spec_before_learnable(tmp_path) -> None:
         grouping_field="task_index",
     )
     batch = [[{'action': 0, 'prev_action': 1, 'reward': 0.5, 'task_index': 0}, {'action': 2, 'prev_action': 0, 'reward': 1.0, 'task_index': 0}]]
-    expected, _ = model(batch_to_token_batch(tokenizer, batch, grouping_field="task_index"))
+    expected = model(batch_to_token_batch(tokenizer, batch, grouping_field="task_index")).predictions
     save_model(model, tmp_path)
     loaded = load_model(tmp_path).eval()
     assert set(model.state_dict()) == set(loaded.state_dict())
-    actual, _ = loaded(batch_to_token_batch(tokenizer, batch, grouping_field="task_index"))
+    actual = loaded(batch_to_token_batch(tokenizer, batch, grouping_field="task_index")).predictions
     assert torch.allclose(actual['action_value'], expected['action_value'])
 
 
@@ -85,22 +87,22 @@ def test_composed_model_roundtrip_static_fourier(tmp_path) -> None:
     """Static Fourier buffers survive save/load."""
     torch.manual_seed(42)
     hidden_dim = 8
-    encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4}, {"type": 'fourier', "field": "reward"}])
+    encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}, {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1}])
     backbone = IdentityBackbone(hidden_dim=hidden_dim)
     heads = DiscreteActionValueHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1)
     model = Model(encoder=encoder, backbone=backbone, heads=heads).eval()
     batch = [[{'action': 1, 'reward': 0.5}, {'action': 2, 'reward': -0.1}]]
-    expected, _ = model(batch_to_token_batch(_tok(model.encoder), batch))
+    expected = model(batch_to_token_batch(_tok(model.encoder), batch)).predictions
     save_model(model, tmp_path)
     loaded = load_model(tmp_path).eval()
-    actual, _ = loaded(batch_to_token_batch(_tok(loaded.encoder), batch))
+    actual = loaded(batch_to_token_batch(_tok(loaded.encoder), batch)).predictions
     assert torch.allclose(actual['action_value'], expected['action_value'])
     enc = cast(NumericEmbedder, model.encoder)
     loaded_enc = cast(NumericEmbedder, loaded.encoder)
     assert torch.equal(enc.fourier.freqs, loaded_enc.fourier.freqs)
 
 def test_model_card_includes_usage_and_architecture(tmp_path) -> None:
-    model = Model(encoder=NumericEmbedder(hidden_dim=8, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4}, {"type": 'fourier', "field": "reward"}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3}]), backbone=IdentityBackbone(hidden_dim=8), heads=DiscreteActionValueHead(in_features=8, out_features=4, hidden_dim=8, num_layers=1))
+    model = Model(encoder=NumericEmbedder(hidden_dim=8, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}, {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3, "std": 0.02, "positions": 1}]), backbone=IdentityBackbone(hidden_dim=8), heads=DiscreteActionValueHead(in_features=8, out_features=4, hidden_dim=8, num_layers=1))
     path = tmp_path / 'README.md'
     _write_model_card(repo_id='user/mouse-example-model', model=model, path=path)
     text = path.read_text()
@@ -143,7 +145,7 @@ def test_model_card_includes_usage_and_architecture(tmp_path) -> None:
 )
 def test_model_to_every_form_keeps_heads_float32(cast) -> None:
     hidden_dim = 8
-    encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4}, {"type": 'fourier', "field": "reward"}])
+    encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}, {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1}])
     backbone = IdentityBackbone(hidden_dim=hidden_dim)
     heads = DiscreteActionValueHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1)
     model = cast(Model(encoder=encoder, backbone=backbone, heads=heads).eval())
@@ -151,7 +153,7 @@ def test_model_to_every_form_keeps_heads_float32(cast) -> None:
     assert {p.dtype for p in model.heads.parameters()} == {torch.float32}
     batch = [[{'action': 0, 'reward': 0.5, 'task_index': 0}, {'action': 1, 'reward': 1.0, 'task_index': 0}]]
     with torch.no_grad():
-        preds, _ = model(batch_to_token_batch(_tok(model.encoder), batch))
+        preds = model(batch_to_token_batch(_tok(model.encoder), batch)).predictions
     assert preds['action_value'].dtype == torch.float32
 
 
@@ -159,7 +161,7 @@ def test_model_to_bfloat16_keeps_heads_float32() -> None:
     if not torch.cuda.is_available():
         pytest.skip('CUDA required')
     hidden_dim = 8
-    encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4}, {"type": 'fourier', "field": "reward"}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3}])
+    encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}, {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3, "std": 0.02, "positions": 1}])
     backbone = Qwen3Backbone(hidden_dim=hidden_dim, num_layers=1, num_heads=2)
     heads = DiscreteActionValueHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1)
     model = Model(encoder=encoder, backbone=backbone, heads=heads).eval()
@@ -169,5 +171,5 @@ def test_model_to_bfloat16_keeps_heads_float32() -> None:
     assert next(model.heads.parameters()).dtype == torch.float32
     batch = [[{'action': 0, 'reward': 0.0, 'episode_done': 0, 'task_done': 0}]]
     with torch.no_grad():
-        preds, _ = model(batch_to_token_batch(_tok(model.encoder), batch), use_cache=True)
+        preds = model(batch_to_token_batch(_tok(model.encoder), batch), use_cache=True).predictions
     assert preds['action_value'].dtype == torch.float32

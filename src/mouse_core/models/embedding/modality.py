@@ -28,6 +28,14 @@ class NumericEmbedderModalitySpec:
     """How the numeric embedder embeds one named modality.
 
     Alignment with the tokenizer is by **name** (``field``).
+
+    ``std`` is required: it is the init scale of this modality's content
+    embeddings (table rows / Fourier features) and of its type vectors.
+
+    ``positions`` is required: the maximum number of tokens this modality
+    emits in one step. The modality owns one type vector per position
+    (``[positions, D]``); token ``t`` receives row ``TokenBatch.positions[t]``.
+    Must be ``>= dim`` for ``continuous`` and ``>= tokens`` for ``learnable``.
     """
 
     type: str
@@ -36,6 +44,7 @@ class NumericEmbedderModalitySpec:
     dim: int | None = None
     tokens: int | None = None
     std: float | None = None
+    positions: int | None = None
 
     _VALID_TYPES: ClassVar[tuple[str, ...]] = (
         "discrete",
@@ -53,6 +62,26 @@ class NumericEmbedderModalitySpec:
                 f"expected one of {self._VALID_TYPES}"
             )
         object.__setattr__(self, "type", k)
+        if self.std is None:
+            raise ValueError(
+                f"embedder modality type={k!r} field={self.field!r} requires std= "
+                "(embedding init scale; no default)"
+            )
+        std = float(self.std)
+        if std < 0.0:
+            raise ValueError(f"embedder modality std must be >= 0, got {self.std!r}")
+        object.__setattr__(self, "std", std)
+        if self.positions is None:
+            raise ValueError(
+                f"embedder modality type={k!r} field={self.field!r} requires positions= "
+                "(max tokens per step; one type vector each; no default)"
+            )
+        positions = int(self.positions)
+        if positions < 1:
+            raise ValueError(
+                f"embedder modality positions must be >= 1, got {self.positions!r}"
+            )
+        object.__setattr__(self, "positions", positions)
         if k == "learnable":
             return
         if self.field is None:
@@ -109,6 +138,8 @@ class EmbedderModalityMeta:
     dim: int = 0
     n_learnable: int = 0
     freq_sets: int = 1
+    n_positions: int = 1
+    """Max tokens this modality emits per step (``spec.positions``); one type vector each."""
 
 
 def expand_embedder_numeric_spec(
@@ -195,11 +226,17 @@ def resolve_embedder_numeric_modalities(
             raise ValueError(f"duplicate embedder modality name {name!r}")
         seen.add(name)
         k = spec.type
+        assert spec.positions is not None
+        n_pos = int(spec.positions)
         if k == "discrete":
             vs = int(spec.vocab_size or 0)
             meta.append(
                 EmbedderModalityMeta(
-                    spec=spec, name=name, kind=KIND_DISCRETE, vocab_size=vs
+                    spec=spec,
+                    name=name,
+                    kind=KIND_DISCRETE,
+                    vocab_size=vs,
+                    n_positions=n_pos,
                 )
             )
         elif k in ("fourier", "continuous"):
@@ -208,6 +245,11 @@ def resolve_embedder_numeric_modalities(
                 raise ValueError(
                     f"continuous modality {name!r} requires dim="
                 )
+            if n_pos < dim:
+                raise ValueError(
+                    f"{k} modality {name!r} emits dim={dim} tokens per step but "
+                    f"declares positions={n_pos}; positions must be >= dim"
+                )
             meta.append(
                 EmbedderModalityMeta(
                     spec=spec,
@@ -215,25 +257,36 @@ def resolve_embedder_numeric_modalities(
                     kind=KIND_FOURIER,
                     dim=dim,
                     freq_sets=dim,
+                    n_positions=n_pos,
                 )
             )
         elif k == "learnable":
             n = int(spec.tokens or 1)
             if n <= 0:
                 raise ValueError("learnable tokens must be >= 1")
+            if n_pos < n:
+                raise ValueError(
+                    f"learnable modality {name!r} emits tokens={n} per step but "
+                    f"declares positions={n_pos}; positions must be >= tokens"
+                )
             meta.append(
                 EmbedderModalityMeta(
                     spec=spec,
                     name=name,
                     kind=KIND_LEARNABLE,
                     n_learnable=n,
+                    n_positions=n_pos,
                 )
             )
         elif k == "image":
             vs = int(spec.vocab_size or 0)
             meta.append(
                 EmbedderModalityMeta(
-                    spec=spec, name=name, kind=KIND_IMAGE, vocab_size=vs
+                    spec=spec,
+                    name=name,
+                    kind=KIND_IMAGE,
+                    vocab_size=vs,
+                    n_positions=n_pos,
                 )
             )
         else:

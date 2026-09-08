@@ -60,7 +60,7 @@ def test_flat_sequence_causal_mask_blocks_cross_grouping_id() -> None:
 
 def test_model_forward_injects_sequence_id_and_runs_flat() -> None:
     encoder = NumericEmbedder(
-        hidden_dim=8, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4}]
+        hidden_dim=8, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}]
     )
     backbone = IdentityBackbone(hidden_dim=8)
     model = Model(
@@ -72,7 +72,7 @@ def test_model_forward_injects_sequence_id_and_runs_flat() -> None:
     )
     batch = [[{"action": i % 4} for i in range(3)], [{"action": 1}, {"action": 2}]]
     tb, objective_data = batch_to_packed(_tok(model.encoder), batch)
-    predictions, _ = model(tb)
+    predictions = model(tb).predictions
     assert "sequence_id" in objective_data.keys()
     assert objective_data["sequence_id"].tolist() == [0, 0, 0, 1, 1]
     assert objective_data["grouping_id"].tolist() == [0, 0, 0, 0, 0]
@@ -80,7 +80,7 @@ def test_model_forward_injects_sequence_id_and_runs_flat() -> None:
     assert tb.N == 5
     assert list(tb.step_counts()) == [3, 2]
     assert list(tb.grouping_ids) == [0] * tb.L
-    preds2, _ = model(tb)
+    preds2 = model(tb).predictions
     assert preds2["action_value"].shape == (5, 4)
 
 
@@ -88,8 +88,8 @@ def test_prepare_derives_grouping_ids_from_field() -> None:
     encoder = NumericEmbedder(
         hidden_dim=8,
         modalities=[
-            {"type": 'discrete', "field": "action", "vocab_size": 4},
-            {"type": 'discrete', "field": "episode_done", "vocab_size": 3},
+            {"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1},
+            {"type": 'discrete', "field": "episode_done", "vocab_size": 3, "std": 0.02, "positions": 1},
         ],
     )
     batch = [
@@ -115,8 +115,8 @@ def test_missing_grouping_field_stamps_zero() -> None:
     encoder = NumericEmbedder(
         hidden_dim=8,
         modalities=[
-            {"type": 'discrete', "field": "action", "vocab_size": 4},
-            {"type": 'discrete', "field": "episode_done", "vocab_size": 3},
+            {"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1},
+            {"type": 'discrete', "field": "episode_done", "vocab_size": 3, "std": 0.02, "positions": 1},
         ],
     )
     batch = [[{"action": 0, "episode_done": 1, "task_done": 2}, {"action": 1, "episode_done": 0, "task_done": 0}]]

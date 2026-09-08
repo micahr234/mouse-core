@@ -10,10 +10,13 @@ from tensordict import TensorDict
 from mouse_core.objectives.base import Objective
 from mouse_core.objectives.dqn import (
     _boundary_discounts,
+    _greedy_from_online_q,
     _in_run_stats,
+    _pair_values_to_rows,
     _pair_weight,
     _head_output_layout,
     _require_done_codes,
+    _td_lambda_targets,
     _weighted_mean,
 )
 
@@ -72,14 +75,15 @@ def _build_layer_gamma_schedule(
 
 
 class LayerwiseDqnObjective(Objective):
-    """One-step Bellman TD objective on every backbone layer.
+    """Bellman TD(λ) objective on every backbone layer.
 
     Reads ``predictions["action_value_layerwise"]`` and
     ``delayed_predictions["action_value_layerwise"]`` with shape ``[P, L, A]``
     (one row per head-output token; ``objective_data["head_output_count"]`` maps
     rows to steps). Every head-output row of step ``i`` trains toward the same
     per-layer target; the bootstrap reads step ``i+1``'s last head-output row.
-    Delayed Q comes from ``averager(averager_inputs)`` and is detached
+    Delayed Q comes from a delayed :class:`~mouse_core.models.base.Model`
+    and is detached
     before the Bellman target, so the TD error does not backprop through it.
     Each layer and each episode/task done-code uses its own discount, built at construction
     from explicit shallow/deep endpoint pairs. A run is the same
@@ -113,6 +117,13 @@ class LayerwiseDqnObjective(Objective):
 
     ``get_action`` on a model with this head uses the deepest layer's Q-values.
 
+    The per-layer target is the TD(λ) return of
+    :class:`~mouse_core.objectives.dqn.DqnObjective` (``td_lambda=0`` is the
+    one-step target) built with that layer's discounts; with ``watkins=True``
+    the trace is also cut wherever the taken action is not that layer's online
+    argmax, and ``metrics["watkins_greedy_frac"]`` reports the deepest layer's
+    in-run greedy fraction.
+
     Args:
         num_backbone_layers: Number of transformer blocks (and Q heads).
         gamma_step_start: Step discount at layer 0 (``episode_done == 0``).
@@ -132,6 +143,9 @@ class LayerwiseDqnObjective(Objective):
         task_done_key: Key in ``objective_data`` for the task-done code.
         cql_weight: CQL penalty coefficient; ``0.0`` disables CQL.
         cql_scale_q_eps: Additive floor when scaling the CQL penalty.
+        td_lambda: λ of the TD(λ) target in ``[0, 1]``. ``0.0`` (default) is
+            the one-step target; ``1.0`` is the full in-run n-step return.
+        watkins: Cut the λ-trace at non-greedy actions (Watkins's Q(λ)).
     """
 
     def __init__(
@@ -155,7 +169,11 @@ class LayerwiseDqnObjective(Objective):
         cql_weight: float = 0.0,
         cql_scale_q_eps: float = 1.0,
         grouping_field: str | None = None,
+        td_lambda: float = 0.0,
+        watkins: bool = False,
     ) -> None:
+        if not 0.0 <= float(td_lambda) <= 1.0:
+            raise ValueError(f"td_lambda must be in [0, 1], got {td_lambda}.")
         self.num_backbone_layers = int(num_backbone_layers)
         self.gamma_step_start = float(gamma_step_start)
         self.gamma_step = float(gamma_step)
@@ -174,6 +192,8 @@ class LayerwiseDqnObjective(Objective):
         self.cql_weight = cql_weight
         self.cql_scale_q_eps = cql_scale_q_eps
         self.grouping_field = grouping_field
+        self.td_lambda = float(td_lambda)
+        self.watkins = bool(watkins)
 
         build = _build_layer_gamma_schedule
         n = self.num_backbone_layers
@@ -214,6 +234,11 @@ class LayerwiseDqnObjective(Objective):
             raise ValueError(
                 f"Layerwise DQN expects action_value_layerwise shape [P, L, A], "
                 f"got {tuple(q.shape)}."
+            )
+        if q.dtype != torch.float32 or q_target.dtype != torch.float32:
+            raise TypeError(
+                "Layerwise DQN expects float32 action_value_layerwise (heads always "
+                f"run in fp32), got online {q.dtype} and delayed {q_target.dtype}."
             )
         if q_target.shape != q.shape:
             raise ValueError(
@@ -277,13 +302,13 @@ class LayerwiseDqnObjective(Objective):
 
         step_next = (step_of + 1).clamp(max=N - 1)      # [P]
         next_actions = action[step_next]                # [P]
-        next_rewards = reward[step_next]                # [P]
-        next_q_target = q_target[last_rows[step_next]]  # [P, L, A]
+        v_step_all = q_target[last_rows].amax(dim=-1)   # [N, L]  V_l(s_i)
 
         layer_losses: list[torch.Tensor] = []
         layer_curr_max_means: list[torch.Tensor] = []
         cql_penalties: list[torch.Tensor] = []
         deepest_curr_max_q: torch.Tensor | None = None
+        deepest_greedy_from: torch.Tensor | None = None
 
         for layer_idx in range(L):
             discount_all = _boundary_discounts(
@@ -297,19 +322,28 @@ class LayerwiseDqnObjective(Objective):
                 dtype=value_dtype,
                 device=device,
             )
-            discount = discount_all[step_next]  # [P]
 
-            curr_q_layer = q[:, layer_idx, :]                 # [P, A]
-            next_q_target_layer = next_q_target[:, layer_idx, :]  # [P, A]
-
+            curr_q_layer = q[:, layer_idx, :]  # [P, A]
             q_values = curr_q_layer.gather(
                 dim=-1, index=next_actions.unsqueeze(-1)
             ).squeeze(-1)
             curr_max_q = curr_q_layer.amax(dim=-1)
-            next_max_q_target = next_q_target_layer.amax(dim=-1)
-            td_target = next_rewards + discount * next_max_q_target
+            greedy_from = (
+                _greedy_from_online_q(q=curr_q_layer, action=action, last_rows=last_rows)
+                if self.watkins
+                else None
+            )
+            pair_target = _td_lambda_targets(
+                reward=reward,
+                discount_all=discount_all,
+                v_step=v_step_all[:, layer_idx],
+                pair_weight=pair_weight,
+                td_lambda=self.td_lambda,
+                greedy_from=greedy_from,
+            )
+            td_target = _pair_values_to_rows(pair_target, step_of)  # [P]
 
-            loss = (q_values - td_target.detach()) ** 2
+            loss = (q_values - td_target) ** 2
 
             if self.cql_weight > 0.0:
                 q_scale = (td_target.abs() + self.cql_scale_q_eps).detach()
@@ -317,10 +351,13 @@ class LayerwiseDqnObjective(Objective):
                 loss = loss + self.cql_weight * q_scale * cql_penalty
                 cql_penalties.append(_weighted_mean(cql_penalty.detach(), row_weight))
 
-            layer_losses.append(_weighted_mean(loss, row_weight))
+            loss = _weighted_mean(loss, row_weight)
+
+            layer_losses.append(loss)
             layer_curr_max_means.append(_weighted_mean(curr_max_q.detach(), row_weight))
             if layer_idx == L - 1:
                 deepest_curr_max_q = curr_max_q
+                deepest_greedy_from = greedy_from
 
         total_loss = torch.stack(layer_losses).mean()
 
@@ -347,6 +384,8 @@ class LayerwiseDqnObjective(Objective):
             named[f"layer_{layer_idx}_q_mean"] = layer_curr_max_means[layer_idx]
         if cql_penalties:
             named["cql_penalty"] = torch.stack(cql_penalties).mean()
+        if deepest_greedy_from is not None:
+            named["watkins_greedy_frac"] = _weighted_mean(deepest_greedy_from, pair_weight)
 
         metrics: dict[str, float] = {
             key: (value.item() if value.numel() == 1 else float(value))

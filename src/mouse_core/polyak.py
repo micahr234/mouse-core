@@ -1,288 +1,117 @@
-"""Polyak averaging of delayed DQN encoder, backbone, and/or heads.
+"""Polyak interpolation of delayed heads toward the online heads.
 
-After each ``optimizer.step()``, call :meth:`PolyakAverager.update`.
-After the online forward::
+The delayed network is the heads-only :class:`~mouse_core.models.base.Model`
+from :meth:`~mouse_core.models.base.Model.delayed_copy`; it reads the online
+token states, so only the heads are delayed. After each ``optimizer.step()``
+call :meth:`Polyak.update` with that step's ``tau``::
 
-    predictions, averager_inputs = model(inputs)
-    delayed_predictions = averager(averager_inputs)
+    delayed_model = model.delayed_copy()
+    polyak = Polyak(model, delayed_model)
+    out = model(inputs)
+    with torch.no_grad():
+        delayed_out = delayed_model(
+            last_hidden_state=out.last_hidden_state,
+            head_output_indices=out.head_output_indices,
+            hidden_states=out.hidden_states,
+        )
+    ...
+    polyak.update(0.0005)
 
-Each of ``tau_encoder``, ``tau_backbone``, and ``tau_head`` is independent.
-``θ_delayed ← τ·θ_online + (1−τ)·θ_delayed``, so ``τ = 1`` is a perfect copy
-of the online section: if its inputs are also not from a delayed section,
-that path is not recomputed. ``τ = 0`` freezes the snapshot taken at
-construction.
+``θ_delayed ← τ·θ_online + (1−τ)·θ_delayed``. ``τ = 0`` keeps the delayed
+heads frozen at their current weights. ``τ = 1`` copies the online heads, so
+the delayed output equals what the online heads would produce on the same
+states — there is no separate delayed network in effect. Heads are always fp32
+(:meth:`~mouse_core.models.base.Model.to` never casts them), so small ``tau``
+updates are not rounded away.
 """
 
 from __future__ import annotations
 
-import copy
-from typing import TypeVar
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
-from tensordict import TensorDict
 
-from mouse_core.models.base import AveragerInputs, Model, _run_heads
-from mouse_core.models.backbone.base import Backbone
-from mouse_core.models.embedding.embedding import Encoder
-from mouse_core.models.heads.base import BaseHead
-
-_DQN_HEADS = ("action_value", "action_value_layerwise")
+if TYPE_CHECKING:
+    from mouse_core.models.base import Model
 
 
 class _PolyakState:
-    """Pairs online/delayed parameters and lerps them in fp32.
+    """Pairs online/delayed parameters and lerps them.
 
-    A small ``tau`` times the online/delayed gap is far below half a bf16 ULP
-    (~``|w| / 512``), so lerping directly in a bf16 parameter rounds every
-    update away and the delayed copy never moves. Non-fp32 delayed parameters
-    therefore get a persistent fp32 shadow: the interpolation happens on the
-    shadow and the result is cast into the delayed parameter each update.
+    Both sides must be fp32: a small ``tau`` times the online/delayed gap is
+    far below half a bf16 ULP (~``|w| / 512``), so a bf16 delayed copy would
+    round every update away and never move.
     """
 
     def __init__(self, online: nn.Module, delayed: nn.Module) -> None:
-        self._pairs: list[tuple[nn.Parameter, nn.Parameter, torch.Tensor | None]] = []
-        for online_p, delayed_p in zip(
-            online.parameters(), delayed.parameters(), strict=True
-        ):
-            shadow = (
-                None
-                if delayed_p.dtype == torch.float32
-                else delayed_p.detach().to(dtype=torch.float32).clone()
+        online_params = dict(online.named_parameters())
+        delayed_params = dict(delayed.named_parameters())
+        if set(online_params) != set(delayed_params):
+            missing = sorted(set(online_params) ^ set(delayed_params))
+            raise ValueError(
+                "online and delayed heads must have the same parameter names; "
+                f"mismatched: {missing[:8]}{'...' if len(missing) > 8 else ''}."
             )
-            self._pairs.append((online_p, delayed_p, shadow))
+        self._pairs: list[tuple[nn.Parameter, nn.Parameter]] = []
+        for name, delayed_p in delayed_params.items():
+            online_p = online_params[name]
+            if online_p.shape != delayed_p.shape:
+                raise ValueError(
+                    f"parameter {name!r} has shape {tuple(online_p.shape)} online "
+                    f"but {tuple(delayed_p.shape)} delayed."
+                )
+            if online_p.dtype != torch.float32 or delayed_p.dtype != torch.float32:
+                raise TypeError(
+                    f"heads must be float32, got {name!r} online {online_p.dtype} "
+                    f"and delayed {delayed_p.dtype}."
+                )
+            self._pairs.append((online_p, delayed_p))
+        if not self._pairs:
+            raise ValueError("Polyak has no parameters to interpolate.")
 
     @torch.no_grad()
     def update(self, tau: float) -> None:
-        """θ_delayed ← τ·θ_online + (1−τ)·θ_delayed, accumulated in fp32."""
+        """θ_delayed ← τ·θ_online + (1−τ)·θ_delayed."""
         if tau <= 0.0:
             return
-        for online_p, delayed_p, shadow in self._pairs:
-            if shadow is None:
-                delayed_p.lerp_(online_p.to(dtype=delayed_p.dtype), tau)
-                continue
-            shadow.lerp_(online_p.to(dtype=torch.float32), tau)
-            delayed_p.copy_(shadow)
+        for online_p, delayed_p in self._pairs:
+            delayed_p.lerp_(online_p, tau)
 
 
-_M = TypeVar("_M", bound=nn.Module)
+class Polyak:
+    """Interpolates a heads-only delayed model toward the online model's heads.
 
-
-def _copy_delayed(online: _M) -> _M:
-    delayed = copy.deepcopy(online)
-    delayed.requires_grad_(False)
-    delayed.train()
-    return delayed
-
-
-def _head_map(heads: nn.ModuleDict) -> dict[str, BaseHead]:
-    return {str(name): heads[name] for name in heads}
-
-
-def _online_section(tau: float) -> bool:
-    """``τ >= 1`` is a perfect copy of the online weights: no delayed module."""
-    return tau >= 1.0
-
-
-class PolyakAverager:
-    """Delayed DQN weights for TD bootstrap targets.
-
-    Construct after ``model.to(...)``. After the online forward, delayed Q is
-    ``averager(averager_inputs)``. Each section has its own interpolation
-    factor. ``1`` is a perfect copy of the online section (no delayed
-    module). ``0`` freezes the construction-time snapshot. Delayed modules
-    run in ``train()``. The delayed forward is ``torch.no_grad`` (no
-    autograd graph, including when a tau-1 section reuses an online
-    module). Call :meth:`update` after each ``optimizer.step()``.
-
-    A delayed forward starts at the first delayed section (``τ < 1``) and
-    reuses the online activations above it:
-
-    - ``tau_encoder < 1`` recomputes embeddings from ``averager_inputs.batch``.
-    - else if ``tau_backbone < 1``, the delayed backbone reads
-      ``averager_inputs.embeds`` (no second encoder pass).
-    - else delayed heads read ``averager_inputs.h`` (no second
-      encoder/backbone pass).
-    - if every tau is ``1``, delayed Q is ``averager_inputs.predictions``.
-
-    When a later section is delayed but an earlier one is not, the online
-    module runs on the delayed inputs (those inputs *are* from a delayed
-    net, so the path cannot be skipped).
+    Does not run a forward. Pair with the model from
+    :meth:`~mouse_core.models.base.Model.delayed_copy`.
 
     Args:
-        model: Online model (must have an ``action_value`` or
-            ``action_value_layerwise`` head).
-        tau_encoder: Interpolation factor for the encoder. ``1`` (default)
-            keeps the online encoder (and skips it when backbone inputs are
-            online). ``0`` freezes the encoder snapshot.
-        tau_backbone: Interpolation factor for the backbone. ``1`` (default)
-            keeps the online backbone (and skips it when head inputs are
-            online). ``0`` freezes the backbone snapshot.
-        tau_head: Interpolation factor for the heads. ``1`` (default)
-            keeps the online heads (and skips them when their inputs are
-            online). ``0`` freezes the head snapshot.
+        online: Source model (encoder, backbone, heads).
+        delayed: Heads-only copy whose parameters are interpolated.
     """
 
-    def __init__(
-        self,
-        model: Model,
-        *,
-        tau_encoder: float = 1.0,
-        tau_backbone: float = 1.0,
-        tau_head: float = 1.0,
-    ) -> None:
-        if not any(name in model._heads for name in _DQN_HEADS):
+    def __init__(self, online: Model, delayed: Model) -> None:
+        from mouse_core.models.base import Model as _Model
+
+        if not isinstance(online, _Model) or not isinstance(delayed, _Model):
+            raise TypeError("Polyak interpolates a delayed Model toward an online Model.")
+        if delayed.backbone is not None or delayed.encoder is not None:
             raise ValueError(
-                "PolyakAverager requires a DQN-style action-value head."
+                "delayed must be the heads-only model from Model.delayed_copy()."
             )
-        self._online = model
-        self.tau_encoder = float(tau_encoder)
-        self.tau_backbone = float(tau_backbone)
-        self.tau_head = float(tau_head)
-        self.encoder: Encoder | None = None
-        self.backbone: Backbone | None = None
-        self.heads: nn.ModuleDict | None = None
-        self._encoder_state: _PolyakState | None = None
-        self._backbone_state: _PolyakState | None = None
-        self._head_state: _PolyakState | None = None
-        if not _online_section(self.tau_encoder):
-            self.encoder = _copy_delayed(model.encoder)
-            self._encoder_state = _PolyakState(model.encoder, self.encoder)
-        if not _online_section(self.tau_backbone):
-            self.backbone = _copy_delayed(model.backbone)
-            self._backbone_state = _PolyakState(model.backbone, self.backbone)
-        if not _online_section(self.tau_head):
-            self.heads = _copy_delayed(model.heads)
-            self._head_state = _PolyakState(model.heads, self.heads)
+        if online.backbone is None:
+            raise ValueError("online must be the full model, not a delayed copy.")
+        self._state = _PolyakState(online.heads, delayed.heads)
 
-    def _delayed_modules(self) -> list[nn.Module]:
-        modules: list[nn.Module] = []
-        if self.encoder is not None:
-            modules.append(self.encoder)
-        if self.backbone is not None:
-            modules.append(self.backbone)
-        if self.heads is not None:
-            modules.append(self.heads)
-        return modules
+    def update(self, tau: float) -> None:
+        """Move the delayed heads toward the online heads after an optimizer step.
 
-    @torch.no_grad()
-    def __call__(self, averager_inputs: AveragerInputs) -> TensorDict:
-        """Delayed head outputs from a :class:`~mouse_core.models.base.AveragerInputs`.
-
-        Sections with tau ``1`` reuse the matching online activation when
-        their inputs are not from a delayed section. The whole call is
-        ``torch.no_grad`` so a tau-1 online module on delayed inputs does
-        not record autograd. Delayed modules run in ``train()``.
+        ``tau`` is this call's interpolation factor: ``0`` leaves the delayed
+        heads unchanged (frozen), ``1`` copies the online heads (the delayed
+        output then equals the online heads on the same states). Pass a new
+        value each step to change it mid-run.
         """
-        if not isinstance(averager_inputs, AveragerInputs):
-            raise TypeError(
-                "averager(...) expects AveragerInputs from model(inputs), "
-                f"got {type(averager_inputs).__name__}."
-            )
-        delay_encoder = self.encoder is not None
-        delay_backbone = self.backbone is not None
-        delay_head = self.heads is not None
-        if not delay_encoder and not delay_backbone and not delay_head:
-            if averager_inputs.predictions is None:
-                raise ValueError(
-                    "Every tau is 1: delayed Q is AveragerInputs.predictions "
-                    "from model(inputs); nothing is recomputed."
-                )
-            return averager_inputs.predictions
-
-        for module in self._delayed_modules():
-            module.train()
-        recompute_backbone = delay_encoder or delay_backbone
-        if not recompute_backbone:
-            h = averager_inputs.h
-        else:
-            h = self._delayed_h(
-                averager_inputs, delay_encoder=delay_encoder
-            )
-        if delay_head:
-            assert self.heads is not None
-            return _run_heads(_head_map(self.heads), h, None)
-        return self._online.head(h=h)
-
-    def _delayed_h(
-        self,
-        averager_inputs: AveragerInputs,
-        *,
-        delay_encoder: bool,
-    ) -> torch.Tensor:
-        reasoned = averager_inputs.token_indices is not None
-        if delay_encoder:
-            assert self.encoder is not None
-            enc_embeds, enc_head_output_indices = self.encoder(averager_inputs.batch)
-            if reasoned:
-                # Reasoning forward: re-encode the real tokens with the delayed
-                # encoder and splice them into the extended stream; the latent
-                # slots keep the detached online-generated embeds.
-                if (
-                    averager_inputs.embeds is None
-                    or averager_inputs.head_output_indices is None
-                ):
-                    raise ValueError(
-                        "Delayed encoder on a reasoning forward needs "
-                        "AveragerInputs.embeds from model(inputs, reasoning=...)."
-                    )
-                assert averager_inputs.token_indices is not None
-                embeds = averager_inputs.embeds.index_copy(
-                    0, averager_inputs.token_indices, enc_embeds
-                )
-                head_output_indices = averager_inputs.head_output_indices
-            else:
-                embeds = enc_embeds
-                head_output_indices = enc_head_output_indices
-            pool_encoder = self.encoder
-        else:
-            if (
-                averager_inputs.embeds is None
-                or averager_inputs.head_output_indices is None
-            ):
-                raise ValueError(
-                    "Delayed backbone with tau_encoder=1 needs "
-                    "AveragerInputs.embeds from model(inputs)."
-                )
-            embeds = averager_inputs.embeds
-            head_output_indices = averager_inputs.head_output_indices
-            pool_encoder = self._online.encoder
-        if (
-            averager_inputs.sequence_ids is not None
-            and averager_inputs.grouping_ids is not None
-        ):
-            sequence_ids = averager_inputs.sequence_ids
-            grouping_ids = averager_inputs.grouping_ids
-        else:
-            t = averager_inputs.batch.to_tensors(embeds.device)
-            sequence_ids = t["sequence_ids"]
-            grouping_ids = t["grouping_ids"]
-        backbone = (
-            self.backbone if self.backbone is not None else self._online.backbone
-        )
-        needs_layerwise = "action_value_layerwise" in self._online._heads
-        session_out = self._online._train_backbone_forward(
-            backbone,
-            embeds,
-            sequence_ids,
-            grouping_ids,
-            needs_layerwise,
-        )
-        return self._online._pool_backbone_out(
-            pool_encoder, session_out, head_output_indices, needs_layerwise
-        )
-
-    def update(self) -> None:
-        """Move delayed weights toward the online model after an optimizer step.
-
-        Interpolation is accumulated in fp32 even when the delayed modules are
-        bf16, so small ``tau`` updates are not rounded away. Sections with
-        tau ``1`` have no delayed copy and are skipped; tau ``0`` keeps the
-        frozen snapshot.
-        """
-        if self._encoder_state is not None:
-            self._encoder_state.update(self.tau_encoder)
-        if self._backbone_state is not None:
-            self._backbone_state.update(self.tau_backbone)
-        if self._head_state is not None:
-            self._head_state.update(self.tau_head)
+        tau = float(tau)
+        if not 0.0 <= tau <= 1.0:
+            raise ValueError(f"tau must be in [0, 1], got {tau}.")
+        self._state.update(tau)

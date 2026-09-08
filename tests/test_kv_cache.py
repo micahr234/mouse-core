@@ -63,7 +63,7 @@ def _as_rect(preds: torch.Tensor) -> torch.Tensor:
 
 def _tiny_model(backbone_cls, tokens: int=1) -> Model:
     hidden_dim = 16
-    encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4}, {"type": 'fourier', "field": "reward"}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3}])
+    encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}, {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3, "std": 0.02, "positions": 1}])
     backbone = backbone_cls(hidden_dim=hidden_dim, num_layers=2, num_heads=2)
     head = DiscreteActionValueHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1)
     return Model(encoder=encoder, backbone=backbone, heads=head).eval()
@@ -82,8 +82,8 @@ def _fwd(model: Model, rows: list[list[dict]], **kwargs):
         patched,
         grouping_field="task_index",
     )
-    preds, averager_inputs = model(tb, **kwargs)
-    return preds, averager_inputs.cache
+    out = model(tb, **kwargs)
+    return out.predictions, out.cache
 
 @pytest.mark.parametrize('backbone_cls', [Qwen3Backbone, LlamaBackbone])
 def test_chunked_cached_forward_matches_full_forward(backbone_cls) -> None:
@@ -274,7 +274,7 @@ def test_concat_fusion_ragged_chunks_match_unbatched() -> None:
     blocks, and the mask must expand to exactly that many tokens per step."""
     torch.manual_seed(6)
     hidden_dim = 16
-    encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4}, {"type": 'fourier', "field": "reward"}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3}, {'type': 'learnable', 'tokens': 1}])
+    encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}, {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3, "std": 0.02, "positions": 1}, {'type': 'learnable', 'tokens': 1, "std": 0.02, "positions": 1}])
     backbone = Qwen3Backbone(hidden_dim=hidden_dim, num_layers=2, num_heads=2)
     head = DiscreteActionValueHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1)
     model = Model(encoder=encoder, backbone=backbone, heads=head).eval()
@@ -386,7 +386,7 @@ def test_reset_rows_restarts_one_sequence_without_rebuild(backbone_cls) -> None:
         cache = None
         preds, cache = _fwd(model, [row0_a, row1[:4]], use_cache=True)
         assert cache is not None
-        cache['session'].reset_rows([0])
+        cache.reset_rows([0])
         collected0: list[torch.Tensor] = []
         collected1 = [preds['action_value'][1]]
         # Continue: row0 starts fresh from row0_b; row1 appends the rest.

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import tempfile
 from collections.abc import Mapping, Sequence
@@ -15,13 +16,14 @@ from tensordict import TensorDict
 
 from mouse_core.models.embedding.embedding import Encoder
 from mouse_core.models.backbone.base import Backbone
-from mouse_core.models.backbone.flex_decode import packed_rope_positions
+from mouse_core.models.backbone.flex_decode import FlexDecodeSession, packed_rope_positions
 from mouse_core.models.heads.base import BaseHead
 from mouse_core.models.heads.discrete_action import DiscreteActionHead
 from mouse_core.models.heads.dqn import DiscreteActionValueHead
 from mouse_core.models.heads.layerwise_dqn import LayerwiseDiscreteActionValueHead
 from mouse_core.models.heads.swiglu import SwiGLUHead
 from mouse_core.models.reasoner import LatentReasoner, _InsertionPlan, _plan_insertions
+from mouse_core.models.recurrence import Recurrence
 
 if TYPE_CHECKING:
     from mouse_core.data.token_batch import TokenBatch
@@ -157,6 +159,12 @@ def _write_model_card(
         if reasoner_cfg
         else ""
     )
+    recurrence_cfg = config.get("recurrence")
+    if recurrence_cfg:
+        reasoner_line += (
+            f"\n- Recurrence: `num_passes={recurrence_cfg['num_passes']}` "
+            "(applied on every forward, including cached decode)"
+        )
     modalities = config["encoder"]["kwargs"].get("modalities", [])
     modality_table = _model_card_modality_table(modalities)
     objective_data_example = _model_card_step_stream_example(modalities)
@@ -236,14 +244,16 @@ eval_transform = tokenizer  # plus compose(selector, tokenizer) as needed
 with torch.no_grad():
     steps = [eval_transform(step) for step in batch[0]]
     inputs, _ = pack_token_batch(steps, sequence_ids=[0] * len(steps))
-    predictions, averager_inputs = model(inputs)
-    action = model.get_action(predictions, temperature=0.0)
+    out = model(inputs)
+    action = model.get_action(out.predictions, temperature=0.0)
 ```
 
-`model()` returns `(predictions, averager_inputs)`. `pack_token_batch` /
+`model()` returns a `ModelOutput` with `predictions` and
+`last_hidden_state` (final pass; `out.passes` has every pass on a
+recurrent model). `pack_token_batch` /
 `DataLoader.next_batch()` return `(inputs, objective_data)`; pass
 `objective_data` to objectives during training. For cached incremental
-rollout, pass ``averager_inputs`` back as ``cache=`` with `use_cache=True`.
+rollout, pass ``out.cache`` back as ``cache=`` with `use_cache=True`.
 Cached batch rows may have different
 lengths on every call (e.g. envs emitting different numbers of steps between
 model calls): decoding runs through a FlexAttention session carried in the
@@ -330,7 +340,7 @@ batch = [[
 ]]
 steps = [eval_transform(batch[0][0])]  # per-step StepTokens; pack_token_batch for many
 inputs, objective_data = pack_token_batch(steps, sequence_ids=[0])
-predictions, averager_inputs = model(inputs)"""
+out = model(inputs)"""
 
 
 def _model_card_field_example(modality: dict[str, Any]) -> str:
@@ -351,6 +361,8 @@ def _model_card_field_example(modality: dict[str, Any]) -> str:
 
 
 def _model_config(model: "Model") -> dict[str, Any]:
+    if model.encoder is None or model.backbone is None:
+        raise TypeError("save_model requires encoder and backbone.")
     config: dict[str, Any] = {
         "format": "mouse-core-model-v1",
         "hidden_dim": int(model.hidden_dim),
@@ -360,6 +372,8 @@ def _model_config(model: "Model") -> dict[str, Any]:
     }
     if model.reasoner is not None:
         config["reasoner"] = {"num_thoughts": int(model.reasoner.num_thoughts)}
+    if model.recurrence is not None:
+        config["recurrence"] = {"num_passes": int(model.recurrence.num_passes)}
     return config
 
 
@@ -375,7 +389,6 @@ def _encoder_config(encoder: Encoder) -> dict[str, Any]:
                 "modalities": [_public_modality_config(modality) for modality in encoder.modalities],
                 "fourier_min": float(encoder.fourier_min),
                 "fourier_max": float(encoder.fourier_max),
-                "std": float(encoder.std),
             },
         }
     if isinstance(encoder, TextEmbedder):
@@ -559,12 +572,22 @@ def _build_model_from_config(config: dict[str, Any]) -> "Model":
         if reasoner_cfg is not None
         else None
     )
+    recurrence_cfg = config.get("recurrence")
+    recurrence = (
+        Recurrence(
+            hidden_dim=int(config["hidden_dim"]),
+            num_passes=int(recurrence_cfg["num_passes"]),
+        )
+        if recurrence_cfg is not None
+        else None
+    )
     return Model(
         encoder=encoder,
         backbone=backbone,
         heads=heads,
         action_head=heads_cfg.get("action_head"),
         reasoner=reasoner,
+        recurrence=recurrence,
     )
 
 
@@ -654,6 +677,41 @@ def _build_heads_from_config(heads: list[dict[str, Any]]) -> dict[str, BaseHead]
     return built
 
 
+def _last_hidden(
+    session_out: torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, ...]],
+) -> torch.Tensor:
+    """Last-layer hidden states (``[L, D]`` train, ``[B, S, D]`` decode)."""
+    if isinstance(session_out, tuple):
+        return session_out[0]
+    return session_out
+
+
+def _pool_head_outputs(
+    h: torch.Tensor, head_output_indices: torch.Tensor
+) -> torch.Tensor:
+    """Gather head-output tokens from backbone states.
+
+    ``h`` is ``[L, D]`` (flat packed) or ``[B, L, D]`` (decode).
+    Train: ``head_output_indices`` is ``[P]`` into ``0 .. L-1``.
+    Decode: ``head_output_indices`` is ``[B, S]`` into the token axis of ``h``.
+    """
+    if h.ndim == 2:
+        return h[head_output_indices.reshape(-1)]
+    B, S = head_output_indices.shape
+    D = h.shape[-1]
+    idx = head_output_indices.unsqueeze(-1).expand(B, S, D)
+    return h.gather(1, idx)
+
+
+def _layer_hiddens(
+    session_out: torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, ...]],
+) -> tuple[torch.Tensor, ...] | None:
+    """Per-layer hidden states when the backbone returned them, else ``None``."""
+    if isinstance(session_out, tuple):
+        return session_out[1]
+    return None
+
+
 def _run_heads(
     heads: dict[str, BaseHead],
     h: torch.Tensor,
@@ -678,57 +736,82 @@ def _run_heads(
 
 
 @dataclass
-class AveragerInputs:
-    """Per-forward extras for delayed Q and incremental decode.
+class DecodeCache:
+    """KV state carried between ``use_cache=True`` calls.
 
-    Pass to :class:`~mouse_core.polyak.PolyakAverager`. A section with tau
-    ``1`` is a perfect copy of the online weights and reuses the matching
-    activation when its inputs are not from a delayed net: encoder skips
-    to ``embeds``, backbone skips to ``h``, heads skip to
-    ``predictions``. A delayed encoder (``τ < 1``) reads ``batch``.
-    Incremental decode uses ``cache`` (or pass this object back as
-    ``cache=``). Activations are detached so gradients cannot flow back
-    through the averager.
-
-    A reasoning forward (``Model.forward(reasoning=...)``) fills the
-    extended-stream fields: ``embeds`` / ``head_output_indices`` describe the
-    stream *with latents inserted*, ``sequence_ids`` / ``grouping_ids`` are
-    its per-token ids, and ``token_indices`` maps each original batch token
-    to its extended position (a delayed encoder re-encodes the batch and is
-    spliced back in at those positions; the latents stay as the detached
-    online-generated embeds).
+    One :class:`~mouse_core.models.backbone.flex_decode.FlexDecodeSession`
+    per backbone pass (a plain model has one; a recurrent model has
+    ``num_passes``). Pass ``out.cache`` back as ``cache=``.
     """
 
-    h: torch.Tensor
-    batch: TokenBatch
-    cache: dict[str, Any] | None = None
-    embeds: torch.Tensor | None = None
-    head_output_indices: torch.Tensor | None = None
-    predictions: TensorDict | None = None
-    sequence_ids: torch.Tensor | None = None
-    grouping_ids: torch.Tensor | None = None
-    token_indices: torch.Tensor | None = None
+    sessions: tuple[FlexDecodeSession, ...]
 
-    def __post_init__(self) -> None:
-        self.h = self.h.detach()
-        if self.embeds is not None:
-            self.embeds = self.embeds.detach()
-        if self.predictions is not None:
-            self.predictions = self.predictions.detach()
+    def reset_rows(self, rows: Sequence[int] | None = None) -> None:
+        """Restart the given batch rows (all rows when ``None``) in every pass."""
+        for session in self.sessions:
+            session.reset_rows(rows)
+
+
+@dataclass
+class PassOutput:
+    """One backbone pass: last-layer states, per-layer states, head predictions.
+
+    ``last_hidden_state`` is the last-layer residual stream (``[L, D]``
+    train, ``[B, S, D]`` decode), on the autograd tape. ``hidden_states`` is
+    the per-layer tuple when a layerwise head is enabled. ``predictions`` is
+    the head TensorDict for this pass.
+    """
+
+    last_hidden_state: torch.Tensor
+    predictions: TensorDict
+    hidden_states: tuple[torch.Tensor, ...] | None = None
+
+
+@dataclass
+class ModelOutput:
+    """Head predictions plus the token states they were read from.
+
+    ``predictions``, ``last_hidden_state``, and ``hidden_states`` are the
+    final backbone pass. ``passes`` holds every pass in order (one entry on
+    a plain model; ``num_passes`` on a recurrent model) so a training loop
+    can supervise each pass::
+
+        out = model(inputs)
+        with torch.no_grad():
+            targets = [
+                delayed_model(
+                    last_hidden_state=p.last_hidden_state,
+                    head_output_indices=out.head_output_indices,
+                    hidden_states=p.hidden_states,
+                ).predictions
+                for p in out.passes
+            ]
+
+    ``head_output_indices`` maps token states to the rows heads read. A
+    reasoning forward extends the stream, so those indices and the states
+    describe the stream *with* latents inserted. Incremental decode carries
+    ``cache`` — pass ``out.cache`` back as ``cache=`` with ``use_cache=True``.
+    """
+
+    predictions: TensorDict
+    last_hidden_state: torch.Tensor
+    passes: tuple[PassOutput, ...]
+    head_output_indices: torch.Tensor
+    hidden_states: tuple[torch.Tensor, ...] | None = None
+    cache: DecodeCache | None = None
 
 
 class Model(nn.Module):
     """Composable MOUSE model: encoder, backbone, and heads as distinct sections.
 
-    The model is assembled from three pluggable parts:
+    The model is assembled from three pluggable parts (a heads-only delayed
+    copy from :meth:`delayed_copy` has neither encoder nor backbone):
 
     - ``encoder``: :class:`~mouse_core.models.embedding.embedding.Encoder`
-      Converts a ``TensorDict[B, S]`` of step records into token embeddings
-      ``[B, T, D]`` and knows how to pool backbone outputs back to per-step
-      representations ``[B, S, D]`` (the vectors used for action output).
+      Converts a :class:`~mouse_core.data.token_batch.TokenBatch` into token
+      embeddings ``[L, D]``.
     - ``backbone``: a :class:`~mouse_core.models.backbone.Backbone`-compatible
-      module that maps ``embeds`` plus optional cache/mask args to
-      ``(hidden_states, cache)``.
+      module that maps encodings to last-layer hidden states ``[L, D]``.
     - ``heads``: heads can be provided in several ergonomic ways:
         - a single :class:`~mouse_core.models.heads.base.BaseHead` (e.g. ``DiscreteActionValueHead(...)``):
           it becomes the only enabled head and the implicit ``action_head``;
@@ -743,7 +826,7 @@ class Model(nn.Module):
     ``action_head`` names which head ``get_action`` consults. If omitted,
     it is auto-selected by preference: ``action_value`` > ``action`` > ``value``.
 
-    The only supported construction is the explicit three-piece composition:
+    Full construction::
 
         encoder = NumericEmbedder(modalities=..., hidden_dim=...)
         backbone = LlamaBackbone(...)   # or any Backbone
@@ -751,13 +834,14 @@ class Model(nn.Module):
 
         model = Model(encoder=encoder, backbone=backbone, heads=heads)
 
-    The backbone is independent; it does not know about the encoder or heads.
-    DQN target Q is ``averager(averager_inputs)`` where ``averager_inputs``
-    comes from that same ``model(inputs)`` call. Pooled head input
-    is ``averager_inputs.h`` (last-layer ``[N, D]``, or stacked layers
-    ``[N, L, D]`` when a layerwise head is enabled). Encoder output is
-    ``averager_inputs.embeds`` so a delayed backbone can skip a tau-1
-    encoder.
+    ``forward`` returns a :class:`ModelOutput` with ``predictions``,
+    ``last_hidden_state``, and per-pass ``passes``. The delayed DQN copy is
+    a heads-only model from :meth:`delayed_copy` run on the online token
+    states; interpolate it with :class:`~mouse_core.polyak.Polyak`.
+    Recurrent-depth refinement is a
+    :class:`~mouse_core.models.recurrence.Recurrence` section
+    (``num_passes`` backbone passes per forward, saved with the model). See
+    ``examples/13_train_offline_recurrent_dqn.ipynb``.
     """
 
     _VALID_HEADS = ("action_value", "action_value_layerwise", "action", "value")
@@ -844,50 +928,73 @@ class Model(nn.Module):
     def __init__(
         self,
         *,
-        encoder: Encoder,
-        backbone: Backbone,
+        encoder: Encoder | None = None,
+        backbone: Backbone | None = None,
         heads: BaseHead | list[BaseHead] | Mapping[str, BaseHead | None] | None = None,
         action_head: str | None = None,
         reasoner: LatentReasoner | None = None,
+        recurrence: Recurrence | None = None,
     ):
-        """Construct a Model from three independent pieces.
+        """Construct a Model from encoder, backbone, and heads.
 
-        This is the *only* supported construction path. ``reasoner`` is an
-        optional fourth section enabling Coconut-style latent reasoning via
-        ``forward(batch, reasoning=...)``.
+        Encoder and backbone are both present on a trainable model and both
+        absent on a heads-only delayed copy (which runs from
+        ``last_hidden_state=``). ``reasoner`` enables Coconut-style latent
+        reasoning via ``forward(batch, reasoning=...)``. ``recurrence``
+        makes every forward run the backbone ``num_passes`` times through
+        the adapter; the two extra sections cannot be combined.
         """
         super().__init__()
 
-        if encoder is None or backbone is None:
-            # Defensive (types make them required)
-            raise TypeError("Model requires encoder and backbone.")
-
-        if not isinstance(encoder, Encoder):
+        if encoder is not None and not isinstance(encoder, Encoder):
             raise TypeError("encoder must be an instance of Encoder (from mouse_core.models.embedding).")
+        if (encoder is None) != (backbone is None):
+            raise TypeError(
+                "encoder and backbone must be given together (or both omitted "
+                "for a heads-only delayed copy)."
+            )
+        if reasoner is not None and backbone is None:
+            raise TypeError("reasoner requires backbone.")
+        if recurrence is not None and backbone is None:
+            raise TypeError("recurrence requires backbone.")
+        if reasoner is not None and recurrence is not None:
+            raise ValueError("reasoner and recurrence cannot be combined on one model.")
 
-        # Consistency check between encoder and backbone hidden sizes when available.
-        enc_dim = getattr(encoder, "hidden_dim", None)
-        bb_dim = getattr(backbone, "hidden_dim", None)
+        enc_dim = getattr(encoder, "hidden_dim", None) if encoder is not None else None
+        bb_dim = getattr(backbone, "hidden_dim", None) if backbone is not None else None
         if enc_dim is not None and bb_dim is not None and enc_dim != bb_dim:
             raise ValueError(
                 f"hidden_dim mismatch between encoder ({enc_dim}) and backbone ({bb_dim}). "
                 "The embedder and the backbone must agree on the hidden dimension."
             )
 
-        self.encoder: Encoder = encoder
-        self.backbone: Backbone = backbone
+        self.encoder: Encoder | None = encoder
+        self.backbone: Backbone | None = backbone
 
         if reasoner is not None:
             if not isinstance(reasoner, LatentReasoner):
                 raise TypeError(
                     f"reasoner must be a LatentReasoner, got {type(reasoner).__name__}."
                 )
-            if enc_dim is not None and reasoner.hidden_dim != enc_dim:
+            dim = enc_dim if enc_dim is not None else bb_dim
+            if dim is not None and reasoner.hidden_dim != dim:
                 raise ValueError(
                     f"hidden_dim mismatch between reasoner ({reasoner.hidden_dim}) "
-                    f"and encoder ({enc_dim})."
+                    f"and model ({dim})."
                 )
         self.reasoner: LatentReasoner | None = reasoner
+
+        if recurrence is not None:
+            if not isinstance(recurrence, Recurrence):
+                raise TypeError(
+                    f"recurrence must be a Recurrence, got {type(recurrence).__name__}."
+                )
+            if bb_dim is not None and recurrence.hidden_dim != bb_dim:
+                raise ValueError(
+                    f"hidden_dim mismatch between recurrence ({recurrence.hidden_dim}) "
+                    f"and backbone ({bb_dim})."
+                )
+        self.recurrence: Recurrence | None = recurrence
 
         if heads is None:
             raise TypeError("Model requires heads (a BaseHead, list of heads, or dict of named heads).")
@@ -928,20 +1035,33 @@ class Model(nn.Module):
             layerwise_head = self._heads["action_value_layerwise"]
             if not isinstance(layerwise_head, LayerwiseDiscreteActionValueHead):
                 raise TypeError("action_value_layerwise head has unexpected type.")
-            bb_layers = _backbone_num_layers(self.backbone)
-            if bb_layers is None:
-                raise ValueError(
-                    "action_value_layerwise requires a backbone with a known layer count "
-                    "(e.g. Qwen3Backbone or LlamaBackbone)."
-                )
-            if layerwise_head.num_backbone_layers != bb_layers:
-                raise ValueError(
-                    f"Layerwise head expects {layerwise_head.num_backbone_layers} backbone layers "
-                    f"but backbone has {bb_layers}."
-                )
+            if self.backbone is not None:
+                bb_layers = _backbone_num_layers(self.backbone)
+                if bb_layers is None:
+                    raise ValueError(
+                        "action_value_layerwise requires a backbone with a known layer count "
+                        "(e.g. Qwen3Backbone or LlamaBackbone)."
+                    )
+                if layerwise_head.num_backbone_layers != bb_layers:
+                    raise ValueError(
+                        f"Layerwise head expects {layerwise_head.num_backbone_layers} backbone layers "
+                        f"but backbone has {bb_layers}."
+                    )
 
-        # Convenience: expose hidden_dim and max_num_actions from encoder/heads
-        self.hidden_dim = int(encoder.hidden_dim)
+        if encoder is not None:
+            self.hidden_dim = int(encoder.hidden_dim)
+        elif bb_dim is not None:
+            self.hidden_dim = int(bb_dim)
+        else:
+            in_features = next(
+                (getattr(h, "in_features", None) for h in self._heads.values()),
+                None,
+            )
+            if not isinstance(in_features, int) or in_features < 1:
+                raise ValueError(
+                    "Cannot infer hidden_dim without encoder, backbone, or a head with in_features."
+                )
+            self.hidden_dim = int(in_features)
         # Best-effort inference of action cardinality for introspection only.
         self.max_num_actions: int = 0
         for _name, h in self.heads.items():
@@ -949,6 +1069,32 @@ class Model(nn.Module):
             if isinstance(out, int) and out > 0:
                 self.max_num_actions = out
                 break
+
+    def delayed_copy(self) -> "Model":
+        """Deep-copy the heads into a frozen heads-only model.
+
+        The copy has ``requires_grad=False``, runs in ``train()``, and is
+        called as ``delayed(last_hidden_state=out.last_hidden_state,
+        head_output_indices=out.head_output_indices, hidden_states=
+        out.hidden_states)`` — the delayed heads read the online token
+        states, so encoder, backbone, reasoning latents, and recurrent
+        passes are shared with the online forward. Construct after
+        ``model.to(...)``. Interpolate toward this model with
+        :class:`~mouse_core.polyak.Polyak`.
+        """
+        if self.backbone is None:
+            raise ValueError("delayed_copy is for the online model, not a delayed copy.")
+
+        def _copy(module: nn.Module) -> nn.Module:
+            delayed = copy.deepcopy(module)
+            delayed.requires_grad_(False)
+            delayed.train()
+            return delayed
+
+        return Model(
+            heads={name: cast(BaseHead, _copy(head)) for name, head in self._heads.items()},
+            action_head=self.action_head,
+        )
 
     def to(self, *args: Any, **kwargs: Any) -> "Model":
         """Move/cast the model; output heads always stay float32.
@@ -971,10 +1117,14 @@ class Model(nn.Module):
             common["device"] = device
         if memory_format is not None:
             common["memory_format"] = memory_format
-        self.encoder.to(dtype=dtype, **common)
-        self.backbone.to(dtype=dtype, **common)
+        if self.encoder is not None:
+            self.encoder.to(dtype=dtype, **common)
+        if self.backbone is not None:
+            self.backbone.to(dtype=dtype, **common)
         if self.reasoner is not None:
             self.reasoner.to(dtype=dtype, **common)
+        if self.recurrence is not None:
+            self.recurrence.to(dtype=dtype, **common)
         self.heads.to(dtype=torch.float32, **common)
         return self
 
@@ -1040,7 +1190,6 @@ class Model(nn.Module):
 
     def _pool_backbone_out(
         self,
-        encoder: Encoder,
         session_out: torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, ...]],
         head_output_indices: torch.Tensor,
         needs_layerwise: bool,
@@ -1052,13 +1201,13 @@ class Model(nn.Module):
             )
             return torch.stack(
                 [
-                    encoder.pool_step_reprs(layer_h, head_output_indices)
+                    _pool_head_outputs(layer_h, head_output_indices)
                     for layer_h in layer_hiddens
                 ],
                 dim=1,
             )
         h = cast(torch.Tensor, session_out)
-        return encoder.pool_step_reprs(h, head_output_indices)
+        return _pool_head_outputs(h, head_output_indices)
 
     def _generate_latents(
         self,
@@ -1081,6 +1230,7 @@ class Model(nn.Module):
         """
         reasoner = self.reasoner
         assert reasoner is not None
+        assert self.backbone is not None
         R = plan.num_thoughts
         device = embeds.device
         nb = int(plan.burst_rows.size)
@@ -1149,20 +1299,40 @@ class Model(nn.Module):
 
     def forward(
         self,
-        batch: TokenBatch,
-        cache: dict[str, Any] | AveragerInputs | None = None,
+        batch: TokenBatch | None = None,
+        *,
+        last_hidden_state: torch.Tensor | None = None,
+        hidden_states: tuple[torch.Tensor, ...] | None = None,
+        head_output_indices: torch.Tensor | None = None,
+        cache: DecodeCache | None = None,
         use_cache: bool = False,
         reasoning: Sequence[int] | np.ndarray | None = None,
-    ) -> tuple[TensorDict, AveragerInputs]:
-        """Run a full forward pass over a :class:`TokenBatch`.
+    ) -> ModelOutput:
+        """Run a forward pass over a :class:`TokenBatch`, or run heads on given states.
 
         Training: ``inputs, objective_data = loader.next_batch()`` then
-        ``predictions, averager_inputs = model(inputs)``. Delayed DQN
-        targets are ``averager(averager_inputs)``. Online / inference:
-        ``inputs, _ = pack_token_batch([eval_transform(step)],
+        ``out = model(inputs)``. Delayed DQN is a heads-only copy:
+        ``delayed_model = model.delayed_copy()`` then
+        ``delayed_model(last_hidden_state=out.last_hidden_state,
+        head_output_indices=out.head_output_indices,
+        hidden_states=out.hidden_states)``. Interpolate with
+        ``Polyak(model, delayed_model)`` and ``polyak.update(tau)``.
+        Online / inference: ``inputs, _ = pack_token_batch([eval_transform(step)],
         sequence_ids=[0])`` then ``model(inputs, use_cache=True)``
-        (optionally ragged; empty-only batches raise). Pass the returned
-        :class:`AveragerInputs` (or its ``.cache``) back as ``cache=``.
+        (optionally ragged; empty-only batches raise). Pass ``out.cache``
+        back as ``cache=``.
+
+        ``last_hidden_state=`` (heads-only delayed copy) skips encoder and
+        backbone and runs the heads after pooling with
+        ``head_output_indices``; ``hidden_states=`` supplies the per-layer
+        states a layerwise head needs. ``head_output_indices=`` and
+        ``hidden_states=`` are only accepted with ``last_hidden_state=``.
+
+        A model with a :class:`~mouse_core.models.recurrence.Recurrence`
+        section runs the backbone ``num_passes`` times (pass ``k`` reads
+        ``recurrence(encodings, pass_{k-1}.last_hidden_state)``), with and
+        without cache. ``predictions`` / ``last_hidden_state`` are the final
+        pass; ``passes`` has every pass.
 
         ``reasoning`` (training only, requires ``Model(reasoner=...)``) is a
         ``[B]`` array of local step indices from
@@ -1173,13 +1343,14 @@ class Model(nn.Module):
         backbone output at the previous position — and inserts them
         immediately before that step's first head-output token, so the Q
         readout and all later same-run tokens attend to them. Predictions
-        keep the flat ``[P, ...]`` contract; the returned
-        :class:`AveragerInputs` describes the extended stream.
+        keep the flat ``[P, ...]`` contract; ``last_hidden_state`` /
+        ``head_output_indices`` describe the extended stream, so the
+        heads-only delayed copy reads the same thoughts.
 
         Training attention uses FlexAttention over the flat concatenated token
         stream (causal within the same ``(sequence_id, grouping_id)`` run). Cached
-        decode keeps ``FlexDecodeSession`` with per-sequence KV caches and the
-        same grouping-id isolation.
+        decode keeps one ``FlexDecodeSession`` per backbone pass with per-sequence
+        KV caches and the same grouping-id isolation.
 
         Training predictions are flat over head-output tokens (``[P, ...]``,
         one row per head-output token; ``objective_data["head_output_count"]``
@@ -1188,16 +1359,39 @@ class Model(nn.Module):
         """
         from mouse_core.data.token_batch import TokenBatch as _TokenBatch
 
+        if last_hidden_state is not None:
+            if batch is not None:
+                raise ValueError("Pass batch= or last_hidden_state=, not both.")
+            if use_cache or cache is not None:
+                raise ValueError("last_hidden_state= is not supported with use_cache=True.")
+            if reasoning is not None:
+                raise ValueError("last_hidden_state= is not supported with reasoning=.")
+            if head_output_indices is None:
+                raise ValueError("last_hidden_state= requires head_output_indices=.")
+            return self._forward_from_hidden(
+                last_hidden_state,
+                hidden_states=hidden_states,
+                head_output_indices=head_output_indices,
+            )
+        if head_output_indices is not None:
+            raise ValueError("head_output_indices= is only accepted with last_hidden_state=.")
+        if hidden_states is not None:
+            raise ValueError("hidden_states= is only accepted with last_hidden_state=.")
+        if cache is not None and not use_cache:
+            raise ValueError("Passing cache= requires use_cache=True.")
+        if batch is None:
+            raise TypeError("Model.forward requires a TokenBatch (or last_hidden_state=).")
         if not isinstance(batch, _TokenBatch):
             raise TypeError(
                 f"Model.forward expects a TokenBatch, got {type(batch).__name__}. "
                 "Use pack_token_batch([transform(step)], ...) "
                 "or DataLoader(transform=...)."
             )
-        if isinstance(cache, AveragerInputs):
-            cache = cache.cache
-        if cache is not None and not use_cache:
-            raise ValueError("Passing cache= requires use_cache=True.")
+        if self.encoder is None or self.backbone is None:
+            raise ValueError(
+                "this is a heads-only delayed copy; pass last_hidden_state= "
+                "and head_output_indices= from the online ModelOutput."
+            )
 
         token_batch = batch
         B = token_batch.B
@@ -1223,16 +1417,16 @@ class Model(nn.Module):
                 self.reasoner.num_thoughts,
             )
 
-        embeds, head_output_indices = self.encoder(token_batch)
-        # embeds: [L, D]; head_output_indices: [P]
-
+        embeds, resolved_indices = self.encoder(token_batch)
+        # embeds: [L, D]; resolved_indices: [P]
         t = token_batch.to_tensors(embeds.device)
         sequence_ids = t["sequence_ids"]
         grouping_ids = t["grouping_ids"]
 
         needs_layerwise = "action_value_layerwise" in self._heads
-        new_cache: dict[str, Any] | None
-        token_indices: torch.Tensor | None = None
+        num_passes = self.recurrence.num_passes if self.recurrence is not None else 1
+        new_cache: DecodeCache | None
+        pass_outs: list[torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, ...]]] = []
 
         if use_cache:
             from mouse_core.models.embedding.packing import left_align_content
@@ -1248,17 +1442,27 @@ class Model(nn.Module):
                 _flat_to_batched_left_pad(
                     embeds,
                     sequence_ids,
-                    head_output_indices[last_of_step],
+                    resolved_indices[last_of_step],
                     B,
                     S_max,
                     step_counts_np.tolist(),
                     grouping_ids=grouping_ids,
                 )
             )
-            session = cache["session"] if cache else self.backbone.decode_session(
-                batch_size=B, capacity=max(batched_embeds.shape[1], 1)
-            )
-            flex_embeds, head_output_indices = left_align_content(
+            if cache is not None:
+                if len(cache.sessions) != num_passes:
+                    raise ValueError(
+                        f"cache has {len(cache.sessions)} sessions but this model "
+                        f"runs {num_passes} backbone passes."
+                    )
+                sessions = cache.sessions
+            else:
+                capacity = max(batched_embeds.shape[1], 1)
+                sessions = tuple(
+                    self.backbone.decode_session(batch_size=B, capacity=capacity)
+                    for _ in range(num_passes)
+                )
+            flex_embeds, resolved_indices = left_align_content(
                 batched_embeds, local_indices
             )
             # Left-align mask ids to the same trailing-column layout as embeds.
@@ -1270,13 +1474,18 @@ class Model(nn.Module):
                 flex_grouping_ids[b, Lmax - rl :] = batched_grouping_ids[b, :rl]
             # ``token_lengths`` already counts only real tokens (tokenize is ragged;
             # empty rows contribute 0). Do not re-derive from left-padded step indices.
-            session_out = session.forward(
-                output_hidden_states=needs_layerwise,
-                embeds=flex_embeds,
-                lengths=token_lengths,
-                grouping_ids=flex_grouping_ids,
-            )
-            new_cache = {"session": session}
+            pass_input = flex_embeds
+            for session in sessions:
+                session_out = session.forward(
+                    output_hidden_states=needs_layerwise,
+                    embeds=pass_input,
+                    lengths=token_lengths,
+                    grouping_ids=flex_grouping_ids,
+                )
+                pass_outs.append(session_out)
+                if self.recurrence is not None:
+                    pass_input = self.recurrence(flex_embeds, _last_hidden(session_out))
+            new_cache = DecodeCache(sessions=tuple(sessions))
             pred_batch_size: tuple[int, ...] = (B, S_max)
         else:
             if plan is not None:
@@ -1285,8 +1494,8 @@ class Model(nn.Module):
                     embeds,
                     sequence_ids,
                     grouping_ids,
-                    head_output_indices,
-                    token_indices,
+                    resolved_indices,
+                    _,
                 ) = self._generate_latents(
                     embeds=embeds,
                     sequence_ids=sequence_ids,
@@ -1294,39 +1503,88 @@ class Model(nn.Module):
                     plan=plan,
                 )
             # Training: Flex packed on CUDA; SDPA mask fallback on CPU (no Flex backward).
-            session_out = self._train_backbone_forward(
-                self.backbone,
-                embeds,
-                sequence_ids,
-                grouping_ids,
-                needs_layerwise,
-            )
+            pass_input = embeds
+            for _ in range(num_passes):
+                session_out = self._train_backbone_forward(
+                    self.backbone,
+                    pass_input,
+                    sequence_ids,
+                    grouping_ids,
+                    needs_layerwise,
+                )
+                pass_outs.append(session_out)
+                if self.recurrence is not None:
+                    pass_input = self.recurrence(embeds, _last_hidden(session_out))
             new_cache = None
             pred_batch_size = (token_batch.P,)
 
-        h = self._pool_backbone_out(
-            self.encoder, session_out, head_output_indices, needs_layerwise
-        )
-        predictions = self.head(h=h, batch_size=pred_batch_size)
-        if plan is not None:
-            return predictions, AveragerInputs(
-                h=h,
-                batch=token_batch,
-                cache=None,
-                embeds=embeds,
-                head_output_indices=head_output_indices,
-                predictions=predictions,
-                sequence_ids=sequence_ids,
-                grouping_ids=grouping_ids,
-                token_indices=token_indices,
+        passes = tuple(
+            PassOutput(
+                last_hidden_state=_last_hidden(session_out),
+                predictions=self.head(
+                    h=self._pool_backbone_out(session_out, resolved_indices, needs_layerwise),
+                    batch_size=pred_batch_size,
+                ),
+                hidden_states=_layer_hiddens(session_out) if needs_layerwise else None,
             )
-        return predictions, AveragerInputs(
-            h=h,
-            batch=token_batch,
+            for session_out in pass_outs
+        )
+        final = passes[-1]
+        return ModelOutput(
+            predictions=final.predictions,
+            last_hidden_state=final.last_hidden_state,
+            passes=passes,
+            head_output_indices=resolved_indices,
+            hidden_states=final.hidden_states,
             cache=new_cache,
-            embeds=embeds,
-            head_output_indices=head_output_indices,
+        )
+
+    def _forward_from_hidden(
+        self,
+        last_hidden_state: torch.Tensor,
+        *,
+        hidden_states: tuple[torch.Tensor, ...] | None,
+        head_output_indices: torch.Tensor,
+    ) -> ModelOutput:
+        if last_hidden_state.ndim not in (2, 3):
+            raise ValueError(
+                "last_hidden_state must have shape [L, D] or [B, S, D], "
+                f"got {tuple(last_hidden_state.shape)}."
+            )
+        if last_hidden_state.shape[-1] != self.hidden_dim:
+            raise ValueError(
+                f"last_hidden_state last dim must be hidden_dim={self.hidden_dim}, "
+                f"got {int(last_hidden_state.shape[-1])}."
+            )
+        needs_layerwise = "action_value_layerwise" in self._heads
+        if needs_layerwise:
+            if hidden_states is None:
+                raise ValueError(
+                    "layerwise heads require hidden_states= from the online ModelOutput."
+                )
+            h = torch.stack(
+                [
+                    _pool_head_outputs(layer_h, head_output_indices)
+                    for layer_h in hidden_states
+                ],
+                dim=1,
+            )
+        else:
+            h = _pool_head_outputs(last_hidden_state, head_output_indices)
+        predictions = self.head(h=h)
+        return ModelOutput(
             predictions=predictions,
+            last_hidden_state=last_hidden_state,
+            passes=(
+                PassOutput(
+                    last_hidden_state=last_hidden_state,
+                    predictions=predictions,
+                    hidden_states=hidden_states,
+                ),
+            ),
+            head_output_indices=head_output_indices,
+            hidden_states=hidden_states,
+            cache=None,
         )
 
     def head(

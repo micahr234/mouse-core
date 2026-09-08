@@ -14,7 +14,6 @@ from mouse_core.models.embedding import NumericEmbedder
 from mouse_core.models.heads import DiscreteActionValueHead
 from mouse_core.models.reasoner import _plan_insertions
 from mouse_core.objectives import DqnObjective
-from mouse_core.polyak import PolyakAverager
 from tests._token_batch_helpers import batch_to_packed, tok_from_encoder
 
 _HIDDEN = 32
@@ -22,11 +21,11 @@ _ACTIONS = 4
 
 # Two learnable head-output tokens per step: every step yields two Q rows.
 _MODALITIES = [
-    {"type": "discrete", "field": "action", "vocab_size": _ACTIONS},
-    {"type": "discrete", "field": "observation", "vocab_size": 16},
-    {"type": "fourier", "field": "reward"},
-    {"type": "discrete", "field": "episode_done", "vocab_size": 3},
-    {"type": "learnable", "field": "value", "tokens": 2},
+    {"type": "discrete", "field": "action", "vocab_size": _ACTIONS, "std": 0.02, "positions": 1},
+    {"type": "discrete", "field": "observation", "vocab_size": 16, "std": 0.02, "positions": 1},
+    {"type": "fourier", "field": "reward", "std": 0.02, "positions": 1},
+    {"type": "discrete", "field": "episode_done", "vocab_size": 3, "std": 0.02, "positions": 1},
+    {"type": "learnable", "field": "value", "tokens": 2, "std": 0.02, "positions": 2},
 ]
 _TOKENS_PER_STEP = 6
 
@@ -149,11 +148,11 @@ def test_forward_yields_one_row_per_head_output_token() -> None:
     model = _tiny_model().eval()
     batch, _ = _packed(model)
     with torch.no_grad():
-        predictions, averager_inputs = model(batch)
-    assert predictions["action_value"].shape == (batch.P, _ACTIONS)
-    assert averager_inputs.head_output_indices is not None
-    assert averager_inputs.head_output_indices.shape == (batch.P,)
-    action = model.get_action(predictions, temperature=0.0)
+        out = model(batch)
+    assert out.predictions["action_value"].shape == (batch.P, _ACTIONS)
+    assert out.head_output_indices is not None
+    assert out.head_output_indices.shape == (batch.P,)
+    action = model.get_action(out.predictions, temperature=0.0)
     assert action.shape == (1,)
 
 
@@ -162,8 +161,8 @@ def test_decode_pools_last_head_output_token_per_step() -> None:
     model = _tiny_model().eval()
     batch, _ = _packed(model)
     with torch.no_grad():
-        flat, _ = model(batch)
-        rect, _ = model(batch, use_cache=True)
+        flat = model(batch).predictions
+        rect = model(batch, use_cache=True).predictions
     q_flat = flat["action_value"]  # [P, A]
     q_rect = rect["action_value"]  # [B, S, A], steps left-padded
     psteps = batch.head_output_steps
@@ -274,19 +273,18 @@ def test_plan_anchors_on_first_head_output_token() -> None:
     assert plan.ext_head_output_indices.tolist() == shifted
 
 
-def test_reasoning_forward_and_averager_parity_multi_head_output() -> None:
+def test_reasoning_forward_and_delayed_parity_multi_head_output() -> None:
     torch.manual_seed(0)
     model = _tiny_model(with_reasoner=True).eval()
     batch, _ = _packed(model)
-    averager = PolyakAverager(
-        model, tau_encoder=0.5, tau_backbone=1.0, tau_head=1.0
-    )
+    delayed = model.delayed_copy()
     with torch.no_grad():
-        predictions, averager_inputs = model(batch, reasoning=[1, 0])
-        delayed = averager(averager_inputs)
-    assert predictions["action_value"].shape == (batch.P, _ACTIONS)
-    # At construction the delayed encoder equals the online one, so the
-    # delayed Q over the extended stream matches the online predictions.
+        out = model(batch, reasoning=[1, 0])
+        delayed_out = delayed(
+            last_hidden_state=out.last_hidden_state,
+            head_output_indices=out.head_output_indices,
+        )
+    assert out.predictions["action_value"].shape == (batch.P, _ACTIONS)
     assert torch.allclose(
-        predictions["action_value"], delayed["action_value"], atol=1e-4
+        out.predictions["action_value"], delayed_out.predictions["action_value"], atol=1e-4
     )

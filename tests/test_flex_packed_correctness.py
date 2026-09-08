@@ -107,7 +107,7 @@ def test_flex_packed_bf16_matches_fp32_sdpa_within_bf16_noise(L: int) -> None:
     assert flex_err <= 2.0 * bf16_floor + 1e-3, f'flex err {flex_err} vs bf16 SDPA floor {bf16_floor}'
 
 def test_prepare_sequence_id_col_matches_step_counts() -> None:
-    encoder = NumericEmbedder(hidden_dim=8, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4}, {"type": 'fourier', "field": "reward"}, {'type': 'learnable', 'tokens': 1}])
+    encoder = NumericEmbedder(hidden_dim=8, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}, {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1}, {'type': 'learnable', 'tokens': 1, "std": 0.02, "positions": 1}])
     batch = [[{'action': s % 4, 'reward': float(s)} for s in range(5)], [{'action': 1, 'reward': 0.0}, {'action': 2, 'reward': 1.0}, {'action': 3, 'reward': 2.0}]]
     tb, objective_data = batch_to_packed(_tok(encoder), batch)
     assert list(tb.step_counts()) == [5, 3]
@@ -168,16 +168,16 @@ def test_model_flex_forward_stable_under_sequence_isolation() -> None:
     torch.manual_seed(2)
     device = torch.device('cuda')
     backbone = Qwen3Backbone(hidden_dim=64, num_layers=2, num_heads=4, num_key_value_heads=4)
-    encoder = NumericEmbedder(hidden_dim=backbone.hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4}, {'type': 'learnable', 'tokens': 1}])
+    encoder = NumericEmbedder(hidden_dim=backbone.hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}, {'type': 'learnable', 'tokens': 1, "std": 0.02, "positions": 1}])
     head = DiscreteActionValueHead(in_features=backbone.hidden_dim, out_features=4, hidden_dim=backbone.hidden_dim, num_layers=1)
     model = Model(encoder=encoder, backbone=backbone, heads=head).to(device=device, dtype=torch.float32).eval()
     batch = [[{'action': i % 4} for i in range(3)], [{'action': i % 4} for i in range(3)]]
     tb = batch_to_token_batch(_tok(encoder), batch)
     with torch.no_grad():
-        preds0, _ = model(tb)
+        preds0 = model(tb).predictions
         batch_corrupt = [[{'action': 3} for _ in range(3)], [{'action': i % 4} for i in range(3)]]
         tb_c = batch_to_token_batch(_tok(encoder), batch_corrupt)
-        preds1, _ = model(tb_c)
+        preds1 = model(tb_c).predictions
     q0 = preds0['action_value']
     q1 = preds1['action_value']
     assert torch.allclose(q0[3:], q1[3:], atol=1e-05, rtol=1e-05)
@@ -192,9 +192,9 @@ def test_model_train_isolates_tasks_within_sequence() -> None:
     encoder = NumericEmbedder(
         hidden_dim=backbone.hidden_dim,
         modalities=[
-            {"type": 'discrete', "field": "action", "vocab_size": 4},
-            {"type": 'discrete', "field": "episode_done", "vocab_size": 3},
-            {'type': 'learnable', 'tokens': 1},
+            {"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1},
+            {"type": 'discrete', "field": "episode_done", "vocab_size": 3, "std": 0.02, "positions": 1},
+            {'type': 'learnable', 'tokens': 1, "std": 0.02, "positions": 1},
         ],
     )
     head = DiscreteActionValueHead(
@@ -224,8 +224,8 @@ def test_model_train_isolates_tasks_within_sequence() -> None:
             [task1],
             grouping_field="task_index",
         )
-        preds_both, _ = model(tb_both)
-        preds_t1, _ = model(tb_t1)
+        preds_both = model(tb_both).predictions
+        preds_t1 = model(tb_t1).predictions
     assert od['task_index'].tolist() == [0, 0, 0, 1, 1]
     # Current-task suffix predictions match a fresh single-task forward.
     assert torch.allclose(

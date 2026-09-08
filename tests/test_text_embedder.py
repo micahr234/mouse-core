@@ -81,6 +81,16 @@ def _text_pair(hidden_dim: int = 8, **kwargs):
     return tokenizer, enc
 
 
+def test_text_tokenizer_positions_count_per_modality_within_step() -> None:
+    tokenizer, _ = _text_pair()
+    st = tokenizer(
+        {"observation": 1, "action": 0, "reward": 0.5, "episode_done": 0, "task_done": 0, "grouping_id": 0}
+    )
+    # A text step is a single modality (``__text__``) emitted in several
+    # runs; positions keep counting across the runs, 0..T-1.
+    assert st.positions.tolist() == list(range(st.T))
+
+
 def test_text_embedder_skip_omits_value_keeps_commas() -> None:
     tokenizer, enc = _text_pair()
     batch = [
@@ -267,13 +277,13 @@ def test_text_embedder_save_load(tmp_path) -> None:
     )
     batch = [[{"action": 1}, {"action": 3}]]
     model.eval()
-    expected, _ = model(batch_to_token_batch(tokenizer, batch))
+    expected = model(batch_to_token_batch(tokenizer, batch)).predictions
     save_model(model, tmp_path)
     loaded = load_model(tmp_path).eval()
     assert isinstance(loaded.encoder, TextEmbedder)
     assert loaded.encoder.vocab_size == 32
     assert torch.equal(loaded.encoder.embed_tokens.weight, emb.weight)
-    actual, _ = loaded(batch_to_token_batch(tokenizer, batch))
+    actual = loaded(batch_to_token_batch(tokenizer, batch)).predictions
     assert torch.allclose(actual["action_value"], expected["action_value"])
 
 

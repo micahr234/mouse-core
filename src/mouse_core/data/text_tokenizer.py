@@ -251,15 +251,23 @@ def _tokenize_text_step(
     modality_ids: list[int] = []
     ids: list[int] = []
     values: list[float] = []
+    positions: list[int] = []
     head_output_mask: list[bool] = []
+    # Running per-modality token count within this step, so ``positions``
+    # keeps counting across separately emitted runs of the same modality.
+    next_position: dict[int, int] = {}
 
     def _emit(token_ids: list[int], *, name: str, head_output: bool = False) -> None:
         mid = name_to_index[name]
+        pos = next_position.get(mid, 0)
         for tid in token_ids:
             modality_ids.append(mid)
             ids.append(tid)
             values.append(0.0)
+            positions.append(pos)
+            pos += 1
             head_output_mask.append(head_output)
+        next_position[mid] = pos
 
     if format_str is not None:
         text_buf: list[str] = []
@@ -354,6 +362,7 @@ def _tokenize_text_step(
         modality_ids=np.asarray(modality_ids, dtype=np.int64),
         ids=np.asarray(ids, dtype=np.int64),
         values=np.asarray(values, dtype=np.float32),
+        positions=np.asarray(positions, dtype=np.int64),
         modality_names=modality_names,
         modality_map=dict(modality_map),
         grouping_id=gid,

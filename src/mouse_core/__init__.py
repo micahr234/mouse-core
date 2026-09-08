@@ -4,7 +4,7 @@ from mouse_core.models import Model, load_model
 from mouse_core.models.heads import BaseHead
 from mouse_core.objectives import Objective
 from mouse_core.optim import AdamW, AdamWFp32
-from mouse_core.polyak import PolyakAverager
+from mouse_core.polyak import Polyak
 
 __version__ = version("mouse-core")
 
@@ -16,5 +16,5 @@ __all__ = [
     "Objective",
     "AdamW",
     "AdamWFp32",
-    "PolyakAverager",
+    "Polyak",
 ]

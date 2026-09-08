@@ -7,23 +7,22 @@ import pytest
 import torch
 import torch.nn as nn
 
-from mouse_core.models import AveragerInputs, Model
-from mouse_core.models.backbone import IdentityBackbone
+from mouse_core.models import Model, ModelOutput
+from mouse_core.models.backbone import IdentityBackbone, LlamaBackbone
 from mouse_core.models.embedding import NumericEmbedder
 from mouse_core.models.heads import (
-    DiscreteActionHead,
     DiscreteActionValueHead,
     LayerwiseDiscreteActionValueHead,
 )
-from mouse_core.polyak import PolyakAverager
+from mouse_core.polyak import Polyak, _PolyakState
 from tests._token_batch_helpers import batch_to_token_batch, tok_from_encoder
 
 _tok = tok_from_encoder
 
 _MODALITIES = [
-    {"type": "discrete", "field": "action", "vocab_size": 4},
-    {"type": "fourier", "field": "reward"},
-    {"type": "discrete", "field": "episode_done", "vocab_size": 3},
+    {"type": "discrete", "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1},
+    {"type": "fourier", "field": "reward", "std": 0.02, "positions": 1},
+    {"type": "discrete", "field": "episode_done", "vocab_size": 3, "std": 0.02, "positions": 1},
 ]
 _BATCH = [
     [
@@ -34,33 +33,10 @@ _BATCH = [
 ]
 
 
-class _ScaleBackbone(IdentityBackbone):
-    """Identity plus a learned scale, so backbone delay is observable."""
-
-    def __init__(self, hidden_dim: int) -> None:
-        super().__init__(hidden_dim=hidden_dim)
-        self.scale = nn.Parameter(torch.ones(hidden_dim))
-
-    def forward(
-        self,
-        embeds: torch.Tensor,
-        output_hidden_states: bool = False,
-        **kwargs: Any,
-    ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
-        out = embeds * self.scale
-        if output_hidden_states:
-            return out, (out,)
-        return out
-
-
-def _tiny_model(*, scaled_backbone: bool = False) -> Model:
+def _tiny_model() -> Model:
     hidden_dim = 8
     encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=_MODALITIES)
-    backbone: IdentityBackbone
-    if scaled_backbone:
-        backbone = _ScaleBackbone(hidden_dim=hidden_dim)
-    else:
-        backbone = IdentityBackbone(hidden_dim=hidden_dim)
+    backbone = IdentityBackbone(hidden_dim=hidden_dim)
     heads = DiscreteActionValueHead(
         in_features=hidden_dim,
         out_features=4,
@@ -70,7 +46,24 @@ def _tiny_model(*, scaled_backbone: bool = False) -> Model:
     return Model(encoder=encoder, backbone=backbone, heads=heads)
 
 
+def _layerwise_model() -> Model:
+    hidden_dim = 16
+    encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=_MODALITIES)
+    backbone = LlamaBackbone(
+        hidden_dim=hidden_dim, num_layers=2, num_heads=2, max_position_embeddings=64
+    )
+    head = LayerwiseDiscreteActionValueHead(
+        num_backbone_layers=2,
+        in_features=hidden_dim,
+        out_features=4,
+        hidden_dim=hidden_dim,
+        num_layers=1,
+    )
+    return Model(encoder=encoder, backbone=backbone, heads=head)
+
+
 def _token_batch(model: Model):
+    assert model.encoder is not None
     return batch_to_token_batch(_tok(model.encoder), _BATCH)
 
 
@@ -80,10 +73,12 @@ def _perturb(module: nn.Module) -> None:
             param.add_(1.0)
 
 
-def _q_and_target(model: Model, averager: PolyakAverager):
-    batch = _token_batch(model)
-    predictions, averager_inputs = model(batch)
-    return predictions, averager(averager_inputs)
+def _delayed_heads(delayed: Model, out: ModelOutput) -> ModelOutput:
+    return delayed(
+        last_hidden_state=out.last_hidden_state,
+        head_output_indices=out.head_output_indices,
+        hidden_states=out.hidden_states,
+    )
 
 
 def _count_calls(module: nn.Module, name: str = "forward"):
@@ -98,315 +93,194 @@ def _count_calls(module: nn.Module, name: str = "forward"):
     return calls
 
 
-def test_head_delay_target_uses_current_features() -> None:
-    torch.manual_seed(0)
-    model = _tiny_model().eval()
-    averager = PolyakAverager(model, tau_head=0.01)
-    before_pred, before_delayed = _q_and_target(model, averager)
-    _perturb(model.encoder)
-    after_pred, after_delayed = _q_and_target(model, averager)
-    assert not torch.allclose(after_delayed["action_value"], before_delayed["action_value"])
-    assert torch.allclose(after_pred["action_value"], after_delayed["action_value"])
-
-
-def test_encoder_delay_recomputes_delayed_representation() -> None:
-    torch.manual_seed(0)
-    model = _tiny_model().eval()
-    averager = PolyakAverager(
-        model, tau_encoder=0.0, tau_backbone=0.0, tau_head=0.0
+def test_delayed_copy_is_heads_only_and_frozen() -> None:
+    model = _tiny_model()
+    delayed = model.delayed_copy()
+    assert delayed.encoder is None and delayed.backbone is None
+    assert delayed.reasoner is None and delayed.recurrence is None
+    assert delayed.training
+    assert all(not p.requires_grad for p in delayed.parameters())
+    assert set(dict(delayed.heads.named_parameters())) == set(
+        dict(model.heads.named_parameters())
     )
-    assert averager.encoder is not None
-    for online_p, delayed_p in zip(
-        model.encoder.parameters(), averager.encoder.parameters(), strict=True
-    ):
-        assert torch.equal(online_p, delayed_p)
-    before_pred, before_delayed = _q_and_target(model, averager)
-    assert torch.allclose(before_pred["action_value"], before_delayed["action_value"])
+    with pytest.raises(ValueError, match="online model"):
+        delayed.delayed_copy()
+
+
+def test_delayed_heads_read_current_online_features() -> None:
+    """Only the heads are delayed: encoder/backbone changes reach the target."""
+    torch.manual_seed(0)
+    model = _tiny_model().eval()
+    delayed = model.delayed_copy()
+    batch = _token_batch(model)
+    before = model(batch)
+    with torch.no_grad():
+        before_delayed = _delayed_heads(delayed, before)
+    assert model.encoder is not None
     _perturb(model.encoder)
-    after_pred, after_delayed = _q_and_target(model, averager)
-    assert not torch.allclose(after_pred["action_value"], before_pred["action_value"])
-    assert torch.allclose(after_delayed["action_value"], before_delayed["action_value"])
-    assert not torch.allclose(after_pred["action_value"], after_delayed["action_value"])
+    after = model(batch)
+    with torch.no_grad():
+        after_delayed = _delayed_heads(delayed, after)
+    assert not torch.allclose(
+        after_delayed.predictions["action_value"],
+        before_delayed.predictions["action_value"],
+    )
+    # Delayed heads still equal online heads (no update yet) on the same states.
+    assert torch.allclose(
+        after.predictions["action_value"], after_delayed.predictions["action_value"]
+    )
 
 
-def test_polyak_tau_is_convex_combination() -> None:
+def test_delayed_heads_lag_online_heads_until_update() -> None:
+    torch.manual_seed(0)
+    model = _tiny_model().eval()
+    delayed = model.delayed_copy()
+    polyak = Polyak(model, delayed)
+    batch = _token_batch(model)
+    _perturb(model.heads)
+    out = model(batch)
+    with torch.no_grad():
+        target = _delayed_heads(delayed, out)
+    assert not torch.allclose(out.predictions["action_value"], target.predictions["action_value"])
+    polyak.update(1.0)
+    with torch.no_grad():
+        target = _delayed_heads(delayed, out)
+    assert torch.allclose(out.predictions["action_value"], target.predictions["action_value"])
+
+
+def test_delayed_heads_do_not_rerun_encoder_or_backbone() -> None:
+    torch.manual_seed(0)
+    model = _tiny_model().eval()
+    delayed = model.delayed_copy()
+    batch = _token_batch(model)
+    out = model(batch)
+    assert model.encoder is not None and model.backbone is not None
+    enc_calls = _count_calls(model.encoder)
+    bb_calls = _count_calls(model.backbone)
+    with torch.no_grad():
+        _delayed_heads(delayed, out)
+    assert enc_calls["n"] == 0 and bb_calls["n"] == 0
+
+
+def test_layerwise_delayed_heads_use_hidden_states() -> None:
+    torch.manual_seed(0)
+    model = _layerwise_model().eval()
+    delayed = model.delayed_copy()
+    batch = _token_batch(model)
+    with torch.no_grad():
+        out = model(batch)
+        assert out.hidden_states is not None and len(out.hidden_states) == 2
+        target = _delayed_heads(delayed, out)
+    assert torch.allclose(
+        out.predictions["action_value_layerwise"],
+        target.predictions["action_value_layerwise"],
+        atol=1e-5,
+    )
+    with pytest.raises(ValueError, match="hidden_states"):
+        delayed(
+            last_hidden_state=out.last_hidden_state,
+            head_output_indices=out.head_output_indices,
+        )
+
+
+def test_polyak_tau_is_convex_combination_and_can_change() -> None:
     torch.manual_seed(0)
     model = _tiny_model()
-    averager = PolyakAverager(
-        model, tau_encoder=0.5, tau_backbone=0.5, tau_head=0.5
-    )
-    assert averager.encoder is not None
-    online = next(model.encoder.parameters())
-    delayed = next(averager.encoder.parameters())
+    delayed = model.delayed_copy()
+    polyak = Polyak(model, delayed)
+    online = next(model.heads.parameters())
+    delayed_p = next(delayed.heads.parameters())
     online.data.fill_(1.0)
-    delayed.data.fill_(0.0)
-    averager.update()
-    assert torch.allclose(delayed, torch.full_like(delayed, 0.5))
+    delayed_p.data.fill_(0.0)
+    polyak.update(0.5)
+    assert torch.allclose(delayed_p, torch.full_like(delayed_p, 0.5))
+    polyak.update(1.0)
+    assert torch.allclose(delayed_p, torch.ones_like(delayed_p))
 
 
-def test_polyak_taus_update_independently() -> None:
+def test_zero_tau_freezes_delayed_heads() -> None:
     torch.manual_seed(0)
-    model = _tiny_model(scaled_backbone=True)
-    averager = PolyakAverager(
-        model, tau_encoder=1.0, tau_backbone=0.5, tau_head=0.0
-    )
-    assert averager.encoder is None
-    assert averager.backbone is not None
-    assert averager.heads is not None
-    model.backbone.scale.data.fill_(1.0)
-    averager.backbone.scale.data.fill_(0.0)
-    online_head = next(model.heads.parameters())
-    delayed_head = next(averager.heads.parameters())
-    online_head.data.fill_(1.0)
-    delayed_head.data.fill_(0.0)
-    averager.update()
-    assert torch.allclose(averager.backbone.scale, torch.full_like(averager.backbone.scale, 0.5))
-    assert torch.allclose(delayed_head, torch.zeros_like(delayed_head))
+    model = _tiny_model()
+    delayed = model.delayed_copy()
+    polyak = Polyak(model, delayed)
+    snapshot = [p.detach().clone() for p in delayed.heads.parameters()]
+    _perturb(model.heads)
+    polyak.update(0.0)
+    for p, s in zip(delayed.heads.parameters(), snapshot, strict=True):
+        assert torch.equal(p, s)
 
 
-def test_polyak_small_tau_accumulates_in_bf16() -> None:
-    torch.manual_seed(0)
-    model = _tiny_model().to(dtype=torch.bfloat16)
-    online = next(model.encoder.parameters())
-    online.data.fill_(0.9)
+def test_polyak_rejects_tau_out_of_range() -> None:
+    model = _tiny_model()
+    polyak = Polyak(model, model.delayed_copy())
+    with pytest.raises(ValueError, match=r"\[0, 1\]"):
+        polyak.update(1.5)
+    with pytest.raises(ValueError, match=r"\[0, 1\]"):
+        polyak.update(-0.1)
+
+
+def test_polyak_small_tau_accumulates_in_fp32() -> None:
+    online = nn.Linear(8, 8, bias=False)
+    delayed = nn.Linear(8, 8, bias=False)
+    online.weight.data.fill_(1.0)
+    delayed.weight.data.fill_(0.9)
+    state = _PolyakState(online, delayed)
     tau = 0.0005
-    averager = PolyakAverager(model, tau_encoder=tau, tau_backbone=tau, tau_head=tau)
-    assert averager.encoder is not None
-    delayed = next(averager.encoder.parameters())
-    assert delayed.dtype == torch.bfloat16
-    online.data.fill_(1.0)
     steps = 2000
     for _ in range(steps):
-        averager.update()
-    # Direct bf16 lerp would stay at ~0.898 forever; fp32 accumulation converges.
+        state.update(tau)
     expected = 1.0 - 0.1 * (1.0 - tau) ** steps
-    assert torch.allclose(
-        delayed.float(), torch.full_like(delayed.float(), expected), atol=1e-2
+    assert torch.allclose(delayed.weight, torch.full_like(delayed.weight, expected), atol=1e-4)
+
+
+def test_polyak_rejects_non_fp32_heads() -> None:
+    online = nn.Linear(8, 8, bias=False)
+    delayed = nn.Linear(8, 8, bias=False).to(dtype=torch.bfloat16)
+    with pytest.raises(TypeError, match="float32"):
+        _PolyakState(online, delayed)
+
+
+def test_polyak_rejects_wrong_models() -> None:
+    model = _tiny_model()
+    delayed = model.delayed_copy()
+    with pytest.raises(TypeError):
+        Polyak(model, nn.Linear(2, 2))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="heads-only"):
+        Polyak(model, model)
+    with pytest.raises(ValueError, match="full model"):
+        Polyak(delayed, delayed)
+
+
+def test_polyak_rejects_mismatched_head_parameters() -> None:
+    model = _tiny_model()
+    other = Model(
+        heads=DiscreteActionValueHead(in_features=8, out_features=4, hidden_dim=8, num_layers=2)
     )
+    other.requires_grad_(False)
+    with pytest.raises(ValueError, match="parameter names"):
+        Polyak(model, other)
 
 
-def test_averager_without_dqn_head_raises() -> None:
-    hidden_dim = 8
-    encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=_MODALITIES)
-    backbone = IdentityBackbone(hidden_dim=hidden_dim)
-    heads = DiscreteActionHead(
-        in_features=hidden_dim,
-        out_features=4,
-        hidden_dim=hidden_dim,
-        num_layers=1,
-    )
-    model = Model(encoder=encoder, backbone=backbone, heads=heads)
-    with pytest.raises(ValueError, match="DQN-style"):
-        PolyakAverager(model, tau_encoder=0.01)
-
-
-def test_layerwise_encoder_delay_recomputes_delayed_layers() -> None:
+def test_forward_returns_model_output() -> None:
     torch.manual_seed(0)
-    hidden_dim = 8
-    encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=_MODALITIES)
-    backbone = IdentityBackbone(hidden_dim=hidden_dim)
-    heads = LayerwiseDiscreteActionValueHead(
-        num_backbone_layers=1,
-        in_features=hidden_dim,
-        out_features=4,
-        hidden_dim=hidden_dim,
-        num_layers=1,
-    )
-    model = Model(encoder=encoder, backbone=backbone, heads=heads).eval()
-    averager = PolyakAverager(
-        model, tau_encoder=0.0, tau_backbone=0.0, tau_head=0.0
-    )
-    before_pred, before_delayed = _q_and_target(model, averager)
-    _perturb(model.encoder)
-    after_pred, after_delayed = _q_and_target(model, averager)
-    assert not torch.allclose(
-        after_pred["action_value_layerwise"], before_pred["action_value_layerwise"]
-    )
-    assert torch.allclose(
-        after_delayed["action_value_layerwise"],
-        before_delayed["action_value_layerwise"],
-    )
-
-
-def test_online_and_delayed_run_in_train() -> None:
-    model = _tiny_model().train()
-    averager = PolyakAverager(model, tau_head=0.01)
-    assert model.training
-    assert averager.heads is not None
-    assert averager.heads.training
-    averager.heads.eval()
-    predictions, averager_inputs = model(_token_batch(model))
-    averager(averager_inputs)
-    assert model.training
-    assert averager.heads.training
-
-
-def test_head_delay_does_not_rerun_encoder() -> None:
-    model = _tiny_model().train()
-    averager = PolyakAverager(model, tau_head=0.01)
-    enc_calls = _count_calls(model.encoder)
-    batch = _token_batch(model)
-    _, averager_inputs = model(batch)
-    assert enc_calls["n"] == 1
-    averager(averager_inputs)
-    assert enc_calls["n"] == 1
-
-
-def test_head_delay_does_not_copy_encoder_backbone() -> None:
-    model = _tiny_model().eval()
-    averager = PolyakAverager(model, tau_head=0.01)
-    assert averager.encoder is None
-    assert averager.backbone is None
-    assert averager.heads is not None
-    delayed_names = {n for n, _ in averager.heads.named_parameters()}
-    online_head_names = {n for n, _ in model.heads.named_parameters()}
-    assert delayed_names == online_head_names
-    _q_and_target(model, averager)
-
-
-def test_tau_one_encoder_skips_encoder_when_backbone_delayed() -> None:
-    model = _tiny_model(scaled_backbone=True).eval()
-    averager = PolyakAverager(model, tau_encoder=1.0, tau_backbone=0.01, tau_head=0.01)
-    enc_calls = _count_calls(model.encoder)
-    assert averager.encoder is None
-    assert averager.backbone is not None
-    bb_calls = _count_calls(averager.backbone)
-    _q_and_target(model, averager)
-    assert enc_calls["n"] == 1
-    assert bb_calls["n"] == 1
-
-
-def test_tau_one_backbone_runs_online_backbone_on_delayed_encoder() -> None:
-    torch.manual_seed(0)
-    model = _tiny_model(scaled_backbone=True).eval()
-    averager = PolyakAverager(model, tau_encoder=0.0, tau_backbone=1.0, tau_head=1.0)
-    assert averager.encoder is not None
-    assert averager.backbone is None
-    assert averager.heads is None
-    enc_calls = _count_calls(averager.encoder)
-    bb_calls = _count_calls(model.backbone)
-    before_pred, before_delayed = _q_and_target(model, averager)
-    assert enc_calls["n"] == 1
-    assert bb_calls["n"] == 2  # online forward + delayed-encoder path
-    assert torch.allclose(before_pred["action_value"], before_delayed["action_value"])
-    _perturb(model.backbone)
-    after_pred, after_delayed = _q_and_target(model, averager)
-    assert torch.allclose(after_pred["action_value"], after_delayed["action_value"])
-    assert not torch.allclose(after_delayed["action_value"], before_delayed["action_value"])
-
-
-def test_tau_one_encoder_delayed_backbone_sees_online_embeds() -> None:
-    torch.manual_seed(0)
-    model = _tiny_model(scaled_backbone=True).eval()
-    averager = PolyakAverager(model, tau_encoder=1.0, tau_backbone=0.0, tau_head=0.01)
-    before_pred, before_delayed = _q_and_target(model, averager)
-    assert torch.allclose(before_pred["action_value"], before_delayed["action_value"])
-    _perturb(model.encoder)
-    after_pred, after_delayed = _q_and_target(model, averager)
-    assert torch.allclose(after_pred["action_value"], after_delayed["action_value"])
-    assert not torch.allclose(after_delayed["action_value"], before_delayed["action_value"])
-
-
-def test_all_one_tau_returns_online_predictions() -> None:
-    model = _tiny_model().train()
-    averager = PolyakAverager(
-        model, tau_encoder=1.0, tau_backbone=1.0, tau_head=1.0
-    )
-    assert averager.encoder is None
-    assert averager.backbone is None
-    assert averager.heads is None
-    enc_calls = _count_calls(model.encoder)
-    bb_calls = _count_calls(model.backbone)
-    head_calls = _count_calls(model.heads["action_value"])
-    predictions, delayed = _q_and_target(model, averager)
-    assert enc_calls["n"] == 1
-    assert bb_calls["n"] == 1
-    assert head_calls["n"] == 1
-    assert torch.equal(predictions["action_value"], delayed["action_value"])
-    assert not delayed["action_value"].requires_grad
-
-
-def test_zero_tau_freezes_snapshot() -> None:
-    torch.manual_seed(0)
-    model = _tiny_model(scaled_backbone=True)
-    averager = PolyakAverager(
-        model, tau_encoder=0.0, tau_backbone=0.0, tau_head=0.0
-    )
-    assert averager.encoder is not None
-    assert averager.backbone is not None
-    assert averager.heads is not None
-    online = next(model.encoder.parameters())
-    delayed = next(averager.encoder.parameters())
-    online.data.fill_(1.0)
-    delayed.data.fill_(0.0)
-    averager.update()
-    assert torch.allclose(delayed, torch.zeros_like(delayed))
-
-
-def test_encoder_delay_runs_delayed_encoder() -> None:
-    model = _tiny_model().eval()
-    averager = PolyakAverager(
-        model, tau_encoder=0.01, tau_backbone=0.01, tau_head=0.01
-    )
-    assert averager.encoder is not None
-    enc_calls = _count_calls(averager.encoder)
-    _q_and_target(model, averager)
-    assert enc_calls["n"] == 1
-
-
-def test_averager_rejects_non_averager_inputs() -> None:
-    model = _tiny_model().eval()
-    averager = PolyakAverager(model, tau_head=0.01)
-    with pytest.raises(TypeError, match="AveragerInputs"):
-        averager(_token_batch(model))  # type: ignore[arg-type]
-
-
-def test_head_delay_uses_passed_inputs_not_later_forward() -> None:
-    torch.manual_seed(0)
-    model = _tiny_model().eval()
-    averager = PolyakAverager(model, tau_head=0.01)
-    batch = _token_batch(model)
-    first_pred, first_inputs = model(batch)
-    first_delayed = averager(first_inputs)
-    _perturb(model.encoder)
-    model(batch)
-    replayed = averager(first_inputs)
-    assert torch.allclose(replayed["action_value"], first_delayed["action_value"])
-    assert torch.allclose(first_pred["action_value"], first_delayed["action_value"])
-
-
-def test_forward_returns_averager_inputs() -> None:
     model = _tiny_model().eval()
     batch = _token_batch(model)
-    predictions, averager_inputs = model(batch)
-    assert isinstance(averager_inputs, AveragerInputs)
-    assert averager_inputs.batch is batch
-    assert averager_inputs.h is not None
-    assert averager_inputs.embeds is not None
-    assert averager_inputs.head_output_indices is not None
-    assert averager_inputs.predictions is not None
-    assert averager_inputs.cache is None
-    assert predictions["action_value"].shape[0] == averager_inputs.h.shape[0]
-    assert averager_inputs.embeds.shape[-1] == averager_inputs.h.shape[-1]
+    with torch.no_grad():
+        out = model(batch)
+    assert isinstance(out, ModelOutput)
+    assert out.last_hidden_state.shape == (batch.L, model.hidden_dim)
+    assert out.head_output_indices.shape == (batch.P,)
+    assert len(out.passes) == 1
+    assert out.passes[0].predictions is out.predictions
+    assert out.cache is None
 
 
-def test_averager_inputs_are_detached() -> None:
+def test_last_hidden_state_stays_on_the_tape() -> None:
+    torch.manual_seed(0)
     model = _tiny_model().train()
-    predictions, averager_inputs = model(_token_batch(model))
-    assert predictions["action_value"].requires_grad
-    assert not averager_inputs.h.requires_grad
-    assert averager_inputs.h.grad_fn is None
-    assert averager_inputs.embeds is not None
-    assert not averager_inputs.embeds.requires_grad
-    assert averager_inputs.predictions is not None
-    assert not averager_inputs.predictions["action_value"].requires_grad
-    live = predictions["action_value"].detach().clone().requires_grad_(True)
-    wrapped = AveragerInputs(h=live, batch=averager_inputs.batch)
-    assert not wrapped.h.requires_grad
-    averager = PolyakAverager(model, tau_head=0.01)
-    delayed = averager(averager_inputs)
-    assert not delayed["action_value"].requires_grad
-    assert delayed["action_value"].grad_fn is None
+    out = model(_token_batch(model))
+    assert out.last_hidden_state.requires_grad
+    assert out.predictions["action_value"].requires_grad
 
 
 def _assert_no_autograd_graph(fn: Callable[[], Any]) -> None:
@@ -416,55 +290,40 @@ def _assert_no_autograd_graph(fn: Callable[[], Any]) -> None:
         saved["n"] += 1
         return tensor
 
-    def unpack(tensor: torch.Tensor) -> torch.Tensor:
-        return tensor
-
-    with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
-        out = fn()
-    q = out["action_value"]
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t):
+        result = fn()
     assert saved["n"] == 0
-    assert not q.requires_grad
-    assert q.grad_fn is None
+    return result
 
 
-@pytest.mark.parametrize(
-    "taus",
-    [
-        {"tau_encoder": 0.01, "tau_backbone": 0.01, "tau_head": 0.01},
-        {"tau_encoder": 0.0, "tau_backbone": 1.0, "tau_head": 1.0},
-        {"tau_encoder": 1.0, "tau_backbone": 0.0, "tau_head": 1.0},
-        {"tau_encoder": 1.0, "tau_backbone": 1.0, "tau_head": 0.01},
-        {"tau_encoder": 1.0, "tau_backbone": 1.0, "tau_head": 1.0},
-    ],
-    ids=[
-        "all-delayed",
-        "encoder-delayed-online-rest",
-        "backbone-delayed-online-rest",
-        "head-delayed",
-        "all-tau-one",
-    ],
-)
-def test_delayed_forward_does_not_build_autograd_graph(taus: dict[str, float]) -> None:
-    """Delayed Q is a constant: the delayed path must not save tensors for backward."""
-    model = _tiny_model(scaled_backbone=True).train()
-    averager = PolyakAverager(model, **taus)
-    _, averager_inputs = model(_token_batch(model))
-    _assert_no_autograd_graph(lambda: averager(averager_inputs))
-
-
-def test_all_one_tau_requires_predictions() -> None:
+def test_delayed_heads_under_no_grad_build_no_graph() -> None:
+    torch.manual_seed(0)
     model = _tiny_model().train()
-    averager = PolyakAverager(
-        model, tau_encoder=1.0, tau_backbone=1.0, tau_head=1.0
-    )
-    _, averager_inputs = model(_token_batch(model))
-    head_calls = _count_calls(model.heads["action_value"])
-    missing = AveragerInputs(
-        h=averager_inputs.h,
-        batch=averager_inputs.batch,
-        embeds=averager_inputs.embeds,
-        head_output_indices=averager_inputs.head_output_indices,
-    )
-    with pytest.raises(ValueError, match="predictions"):
-        averager(missing)
-    assert head_calls["n"] == 0
+    delayed = model.delayed_copy()
+    out = model(_token_batch(model))
+
+    def run():
+        with torch.no_grad():
+            return _delayed_heads(delayed, out)
+
+    delayed_out = _assert_no_autograd_graph(run)
+    assert delayed_out.predictions["action_value"].grad_fn is None
+
+
+def test_forward_rejects_stray_state_arguments() -> None:
+    model = _tiny_model().eval()
+    batch = _token_batch(model)
+    with torch.no_grad():
+        out = model(batch)
+    with pytest.raises(ValueError, match="only accepted with last_hidden_state"):
+        model(batch, head_output_indices=out.head_output_indices)
+    with pytest.raises(ValueError, match="only accepted with last_hidden_state"):
+        model(batch, hidden_states=())
+    with pytest.raises(ValueError, match="requires head_output_indices"):
+        model(last_hidden_state=out.last_hidden_state)
+    with pytest.raises(ValueError, match="not both"):
+        model(
+            batch,
+            last_hidden_state=out.last_hidden_state,
+            head_output_indices=out.head_output_indices,
+        )

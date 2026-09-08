@@ -389,8 +389,8 @@ def test_dataloader_transform_returns_token_batch() -> None:
     encoder = NumericEmbedder(
         hidden_dim=8,
         modalities=[
-            {"type": 'discrete', "field": "action", "vocab_size": 16},
-            {"type": 'fourier', "field": "reward"},
+            {"type": 'discrete', "field": "action", "vocab_size": 16, "std": 0.02, "positions": 1},
+            {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1},
         ],
     )
     loader = DataLoader(

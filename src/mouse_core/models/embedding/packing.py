@@ -12,7 +12,7 @@ def left_align_content(
     """Shift right-padded rows so content sits in trailing columns (FlexDecode).
 
     Returns ``(aligned_embeds, head_output_indices)`` with indices adjusted for
-    the aligned layout (for :meth:`Encoder.pool_step_reprs`).
+    the aligned layout (what ``Model`` pools head outputs from).
     """
     B, L, _D = embeds.shape
     row_lens = head_output_indices[:, -1] + 1

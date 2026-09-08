@@ -1,4 +1,4 @@
-"""One-step two-head DQN TD objective."""
+"""TD(λ) DQN objective with a delayed target network."""
 
 from __future__ import annotations
 
@@ -166,14 +166,108 @@ def _in_run_stats(
     return selected.mean(), std, selected.min(), selected.max()
 
 
+def _greedy_from_online_q(
+    *,
+    q: torch.Tensor,
+    action: torch.Tensor,
+    last_rows: torch.Tensor,
+) -> torch.Tensor:
+    """``[N-1]``: 1 if the action taken from step ``i`` matches online Q.
+
+    Compares the taken action (stored at ``i+1``) to the online network's
+    scores at step ``i`` (its last head-output row). Ties count as a match
+    if the taken action is among the max scores. Never reads oracle columns
+    such as ``info_q_star``.
+    """
+    scores = q.detach()[last_rows][:-1]  # [N-1, A]  Q(s_i)
+    taken = action[1:].unsqueeze(-1)  # [N-1, 1]  a_i
+    is_max = scores == scores.amax(dim=-1, keepdim=True)
+    return is_max.gather(dim=-1, index=taken).squeeze(-1).to(dtype=scores.dtype)
+
+
+def _shift_next(values: torch.Tensor) -> torch.Tensor:
+    """``out[t] = values[t+1]``, zero at the end."""
+    return torch.cat([values[1:], values.new_zeros(1)])
+
+
+def _affine_scan_backward(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Solve ``g_t = a_t + b_t * g_{t+1}`` with ``g_T = 0`` for every ``t``.
+
+    Parallel (Hillis-Steele) scan over the affine maps ``x -> a + b * x``:
+    composing ``(a1, b1)`` then ``(a2, b2)`` gives ``(a2 + b2 * a1, b2 * b1)``.
+    ``ceil(log2 T)`` rounds of elementwise ops on the whole tensor, no
+    host-device syncs, and no division, so zeros in ``b`` (run ends, trace
+    cuts, terminal discounts) are exact.
+    """
+    A = a.flip(0)
+    B = b.flip(0)
+    T = int(A.shape[0])
+    offset = 1
+    while offset < T:
+        A_prev = F.pad(A[:-offset], (offset, 0))
+        B_prev = F.pad(B[:-offset], (offset, 0), value=1.0)
+        A, B = A + B * A_prev, B * B_prev
+        offset *= 2
+    return A.flip(0)
+
+
+@torch.no_grad()
+def _td_lambda_targets(
+    *,
+    reward: torch.Tensor,
+    discount_all: torch.Tensor,
+    v_step: torch.Tensor,
+    pair_weight: torch.Tensor,
+    td_lambda: float,
+    greedy_from: torch.Tensor | None,
+) -> torch.Tensor:
+    """TD(λ) target for every pair ``(t, t+1)``, shape ``[N-1]``.
+
+    ``G_t = r_{t+1} + γ_{t+1} * ((1 - λ c_t) * V_{t+1} + λ c_t * G_{t+1})``
+    where ``V`` is the delayed max-Q and ``c_t`` says whether the trace
+    continues through ``s_{t+1}``: pair ``t+1`` must exist and be in-run, and
+    with Watkins the action taken from ``s_{t+1}`` must be online-greedy
+    (``greedy_from``). Episode / task boundaries are handled by ``γ_{t+1}``
+    itself — the done-code discount from ``_boundary_discounts`` multiplies
+    both the bootstrap and the continued return, so a ``0`` gamma ends the
+    trace and a non-zero truncation gamma carries it through, discounted.
+    ``λ = 0`` or ``c_t = 0`` is exactly the one-step target ``r + γ V``.
+    Out-of-run pairs return ``0`` (their rows carry weight ``0``).
+    """
+    r = reward[1:].to(dtype=v_step.dtype)  # [N-1]  r_t (stored at t+1)
+    g = discount_all[1:]  # [N-1]  γ_t from done codes at t+1
+    v_next = v_step[1:]  # [N-1]  V(s_{t+1})
+    in_run = pair_weight > 0
+    cont = _shift_next(in_run.to(dtype=v_step.dtype))
+    if greedy_from is not None:
+        cont = cont * _shift_next(greedy_from)
+    mix = float(td_lambda) * cont
+    a = r + g * (1.0 - mix) * v_next
+    if td_lambda == 0.0:
+        returns = a
+    else:
+        returns = _affine_scan_backward(a, g * mix)
+    return returns * in_run.to(dtype=returns.dtype)
+
+
+def _pair_values_to_rows(
+    pair_values: torch.Tensor,
+    step_of: torch.Tensor,
+) -> torch.Tensor:
+    """Broadcast ``[N-1]`` per-pair values onto head-output rows ``[P]``."""
+    padded = torch.cat([pair_values, pair_values.new_zeros(1)])
+    return padded[step_of]
+
+
 class DqnObjective(Objective):
-    """One-step Bellman TD objective with a delayed target network.
+    """Bellman TD(λ) objective with a delayed target network.
 
     Instantiate with hyperparameters, then call with
     ``(objective_data, predictions, delayed_predictions)``. Online Q is
     ``predictions["action_value"]``; bootstrap Q is
-    ``delayed_predictions["action_value"]`` from
-    ``averager(averager_inputs)``. The delayed tensor is detached before
+    ``delayed_predictions["action_value"]`` from the heads-only delayed
+    :class:`~mouse_core.models.base.Model` (``model.delayed_copy()``) run on
+    the online token states. The delayed tensor is detached before
     the Bellman target, so the TD error does not backprop through it.
 
     Q rows are **per head-output token** (``[P, A]``), not per step: a step may
@@ -199,6 +293,23 @@ class DqnObjective(Objective):
     discount applied to the bootstrap value. Both factors always multiply:
     ``V ← episode_gamma * task_gamma * V``. ``task_done == 0`` uses task
     factor ``1.0``.
+
+    The target is the TD(λ) return along the run,
+    ``G_i = r + γ * ((1 - λ) * V(s_{i+1}) + λ * G_{i+1})`` with ``V`` the
+    delayed max-Q, so ``td_lambda=0`` (default) is the plain one-step target
+    ``r + γ V`` and ``td_lambda=1`` is the full n-step return to the end of
+    the run. The trace never crosses a run break. At an episode / task
+    boundary ``γ`` is the corresponding done-code gamma and multiplies both
+    the bootstrap and the continued return, so ``gamma_*_terminal = 0`` ends
+    the trace there while a non-zero truncation gamma carries it (discounted)
+    into the reset frame's return. Off-policy behavior is not
+    corrected unless ``watkins=True`` (Watkins's Q(λ)), which also cuts the
+    trace wherever the taken action is not the online argmax of
+    ``predictions["action_value"]`` (ties included; never compared against
+    oracle columns such as ``info_q_star``). ``metrics["watkins_greedy_frac"]``
+    then reports the in-run fraction of taken actions that were greedy —
+    near ``0`` means the traces are cut everywhere and the target is one-step.
+    The λ-return is computed with a parallel scan on the device (no host syncs).
 
     Those columns arrive in ``objective_data`` only if they are listed in the
     tokenizer ``objective_fields`` keep-list (input fields are not auto-copied).
@@ -254,6 +365,9 @@ class DqnObjective(Objective):
         cql_weight: Alpha coefficient for the Conservative Q-Learning penalty.
             ``0.0`` disables CQL.
         cql_scale_q_eps: Additive floor used when scaling the CQL penalty.
+        td_lambda: λ of the TD(λ) target in ``[0, 1]``. ``0.0`` (default) is
+            the one-step target; ``1.0`` is the full in-run n-step return.
+        watkins: Cut the λ-trace at non-greedy actions (Watkins's Q(λ)).
     """
 
     def __init__(
@@ -271,7 +385,11 @@ class DqnObjective(Objective):
         grouping_field: str | None = None,
         cql_weight: float = 0.0,
         cql_scale_q_eps: float = 1.0,
+        td_lambda: float = 0.0,
+        watkins: bool = False,
     ) -> None:
+        if not 0.0 <= float(td_lambda) <= 1.0:
+            raise ValueError(f"td_lambda must be in [0, 1], got {td_lambda}.")
         self.gamma_step = gamma_step
         self.gamma_episode_terminal = gamma_episode_terminal
         self.gamma_episode_truncated = gamma_episode_truncated
@@ -284,6 +402,8 @@ class DqnObjective(Objective):
         self.grouping_field = grouping_field
         self.cql_weight = cql_weight
         self.cql_scale_q_eps = cql_scale_q_eps
+        self.td_lambda = float(td_lambda)
+        self.watkins = bool(watkins)
 
     def __call__(
         self,
@@ -297,6 +417,11 @@ class DqnObjective(Objective):
         if q.ndim != 2:
             raise ValueError(
                 f"DQN expects action_value shape [P, A], got {tuple(q.shape)}."
+            )
+        if q.dtype != torch.float32 or q_target.dtype != torch.float32:
+            raise TypeError(
+                "DQN expects float32 action_value (heads always run in fp32), got "
+                f"online {q.dtype} and delayed {q_target.dtype}."
             )
         if q_target.shape != q.shape:
             raise ValueError(
@@ -357,8 +482,6 @@ class DqnObjective(Objective):
         # described by the fields stored at i+1.
         step_next = (step_of + 1).clamp(max=N - 1)  # [P] (final step clamped, weight 0)
         next_actions = action[step_next]            # [P]  a_i (stored at i+1)
-        next_rewards = reward[step_next]            # [P]  r_i (stored at i+1)
-        next_q_target = q_target[last_rows[step_next]]  # [P, A] Q_target(s_{i+1})
 
         discount_all = _boundary_discounts(
             episode_done=episode_done,
@@ -371,14 +494,24 @@ class DqnObjective(Objective):
             dtype=value_dtype,
             device=device,
         )
-        discount = discount_all[step_next]  # [P] from done codes stored at i+1
 
         q_values = q.gather(dim=-1, index=next_actions.unsqueeze(-1)).squeeze(-1)  # [P]
-        next_max_q_target = next_q_target.amax(dim=-1)                             # [P]
+        greedy_from = (
+            _greedy_from_online_q(q=q, action=action, last_rows=last_rows)
+            if self.watkins
+            else None
+        )
+        pair_target = _td_lambda_targets(
+            reward=reward,
+            discount_all=discount_all,
+            v_step=q_target[last_rows].amax(dim=-1),  # [N]  V(s_i) = max_a Q_target
+            pair_weight=pair_weight,
+            td_lambda=self.td_lambda,
+            greedy_from=greedy_from,
+        )
+        td_target = _pair_values_to_rows(pair_target, step_of)  # [P]
 
-        td_target = next_rewards + discount * next_max_q_target
-
-        loss = (q_values - td_target.detach()) ** 2
+        loss = (q_values - td_target) ** 2
 
         cql_penalty_mean: torch.Tensor | None = None
         if self.cql_weight > 0.0:
@@ -400,6 +533,8 @@ class DqnObjective(Objective):
         }
         if cql_penalty_mean is not None:
             named["cql_penalty"] = cql_penalty_mean
+        if greedy_from is not None:
+            named["watkins_greedy_frac"] = _weighted_mean(greedy_from, pair_weight)
 
         metrics: dict[str, float] = dict(zip(named, torch.stack(list(named.values())).tolist()))
         return loss, metrics

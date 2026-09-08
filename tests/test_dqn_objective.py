@@ -3,7 +3,12 @@ from __future__ import annotations
 import torch
 from tensordict import TensorDict
 from mouse_core.objectives import DqnObjective
-from mouse_core.objectives.dqn import _pair_weight, _weighted_mean
+import pytest
+from mouse_core.objectives.dqn import (
+    _affine_scan_backward,
+    _pair_weight,
+    _weighted_mean,
+)
 
 
 def _q(online: torch.Tensor, delayed: torch.Tensor) -> tuple[TensorDict, TensorDict]:
@@ -23,6 +28,7 @@ def test_dqn_objective_runs() -> None:
     assert loss.ndim == 0
     assert 'action_value' in metrics
     assert metrics['action_value'] >= 0.0
+    assert 'watkins_greedy_frac' not in metrics
 
 def test_dqn_objective_rejects_wrong_action_shape() -> None:
     n, a = (4, 3)
@@ -204,3 +210,174 @@ def test_dqn_objective_does_not_backprop_through_delayed_q() -> None:
     loss.backward()
     assert online.grad is not None
     assert delayed.grad is None
+
+
+def _lambda_fixture() -> tuple[TensorDict, TensorDict, TensorDict]:
+    """Three in-run steps so λ can mix a two-step backup from s0.
+
+    Action from s0 is 0; from s1 is 1. Delayed max-Q is 3 at s1 and 100 at s2.
+    Rewards out of s0 / s1 are 1 and 10. One-step target at s0 is 4; the
+    λ=1 (full n-step) target at s0 is 111.
+    """
+    step_stream = TensorDict(
+        {
+            "action": torch.tensor([0, 0, 1]),
+            "reward": torch.tensor([0.0, 1.0, 10.0]),
+            "episode_done": torch.zeros(3, dtype=torch.int64),
+            "task_done": torch.zeros(3, dtype=torch.int64),
+            "sequence_id": torch.zeros(3, dtype=torch.int64),
+            "info_q_star": torch.tensor(
+                [[10.0, 0.0], [0.0, 10.0], [0.0, 10.0]]
+            ),
+        },
+        batch_size=[3],
+    )
+    # Online Q(s0, a=0) = 5; Q(s1, a=1) = 0.
+    online = torch.tensor([[5.0, 0.0], [0.0, 0.0], [0.0, 0.0]])
+    delayed = torch.tensor([[0.0, 0.0], [3.0, 0.0], [0.0, 100.0]])
+    return step_stream, *_q(online, delayed)
+
+
+# One-step MSEs: (5-4)^2 = 1 and (0-110)^2 = 12100 → mean 6050.5.
+_ONE_STEP = 6050.5
+# λ=1 target at s0 is 1 + 10 + 100 = 111 → (5-111)^2 = 11236; s1 stays 12100 → mean 11668.
+_FULL_RETURN = 11668.0
+
+
+def test_td_lambda_zero_is_the_one_step_target() -> None:
+    step_stream, predictions, delayed = _lambda_fixture()
+    loss, metrics = DqnObjective(gamma_step=1.0)(step_stream, predictions, delayed)
+    assert abs(loss.item() - _ONE_STEP) < 1e-03
+    assert "watkins_greedy_frac" not in metrics
+
+
+def test_td_lambda_one_is_the_full_n_step_return() -> None:
+    step_stream, predictions, delayed = _lambda_fixture()
+    loss, _ = DqnObjective(gamma_step=1.0, td_lambda=1.0)(step_stream, predictions, delayed)
+    assert abs(loss.item() - _FULL_RETURN) < 1e-03
+
+
+def test_td_lambda_half_mixes_bootstrap_and_return() -> None:
+    step_stream, predictions, delayed = _lambda_fixture()
+    # G_0 = 1 + (0.5 * 3 + 0.5 * 110) = 57.5 → (5 - 57.5)^2 = 2756.25; s1 stays 12100.
+    expected = (2756.25 + 12100.0) / 2
+    loss, _ = DqnObjective(gamma_step=1.0, td_lambda=0.5)(step_stream, predictions, delayed)
+    assert abs(loss.item() - expected) < 1e-03
+
+
+def test_td_lambda_rejects_out_of_range() -> None:
+    with pytest.raises(ValueError, match=r"\[0, 1\]"):
+        DqnObjective(td_lambda=1.5)
+
+
+def test_td_lambda_terminal_gamma_zero_ends_the_trace() -> None:
+    """s0 → s1 terminates the episode (code stored at s1): G_0 = r only."""
+    step_stream, predictions, delayed = _lambda_fixture()
+    step_stream = step_stream.clone()
+    step_stream["episode_done"] = torch.tensor([0, 1, 0])
+    loss, _ = DqnObjective(
+        gamma_step=1.0, gamma_episode_terminal=0.0, td_lambda=1.0
+    )(step_stream, predictions, delayed)
+    # s0: (5 - 1)^2 = 16 — neither V(s1) nor the next episode's return; s1: 12100.
+    assert abs(loss.item() - (16.0 + 12100.0) / 2) < 1e-03
+
+
+def test_td_lambda_truncation_gamma_carries_the_trace_discounted() -> None:
+    """A non-zero truncation gamma bootstraps through the reset, so the trace does too."""
+    step_stream, predictions, delayed = _lambda_fixture()
+    step_stream = step_stream.clone()
+    step_stream["episode_done"] = torch.tensor([0, 2, 0])
+    loss, _ = DqnObjective(
+        gamma_step=1.0, gamma_episode_truncated=0.5, td_lambda=1.0
+    )(step_stream, predictions, delayed)
+    # s0: 1 + 0.5 * G_1 = 1 + 0.5 * 110 = 56 → (5 - 56)^2 = 2601; s1: 12100.
+    assert abs(loss.item() - (2601.0 + 12100.0) / 2) < 1e-03
+
+
+def test_td_lambda_task_gamma_scales_the_trace() -> None:
+    step_stream, predictions, delayed = _lambda_fixture()
+    step_stream = step_stream.clone()
+    step_stream["task_done"] = torch.tensor([0, 2, 0])
+    full, _ = DqnObjective(
+        gamma_step=1.0, gamma_task_truncated=1.0, td_lambda=1.0
+    )(step_stream, predictions, delayed)
+    assert abs(full.item() - _FULL_RETURN) < 1e-03
+    cut, _ = DqnObjective(
+        gamma_step=1.0, gamma_task_truncated=0.0, td_lambda=1.0
+    )(step_stream, predictions, delayed)
+    assert abs(cut.item() - (16.0 + 12100.0) / 2) < 1e-03
+
+
+def test_watkins_cuts_when_taken_action_is_not_online_greedy() -> None:
+    """Online Q at s1 prefers 0; taken action is 1 → cut. Oracle would continue."""
+    step_stream, predictions, delayed = _lambda_fixture()
+    predictions = predictions.clone()
+    q = predictions["action_value"].clone()
+    q[1] = torch.tensor([10.0, 0.0])
+    predictions["action_value"] = q
+    # A separate action-head would prefer the taken action; Watkins must ignore it.
+    predictions["action"] = torch.tensor([[10.0, 0.0], [0.0, 10.0], [0.0, 0.0]])
+    loss, metrics = DqnObjective(gamma_step=1.0, td_lambda=1.0, watkins=True)(
+        step_stream, predictions, delayed
+    )
+    one_step, _ = DqnObjective(gamma_step=1.0)(step_stream, predictions, delayed)
+    assert abs(loss.item() - one_step.item()) < 1e-04
+    # a_0 = 0 is greedy at s0 (Q = [5, 0]); a_1 = 1 is not at s1 → 1 of 2 in-run pairs.
+    assert abs(metrics["watkins_greedy_frac"] - 0.5) < 1e-06
+
+
+def test_watkins_continues_when_taken_action_matches_online_q() -> None:
+    step_stream, predictions, delayed = _lambda_fixture()
+    predictions = predictions.clone()
+    q = predictions["action_value"].clone()
+    q[1] = torch.tensor([-1.0, 0.0])  # greedy at s1 is the taken action; Q(s1,a=1) stays 0
+    predictions["action_value"] = q
+    loss, metrics = DqnObjective(gamma_step=1.0, td_lambda=1.0, watkins=True)(
+        step_stream, predictions, delayed
+    )
+    assert abs(loss.item() - _FULL_RETURN) < 1e-03
+    assert abs(metrics["watkins_greedy_frac"] - 1.0) < 1e-06
+
+
+def test_lambda_returns_do_not_cross_sequence_boundary() -> None:
+    step_stream, predictions, delayed = _lambda_fixture()
+    step_stream = step_stream.clone()
+    step_stream["sequence_id"] = torch.tensor([0, 0, 1])
+    loss, _ = DqnObjective(gamma_step=1.0, td_lambda=1.0)(step_stream, predictions, delayed)
+    one_step, _ = DqnObjective(gamma_step=1.0)(step_stream, predictions, delayed)
+    assert abs(loss.item() - one_step.item()) < 1e-04
+
+
+def test_td_lambda_with_multiple_head_output_rows_per_step() -> None:
+    """Every row of a step trains toward that step's λ-return; bootstrap reads the last row."""
+    step_stream, predictions, delayed = _lambda_fixture()
+    step_stream = step_stream.clone()
+    step_stream["head_output_count"] = torch.tensor([2, 1, 2])
+    online = torch.tensor([[5.0, 0.0], [7.0, 0.0], [0.0, 0.0], [0.0, -9.0], [0.0, 0.0]])
+    delayed_q = torch.tensor([[0.0, 0.0], [0.0, 0.0], [3.0, 0.0], [-9.0, -9.0], [0.0, 100.0]])
+    predictions, delayed = _q(online, delayed_q)
+    loss, _ = DqnObjective(gamma_step=1.0, td_lambda=1.0)(step_stream, predictions, delayed)
+    # s0 rows: (5-111)^2 = 11236, (7-111)^2 = 10816; s1 row: (0-110)^2 = 12100; s2 rows weight 0.
+    assert abs(loss.item() - (11236.0 + 10816.0 + 12100.0) / 3) < 1e-02
+
+
+def test_affine_scan_matches_sequential_recursion() -> None:
+    torch.manual_seed(0)
+    T = 1000
+    a = torch.randn(T)
+    b = torch.rand(T) * 0.99
+    b[torch.rand(T) < 0.1] = 0.0  # run ends / trace cuts / terminal discounts
+    expected = torch.zeros(T)
+    g = 0.0
+    for t in range(T - 1, -1, -1):
+        g = a[t].item() + b[t].item() * g
+        expected[t] = g
+    assert torch.allclose(_affine_scan_backward(a, b), expected, atol=1e-04, rtol=1e-05)
+
+
+def test_dqn_objective_rejects_non_fp32_q() -> None:
+    step_stream, predictions, delayed = _lambda_fixture()
+    predictions = predictions.clone()
+    predictions["action_value"] = predictions["action_value"].to(torch.bfloat16)
+    with pytest.raises(TypeError, match="float32"):
+        DqnObjective()(step_stream, predictions, delayed)

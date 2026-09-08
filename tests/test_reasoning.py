@@ -1,4 +1,4 @@
-"""Coconut-style latent reasoning: generation, bookkeeping, gradients, averager."""
+"""Coconut-style latent reasoning: generation, bookkeeping, gradients, delayed copy."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ import pytest
 import torch
 
 from mouse_core.models import (
-    AveragerInputs,
     LatentReasoner,
     Model,
     load_model,
@@ -18,7 +17,6 @@ from mouse_core.models.backbone import LlamaBackbone
 from mouse_core.models.embedding import NumericEmbedder
 from mouse_core.models.heads import DiscreteActionValueHead
 from mouse_core.models.reasoner import _plan_insertions
-from mouse_core.polyak import PolyakAverager
 from tests._token_batch_helpers import batch_to_token_batch, tok_from_encoder
 
 _HIDDEN = 32
@@ -28,11 +26,11 @@ _ACTIONS = 4
 # the tokenizer emits modalities in list order, so it is each step's
 # head-output token and Q is read from it.
 _MODALITIES = [
-    {"type": "discrete", "field": "action", "vocab_size": _ACTIONS},
-    {"type": "discrete", "field": "observation", "vocab_size": 16},
-    {"type": "fourier", "field": "reward"},
-    {"type": "discrete", "field": "episode_done", "vocab_size": 3},
-    {"type": "learnable", "field": "value", "tokens": 1},
+    {"type": "discrete", "field": "action", "vocab_size": _ACTIONS, "std": 0.02, "positions": 1},
+    {"type": "discrete", "field": "observation", "vocab_size": 16, "std": 0.02, "positions": 1},
+    {"type": "fourier", "field": "reward", "std": 0.02, "positions": 1},
+    {"type": "discrete", "field": "episode_done", "vocab_size": 3, "std": 0.02, "positions": 1},
+    {"type": "learnable", "field": "value", "tokens": 1, "std": 0.02, "positions": 1},
 ]
 _TOKENS_PER_STEP = 5
 
@@ -95,8 +93,8 @@ def test_reasoning_none_matches_plain_forward() -> None:
     model = _tiny_model().eval()
     batch = _token_batch(model, _BATCH)
     with torch.no_grad():
-        plain, _ = model(batch)
-        with_arg, _ = model(batch, reasoning=None)
+        plain = model(batch).predictions
+        with_arg = model(batch, reasoning=None).predictions
     assert torch.equal(plain["action_value"], with_arg["action_value"])
 
 
@@ -105,12 +103,10 @@ def test_all_skip_splits_match_plain_forward() -> None:
     model = _tiny_model().eval()
     batch = _token_batch(model, _BATCH)
     with torch.no_grad():
-        plain, plain_inputs = model(batch)
-        skipped, skipped_inputs = model(batch, reasoning=[-1, -1])
-    assert torch.equal(plain["action_value"], skipped["action_value"])
-    assert skipped_inputs.token_indices is None
-    assert plain_inputs.embeds is not None and skipped_inputs.embeds is not None
-    assert torch.equal(plain_inputs.embeds, skipped_inputs.embeds)
+        plain = model(batch)
+        skipped = model(batch, reasoning=[-1, -1])
+    assert torch.equal(plain.predictions["action_value"], skipped.predictions["action_value"])
+    assert torch.equal(plain.last_hidden_state, skipped.last_hidden_state)
 
 
 def test_plan_insertions_bookkeeping() -> None:
@@ -140,16 +136,12 @@ def test_reasoning_extends_stream_and_shifts_predictions() -> None:
     model = _tiny_model(num_thoughts=3).eval()
     batch = _token_batch(model, _BATCH)
     with torch.no_grad():
-        predictions, averager_inputs = model(batch, reasoning=[1, 0])
-    assert predictions["action_value"].shape == (batch.N, _ACTIONS)
-    assert averager_inputs.embeds is not None
-    assert averager_inputs.embeds.shape[0] == batch.L + 2 * 3
-    assert averager_inputs.sequence_ids is not None
-    assert averager_inputs.sequence_ids.shape[0] == batch.L + 6
-    assert averager_inputs.head_output_indices is not None
-    assert averager_inputs.head_output_indices.shape[0] == batch.N
-    assert averager_inputs.token_indices is not None
-    assert averager_inputs.token_indices.shape[0] == batch.L
+        out = model(batch, reasoning=[1, 0])
+    assert out.predictions["action_value"].shape == (batch.N, _ACTIONS)
+    assert out.last_hidden_state is not None
+    assert out.last_hidden_state.shape[0] == batch.L + 2 * 3
+    assert out.head_output_indices is not None
+    assert out.head_output_indices.shape[0] == batch.N
 
 
 def test_burst_changes_only_burst_and_later_steps() -> None:
@@ -157,8 +149,8 @@ def test_burst_changes_only_burst_and_later_steps() -> None:
     model = _tiny_model().eval()
     batch = _token_batch(model, _BATCH)
     with torch.no_grad():
-        plain, _ = model(batch)
-        reasoned, _ = model(batch, reasoning=[1, -1])
+        plain = model(batch).predictions
+        reasoned = model(batch, reasoning=[1, -1]).predictions
     q_plain = plain["action_value"]
     q_reasoned = reasoned["action_value"]
     # Steps of sequence 1 (no burst) are isolated by the attention mask.
@@ -174,7 +166,7 @@ def test_gradients_flow_through_latent_chain() -> None:
     torch.manual_seed(0)
     model = _tiny_model().train()
     batch = _token_batch(model, _BATCH)
-    predictions, _ = model(batch, reasoning=[1, -1])
+    predictions = model(batch, reasoning=[1, -1]).predictions
     loss = predictions["action_value"][2].sum()  # post-burst step of sequence 0
     loss.backward()
     proj_grad = model.reasoner.proj.weight.grad  # type: ignore[union-attr]
@@ -187,7 +179,7 @@ def test_pre_burst_loss_gives_no_reasoner_gradient() -> None:
     torch.manual_seed(0)
     model = _tiny_model().train()
     batch = _token_batch(model, _BATCH)
-    predictions, _ = model(batch, reasoning=[1, -1])
+    predictions = model(batch, reasoning=[1, -1]).predictions
     loss = predictions["action_value"][0].sum()  # step before the burst
     loss.backward()
     proj_grad = model.reasoner.proj.weight.grad  # type: ignore[union-attr]
@@ -227,45 +219,45 @@ def test_reasoning_errors() -> None:
         model(batch, reasoning=[1])
 
 
-@pytest.mark.parametrize(
-    "taus",
-    [
-        {"tau_encoder": 0.01, "tau_backbone": 0.01, "tau_head": 0.01},
-        {"tau_encoder": 0.0, "tau_backbone": 1.0, "tau_head": 1.0},
-        {"tau_encoder": 1.0, "tau_backbone": 0.0, "tau_head": 1.0},
-        {"tau_encoder": 1.0, "tau_backbone": 1.0, "tau_head": 0.01},
-        {"tau_encoder": 1.0, "tau_backbone": 1.0, "tau_head": 1.0},
-    ],
-    ids=[
-        "all-delayed",
-        "encoder-delayed",
-        "backbone-delayed",
-        "head-delayed",
-        "all-tau-one",
-    ],
-)
-def test_averager_parity_with_reasoning(taus: dict[str, float]) -> None:
-    """At construction the delayed weights equal the online weights, so the
-    delayed forward over the extended stream must reproduce the online Q."""
+def test_delayed_heads_parity_with_reasoning() -> None:
+    """At construction the delayed heads equal the online heads, so delayed Q
+    on the online last-hidden states matches the online predictions."""
     torch.manual_seed(0)
     model = _tiny_model().eval()
-    averager = PolyakAverager(model, **taus)
+    delayed = model.delayed_copy()
     batch = _token_batch(model, _BATCH)
-    predictions, averager_inputs = model(batch, reasoning=[1, 0])
-    delayed = averager(averager_inputs)
+    out = model(batch, reasoning=[1, 0])
+    with torch.no_grad():
+        delayed_out = delayed(
+            last_hidden_state=out.last_hidden_state,
+            head_output_indices=out.head_output_indices,
+        )
     assert torch.allclose(
-        predictions["action_value"], delayed["action_value"], atol=1e-5
+        out.predictions["action_value"], delayed_out.predictions["action_value"], atol=1e-5
     )
-    assert not delayed["action_value"].requires_grad
+    assert not delayed_out.predictions["action_value"].requires_grad
+
+
+def test_delayed_copy_is_heads_only() -> None:
+    """The delayed model has no encoder/backbone/reasoner: it always reads the
+    online stream (with the thoughts already inserted)."""
+    model = _tiny_model()
+    delayed = model.delayed_copy()
+    assert delayed.encoder is None and delayed.backbone is None
+    assert delayed.reasoner is None
+    batch = _token_batch(model, _BATCH)
+    with pytest.raises(ValueError, match="heads-only"):
+        delayed(batch)
+    with pytest.raises(ValueError, match="heads-only"):
+        delayed(batch, reasoning=[1, 0])
 
 
 def test_delayed_reasoning_builds_no_autograd_graph() -> None:
     torch.manual_seed(0)
     model = _tiny_model().train()
-    averager = PolyakAverager(
-        model, tau_encoder=0.01, tau_backbone=0.01, tau_head=0.01
-    )
-    _, averager_inputs = model(_token_batch(model, _BATCH), reasoning=[1, 0])
+    delayed = model.delayed_copy()
+    batch = _token_batch(model, _BATCH)
+    out = model(batch, reasoning=[1, 0])
     saved = {"n": 0}
 
     def pack(tensor: torch.Tensor) -> torch.Tensor:
@@ -273,20 +265,21 @@ def test_delayed_reasoning_builds_no_autograd_graph() -> None:
         return tensor
 
     with torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t):
-        delayed = averager(averager_inputs)
+        with torch.no_grad():
+            delayed_out = delayed(
+                last_hidden_state=out.last_hidden_state,
+                head_output_indices=out.head_output_indices,
+            )
     assert saved["n"] == 0
-    assert delayed["action_value"].grad_fn is None
+    assert delayed_out.predictions["action_value"].grad_fn is None
 
 
-def test_averager_inputs_extended_stream_is_detached() -> None:
+def test_reasoning_states_stay_on_the_tape() -> None:
     torch.manual_seed(0)
     model = _tiny_model().train()
-    predictions, averager_inputs = model(_token_batch(model, _BATCH), reasoning=[1, 0])
-    assert predictions["action_value"].requires_grad
-    assert isinstance(averager_inputs, AveragerInputs)
-    assert averager_inputs.embeds is not None
-    assert not averager_inputs.embeds.requires_grad
-    assert not averager_inputs.h.requires_grad
+    out = model(_token_batch(model, _BATCH), reasoning=[1, 0])
+    assert out.predictions["action_value"].requires_grad
+    assert out.last_hidden_state.requires_grad
 
 
 def test_save_load_roundtrip_with_reasoner(tmp_path) -> None:
@@ -298,8 +291,8 @@ def test_save_load_roundtrip_with_reasoner(tmp_path) -> None:
     assert loaded.reasoner.num_thoughts == 3
     batch = _token_batch(model, _BATCH)
     with torch.no_grad():
-        original, _ = model(batch, reasoning=[1, 0])
-        reloaded, _ = loaded(batch, reasoning=[1, 0])
+        original = model(batch, reasoning=[1, 0]).predictions
+        reloaded = loaded(batch, reasoning=[1, 0]).predictions
     assert torch.allclose(
         original["action_value"], reloaded["action_value"], atol=1e-6
     )

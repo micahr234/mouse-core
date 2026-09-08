@@ -23,13 +23,13 @@ def test_infer_head_name_is_action() -> None:
 def test_discrete_action_head_save_load_roundtrip(tmp_path) -> None:
     torch.manual_seed(0)
     hidden_dim = 8
-    encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4}, {"type": 'fourier', "field": "reward"}])
+    encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}, {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1}])
     model = Model(encoder=encoder, backbone=IdentityBackbone(hidden_dim=hidden_dim), heads=DiscreteActionHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1)).eval()
     batch = [[{'action': 0, 'reward': 0.0}, {'action': 1, 'reward': 1.0}]]
-    expected, _ = model(batch_to_token_batch(_tok(model.encoder), batch))
+    expected = model(batch_to_token_batch(_tok(model.encoder), batch)).predictions
     save_model(model, tmp_path)
     loaded = load_model(tmp_path).eval()
-    actual, _ = loaded(batch_to_token_batch(_tok(loaded.encoder), batch))
+    actual = loaded(batch_to_token_batch(_tok(loaded.encoder), batch)).predictions
     assert torch.allclose(actual['action'], expected['action'])
     assert loaded.action_head == 'action'
     with (tmp_path / 'config.json').open() as fh:

@@ -70,6 +70,11 @@ class StepTokens:
     ``modality_ids[t]`` indexes ``modality_names``; type/kind comes from
     ``modality_map[modality_names[modality_ids[t]]]``.
 
+    ``positions[t]`` is the token's 0-based index among the tokens of the
+    same modality in this step (coordinate of a continuous vector, learnable
+    slot, image patch, text run offset). Embedders use it to give each token
+    of a multi-token modality its own type vector.
+
     ``head_output_mask[t]`` marks the step's head-output tokens (the positions
     the model reads Q / action outputs from). Tokenizers set it from the
     input field flagged ``head_output=True``; every step must have at least
@@ -79,6 +84,7 @@ class StepTokens:
     modality_ids: np.ndarray  # [T] index into modality_names
     ids: np.ndarray  # [T]
     values: np.ndarray  # [T]
+    positions: np.ndarray  # [T] index within modality within the step
     modality_names: tuple[str, ...]
     modality_map: dict[str, ModalityInfo]
     grouping_id: int
@@ -95,11 +101,15 @@ class StepTokens:
         t = int(np.asarray(self.modality_ids).shape[0])
         if t == 0:
             raise ValueError("StepTokens must contain at least one token")
-        for name in ("modality_ids", "ids", "values"):
+        for name in ("modality_ids", "ids", "values", "positions"):
             arr = np.asarray(getattr(self, name))
             if arr.shape != (t,):
                 raise ValueError(f"{name} must have shape [{t}], got {arr.shape}")
             object.__setattr__(self, name, arr)
+        pos = np.asarray(self.positions, dtype=np.int64)
+        if pos.min(initial=0) < 0:
+            raise ValueError(f"positions must be >= 0, got min={int(pos.min())}")
+        object.__setattr__(self, "positions", pos)
         mids = np.asarray(self.modality_ids, dtype=np.int64)
         if mids.min(initial=0) < 0 or mids.max(initial=0) >= len(names):
             raise ValueError(
@@ -150,6 +160,8 @@ class TokenBatch:
         modality_map: name → :class:`ModalityInfo` (type/kind lookup).
         ids: ``[L]`` int64 — discrete row id, or continuous freq-bank index.
         values: ``[L]`` float32 — continuous scalar (0 when discrete).
+        positions: ``[L]`` int64 — index of the token among its modality's
+            tokens within its step (see :class:`StepTokens`).
         sequence_ids: ``[L]`` int64 — which of the ``B`` sequences each token belongs to.
         grouping_ids: ``[L]`` int64 — attention group within the sequence.
         head_output_indices: ``[P]`` int64 — token index of every head-output
@@ -163,6 +175,7 @@ class TokenBatch:
     modality_ids: np.ndarray
     ids: np.ndarray
     values: np.ndarray
+    positions: np.ndarray
     modality_names: tuple[str, ...]
     modality_map: dict[str, ModalityInfo]
     sequence_ids: np.ndarray
@@ -183,6 +196,7 @@ class TokenBatch:
             "modality_ids",
             "ids",
             "values",
+            "positions",
             "sequence_ids",
             "grouping_ids",
         ):
@@ -191,6 +205,9 @@ class TokenBatch:
                 raise ValueError(f"{name} must have shape [{L}], got {arr.shape}")
             object.__setattr__(self, name, arr)
         if L > 0:
+            pos = np.asarray(self.positions, dtype=np.int64)
+            if int(pos.min()) < 0:
+                raise ValueError(f"positions must be >= 0, got min={int(pos.min())}")
             mids = np.asarray(self.modality_ids, dtype=np.int64)
             if mids.min() < 0 or mids.max() >= len(names):
                 raise ValueError(
@@ -294,6 +311,7 @@ class TokenBatch:
             "modality_ids": _long(self.modality_ids),
             "ids": _long(self.ids),
             "values": _float(self.values),
+            "positions": _long(self.positions),
             "modality_names": self.modality_names,
             "modality_map": self.modality_map,
             "sequence_ids": _long(self.sequence_ids),
@@ -320,6 +338,7 @@ def empty_token_batch(
         modality_ids=np.zeros(0, dtype=np.int64),
         ids=np.zeros(0, dtype=np.int64),
         values=np.zeros(0, dtype=np.float32),
+        positions=np.zeros(0, dtype=np.int64),
         modality_names=names,
         modality_map=mmap,
         sequence_ids=np.zeros(0, dtype=np.int64),
@@ -473,6 +492,7 @@ def pack_token_batch(
     modality_ids: list[np.ndarray] = []
     ids: list[np.ndarray] = []
     values: list[np.ndarray] = []
+    positions: list[np.ndarray] = []
     seq_ids: list[np.ndarray] = []
     grouping_ids: list[np.ndarray] = []
     head_output_indices: list[int] = []
@@ -485,12 +505,13 @@ def pack_token_batch(
         modality_ids.append(st.modality_ids)
         ids.append(st.ids)
         values.append(st.values)
+        positions.append(st.positions)
         seq_ids.append(np.full(t, sid, dtype=np.int64))
         grouping_ids.append(np.full(t, st.grouping_id, dtype=np.int64))
-        positions = np.flatnonzero(st.head_output_mask)
-        head_output_indices.extend((offset + positions).tolist())
-        head_output_steps.extend([step_idx] * int(positions.size))
-        head_output_counts.append(int(positions.size))
+        ho = np.flatnonzero(st.head_output_mask)
+        head_output_indices.extend((offset + ho).tolist())
+        head_output_steps.extend([step_idx] * int(ho.size))
+        head_output_counts.append(int(ho.size))
         offset += t
 
     inferred_B = (max(seq_per_step) + 1) if seq_per_step else 0
@@ -519,6 +540,7 @@ def pack_token_batch(
         modality_ids=np.concatenate(modality_ids),
         ids=np.concatenate(ids),
         values=np.concatenate(values),
+        positions=np.concatenate(positions),
         modality_names=names,
         modality_map=dict(mmap),
         sequence_ids=np.concatenate(seq_ids),
