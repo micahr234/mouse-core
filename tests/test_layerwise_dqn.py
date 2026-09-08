@@ -36,7 +36,7 @@ def test_model_layerwise_forward_and_objective() -> None:
         ),
         batch,
     )
-    delayed = model.delayed_copy()
+    delayed = model.delayed_copy(heads=True)
     out = model(token_batch)
     predictions = out.predictions
     with torch.no_grad():
@@ -53,7 +53,7 @@ def test_model_layerwise_forward_and_objective() -> None:
     assert metrics['action_value_layerwise'] >= 0.0
     action = model.get_action(predictions, temperature=0.0, num_actions=4)
     assert action.shape == (1,)
-    Polyak(model, delayed).update(0.1)
+    Polyak(model, delayed).update(tau_heads=0.1)
 
 def test_layerwise_objective_q_metrics_use_curr_max_q() -> None:
     """q_values_mean and layer_q_mean report max online Q at the current state."""

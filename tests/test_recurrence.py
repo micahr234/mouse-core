@@ -222,7 +222,7 @@ def test_delayed_heads_parity_per_pass() -> None:
     torch.manual_seed(0)
     model = _tiny_model(num_passes=3).eval()
     _turn_on_recurrence(model)
-    delayed = model.delayed_copy()
+    delayed = model.delayed_copy(heads=True)
     batch = _token_batch(model, _BATCH)
     out = model(batch)
     for p in out.passes:
@@ -239,7 +239,7 @@ def test_layerwise_recurrent_passes_carry_hidden_states() -> None:
     torch.manual_seed(0)
     model = _tiny_model(num_passes=2, layerwise=True).eval()
     _turn_on_recurrence(model)
-    delayed = model.delayed_copy()
+    delayed = model.delayed_copy(heads=True)
     batch = _token_batch(model, _BATCH)
     with torch.no_grad():
         out = model(batch)
@@ -261,7 +261,7 @@ def test_mean_loss_over_passes_trains() -> None:
     torch.manual_seed(0)
     model = _tiny_model(num_passes=3).train()
     _turn_on_recurrence(model)
-    delayed = model.delayed_copy()
+    delayed = model.delayed_copy(heads=True)
     batch = [[{**row, "task_done": 0} for row in seq] for seq in _BATCH]
     assert model.encoder is not None
     tok = tok_from_encoder(

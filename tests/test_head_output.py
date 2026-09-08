@@ -277,7 +277,7 @@ def test_reasoning_forward_and_delayed_parity_multi_head_output() -> None:
     torch.manual_seed(0)
     model = _tiny_model(with_reasoner=True).eval()
     batch, _ = _packed(model)
-    delayed = model.delayed_copy()
+    delayed = model.delayed_copy(heads=True)
     with torch.no_grad():
         out = model(batch, reasoning=[1, 0])
         delayed_out = delayed(

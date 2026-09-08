@@ -224,7 +224,7 @@ def test_delayed_heads_parity_with_reasoning() -> None:
     on the online last-hidden states matches the online predictions."""
     torch.manual_seed(0)
     model = _tiny_model().eval()
-    delayed = model.delayed_copy()
+    delayed = model.delayed_copy(heads=True)
     batch = _token_batch(model, _BATCH)
     out = model(batch, reasoning=[1, 0])
     with torch.no_grad():
@@ -242,7 +242,7 @@ def test_delayed_copy_is_heads_only() -> None:
     """The delayed model has no encoder/backbone/reasoner: it always reads the
     online stream (with the thoughts already inserted)."""
     model = _tiny_model()
-    delayed = model.delayed_copy()
+    delayed = model.delayed_copy(heads=True)
     assert delayed.encoder is None and delayed.backbone is None
     assert delayed.reasoner is None
     batch = _token_batch(model, _BATCH)
@@ -255,7 +255,7 @@ def test_delayed_copy_is_heads_only() -> None:
 def test_delayed_reasoning_builds_no_autograd_graph() -> None:
     torch.manual_seed(0)
     model = _tiny_model().train()
-    delayed = model.delayed_copy()
+    delayed = model.delayed_copy(heads=True)
     batch = _token_batch(model, _BATCH)
     out = model(batch, reasoning=[1, 0])
     saved = {"n": 0}

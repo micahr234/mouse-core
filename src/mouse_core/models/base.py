@@ -835,9 +835,10 @@ class Model(nn.Module):
         model = Model(encoder=encoder, backbone=backbone, heads=heads)
 
     ``forward`` returns a :class:`ModelOutput` with ``predictions``,
-    ``last_hidden_state``, and per-pass ``passes``. The delayed DQN copy is
-    a heads-only model from :meth:`delayed_copy` run on the online token
-    states; interpolate it with :class:`~mouse_core.polyak.Polyak`.
+    ``last_hidden_state``, and per-pass ``passes``. The delayed DQN model
+    comes from :meth:`delayed_copy`: heads-only (run on the online token
+    states) or with a delayed encoder / backbone (run on the ``TokenBatch``);
+    interpolate it with :class:`~mouse_core.polyak.Polyak`.
     Recurrent-depth refinement is a
     :class:`~mouse_core.models.recurrence.Recurrence` section
     (``num_passes`` backbone passes per forward, saved with the model). See
@@ -1070,20 +1071,42 @@ class Model(nn.Module):
                 self.max_num_actions = out
                 break
 
-    def delayed_copy(self) -> "Model":
-        """Deep-copy the heads into a frozen heads-only model.
+    def delayed_copy(
+        self, *, encoder: bool = False, backbone: bool = False, heads: bool = False
+    ) -> "Model":
+        """Build the delayed model for TD targets.
 
-        The copy has ``requires_grad=False``, runs in ``train()``, and is
-        called as ``delayed(last_hidden_state=out.last_hidden_state,
-        head_output_indices=out.head_output_indices, hidden_states=
-        out.hidden_states)`` — the delayed heads read the online token
-        states, so encoder, backbone, reasoning latents, and recurrent
-        passes are shared with the online forward. Construct after
-        ``model.to(...)``. Interpolate toward this model with
-        :class:`~mouse_core.polyak.Polyak`.
+        Each flag chooses whether that section is delayed — a section is
+        delayed exactly when its Polyak ``tau`` is not ``1``. A section set to
+        ``True`` is a frozen deep copy (``train()``) that
+        :class:`~mouse_core.polyak.Polyak` interpolates; a section left
+        ``False`` is the online module itself, shared by reference
+        (equivalent to ``tau = 1`` every step). At least one flag must be
+        ``True``. The reasoner / recurrence section follows ``backbone``.
+
+        - ``delayed_copy(heads=True)`` — heads-only model. Called as
+          ``delayed(last_hidden_state=out.last_hidden_state,
+          head_output_indices=out.head_output_indices,
+          hidden_states=out.hidden_states)``: the delayed heads read the
+          online token states, so encoder, backbone, reasoning latents, and
+          recurrent passes are shared with the online forward.
+        - ``encoder=True`` and/or ``backbone=True`` — full model. Called as
+          ``delayed(inputs)`` (same ``TokenBatch`` and ``reasoning=`` as the
+          online forward, under ``torch.no_grad()``); it re-runs the trunk
+          through the delayed / shared sections and then the delayed or
+          shared heads.
+
+        Construct after ``model.to(...)``. Do not call ``requires_grad_`` /
+        ``to`` on a delayed model that shares sections: they would hit the
+        online modules.
         """
         if self.backbone is None:
             raise ValueError("delayed_copy is for the online model, not a delayed copy.")
+        if not (encoder or backbone or heads):
+            raise ValueError(
+                "delayed_copy needs at least one delayed section: pass encoder=True, "
+                "backbone=True, and/or heads=True (a section with tau = 1 is shared)."
+            )
 
         def _copy(module: nn.Module) -> nn.Module:
             delayed = copy.deepcopy(module)
@@ -1091,9 +1114,33 @@ class Model(nn.Module):
             delayed.train()
             return delayed
 
+        delayed_heads = {
+            name: (cast(BaseHead, _copy(head)) if heads else head)
+            for name, head in self._heads.items()
+        }
+        if not encoder and not backbone:
+            return Model(heads=delayed_heads, action_head=self.action_head)
+
+        assert self.encoder is not None
+        delayed_encoder = cast(Encoder, _copy(self.encoder)) if encoder else self.encoder
+        delayed_backbone = cast(Backbone, _copy(self.backbone)) if backbone else self.backbone
+        delayed_reasoner = (
+            None
+            if self.reasoner is None
+            else (cast(LatentReasoner, _copy(self.reasoner)) if backbone else self.reasoner)
+        )
+        delayed_recurrence = (
+            None
+            if self.recurrence is None
+            else (cast(Recurrence, _copy(self.recurrence)) if backbone else self.recurrence)
+        )
         return Model(
-            heads={name: cast(BaseHead, _copy(head)) for name, head in self._heads.items()},
+            encoder=delayed_encoder,
+            backbone=delayed_backbone,
+            heads=delayed_heads,
             action_head=self.action_head,
+            reasoner=delayed_reasoner,
+            recurrence=delayed_recurrence,
         )
 
     def to(self, *args: Any, **kwargs: Any) -> "Model":
@@ -1311,12 +1358,15 @@ class Model(nn.Module):
         """Run a forward pass over a :class:`TokenBatch`, or run heads on given states.
 
         Training: ``inputs, objective_data = loader.next_batch()`` then
-        ``out = model(inputs)``. Delayed DQN is a heads-only copy:
-        ``delayed_model = model.delayed_copy()`` then
+        ``out = model(inputs)``. Delayed DQN with heads-only delay:
+        ``delayed_model = model.delayed_copy(heads=True)`` then
         ``delayed_model(last_hidden_state=out.last_hidden_state,
         head_output_indices=out.head_output_indices,
-        hidden_states=out.hidden_states)``. Interpolate with
-        ``Polyak(model, delayed_model)`` and ``polyak.update(tau)``.
+        hidden_states=out.hidden_states)``. With a delayed encoder and/or
+        backbone (``delayed_copy(encoder=..., backbone=...)``) run
+        ``delayed_model(inputs)`` instead. Interpolate with
+        ``Polyak(model, delayed_model)`` and ``polyak.update(tau_heads=...)``
+        (plus ``tau_encoder`` / ``tau_backbone`` for delayed trunk sections).
         Online / inference: ``inputs, _ = pack_token_batch([eval_transform(step)],
         sequence_ids=[0])`` then ``model(inputs, use_cache=True)``
         (optionally ragged; empty-only batches raise). Pass ``out.cache``

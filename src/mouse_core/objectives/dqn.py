@@ -266,7 +266,7 @@ class DqnObjective(Objective):
     ``(objective_data, predictions, delayed_predictions)``. Online Q is
     ``predictions["action_value"]``; bootstrap Q is
     ``delayed_predictions["action_value"]`` from the heads-only delayed
-    :class:`~mouse_core.models.base.Model` (``model.delayed_copy()``) run on
+    :class:`~mouse_core.models.base.Model` (``model.delayed_copy(heads=True)``) run on
     the online token states. The delayed tensor is detached before
     the Bellman target, so the TD error does not backprop through it.
 

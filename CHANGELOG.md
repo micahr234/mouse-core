@@ -19,8 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   trace, a non-zero truncation gamma carries it through discounted).
   Computed with a parallel scan on the device (no per-step host syncs).
 - Heads are always fp32: ``DqnObjective`` / ``LayerwiseDqnObjective`` reject
-  non-fp32 ``action_value`` and ``Polyak`` rejects non-fp32 heads (the bf16
-  shadow accumulator is gone).
+  non-fp32 ``action_value``.
 - Explicit head-output tokens. Exactly one tokenizer input field (numeric or
   text) must set ``head_output: True``; the tokens it emits are the step's
   **head-output tokens** — the positions the heads read Q / action outputs
@@ -110,20 +109,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a resumed run keeps its sub-ULP progress. Load model weights before
   constructing ``AdamWFp32`` — the masters are the source of truth from then
   on and every ``step`` writes them back over the compute parameters.
-- Delayed DQN is a heads-only ``Model`` from ``Model.delayed_copy()``,
-  interpolated with ``Polyak(online, delayed)``. Only the heads are
-  delayed: the copy runs on the online token states
-  (``delayed(last_hidden_state=out.last_hidden_state,
+- Delayed DQN is a ``Model`` from ``Model.delayed_copy(encoder=False,
+  backbone=False, heads=False)``, interpolated with ``Polyak(online,
+  delayed)``. Each section is delayed exactly when its ``tau`` is not
+  ``1``: a flagged section is a frozen deep copy, an unflagged one is the
+  online module shared by reference, at least one flag is required, and
+  the reasoner / recurrence section follows ``backbone``.
+  ``delayed_copy(heads=True)`` is heads-only and runs on the online token
+  states (``delayed(last_hidden_state=out.last_hidden_state,
   head_output_indices=out.head_output_indices,
   hidden_states=out.hidden_states)``), so encoder, backbone, reasoning
   latents, and recurrent passes are shared with the online forward.
-  ``polyak.update(tau)`` takes this step's factor: ``0`` keeps the delayed
-  heads frozen, ``1`` copies the online heads (the delayed output then
-  equals the online heads on the same states). ``Model.forward`` returns
-  a ``ModelOutput`` with ``predictions``, ``last_hidden_state``,
-  ``head_output_indices``, ``hidden_states``, ``passes``, and ``cache``.
-  ``Polyak`` matches parameters by name and accumulates interpolation in
-  fp32 shadows so small ``tau`` updates are not rounded away in bf16.
+  With ``encoder=True`` and/or ``backbone=True`` it is a full model run
+  on the ``TokenBatch`` (``delayed(inputs)``, same ``reasoning=`` as the
+  online forward). ``polyak.update(tau_heads=..., tau_encoder=...,
+  tau_backbone=...)`` takes this step's factor per section: ``0`` keeps
+  it frozen, ``1`` copies the online weights. Each ``tau`` is required
+  for a delayed section and must be omitted or ``1`` for a shared one. ``Model.forward`` returns a ``ModelOutput`` with ``predictions``,
+  ``last_hidden_state``, ``head_output_indices``, ``hidden_states``,
+  ``passes``, and ``cache``. ``Polyak`` matches parameters by name and
+  accumulates non-fp32 (bf16 encoder / backbone) interpolation in fp32
+  shadows so small ``tau`` updates are not rounded away.
+  ``examples/11_train_offline_dqn_model_delay.ipynb`` is the offline DQN
+  loop with the encoder, backbone, and Q head all delayed.
 - ``examples/05_train_offline_sv.ipynb``: offline supervised-value training
   (``SvObjective`` regresses ``action_value`` onto ``info_q_star``). The action
   permute spec sets ``input_vector_field`` / ``output_vector_field`` to
@@ -207,7 +215,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   model device before the objective.
 - DQN target Q is no longer inside ``Model`` or the action-value heads.
   ``DqnObjective`` / ``LayerwiseDqnObjective`` no longer take ``tau``.
-  After ``optimizer.step()``, call ``polyak.update(tau)``.
+  After ``optimizer.step()``, call ``polyak.update(tau_heads=...)``.
   ``DqnObjective`` / ``LayerwiseDqnObjective`` take
   ``(objective_data, predictions, delayed_predictions)`` — delayed Q is
   ``delayed_predictions["action_value"]`` (or ``action_value_layerwise``)
