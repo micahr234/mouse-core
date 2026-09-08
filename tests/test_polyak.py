@@ -383,7 +383,7 @@ def test_forward_returns_averager_inputs() -> None:
     assert averager_inputs.batch is batch
     assert averager_inputs.h is not None
     assert averager_inputs.embeds is not None
-    assert averager_inputs.prediction_indices is not None
+    assert averager_inputs.head_output_indices is not None
     assert averager_inputs.predictions is not None
     assert averager_inputs.cache is None
     assert predictions["action_value"].shape[0] == averager_inputs.h.shape[0]
@@ -463,7 +463,7 @@ def test_all_one_tau_requires_predictions() -> None:
         h=averager_inputs.h,
         batch=averager_inputs.batch,
         embeds=averager_inputs.embeds,
-        prediction_indices=averager_inputs.prediction_indices,
+        head_output_indices=averager_inputs.head_output_indices,
     )
     with pytest.raises(ValueError, match="predictions"):
         averager(missing)

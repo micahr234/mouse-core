@@ -220,7 +220,7 @@ from mouse_core.data import NumericTokenizer, compose, pack_token_batch
 
 tokenizer = NumericTokenizer(
     input_fields=[...],  # input_field=; optional output_field= matches embedder field=;
-                         # flag exactly one field prediction=True (the Q readout tokens)
+                         # flag exactly one field head_output=True (the Q readout tokens)
     objective_fields=[
         {{"input_field": "action"}},
         {{"input_field": "reward"}},
@@ -691,7 +691,7 @@ class AveragerInputs:
     through the averager.
 
     A reasoning forward (``Model.forward(reasoning=...)``) fills the
-    extended-stream fields: ``embeds`` / ``prediction_indices`` describe the
+    extended-stream fields: ``embeds`` / ``head_output_indices`` describe the
     stream *with latents inserted*, ``sequence_ids`` / ``grouping_ids`` are
     its per-token ids, and ``token_indices`` maps each original batch token
     to its extended position (a delayed encoder re-encodes the batch and is
@@ -703,7 +703,7 @@ class AveragerInputs:
     batch: TokenBatch
     cache: dict[str, Any] | None = None
     embeds: torch.Tensor | None = None
-    prediction_indices: torch.Tensor | None = None
+    head_output_indices: torch.Tensor | None = None
     predictions: TensorDict | None = None
     sequence_ids: torch.Tensor | None = None
     grouping_ids: torch.Tensor | None = None
@@ -1042,7 +1042,7 @@ class Model(nn.Module):
         self,
         encoder: Encoder,
         session_out: torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, ...]],
-        prediction_indices: torch.Tensor,
+        head_output_indices: torch.Tensor,
         needs_layerwise: bool,
     ) -> torch.Tensor:
         """Pool backbone hidden states to the tensor :meth:`head` consumes."""
@@ -1052,13 +1052,13 @@ class Model(nn.Module):
             )
             return torch.stack(
                 [
-                    encoder.pool_step_reprs(layer_h, prediction_indices)
+                    encoder.pool_step_reprs(layer_h, head_output_indices)
                     for layer_h in layer_hiddens
                 ],
                 dim=1,
             )
         h = cast(torch.Tensor, session_out)
-        return encoder.pool_step_reprs(h, prediction_indices)
+        return encoder.pool_step_reprs(h, head_output_indices)
 
     def _generate_latents(
         self,
@@ -1076,7 +1076,7 @@ class Model(nn.Module):
         adapter applied to the backbone output at the previous position, so
         gradients flow through the whole latent chain. Returns
         ``(ext_embeds, ext_sequence_ids, ext_grouping_ids,
-        ext_prediction_indices, token_indices)`` where ``token_indices`` maps
+        ext_head_output_indices, token_indices)`` where ``token_indices`` maps
         each original token to its extended-stream position.
         """
         reasoner = self.reasoner
@@ -1132,14 +1132,14 @@ class Model(nn.Module):
         )
         ext_sequence_ids = torch.as_tensor(plan.ext_sequence_ids, device=device)
         ext_grouping_ids = torch.as_tensor(plan.ext_grouping_ids, device=device)
-        ext_prediction_indices = torch.as_tensor(
-            plan.ext_prediction_indices, device=device
+        ext_head_output_indices = torch.as_tensor(
+            plan.ext_head_output_indices, device=device
         )
         return (
             ext_embeds,
             ext_sequence_ids,
             ext_grouping_ids,
-            ext_prediction_indices,
+            ext_head_output_indices,
             token_indices,
         )
 
@@ -1171,7 +1171,7 @@ class Model(nn.Module):
         ``reasoner.num_thoughts`` latent thought embeddings on the autograd
         tape — each thought's input is the reasoner adapter applied to the
         backbone output at the previous position — and inserts them
-        immediately before that step's first prediction token, so the Q
+        immediately before that step's first head-output token, so the Q
         readout and all later same-run tokens attend to them. Predictions
         keep the flat ``[P, ...]`` contract; the returned
         :class:`AveragerInputs` describes the extended stream.
@@ -1181,10 +1181,10 @@ class Model(nn.Module):
         decode keeps ``FlexDecodeSession`` with per-sequence KV caches and the
         same grouping-id isolation.
 
-        Training predictions are flat over prediction tokens (``[P, ...]``,
-        one row per prediction token; ``objective_data["prediction_count"]``
+        Training predictions are flat over head-output tokens (``[P, ...]``,
+        one row per head-output token; ``objective_data["head_output_count"]``
         maps rows to steps). Cached decode returns rectangular ``[B, S]``
-        tensors pooled at each step's last prediction token.
+        tensors pooled at each step's last head-output token.
         """
         from mouse_core.data.token_batch import TokenBatch as _TokenBatch
 
@@ -1223,8 +1223,8 @@ class Model(nn.Module):
                 self.reasoner.num_thoughts,
             )
 
-        embeds, prediction_indices = self.encoder(token_batch)
-        # embeds: [L, D]; prediction_indices: [P]
+        embeds, head_output_indices = self.encoder(token_batch)
+        # embeds: [L, D]; head_output_indices: [P]
 
         t = token_batch.to_tensors(embeds.device)
         sequence_ids = t["sequence_ids"]
@@ -1237,9 +1237,9 @@ class Model(nn.Module):
         if use_cache:
             from mouse_core.models.embedding.packing import left_align_content
 
-            # Decode pools one position per step: the step's *last* prediction
+            # Decode pools one position per step: the step's *last* head-output
             # token (the most informed one when a step has several).
-            psteps = t["prediction_steps"]
+            psteps = t["head_output_steps"]
             last_of_step = torch.ones(
                 psteps.shape[0], dtype=torch.bool, device=psteps.device
             )
@@ -1248,7 +1248,7 @@ class Model(nn.Module):
                 _flat_to_batched_left_pad(
                     embeds,
                     sequence_ids,
-                    prediction_indices[last_of_step],
+                    head_output_indices[last_of_step],
                     B,
                     S_max,
                     step_counts_np.tolist(),
@@ -1258,7 +1258,7 @@ class Model(nn.Module):
             session = cache["session"] if cache else self.backbone.decode_session(
                 batch_size=B, capacity=max(batched_embeds.shape[1], 1)
             )
-            flex_embeds, prediction_indices = left_align_content(
+            flex_embeds, head_output_indices = left_align_content(
                 batched_embeds, local_indices
             )
             # Left-align mask ids to the same trailing-column layout as embeds.
@@ -1285,7 +1285,7 @@ class Model(nn.Module):
                     embeds,
                     sequence_ids,
                     grouping_ids,
-                    prediction_indices,
+                    head_output_indices,
                     token_indices,
                 ) = self._generate_latents(
                     embeds=embeds,
@@ -1305,7 +1305,7 @@ class Model(nn.Module):
             pred_batch_size = (token_batch.P,)
 
         h = self._pool_backbone_out(
-            self.encoder, session_out, prediction_indices, needs_layerwise
+            self.encoder, session_out, head_output_indices, needs_layerwise
         )
         predictions = self.head(h=h, batch_size=pred_batch_size)
         if plan is not None:
@@ -1314,7 +1314,7 @@ class Model(nn.Module):
                 batch=token_batch,
                 cache=None,
                 embeds=embeds,
-                prediction_indices=prediction_indices,
+                head_output_indices=head_output_indices,
                 predictions=predictions,
                 sequence_ids=sequence_ids,
                 grouping_ids=grouping_ids,
@@ -1325,7 +1325,7 @@ class Model(nn.Module):
             batch=token_batch,
             cache=new_cache,
             embeds=embeds,
-            prediction_indices=prediction_indices,
+            head_output_indices=head_output_indices,
             predictions=predictions,
         )
 
@@ -1349,7 +1349,7 @@ class Model(nn.Module):
         temperature: float = 1.0,
         num_actions: int | None = None,
     ) -> torch.Tensor:
-        """Select an action using ``action_head`` at the last prediction token."""
+        """Select an action using ``action_head`` at the last head-output token."""
         raw = cast(torch.Tensor, out[self.action_head])
         if self.action_head == "action_value_layerwise":
             if raw.ndim == 4:
@@ -1401,7 +1401,7 @@ def preferred_dtype(device: torch.device | str | None = None) -> torch.dtype:
 def _flat_to_batched_left_pad(
     embeds: torch.Tensor,
     sequence_ids: torch.Tensor,
-    prediction_indices: torch.Tensor,
+    head_output_indices: torch.Tensor,
     B: int,
     S: int,
     step_counts: list[int],
@@ -1411,9 +1411,9 @@ def _flat_to_batched_left_pad(
     """Scatter flat ``[L, D]`` embeds into a rectangular ``[B, Lmax, D]`` layout.
 
     Content is packed from index 0 within each row (right-padded).
-    ``prediction_indices`` is flat ``[N]`` (one index per step — the caller
-    passes each step's last prediction token). Returns local rectangular
-    ``prediction_indices`` ``[B, S]`` with real steps in trailing columns
+    ``head_output_indices`` is flat ``[N]`` (one index per step — the caller
+    passes each step's last head-output token). Returns local rectangular
+    ``head_output_indices`` ``[B, S]`` with real steps in trailing columns
     (left-padded in the step dimension for decode), plus right-padded
     ``grouping_ids`` ``[B, Lmax]`` aligned with the embed rows.
     """
@@ -1440,7 +1440,7 @@ def _flat_to_batched_left_pad(
     for b in range(B):
         n = int(step_counts[b]) if b < len(step_counts) else S
         for s_local in range(n):
-            abs_i = int(prediction_indices[flat_offset + s_local].item())
+            abs_i = int(head_output_indices[flat_offset + s_local].item())
             # Place into trailing step columns.
             local_indices[b, S - n + s_local] = int(local_of_abs[abs_i].item())
         flat_offset += n

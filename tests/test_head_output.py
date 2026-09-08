@@ -1,4 +1,4 @@
-"""Explicit prediction tokens: flagging, packing, objectives, multi-prediction."""
+"""Explicit head-output tokens: flagging, packing, objectives, multi-token readout."""
 
 from __future__ import annotations
 
@@ -20,13 +20,13 @@ from tests._token_batch_helpers import batch_to_packed, tok_from_encoder
 _HIDDEN = 32
 _ACTIONS = 4
 
-# Two learnable prediction tokens per step: every step yields two Q rows.
+# Two learnable head-output tokens per step: every step yields two Q rows.
 _MODALITIES = [
     {"type": "discrete", "field": "action", "vocab_size": _ACTIONS},
     {"type": "discrete", "field": "observation", "vocab_size": 16},
     {"type": "fourier", "field": "reward"},
     {"type": "discrete", "field": "episode_done", "vocab_size": 3},
-    {"type": "learnable", "field": "prediction", "tokens": 2},
+    {"type": "learnable", "field": "value", "tokens": 2},
 ]
 _TOKENS_PER_STEP = 6
 
@@ -77,7 +77,7 @@ def _packed(model: Model):
 # ---------------------------------------------------------------------------
 
 
-def test_tokenizer_requires_exactly_one_prediction_field() -> None:
+def test_tokenizer_requires_exactly_one_head_output_field() -> None:
     with pytest.raises(ValueError, match="exactly one input field with"):
         NumericTokenizer(
             input_fields=[{"type": "discrete", "input_field": "action"}],
@@ -86,14 +86,14 @@ def test_tokenizer_requires_exactly_one_prediction_field() -> None:
     with pytest.raises(ValueError, match="exactly one input field with"):
         NumericTokenizer(
             input_fields=[
-                {"type": "discrete", "input_field": "action", "prediction": True},
-                {"type": "discrete", "input_field": "obs", "prediction": True},
+                {"type": "discrete", "input_field": "action", "head_output": True},
+                {"type": "discrete", "input_field": "obs", "head_output": True},
             ],
             grouping_field="task_index",
         )
 
 
-def test_step_without_prediction_token_raises() -> None:
+def test_step_without_head_output_token_raises() -> None:
     tok = NumericTokenizer(
         input_fields=[
             {"type": "discrete", "input_field": "action"},
@@ -101,42 +101,42 @@ def test_step_without_prediction_token_raises() -> None:
                 "type": "fourier",
                 "input_field": "reward",
                 "skip": 0.0,
-                "prediction": True,
+                "head_output": True,
             },
         ],
         grouping_field="task_index",
     )
-    # Prediction field present → fine.
+    # Head-output field present → fine.
     st = tok({"action": 1, "reward": 0.5, "task_index": 0})
-    assert st.prediction_mask.tolist() == [False, True]
-    # Prediction field skipped → the step has no prediction token.
-    with pytest.raises(ValueError, match="no prediction tokens"):
+    assert st.head_output_mask.tolist() == [False, True]
+    # Head-output field skipped → the step has no head-output token.
+    with pytest.raises(ValueError, match="no head-output tokens"):
         tok({"action": 1, "reward": 0.0, "task_index": 0})
 
 
 # ---------------------------------------------------------------------------
-# Packing: multiple prediction tokens per step
+# Packing: multiple head-output tokens per step
 # ---------------------------------------------------------------------------
 
 
-def test_pack_multi_prediction_layout() -> None:
+def test_pack_multi_head_output_layout() -> None:
     model = _tiny_model()
     batch, objective_data = _packed(model)
     N = sum(len(seq) for seq in _BATCH)
     assert batch.N == N
     assert batch.P == 2 * N
-    # Each step's prediction tokens are its two trailing learnable tokens.
+    # Each step's head-output tokens are its two trailing learnable tokens.
     expected = []
     for i in range(N):
         base = i * _TOKENS_PER_STEP
         expected += [base + 4, base + 5]
-    assert batch.prediction_indices.tolist() == expected
-    assert batch.prediction_steps.tolist() == [i for i in range(N) for _ in range(2)]
+    assert batch.head_output_indices.tolist() == expected
+    assert batch.head_output_steps.tolist() == [i for i in range(N) for _ in range(2)]
     assert batch.step_counts().tolist() == [3, 2]
-    pred_mod = batch.modality_names.index("prediction")
-    assert batch.modality_ids[batch.prediction_indices].tolist() == [pred_mod] * (2 * N)
+    pred_mod = batch.modality_names.index("value")
+    assert batch.modality_ids[batch.head_output_indices].tolist() == [pred_mod] * (2 * N)
     # pack stamps the row→step map for the objectives.
-    assert objective_data["prediction_count"].tolist() == [2] * N
+    assert objective_data["head_output_count"].tolist() == [2] * N
 
 
 # ---------------------------------------------------------------------------
@@ -144,20 +144,20 @@ def test_pack_multi_prediction_layout() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_forward_yields_one_row_per_prediction_token() -> None:
+def test_forward_yields_one_row_per_head_output_token() -> None:
     torch.manual_seed(0)
     model = _tiny_model().eval()
     batch, _ = _packed(model)
     with torch.no_grad():
         predictions, averager_inputs = model(batch)
     assert predictions["action_value"].shape == (batch.P, _ACTIONS)
-    assert averager_inputs.prediction_indices is not None
-    assert averager_inputs.prediction_indices.shape == (batch.P,)
+    assert averager_inputs.head_output_indices is not None
+    assert averager_inputs.head_output_indices.shape == (batch.P,)
     action = model.get_action(predictions, temperature=0.0)
     assert action.shape == (1,)
 
 
-def test_decode_pools_last_prediction_token_per_step() -> None:
+def test_decode_pools_last_head_output_token_per_step() -> None:
     torch.manual_seed(0)
     model = _tiny_model().eval()
     batch, _ = _packed(model)
@@ -166,7 +166,7 @@ def test_decode_pools_last_prediction_token_per_step() -> None:
         rect, _ = model(batch, use_cache=True)
     q_flat = flat["action_value"]  # [P, A]
     q_rect = rect["action_value"]  # [B, S, A], steps left-padded
-    psteps = batch.prediction_steps
+    psteps = batch.head_output_steps
     last = np.ones(batch.P, dtype=bool)
     last[:-1] = psteps[1:] != psteps[:-1]
     last_rows = np.flatnonzero(last)
@@ -182,7 +182,7 @@ def test_decode_pools_last_prediction_token_per_step() -> None:
 
 
 # ---------------------------------------------------------------------------
-# DQN objective with several prediction rows per step
+# DQN objective with several head-output rows per step
 # ---------------------------------------------------------------------------
 
 
@@ -197,11 +197,11 @@ def _objective_data(
         "sequence_id": torch.zeros(N, dtype=torch.int64),
     }
     if counts is not None:
-        data["prediction_count"] = torch.tensor(counts, dtype=torch.int64)
+        data["head_output_count"] = torch.tensor(counts, dtype=torch.int64)
     return TensorDict(data, batch_size=[N])
 
 
-def test_dqn_duplicated_rows_match_single_prediction() -> None:
+def test_dqn_duplicated_rows_match_single_head_output() -> None:
     torch.manual_seed(0)
     N, A = 5, _ACTIONS
     q = torch.randn(N, A)
@@ -213,7 +213,7 @@ def test_dqn_duplicated_rows_match_single_prediction() -> None:
         TensorDict({"action_value": q}, batch_size=[N]),
         TensorDict({"action_value": q_target}, batch_size=[N]),
     )
-    # Duplicate every step's prediction row: same targets, same loss.
+    # Duplicate every step's head-output row: same targets, same loss.
     q2 = q.repeat_interleave(2, dim=0)
     q2_target = q_target.repeat_interleave(2, dim=0)
     dup_loss, dup_metrics = objective(
@@ -226,8 +226,8 @@ def test_dqn_duplicated_rows_match_single_prediction() -> None:
         assert base_metrics[key] == pytest.approx(dup_metrics[key], abs=1e-6)
 
 
-def test_dqn_multi_prediction_shares_step_target() -> None:
-    # N=2 steps, step 0 has two prediction rows, step 1 has one. Both rows of
+def test_dqn_multi_head_output_shares_step_target() -> None:
+    # N=2 steps, step 0 has two head-output rows, step 1 has one. Both rows of
     # step 0 train toward the same target, bootstrapped from step 1's last row.
     gamma = 0.9
     q = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
@@ -245,36 +245,36 @@ def test_dqn_multi_prediction_shares_step_target() -> None:
     assert loss.item() == pytest.approx(expected)
 
 
-def test_dqn_misaligned_prediction_count_raises() -> None:
+def test_dqn_misaligned_head_output_count_raises() -> None:
     N = 3
     q = torch.randn(2 * N, _ACTIONS)
     preds = TensorDict({"action_value": q}, batch_size=[2 * N])
     objective = DqnObjective()
     with pytest.raises(ValueError, match="misaligned"):
         objective(_objective_data(N, counts=[2, 2, 1]), preds, preds.clone())
-    with pytest.raises(ValueError, match="prediction_count column"):
+    with pytest.raises(ValueError, match="head_output_count column"):
         objective(_objective_data(N), preds, preds.clone())
 
 
 # ---------------------------------------------------------------------------
-# Reasoning with several prediction tokens per step
+# Reasoning with several head-output tokens per step
 # ---------------------------------------------------------------------------
 
 
-def test_plan_anchors_on_first_prediction_token() -> None:
+def test_plan_anchors_on_first_head_output_token() -> None:
     model = _tiny_model(with_reasoner=True)
     batch, _ = _packed(model)
-    # Seq 0: steps at tokens 0..17 with prediction pairs (4,5), (10,11),
-    # (16,17); burst at step 1 → anchor 10 (the *first* prediction token).
+    # Seq 0: steps at tokens 0..17 with head-output pairs (4,5), (10,11),
+    # (16,17); burst at step 1 → anchor 10 (the *first* head-output token).
     plan = _plan_insertions(batch, np.array([1, -1]), num_thoughts=2)
     assert plan is not None
     assert plan.anchors.tolist() == [10]
     assert plan.latent_positions.tolist() == [10, 11]
-    shifted = [p if p < 10 else p + 2 for p in batch.prediction_indices.tolist()]
-    assert plan.ext_prediction_indices.tolist() == shifted
+    shifted = [p if p < 10 else p + 2 for p in batch.head_output_indices.tolist()]
+    assert plan.ext_head_output_indices.tolist() == shifted
 
 
-def test_reasoning_forward_and_averager_parity_multi_prediction() -> None:
+def test_reasoning_forward_and_averager_parity_multi_head_output() -> None:
     torch.manual_seed(0)
     model = _tiny_model(with_reasoner=True).eval()
     batch, _ = _packed(model)

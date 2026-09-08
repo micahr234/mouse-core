@@ -70,10 +70,10 @@ class StepTokens:
     ``modality_ids[t]`` indexes ``modality_names``; type/kind comes from
     ``modality_map[modality_names[modality_ids[t]]]``.
 
-    ``prediction_mask[t]`` marks the step's prediction tokens (the positions
+    ``head_output_mask[t]`` marks the step's head-output tokens (the positions
     the model reads Q / action outputs from). Tokenizers set it from the
-    input field flagged ``prediction=True``; every step must have at least
-    one prediction token, and may have several.
+    input field flagged ``head_output=True``; every step must have at least
+    one head-output token, and may have several.
     """
 
     modality_ids: np.ndarray  # [T] index into modality_names
@@ -83,7 +83,7 @@ class StepTokens:
     modality_map: dict[str, ModalityInfo]
     grouping_id: int
     grouping_field: str
-    prediction_mask: np.ndarray  # [T] bool
+    head_output_mask: np.ndarray  # [T] bool
     objective_fields: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -108,18 +108,18 @@ class StepTokens:
             )
         object.__setattr__(self, "modality_ids", mids)
         object.__setattr__(self, "grouping_id", int(self.grouping_id))
-        mask = np.asarray(self.prediction_mask, dtype=bool)
+        mask = np.asarray(self.head_output_mask, dtype=bool)
         if mask.shape != (t,):
             raise ValueError(
-                f"prediction_mask must have shape [{t}], got {mask.shape}"
+                f"head_output_mask must have shape [{t}], got {mask.shape}"
             )
         if not bool(mask.any()):
             raise ValueError(
-                "step has no prediction tokens; the tokenizer input field "
-                "flagged prediction=True must emit at least one token on "
+                "step has no head-output tokens; the tokenizer input field "
+                "flagged head_output=True must emit at least one token on "
                 "every step (it must never be skipped)"
             )
-        object.__setattr__(self, "prediction_mask", mask)
+        object.__setattr__(self, "head_output_mask", mask)
 
     @property
     def T(self) -> int:
@@ -132,11 +132,11 @@ class TokenBatch:
 
     Built by :func:`pack_token_batch` from many :class:`StepTokens`. Length ``L``
     is the total number of tokens across all sequences and steps. ``N`` is the
-    number of steps (ragged windows allowed); ``P = len(prediction_indices)``
-    is the number of prediction tokens, ``P >= N`` (every step has at least
-    one, and may have several). ``prediction_steps[p]`` maps prediction token
+    number of steps (ragged windows allowed); ``P = len(head_output_indices)``
+    is the number of head-output tokens, ``P >= N`` (every step has at least
+    one, and may have several). ``head_output_steps[p]`` maps head-output token
     ``p`` to its step ``0..N-1``. Per-sequence step counts are derived from
-    the first prediction token of each step (see :meth:`step_counts`); they
+    the first head-output token of each step (see :meth:`step_counts`); they
     are not stored separately.
 
     Token type/kind is looked up via ``modality_map[modality_names[modality_ids[i]]]``:
@@ -152,10 +152,10 @@ class TokenBatch:
         values: ``[L]`` float32 — continuous scalar (0 when discrete).
         sequence_ids: ``[L]`` int64 — which of the ``B`` sequences each token belongs to.
         grouping_ids: ``[L]`` int64 — attention group within the sequence.
-        prediction_indices: ``[P]`` int64 — token index of every prediction
+        head_output_indices: ``[P]`` int64 — token index of every head-output
             token, strictly increasing.
-        prediction_steps: ``[P]`` int64 — step id ``0..N-1`` of each
-            prediction token (dense, non-decreasing).
+        head_output_steps: ``[P]`` int64 — step id ``0..N-1`` of each
+            head-output token (dense, non-decreasing).
         B: Number of sequences.
         grouping_field: Name of the grouping column.
     """
@@ -167,8 +167,8 @@ class TokenBatch:
     modality_map: dict[str, ModalityInfo]
     sequence_ids: np.ndarray
     grouping_ids: np.ndarray
-    prediction_indices: np.ndarray
-    prediction_steps: np.ndarray
+    head_output_indices: np.ndarray
+    head_output_steps: np.ndarray
     grouping_field: str
     B: int = 0
 
@@ -208,32 +208,32 @@ class TokenBatch:
                 raise ValueError(
                     "sequence_ids must be non-decreasing: every sequence's tokens "
                     "must form one contiguous block, in sequence order (the model "
-                    "walks prediction_indices row by row and pads per block)."
+                    "walks head_output_indices row by row and pads per block)."
                 )
-        pred = np.asarray(self.prediction_indices, dtype=np.int64).reshape(-1)
-        object.__setattr__(self, "prediction_indices", pred)
-        psteps = np.asarray(self.prediction_steps, dtype=np.int64).reshape(-1)
-        object.__setattr__(self, "prediction_steps", psteps)
+        pred = np.asarray(self.head_output_indices, dtype=np.int64).reshape(-1)
+        object.__setattr__(self, "head_output_indices", pred)
+        psteps = np.asarray(self.head_output_steps, dtype=np.int64).reshape(-1)
+        object.__setattr__(self, "head_output_steps", psteps)
         p = int(pred.shape[0])
         if psteps.shape != (p,):
             raise ValueError(
-                f"prediction_steps must have shape [{p}] (one step id per "
-                f"prediction token), got {psteps.shape}"
+                f"head_output_steps must have shape [{p}] (one step id per "
+                f"head-output token), got {psteps.shape}"
             )
         if p > 0:
             if L == 0:
-                raise ValueError("prediction_indices require L > 0 when P > 0")
+                raise ValueError("head_output_indices require L > 0 when P > 0")
             if int(pred.min()) < 0 or int(pred.max()) >= L:
                 raise ValueError(
-                    f"prediction_indices must be in [0, {L}), got "
+                    f"head_output_indices must be in [0, {L}), got "
                     f"min={int(pred.min())} max={int(pred.max())}"
                 )
             if bool(np.any(pred[1:] <= pred[:-1])):
-                raise ValueError("prediction_indices must be strictly increasing")
+                raise ValueError("head_output_indices must be strictly increasing")
             diffs = np.diff(psteps)
             if int(psteps[0]) != 0 or bool(np.any((diffs < 0) | (diffs > 1))):
                 raise ValueError(
-                    "prediction_steps must be dense non-decreasing step ids "
+                    "head_output_steps must be dense non-decreasing step ids "
                     f"starting at 0, got {psteps.tolist()}"
                 )
         counts = self.step_counts()
@@ -250,14 +250,14 @@ class TokenBatch:
     @property
     def N(self) -> int:
         """Number of steps."""
-        if self.prediction_steps.shape[0] == 0:
+        if self.head_output_steps.shape[0] == 0:
             return 0
-        return int(self.prediction_steps[-1]) + 1
+        return int(self.head_output_steps[-1]) + 1
 
     @property
     def P(self) -> int:
-        """Number of prediction tokens (``>= N``)."""
-        return int(self.prediction_indices.shape[0])
+        """Number of head-output tokens (``>= N``)."""
+        return int(self.head_output_indices.shape[0])
 
     @property
     def S(self) -> int:
@@ -268,14 +268,14 @@ class TokenBatch:
         return int(counts.max()) if counts.size else 0
 
     def step_counts(self) -> np.ndarray:
-        """Steps per sequence ``[B]``, from each step's first prediction token."""
+        """Steps per sequence ``[B]``, from each step's first head-output token."""
         if self.P == 0:
             return np.zeros(self.B, dtype=np.int64)
         first = np.ones(self.P, dtype=bool)
-        first[1:] = self.prediction_steps[1:] != self.prediction_steps[:-1]
+        first[1:] = self.head_output_steps[1:] != self.head_output_steps[:-1]
         return step_counts_from_sequence_id(
             np.asarray(self.sequence_ids, dtype=np.int64)[
-                self.prediction_indices[first]
+                self.head_output_indices[first]
             ],
             self.B,
         )
@@ -298,8 +298,8 @@ class TokenBatch:
             "modality_map": self.modality_map,
             "sequence_ids": _long(self.sequence_ids),
             "grouping_ids": _long(self.grouping_ids),
-            "prediction_indices": _long(self.prediction_indices),
-            "prediction_steps": _long(self.prediction_steps),
+            "head_output_indices": _long(self.head_output_indices),
+            "head_output_steps": _long(self.head_output_steps),
             "B": self.B,
             "grouping_field": self.grouping_field,
         }
@@ -324,8 +324,8 @@ def empty_token_batch(
         modality_map=mmap,
         sequence_ids=np.zeros(0, dtype=np.int64),
         grouping_ids=np.zeros(0, dtype=np.int64),
-        prediction_indices=np.zeros(0, dtype=np.int64),
-        prediction_steps=np.zeros(0, dtype=np.int64),
+        head_output_indices=np.zeros(0, dtype=np.int64),
+        head_output_steps=np.zeros(0, dtype=np.int64),
         grouping_field=grouping_field,
         B=B,
     )
@@ -359,7 +359,7 @@ def _stack_objective_fields(
     for st in steps:
         keys.update(st.objective_fields)
     keys.discard("sequence_id")
-    keys.discard("prediction_count")
+    keys.discard("head_output_count")
     keys.discard(grouping_field)
 
     out: dict[str, np.ndarray] = {}
@@ -475,9 +475,9 @@ def pack_token_batch(
     values: list[np.ndarray] = []
     seq_ids: list[np.ndarray] = []
     grouping_ids: list[np.ndarray] = []
-    prediction_indices: list[int] = []
-    prediction_steps: list[int] = []
-    prediction_counts: list[int] = []
+    head_output_indices: list[int] = []
+    head_output_steps: list[int] = []
+    head_output_counts: list[int] = []
 
     offset = 0
     for step_idx, (st, sid) in enumerate(zip(steps, seq_per_step)):
@@ -487,10 +487,10 @@ def pack_token_batch(
         values.append(st.values)
         seq_ids.append(np.full(t, sid, dtype=np.int64))
         grouping_ids.append(np.full(t, st.grouping_id, dtype=np.int64))
-        positions = np.flatnonzero(st.prediction_mask)
-        prediction_indices.extend((offset + positions).tolist())
-        prediction_steps.extend([step_idx] * int(positions.size))
-        prediction_counts.append(int(positions.size))
+        positions = np.flatnonzero(st.head_output_mask)
+        head_output_indices.extend((offset + positions).tolist())
+        head_output_steps.extend([step_idx] * int(positions.size))
+        head_output_counts.append(int(positions.size))
         offset += t
 
     inferred_B = (max(seq_per_step) + 1) if seq_per_step else 0
@@ -514,7 +514,7 @@ def pack_token_batch(
     fields = _stack_objective_fields(
         steps, sequence_ids=seq_per_step, grouping_field=gf
     )
-    fields["prediction_count"] = np.asarray(prediction_counts, dtype=np.int64)
+    fields["head_output_count"] = np.asarray(head_output_counts, dtype=np.int64)
     inputs = TokenBatch(
         modality_ids=np.concatenate(modality_ids),
         ids=np.concatenate(ids),
@@ -523,8 +523,8 @@ def pack_token_batch(
         modality_map=dict(mmap),
         sequence_ids=np.concatenate(seq_ids),
         grouping_ids=np.concatenate(grouping_ids),
-        prediction_indices=np.asarray(prediction_indices, dtype=np.int64),
-        prediction_steps=np.asarray(prediction_steps, dtype=np.int64),
+        head_output_indices=np.asarray(head_output_indices, dtype=np.int64),
+        head_output_steps=np.asarray(head_output_steps, dtype=np.int64),
         grouping_field=gf,
         B=B,
     )

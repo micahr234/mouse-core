@@ -1,4 +1,4 @@
-"""Supervised policy objective over action predictions at PREDICTION positions."""
+"""Supervised policy objective over action predictions at head-output positions."""
 
 from __future__ import annotations
 

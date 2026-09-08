@@ -91,11 +91,11 @@ class TextTokenizer:
         if format is not None and not (has_text or has_token or has_image):
             raise TypeError("format= requires at least one text, token, or image input field")
 
-        flagged = [s.output_field for s in specs if s.prediction]
+        flagged = [s.output_field for s in specs if s.head_output]
         if len(flagged) != 1:
             raise ValueError(
                 "TextTokenizer requires exactly one input field with "
-                "prediction=True (its tokens are the step's prediction tokens "
+                "head_output=True (its tokens are the step's head-output tokens "
                 f"— the Q / action readout positions); got {flagged or 'none'}"
             )
 
@@ -251,15 +251,15 @@ def _tokenize_text_step(
     modality_ids: list[int] = []
     ids: list[int] = []
     values: list[float] = []
-    prediction_mask: list[bool] = []
+    head_output_mask: list[bool] = []
 
-    def _emit(token_ids: list[int], *, name: str, prediction: bool = False) -> None:
+    def _emit(token_ids: list[int], *, name: str, head_output: bool = False) -> None:
         mid = name_to_index[name]
         for tid in token_ids:
             modality_ids.append(mid)
             ids.append(tid)
             values.append(0.0)
-            prediction_mask.append(prediction)
+            head_output_mask.append(head_output)
 
     if format_str is not None:
         text_buf: list[str] = []
@@ -297,7 +297,7 @@ def _tokenize_text_step(
                     _emit(
                         [int(unwrap_scalar(value))],
                         name=NAME_TEXT,
-                        prediction=spec.prediction,
+                        head_output=spec.head_output,
                     )
                 else:
                     spec = image_by_field[name]
@@ -323,7 +323,7 @@ def _tokenize_text_step(
                         raise TypeError(
                             "image_processor must return a sequence of token ids"
                         )
-                    _emit(img_ids, name=NAME_VISION, prediction=spec.prediction)
+                    _emit(img_ids, name=NAME_VISION, head_output=spec.head_output)
                 continue
 
             if literal:
@@ -332,13 +332,13 @@ def _tokenize_text_step(
             rendered = _field_text_value(spec, row)
             if rendered is None:
                 continue
-            if spec.prediction:
-                # Tokenize the prediction field as its own run so its token
-                # boundaries (and therefore the prediction mask) are exact.
+            if spec.head_output:
+                # Tokenize the head-output field as its own run so its token
+                # boundaries (and therefore the head-output mask) are exact.
                 flush_text()
                 if tokenizer is None:
                     raise RuntimeError("tokenizer required to tokenize text runs")
-                _emit(_tokenize_ids(tokenizer, rendered), name=NAME_TEXT, prediction=True)
+                _emit(_tokenize_ids(tokenizer, rendered), name=NAME_TEXT, head_output=True)
                 continue
             text_buf.append(rendered)
 
@@ -358,6 +358,6 @@ def _tokenize_text_step(
         modality_map=dict(modality_map),
         grouping_id=gid,
         grouping_field=grouping_field,
-        prediction_mask=np.asarray(prediction_mask, dtype=bool),
+        head_output_mask=np.asarray(head_output_mask, dtype=bool),
         objective_fields=copy_keep_fields(row, objective_fields_keep),
     )

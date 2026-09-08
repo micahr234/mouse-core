@@ -38,24 +38,24 @@ class Encoder(nn.Module, ABC):
     @property
     @abstractmethod
     def tokens_per_step(self) -> int:
-        """Capacity hint; real layout comes from ``prediction_indices``."""
+        """Capacity hint; real layout comes from ``head_output_indices``."""
         ...
 
     @abstractmethod
     def forward(
         self, token_batch: TokenBatch
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Embed ``TokenBatch`` → ``(embeds [L, D], prediction_indices [P])``."""
+        """Embed ``TokenBatch`` → ``(embeds [L, D], head_output_indices [P])``."""
         ...
 
     @abstractmethod
-    def pool_step_reprs(self, h: torch.Tensor, prediction_indices: torch.Tensor) -> torch.Tensor:
-        """Gather prediction tokens → ``[N, D]`` (train) or ``[B, S, D]`` (decode).
+    def pool_step_reprs(self, h: torch.Tensor, head_output_indices: torch.Tensor) -> torch.Tensor:
+        """Gather head-output tokens → ``[N, D]`` (train) or ``[B, S, D]`` (decode).
 
         ``h`` is ``[L, D]`` (flat packed) or ``[B, L, D]`` (decode).
-        Train: ``prediction_indices`` is ``[P]`` absolute indices into ``0 .. L-1``
-        (one per prediction token; a step may own several).
-        Decode: ``prediction_indices`` is ``[B, S]`` into the token axis of ``h``.
+        Train: ``head_output_indices`` is ``[P]`` absolute indices into ``0 .. L-1``
+        (one per head-output token; a step may own several).
+        Decode: ``head_output_indices`` is ``[B, S]`` into the token axis of ``h``.
         """
         ...
 
@@ -88,7 +88,11 @@ def _validate_batch_modalities(
 
 
 class NumericEmbedder(Encoder):
-    """Named embedding tables + static Fourier over a :class:`TokenBatch`."""
+    """Named embedding tables + static Fourier over a :class:`TokenBatch`.
+
+    Every modality also has a learnable type vector of shape ``[D]``, added
+    to each of that modality's content embeddings.
+    """
 
     def __init__(
         self,
@@ -113,9 +117,14 @@ class NumericEmbedder(Encoder):
         self._meta_by_name = {m.name: m for m in self._meta}
 
         self._tables = nn.ModuleDict()
+        self._type_vectors = nn.ParameterDict()
         max_freq_sets = 1
         for m in self._meta:
             max_freq_sets = max(max_freq_sets, m.freq_sets)
+            mod_std = float(m.spec.std if m.spec.std is not None else std)
+            self._type_vectors[m.name] = nn.Parameter(
+                torch.randn(hidden_dim) * mod_std
+            )
             if m.kind in (KIND_DISCRETE, KIND_LEARNABLE, KIND_IMAGE):
                 vs = m.vocab_size if m.kind != KIND_LEARNABLE else m.n_learnable
                 if vs <= 0:
@@ -123,8 +132,7 @@ class NumericEmbedder(Encoder):
                     raise ValueError(
                         f"{m.kind} modality {m.name!r} requires {kind}="
                     )
-                scale = m.spec.std if m.spec.std is not None else std
-                self._tables[m.name] = ScaledEmbedding(vs, hidden_dim, scale=scale)
+                self._tables[m.name] = ScaledEmbedding(vs, hidden_dim, scale=mod_std)
 
         self._fourier_std: dict[str, float] = {
             m.name: float(m.spec.std if m.spec.std is not None else std)
@@ -187,21 +195,25 @@ class NumericEmbedder(Encoder):
                 if not bool(mask.any()):
                     continue
                 meta = self._meta_by_name[name]
+                type_vec = self._type_vectors[name].to(dtype=dtype)
                 if meta.kind in (KIND_DISCRETE, KIND_LEARNABLE, KIND_IMAGE):
-                    embeds[mask] = self._tables[name](ids[mask]).to(dtype=dtype)
+                    content = self._tables[name](ids[mask]).to(dtype=dtype)
                 elif meta.kind == KIND_FOURIER:
                     feat = self.fourier(values[mask], ids[mask])
                     mod_std = self._fourier_std[name]
                     if self.std != 0.0 and mod_std != self.std:
                         feat = feat * (mod_std / self.std)
-                    embeds[mask] = feat.to(dtype=dtype)
+                    content = feat.to(dtype=dtype)
+                else:
+                    continue
+                embeds[mask] = content + type_vec
 
-        return embeds, t["prediction_indices"]
+        return embeds, t["head_output_indices"]
 
-    def pool_step_reprs(self, h: torch.Tensor, prediction_indices: torch.Tensor) -> torch.Tensor:
+    def pool_step_reprs(self, h: torch.Tensor, head_output_indices: torch.Tensor) -> torch.Tensor:
         D = self._hidden_dim
         if h.ndim == 2:
-            return h[prediction_indices.reshape(-1)]
-        B, S = prediction_indices.shape
-        idx = prediction_indices.unsqueeze(-1).expand(B, S, D)
+            return h[head_output_indices.reshape(-1)]
+        B, S = head_output_indices.shape
+        idx = head_output_indices.unsqueeze(-1).expand(B, S, D)
         return h.gather(1, idx)

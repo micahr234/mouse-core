@@ -12,7 +12,7 @@ from mouse_core.objectives.dqn import (
     _boundary_discounts,
     _in_run_stats,
     _pair_weight,
-    _prediction_layout,
+    _head_output_layout,
     _require_done_codes,
     _weighted_mean,
 )
@@ -76,9 +76,9 @@ class LayerwiseDqnObjective(Objective):
 
     Reads ``predictions["action_value_layerwise"]`` and
     ``delayed_predictions["action_value_layerwise"]`` with shape ``[P, L, A]``
-    (one row per prediction token; ``objective_data["prediction_count"]`` maps
-    rows to steps). Every prediction row of step ``i`` trains toward the same
-    per-layer target; the bootstrap reads step ``i+1``'s last prediction row.
+    (one row per head-output token; ``objective_data["head_output_count"]`` maps
+    rows to steps). Every head-output row of step ``i`` trains toward the same
+    per-layer target; the bootstrap reads step ``i+1``'s last head-output row.
     Delayed Q comes from ``averager(averager_inputs)`` and is detached
     before the Bellman target, so the TD error does not backprop through it.
     Each layer and each episode/task done-code uses its own discount, built at construction
@@ -257,10 +257,10 @@ class LayerwiseDqnObjective(Objective):
             N=N,
         )
 
-        # A step may own several prediction tokens; every row of step i trains
+        # A step may own several head-output tokens; every row of step i trains
         # toward the same per-layer target, and the bootstrap reads step i+1's
-        # last prediction row.
-        step_of, last_rows = _prediction_layout(
+        # last head-output row.
+        step_of, last_rows = _head_output_layout(
             objective_data, N=N, P=P, device=device
         )
 

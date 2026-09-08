@@ -213,14 +213,14 @@ class PolyakAverager:
         reasoned = averager_inputs.token_indices is not None
         if delay_encoder:
             assert self.encoder is not None
-            enc_embeds, enc_prediction_indices = self.encoder(averager_inputs.batch)
+            enc_embeds, enc_head_output_indices = self.encoder(averager_inputs.batch)
             if reasoned:
                 # Reasoning forward: re-encode the real tokens with the delayed
                 # encoder and splice them into the extended stream; the latent
                 # slots keep the detached online-generated embeds.
                 if (
                     averager_inputs.embeds is None
-                    or averager_inputs.prediction_indices is None
+                    or averager_inputs.head_output_indices is None
                 ):
                     raise ValueError(
                         "Delayed encoder on a reasoning forward needs "
@@ -230,22 +230,22 @@ class PolyakAverager:
                 embeds = averager_inputs.embeds.index_copy(
                     0, averager_inputs.token_indices, enc_embeds
                 )
-                prediction_indices = averager_inputs.prediction_indices
+                head_output_indices = averager_inputs.head_output_indices
             else:
                 embeds = enc_embeds
-                prediction_indices = enc_prediction_indices
+                head_output_indices = enc_head_output_indices
             pool_encoder = self.encoder
         else:
             if (
                 averager_inputs.embeds is None
-                or averager_inputs.prediction_indices is None
+                or averager_inputs.head_output_indices is None
             ):
                 raise ValueError(
                     "Delayed backbone with tau_encoder=1 needs "
                     "AveragerInputs.embeds from model(inputs)."
                 )
             embeds = averager_inputs.embeds
-            prediction_indices = averager_inputs.prediction_indices
+            head_output_indices = averager_inputs.head_output_indices
             pool_encoder = self._online.encoder
         if (
             averager_inputs.sequence_ids is not None
@@ -269,7 +269,7 @@ class PolyakAverager:
             needs_layerwise,
         )
         return self._online._pool_backbone_out(
-            pool_encoder, session_out, prediction_indices, needs_layerwise
+            pool_encoder, session_out, head_output_indices, needs_layerwise
         )
 
     def update(self) -> None:

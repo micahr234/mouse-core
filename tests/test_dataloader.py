@@ -51,7 +51,7 @@ def _tokenizer(*, objective_fields: list[dict[str, str]] | None = None) -> Numer
     return NumericTokenizer(
         input_fields=[
             {"type": "discrete", "input_field": "action"},
-            {"type": "fourier", "input_field": "reward", "prediction": True},
+            {"type": "fourier", "input_field": "reward", "head_output": True},
         ],
         objective_fields=keep,
         grouping_field="grouping_id",
@@ -406,9 +406,9 @@ def test_dataloader_transform_returns_token_batch() -> None:
         assert int(tb.step_counts().sum()) == tb.N
         assert tb.N >= 2
         assert all(1 <= int(n) <= 3 for n in tb.step_counts())
-        embeds, prediction_indices = encoder(tb)
+        embeds, head_output_indices = encoder(tb)
         assert embeds.shape == (tb.L, 8)
-        assert prediction_indices.shape == (tb.N,)
+        assert head_output_indices.shape == (tb.N,)
         assert "sequence_id" in obj.keys()
     finally:
         loader.close()

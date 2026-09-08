@@ -31,12 +31,12 @@ class NumericTokenizerModalitySpec:
     ``input_field`` is the step key; ``output_field`` is the modality name
     (embedder alignment). Omitted ``output_field`` defaults to ``input_field``.
     Learnable modalities have no ``input_field``; set ``output_field`` to name
-    them (e.g. ``"prediction"``), else they are auto-named ``__learnable_<i>``.
+    them (e.g. ``"value"``), else they are auto-named ``__learnable_<i>``.
 
-    Exactly one input field must set ``prediction=True``: its tokens are the
-    step's **prediction tokens** — the positions the model reads Q / action
+    Exactly one input field must set ``head_output=True``: its tokens are the
+    step's **head-output tokens** — the positions the model reads Q / action
     outputs from. A step may emit several (e.g. ``learnable`` with
-    ``tokens > 1``); every step must emit at least one, so the prediction
+    ``tokens > 1``); every step must emit at least one, so the head-output
     field must not be skippable on any step.
     """
 
@@ -47,7 +47,7 @@ class NumericTokenizerModalitySpec:
     tokens: int | None = None
     skip: Any = None
     required: bool = True
-    prediction: bool = False
+    head_output: bool = False
 
     _VALID_TYPES: ClassVar[tuple[str, ...]] = (
         "discrete",
@@ -84,11 +84,11 @@ class NumericTokenizerModalitySpec:
 class TextTokenizerModalitySpec:
     """Modality for :class:`~mouse_core.data.text_tokenizer.TextTokenizer`.
 
-    Exactly one input field must set ``prediction=True``: the tokens it emits
-    are the step's prediction tokens (Q / action readout positions). A
-    ``text`` prediction field is tokenized as its own run so its token
-    boundaries are exact; every step must emit at least one prediction token,
-    so the prediction field must not be skippable on any step.
+    Exactly one input field must set ``head_output=True``: the tokens it emits
+    are the step's head-output tokens (Q / action readout positions). A
+    ``text`` head-output field is tokenized as its own run so its token
+    boundaries are exact; every step must emit at least one head-output token,
+    so the head-output field must not be skippable on any step.
     """
 
     type: str
@@ -97,7 +97,7 @@ class TextTokenizerModalitySpec:
     format: str | None = None
     skip: Any = None
     required: bool = True
-    prediction: bool = False
+    head_output: bool = False
 
     _VALID_TYPES: ClassVar[tuple[str, ...]] = ("text", "token", "image")
 

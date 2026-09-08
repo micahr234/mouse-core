@@ -25,13 +25,13 @@ def _io(*pairs: tuple[str, str]) -> list[dict[str, str]]:
 
 
 def _tok_in(
-    *names: str, type: str = "discrete", prediction: str | None = None
+    *names: str, type: str = "discrete", head_output: str | None = None
 ) -> list[dict]:
     return [
         {
             "type": type,
             "input_field": name,
-            **({"prediction": True} if name == prediction else {}),
+            **({"head_output": True} if name == head_output else {}),
         }
         for name in names
     ]
@@ -69,7 +69,7 @@ def test_selector_concat_matches_full() -> None:
 def test_selector_renames_before_tokenizer() -> None:
     selector = Selector(fields=_io(("act", "action"), ("obs", "observation"), ("task_index", "task_index")))
     tokenizer = NumericTokenizer(
-        input_fields=_tok_in("action", "observation", prediction="observation"),
+        input_fields=_tok_in("action", "observation", head_output="observation"),
         objective_fields=_io(("action", "action"), ("observation", "observation")),
         grouping_field="task_index",
     )
@@ -83,7 +83,7 @@ def test_selector_renames_before_tokenizer() -> None:
 
 def test_missing_objective_fields_key_raises() -> None:
     tokenizer = NumericTokenizer(
-        input_fields=_tok_in("action", prediction="action"),
+        input_fields=_tok_in("action", head_output="action"),
         objective_fields=_io(("action", "action"), ("old_log_prob", "old_log_prob")),
         grouping_field="task_index",
     )
@@ -101,7 +101,7 @@ def test_tokenizer_rejects_legacy_field_key() -> None:
 
 def test_tokenizer_output_defaults_to_input() -> None:
     tokenizer = NumericTokenizer(
-        input_fields=_tok_in("action", prediction="action"),
+        input_fields=_tok_in("action", head_output="action"),
         objective_fields=_io(("reward", "reward")),
         grouping_field="task_index",
     )
@@ -117,7 +117,7 @@ def test_tokenizer_renames_input_and_objective_fields() -> None:
                 "type": "discrete",
                 "input_field": "act",
                 "output_field": "action",
-                "prediction": True,
+                "head_output": True,
             },
         ],
         objective_fields=_io(("q", "info_q_star")),
@@ -134,7 +134,7 @@ def test_tokenizer_full_matches_per_step_concat() -> None:
         input_fields=[
             *_tok_in("action", "observation"),
             *_tok_in("reward", type="fourier"),
-            *_tok_in("episode_done", prediction="episode_done"),
+            *_tok_in("episode_done", head_output="episode_done"),
         ],
         objective_fields=_io(
             ("action", "action"),
@@ -154,7 +154,7 @@ def test_tokenizer_full_matches_per_step_concat() -> None:
     assert np.array_equal(full.ids, cat.ids)
     assert np.allclose(full.values, cat.values)
     assert np.array_equal(full.grouping_ids, cat.grouping_ids)
-    assert np.array_equal(full.prediction_indices, cat.prediction_indices)
+    assert np.array_equal(full.head_output_indices, cat.head_output_indices)
     for key in ("action", "observation", "reward", "episode_done", "task_done", "task_index"):
         assert torch.equal(full_obj[key], cat_obj[key])
 
@@ -175,7 +175,7 @@ def test_pipeline_without_augmenter_full_matches_head_plus_tail_tokens() -> None
         input_fields=[
             *_tok_in("action", "observation"),
             *_tok_in("reward", type="fourier"),
-            *_tok_in("episode_done", prediction="episode_done"),
+            *_tok_in("episode_done", head_output="episode_done"),
         ],
         objective_fields=_io(
             ("action", "action"),
@@ -195,4 +195,4 @@ def test_pipeline_without_augmenter_full_matches_head_plus_tail_tokens() -> None
     assert np.array_equal(full.modality_ids, cat.modality_ids)
     assert np.array_equal(full.ids, cat.ids)
     assert np.array_equal(full.grouping_ids, cat.grouping_ids)
-    assert np.array_equal(full.prediction_indices, cat.prediction_indices)
+    assert np.array_equal(full.head_output_indices, cat.head_output_indices)

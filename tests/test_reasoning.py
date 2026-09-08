@@ -24,15 +24,15 @@ from tests._token_batch_helpers import batch_to_token_batch, tok_from_encoder
 _HIDDEN = 32
 _ACTIONS = 4
 
-# Every step ends with a learnable "prediction" token (the action prompt):
+# Every step ends with a learnable "value" token (the action prompt):
 # the tokenizer emits modalities in list order, so it is each step's
-# prediction token and Q is read from it.
+# head-output token and Q is read from it.
 _MODALITIES = [
     {"type": "discrete", "field": "action", "vocab_size": _ACTIONS},
     {"type": "discrete", "field": "observation", "vocab_size": 16},
     {"type": "fourier", "field": "reward"},
     {"type": "discrete", "field": "episode_done", "vocab_size": 3},
-    {"type": "learnable", "field": "prediction", "tokens": 1},
+    {"type": "learnable", "field": "value", "tokens": 1},
 ]
 _TOKENS_PER_STEP = 5
 
@@ -79,14 +79,14 @@ def _token_batch(model: Model, batch: list[list[dict]]):
 _BATCH = [_rows(4), _rows(3, offset=1)]
 
 
-def test_prediction_modality_is_named() -> None:
+def test_value_modality_is_named() -> None:
     model = _tiny_model()
     batch = _token_batch(model, _BATCH)
-    assert "prediction" in batch.modality_names
-    assert "prediction" in dict(model.encoder._tables)  # type: ignore[union-attr]
-    # The prompt is each step's last token, so it is the prediction token.
-    assert batch.modality_ids[batch.prediction_indices].tolist() == (
-        [batch.modality_names.index("prediction")] * batch.N
+    assert "value" in batch.modality_names
+    assert "value" in dict(model.encoder._tables)  # type: ignore[union-attr]
+    # The prompt is each step's last token, so it is the head-output token.
+    assert batch.modality_ids[batch.head_output_indices].tolist() == (
+        [batch.modality_names.index("value")] * batch.N
     )
 
 
@@ -126,7 +126,7 @@ def test_plan_insertions_bookkeeping() -> None:
     assert plan.latent_positions.tolist() == [9, 10]
     expected_tokens = [i if i < 9 else i + 2 for i in range(batch.L)]
     assert plan.token_positions.tolist() == expected_tokens
-    assert plan.ext_prediction_indices.tolist() == [4, 11, 16, 21, 26, 31, 36]
+    assert plan.ext_head_output_indices.tolist() == [4, 11, 16, 21, 26, 31, 36]
     assert plan.ext_sequence_ids[9:11].tolist() == [0, 0]
     assert plan.ext_grouping_ids[9:11].tolist() == [0, 0]
     # Original ids land at their shifted positions.
@@ -146,8 +146,8 @@ def test_reasoning_extends_stream_and_shifts_predictions() -> None:
     assert averager_inputs.embeds.shape[0] == batch.L + 2 * 3
     assert averager_inputs.sequence_ids is not None
     assert averager_inputs.sequence_ids.shape[0] == batch.L + 6
-    assert averager_inputs.prediction_indices is not None
-    assert averager_inputs.prediction_indices.shape[0] == batch.N
+    assert averager_inputs.head_output_indices is not None
+    assert averager_inputs.head_output_indices.shape[0] == batch.N
     assert averager_inputs.token_indices is not None
     assert averager_inputs.token_indices.shape[0] == batch.L
 

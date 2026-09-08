@@ -117,7 +117,7 @@ def expand_embedder_numeric_spec(
     """Expand one spec into one spec per field name.
 
     Learnable specs without a ``field`` are auto-named ``__learnable_<i>``;
-    an explicit ``field`` (e.g. ``"prediction"``) is kept and must match the
+    an explicit ``field`` (e.g. ``"value"``) is kept and must match the
     tokenizer's ``output_field``. ``learnable_index`` is the ordinal among
     *learnable* specs (0 for the first learnable, 1 for the second, …). It
     must not depend on the position in the full list: the saved config stores

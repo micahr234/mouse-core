@@ -28,14 +28,14 @@ _DEFAULT_MODALITIES = [
 _DEFAULT_FORMAT = "<action={action},{observation},{reward},{episode_done}>"
 
 
-def _tokenizer_fields(modalities: list[dict], prediction: str = "action") -> list[dict]:
+def _tokenizer_fields(modalities: list[dict], head_output: str = "action") -> list[dict]:
     out: list[dict] = []
     for modality in modalities:
         data = dict(modality)
         if "field" in data:
             data["input_field"] = data.pop("field")
-        if data.get("input_field") == prediction:
-            data["prediction"] = True
+        if data.get("input_field") == head_output:
+            data["head_output"] = True
         out.append(data)
     return out
 
@@ -58,9 +58,9 @@ def _text_pair(hidden_dim: int = 8, **kwargs):
         "objective_fields",
         _obj("action", "observation", "reward", "episode_done", "task_done"),
     )
-    prediction = kwargs.pop("prediction", "action")
+    head_output = kwargs.pop("head_output", "action")
     tokenizer = TextTokenizer(
-        input_fields=_tokenizer_fields(modalities, prediction=prediction),
+        input_fields=_tokenizer_fields(modalities, head_output=head_output),
         format=format_str,
         tokenizer=hf_tok,
         image_processor=image_processor,
@@ -95,8 +95,8 @@ def test_text_embedder_skip_omits_value_keeps_commas() -> None:
     assert obj["action"].dtype == torch.int64
     assert obj["reward"].tolist() == [0.0, 1.0]
     assert embeds.ndim == 2 and embeds.shape[1] == 8
-    # Skips shorten step 0 relative to step 1; prediction indices point at
-    # each step's action token (the flagged prediction field).
+    # Skips shorten step 0 relative to step 1; head-output indices point at
+    # each step's action token (the flagged head-output field).
     import numpy as np
 
     st0 = tokenizer({**batch[0][0], "grouping_id": 0})
@@ -104,8 +104,8 @@ def test_text_embedder_skip_omits_value_keeps_commas() -> None:
     assert st0.T < st1.T
     assert embeds.shape[0] == st0.T + st1.T
     assert indices.tolist() == [
-        int(np.flatnonzero(st0.prediction_mask)[0]),
-        st0.T + int(np.flatnonzero(st1.prediction_mask)[0]),
+        int(np.flatnonzero(st0.head_output_mask)[0]),
+        st0.T + int(np.flatnonzero(st1.head_output_mask)[0]),
     ]
     seen: list[str] = []
 
@@ -192,7 +192,7 @@ def test_text_embedder_field_format_in_step_template() -> None:
         objective_fields=_obj("action"),
     )
     enc(batch_to_token_batch(tokenizer, [[{"observation": 3, "action": 2}]]))
-    # The flagged prediction field ("action") is tokenized as its own run so
+    # The flagged head-output field ("action") is tokenized as its own run so
     # its token boundaries are exact; the other fields stay merged.
     assert seen == ["<o=3|", "a=2", ">"]
 
@@ -214,14 +214,14 @@ def test_text_embedder_image_token_ids() -> None:
             {"type": 'image', "field": "pixels"},
         ],
         objective_fields=_obj("observation", "pixels"),
-        prediction="pixels",
+        head_output="pixels",
     )
     batch = [[{"observation": 3, "pixels": [1, 2, 3]}]]
     tb, obj = batch_to_packed(tokenizer, batch)
     embeds, indices = enc(tb)
     assert "pixels" in obj.keys()
     assert embeds.ndim == 2 and embeds.shape[1] == D
-    # "<3," (3 chars → 3 tokens), then the two image tokens (the prediction
+    # "<3," (3 chars → 3 tokens), then the two image tokens (the head-output
     # tokens), then the trailing ">" run.
     assert indices.tolist() == [3, 4]
     assert embeds.shape[0] == 6

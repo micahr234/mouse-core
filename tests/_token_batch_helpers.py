@@ -16,8 +16,8 @@ DEFAULT_GROUPING_FIELD = "grouping_id"
 def _tokenizer_input_fields_from_encoder(encoder) -> list[dict]:
     """Map embedder modality specs to tokenizer packing specs (by name).
 
-    The last modality is flagged ``prediction=True`` (tokenizers require
-    exactly one prediction field; tests list the readout modality last).
+    The last modality is flagged ``head_output=True`` (tokenizers require
+    exactly one head-output field; tests list the readout modality last).
     """
     out: list[dict] = []
     for m in encoder.modalities:
@@ -39,7 +39,7 @@ def _tokenizer_input_fields_from_encoder(encoder) -> list[dict]:
             entry["dim"] = data["dim"]
         out.append(entry)
     if out:
-        out[-1]["prediction"] = True
+        out[-1]["head_output"] = True
     return out
 
 

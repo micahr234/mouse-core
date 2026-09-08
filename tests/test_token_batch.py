@@ -11,7 +11,7 @@ from mouse_core.data import NumericTokenizer, pack_token_batch
 def _tok(**kwargs) -> NumericTokenizer:
     return NumericTokenizer(
         input_fields=[
-            {"type": "discrete", "input_field": "action", "prediction": True}
+            {"type": "discrete", "input_field": "action", "head_output": True}
         ],
         objective_fields=[{"input_field": "reward"}, {"input_field": "action"}],
         grouping_field="task_index",
@@ -42,7 +42,7 @@ def test_objective_column_stays_int_when_all_steps_are_int() -> None:
 def test_objective_vector_column_promotes_dtype() -> None:
     tok = NumericTokenizer(
         input_fields=[
-            {"type": "discrete", "input_field": "action", "prediction": True}
+            {"type": "discrete", "input_field": "action", "head_output": True}
         ],
         objective_fields=[{"input_field": "q"}],
         grouping_field="task_index",
@@ -59,7 +59,7 @@ def test_objective_vector_column_promotes_dtype() -> None:
 def test_objective_mixed_rank_raises() -> None:
     tok = NumericTokenizer(
         input_fields=[
-            {"type": "discrete", "input_field": "action", "prediction": True}
+            {"type": "discrete", "input_field": "action", "head_output": True}
         ],
         objective_fields=[{"input_field": "q"}],
         grouping_field="task_index",
@@ -75,7 +75,7 @@ def test_objective_mixed_rank_raises() -> None:
 def test_continuous_dim_mismatch_raises() -> None:
     tok = NumericTokenizer(
         input_fields=[
-            {"type": "continuous", "input_field": "obs", "dim": 3, "prediction": True}
+            {"type": "continuous", "input_field": "obs", "dim": 3, "head_output": True}
         ],
         objective_fields=[],
         grouping_field="task_index",
@@ -91,7 +91,7 @@ def test_continuous_dim_mismatch_raises() -> None:
 def test_skip_on_vector_modality_compares_elementwise() -> None:
     tok = NumericTokenizer(
         input_fields=[
-            {"type": "discrete", "input_field": "action", "prediction": True},
+            {"type": "discrete", "input_field": "action", "head_output": True},
             {"type": "continuous", "input_field": "obs", "dim": 2, "skip": 0.0},
         ],
         objective_fields=[],
@@ -101,7 +101,7 @@ def test_skip_on_vector_modality_compares_elementwise() -> None:
     assert tok({"action": 0, "obs": np.array([0.0, 1.0]), "task_index": 0}).T == 3
     tok_vec = NumericTokenizer(
         input_fields=[
-            {"type": "discrete", "input_field": "action", "prediction": True},
+            {"type": "discrete", "input_field": "action", "head_output": True},
             {"type": "continuous", "input_field": "obs", "dim": 2, "skip": [1.0, 2.0]},
         ],
         objective_fields=[],
@@ -133,8 +133,8 @@ def test_sequence_ids_out_of_range_rejected() -> None:
             modality_map=inputs.modality_map,
             sequence_ids=inputs.sequence_ids,
             grouping_ids=inputs.grouping_ids,
-            prediction_indices=inputs.prediction_indices,
-            prediction_steps=inputs.prediction_steps,
+            head_output_indices=inputs.head_output_indices,
+            head_output_steps=inputs.head_output_steps,
             grouping_field=inputs.grouping_field,
             B=1,
         )

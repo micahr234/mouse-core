@@ -65,33 +65,33 @@ def _boundary_discounts(
     return episode_gammas[episode_done] * task_gammas[task_done]
 
 
-def _prediction_layout(
+def _head_output_layout(
     objective_data: TensorDict,
     *,
     N: int,
     P: int,
     device: torch.device | str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Map prediction rows to steps: ``(step_of [P], last_rows [N])``.
+    """Map head-output rows to steps: ``(step_of [P], last_rows [N])``.
 
-    ``step_of[p]`` is the step of prediction row ``p``; ``last_rows[i]`` is
-    the row of step ``i``'s last prediction token (the bootstrap read). Reads
-    the ``prediction_count`` column stamped by ``pack_token_batch``; when the
-    column is absent every step must have exactly one prediction (``P == N``).
+    ``step_of[p]`` is the step of head-output row ``p``; ``last_rows[i]`` is
+    the row of step ``i``'s last head-output token (the bootstrap read). Reads
+    the ``head_output_count`` column stamped by ``pack_token_batch``; when the
+    column is absent every step must have exactly one head-output token (``P == N``).
     """
-    if "prediction_count" in objective_data.keys():
-        counts = objective_data["prediction_count"]
+    if "head_output_count" in objective_data.keys():
+        counts = objective_data["head_output_count"]
         if counts.dtype != torch.int64:
-            raise TypeError(f"prediction_count must be int64, got {counts.dtype}.")
+            raise TypeError(f"head_output_count must be int64, got {counts.dtype}.")
         if counts.shape != torch.Size([N]):
             raise ValueError(
-                f"prediction_count must have shape [{N}], got {tuple(counts.shape)}."
+                f"head_output_count must have shape [{N}], got {tuple(counts.shape)}."
             )
         if bool((counts < 1).any()):
-            raise ValueError("prediction_count entries must be >= 1.")
+            raise ValueError("head_output_count entries must be >= 1.")
         if int(counts.sum()) != P:
             raise ValueError(
-                f"prediction_count sums to {int(counts.sum())} but predictions "
+                f"head_output_count sums to {int(counts.sum())} but predictions "
                 f"have {P} rows; predictions and objective_data are misaligned."
             )
         counts = counts.to(device=device)
@@ -99,8 +99,8 @@ def _prediction_layout(
         if P != N:
             raise ValueError(
                 f"predictions have {P} rows for {N} steps but objective_data "
-                "has no prediction_count column; pack with pack_token_batch "
-                "or provide prediction_count."
+                "has no head_output_count column; pack with pack_token_batch "
+                "or provide head_output_count."
             )
         counts = torch.ones(N, dtype=torch.int64, device=device)
     step_of = torch.repeat_interleave(
@@ -176,13 +176,13 @@ class DqnObjective(Objective):
     ``averager(averager_inputs)``. The delayed tensor is detached before
     the Bellman target, so the TD error does not backprop through it.
 
-    Q rows are **per prediction token** (``[P, A]``), not per step: a step may
-    own several prediction tokens (tokenizer input field flagged
-    ``prediction=True`` emitting more than one token). The
-    ``prediction_count`` column stamped by ``pack_token_batch`` maps rows to
+    Q rows are **per head-output token** (``[P, A]``), not per step: a step may
+    own several head-output tokens (tokenizer input field flagged
+    ``head_output=True`` emitting more than one token). The
+    ``head_output_count`` column stamped by ``pack_token_batch`` maps rows to
     steps, so predictions and step fields can never misalign. Every
-    prediction row of step ``i`` trains toward the *same* TD target; the
-    bootstrap reads the *last* prediction row of step ``i+1`` (the most
+    head-output row of step ``i`` trains toward the *same* TD target; the
+    bootstrap reads the *last* head-output row of step ``i+1`` (the most
     informed one).
 
     A **run** is the same ``sequence_id`` and, when ``grouping_field`` is set
@@ -332,10 +332,10 @@ class DqnObjective(Objective):
             N=N,
         )
 
-        # A step may own several prediction tokens; every row of step i trains
+        # A step may own several head-output tokens; every row of step i trains
         # toward the same target, and the bootstrap reads step i+1's *last*
-        # prediction row.
-        step_of, last_rows = _prediction_layout(
+        # head-output row.
+        step_of, last_rows = _head_output_layout(
             objective_data, N=N, P=P, device=device
         )
 

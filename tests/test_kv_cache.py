@@ -270,7 +270,7 @@ def test_empty_first_chunk_then_real_rows_match_unbatched(backbone_cls) -> None:
 
 def test_concat_fusion_ragged_chunks_match_unbatched() -> None:
     """Ragged decode with concat fusion, per-modality token counts, and a
-    learnable prediction token — tokens_per_step comes from summing modality
+    learnable head-output token — tokens_per_step comes from summing modality
     blocks, and the mask must expand to exactly that many tokens per step."""
     torch.manual_seed(6)
     hidden_dim = 16

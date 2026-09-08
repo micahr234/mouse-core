@@ -69,15 +69,15 @@ def test_numeric_embedder_keeps_optional_missing_modality() -> None:
                 "type": "fourier",
                 "input_field": "reward",
                 "output_field": "reward",
-                "prediction": True,
+                "head_output": True,
             },
         ],
         grouping_field="grouping_id",
     )
     batch = _batch([{"reward": 0.5}])
-    embeds, prediction_indices = encoder(batch_to_token_batch(tokenizer, batch))
+    embeds, head_output_indices = encoder(batch_to_token_batch(tokenizer, batch))
     assert embeds.shape == (1, 8)
-    assert prediction_indices.shape == (1,)
+    assert head_output_indices.shape == (1,)
 
 
 def test_numeric_embedder_returns_objective_fields() -> None:
@@ -90,9 +90,9 @@ def test_numeric_embedder_returns_objective_fields() -> None:
     )
     batch = _batch([{"action": 2, "reward": 1.5}])
     tb, obj = batch_to_packed(_tok(encoder), batch)
-    embeds, prediction_indices = encoder(tb)
+    embeds, head_output_indices = encoder(tb)
     assert embeds.shape == (2, 8)
-    assert prediction_indices.tolist() == [1]
+    assert head_output_indices.tolist() == [1]
     assert obj["action"].item() == 2
     assert obj["reward"].item() == pytest.approx(1.5)
 
@@ -135,11 +135,11 @@ def test_numeric_embedder_batch_shape() -> None:
         for b in range(B)
     ]
     tb, obj = batch_to_packed(_tok(encoder), batch)
-    embeds, prediction_indices = encoder(tb)
+    embeds, head_output_indices = encoder(tb)
     assert embeds.shape == (B * S * 2, 8)
     assert obj["action"].shape == (B * S,)
     assert obj["reward"].shape == (B * S,)
-    assert prediction_indices.shape == (B * S,)
+    assert head_output_indices.shape == (B * S,)
 
 
 def test_numeric_embedder_concat_tokens_in_order() -> None:
@@ -151,11 +151,11 @@ def test_numeric_embedder_concat_tokens_in_order() -> None:
             {"type": "learnable", "tokens": 1},
         ],
     )
-    embeds, prediction_indices = encoder(
+    embeds, head_output_indices = encoder(
         _tb(encoder, _batch([{"action": 2, "reward": 1.5}]))
     )
     assert embeds.shape == (3, 8)
-    assert prediction_indices.tolist() == [2]
+    assert head_output_indices.tolist() == [2]
 
 
 def test_numeric_embedder_rejects_unknown_constructor_kwargs() -> None:
@@ -191,10 +191,10 @@ def test_numeric_embedder_continuous_one_token_per_scalar() -> None:
     )
     batch = [[{"obs": [0.1, 0.2, 0.3, 0.4], "reward": 1.0}]]
     tb, obj = batch_to_packed(_tok(encoder), batch)
-    embeds, prediction_indices = encoder(tb)
+    embeds, head_output_indices = encoder(tb)
     assert embeds.shape == (5, 8)
     assert obj["obs"].shape == (1, 4)
-    assert prediction_indices.tolist() == [4]
+    assert head_output_indices.tolist() == [4]
 
 
 def test_numeric_embedder_skip_shortens_step() -> None:
@@ -210,7 +210,7 @@ def test_numeric_embedder_skip_shortens_step() -> None:
         input_fields=[
             {"type": "discrete", "input_field": "action", "output_field": "action"},
             {"type": "fourier", "input_field": "reward", "output_field": "reward", "skip": 0.0},
-            {"type": "learnable", "tokens": 1, "prediction": True},
+            {"type": "learnable", "tokens": 1, "head_output": True},
         ],
         objective_fields=[
             {"input_field": "action", "output_field": "action"},
@@ -251,9 +251,9 @@ def test_numeric_embedder_prepare_token_batch() -> None:
     assert tb.B == 1 and int(tb.step_counts()[0]) == 2
     assert tb.L == 4
     assert list(tb.sequence_ids) == [0, 0, 0, 0]
-    embeds, prediction_indices = encoder(tb)
+    embeds, head_output_indices = encoder(tb)
     assert embeds.shape == (4, 8)
-    assert prediction_indices.shape == (2,)
+    assert head_output_indices.shape == (2,)
 
 
 def test_numeric_embedder_fourier_honors_per_modality_std() -> None:
@@ -269,7 +269,7 @@ def test_numeric_embedder_fourier_honors_per_modality_std() -> None:
     tokenizer = NumericTokenizer(
         input_fields=[
             {"type": "fourier", "input_field": "reward"},
-            {"type": "fourier", "input_field": "bonus", "prediction": True},
+            {"type": "fourier", "input_field": "bonus", "head_output": True},
         ],
         grouping_field="grouping_id",
     )
@@ -278,8 +278,14 @@ def test_numeric_embedder_fourier_honors_per_modality_std() -> None:
     tb = batch_to_token_batch(tokenizer, batch)
     embeds, _ = encoder(tb)
     names = tokenizer.modality_names
-    reward_emb = embeds[torch.from_numpy(tb.modality_ids == names.index("reward"))]
-    bonus_emb = embeds[torch.from_numpy(tb.modality_ids == names.index("bonus"))]
+    reward_emb = (
+        embeds[torch.from_numpy(tb.modality_ids == names.index("reward"))]
+        - encoder._type_vectors["reward"]
+    )
+    bonus_emb = (
+        embeds[torch.from_numpy(tb.modality_ids == names.index("bonus"))]
+        - encoder._type_vectors["bonus"]
+    )
     reward_rms = float(reward_emb.pow(2).mean().sqrt().item())
     bonus_rms = float(bonus_emb.pow(2).mean().sqrt().item())
     assert reward_rms == pytest.approx(0.02, abs=0.008)
@@ -314,6 +320,7 @@ def test_static_fourier_stays_fp32_under_bf16_cast() -> None:
 def test_numeric_embedder_bf16_keeps_fourier_precision() -> None:
     torch.manual_seed(0)
     fp32 = _enc(hidden_dim=64, modalities=[{"type": "fourier", "field": "reward"}])
+    torch.manual_seed(0)
     bf16 = _enc(hidden_dim=64, modalities=[{"type": "fourier", "field": "reward"}]).to(
         dtype=torch.bfloat16
     )
@@ -336,7 +343,7 @@ def test_numeric_embedder_extra_fields_in_objective_fields() -> None:
                 "type": "discrete",
                 "input_field": "action",
                 "output_field": "action",
-                "prediction": True,
+                "head_output": True,
             }
         ],
         objective_fields=[
@@ -371,7 +378,7 @@ def test_task_done_is_objective_field_not_input_field() -> None:
                 "type": "discrete",
                 "input_field": "episode_done",
                 "output_field": "episode_done",
-                "prediction": True,
+                "head_output": True,
             },
         ],
         objective_fields=[
@@ -388,3 +395,42 @@ def test_task_done_is_objective_field_not_input_field() -> None:
     assert obj["task_done"].tolist() == [2]
     embeds, _ = encoder(tb)
     assert embeds.shape == (2, 8)
+
+
+def test_numeric_embedder_adds_type_vector_to_discrete() -> None:
+    encoder = _enc(
+        hidden_dim=8,
+        modalities=[{"type": "discrete", "field": "action", "vocab_size": 4}],
+    )
+    tb = _tb(encoder, [[{"action": 2}]])
+    embeds, _ = encoder(tb)
+    content = encoder._tables["action"](torch.tensor([2]))
+    assert torch.allclose(embeds[0], content[0] + encoder._type_vectors["action"])
+
+
+def test_numeric_embedder_adds_type_vector_to_fourier() -> None:
+    encoder = _enc(hidden_dim=8, modalities=[{"type": "fourier", "field": "reward"}])
+    tb = _tb(encoder, [[{"reward": 1.5}]])
+    embeds, _ = encoder(tb)
+    feat = encoder.fourier(torch.tensor([1.5]), torch.tensor([0]))
+    assert torch.allclose(
+        embeds[0].float(), feat[0] + encoder._type_vectors["reward"]
+    )
+
+
+def test_numeric_embedder_type_vectors_are_per_modality() -> None:
+    encoder = _enc(
+        hidden_dim=8,
+        modalities=[
+            {"type": "discrete", "field": "action", "vocab_size": 4},
+            {"type": "discrete", "field": "observation", "vocab_size": 4},
+        ],
+    )
+    assert encoder._type_vectors["action"] is not encoder._type_vectors["observation"]
+    encoder._type_vectors["observation"].data.zero_()
+    tb = _tb(encoder, [[{"action": 1, "observation": 1}]])
+    embeds, _ = encoder(tb)
+    action_content = encoder._tables["action"](torch.tensor([1]))
+    obs_content = encoder._tables["observation"](torch.tensor([1]))
+    assert torch.allclose(embeds[0], action_content[0] + encoder._type_vectors["action"])
+    assert torch.allclose(embeds[1], obs_content[0])

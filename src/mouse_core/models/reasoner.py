@@ -4,8 +4,8 @@ A :class:`LatentReasoner` generates ``num_thoughts`` latent "thought" tokens
 at one sampled step per sequence during the training forward: the input
 embedding of thought ``r`` is the adapter applied to the backbone's output
 hidden state at the previous position. The latents are inserted immediately
-before the burst step's *first* prediction token (its action prompt), so
-every prediction token of that step — and every later token in the same
+before the burst step's *first* head-output token (its action prompt), so
+every head-output token of that step — and every later token in the same
 ``(sequence, grouping)`` run — attends to the thoughts. Generation happens
 on the autograd tape, so TD errors backpropagate through the latent chain
 into the backbone.
@@ -67,9 +67,9 @@ def sample_reasoning_splits(
     """
     rng = generator if generator is not None else np.random.default_rng()
     counts = batch.step_counts()
-    first_rows = _first_prediction_rows(batch)
+    first_rows = _first_head_output_rows(batch)
     step_groups = np.asarray(batch.grouping_ids, dtype=np.int64)[
-        np.asarray(batch.prediction_indices, dtype=np.int64)[first_rows]
+        np.asarray(batch.head_output_indices, dtype=np.int64)[first_rows]
     ]
     offsets = np.concatenate([np.zeros(1, dtype=np.int64), np.cumsum(counts)])
     splits = np.full(batch.B, -1, dtype=np.int64)
@@ -81,9 +81,9 @@ def sample_reasoning_splits(
     return splits
 
 
-def _first_prediction_rows(batch: TokenBatch) -> np.ndarray:
-    """Row index into ``prediction_indices`` of each step's first prediction token."""
-    psteps = np.asarray(batch.prediction_steps, dtype=np.int64)
+def _first_head_output_rows(batch: TokenBatch) -> np.ndarray:
+    """Row index into ``head_output_indices`` of each step's first head-output token."""
+    psteps = np.asarray(batch.head_output_steps, dtype=np.int64)
     if psteps.size == 0:
         return np.zeros(0, dtype=np.int64)
     first = np.ones(psteps.size, dtype=bool)
@@ -97,20 +97,20 @@ class _InsertionPlan:
 
     ``token_positions[i]`` is the extended-stream position of original token
     ``i``; ``latent_positions`` is burst-major ``[nb * R]``. Latents for burst
-    ``j`` sit immediately before that burst step's first prediction token,
+    ``j`` sit immediately before that burst step's first head-output token,
     which (like every later token) shifts right by ``R`` per earlier insertion.
     """
 
     num_thoughts: int
     burst_rows: np.ndarray  # [nb] sequence indices with a burst
     prefix_starts: np.ndarray  # [nb] first token index of each burst sequence
-    anchors: np.ndarray  # [nb] token index of each burst step's first prediction token
+    anchors: np.ndarray  # [nb] token index of each burst step's first head-output token
     latent_groups: np.ndarray  # [nb] grouping id assigned to the latents
     token_positions: np.ndarray  # [L] extended position of each original token
     latent_positions: np.ndarray  # [nb * R] extended positions of the latents
     ext_sequence_ids: np.ndarray  # [L_ext]
     ext_grouping_ids: np.ndarray  # [L_ext]
-    ext_prediction_indices: np.ndarray  # [P]
+    ext_head_output_indices: np.ndarray  # [P]
     ext_length: int
 
 
@@ -148,22 +148,22 @@ def _plan_insertions(
 
     R = int(num_thoughts)
     L = batch.L
-    pred = np.asarray(batch.prediction_indices, dtype=np.int64)
+    pred = np.asarray(batch.head_output_indices, dtype=np.int64)
     seq = np.asarray(batch.sequence_ids, dtype=np.int64)
     group = np.asarray(batch.grouping_ids, dtype=np.int64)
     offsets = np.concatenate([np.zeros(1, dtype=np.int64), np.cumsum(counts)])
 
-    # Anchor = the burst step's *first* prediction token (its action prompt),
-    # so every prediction token of the step attends to the latents. Latents
+    # Anchor = the burst step's *first* head-output token (its action prompt),
+    # so every head-output token of the step attends to the latents. Latents
     # are inserted immediately before it. Anchors are strictly increasing
     # because sequences occupy contiguous, ordered token blocks.
-    first_rows = _first_prediction_rows(batch)
+    first_rows = _first_head_output_rows(batch)
     anchors = pred[first_rows[offsets[burst_rows] + splits[burst_rows]]]
     prefix_starts = np.searchsorted(seq, burst_rows, side="left")
     if bool(np.any(anchors == prefix_starts)):
         b = int(burst_rows[int(np.flatnonzero(anchors == prefix_starts)[0])])
         raise ValueError(
-            f"burst step in sequence {b} has no tokens before its prediction "
+            f"burst step in sequence {b} has no tokens before its head-output "
             "token; latent generation needs at least one preceding token."
         )
 
@@ -184,7 +184,7 @@ def _plan_insertions(
     ext_grouping_ids = np.zeros(ext_length, dtype=np.int64)
     ext_grouping_ids[token_positions] = group
     ext_grouping_ids[latent_positions] = np.repeat(latent_groups, R)
-    ext_prediction_indices = pred + R * np.searchsorted(anchors, pred, side="right")
+    ext_head_output_indices = pred + R * np.searchsorted(anchors, pred, side="right")
 
     return _InsertionPlan(
         num_thoughts=R,
@@ -196,6 +196,6 @@ def _plan_insertions(
         latent_positions=latent_positions,
         ext_sequence_ids=ext_sequence_ids,
         ext_grouping_ids=ext_grouping_ids,
-        ext_prediction_indices=ext_prediction_indices,
+        ext_head_output_indices=ext_head_output_indices,
         ext_length=ext_length,
     )

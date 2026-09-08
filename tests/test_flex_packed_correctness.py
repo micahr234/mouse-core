@@ -113,9 +113,9 @@ def test_prepare_sequence_id_col_matches_step_counts() -> None:
     assert list(tb.step_counts()) == [5, 3]
     assert objective_data['sequence_id'].tolist() == [0, 0, 0, 0, 0, 1, 1, 1]
     assert objective_data['grouping_id'].tolist() == [0] * 8
-    assert tb.prediction_indices.shape == (8,)
-    assert list(tb.sequence_ids[tb.prediction_indices]).count(0) == 5
-    assert list(tb.sequence_ids[tb.prediction_indices]).count(1) == 3
+    assert tb.head_output_indices.shape == (8,)
+    assert list(tb.sequence_ids[tb.head_output_indices]).count(0) == 5
+    assert list(tb.sequence_ids[tb.head_output_indices]).count(1) == 3
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='Flex packed path is CUDA-only')
 def test_flex_packed_matches_sdpa_document_mask() -> None:
@@ -183,7 +183,7 @@ def test_model_flex_forward_stable_under_sequence_isolation() -> None:
     assert torch.allclose(q0[3:], q1[3:], atol=1e-05, rtol=1e-05)
     assert not torch.allclose(q0[:3], q1[:3], atol=1e-05, rtol=1e-05)
     assert tb.N == 6
-    assert list(tb.sequence_ids[tb.prediction_indices]) == [0, 0, 0, 1, 1, 1]
+    assert list(tb.sequence_ids[tb.head_output_indices]) == [0, 0, 0, 1, 1, 1]
 
 def test_model_train_isolates_tasks_within_sequence() -> None:
     """Packed train forward on a two-task window matches a single-task suffix forward."""

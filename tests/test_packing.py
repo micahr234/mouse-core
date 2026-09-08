@@ -8,8 +8,8 @@ def test_left_align_content_shifts_indices() -> None:
     embeds[0, 0] = 1.0
     embeds[0, 1] = 2.0
     embeds[0, 2] = 3.0
-    prediction_indices = torch.tensor([[2]])
-    aligned, aligned_indices = left_align_content(embeds, prediction_indices)
+    head_output_indices = torch.tensor([[2]])
+    aligned, aligned_indices = left_align_content(embeds, head_output_indices)
     assert aligned_indices.tolist() == [[4]]
     assert torch.allclose(aligned[0, 2], torch.tensor([1.0, 1.0]))
     assert torch.allclose(aligned[0, 3], torch.tensor([2.0, 2.0]))

@@ -8,22 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- Explicit prediction tokens. Exactly one tokenizer input field (numeric or
-  text) must set ``prediction: True``; the tokens it emits are the step's
-  **prediction tokens** — the positions the model reads Q / action outputs
-  from. Every step must emit at least one (the prediction field must never
+- Explicit head-output tokens. Exactly one tokenizer input field (numeric or
+  text) must set ``head_output: True``; the tokens it emits are the step's
+  **head-output tokens** — the positions the heads read Q / action outputs
+  from. Every step must emit at least one (the head-output field must never
   be skipped), and a step may emit several (e.g. ``learnable`` with
   ``tokens > 1``, or a multi-token text field). ``StepTokens`` carries a
-  per-token ``prediction_mask``; ``TokenBatch.prediction_indices`` lists all
-  ``P >= N`` prediction tokens with a parallel ``prediction_steps`` row→step
-  map, and ``pack_token_batch`` stamps a ``prediction_count`` column into
-  ``objective_data`` so predictions and step fields can never misalign.
-  Training predictions are flat ``[P, ...]`` (one row per prediction token);
-  ``DqnObjective`` and ``LayerwiseDqnObjective`` train every prediction row
+  per-token ``head_output_mask``; ``TokenBatch.head_output_indices`` lists all
+  ``P >= N`` head-output tokens with a parallel ``head_output_steps`` row→step
+  map, and ``pack_token_batch`` stamps a ``head_output_count`` column into
+  ``objective_data`` so head rows and step fields can never misalign.
+  Training predictions are flat ``[P, ...]`` (one row per head-output token);
+  ``DqnObjective`` and ``LayerwiseDqnObjective`` train every head-output row
   of step ``i`` toward the same TD target and bootstrap from step ``i+1``'s
-  last prediction row. Cached decode pools each step's last prediction
-  token. A ``text`` prediction field is tokenized as its own run so its
+  last head-output row. Cached decode pools each step's last head-output
+  token. A ``text`` head-output field is tokenized as its own run so its
   token boundaries are exact.
+- ``NumericEmbedder`` adds a per-modality learnable type vector of shape
+  ``[D]`` to every token's content embedding (discrete lookup, Fourier
+  features, image ids, and learnable slots). Init uses that modality's
+  ``std``.
 - Coconut-style latent reasoning. ``LatentReasoner(hidden_dim=, num_thoughts=)``
   is an optional fourth model section (``Model(reasoner=...)``, saved and
   loaded with the checkpoint): a LayerNorm + Linear adapter that maps the
@@ -32,7 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (training only) takes a ``[B]`` array of per-sequence burst step indices
   (``-1`` skips a row), generates ``num_thoughts`` thought embeddings per
   burst on the autograd tape, and inserts them immediately before the burst
-  step's first prediction token, so the Q readout and all later same-run
+  step's first head-output token, so the Q readout and all later same-run
   tokens attend to them and TD errors backpropagate through the latent chain.
   Generation costs ``num_thoughts + 1`` backbone passes per batch.
   ``sample_reasoning_splits(batch, generator)`` picks one burst step per
@@ -45,8 +49,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Unnamed learnables keep the ``__learnable_<i>`` auto-name.
 - ``examples/12_train_offline_reasoning_dqn.ipynb``: same offline DQN loop
   as ``02``, with a trailing ``learnable`` action-prompt token named
-  ``prediction`` on every step (Q is read from it) and per-batch latent
-  reasoning bursts via ``LatentReasoner`` + ``sample_reasoning_splits``.
+  ``value`` on every step (flagged ``head_output: True``; Q is read from it)
+  and per-batch latent reasoning bursts via ``LatentReasoner`` +
+  ``sample_reasoning_splits``.
 - ``AdamW.zero_grad`` and ``AdamWFp32.zero_grad`` accept ``set_to_none``
   (default ``True``), matching ``torch.optim.Optimizer.zero_grad``.
   ``AdamWFp32`` also clears fp32 master grads.
@@ -83,7 +88,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ``StepTokens``: tokenizer output for one step (token arrays + scalar
   ``grouping_id`` + ``objective_fields``). ``pack_token_batch(...)`` builds a
   ``TokenBatch`` from many steps (assigns ``sequence_ids``, expands
-  ``grouping_ids``, computes ``prediction_indices``).
+  ``grouping_ids``, computes ``head_output_indices``).
 - ``Augmenter.reseed()`` advances the draw generation so every ``seed_field``
   key gets a new permute/scale/shift set (stable within a generation).
   ``compose(...).reseed()`` forwards to stages that define ``reseed``;
@@ -121,6 +126,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``grouping_field: str | None = None`` (``None`` ⇒ no grouping filter).
 
 ### Changed
+- Readout tokens are ``head_output`` tokens: tokenizer flag
+  ``head_output: True``, ``StepTokens.head_output_mask``,
+  ``TokenBatch.head_output_indices`` / ``head_output_steps``, and
+  ``objective_data["head_output_count"]``. The unreleased ``prediction*``
+  names are gone. Head-emitted tensors stay ``predictions``.
 - ``Model.head(h=...)`` takes one pooled tensor. Pooled head input from
   ``forward`` is ``averager_inputs.h`` (last-layer ``[N, D]``, or stacked
   layers ``[N, L, D]`` when a layerwise Q head is enabled). ``h_layers``
@@ -358,9 +368,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``encode_hf_rows`` reference is gone.
 
 ### Removed
-- Implicit "last token of each step is the prediction token" rule. Prediction
+- Implicit "last token of each step is the head-output token" rule. Head-output
   positions now come only from the tokenizer input field flagged
-  ``prediction: True``; tokenizers without exactly one flagged field raise.
+  ``head_output: True``; tokenizers without exactly one flagged field raise.
 - ``TextTokenizer.MODALITY_TEXT`` / ``MODALITY_VISION`` integer constants.
   They were wrong whenever only an image modality was declared (vision was
   local index 0); resolve indices via ``StepTokens.modality_names``.
