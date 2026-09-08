@@ -51,7 +51,7 @@ def _tokenizer(*, objective_fields: list[dict[str, str]] | None = None) -> Numer
     return NumericTokenizer(
         input_fields=[
             {"type": "discrete", "input_field": "action"},
-            {"type": "fourier", "input_field": "reward"},
+            {"type": "fourier", "input_field": "reward", "prediction": True},
         ],
         objective_fields=keep,
         grouping_field="grouping_id",

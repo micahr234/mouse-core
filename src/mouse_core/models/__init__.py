@@ -15,6 +15,7 @@ from mouse_core.models.heads import (
     DiscreteActionValueHead,
     LayerwiseDiscreteActionValueHead,
 )
+from mouse_core.models.reasoner import LatentReasoner, sample_reasoning_splits
 from mouse_core.polyak import PolyakAverager
 from mouse_core.data.token_batch import TokenBatch
 from mouse_core.models.embedding.embedding import Encoder, NumericEmbedder
@@ -39,7 +40,9 @@ __all__ = [
     "IdentityBackbone",
     "BaseHead",
     "HeadSpec",
+    "LatentReasoner",
     "PolyakAverager",
+    "sample_reasoning_splits",
     "SwiGLUHead",
     "DiscreteActionHead",
     "DiscreteActionValueHead",

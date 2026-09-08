@@ -28,12 +28,14 @@ _DEFAULT_MODALITIES = [
 _DEFAULT_FORMAT = "<action={action},{observation},{reward},{episode_done}>"
 
 
-def _tokenizer_fields(modalities: list[dict]) -> list[dict]:
+def _tokenizer_fields(modalities: list[dict], prediction: str = "action") -> list[dict]:
     out: list[dict] = []
     for modality in modalities:
         data = dict(modality)
         if "field" in data:
             data["input_field"] = data.pop("field")
+        if data.get("input_field") == prediction:
+            data["prediction"] = True
         out.append(data)
     return out
 
@@ -56,8 +58,9 @@ def _text_pair(hidden_dim: int = 8, **kwargs):
         "objective_fields",
         _obj("action", "observation", "reward", "episode_done", "task_done"),
     )
+    prediction = kwargs.pop("prediction", "action")
     tokenizer = TextTokenizer(
-        input_fields=_tokenizer_fields(modalities),
+        input_fields=_tokenizer_fields(modalities, prediction=prediction),
         format=format_str,
         tokenizer=hf_tok,
         image_processor=image_processor,
@@ -92,10 +95,18 @@ def test_text_embedder_skip_omits_value_keeps_commas() -> None:
     assert obj["action"].dtype == torch.int64
     assert obj["reward"].tolist() == [0.0, 1.0]
     assert embeds.ndim == 2 and embeds.shape[1] == 8
-    c0 = int(indices[0].item()) + 1
-    c1 = int(indices[1].item()) - int(indices[0].item())
-    assert c0 < c1
-    assert embeds.shape[0] == c0 + c1
+    # Skips shorten step 0 relative to step 1; prediction indices point at
+    # each step's action token (the flagged prediction field).
+    import numpy as np
+
+    st0 = tokenizer({**batch[0][0], "grouping_id": 0})
+    st1 = tokenizer({**batch[0][1], "grouping_id": 0})
+    assert st0.T < st1.T
+    assert embeds.shape[0] == st0.T + st1.T
+    assert indices.tolist() == [
+        int(np.flatnonzero(st0.prediction_mask)[0]),
+        st0.T + int(np.flatnonzero(st1.prediction_mask)[0]),
+    ]
     seen: list[str] = []
 
     class _CaptureTok:
@@ -181,7 +192,9 @@ def test_text_embedder_field_format_in_step_template() -> None:
         objective_fields=_obj("action"),
     )
     enc(batch_to_token_batch(tokenizer, [[{"observation": 3, "action": 2}]]))
-    assert seen == ["<o=3|a=2>"]
+    # The flagged prediction field ("action") is tokenized as its own run so
+    # its token boundaries are exact; the other fields stay merged.
+    assert seen == ["<o=3|", "a=2", ">"]
 
 
 def test_text_embedder_image_token_ids() -> None:
@@ -201,13 +214,17 @@ def test_text_embedder_image_token_ids() -> None:
             {"type": 'image', "field": "pixels"},
         ],
         objective_fields=_obj("observation", "pixels"),
+        prediction="pixels",
     )
     batch = [[{"observation": 3, "pixels": [1, 2, 3]}]]
     tb, obj = batch_to_packed(tokenizer, batch)
     embeds, indices = enc(tb)
     assert "pixels" in obj.keys()
     assert embeds.ndim == 2 and embeds.shape[1] == D
-    assert int(indices[0].item()) + 1 == embeds.shape[0]
+    # "<3," (3 chars → 3 tokens), then the two image tokens (the prediction
+    # tokens), then the trailing ">" run.
+    assert indices.tolist() == [3, 4]
+    assert embeds.shape[0] == 6
 
 
 def test_text_embedder_save_load(tmp_path) -> None:

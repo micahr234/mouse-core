@@ -45,7 +45,7 @@ class Encoder(nn.Module, ABC):
     def forward(
         self, token_batch: TokenBatch
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Embed ``TokenBatch`` → ``(embeds [L, D], prediction_indices [N])``."""
+        """Embed ``TokenBatch`` → ``(embeds [L, D], prediction_indices [P])``."""
         ...
 
     @abstractmethod
@@ -53,7 +53,8 @@ class Encoder(nn.Module, ABC):
         """Gather prediction tokens → ``[N, D]`` (train) or ``[B, S, D]`` (decode).
 
         ``h`` is ``[L, D]`` (flat packed) or ``[B, L, D]`` (decode).
-        Train: ``prediction_indices`` is ``[N]`` absolute indices into ``0 .. L-1``.
+        Train: ``prediction_indices`` is ``[P]`` absolute indices into ``0 .. L-1``
+        (one per prediction token; a step may own several).
         Decode: ``prediction_indices`` is ``[B, S]`` into the token axis of ``h``.
         """
         ...

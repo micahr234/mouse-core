@@ -210,9 +210,30 @@ class PolyakAverager:
         *,
         delay_encoder: bool,
     ) -> torch.Tensor:
+        reasoned = averager_inputs.token_indices is not None
         if delay_encoder:
             assert self.encoder is not None
-            embeds, prediction_indices = self.encoder(averager_inputs.batch)
+            enc_embeds, enc_prediction_indices = self.encoder(averager_inputs.batch)
+            if reasoned:
+                # Reasoning forward: re-encode the real tokens with the delayed
+                # encoder and splice them into the extended stream; the latent
+                # slots keep the detached online-generated embeds.
+                if (
+                    averager_inputs.embeds is None
+                    or averager_inputs.prediction_indices is None
+                ):
+                    raise ValueError(
+                        "Delayed encoder on a reasoning forward needs "
+                        "AveragerInputs.embeds from model(inputs, reasoning=...)."
+                    )
+                assert averager_inputs.token_indices is not None
+                embeds = averager_inputs.embeds.index_copy(
+                    0, averager_inputs.token_indices, enc_embeds
+                )
+                prediction_indices = averager_inputs.prediction_indices
+            else:
+                embeds = enc_embeds
+                prediction_indices = enc_prediction_indices
             pool_encoder = self.encoder
         else:
             if (
@@ -226,7 +247,16 @@ class PolyakAverager:
             embeds = averager_inputs.embeds
             prediction_indices = averager_inputs.prediction_indices
             pool_encoder = self._online.encoder
-        t = averager_inputs.batch.to_tensors(embeds.device)
+        if (
+            averager_inputs.sequence_ids is not None
+            and averager_inputs.grouping_ids is not None
+        ):
+            sequence_ids = averager_inputs.sequence_ids
+            grouping_ids = averager_inputs.grouping_ids
+        else:
+            t = averager_inputs.batch.to_tensors(embeds.device)
+            sequence_ids = t["sequence_ids"]
+            grouping_ids = t["grouping_ids"]
         backbone = (
             self.backbone if self.backbone is not None else self._online.backbone
         )
@@ -234,8 +264,8 @@ class PolyakAverager:
         session_out = self._online._train_backbone_forward(
             backbone,
             embeds,
-            t["sequence_ids"],
-            t["grouping_ids"],
+            sequence_ids,
+            grouping_ids,
             needs_layerwise,
         )
         return self._online._pool_backbone_out(

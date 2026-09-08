@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import json
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -20,6 +21,7 @@ from mouse_core.models.heads.discrete_action import DiscreteActionHead
 from mouse_core.models.heads.dqn import DiscreteActionValueHead
 from mouse_core.models.heads.layerwise_dqn import LayerwiseDiscreteActionValueHead
 from mouse_core.models.heads.swiglu import SwiGLUHead
+from mouse_core.models.reasoner import LatentReasoner, _InsertionPlan, _plan_insertions
 
 if TYPE_CHECKING:
     from mouse_core.data.token_batch import TokenBatch
@@ -149,6 +151,12 @@ def _write_model_card(
     config = _model_config(model)
     heads = config["heads"]["heads"]
     head_names = ", ".join(head["name"] for head in heads) or "none"
+    reasoner_cfg = config.get("reasoner")
+    reasoner_line = (
+        f"\n- Latent reasoner: `num_thoughts={reasoner_cfg['num_thoughts']}`"
+        if reasoner_cfg
+        else ""
+    )
     modalities = config["encoder"]["kwargs"].get("modalities", [])
     modality_table = _model_card_modality_table(modalities)
     objective_data_example = _model_card_step_stream_example(modalities)
@@ -168,7 +176,7 @@ This repository contains a MOUSE model checkpoint.
 - Backbone: `{config["backbone"]["type"]}`
 - Hidden dimension: `{config["hidden_dim"]}`
 - Heads: `{head_names}`
-- Action head: `{config["heads"]["action_head"]}`
+- Action head: `{config["heads"]["action_head"]}`{reasoner_line}
 
 ### Encoder
 
@@ -211,7 +219,8 @@ saved model.
 from mouse_core.data import NumericTokenizer, compose, pack_token_batch
 
 tokenizer = NumericTokenizer(
-    input_fields=[...],  # input_field=; optional output_field= matches embedder field=
+    input_fields=[...],  # input_field=; optional output_field= matches embedder field=;
+                         # flag exactly one field prediction=True (the Q readout tokens)
     objective_fields=[
         {{"input_field": "action"}},
         {{"input_field": "reward"}},
@@ -342,13 +351,16 @@ def _model_card_field_example(modality: dict[str, Any]) -> str:
 
 
 def _model_config(model: "Model") -> dict[str, Any]:
-    return {
+    config: dict[str, Any] = {
         "format": "mouse-core-model-v1",
         "hidden_dim": int(model.hidden_dim),
         "encoder": _encoder_config(model.encoder),
         "backbone": _backbone_config(model.backbone),
         "heads": _heads_config(model),
     }
+    if model.reasoner is not None:
+        config["reasoner"] = {"num_thoughts": int(model.reasoner.num_thoughts)}
+    return config
 
 
 def _encoder_config(encoder: Encoder) -> dict[str, Any]:
@@ -538,11 +550,21 @@ def _build_model_from_config(config: dict[str, Any]) -> "Model":
     backbone = _build_backbone_from_config(config["backbone"])
     heads_cfg = config["heads"]
     heads = _build_heads_from_config(heads_cfg["heads"])
+    reasoner_cfg = config.get("reasoner")
+    reasoner = (
+        LatentReasoner(
+            hidden_dim=int(config["hidden_dim"]),
+            num_thoughts=int(reasoner_cfg["num_thoughts"]),
+        )
+        if reasoner_cfg is not None
+        else None
+    )
     return Model(
         encoder=encoder,
         backbone=backbone,
         heads=heads,
         action_head=heads_cfg.get("action_head"),
+        reasoner=reasoner,
     )
 
 
@@ -667,6 +689,14 @@ class AveragerInputs:
     Incremental decode uses ``cache`` (or pass this object back as
     ``cache=``). Activations are detached so gradients cannot flow back
     through the averager.
+
+    A reasoning forward (``Model.forward(reasoning=...)``) fills the
+    extended-stream fields: ``embeds`` / ``prediction_indices`` describe the
+    stream *with latents inserted*, ``sequence_ids`` / ``grouping_ids`` are
+    its per-token ids, and ``token_indices`` maps each original batch token
+    to its extended position (a delayed encoder re-encodes the batch and is
+    spliced back in at those positions; the latents stay as the detached
+    online-generated embeds).
     """
 
     h: torch.Tensor
@@ -675,6 +705,9 @@ class AveragerInputs:
     embeds: torch.Tensor | None = None
     prediction_indices: torch.Tensor | None = None
     predictions: TensorDict | None = None
+    sequence_ids: torch.Tensor | None = None
+    grouping_ids: torch.Tensor | None = None
+    token_indices: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         self.h = self.h.detach()
@@ -815,10 +848,13 @@ class Model(nn.Module):
         backbone: Backbone,
         heads: BaseHead | list[BaseHead] | Mapping[str, BaseHead | None] | None = None,
         action_head: str | None = None,
+        reasoner: LatentReasoner | None = None,
     ):
         """Construct a Model from three independent pieces.
 
-        This is the *only* supported construction path.
+        This is the *only* supported construction path. ``reasoner`` is an
+        optional fourth section enabling Coconut-style latent reasoning via
+        ``forward(batch, reasoning=...)``.
         """
         super().__init__()
 
@@ -840,6 +876,18 @@ class Model(nn.Module):
 
         self.encoder: Encoder = encoder
         self.backbone: Backbone = backbone
+
+        if reasoner is not None:
+            if not isinstance(reasoner, LatentReasoner):
+                raise TypeError(
+                    f"reasoner must be a LatentReasoner, got {type(reasoner).__name__}."
+                )
+            if enc_dim is not None and reasoner.hidden_dim != enc_dim:
+                raise ValueError(
+                    f"hidden_dim mismatch between reasoner ({reasoner.hidden_dim}) "
+                    f"and encoder ({enc_dim})."
+                )
+        self.reasoner: LatentReasoner | None = reasoner
 
         if heads is None:
             raise TypeError("Model requires heads (a BaseHead, list of heads, or dict of named heads).")
@@ -925,6 +973,8 @@ class Model(nn.Module):
             common["memory_format"] = memory_format
         self.encoder.to(dtype=dtype, **common)
         self.backbone.to(dtype=dtype, **common)
+        if self.reasoner is not None:
+            self.reasoner.to(dtype=dtype, **common)
         self.heads.to(dtype=torch.float32, **common)
         return self
 
@@ -1010,6 +1060,89 @@ class Model(nn.Module):
         h = cast(torch.Tensor, session_out)
         return encoder.pool_step_reprs(h, prediction_indices)
 
+    def _generate_latents(
+        self,
+        *,
+        embeds: torch.Tensor,
+        sequence_ids: torch.Tensor,
+        grouping_ids: torch.Tensor,
+        plan: _InsertionPlan,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Generate latent thoughts on the autograd tape and assemble the extended stream.
+
+        Runs ``R`` extra backbone passes over the growing per-burst prefixes
+        (all bursts in lockstep; attention isolation makes dropping the other
+        sequences exact). Thought ``r``'s input embedding is the reasoner
+        adapter applied to the backbone output at the previous position, so
+        gradients flow through the whole latent chain. Returns
+        ``(ext_embeds, ext_sequence_ids, ext_grouping_ids,
+        ext_prediction_indices, token_indices)`` where ``token_indices`` maps
+        each original token to its extended-stream position.
+        """
+        reasoner = self.reasoner
+        assert reasoner is not None
+        R = plan.num_thoughts
+        device = embeds.device
+        nb = int(plan.burst_rows.size)
+
+        prefix_bounds = list(
+            zip(plan.prefix_starts.tolist(), plan.anchors.tolist())
+        )
+        thoughts: list[torch.Tensor] = []  # thought r → [nb, D]
+        for r in range(R):
+            parts: list[torch.Tensor] = []
+            seq_parts: list[torch.Tensor] = []
+            group_parts: list[torch.Tensor] = []
+            last_positions: list[int] = []
+            offset = 0
+            for j, (start, anchor) in enumerate(prefix_bounds):
+                parts.append(embeds[start:anchor])
+                seq_parts.append(sequence_ids[start:anchor])
+                group_parts.append(grouping_ids[start:anchor])
+                if r > 0:
+                    parts.append(torch.stack([thoughts[q][j] for q in range(r)]))
+                    seq_parts.append(
+                        sequence_ids.new_full((r,), int(plan.burst_rows[j]))
+                    )
+                    group_parts.append(
+                        grouping_ids.new_full((r,), int(plan.latent_groups[j]))
+                    )
+                block = (anchor - start) + r
+                last_positions.append(offset + block - 1)
+                offset += block
+            gen_out = self._train_backbone_forward(
+                self.backbone,
+                torch.cat(parts),
+                torch.cat(seq_parts),
+                torch.cat(group_parts),
+                False,
+            )
+            h_last = cast(torch.Tensor, gen_out)[
+                torch.as_tensor(last_positions, device=device)
+            ]
+            thoughts.append(reasoner(h_last))
+
+        latent_embeds = torch.stack(thoughts, dim=1).reshape(nb * R, embeds.shape[-1])
+        token_indices = torch.as_tensor(plan.token_positions, device=device)
+        latent_indices = torch.as_tensor(plan.latent_positions, device=device)
+        ext_embeds = (
+            embeds.new_zeros(plan.ext_length, embeds.shape[-1])
+            .index_copy(0, token_indices, embeds)
+            .index_copy(0, latent_indices, latent_embeds)
+        )
+        ext_sequence_ids = torch.as_tensor(plan.ext_sequence_ids, device=device)
+        ext_grouping_ids = torch.as_tensor(plan.ext_grouping_ids, device=device)
+        ext_prediction_indices = torch.as_tensor(
+            plan.ext_prediction_indices, device=device
+        )
+        return (
+            ext_embeds,
+            ext_sequence_ids,
+            ext_grouping_ids,
+            ext_prediction_indices,
+            token_indices,
+        )
+
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
@@ -1019,6 +1152,7 @@ class Model(nn.Module):
         batch: TokenBatch,
         cache: dict[str, Any] | AveragerInputs | None = None,
         use_cache: bool = False,
+        reasoning: Sequence[int] | np.ndarray | None = None,
     ) -> tuple[TensorDict, AveragerInputs]:
         """Run a full forward pass over a :class:`TokenBatch`.
 
@@ -1030,13 +1164,27 @@ class Model(nn.Module):
         (optionally ragged; empty-only batches raise). Pass the returned
         :class:`AveragerInputs` (or its ``.cache``) back as ``cache=``.
 
+        ``reasoning`` (training only, requires ``Model(reasoner=...)``) is a
+        ``[B]`` array of local step indices from
+        :func:`~mouse_core.models.reasoner.sample_reasoning_splits`
+        (``-1`` skips a row). For each selected step the model generates
+        ``reasoner.num_thoughts`` latent thought embeddings on the autograd
+        tape — each thought's input is the reasoner adapter applied to the
+        backbone output at the previous position — and inserts them
+        immediately before that step's first prediction token, so the Q
+        readout and all later same-run tokens attend to them. Predictions
+        keep the flat ``[P, ...]`` contract; the returned
+        :class:`AveragerInputs` describes the extended stream.
+
         Training attention uses FlexAttention over the flat concatenated token
         stream (causal within the same ``(sequence_id, grouping_id)`` run). Cached
         decode keeps ``FlexDecodeSession`` with per-sequence KV caches and the
         same grouping-id isolation.
 
-        Predictions are flat over steps (``N`` steps) for training; cached
-        decode returns rectangular ``[B, S]`` tensors.
+        Training predictions are flat over prediction tokens (``[P, ...]``,
+        one row per prediction token; ``objective_data["prediction_count"]``
+        maps rows to steps). Cached decode returns rectangular ``[B, S]``
+        tensors pooled at each step's last prediction token.
         """
         from mouse_core.data.token_batch import TokenBatch as _TokenBatch
 
@@ -1060,8 +1208,23 @@ class Model(nn.Module):
         if use_cache and B > 0 and N == 0:
             raise ValueError("Model.forward requires at least one non-empty row in batch.")
 
+        plan: _InsertionPlan | None = None
+        if reasoning is not None:
+            if use_cache:
+                raise ValueError("reasoning= is not supported with use_cache=True.")
+            if self.reasoner is None:
+                raise ValueError(
+                    "Model.forward(reasoning=...) requires a reasoner; construct "
+                    "Model(..., reasoner=LatentReasoner(...))."
+                )
+            plan = _plan_insertions(
+                token_batch,
+                np.asarray(reasoning, dtype=np.int64).reshape(-1),
+                self.reasoner.num_thoughts,
+            )
+
         embeds, prediction_indices = self.encoder(token_batch)
-        # embeds: [L, D]; prediction_indices: [N]
+        # embeds: [L, D]; prediction_indices: [P]
 
         t = token_batch.to_tensors(embeds.device)
         sequence_ids = t["sequence_ids"]
@@ -1069,15 +1232,23 @@ class Model(nn.Module):
 
         needs_layerwise = "action_value_layerwise" in self._heads
         new_cache: dict[str, Any] | None
+        token_indices: torch.Tensor | None = None
 
         if use_cache:
             from mouse_core.models.embedding.packing import left_align_content
 
+            # Decode pools one position per step: the step's *last* prediction
+            # token (the most informed one when a step has several).
+            psteps = t["prediction_steps"]
+            last_of_step = torch.ones(
+                psteps.shape[0], dtype=torch.bool, device=psteps.device
+            )
+            last_of_step[:-1] = psteps[1:] != psteps[:-1]
             batched_embeds, token_lengths, local_indices, batched_grouping_ids = (
                 _flat_to_batched_left_pad(
                     embeds,
                     sequence_ids,
-                    prediction_indices,
+                    prediction_indices[last_of_step],
                     B,
                     S_max,
                     step_counts_np.tolist(),
@@ -1108,6 +1279,20 @@ class Model(nn.Module):
             new_cache = {"session": session}
             pred_batch_size: tuple[int, ...] = (B, S_max)
         else:
+            if plan is not None:
+                # Gradient-taped latent generation; swaps in the extended stream.
+                (
+                    embeds,
+                    sequence_ids,
+                    grouping_ids,
+                    prediction_indices,
+                    token_indices,
+                ) = self._generate_latents(
+                    embeds=embeds,
+                    sequence_ids=sequence_ids,
+                    grouping_ids=grouping_ids,
+                    plan=plan,
+                )
             # Training: Flex packed on CUDA; SDPA mask fallback on CPU (no Flex backward).
             session_out = self._train_backbone_forward(
                 self.backbone,
@@ -1117,12 +1302,24 @@ class Model(nn.Module):
                 needs_layerwise,
             )
             new_cache = None
-            pred_batch_size = (N,)
+            pred_batch_size = (token_batch.P,)
 
         h = self._pool_backbone_out(
             self.encoder, session_out, prediction_indices, needs_layerwise
         )
         predictions = self.head(h=h, batch_size=pred_batch_size)
+        if plan is not None:
+            return predictions, AveragerInputs(
+                h=h,
+                batch=token_batch,
+                cache=None,
+                embeds=embeds,
+                prediction_indices=prediction_indices,
+                predictions=predictions,
+                sequence_ids=sequence_ids,
+                grouping_ids=grouping_ids,
+                token_indices=token_indices,
+            )
         return predictions, AveragerInputs(
             h=h,
             batch=token_batch,
@@ -1152,7 +1349,7 @@ class Model(nn.Module):
         temperature: float = 1.0,
         num_actions: int | None = None,
     ) -> torch.Tensor:
-        """Select an action using ``action_head`` from the last step."""
+        """Select an action using ``action_head`` at the last prediction token."""
         raw = cast(torch.Tensor, out[self.action_head])
         if self.action_head == "action_value_layerwise":
             if raw.ndim == 4:
@@ -1214,7 +1411,8 @@ def _flat_to_batched_left_pad(
     """Scatter flat ``[L, D]`` embeds into a rectangular ``[B, Lmax, D]`` layout.
 
     Content is packed from index 0 within each row (right-padded).
-    ``prediction_indices`` is flat ``[N]``. Returns local rectangular
+    ``prediction_indices`` is flat ``[N]`` (one index per step — the caller
+    passes each step's last prediction token). Returns local rectangular
     ``prediction_indices`` ``[B, S]`` with real steps in trailing columns
     (left-padded in the step dimension for decode), plus right-padded
     ``grouping_ids`` ``[B, Lmax]`` aligned with the embed rows.

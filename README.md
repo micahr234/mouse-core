@@ -74,6 +74,7 @@ The [example notebooks](examples/) are short usage docs, not full experiments. W
 | [09 — Inference](examples/09_inference.ipynb) | Evaluation: load a Hub checkpoint and run batched FlexAttention cached inference (`max_cache` / `start_cache`) |
 | [10 — Train offline SP](examples/10_train_offline_sp.ipynb) | Same offline loop as `05`, but `SpObjective` CE onto a random argmax of `info_q_star` with `DiscreteActionHead` *(ranking check)* |
 | [11 — Offline DQN, full-model delay](examples/11_train_offline_dqn_model_delay.ipynb) | Same offline loop as `02`, with `PolyakAverager` delaying encoder, backbone, and Q head |
+| [12 — Offline reasoning DQN](examples/12_train_offline_reasoning_dqn.ipynb) | Same offline loop as `02`, with a per-step learnable action-prompt token and Coconut-style latent reasoning bursts (`LatentReasoner`, `sample_reasoning_splits`) trained through the DQN loss |
 
 ### Example dependencies
 

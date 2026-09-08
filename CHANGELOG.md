@@ -8,6 +8,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Explicit prediction tokens. Exactly one tokenizer input field (numeric or
+  text) must set ``prediction: True``; the tokens it emits are the step's
+  **prediction tokens** — the positions the model reads Q / action outputs
+  from. Every step must emit at least one (the prediction field must never
+  be skipped), and a step may emit several (e.g. ``learnable`` with
+  ``tokens > 1``, or a multi-token text field). ``StepTokens`` carries a
+  per-token ``prediction_mask``; ``TokenBatch.prediction_indices`` lists all
+  ``P >= N`` prediction tokens with a parallel ``prediction_steps`` row→step
+  map, and ``pack_token_batch`` stamps a ``prediction_count`` column into
+  ``objective_data`` so predictions and step fields can never misalign.
+  Training predictions are flat ``[P, ...]`` (one row per prediction token);
+  ``DqnObjective`` and ``LayerwiseDqnObjective`` train every prediction row
+  of step ``i`` toward the same TD target and bootstrap from step ``i+1``'s
+  last prediction row. Cached decode pools each step's last prediction
+  token. A ``text`` prediction field is tokenized as its own run so its
+  token boundaries are exact.
+- Coconut-style latent reasoning. ``LatentReasoner(hidden_dim=, num_thoughts=)``
+  is an optional fourth model section (``Model(reasoner=...)``, saved and
+  loaded with the checkpoint): a LayerNorm + Linear adapter that maps the
+  backbone's output hidden state at the previous position to the input
+  embedding of the next latent thought. ``Model.forward(batch, reasoning=...)``
+  (training only) takes a ``[B]`` array of per-sequence burst step indices
+  (``-1`` skips a row), generates ``num_thoughts`` thought embeddings per
+  burst on the autograd tape, and inserts them immediately before the burst
+  step's first prediction token, so the Q readout and all later same-run
+  tokens attend to them and TD errors backpropagate through the latent chain.
+  Generation costs ``num_thoughts + 1`` backbone passes per batch.
+  ``sample_reasoning_splits(batch, generator)`` picks one burst step per
+  sequence, uniform over steps whose next step shares the grouping.
+  ``PolyakAverager`` replays the extended stream with the thoughts detached
+  (a delayed encoder re-encodes the real tokens and splices them back in),
+  so delayed Q never backpropagates through the reasoning.
+- Learnable modalities accept an explicit name: ``field=`` on the embedder
+  spec and ``output_field=`` on the tokenizer spec (they must match).
+  Unnamed learnables keep the ``__learnable_<i>`` auto-name.
+- ``examples/12_train_offline_reasoning_dqn.ipynb``: same offline DQN loop
+  as ``02``, with a trailing ``learnable`` action-prompt token named
+  ``prediction`` on every step (Q is read from it) and per-batch latent
+  reasoning bursts via ``LatentReasoner`` + ``sample_reasoning_splits``.
 - ``AdamW.zero_grad`` and ``AdamWFp32.zero_grad`` accept ``set_to_none``
   (default ``True``), matching ``torch.optim.Optimizer.zero_grad``.
   ``AdamWFp32`` also clears fp32 master grads.
@@ -319,6 +358,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``encode_hf_rows`` reference is gone.
 
 ### Removed
+- Implicit "last token of each step is the prediction token" rule. Prediction
+  positions now come only from the tokenizer input field flagged
+  ``prediction: True``; tokenizers without exactly one flagged field raise.
 - ``TextTokenizer.MODALITY_TEXT`` / ``MODALITY_VISION`` integer constants.
   They were wrong whenever only an image modality was declared (vision was
   local index 0); resolve indices via ``StepTokens.modality_names``.

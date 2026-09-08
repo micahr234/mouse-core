@@ -14,13 +14,21 @@ DEFAULT_GROUPING_FIELD = "grouping_id"
 
 
 def _tokenizer_input_fields_from_encoder(encoder) -> list[dict]:
-    """Map embedder modality specs to tokenizer packing specs (by name)."""
+    """Map embedder modality specs to tokenizer packing specs (by name).
+
+    The last modality is flagged ``prediction=True`` (tokenizers require
+    exactly one prediction field; tests list the readout modality last).
+    """
     out: list[dict] = []
     for m in encoder.modalities:
         data = asdict(m) if is_dataclass(m) else dict(m)
         kind = str(data["type"]).lower()
         if kind == "learnable":
-            out.append({"type": "learnable", "tokens": data.get("tokens")})
+            entry = {"type": "learnable", "tokens": data.get("tokens")}
+            name = data.get("field")
+            if isinstance(name, str) and not name.startswith("__learnable_"):
+                entry["output_field"] = name
+            out.append(entry)
             continue
         name = data.get("field")
         entry: dict = {
@@ -30,6 +38,8 @@ def _tokenizer_input_fields_from_encoder(encoder) -> list[dict]:
         if data.get("dim") is not None:
             entry["dim"] = data["dim"]
         out.append(entry)
+    if out:
+        out[-1]["prediction"] = True
     return out
 
 

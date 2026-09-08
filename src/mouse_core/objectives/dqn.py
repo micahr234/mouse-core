@@ -65,6 +65,51 @@ def _boundary_discounts(
     return episode_gammas[episode_done] * task_gammas[task_done]
 
 
+def _prediction_layout(
+    objective_data: TensorDict,
+    *,
+    N: int,
+    P: int,
+    device: torch.device | str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Map prediction rows to steps: ``(step_of [P], last_rows [N])``.
+
+    ``step_of[p]`` is the step of prediction row ``p``; ``last_rows[i]`` is
+    the row of step ``i``'s last prediction token (the bootstrap read). Reads
+    the ``prediction_count`` column stamped by ``pack_token_batch``; when the
+    column is absent every step must have exactly one prediction (``P == N``).
+    """
+    if "prediction_count" in objective_data.keys():
+        counts = objective_data["prediction_count"]
+        if counts.dtype != torch.int64:
+            raise TypeError(f"prediction_count must be int64, got {counts.dtype}.")
+        if counts.shape != torch.Size([N]):
+            raise ValueError(
+                f"prediction_count must have shape [{N}], got {tuple(counts.shape)}."
+            )
+        if bool((counts < 1).any()):
+            raise ValueError("prediction_count entries must be >= 1.")
+        if int(counts.sum()) != P:
+            raise ValueError(
+                f"prediction_count sums to {int(counts.sum())} but predictions "
+                f"have {P} rows; predictions and objective_data are misaligned."
+            )
+        counts = counts.to(device=device)
+    else:
+        if P != N:
+            raise ValueError(
+                f"predictions have {P} rows for {N} steps but objective_data "
+                "has no prediction_count column; pack with pack_token_batch "
+                "or provide prediction_count."
+            )
+        counts = torch.ones(N, dtype=torch.int64, device=device)
+    step_of = torch.repeat_interleave(
+        torch.arange(N, dtype=torch.int64, device=device), counts
+    )
+    last_rows = counts.cumsum(dim=0) - 1
+    return step_of, last_rows
+
+
 def _pair_weight(
     objective_data: TensorDict,
     N: int,
@@ -130,6 +175,15 @@ class DqnObjective(Objective):
     ``delayed_predictions["action_value"]`` from
     ``averager(averager_inputs)``. The delayed tensor is detached before
     the Bellman target, so the TD error does not backprop through it.
+
+    Q rows are **per prediction token** (``[P, A]``), not per step: a step may
+    own several prediction tokens (tokenizer input field flagged
+    ``prediction=True`` emitting more than one token). The
+    ``prediction_count`` column stamped by ``pack_token_batch`` maps rows to
+    steps, so predictions and step fields can never misalign. Every
+    prediction row of step ``i`` trains toward the *same* TD target; the
+    bootstrap reads the *last* prediction row of step ``i+1`` (the most
+    informed one).
 
     A **run** is the same ``sequence_id`` and, when ``grouping_field`` is set
     and present, the same grouping column (typically ``task_index``). Neighbor
@@ -242,20 +296,28 @@ class DqnObjective(Objective):
 
         if q.ndim != 2:
             raise ValueError(
-                f"DQN expects action_value shape [N, A], got {tuple(q.shape)}."
+                f"DQN expects action_value shape [P, A], got {tuple(q.shape)}."
             )
-        N, A = q.shape
+        if q_target.shape != q.shape:
+            raise ValueError(
+                f"DQN delayed action_value shape {tuple(q_target.shape)} must "
+                f"match online shape {tuple(q.shape)}."
+            )
+        P, A = q.shape
         device = q.device
         value_dtype = q.dtype
-
-        if N < 2:
-            raise ValueError("Not enough valid q values in data.")
 
         action = objective_data[self.action_key]
         if action.dtype != torch.int64:
             raise TypeError(f"action must be int64, got {action.dtype}.")
-        if action.shape != torch.Size([N]):
-            raise ValueError(f"DQN objective expects action shape [{N}], got {tuple(action.shape)}.")
+        if action.ndim != 1:
+            raise ValueError(
+                f"DQN objective expects action shape [N], got {tuple(action.shape)}."
+            )
+        N = int(action.shape[0])
+
+        if N < 2:
+            raise ValueError("Not enough valid q values in data.")
 
         reward = objective_data[self.reward_key]
         if reward.dtype != torch.float32:
@@ -270,6 +332,13 @@ class DqnObjective(Objective):
             N=N,
         )
 
+        # A step may own several prediction tokens; every row of step i trains
+        # toward the same target, and the bootstrap reads step i+1's *last*
+        # prediction row.
+        step_of, last_rows = _prediction_layout(
+            objective_data, N=N, P=P, device=device
+        )
+
         pair_weight = _pair_weight(
             objective_data,
             N,
@@ -277,20 +346,23 @@ class DqnObjective(Objective):
             grouping_field=self.grouping_field,
             dtype=value_dtype,
         )
+        # Row weight = the (i, i+1) pair weight of the row's step; rows of the
+        # final step have no next step and get weight 0.
+        row_weight = torch.cat([pair_weight, pair_weight.new_zeros(1)])[step_of]  # [P]
 
         # Each token at position i encodes (obs_i, action_{i-1}, reward_{i-1},
         # episode_done_{i-1}, task_done_{i-1}), i.e. the action, reward, and
         # done codes stored at i are the ones that *produced* obs_i, not the
         # ones taken *from* obs_i.  The transition out of state i is therefore
         # described by the fields stored at i+1.
-        curr_q = q[:-1, :]              # [N-1, A]  Q(s_i)
-        next_actions = action[1:]       # [N-1]     a_i (stored at i+1)
-        next_rewards = reward[1:]       # [N-1]     r_i (stored at i+1)
-        next_q_target = q_target[1:, :]  # [N-1, A]  Q_target(s_{i+1})
+        step_next = (step_of + 1).clamp(max=N - 1)  # [P] (final step clamped, weight 0)
+        next_actions = action[step_next]            # [P]  a_i (stored at i+1)
+        next_rewards = reward[step_next]            # [P]  r_i (stored at i+1)
+        next_q_target = q_target[last_rows[step_next]]  # [P, A] Q_target(s_{i+1})
 
-        discount = _boundary_discounts(
-            episode_done=episode_done[1:],
-            task_done=task_done[1:],
+        discount_all = _boundary_discounts(
+            episode_done=episode_done,
+            task_done=task_done,
             gamma_step=self.gamma_step,
             gamma_episode_terminal=self.gamma_episode_terminal,
             gamma_episode_truncated=self.gamma_episode_truncated,
@@ -299,9 +371,10 @@ class DqnObjective(Objective):
             dtype=value_dtype,
             device=device,
         )
+        discount = discount_all[step_next]  # [P] from done codes stored at i+1
 
-        q_values = curr_q.gather(dim=-1, index=next_actions.unsqueeze(-1)).squeeze(-1)  # [N-1]
-        next_max_q_target = next_q_target.amax(dim=-1)                                  # [N-1]
+        q_values = q.gather(dim=-1, index=next_actions.unsqueeze(-1)).squeeze(-1)  # [P]
+        next_max_q_target = next_q_target.amax(dim=-1)                             # [P]
 
         td_target = next_rewards + discount * next_max_q_target
 
@@ -310,14 +383,14 @@ class DqnObjective(Objective):
         cql_penalty_mean: torch.Tensor | None = None
         if self.cql_weight > 0.0:
             q_scale = (td_target.abs() + self.cql_scale_q_eps).detach()
-            cql_penalty = torch.logsumexp(curr_q, dim=-1) - q_values
+            cql_penalty = torch.logsumexp(q, dim=-1) - q_values
             loss = loss + self.cql_weight * q_scale * cql_penalty
-            cql_penalty_mean = _weighted_mean(cql_penalty.detach(), pair_weight)
+            cql_penalty_mean = _weighted_mean(cql_penalty.detach(), row_weight)
 
-        loss = _weighted_mean(loss, pair_weight)
+        loss = _weighted_mean(loss, row_weight)
 
-        curr_max_q = curr_q.amax(dim=-1)  # [N-1]  max online Q at s_i
-        q_mean, q_std, q_min, q_max = _in_run_stats(curr_max_q.detach(), pair_weight)
+        curr_max_q = q.amax(dim=-1)  # [P]  max online Q at s_i
+        q_mean, q_std, q_min, q_max = _in_run_stats(curr_max_q.detach(), row_weight)
         named: dict[str, torch.Tensor] = {
             "q_values_mean":   q_mean,
             "q_values_std":    q_std,

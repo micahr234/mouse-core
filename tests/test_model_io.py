@@ -67,7 +67,7 @@ def test_roundtrip_multi_field_spec_before_learnable(tmp_path) -> None:
             {"type": "discrete", "input_field": "prev_action"},
             {"type": "learnable", "tokens": 2},
             {"type": "fourier", "input_field": "reward"},
-            {"type": "learnable"},
+            {"type": "learnable", "prediction": True},
         ],
         objective_fields=[],
         grouping_field="task_index",

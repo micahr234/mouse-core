@@ -30,6 +30,14 @@ class NumericTokenizerModalitySpec:
 
     ``input_field`` is the step key; ``output_field`` is the modality name
     (embedder alignment). Omitted ``output_field`` defaults to ``input_field``.
+    Learnable modalities have no ``input_field``; set ``output_field`` to name
+    them (e.g. ``"prediction"``), else they are auto-named ``__learnable_<i>``.
+
+    Exactly one input field must set ``prediction=True``: its tokens are the
+    step's **prediction tokens** — the positions the model reads Q / action
+    outputs from. A step may emit several (e.g. ``learnable`` with
+    ``tokens > 1``); every step must emit at least one, so the prediction
+    field must not be skippable on any step.
     """
 
     type: str
@@ -39,6 +47,7 @@ class NumericTokenizerModalitySpec:
     tokens: int | None = None
     skip: Any = None
     required: bool = True
+    prediction: bool = False
 
     _VALID_TYPES: ClassVar[tuple[str, ...]] = (
         "discrete",
@@ -73,7 +82,14 @@ class NumericTokenizerModalitySpec:
 
 @dataclass
 class TextTokenizerModalitySpec:
-    """Modality for :class:`~mouse_core.data.text_tokenizer.TextTokenizer`."""
+    """Modality for :class:`~mouse_core.data.text_tokenizer.TextTokenizer`.
+
+    Exactly one input field must set ``prediction=True``: the tokens it emits
+    are the step's prediction tokens (Q / action readout positions). A
+    ``text`` prediction field is tokenized as its own run so its token
+    boundaries are exact; every step must emit at least one prediction token,
+    so the prediction field must not be skippable on any step.
+    """
 
     type: str
     input_field: str | None = None
@@ -81,6 +97,7 @@ class TextTokenizerModalitySpec:
     format: str | None = None
     skip: Any = None
     required: bool = True
+    prediction: bool = False
 
     _VALID_TYPES: ClassVar[tuple[str, ...]] = ("text", "token", "image")
 
@@ -202,10 +219,12 @@ def copy_keep_fields(
 def expand_tokenizer_numeric_spec(
     spec: NumericTokenizerModalitySpec, *, learnable_index: int
 ) -> list[NumericTokenizerModalitySpec]:
-    """``learnable_index`` is the ordinal among learnable specs (matches the embedder)."""
+    """``learnable_index`` names anonymous learnables (ordinal among learnable
+    specs, matching the embedder); an explicit ``output_field`` is kept."""
     if spec.type == "learnable":
-        name = f"__learnable_{learnable_index}"
-        return [replace(spec, output_field=name)]
+        if spec.output_field:
+            return [spec]
+        return [replace(spec, output_field=f"__learnable_{learnable_index}")]
     if not spec.input_field or not spec.output_field:
         raise ValueError(
             "input-backed tokenizer modalities must set input_field="

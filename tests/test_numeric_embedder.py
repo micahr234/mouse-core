@@ -65,7 +65,12 @@ def test_numeric_embedder_keeps_optional_missing_modality() -> None:
                 "output_field": "action",
                 "required": False,
             },
-            {"type": "fourier", "input_field": "reward", "output_field": "reward"},
+            {
+                "type": "fourier",
+                "input_field": "reward",
+                "output_field": "reward",
+                "prediction": True,
+            },
         ],
         grouping_field="grouping_id",
     )
@@ -205,7 +210,7 @@ def test_numeric_embedder_skip_shortens_step() -> None:
         input_fields=[
             {"type": "discrete", "input_field": "action", "output_field": "action"},
             {"type": "fourier", "input_field": "reward", "output_field": "reward", "skip": 0.0},
-            {"type": "learnable", "tokens": 1},
+            {"type": "learnable", "tokens": 1, "prediction": True},
         ],
         objective_fields=[
             {"input_field": "action", "output_field": "action"},
@@ -264,7 +269,7 @@ def test_numeric_embedder_fourier_honors_per_modality_std() -> None:
     tokenizer = NumericTokenizer(
         input_fields=[
             {"type": "fourier", "input_field": "reward"},
-            {"type": "fourier", "input_field": "bonus"},
+            {"type": "fourier", "input_field": "bonus", "prediction": True},
         ],
         grouping_field="grouping_id",
     )
@@ -327,7 +332,12 @@ def test_numeric_embedder_extra_fields_in_objective_fields() -> None:
     )
     tokenizer = NumericTokenizer(
         input_fields=[
-            {"type": "discrete", "input_field": "action", "output_field": "action"}
+            {
+                "type": "discrete",
+                "input_field": "action",
+                "output_field": "action",
+                "prediction": True,
+            }
         ],
         objective_fields=[
             {"input_field": "action", "output_field": "action"},
@@ -361,6 +371,7 @@ def test_task_done_is_objective_field_not_input_field() -> None:
                 "type": "discrete",
                 "input_field": "episode_done",
                 "output_field": "episode_done",
+                "prediction": True,
             },
         ],
         objective_fields=[

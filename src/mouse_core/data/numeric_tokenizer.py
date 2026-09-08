@@ -38,6 +38,11 @@ class NumericTokenizer:
     Construct independently of the embedder. Alignment is by ``output_field``
     name, not list order. ``input_fields=`` are the tokens fed to the
     transformer (each ``{type, input_field}``; optional ``output_field``).
+    Exactly one input field must set ``prediction=True``: its tokens are the
+    step's prediction tokens — the positions the model reads Q / action
+    outputs from. Every step must emit at least one (never skip that field);
+    a step may emit several (e.g. ``learnable`` with ``tokens > 1``), and the
+    DQN objectives then train each of them toward the same per-step target.
     ``objective_fields=`` is a list of ``{input_field}`` dicts (optional
     ``output_field``; defaults to the input name)
     copied into ``StepTokens.objective_fields`` (input fields are not
@@ -64,6 +69,13 @@ class NumericTokenizer:
         if any(m.kind == KIND_IMAGE for m in meta) and image_tokenizer is None:
             raise TypeError(
                 "NumericTokenizer with type='image' input_fields requires image_tokenizer="
+            )
+        flagged = [m.name for m in meta if m.spec.prediction]
+        if len(flagged) != 1:
+            raise ValueError(
+                "NumericTokenizer requires exactly one input field with "
+                "prediction=True (its tokens are the step's prediction tokens "
+                f"— the Q / action readout positions); got {flagged or 'none'}"
             )
         self.input_fields: list[NumericTokenizerModalitySpec] = list(specs)
         self._meta: tuple[TokenizerModalityMeta, ...] = tuple(meta)
@@ -126,18 +138,22 @@ def _tokenize_numeric_step(
     modality_ids: list[int] = []
     ids: list[int] = []
     values: list[float] = []
+    prediction_mask: list[bool] = []
 
-    def _emit(*, name: str, token_id: int, value: float = 0.0) -> None:
+    def _emit(
+        *, name: str, token_id: int, value: float = 0.0, prediction: bool = False
+    ) -> None:
         modality_ids.append(name_to_index[name])
         ids.append(token_id)
         values.append(value)
+        prediction_mask.append(prediction)
 
     for m in meta:
         name = m.name
         spec = m.spec
         if m.kind == KIND_LEARNABLE:
             for i in range(m.n_learnable):
-                _emit(name=name, token_id=i)
+                _emit(name=name, token_id=i, prediction=spec.prediction)
             continue
 
         in_name = str(spec.input_field)
@@ -152,7 +168,11 @@ def _tokenize_numeric_step(
             continue
 
         if m.kind == KIND_DISCRETE:
-            _emit(name=name, token_id=int(unwrap_scalar(value)))
+            _emit(
+                name=name,
+                token_id=int(unwrap_scalar(value)),
+                prediction=spec.prediction,
+            )
         elif m.kind == KIND_FOURIER:
             if m.dim == 1:
                 vals = [float(unwrap_scalar(value))]
@@ -165,7 +185,7 @@ def _tokenize_numeric_step(
                     )
                 vals = [float(v) for v in arr]
             for i, v in enumerate(vals):
-                _emit(name=name, token_id=i, value=v)
+                _emit(name=name, token_id=i, value=v, prediction=spec.prediction)
         elif m.kind == KIND_IMAGE:
             if image_tokenizer is None:
                 raise RuntimeError("image_tokenizer is not configured")
@@ -175,7 +195,7 @@ def _tokenize_numeric_step(
                     f"image tokenizer returned no tokens for {in_name!r}"
                 )
             for tid in img_ids:
-                _emit(name=name, token_id=int(tid))
+                _emit(name=name, token_id=int(tid), prediction=spec.prediction)
 
     if not modality_ids:
         raise ValueError(
@@ -191,5 +211,6 @@ def _tokenize_numeric_step(
         modality_map=dict(modality_map),
         grouping_id=gid,
         grouping_field=grouping_field,
+        prediction_mask=np.asarray(prediction_mask, dtype=bool),
         objective_fields=copy_keep_fields(row, objective_fields_keep),
     )

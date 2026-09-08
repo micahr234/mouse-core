@@ -12,6 +12,7 @@ from mouse_core.objectives.dqn import (
     _boundary_discounts,
     _in_run_stats,
     _pair_weight,
+    _prediction_layout,
     _require_done_codes,
     _weighted_mean,
 )
@@ -74,7 +75,10 @@ class LayerwiseDqnObjective(Objective):
     """One-step Bellman TD objective on every backbone layer.
 
     Reads ``predictions["action_value_layerwise"]`` and
-    ``delayed_predictions["action_value_layerwise"]`` with shape ``[N, L, A]``.
+    ``delayed_predictions["action_value_layerwise"]`` with shape ``[P, L, A]``
+    (one row per prediction token; ``objective_data["prediction_count"]`` maps
+    rows to steps). Every prediction row of step ``i`` trains toward the same
+    per-layer target; the bootstrap reads step ``i+1``'s last prediction row.
     Delayed Q comes from ``averager(averager_inputs)`` and is detached
     before the Bellman target, so the TD error does not backprop through it.
     Each layer and each episode/task done-code uses its own discount, built at construction
@@ -208,10 +212,15 @@ class LayerwiseDqnObjective(Objective):
 
         if q.ndim != 3:
             raise ValueError(
-                f"Layerwise DQN expects action_value_layerwise shape [N, L, A], "
+                f"Layerwise DQN expects action_value_layerwise shape [P, L, A], "
                 f"got {tuple(q.shape)}."
             )
-        N, L, A = q.shape
+        if q_target.shape != q.shape:
+            raise ValueError(
+                f"Layerwise DQN delayed shape {tuple(q_target.shape)} must "
+                f"match online shape {tuple(q.shape)}."
+            )
+        P, L, A = q.shape
         device = q.device
         value_dtype = q.dtype
 
@@ -221,16 +230,17 @@ class LayerwiseDqnObjective(Objective):
                 f"but predictions have {L}."
             )
 
-        if N < 2:
-            raise ValueError("Not enough valid q values in data.")
-
         action = objective_data[self.action_key]
         if action.dtype != torch.int64:
             raise TypeError(f"action must be int64, got {action.dtype}.")
-        if action.shape != torch.Size([N]):
+        if action.ndim != 1:
             raise ValueError(
-                f"Layerwise DQN objective expects action shape [{N}], got {tuple(action.shape)}."
+                f"Layerwise DQN objective expects action shape [N], got {tuple(action.shape)}."
             )
+        N = int(action.shape[0])
+
+        if N < 2:
+            raise ValueError("Not enough valid q values in data.")
 
         reward = objective_data[self.reward_key]
         if reward.dtype != torch.float32:
@@ -247,6 +257,13 @@ class LayerwiseDqnObjective(Objective):
             N=N,
         )
 
+        # A step may own several prediction tokens; every row of step i trains
+        # toward the same per-layer target, and the bootstrap reads step i+1's
+        # last prediction row.
+        step_of, last_rows = _prediction_layout(
+            objective_data, N=N, P=P, device=device
+        )
+
         pair_weight = _pair_weight(
             objective_data,
             N,
@@ -254,13 +271,14 @@ class LayerwiseDqnObjective(Objective):
             grouping_field=self.grouping_field,
             dtype=value_dtype,
         )
+        # Row weight = the (i, i+1) pair weight of the row's step; rows of the
+        # final step have no next step and get weight 0.
+        row_weight = torch.cat([pair_weight, pair_weight.new_zeros(1)])[step_of]  # [P]
 
-        curr_q = q[:-1, :, :]              # [N-1, L, A]
-        next_actions = action[1:]          # [N-1]
-        next_rewards = reward[1:]          # [N-1]
-        next_episode_done = episode_done[1:]
-        next_task_done = task_done[1:]
-        next_q_target = q_target[1:, :, :]  # [N-1, L, A]
+        step_next = (step_of + 1).clamp(max=N - 1)      # [P]
+        next_actions = action[step_next]                # [P]
+        next_rewards = reward[step_next]                # [P]
+        next_q_target = q_target[last_rows[step_next]]  # [P, L, A]
 
         layer_losses: list[torch.Tensor] = []
         layer_curr_max_means: list[torch.Tensor] = []
@@ -268,9 +286,9 @@ class LayerwiseDqnObjective(Objective):
         deepest_curr_max_q: torch.Tensor | None = None
 
         for layer_idx in range(L):
-            discount = _boundary_discounts(
-                episode_done=next_episode_done,
-                task_done=next_task_done,
+            discount_all = _boundary_discounts(
+                episode_done=episode_done,
+                task_done=task_done,
                 gamma_step=self.layer_gamma_step[layer_idx],
                 gamma_episode_terminal=self.layer_gamma_episode_terminal[layer_idx],
                 gamma_episode_truncated=self.layer_gamma_episode_truncated[layer_idx],
@@ -279,9 +297,10 @@ class LayerwiseDqnObjective(Objective):
                 dtype=value_dtype,
                 device=device,
             )
+            discount = discount_all[step_next]  # [P]
 
-            curr_q_layer = curr_q[:, layer_idx, :]
-            next_q_target_layer = next_q_target[:, layer_idx, :]
+            curr_q_layer = q[:, layer_idx, :]                 # [P, A]
+            next_q_target_layer = next_q_target[:, layer_idx, :]  # [P, A]
 
             q_values = curr_q_layer.gather(
                 dim=-1, index=next_actions.unsqueeze(-1)
@@ -296,10 +315,10 @@ class LayerwiseDqnObjective(Objective):
                 q_scale = (td_target.abs() + self.cql_scale_q_eps).detach()
                 cql_penalty = torch.logsumexp(curr_q_layer, dim=-1) - q_values
                 loss = loss + self.cql_weight * q_scale * cql_penalty
-                cql_penalties.append(_weighted_mean(cql_penalty.detach(), pair_weight))
+                cql_penalties.append(_weighted_mean(cql_penalty.detach(), row_weight))
 
-            layer_losses.append(_weighted_mean(loss, pair_weight))
-            layer_curr_max_means.append(_weighted_mean(curr_max_q.detach(), pair_weight))
+            layer_losses.append(_weighted_mean(loss, row_weight))
+            layer_curr_max_means.append(_weighted_mean(curr_max_q.detach(), row_weight))
             if layer_idx == L - 1:
                 deepest_curr_max_q = curr_max_q
 
@@ -310,7 +329,7 @@ class LayerwiseDqnObjective(Objective):
                 "Layerwise DQN objective did not compute deepest-layer current-state max Q values."
             )
         q_mean, q_std, q_min, q_max = _in_run_stats(
-            deepest_curr_max_q.detach(), pair_weight
+            deepest_curr_max_q.detach(), row_weight
         )
 
         named: dict[str, torch.Tensor] = {

@@ -116,13 +116,16 @@ def expand_embedder_numeric_spec(
 ) -> list[NumericEmbedderModalitySpec]:
     """Expand one spec into one spec per field name.
 
-    ``learnable_index`` is the ordinal among *learnable* specs (0 for the
-    first learnable, 1 for the second, …). It must not depend on the position
-    in the full list: the saved config stores the expanded list, where a
-    multi-field spec occupies several slots, so a raw index would shift on
-    reload and the table's ``state_dict`` key would no longer match.
+    Learnable specs without a ``field`` are auto-named ``__learnable_<i>``;
+    an explicit ``field`` (e.g. ``"prediction"``) is kept and must match the
+    tokenizer's ``output_field``. ``learnable_index`` is the ordinal among
+    *learnable* specs (0 for the first learnable, 1 for the second, …). It
+    must not depend on the position in the full list: the saved config stores
+    the expanded list, where a multi-field spec occupies several slots, so a
+    raw index would shift on reload and the table's ``state_dict`` key would
+    no longer match.
     """
-    if spec.type == "learnable":
+    if spec.type == "learnable" and spec.field is None:
         name = f"__learnable_{learnable_index}"
         return [replace(spec, field=name)]
     names = _field_names(spec.field)

@@ -24,8 +24,17 @@ def _io(*pairs: tuple[str, str]) -> list[dict[str, str]]:
     return fields
 
 
-def _tok_in(*names: str, type: str = "discrete") -> list[dict[str, str]]:
-    return [{"type": type, "input_field": name} for name in names]
+def _tok_in(
+    *names: str, type: str = "discrete", prediction: str | None = None
+) -> list[dict]:
+    return [
+        {
+            "type": type,
+            "input_field": name,
+            **({"prediction": True} if name == prediction else {}),
+        }
+        for name in names
+    ]
 
 
 def _rows() -> list[dict]:
@@ -60,7 +69,7 @@ def test_selector_concat_matches_full() -> None:
 def test_selector_renames_before_tokenizer() -> None:
     selector = Selector(fields=_io(("act", "action"), ("obs", "observation"), ("task_index", "task_index")))
     tokenizer = NumericTokenizer(
-        input_fields=_tok_in("action", "observation"),
+        input_fields=_tok_in("action", "observation", prediction="observation"),
         objective_fields=_io(("action", "action"), ("observation", "observation")),
         grouping_field="task_index",
     )
@@ -74,7 +83,7 @@ def test_selector_renames_before_tokenizer() -> None:
 
 def test_missing_objective_fields_key_raises() -> None:
     tokenizer = NumericTokenizer(
-        input_fields=_tok_in("action"),
+        input_fields=_tok_in("action", prediction="action"),
         objective_fields=_io(("action", "action"), ("old_log_prob", "old_log_prob")),
         grouping_field="task_index",
     )
@@ -92,7 +101,7 @@ def test_tokenizer_rejects_legacy_field_key() -> None:
 
 def test_tokenizer_output_defaults_to_input() -> None:
     tokenizer = NumericTokenizer(
-        input_fields=_tok_in("action"),
+        input_fields=_tok_in("action", prediction="action"),
         objective_fields=_io(("reward", "reward")),
         grouping_field="task_index",
     )
@@ -104,7 +113,12 @@ def test_tokenizer_output_defaults_to_input() -> None:
 def test_tokenizer_renames_input_and_objective_fields() -> None:
     tokenizer = NumericTokenizer(
         input_fields=[
-            {"type": "discrete", "input_field": "act", "output_field": "action"},
+            {
+                "type": "discrete",
+                "input_field": "act",
+                "output_field": "action",
+                "prediction": True,
+            },
         ],
         objective_fields=_io(("q", "info_q_star")),
         grouping_field="task_index",
@@ -120,7 +134,7 @@ def test_tokenizer_full_matches_per_step_concat() -> None:
         input_fields=[
             *_tok_in("action", "observation"),
             *_tok_in("reward", type="fourier"),
-            *_tok_in("episode_done"),
+            *_tok_in("episode_done", prediction="episode_done"),
         ],
         objective_fields=_io(
             ("action", "action"),
@@ -161,7 +175,7 @@ def test_pipeline_without_augmenter_full_matches_head_plus_tail_tokens() -> None
         input_fields=[
             *_tok_in("action", "observation"),
             *_tok_in("reward", type="fourier"),
-            *_tok_in("episode_done"),
+            *_tok_in("episode_done", prediction="episode_done"),
         ],
         objective_fields=_io(
             ("action", "action"),
