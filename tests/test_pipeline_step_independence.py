@@ -8,8 +8,6 @@ import torch
 
 from mouse_core.data import (
     NumericTokenizer,
-    Selector,
-    compose,
     pack_token_batch,
 )
 
@@ -46,39 +44,6 @@ def _rows() -> list[dict]:
         {"action": 1, "observation": 5, "reward": 0.25, "episode_done": 2, "task_done": 2, "task_index": 1, "noise": 5},
         {"action": 3, "observation": 6, "reward": 0.0, "episode_done": 0, "task_done": 0, "task_index": 2, "noise": 4},
     ]
-
-
-def test_selector_concat_matches_full() -> None:
-    selector = Selector(
-        fields=_io(
-            ("action", "action"),
-            ("observation", "observation"),
-            ("reward", "reward"),
-            ("episode_done", "episode_done"),
-            ("task_done", "task_done"),
-            ("task_index", "task_index"),
-        )
-    )
-    rows = _rows()
-    full = [selector(r) for r in rows]
-    head = [selector(r) for r in rows[:-1]]
-    tail = [selector(r) for r in rows[-1:]]
-    assert full == head + tail
-
-
-def test_selector_renames_before_tokenizer() -> None:
-    selector = Selector(fields=_io(("act", "action"), ("obs", "observation"), ("task_index", "task_index")))
-    tokenizer = NumericTokenizer(
-        input_fields=_tok_in("action", "observation", head_output="observation"),
-        objective_fields=_io(("action", "action"), ("observation", "observation")),
-        grouping_field="task_index",
-    )
-    transform = compose(selector, tokenizer)
-    step = {"act": 1, "obs": 2, "task_index": 0, "noise": 9}
-    tokens = transform(step)
-    assert tokens.objective_fields["action"] == 1
-    assert tokens.objective_fields["observation"] == 2
-    assert tokens.grouping_id == 0
 
 
 def test_missing_objective_fields_key_raises() -> None:
@@ -157,42 +122,3 @@ def test_tokenizer_full_matches_per_step_concat() -> None:
     assert np.array_equal(full.head_output_indices, cat.head_output_indices)
     for key in ("action", "observation", "reward", "episode_done", "task_done", "task_index"):
         assert torch.equal(full_obj[key], cat_obj[key])
-
-
-def test_pipeline_without_augmenter_full_matches_head_plus_tail_tokens() -> None:
-    """selector→tokenizer on full window matches head/tail pack."""
-    selector = Selector(
-        fields=_io(
-            ("action", "action"),
-            ("observation", "observation"),
-            ("reward", "reward"),
-            ("episode_done", "episode_done"),
-            ("task_done", "task_done"),
-            ("task_index", "task_index"),
-        )
-    )
-    tokenizer = NumericTokenizer(
-        input_fields=[
-            *_tok_in("action", "observation"),
-            *_tok_in("reward", type="fourier"),
-            *_tok_in("episode_done", head_output="episode_done"),
-        ],
-        objective_fields=_io(
-            ("action", "action"),
-            ("observation", "observation"),
-            ("reward", "reward"),
-            ("episode_done", "episode_done"),
-            ("task_done", "task_done"),
-        ),
-        grouping_field="task_index",
-    )
-    transform = compose(selector, tokenizer)
-    rows = _rows()
-    full, _ = pack_token_batch([transform(s) for s in rows])
-    head = [transform(s) for s in rows[:-1]]
-    tail = transform(rows[-1])
-    cat, _ = pack_token_batch(head + [tail])
-    assert np.array_equal(full.modality_ids, cat.modality_ids)
-    assert np.array_equal(full.ids, cat.ids)
-    assert np.array_equal(full.grouping_ids, cat.grouping_ids)
-    assert np.array_equal(full.head_output_indices, cat.head_output_indices)

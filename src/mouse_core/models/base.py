@@ -218,13 +218,13 @@ model = (
 ## Run Inference
 
 Training and inference both take a `TokenBatch`. Training typically uses
-`DataLoader(transform=train_transform)`. Online / inference uses a per-step
-`eval_transform` (compose selector/tokenizer, no augmenter → `StepTokens`) and
+`DataLoader(transform=compose(augmenter, tokenizer))`. Online / inference
+uses the tokenizer (no augmenter → `StepTokens`) and
 `pack_token_batch` when combining steps. The tokenizer is not part of the
 saved model.
 
 ```python
-from mouse_core.data import NumericTokenizer, compose, pack_token_batch
+from mouse_core.data import NumericTokenizer, pack_token_batch
 
 tokenizer = NumericTokenizer(
     input_fields=[...],  # input_field=; optional output_field= matches embedder field=;
@@ -237,7 +237,7 @@ tokenizer = NumericTokenizer(
     ],
     grouping_field="task_index",
 )
-eval_transform = tokenizer  # plus compose(selector, tokenizer) as needed
+eval_transform = tokenizer
 
 {objective_data_example}
 

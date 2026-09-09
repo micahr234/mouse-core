@@ -6,7 +6,6 @@ from mouse_core.data.augmenter import (
     SequenceAugmentFieldSpec,
 )
 from mouse_core.data.compose import compose
-from mouse_core.data.selector import Selector
 from mouse_core.data.modality import (
     NumericTokenizerModalitySpec,
     TextTokenizerModalitySpec,
@@ -24,7 +23,6 @@ from mouse_core.data.token_batch import (
 
 __all__ = [
     "Augmenter",
-    "Selector",
     "compose",
     "DataLoader",
     "Datastore",

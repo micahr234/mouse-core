@@ -19,7 +19,7 @@ def _reject_io_fields(data: dict[str, Any], *, who: str) -> None:
     if "input_field" in data or "output_field" in data:
         raise TypeError(
             f"{who} modalities use field= (not input_field=/output_field=); "
-            "rename with Selector before tokenize"
+            "rename with the tokenizer input_field=/output_field="
         )
 
 

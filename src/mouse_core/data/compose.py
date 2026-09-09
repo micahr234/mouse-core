@@ -36,8 +36,8 @@ def compose(*stages: Callable[[Any], Any]) -> _Compose:
     Train includes the augmenter; eval leaves it out so the model sees raw
     values::
 
-        train_transform = compose(augmenter, selector, tokenizer)
-        eval_transform = compose(selector, tokenizer)
+        train_transform = compose(augmenter, tokenizer)
+        eval_transform = tokenizer
         step_tokens = train_transform(step)
         train_transform.reseed()
         step_tokens = eval_transform(step)

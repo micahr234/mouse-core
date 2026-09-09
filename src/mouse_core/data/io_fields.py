@@ -1,4 +1,4 @@
-"""Shared coerce for Selector ``fields=`` lists."""
+"""Shared coerce for tokenizer ``objective_fields=`` lists."""
 
 from __future__ import annotations
 

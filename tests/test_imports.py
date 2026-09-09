@@ -2,7 +2,6 @@ from mouse_core.data import (
     Augmenter,
     DataLoader,
     Datastore,
-    Selector,
     NumericTokenizer,
     NumericTokenizerModalitySpec,
     SequenceAugmentFieldSpec,
@@ -24,7 +23,6 @@ def test_public_data_exports() -> None:
     assert Augmenter is not None
     assert DataLoader is not None
     assert Datastore is not None
-    assert Selector is not None
     assert NumericTokenizer is not None
     assert TextTokenizer is not None
     assert NumericTokenizerModalitySpec is not None

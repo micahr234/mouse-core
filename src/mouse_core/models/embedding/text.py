@@ -61,7 +61,7 @@ class TextEmbedder(Encoder):
                     raise TypeError(
                         "embedder modalities use field= "
                         "(not input_field=/output_field=); "
-                        "rename with Selector before tokenize"
+                        "rename with the tokenizer input_field=/output_field="
                     )
                 for banned in ("skip", "required"):
                     if banned in data:

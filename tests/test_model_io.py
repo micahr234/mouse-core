@@ -128,7 +128,7 @@ def test_model_card_includes_usage_and_architecture(tmp_path) -> None:
     assert 'out, step_stream, cache = model(batch)' not in text
     assert 'compose' in text
     assert 'pack_token_batch' in text
-    assert 'DataLoader(transform=train_transform)' in text
+    assert 'DataLoader(transform=compose(augmenter, tokenizer))' in text
     assert 'eval_transform = tokenizer' in text
     assert 'grouping_field="task_index"' in text
     assert '{"input_field": "action"}' in text

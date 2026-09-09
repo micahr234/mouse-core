@@ -5,11 +5,11 @@ I/O
 * **in:** ``dict`` (one step)
 * **out:** ``dict`` (values may be transformed)
 
-Field keep/rename is :class:`~mouse_core.data.selector.Selector`, not this class.
-Compose in pipeline order::
+Field keep/rename is the tokenizer's ``input_field`` / ``output_field``,
+not this class. Compose in pipeline order::
 
-    train_transform = compose(augmenter, selector, tokenizer)
-    eval_transform = compose(selector, tokenizer)
+    train_transform = compose(augmenter, tokenizer)
+    eval_transform = tokenizer
 
 Permute/scale/shift draws are keyed by ``seed_field`` so steps sharing that
 id share draws within one :meth:`Augmenter.reseed` generation. Mask decisions

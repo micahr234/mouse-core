@@ -155,13 +155,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``compose(...).reseed()`` forwards to stages that define ``reseed``;
   ``DataLoader`` calls ``transform.reseed()`` once at the start of each batch
   fetch.
-- Train and eval are two composes that share selector + tokenizer. Train
-  includes the augmenter (``compose(augmenter, selector, tokenizer)``);
-  eval leaves it out (``compose(selector, tokenizer)``) so the model sees
-  raw values and chosen actions mean the same thing to the env.
-- Required ``input_field`` on each ``Augmenter`` and ``Selector`` field spec.
+- Train includes the augmenter (``compose(augmenter, tokenizer)``);
+  eval is the tokenizer alone so the model sees raw values and chosen
+  actions mean the same thing to the env.
+- Required ``input_field`` on each ``Augmenter`` field spec.
   Omitted ``output_field`` defaults to ``input_field``; a different name writes
-  the output and leaves the input. Selector keeps only listed keys.
+  the output and leaves the input. The tokenizer keeps only the fields it
+  reads (``input_fields`` / ``objective_fields`` / ``grouping_field``).
 - Tokenizer ``input_fields=`` use ``input_field`` (omitted ``output_field``
   defaults to the input name; output name is the modality the embedder aligns
   on).
@@ -251,7 +251,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Tokenizer ``input_fields=`` and ``objective_fields=`` use
   ``input_field`` dicts (optional ``output_field``; no ``field=`` / string
   keep-list). Omitted ``output_field`` defaults to ``input_field`` on
-  Augmenter, Selector, and tokenizer specs (same for augmenter
+  Augmenter and tokenizer specs (same for augmenter
   ``output_vector_field``).
 - Example tokenizer ``objective_fields=`` keep-lists match what each
   objective reads: SV is ``info_q_star``; SP is ``episode_done`` +
@@ -275,8 +275,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Dict→dict pipeline stages take ``fields=`` as a list of
   ``{input_field}`` dicts (optional ``output_field``); tokenizer takes
   ``input_fields=`` and embedder keeps ``modalities=``. ``Augmenter(fields=...)`` (was ``modalities=``);
-  ``SequenceAugmentFieldSpec`` (was ``SequenceAugmentModalitySpec``);
-  ``Selector`` uses the same list-of-dicts shape (not a name→name mapping).
+  ``SequenceAugmentFieldSpec`` (was ``SequenceAugmentModalitySpec``).
 - Depend on ``tokenizers>=0.23.1`` (free-threaded wheels; no upper bound)
   and ``transformers>=5.16.1`` (PyPI; allows that tokenizers range). Other
   dependency floors raised to current PyPI latest (``torch>=2.13.0``,
@@ -318,14 +317,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ``examples/06_train_offline_text.ipynb`` renamed to
   ``examples/06_train_offline_text_dqn.ipynb``.
 - Per-step data pipeline under ``mouse_core.data`` (compose on raw steps, then
-  pack, then embed): ``augmenter → selector → tokenizer → pack → embedder``.
+  pack, then embed): ``augmenter → tokenizer → pack → embedder``.
   * ``compose(*stages)`` — thread a step through callables; ``reseed()`` forwards
   * ``Augmenter`` — ``dict → dict`` (``fields=`` specs with ``input_field`` /
     ``output_field``; required ``seed_field=``; draws keyed by that id within a
     ``reseed`` generation; usable in train and eval)
-  * ``Selector`` — ``dict → dict`` (``fields=`` ``input_field`` /
-    ``output_field`` keep/rename, omitted output defaults to input; include
-    ``grouping_field``)
   * ``NumericTokenizer`` / ``TextTokenizer`` — ``dict → StepTokens`` (one step;
     ``input_field`` on input and objective specs, optional ``output_field``;
     require ``grouping_field=``)
@@ -356,6 +352,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   validates batch ``modality_map`` names/types against the embedder config.
 - ``FlexDecodeSession.reset_rows``: zero selected per-sequence decode lengths so
   a cleared stream can restart without rebuilding the whole batch.
+
+### Removed
+- ``Selector``. Keep/rename is the tokenizer's ``input_field`` /
+  ``output_field`` (and ``objective_fields``). Extra step keys are ignored.
+  Train is ``compose(augmenter, tokenizer)``; eval is the tokenizer.
 
 ### Fixed
 - ``push_to_hub`` and ``push_stores_to_hub`` with ``clear=True`` delete
@@ -456,8 +457,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   local index 0); resolve indices via ``StepTokens.modality_names``.
 - ``StaticFourierFeatures(dtype=...)``: the tables are always fp32.
 - ``Grouper``. Tokenizer ``grouping_field=`` names the step key used for
-  attention isolation (typically ``task_index``). Keep that key through
-  Selector. For no isolation, stamp a constant column on the step.
+  attention isolation (typically ``task_index``). Keep that key on the
+  step so the tokenizer can read it. For no isolation, stamp a constant
+  column on the step.
 - Combined 5-code ``done`` step field and objective ``done_key`` (use
   ``episode_done`` / ``task_done`` and ``episode_done_key`` / ``task_done_key``).
 - Vector-DQN, entirely: ``VecDqnObjective``, ``VectorActionValueHead``,
@@ -468,11 +470,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ``concat_token_batches`` (replaced by ``pack_token_batch`` over ``StepTokens``).
 - Shared ``ModalitySpec`` / ``TextModalitySpec``. Embedder modalities use
   ``field=`` (modality name). Tokenizers use ``input_field`` / ``output_field``.
-- ``Filter`` / ``Filter(keep_fields=...)`` (use ``Selector(fields=...)``).
+- ``Filter`` / ``Filter(keep_fields=...)`` (the tokenizer reads only
+  ``input_fields`` / ``objective_fields`` / ``grouping_field``).
 - ``Augmenter`` without ``seed_field`` (and the per-call streaming ``generator``
   path); draws are always keyed by ``seed_field`` so steps that share an id
   share permute/scale/shift.
-- ``Augmenter(keep_fields=...)`` (use :class:`~mouse_core.data.selector.Selector`).
+- ``Augmenter(keep_fields=...)`` (the tokenizer reads only the fields it
+  needs).
 - ``Encoder.prepare`` / ``make_preparer`` and ``DataLoader(preparer=)`` (replaced by
   data-pipeline tokenizers and ``DataLoader(transform=)``).
 - ``DataLoader`` stage kwargs ``augmenter=`` / ``filter=`` / ``grouper=`` /
@@ -545,8 +549,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pair weight ``1`` when ``sequence_id[i] == sequence_id[i+1]`` and, when
   ``grouping_field=`` is set, ``objective_data[grouping_field]`` matches across
   the pair; otherwise weight ``0``. All-zero weights yield loss ``0``.
-- Example notebooks build ``train_transform = compose(augmenter, selector,
-  tokenizer)`` and ``eval_transform = compose(selector, tokenizer)``
+- Example notebooks build ``train_transform = compose(augmenter,
+  tokenizer)`` and ``eval_transform = tokenizer``
   (online typically uses one tokenizer), pass
   ``DataLoader(transform=train_transform)``, and decode via
   ``pack_token_batch([eval_transform(s) for s in ...])``.
@@ -584,7 +588,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per-process salted ``hash()``, so ``Augmenter(seed=...)`` (and mask draws)
   reproduce across interpreter runs.
 - Offline example notebooks (``02``, ``04``, ``06``) no longer augment at eval:
-  ``pack_rows`` uses ``eval_transform`` (selector + tokenizer, no augmenter).
+  ``pack_rows`` uses ``eval_transform`` (tokenizer, no augmenter).
   Previously the model chose actions in the augmenter's permuted label space
   while the env executed them as raw ids, so the executed action was not the
   one the model selected.

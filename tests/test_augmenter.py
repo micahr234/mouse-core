@@ -5,7 +5,7 @@ import copy
 import numpy as np
 import pytest
 
-from mouse_core.data import Augmenter, Selector, SequenceAugmentFieldSpec, compose
+from mouse_core.data import Augmenter, SequenceAugmentFieldSpec, compose
 from mouse_core.data.augmenter import _stable_hash
 
 
@@ -289,18 +289,10 @@ def test_eval_compose_omits_augmenter() -> None:
             {"type": "discrete", "input_field": "action", "output_field": "action", "vocab_size": 10, "permute": True}
         ],
     )
-    selector = Selector(
-        fields=[
-            {"input_field": "action", "output_field": "action"},
-            {"input_field": "task_index", "output_field": "task_index"},
-        ]
-    )
-    train_transform = compose(augment, selector)
-    eval_transform = compose(selector)
+    train_transform = compose(augment)
     step = {"action": 0, "task_index": 7}
-    assert eval_transform(step) == {"action": 0, "task_index": 7}
-    assert train_transform(step) == selector(augment(step))
-    assert train_transform is not eval_transform
+    assert train_transform(step) == augment(step)
+    # eval is the raw step — no augmenter in the compose.
 
 
 def test_compose_reseed_forwards_to_augmenter() -> None:
@@ -311,20 +303,12 @@ def test_compose_reseed_forwards_to_augmenter() -> None:
             {"type": "discrete", "input_field": "action", "output_field": "action", "vocab_size": 10, "permute": True}
         ],
     )
-    transform = compose(
-        augment,
-        Selector(
-            fields=[
-                {"input_field": "action", "output_field": "action"},
-                {"input_field": "task_index", "output_field": "task_index"},
-            ]
-        ),
-    )
+    transform = compose(augment)
     assert augment._generation == 0
     transform.reseed()
     assert augment._generation == 1
     out = transform({"action": 0, "task_index": 7, "extra": 1})
-    assert "extra" not in out
+    assert out["extra"] == 1
     assert out["action"] == int(
         _rng_for_key(seed=0, seed_field="task_index", key=7, generation=1).permutation(10)[0]
     )
