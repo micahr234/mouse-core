@@ -250,6 +250,18 @@ def _td_lambda_targets(
     return returns * in_run.to(dtype=returns.dtype)
 
 
+def _affine_reward(
+    reward: torch.Tensor, *, scale: float, shift: float
+) -> torch.Tensor:
+    """``scale * reward + shift`` for the TD target. Identity is ``1`` / ``0``.
+
+    Does not mutate ``objective_data``; tokenizer / logged env reward stay raw.
+    """
+    if float(scale) == 1.0 and float(shift) == 0.0:
+        return reward
+    return reward * float(scale) + float(shift)
+
+
 def _pair_values_to_rows(
     pair_values: torch.Tensor,
     step_of: torch.Tensor,
@@ -360,6 +372,11 @@ class DqnObjective(Objective):
             Multiplies the episode discount. ``0.0`` zeros the bootstrap.
         action_key: Key in ``objective_data`` that holds the integer action.
         reward_key: Key in ``objective_data`` that holds the per-step reward.
+        reward_scale: Multiplier applied to ``reward`` before the TD target
+            (default ``1.0``). Does not change ``objective_data`` or the
+            tokenizer.
+        reward_shift: Offset added after ``reward_scale`` (default ``0.0``).
+            The TD reward is ``reward_scale * r + reward_shift``.
         episode_done_key: Key in ``objective_data`` for the episode-done code.
         task_done_key: Key in ``objective_data`` for the task-done code.
         cql_weight: Alpha coefficient for the Conservative Q-Learning penalty.
@@ -380,6 +397,8 @@ class DqnObjective(Objective):
         gamma_task_truncated: float = 0.0,
         action_key: str = "action",
         reward_key: str = "reward",
+        reward_scale: float = 1.0,
+        reward_shift: float = 0.0,
         episode_done_key: str = "episode_done",
         task_done_key: str = "task_done",
         grouping_field: str | None = None,
@@ -397,6 +416,8 @@ class DqnObjective(Objective):
         self.gamma_task_truncated = gamma_task_truncated
         self.action_key = action_key
         self.reward_key = reward_key
+        self.reward_scale = float(reward_scale)
+        self.reward_shift = float(reward_shift)
         self.episode_done_key = episode_done_key
         self.task_done_key = task_done_key
         self.grouping_field = grouping_field
@@ -449,6 +470,9 @@ class DqnObjective(Objective):
             raise TypeError(f"reward must be float32, got {reward.dtype}.")
         if reward.shape != torch.Size([N]):
             raise ValueError(f"DQN objective expects reward shape [{N}], got {tuple(reward.shape)}.")
+        reward = _affine_reward(
+            reward, scale=self.reward_scale, shift=self.reward_shift
+        )
 
         episode_done, task_done = _require_done_codes(
             objective_data,

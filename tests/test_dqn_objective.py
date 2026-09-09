@@ -58,6 +58,52 @@ def test_dqn_objective_trains_on_terminal_transitions() -> None:
     loss, _ = DqnObjective(gamma_step=0.0, gamma_episode_terminal=0.0)(step_stream, predictions, delayed)
     assert abs(loss.item() - 2.5) < 1e-05
 
+
+def test_dqn_objective_reward_affine_is_identity_by_default() -> None:
+    step_stream = TensorDict(
+        {
+            "action": torch.tensor([0, 1, 0]),
+            "reward": torch.tensor([0.0, 1.0, 5.0]),
+            "episode_done": torch.tensor([0, 1, 0]),
+            "task_done": torch.tensor([0, 0, 0]),
+        },
+        batch_size=[3],
+    )
+    predictions, delayed = _q(torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]]), torch.zeros(3, 2))
+    plain, _ = DqnObjective(gamma_step=0.0, gamma_episode_terminal=0.0)(
+        step_stream, predictions, delayed
+    )
+    affine, _ = DqnObjective(
+        gamma_step=0.0, gamma_episode_terminal=0.0, reward_scale=1.0, reward_shift=0.0
+    )(step_stream, predictions, delayed)
+    assert abs(plain.item() - affine.item()) < 1e-05
+
+
+def test_dqn_objective_reward_scale_and_shift() -> None:
+    """gamma=0 so targets are the affine rewards stored at i+1."""
+    step_stream = TensorDict(
+        {
+            "action": torch.tensor([0, 1, 0]),
+            "reward": torch.tensor([0.0, 1.0, 5.0]),
+            "episode_done": torch.tensor([0, 1, 0]),
+            "task_done": torch.tensor([0, 0, 0]),
+        },
+        batch_size=[3],
+    )
+    predictions, delayed = _q(torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]]), torch.zeros(3, 2))
+    # Unscaled targets 1 and 5 → MSE 2.5. Scale 2: targets 2 and 10 → (2-2)^2, (3-10)^2.
+    scaled, _ = DqnObjective(
+        gamma_step=0.0, gamma_episode_terminal=0.0, reward_scale=2.0
+    )(step_stream, predictions, delayed)
+    assert abs(scaled.item() - 24.5) < 1e-05
+    # Shift 1: targets 2 and 6 → (2-2)^2, (3-6)^2.
+    shifted, _ = DqnObjective(
+        gamma_step=0.0, gamma_episode_terminal=0.0, reward_shift=1.0
+    )(step_stream, predictions, delayed)
+    assert abs(shifted.item() - 4.5) < 1e-05
+    # Leaves objective_data reward unchanged.
+    assert torch.equal(step_stream["reward"], torch.tensor([0.0, 1.0, 5.0]))
+
 def _sequence_fixture(sequence_id: list[int]) -> tuple[TensorDict, TensorDict, TensorDict]:
     step_stream = TensorDict({'action': torch.tensor([0, 1, 0]), 'reward': torch.tensor([0.0, 1.0, 5.0]), 'episode_done': torch.tensor([0, 0, 0]), 'task_done': torch.tensor([0, 0, 0]), 'sequence_id': torch.tensor(sequence_id)}, batch_size=[3])
     predictions, delayed = _q(torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]]), torch.zeros(3, 2))

@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- ``DqnObjective`` and ``LayerwiseDqnObjective`` take ``reward_scale``
+  (default ``1``) and ``reward_shift`` (default ``0``). The TD target
+  uses ``reward_scale * r + reward_shift``; ``objective_data`` and the
+  tokenizer are unchanged.
 - ``DqnObjective`` and ``LayerwiseDqnObjective`` target is the TD(λ) return
   (``td_lambda``, default ``0.0`` = the one-step target; ``1.0`` = the full
   in-run n-step return). ``watkins=True`` (Watkins's Q(λ)) also cuts the

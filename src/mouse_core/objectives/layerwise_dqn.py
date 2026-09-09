@@ -9,6 +9,7 @@ from tensordict import TensorDict
 
 from mouse_core.objectives.base import Objective
 from mouse_core.objectives.dqn import (
+    _affine_reward,
     _boundary_discounts,
     _greedy_from_online_q,
     _in_run_stats,
@@ -139,6 +140,9 @@ class LayerwiseDqnObjective(Objective):
         gamma_task_truncated: Task-truncated extra discount at the deepest layer.
         action_key: Key in ``objective_data`` for the integer action.
         reward_key: Key in ``objective_data`` for per-step reward.
+        reward_scale: Multiplier applied to ``reward`` before the TD target
+            (default ``1.0``). Does not change ``objective_data``.
+        reward_shift: Offset added after ``reward_scale`` (default ``0.0``).
         episode_done_key: Key in ``objective_data`` for the episode-done code.
         task_done_key: Key in ``objective_data`` for the task-done code.
         cql_weight: CQL penalty coefficient; ``0.0`` disables CQL.
@@ -164,6 +168,8 @@ class LayerwiseDqnObjective(Objective):
         gamma_task_truncated: float = 0.0,
         action_key: str = "action",
         reward_key: str = "reward",
+        reward_scale: float = 1.0,
+        reward_shift: float = 0.0,
         episode_done_key: str = "episode_done",
         task_done_key: str = "task_done",
         cql_weight: float = 0.0,
@@ -187,6 +193,8 @@ class LayerwiseDqnObjective(Objective):
         self.gamma_task_truncated = float(gamma_task_truncated)
         self.action_key = action_key
         self.reward_key = reward_key
+        self.reward_scale = float(reward_scale)
+        self.reward_shift = float(reward_shift)
         self.episode_done_key = episode_done_key
         self.task_done_key = task_done_key
         self.cql_weight = cql_weight
@@ -274,6 +282,9 @@ class LayerwiseDqnObjective(Objective):
             raise ValueError(
                 f"Layerwise DQN objective expects reward shape [{N}], got {tuple(reward.shape)}."
             )
+        reward = _affine_reward(
+            reward, scale=self.reward_scale, shift=self.reward_shift
+        )
 
         episode_done, task_done = _require_done_codes(
             objective_data,
