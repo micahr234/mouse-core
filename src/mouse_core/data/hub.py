@@ -3,10 +3,9 @@
 Pushes write the raw rows (whatever shape you stored) using standard
 ``DatasetDict.push_to_hub`` with ``config_name`` for subsets/bins.
 
-When ``clear=True`` (the default), an existing dataset repository is deleted
-before the new upload. Overwriting same-named parquet shards in place does
-not refresh Hugging Face's converted parquet / dataset viewer; recreating
-the repository forces a fresh conversion that matches the data just pushed.
+When ``clear=True`` (the default), the existing dataset repository is
+deleted, the new files are uploaded with ``viewer: false``, then the card
+is updated to ``viewer: true`` so Hugging Face rebuilds converted parquet.
 
 When ``clear=False``, the push is layered on top of the existing repository.
 
@@ -30,6 +29,7 @@ from __future__ import annotations
 from pathlib import Path
 import re
 import tempfile
+import time
 from typing import TYPE_CHECKING, Any, NoReturn
 
 import numpy as np
@@ -169,15 +169,29 @@ def _build_split_datasets(splits: dict[str, list[Datastore]]) -> dict[str, Datas
     return _align_splits(resolved)
 
 
-def _delete_dataset_repo_if_exists(api: HfApi, repo_id: str) -> None:
-    """Delete an existing dataset repo so Hub parquet conversion starts fresh.
+_REPO_DELETE_TIMEOUT_S = 60.0
+_REPO_DELETE_POLL_S = 0.5
 
-    Overwriting same-named parquet shards in place leaves Hugging Face's
-    converted parquet / dataset viewer stale. Recreating the repository
-    forces a new conversion that matches the data just pushed.
-    """
-    resolved = repo_id if "/" in repo_id else f"{api.whoami()['name']}/{repo_id}"
+
+def _resolved_hub_dataset_id(api: HfApi, repo_id: str) -> str:
+    if "/" in repo_id:
+        return repo_id
+    return f"{api.whoami()['name']}/{repo_id}"
+
+
+def _delete_dataset_repo_if_exists(api: HfApi, repo_id: str) -> str:
+    """Delete an existing dataset repo and wait until the Hub finishes."""
+    resolved = _resolved_hub_dataset_id(api, repo_id)
     api.delete_repo(repo_id=resolved, repo_type="dataset", missing_ok=True)
+    deadline = time.monotonic() + _REPO_DELETE_TIMEOUT_S
+    while api.repo_exists(repo_id=resolved, repo_type="dataset"):
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"Timed out waiting for Hub dataset {resolved!r} to be deleted. "
+                "Retry the push."
+            )
+        time.sleep(_REPO_DELETE_POLL_S)
+    return resolved
 
 
 def _create_or_update_dataset_repo(
@@ -190,13 +204,41 @@ def _create_or_update_dataset_repo(
     if clear:
         _delete_dataset_repo_if_exists(api, repo_id)
     repo_url = api.create_repo(
-        repo_id=repo_id, repo_type="dataset", private=private, exist_ok=True
+        repo_id=repo_id, repo_type="dataset", private=private, exist_ok=not clear
     )
     hub_repo_id = repo_url.repo_id
     # create_repo only sets visibility on creation; enforce it on every push so
     # re-pushing an existing repo with a different ``private`` value takes effect.
     api.update_repo_settings(repo_id=hub_repo_id, repo_type="dataset", private=private)
     return str(repo_url), hub_repo_id
+
+
+def _commit_dataset_card(
+    *,
+    api: HfApi,
+    repo_id: str,
+    text: str,
+    commit_message: str,
+) -> None:
+    api.create_commit(
+        repo_id=repo_id,
+        repo_type="dataset",
+        commit_message=commit_message,
+        operations=[
+            CommitOperationAdd(path_in_repo="README.md", path_or_fileobj=text.encode("utf-8")),
+        ],
+    )
+
+
+def _card_with_viewer(text: str, *, viewer: bool) -> str:
+    flag = "true" if viewer else "false"
+    if text.startswith("---"):
+        end = text.find("\n---", 3)
+        if end != -1:
+            fm_lines = [line for line in text[4:end].splitlines() if not line.startswith("viewer:")]
+            rest = text[end + 4:]
+            return f"---\nviewer: {flag}\n" + ("\n".join(fm_lines) + "\n" if fm_lines else "") + f"---{rest}"
+    return f"---\nviewer: {flag}\n---\n{text}"
 
 
 def _push_dataset_dict(
@@ -214,11 +256,11 @@ def _push_dataset_dict(
     )
 
 
-def _dataset_card_for_configs(*, config_names: list[str], split: str) -> str:
-    lines = [
-        "---",
-        "configs:",
-    ]
+def _dataset_card_for_configs(*, config_names: list[str], split: str, viewer: bool | None = None) -> str:
+    lines = ["---"]
+    if viewer is not None:
+        lines.append(f"viewer: {'true' if viewer else 'false'}")
+    lines.append("configs:")
     for config_name in config_names:
         lines.extend([
             f"- config_name: {config_name}",
@@ -300,10 +342,15 @@ def _write_store_dataset_repo(
     root: Path,
     prepared: list[tuple[str, Dataset]],
     split: str,
+    viewer: bool | None = None,
 ) -> None:
     (root / "data").mkdir(parents=True, exist_ok=True)
     (root / datasets_config.REPOCARD_FILENAME).write_text(
-        _dataset_card_for_configs(split=split, config_names=[config_name for config_name, _ in prepared]),
+        _dataset_card_for_configs(
+            split=split,
+            config_names=[config_name for config_name, _ in prepared],
+            viewer=viewer,
+        ),
         encoding="utf-8",
     )
 
@@ -454,12 +501,11 @@ def push_to_hub(
         Default is ``"default"``. When loading later use
         ``load_stores_from_hub(repo_id=repo, store_names=[config_name], split=...)``.
     clear :
-        If ``True`` (default), delete the existing dataset repository (if any)
-        and recreate it before uploading. Same-named parquet shards overwritten
-        in place do not refresh Hugging Face's converted parquet / dataset
-        viewer; a new repository forces a fresh conversion. If ``False``,
-        nothing is deleted and this push is layered on top of the existing
-        repository — you are responsible for keeping the combined
+        If ``True`` (default), delete the existing dataset repository, upload
+        the new files with ``viewer: false``, then update the card to
+        ``viewer: true`` so Hugging Face rebuilds converted parquet. If
+        ``False``, nothing is deleted and this push is layered on top of the
+        existing repository — you are responsible for keeping the combined
         configs/splits consistent.
 
     Returns
@@ -500,6 +546,22 @@ def push_to_hub(
             private=private, api=api, repo_id=repo_id, clear=clear
         )
         _push_dataset_dict(repo_id=hub_repo_id, commit_message=commit_message, config_name=config_name, dataset_dict=dataset_dict)
+        if clear:
+            enabled_card = Path(
+                api.hf_hub_download(repo_id=hub_repo_id, filename="README.md", repo_type="dataset")
+            ).read_text(encoding="utf-8")
+            _commit_dataset_card(
+                api=api,
+                repo_id=hub_repo_id,
+                text=_card_with_viewer(enabled_card, viewer=False),
+                commit_message="Upload dataset with viewer: false",
+            )
+            _commit_dataset_card(
+                api=api,
+                repo_id=hub_repo_id,
+                text=_card_with_viewer(enabled_card, viewer=True),
+                commit_message="Enable dataset viewer",
+            )
     except HfHubHTTPError as e:
         _raise_for_hub_http_error(e, repo_id)
 
@@ -541,12 +603,12 @@ def push_stores_to_hub(
     commit_message :
         Commit message written to the Hub.
     clear :
-        If ``True`` (default), delete the existing dataset repository (if any)
-        and recreate it before uploading, so the pushed stores fully define
-        the repository and Hugging Face re-converts parquet for the viewer.
-        If ``False``, nothing is deleted and the pushed configs are layered
-        on top of the existing repository — you are responsible for keeping
-        the combined contents consistent (including the README ``configs:``
+        If ``True`` (default), delete the existing dataset repository, upload
+        the new files with ``viewer: false``, then update the card to
+        ``viewer: true`` so Hugging Face rebuilds converted parquet. If
+        ``False``, nothing is deleted and the pushed configs are layered on
+        top of the existing repository — you are responsible for keeping the
+        combined contents consistent (including the README ``configs:``
         block, which this push overwrites with only the stores being pushed
         now).
 
@@ -612,8 +674,26 @@ def push_stores_to_hub(
         )
         with tempfile.TemporaryDirectory() as tmp:
             folder_path = Path(tmp)
-            _write_store_dataset_repo(split=split, root=folder_path, prepared=prepared)
-            _commit_dataset_repo(repo_id=hub_repo_id, folder_path=folder_path, commit_message=commit_message, api=api)
+            viewer = False if clear else None
+            _write_store_dataset_repo(split=split, root=folder_path, prepared=prepared, viewer=viewer)
+            _commit_dataset_repo(
+                repo_id=hub_repo_id,
+                folder_path=folder_path,
+                commit_message=commit_message,
+                api=api,
+            )
+            if clear:
+                enabled_card = _dataset_card_for_configs(
+                    split=split,
+                    config_names=[config_name for config_name, _ in prepared],
+                    viewer=True,
+                )
+                _commit_dataset_card(
+                    api=api,
+                    repo_id=hub_repo_id,
+                    text=enabled_card,
+                    commit_message="Enable dataset viewer",
+                )
     except HfHubHTTPError as e:
         _raise_for_hub_http_error(e, repo_id)
 

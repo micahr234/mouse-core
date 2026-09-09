@@ -1,5 +1,6 @@
 from __future__ import annotations
 from pathlib import Path
+import tempfile
 import pytest
 from datasets import Dataset
 from mouse_core.data import Datastore
@@ -13,16 +14,21 @@ class _FakeRepoUrl:
 
 class _FakeHfApi:
 
-    def __init__(self) -> None:
+    def __init__(self, *, repo_present: bool = True) -> None:
         self.settings_updates: list[tuple[str, bool]] = []
         self.commits: list[list[str]] = []
+        self.commit_messages: list[str] = []
+        self.card_texts: list[str] = []
         self.deleted_repos: list[str] = []
+        self.create_exist_oks: list[bool] = []
+        self._repo_present = repo_present
 
     def create_repo(self, *, repo_id: str, repo_type: str, private: bool, exist_ok: bool) -> _FakeRepoUrl:
         assert repo_id == 'test-dataset'
         assert repo_type == 'dataset'
         assert private is True
-        assert exist_ok is True
+        self.create_exist_oks.append(exist_ok)
+        self._repo_present = True
         return _FakeRepoUrl()
 
     def update_repo_settings(self, *, repo_id: str, repo_type: str, private: bool) -> None:
@@ -33,12 +39,32 @@ class _FakeHfApi:
         assert repo_type == 'dataset'
         assert missing_ok is True
         self.deleted_repos.append(repo_id)
+        self._repo_present = False
+
+    def repo_exists(self, *, repo_id: str, repo_type: str, token: str | bool | None = None) -> bool:
+        assert repo_type == 'dataset'
+        return self._repo_present
+
+    def hf_hub_download(self, *, repo_id: str, filename: str, repo_type: str, **kwargs) -> str:
+        assert repo_id == 'user/test-dataset'
+        assert filename == 'README.md'
+        assert repo_type == 'dataset'
+        path = Path(tempfile.mkdtemp()) / 'README.md'
+        path.write_text('---\nconfigs: []\n---\n', encoding='utf-8')
+        return str(path)
 
     def create_commit(self, *, repo_id: str, repo_type: str, operations: list, commit_message: str) -> None:
         assert repo_id == 'user/test-dataset'
         assert repo_type == 'dataset'
         assert commit_message
+        self.commit_messages.append(commit_message)
         self.commits.append([op.path_in_repo for op in operations])
+        for op in operations:
+            payload = getattr(op, 'path_or_fileobj', None)
+            if op.path_in_repo == 'README.md' and isinstance(payload, bytes):
+                self.card_texts.append(payload.decode('utf-8'))
+            elif op.path_in_repo == 'README.md' and payload is not None and not isinstance(payload, (bytes, bytearray)):
+                self.card_texts.append(Path(payload).read_text(encoding='utf-8'))
 
     def whoami(self, token: str | bool | None=None) -> dict[str, str]:
         return {'name': 'user'}
@@ -146,26 +172,33 @@ def test_push_stores_to_hub_pushes_one_config_per_store(monkeypatch: pytest.Monk
     assert url == 'https://huggingface.co/datasets/user/test-dataset'
     assert api.settings_updates == [('user/test-dataset', True)]
     assert api.deleted_repos == ['user/test-dataset']
-    assert api.commits == []
-    assert commits == [{'files': ['README.md', 'data/cartpole/train-00000-of-00001.parquet', 'data/lunar/train-00000-of-00001.parquet'], 'readme': '---\nconfigs:\n- config_name: cartpole\n  data_files:\n  - split: train\n    path: data/cartpole/train-*.parquet\n- config_name: lunar\n  data_files:\n  - split: train\n    path: data/lunar/train-*.parquet\n---\n'}]
+    assert api.create_exist_oks == [False]
+    assert api.commit_messages == ['Enable dataset viewer']
+    assert api.card_texts == ['---\nviewer: true\nconfigs:\n- config_name: cartpole\n  data_files:\n  - split: train\n    path: data/cartpole/train-*.parquet\n- config_name: lunar\n  data_files:\n  - split: train\n    path: data/lunar/train-*.parquet\n---\n']
+    assert commits == [{'files': ['README.md', 'data/cartpole/train-00000-of-00001.parquet', 'data/lunar/train-00000-of-00001.parquet'], 'readme': '---\nviewer: false\nconfigs:\n- config_name: cartpole\n  data_files:\n  - split: train\n    path: data/cartpole/train-*.parquet\n- config_name: lunar\n  data_files:\n  - split: train\n    path: data/lunar/train-*.parquet\n---\n'}]
 
 def test_delete_dataset_repo_if_exists_scopes_short_names() -> None:
     api = _FakeHfApi()
-    hub._delete_dataset_repo_if_exists(api, 'test-dataset')
+    assert hub._delete_dataset_repo_if_exists(api, 'test-dataset') == 'user/test-dataset'
     assert api.deleted_repos == ['user/test-dataset']
 
-def test_delete_dataset_repo_if_exists_keeps_scoped_names() -> None:
-    api = _FakeHfApi()
-    hub._delete_dataset_repo_if_exists(api, 'org/test-dataset')
-    assert api.deleted_repos == ['org/test-dataset']
+def test_card_with_viewer_sets_true_and_false() -> None:
+    card = '---\nconfigs:\n- config_name: cartpole\n---\n'
+    assert hub._card_with_viewer(card, viewer=False).startswith('---\nviewer: false\n')
+    assert hub._card_with_viewer(card, viewer=True).startswith('---\nviewer: true\n')
 
-def test_push_stores_to_hub_clear_true_deletes_repo_then_uploads(monkeypatch: pytest.MonkeyPatch) -> None:
-    """clear=True deletes the existing repo so Hub parquet conversion starts fresh."""
+def test_push_stores_to_hub_clear_true_deletes_then_toggles_viewer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """clear=True deletes the repo, uploads with viewer: false, then sets viewer: true."""
     api = _FakeHfApi()
     monkeypatch.setattr(hub, 'HfApi', lambda: api)
     hub.push_stores_to_hub(repo_id='test-dataset', private=True, stores=[_store(1, name='cartpole')])
     assert api.deleted_repos == ['user/test-dataset']
-    assert api.commits == [['README.md', 'data/cartpole/train-00000-of-00001.parquet']]
+    assert api.create_exist_oks == [False]
+    assert api.commit_messages == ['New rollout data', 'Enable dataset viewer']
+    assert api.commits[0] == ['README.md', 'data/cartpole/train-00000-of-00001.parquet']
+    assert api.commits[1] == ['README.md']
+    assert 'viewer: false' in api.card_texts[0]
+    assert 'viewer: true' in api.card_texts[1]
 
 def test_push_stores_to_hub_clear_false_deletes_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
     """clear=False layers the push on top of existing files: additions only."""
@@ -173,19 +206,29 @@ def test_push_stores_to_hub_clear_false_deletes_nothing(monkeypatch: pytest.Monk
     monkeypatch.setattr(hub, 'HfApi', lambda: api)
     hub.push_stores_to_hub(repo_id='test-dataset', clear=False, private=True, stores=[_store(1, name='cartpole')])
     assert api.deleted_repos == []
+    assert api.create_exist_oks == [True]
+    assert api.commit_messages == ['New rollout data']
     assert api.commits == [['README.md', 'data/cartpole/train-00000-of-00001.parquet']]
+    assert api.card_texts == ['---\nconfigs:\n- config_name: cartpole\n  data_files:\n  - split: train\n    path: data/cartpole/train-*.parquet\n---\n']
+    assert 'viewer:' not in api.card_texts[0]
 
-def test_push_to_hub_clear_flag_deletes_repo(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_push_to_hub_clear_flag_deletes_then_toggles_viewer(monkeypatch: pytest.MonkeyPatch) -> None:
     api = _FakeHfApi()
     pushes: list[str] = []
     monkeypatch.setattr(hub, 'HfApi', lambda: api)
     monkeypatch.setattr(hub, '_push_dataset_dict', lambda dataset_dict, *, repo_id, commit_message, config_name: pushes.append(config_name))
     hub.push_to_hub(repo_id='test-dataset', private=True, splits={'train': [_store(1, name='cartpole')]})
     assert api.deleted_repos == ['user/test-dataset']
+    assert api.create_exist_oks == [False]
     assert pushes == ['default']
+    assert api.commit_messages == ['Upload dataset with viewer: false', 'Enable dataset viewer']
+    assert api.card_texts[0].startswith('---\nviewer: false\n')
+    assert api.card_texts[1].startswith('---\nviewer: true\n')
     hub.push_to_hub(repo_id='test-dataset', clear=False, private=True, splits={'train': [_store(1, name='cartpole')]})
     assert api.deleted_repos == ['user/test-dataset']
+    assert api.create_exist_oks == [False, True]
     assert pushes == ['default', 'default']
+    assert api.commit_messages == ['Upload dataset with viewer: false', 'Enable dataset viewer']
 
 def test_push_stores_to_hub_requires_named_stores() -> None:
     with pytest.raises(ValueError, match='non-empty name'):

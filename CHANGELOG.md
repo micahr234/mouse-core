@@ -346,10 +346,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a cleared stream can restart without rebuilding the whole batch.
 
 ### Fixed
-- ``push_to_hub`` and ``push_stores_to_hub`` with ``clear=True`` now delete
-  the existing Hub dataset repository before uploading. Overwriting
-  same-named parquet shards in place left Hugging Face's converted parquet
-  / dataset viewer stale.
+- ``push_to_hub`` and ``push_stores_to_hub`` with ``clear=True`` delete
+  the existing Hub dataset repository, upload the new files with
+  ``viewer: false``, then set ``viewer: true`` so converted parquet
+  rebuilds.
 - ``DqnObjective`` / ``LayerwiseDqnObjective`` detach delayed Q before
   the Bellman target, so a gradient tape on the delayed tensor cannot
   flow into the TD error.
