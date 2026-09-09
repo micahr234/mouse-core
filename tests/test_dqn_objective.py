@@ -104,6 +104,53 @@ def test_dqn_objective_reward_scale_and_shift() -> None:
     # Leaves objective_data reward unchanged.
     assert torch.equal(step_stream["reward"], torch.tensor([0.0, 1.0, 5.0]))
 
+
+def test_dqn_objective_q_affine_is_identity_by_default() -> None:
+    step_stream = TensorDict(
+        {
+            "action": torch.tensor([0, 1, 0]),
+            "reward": torch.tensor([0.0, 1.0, 5.0]),
+            "episode_done": torch.tensor([0, 1, 0]),
+            "task_done": torch.tensor([0, 0, 0]),
+        },
+        batch_size=[3],
+    )
+    predictions, delayed = _q(torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]]), torch.zeros(3, 2))
+    plain, _ = DqnObjective(gamma_step=0.0, gamma_episode_terminal=0.0)(
+        step_stream, predictions, delayed
+    )
+    affine, _ = DqnObjective(
+        gamma_step=0.0, gamma_episode_terminal=0.0, q_scale=1.0, q_shift=0.0
+    )(step_stream, predictions, delayed)
+    assert abs(plain.item() - affine.item()) < 1e-05
+
+
+def test_dqn_objective_q_scale_and_shift() -> None:
+    """gamma=0 so bootstrap is unused; affine applies to online Q only."""
+    step_stream = TensorDict(
+        {
+            "action": torch.tensor([0, 1, 0]),
+            "reward": torch.tensor([0.0, 1.0, 5.0]),
+            "episode_done": torch.tensor([0, 1, 0]),
+            "task_done": torch.tensor([0, 0, 0]),
+        },
+        batch_size=[3],
+    )
+    online = torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]])
+    predictions, delayed = _q(online, torch.zeros(3, 2))
+    # Taken Q 2 and 3, targets 1 and 5. Scale 2: 4 and 6 → (4-1)^2, (6-5)^2.
+    scaled, _ = DqnObjective(
+        gamma_step=0.0, gamma_episode_terminal=0.0, q_scale=2.0
+    )(step_stream, predictions, delayed)
+    assert abs(scaled.item() - 5.0) < 1e-05
+    # Shift 1: 3 and 4 → (3-1)^2, (4-5)^2.
+    shifted, _ = DqnObjective(
+        gamma_step=0.0, gamma_episode_terminal=0.0, q_shift=1.0
+    )(step_stream, predictions, delayed)
+    assert abs(shifted.item() - 2.5) < 1e-05
+    assert torch.equal(predictions["action_value"], online)
+
+
 def _sequence_fixture(sequence_id: list[int]) -> tuple[TensorDict, TensorDict, TensorDict]:
     step_stream = TensorDict({'action': torch.tensor([0, 1, 0]), 'reward': torch.tensor([0.0, 1.0, 5.0]), 'episode_done': torch.tensor([0, 0, 0]), 'task_done': torch.tensor([0, 0, 0]), 'sequence_id': torch.tensor(sequence_id)}, batch_size=[3])
     predictions, delayed = _q(torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]]), torch.zeros(3, 2))
@@ -295,6 +342,17 @@ def test_td_lambda_zero_is_the_one_step_target() -> None:
     loss, metrics = DqnObjective(gamma_step=1.0)(step_stream, predictions, delayed)
     assert abs(loss.item() - _ONE_STEP) < 1e-03
     assert "watkins_greedy_frac" not in metrics
+
+
+def test_dqn_objective_q_affine_applies_to_online_and_delayed() -> None:
+    """Same affine on online Q and delayed bootstrap (γ=1 one-step)."""
+    step_stream, predictions, delayed = _lambda_fixture()
+    # Taken Q 10 and 0; delayed max 6 and 200; targets 7 and 210.
+    loss, _ = DqnObjective(gamma_step=1.0, q_scale=2.0)(
+        step_stream, predictions, delayed
+    )
+    expected = (9.0 + 44100.0) / 2
+    assert abs(loss.item() - expected) < 1e-03
 
 
 def test_td_lambda_one_is_the_full_n_step_return() -> None:

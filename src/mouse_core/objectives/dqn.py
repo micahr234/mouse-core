@@ -250,16 +250,17 @@ def _td_lambda_targets(
     return returns * in_run.to(dtype=returns.dtype)
 
 
-def _affine_reward(
-    reward: torch.Tensor, *, scale: float, shift: float
+def _affine(
+    values: torch.Tensor, *, scale: float, shift: float
 ) -> torch.Tensor:
-    """``scale * reward + shift`` for the TD target. Identity is ``1`` / ``0``.
+    """``scale * values + shift``. Identity is ``1`` / ``0``.
 
-    Does not mutate ``objective_data``; tokenizer / logged env reward stay raw.
+    Used for the TD reward and for online / delayed Q. Does not mutate
+    ``objective_data`` or the prediction tensors.
     """
     if float(scale) == 1.0 and float(shift) == 0.0:
-        return reward
-    return reward * float(scale) + float(shift)
+        return values
+    return values * float(scale) + float(shift)
 
 
 def _pair_values_to_rows(
@@ -377,6 +378,12 @@ class DqnObjective(Objective):
             tokenizer.
         reward_shift: Offset added after ``reward_scale`` (default ``0.0``).
             The TD reward is ``reward_scale * r + reward_shift``.
+        q_scale: Multiplier applied to online and delayed ``action_value``
+            before the TD error (default ``1.0``). Same affine on both
+            networks. Does not change the prediction tensors or eval
+            ``argmax``.
+        q_shift: Offset added after ``q_scale`` (default ``0.0``). The TD
+            Q is ``q_scale * Q + q_shift``.
         episode_done_key: Key in ``objective_data`` for the episode-done code.
         task_done_key: Key in ``objective_data`` for the task-done code.
         cql_weight: Alpha coefficient for the Conservative Q-Learning penalty.
@@ -399,6 +406,8 @@ class DqnObjective(Objective):
         reward_key: str = "reward",
         reward_scale: float = 1.0,
         reward_shift: float = 0.0,
+        q_scale: float = 1.0,
+        q_shift: float = 0.0,
         episode_done_key: str = "episode_done",
         task_done_key: str = "task_done",
         grouping_field: str | None = None,
@@ -418,6 +427,8 @@ class DqnObjective(Objective):
         self.reward_key = reward_key
         self.reward_scale = float(reward_scale)
         self.reward_shift = float(reward_shift)
+        self.q_scale = float(q_scale)
+        self.q_shift = float(q_shift)
         self.episode_done_key = episode_done_key
         self.task_done_key = task_done_key
         self.grouping_field = grouping_field
@@ -449,6 +460,8 @@ class DqnObjective(Objective):
                 f"DQN delayed action_value shape {tuple(q_target.shape)} must "
                 f"match online shape {tuple(q.shape)}."
             )
+        q = _affine(q, scale=self.q_scale, shift=self.q_shift)
+        q_target = _affine(q_target, scale=self.q_scale, shift=self.q_shift)
         P, A = q.shape
         device = q.device
         value_dtype = q.dtype
@@ -470,7 +483,7 @@ class DqnObjective(Objective):
             raise TypeError(f"reward must be float32, got {reward.dtype}.")
         if reward.shape != torch.Size([N]):
             raise ValueError(f"DQN objective expects reward shape [{N}], got {tuple(reward.shape)}.")
-        reward = _affine_reward(
+        reward = _affine(
             reward, scale=self.reward_scale, shift=self.reward_shift
         )
 

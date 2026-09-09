@@ -9,7 +9,7 @@ from tensordict import TensorDict
 
 from mouse_core.objectives.base import Objective
 from mouse_core.objectives.dqn import (
-    _affine_reward,
+    _affine,
     _boundary_discounts,
     _greedy_from_online_q,
     _in_run_stats,
@@ -143,6 +143,9 @@ class LayerwiseDqnObjective(Objective):
         reward_scale: Multiplier applied to ``reward`` before the TD target
             (default ``1.0``). Does not change ``objective_data``.
         reward_shift: Offset added after ``reward_scale`` (default ``0.0``).
+        q_scale: Multiplier applied to online and delayed Q before the TD
+            error (default ``1.0``). Same affine on both networks.
+        q_shift: Offset added after ``q_scale`` (default ``0.0``).
         episode_done_key: Key in ``objective_data`` for the episode-done code.
         task_done_key: Key in ``objective_data`` for the task-done code.
         cql_weight: CQL penalty coefficient; ``0.0`` disables CQL.
@@ -170,6 +173,8 @@ class LayerwiseDqnObjective(Objective):
         reward_key: str = "reward",
         reward_scale: float = 1.0,
         reward_shift: float = 0.0,
+        q_scale: float = 1.0,
+        q_shift: float = 0.0,
         episode_done_key: str = "episode_done",
         task_done_key: str = "task_done",
         cql_weight: float = 0.0,
@@ -195,6 +200,8 @@ class LayerwiseDqnObjective(Objective):
         self.reward_key = reward_key
         self.reward_scale = float(reward_scale)
         self.reward_shift = float(reward_shift)
+        self.q_scale = float(q_scale)
+        self.q_shift = float(q_shift)
         self.episode_done_key = episode_done_key
         self.task_done_key = task_done_key
         self.cql_weight = cql_weight
@@ -253,6 +260,8 @@ class LayerwiseDqnObjective(Objective):
                 f"Layerwise DQN delayed shape {tuple(q_target.shape)} must "
                 f"match online shape {tuple(q.shape)}."
             )
+        q = _affine(q, scale=self.q_scale, shift=self.q_shift)
+        q_target = _affine(q_target, scale=self.q_scale, shift=self.q_shift)
         P, L, A = q.shape
         device = q.device
         value_dtype = q.dtype
@@ -282,7 +291,7 @@ class LayerwiseDqnObjective(Objective):
             raise ValueError(
                 f"Layerwise DQN objective expects reward shape [{N}], got {tuple(reward.shape)}."
             )
-        reward = _affine_reward(
+        reward = _affine(
             reward, scale=self.reward_scale, shift=self.reward_shift
         )
 
