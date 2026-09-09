@@ -390,7 +390,7 @@ def test_dataloader_transform_returns_token_batch() -> None:
         hidden_dim=8,
         modalities=[
             {"type": 'discrete', "field": "action", "vocab_size": 16, "std": 0.02, "positions": 1},
-            {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1},
+            {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0},
         ],
     )
     loader = DataLoader(

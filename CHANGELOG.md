@@ -187,6 +187,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``grouping_field: str | None = None`` (``None`` ⇒ no grouping filter).
 
 ### Changed
+- ``NumericEmbedder`` Fourier input range is set per modality: every
+  ``fourier`` / ``continuous`` spec must pass ``fourier_min`` and
+  ``fourier_max`` (no default). Each field owns its own
+  ``StaticFourierFeatures`` bank. The embedder-wide ``fourier_min=`` /
+  ``fourier_max=`` kwargs are gone; ``NumericEmbedder(fourier_min=...)`` is
+  a ``TypeError`` and the saved encoder config no longer carries top-level
+  ``fourier_min`` / ``fourier_max``.
 - ``NumericEmbedder`` embedding init scale is set per modality only: every
   modality spec must pass ``std`` (content table / Fourier features and the
   type vector for that modality all use it) and construction raises

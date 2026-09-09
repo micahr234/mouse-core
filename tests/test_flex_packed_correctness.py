@@ -107,7 +107,7 @@ def test_flex_packed_bf16_matches_fp32_sdpa_within_bf16_noise(L: int) -> None:
     assert flex_err <= 2.0 * bf16_floor + 1e-3, f'flex err {flex_err} vs bf16 SDPA floor {bf16_floor}'
 
 def test_prepare_sequence_id_col_matches_step_counts() -> None:
-    encoder = NumericEmbedder(hidden_dim=8, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}, {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1}, {'type': 'learnable', 'tokens': 1, "std": 0.02, "positions": 1}])
+    encoder = NumericEmbedder(hidden_dim=8, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}, {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0}, {'type': 'learnable', 'tokens': 1, "std": 0.02, "positions": 1}])
     batch = [[{'action': s % 4, 'reward': float(s)} for s in range(5)], [{'action': 1, 'reward': 0.0}, {'action': 2, 'reward': 1.0}, {'action': 3, 'reward': 2.0}]]
     tb, objective_data = batch_to_packed(_tok(encoder), batch)
     assert list(tb.step_counts()) == [5, 3]

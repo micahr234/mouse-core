@@ -36,6 +36,10 @@ class NumericEmbedderModalitySpec:
     emits in one step. The modality owns one type vector per position
     (``[positions, D]``); token ``t`` receives row ``TokenBatch.positions[t]``.
     Must be ``>= dim`` for ``continuous`` and ``>= tokens`` for ``learnable``.
+
+    ``fourier`` / ``continuous`` must set ``fourier_min`` and ``fourier_max``
+    (the static Fourier input range for this field; no default). Other
+    types must not set them.
     """
 
     type: str
@@ -45,6 +49,8 @@ class NumericEmbedderModalitySpec:
     tokens: int | None = None
     std: float | None = None
     positions: int | None = None
+    fourier_min: float | None = None
+    fourier_max: float | None = None
 
     _VALID_TYPES: ClassVar[tuple[str, ...]] = (
         "discrete",
@@ -82,6 +88,31 @@ class NumericEmbedderModalitySpec:
                 f"embedder modality positions must be >= 1, got {self.positions!r}"
             )
         object.__setattr__(self, "positions", positions)
+        if k in ("fourier", "continuous"):
+            if self.fourier_min is None or self.fourier_max is None:
+                raise ValueError(
+                    f"embedder modality type={k!r} field={self.field!r} requires "
+                    "fourier_min= and fourier_max= (Fourier input range; no default)"
+                )
+            fmin = float(self.fourier_min)
+            fmax = float(self.fourier_max)
+            if fmin <= 0.0 or fmax <= 0.0:
+                raise ValueError(
+                    "embedder modality fourier_min and fourier_max must be > 0, "
+                    f"got fourier_min={self.fourier_min!r} fourier_max={self.fourier_max!r}"
+                )
+            if fmin >= fmax:
+                raise ValueError(
+                    "embedder modality fourier_min must be < fourier_max, "
+                    f"got fourier_min={self.fourier_min!r} fourier_max={self.fourier_max!r}"
+                )
+            object.__setattr__(self, "fourier_min", fmin)
+            object.__setattr__(self, "fourier_max", fmax)
+        elif self.fourier_min is not None or self.fourier_max is not None:
+            raise TypeError(
+                f"embedder modality type={k!r} field={self.field!r} does not accept "
+                "fourier_min=/fourier_max= (fourier/continuous only)"
+            )
         if k == "learnable":
             return
         if self.field is None:

@@ -41,7 +41,7 @@ def test_numeric_embedder_faults_on_missing_required_modality() -> None:
         hidden_dim=8,
         modalities=[
             {"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1},
-            {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1},
+            {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0},
         ],
     )
     batch = _batch([{"reward": 0.5}])
@@ -54,7 +54,7 @@ def test_numeric_embedder_keeps_optional_missing_modality() -> None:
         hidden_dim=8,
         modalities=[
             {"type": "discrete", "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1},
-            {"type": "fourier", "field": "reward", "std": 0.02, "positions": 1},
+            {"type": "fourier", "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0},
         ],
     )
     tokenizer = NumericTokenizer(
@@ -85,7 +85,7 @@ def test_numeric_embedder_returns_objective_fields() -> None:
         hidden_dim=8,
         modalities=[
             {"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1},
-            {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1},
+            {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0},
         ],
     )
     batch = _batch([{"action": 2, "reward": 1.5}])
@@ -102,7 +102,7 @@ def test_numeric_embedder_expands_multi_field_modality_specs() -> None:
         hidden_dim=8,
         modalities=[
             {"type": "discrete", "field": ("action", "prev_action"), "vocab_size": 4, "std": 0.02, "positions": 1},
-            {"type": "fourier", "field": ("reward", "value"), "std": 0.02, "positions": 1},
+            {"type": "fourier", "field": ("reward", "value"), "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0},
         ],
     )
     batch = _batch(
@@ -126,7 +126,7 @@ def test_numeric_embedder_batch_shape() -> None:
         hidden_dim=8,
         modalities=[
             {"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1},
-            {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1},
+            {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0},
         ],
     )
     B, S = (3, 5)
@@ -147,7 +147,7 @@ def test_numeric_embedder_concat_tokens_in_order() -> None:
         hidden_dim=8,
         modalities=[
             {"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1},
-            {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1},
+            {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0},
             {"type": "learnable", "tokens": 1, "std": 0.02, "positions": 1},
         ],
     )
@@ -185,8 +185,8 @@ def test_numeric_embedder_continuous_one_token_per_scalar() -> None:
     encoder = _enc(
         hidden_dim=8,
         modalities=[
-            {"type": 'continuous', "field": "obs", "dim": 4, "std": 0.02, "positions": 4},
-            {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1},
+            {"type": 'continuous', "field": "obs", "dim": 4, "std": 0.02, "positions": 4, "fourier_min": 0.01, "fourier_max": 10.0},
+            {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0},
         ],
     )
     batch = [[{"obs": [0.1, 0.2, 0.3, 0.4], "reward": 1.0}]]
@@ -202,7 +202,7 @@ def test_numeric_embedder_skip_shortens_step() -> None:
         hidden_dim=8,
         modalities=[
             {"type": "discrete", "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1},
-            {"type": "fourier", "field": "reward", "std": 0.02, "positions": 1},
+            {"type": "fourier", "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0},
             {"type": "learnable", "tokens": 1, "std": 0.02, "positions": 1},
         ],
     )
@@ -247,7 +247,7 @@ def test_numeric_embedder_prepare_token_batch() -> None:
         hidden_dim=8,
         modalities=[
             {"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1},
-            {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1},
+            {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0},
         ],
     )
     batch = [[{"action": 1, "reward": 0.5}, {"action": 2, "reward": 1.0}]]
@@ -268,7 +268,7 @@ def test_numeric_embedder_requires_std_per_modality() -> None:
     with pytest.raises(ValueError, match="requires std="):
         _enc(hidden_dim=8, modalities=[{"type": "learnable", "tokens": 1}])
     with pytest.raises(ValueError, match="must be >= 0"):
-        _enc(hidden_dim=8, modalities=[{"type": "fourier", "field": "reward", "std": -0.1, "positions": 1}])
+        _enc(hidden_dim=8, modalities=[{"type": "fourier", "field": "reward", "std": -0.1, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0}])
 
 
 def test_numeric_embedder_requires_positions_per_modality() -> None:
@@ -277,11 +277,11 @@ def test_numeric_embedder_requires_positions_per_modality() -> None:
     with pytest.raises(ValueError, match="requires positions="):
         _enc(hidden_dim=8, modalities=[{"type": "learnable", "tokens": 1, "std": 0.02}])
     with pytest.raises(ValueError, match="positions must be >= 1"):
-        _enc(hidden_dim=8, modalities=[{"type": "fourier", "field": "reward", "std": 0.02, "positions": 0}])
+        _enc(hidden_dim=8, modalities=[{"type": "fourier", "field": "reward", "std": 0.02, "positions": 0, "fourier_min": 0.01, "fourier_max": 10.0}])
     with pytest.raises(ValueError, match="positions must be >= dim"):
         _enc(
             hidden_dim=8,
-            modalities=[{"type": "continuous", "field": "obs", "dim": 3, "std": 0.02, "positions": 2}],
+            modalities=[{"type": "continuous", "field": "obs", "dim": 3, "std": 0.02, "positions": 2, "fourier_min": 0.01, "fourier_max": 10.0}],
         )
     with pytest.raises(ValueError, match="positions must be >= tokens"):
         _enc(hidden_dim=8, modalities=[{"type": "learnable", "tokens": 2, "std": 0.02, "positions": 1}])
@@ -296,7 +296,69 @@ def test_numeric_embedder_requires_positions_per_modality() -> None:
         NumericEmbedder(
             hidden_dim=8,
             std=0.02,
+            modalities=[{"type": "fourier", "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0}],
+        )
+    with pytest.raises(TypeError):
+        NumericEmbedder(
+            hidden_dim=8,
+            fourier_min=0.01,
+            modalities=[{"type": "fourier", "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0}],
+        )
+
+
+def test_numeric_embedder_requires_fourier_range_per_modality() -> None:
+    with pytest.raises(ValueError, match="requires fourier_min="):
+        _enc(
+            hidden_dim=8,
             modalities=[{"type": "fourier", "field": "reward", "std": 0.02, "positions": 1}],
+        )
+    with pytest.raises(ValueError, match="requires fourier_min="):
+        _enc(
+            hidden_dim=8,
+            modalities=[{"type": "continuous", "field": "obs", "dim": 2, "std": 0.02, "positions": 2}],
+        )
+    with pytest.raises(ValueError, match="must be > 0"):
+        _enc(
+            hidden_dim=8,
+            modalities=[
+                {
+                    "type": "fourier",
+                    "field": "reward",
+                    "std": 0.02,
+                    "positions": 1,
+                    "fourier_min": 0.0,
+                    "fourier_max": 10.0,
+                }
+            ],
+        )
+    with pytest.raises(ValueError, match="must be < fourier_max"):
+        _enc(
+            hidden_dim=8,
+            modalities=[
+                {
+                    "type": "fourier",
+                    "field": "reward",
+                    "std": 0.02,
+                    "positions": 1,
+                    "fourier_min": 10.0,
+                    "fourier_max": 0.01,
+                }
+            ],
+        )
+    with pytest.raises(TypeError, match="does not accept fourier_min"):
+        _enc(
+            hidden_dim=8,
+            modalities=[
+                {
+                    "type": "discrete",
+                    "field": "action",
+                    "vocab_size": 4,
+                    "std": 0.02,
+                    "positions": 1,
+                    "fourier_min": 0.01,
+                    "fourier_max": 10.0,
+                }
+            ],
         )
 
 
@@ -321,8 +383,8 @@ def test_numeric_embedder_fourier_honors_per_modality_std() -> None:
     encoder = _enc(
         hidden_dim=64,
         modalities=[
-            {"type": "fourier", "field": "reward", "std": 0.02, "positions": 1},
-            {"type": "fourier", "field": "bonus", "std": 0.10, "positions": 1},
+            {"type": "fourier", "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0},
+            {"type": "fourier", "field": "bonus", "std": 0.10, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0},
         ],
     )
     tokenizer = NumericTokenizer(
@@ -349,6 +411,43 @@ def test_numeric_embedder_fourier_honors_per_modality_std() -> None:
     bonus_rms = float(bonus_emb.pow(2).mean().sqrt().item())
     assert reward_rms == pytest.approx(0.02, abs=0.008)
     assert bonus_rms == pytest.approx(0.10, abs=0.03)
+
+
+def test_numeric_embedder_fourier_honors_per_modality_range() -> None:
+    """Each Fourier field uses its own ``fourier_min`` / ``fourier_max`` bank."""
+    from mouse_core.models.embedding import StaticFourierFeatures
+
+    encoder = _enc(
+        hidden_dim=32,
+        modalities=[
+            {
+                "type": "fourier",
+                "field": "reward",
+                "std": 1.0,
+                "positions": 1,
+                "fourier_min": 0.01,
+                "fourier_max": 10.0,
+            },
+            {
+                "type": "fourier",
+                "field": "bonus",
+                "std": 1.0,
+                "positions": 1,
+                "fourier_min": 1.0,
+                "fourier_max": 100.0,
+            },
+        ],
+    )
+    x = torch.tensor([1.5])
+    idx = torch.tensor([0])
+    got_reward = encoder.fourier["reward"](x, idx)
+    got_bonus = encoder.fourier["bonus"](x, idx)
+    scale = 1.0 / (0.5 ** 0.5)
+    ref_reward = StaticFourierFeatures(32, in_min=0.01, in_max=10.0, output_scale=scale)(x, idx)
+    ref_bonus = StaticFourierFeatures(32, in_min=1.0, in_max=100.0, output_scale=scale)(x, idx)
+    assert torch.allclose(got_reward, ref_reward)
+    assert torch.allclose(got_bonus, ref_bonus)
+    assert not torch.allclose(got_reward, got_bonus)
 
 
 def test_static_fourier_no_parameters() -> None:
@@ -378,9 +477,9 @@ def test_static_fourier_stays_fp32_under_bf16_cast() -> None:
 
 def test_numeric_embedder_bf16_keeps_fourier_precision() -> None:
     torch.manual_seed(0)
-    fp32 = _enc(hidden_dim=64, modalities=[{"type": "fourier", "field": "reward", "std": 0.02, "positions": 1}])
+    fp32 = _enc(hidden_dim=64, modalities=[{"type": "fourier", "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0}])
     torch.manual_seed(0)
-    bf16 = _enc(hidden_dim=64, modalities=[{"type": "fourier", "field": "reward", "std": 0.02, "positions": 1}]).to(
+    bf16 = _enc(hidden_dim=64, modalities=[{"type": "fourier", "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0}]).to(
         dtype=torch.bfloat16
     )
     batch = _tb(fp32, [[{"reward": 10.0, "task_index": 0}]])
@@ -468,10 +567,10 @@ def test_numeric_embedder_adds_type_vector_to_discrete() -> None:
 
 
 def test_numeric_embedder_adds_type_vector_to_fourier() -> None:
-    encoder = _enc(hidden_dim=8, modalities=[{"type": "fourier", "field": "reward", "std": 0.02, "positions": 1}])
+    encoder = _enc(hidden_dim=8, modalities=[{"type": "fourier", "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0}])
     tb = _tb(encoder, [[{"reward": 1.5}]])
     embeds, _ = encoder(tb)
-    feat = encoder.fourier(torch.tensor([1.5]), torch.tensor([0])) * 0.02
+    feat = encoder.fourier["reward"](torch.tensor([1.5]), torch.tensor([0])) * 0.02
     assert torch.allclose(
         embeds[0].float(), feat[0] + encoder._type_vectors["reward"][0]
     )
@@ -481,7 +580,7 @@ def test_numeric_embedder_type_vectors_are_per_position_for_continuous() -> None
     torch.manual_seed(0)
     encoder = _enc(
         hidden_dim=8,
-        modalities=[{"type": "continuous", "field": "obs", "dim": 3, "std": 0.02, "positions": 3}],
+        modalities=[{"type": "continuous", "field": "obs", "dim": 3, "std": 0.02, "positions": 3, "fourier_min": 0.01, "fourier_max": 10.0}],
     )
     assert encoder._type_vectors["obs"].shape == (3, 8)
     # Same scalar in every coordinate: content differs only by the Fourier
@@ -490,7 +589,7 @@ def test_numeric_embedder_type_vectors_are_per_position_for_continuous() -> None
     assert tb.positions.tolist() == [0, 1, 2]
     embeds, _ = encoder(tb)
     for i in range(3):
-        feat = encoder.fourier(torch.tensor([0.5]), torch.tensor([i]))[0] * 0.02
+        feat = encoder.fourier["obs"](torch.tensor([0.5]), torch.tensor([i]))[0] * 0.02
         assert torch.allclose(embeds[i], feat + encoder._type_vectors["obs"][i])
     tv = encoder._type_vectors["obs"]
     assert not torch.allclose(tv[0], tv[1]) and not torch.allclose(tv[1], tv[2])
@@ -511,7 +610,7 @@ def test_numeric_embedder_type_vectors_are_per_position_for_learnable() -> None:
 def test_numeric_embedder_rejects_more_tokens_than_declared() -> None:
     encoder = _enc(
         hidden_dim=8,
-        modalities=[{"type": "continuous", "field": "obs", "dim": 2, "std": 0.02, "positions": 2}],
+        modalities=[{"type": "continuous", "field": "obs", "dim": 2, "std": 0.02, "positions": 2, "fourier_min": 0.01, "fourier_max": 10.0}],
     )
     tb = _tb(encoder, [[{"obs": [0.1, 0.2]}]])
     tb.positions[:] = [0, 5]

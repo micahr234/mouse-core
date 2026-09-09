@@ -305,6 +305,14 @@ def _model_card_modality_dtype(modality: dict[str, Any]) -> str:
     return "torch.float32"
 
 
+def _model_card_fourier_range(modality: dict[str, Any]) -> list[str]:
+    fmin = modality.get("fourier_min")
+    fmax = modality.get("fourier_max")
+    if fmin is None or fmax is None:
+        return []
+    return [f"Fourier range `[{fmin}, {fmax}]`"]
+
+
 def _model_card_modality_notes(modality: dict[str, Any]) -> str:
     modality_type = modality["type"]
     parts: list[str] = []
@@ -314,8 +322,10 @@ def _model_card_modality_notes(modality: dict[str, Any]) -> str:
             parts.append(f"integer ids in `[0, {int(vocab_size) - 1}]`")
     elif modality_type == "fourier":
         parts.append("scalar value")
+        parts.extend(_model_card_fourier_range(modality))
     elif modality_type == "continuous":
         parts.append("vector values")
+        parts.extend(_model_card_fourier_range(modality))
     elif modality_type == "image":
         parts.append("token ids from an image tokenizer")
     elif modality_type == "learnable":
@@ -387,8 +397,6 @@ def _encoder_config(encoder: Encoder) -> dict[str, Any]:
             "kwargs": {
                 "hidden_dim": int(encoder.hidden_dim),
                 "modalities": [_public_modality_config(modality) for modality in encoder.modalities],
-                "fourier_min": float(encoder.fourier_min),
-                "fourier_max": float(encoder.fourier_max),
             },
         }
     if isinstance(encoder, TextEmbedder):

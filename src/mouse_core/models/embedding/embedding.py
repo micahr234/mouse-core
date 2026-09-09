@@ -87,7 +87,8 @@ class NumericEmbedder(Encoder):
 
     Each modality spec must set ``std`` (init scale of its content embeddings
     and type vectors) and ``positions`` (max tokens per step, i.e. type table
-    rows). There are no embedder-wide defaults.
+    rows). ``fourier`` / ``continuous`` specs must also set ``fourier_min``
+    and ``fourier_max``. There are no embedder-wide defaults.
     """
 
     def __init__(
@@ -97,13 +98,9 @@ class NumericEmbedder(Encoder):
         modalities: list[dict[str, Any] | NumericEmbedderModalitySpec]
         | Mapping[str, dict[str, Any]]
         | None = None,
-        fourier_min: float = 0.01,
-        fourier_max: float = 10.0,
     ) -> None:
         super().__init__()
         self._hidden_dim = int(hidden_dim)
-        self.fourier_min = float(fourier_min)
-        self.fourier_max = float(fourier_max)
 
         specs, meta = resolve_embedder_numeric_modalities(modalities)
         self.modalities: list[NumericEmbedderModalitySpec] = list(specs)
@@ -112,9 +109,9 @@ class NumericEmbedder(Encoder):
 
         self._tables = nn.ModuleDict()
         self._type_vectors = nn.ParameterDict()
-        max_freq_sets = 1
+        self.fourier = nn.ModuleDict()
+        self._fourier_std: dict[str, float] = {}
         for m in self._meta:
-            max_freq_sets = max(max_freq_sets, m.freq_sets)
             assert m.spec.std is not None
             mod_std = float(m.spec.std)
             self._type_vectors[m.name] = nn.Parameter(
@@ -128,21 +125,19 @@ class NumericEmbedder(Encoder):
                         f"{m.kind} modality {m.name!r} requires {kind}="
                     )
                 self._tables[m.name] = ScaledEmbedding(vs, hidden_dim, scale=mod_std)
-
-        self._fourier_std: dict[str, float] = {
-            m.name: float(m.spec.std)  # type: ignore[arg-type]
-            for m in self._meta
-            if m.kind == KIND_FOURIER
-        }
-        # ``cos`` has variance 1/2; scale so each feature has unit std, then
-        # multiply by the modality's ``std`` in ``forward``.
-        self.fourier = StaticFourierFeatures(
-            num_features=hidden_dim,
-            in_min=fourier_min,
-            in_max=fourier_max,
-            num_freq_sets=max_freq_sets,
-            output_scale=1.0 / (0.5 ** 0.5),
-        )
+            elif m.kind == KIND_FOURIER:
+                assert m.spec.fourier_min is not None
+                assert m.spec.fourier_max is not None
+                self._fourier_std[m.name] = mod_std
+                # ``cos`` has variance 1/2; scale so each feature has unit std,
+                # then multiply by the modality's ``std`` in ``forward``.
+                self.fourier[m.name] = StaticFourierFeatures(
+                    num_features=hidden_dim,
+                    in_min=float(m.spec.fourier_min),
+                    in_max=float(m.spec.fourier_max),
+                    num_freq_sets=m.freq_sets,
+                    output_scale=1.0 / (0.5 ** 0.5),
+                )
         # Follows ``.to(device/dtype)`` so an encoder with no learnable tables
         # (fourier-only) still knows its compute dtype and device.
         self.register_buffer("_anchor", torch.zeros(0), persistent=False)
@@ -193,7 +188,7 @@ class NumericEmbedder(Encoder):
                 if meta.kind in (KIND_DISCRETE, KIND_LEARNABLE, KIND_IMAGE):
                     content = self._tables[name](ids[mask]).to(dtype=dtype)
                 elif meta.kind == KIND_FOURIER:
-                    feat = self.fourier(values[mask], ids[mask]) * self._fourier_std[name]
+                    feat = self.fourier[name](values[mask], ids[mask]) * self._fourier_std[name]
                     content = feat.to(dtype=dtype)
                 else:
                     continue

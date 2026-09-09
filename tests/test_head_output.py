@@ -23,7 +23,7 @@ _ACTIONS = 4
 _MODALITIES = [
     {"type": "discrete", "field": "action", "vocab_size": _ACTIONS, "std": 0.02, "positions": 1},
     {"type": "discrete", "field": "observation", "vocab_size": 16, "std": 0.02, "positions": 1},
-    {"type": "fourier", "field": "reward", "std": 0.02, "positions": 1},
+    {"type": "fourier", "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0},
     {"type": "discrete", "field": "episode_done", "vocab_size": 3, "std": 0.02, "positions": 1},
     {"type": "learnable", "field": "value", "tokens": 2, "std": 0.02, "positions": 2},
 ]

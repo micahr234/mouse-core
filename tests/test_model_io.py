@@ -16,7 +16,7 @@ _tok = tok_from_encoder
 def test_composed_model_roundtrip(tmp_path) -> None:
     torch.manual_seed(0)
     hidden_dim = 8
-    encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}, {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3, "std": 0.02, "positions": 1}])
+    encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}, {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3, "std": 0.02, "positions": 1}])
     backbone = IdentityBackbone(hidden_dim=hidden_dim)
     heads = DiscreteActionValueHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1)
     model = Model(encoder=encoder, backbone=backbone, heads=heads).eval()
@@ -38,10 +38,16 @@ def test_composed_model_roundtrip(tmp_path) -> None:
     assert config['backbone']['type'] == 'identity'
     assert config['encoder']['type'] == 'numeric'
     enc_kwargs = config['encoder']['kwargs']
-    for required_key in ('hidden_dim', 'modalities', 'fourier_min', 'fourier_max'):
+    for required_key in ('hidden_dim', 'modalities'):
         assert required_key in enc_kwargs, f'encoder config missing key {required_key!r}'
     assert 'std' not in enc_kwargs
+    assert 'fourier_min' not in enc_kwargs
+    assert 'fourier_max' not in enc_kwargs
     assert all(m['std'] == 0.02 for m in enc_kwargs['modalities'])
+    fourier_mods = [m for m in enc_kwargs['modalities'] if m['type'] == 'fourier']
+    assert fourier_mods
+    assert all(m['fourier_min'] == 0.01 and m['fourier_max'] == 10.0 for m in fourier_mods)
+    assert all('fourier_min' not in m for m in enc_kwargs['modalities'] if m['type'] != 'fourier')
     assert 'modality_fusion' not in enc_kwargs
     assert 'include_type_token' not in enc_kwargs
 
@@ -54,7 +60,7 @@ def test_roundtrip_multi_field_spec_before_learnable(tmp_path) -> None:
         modalities=[
             {"type": 'discrete', "field": ("action", "prev_action"), "vocab_size": 4, "std": 0.02, "positions": 1},
             {"type": 'learnable', "tokens": 2, "std": 0.02, "positions": 2},
-            {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1},
+            {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0},
             {"type": 'learnable', "std": 0.02, "positions": 1},
         ],
     )
@@ -87,7 +93,7 @@ def test_composed_model_roundtrip_static_fourier(tmp_path) -> None:
     """Static Fourier buffers survive save/load."""
     torch.manual_seed(42)
     hidden_dim = 8
-    encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}, {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1}])
+    encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}, {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0}])
     backbone = IdentityBackbone(hidden_dim=hidden_dim)
     heads = DiscreteActionValueHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1)
     model = Model(encoder=encoder, backbone=backbone, heads=heads).eval()
@@ -99,10 +105,10 @@ def test_composed_model_roundtrip_static_fourier(tmp_path) -> None:
     assert torch.allclose(actual['action_value'], expected['action_value'])
     enc = cast(NumericEmbedder, model.encoder)
     loaded_enc = cast(NumericEmbedder, loaded.encoder)
-    assert torch.equal(enc.fourier.freqs, loaded_enc.fourier.freqs)
+    assert torch.equal(enc.fourier["reward"].freqs, loaded_enc.fourier["reward"].freqs)
 
 def test_model_card_includes_usage_and_architecture(tmp_path) -> None:
-    model = Model(encoder=NumericEmbedder(hidden_dim=8, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}, {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3, "std": 0.02, "positions": 1}]), backbone=IdentityBackbone(hidden_dim=8), heads=DiscreteActionValueHead(in_features=8, out_features=4, hidden_dim=8, num_layers=1))
+    model = Model(encoder=NumericEmbedder(hidden_dim=8, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}, {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3, "std": 0.02, "positions": 1}]), backbone=IdentityBackbone(hidden_dim=8), heads=DiscreteActionValueHead(in_features=8, out_features=4, hidden_dim=8, num_layers=1))
     path = tmp_path / 'README.md'
     _write_model_card(repo_id='user/mouse-example-model', model=model, path=path)
     text = path.read_text()
@@ -116,6 +122,7 @@ def test_model_card_includes_usage_and_architecture(tmp_path) -> None:
     assert 'load_model("user/mouse-example-model"' in text
     assert 'NumericTokenizer' in text
     assert '| `action` | `discrete` | `[B, S]` | `torch.long` | integer ids in `[0, 3]` |' in text
+    assert 'Fourier range `[0.01, 10.0]`' in text
     assert '"action": 0,' in text
     assert '"reward": 0.0,' in text
     assert 'out, step_stream, cache = model(batch)' not in text
@@ -145,7 +152,7 @@ def test_model_card_includes_usage_and_architecture(tmp_path) -> None:
 )
 def test_model_to_every_form_keeps_heads_float32(cast) -> None:
     hidden_dim = 8
-    encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}, {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1}])
+    encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}, {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0}])
     backbone = IdentityBackbone(hidden_dim=hidden_dim)
     heads = DiscreteActionValueHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1)
     model = cast(Model(encoder=encoder, backbone=backbone, heads=heads).eval())
@@ -161,7 +168,7 @@ def test_model_to_bfloat16_keeps_heads_float32() -> None:
     if not torch.cuda.is_available():
         pytest.skip('CUDA required')
     hidden_dim = 8
-    encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}, {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3, "std": 0.02, "positions": 1}])
+    encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}, {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3, "std": 0.02, "positions": 1}])
     backbone = Qwen3Backbone(hidden_dim=hidden_dim, num_layers=1, num_heads=2)
     heads = DiscreteActionValueHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1)
     model = Model(encoder=encoder, backbone=backbone, heads=heads).eval()
