@@ -3,17 +3,12 @@
 Pushes write the raw rows (whatever shape you stored) using standard
 ``DatasetDict.push_to_hub`` with ``config_name`` for subsets/bins.
 
-Before each push we wipe previous parquet shards, ``dataset_infos.json``,
-and the README (dataset card). This ensures that ``push_to_hub`` writes a
-fresh README whose leading ``dataset_info:`` (features, splits, sizes, etc.)
-exactly matches the dataset being uploaded right now.
+When ``clear=True`` (the default), an existing dataset repository is deleted
+before the new upload. Overwriting same-named parquet shards in place does
+not refresh Hugging Face's converted parquet / dataset viewer; recreating
+the repository forces a fresh conversion that matches the data just pushed.
 
-This is required when uploading a brand new dataset or when the schema,
-configs, or split structure has changed.
-
-If you want a custom ``configs:`` YAML block (per the HF repository structure
-guide) in addition to the auto-generated info, add or restore it after the
-push (e.g. by editing on the Hub) or manage the card separately.
+When ``clear=False``, the push is layered on top of the existing repository.
 
 See https://huggingface.co/docs/datasets/repository_structure
 
@@ -41,52 +36,11 @@ import numpy as np
 from datasets import Dataset, DatasetDict, Features, Value, load_dataset
 from datasets import config as datasets_config
 from huggingface_hub import HfApi, snapshot_download
-from huggingface_hub.errors import HfHubHTTPError, RepositoryNotFoundError
-from huggingface_hub.hf_api import CommitOperationAdd, CommitOperationDelete
+from huggingface_hub.errors import HfHubHTTPError
+from huggingface_hub.hf_api import CommitOperationAdd
 
 if TYPE_CHECKING:
     from mouse_core.data.datastore import Datastore
-
-
-# ---------------------------------------------------------------------------
-# Hub helpers
-# ---------------------------------------------------------------------------
-
-_HUB_PARQUET_SHARD_RE = re.compile(r"^data/(?:[^/]+/)?[^/]+-\d{5}-of-\d{5}\.parquet$")
-
-
-def _wipe_hub_repo_data(api: HfApi, repo_id: str) -> None:
-    """Delete previous data shards, dataset infos, and the README card.
-
-    We remove the README (``README.md``) so that the subsequent
-    ``DatasetDict.push_to_hub`` call generates a brand new dataset card.
-    The leading ``dataset_info:`` section (features, splits, sizes, etc.)
-    in that card must reflect the exact data being uploaded now.
-
-    This matters when:
-    - Uploading to a brand new dataset repository, or
-    - The columns, configs, or split layout have changed since the last push.
-
-    We also clean stale parquet shards and ``dataset_infos.json`` so old
-    split/config metadata does not leak into the new card.
-    """
-    try:
-        files = list(api.list_repo_files(repo_id=repo_id, repo_type="dataset"))
-    except RepositoryNotFoundError:
-        return
-    stale = datasets_config.DATASETDICT_INFOS_FILENAME
-    to_delete = [
-        f for f in files
-        if _HUB_PARQUET_SHARD_RE.match(f)
-        or f in (datasets_config.REPOCARD_FILENAME, stale)
-    ]
-    if to_delete:
-        api.create_commit(
-            repo_id=repo_id,
-            repo_type="dataset",
-            operations=[CommitOperationDelete(path_in_repo=f) for f in to_delete],
-            commit_message="chore: wipe stale shards + card before fresh push",
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -215,12 +169,26 @@ def _build_split_datasets(splits: dict[str, list[Datastore]]) -> dict[str, Datas
     return _align_splits(resolved)
 
 
+def _delete_dataset_repo_if_exists(api: HfApi, repo_id: str) -> None:
+    """Delete an existing dataset repo so Hub parquet conversion starts fresh.
+
+    Overwriting same-named parquet shards in place leaves Hugging Face's
+    converted parquet / dataset viewer stale. Recreating the repository
+    forces a new conversion that matches the data just pushed.
+    """
+    resolved = repo_id if "/" in repo_id else f"{api.whoami()['name']}/{repo_id}"
+    api.delete_repo(repo_id=resolved, repo_type="dataset", missing_ok=True)
+
+
 def _create_or_update_dataset_repo(
     *,
     api: HfApi,
     repo_id: str,
     private: bool,
+    clear: bool,
 ) -> tuple[str, str]:
+    if clear:
+        _delete_dataset_repo_if_exists(api, repo_id)
     repo_url = api.create_repo(
         repo_id=repo_id, repo_type="dataset", private=private, exist_ok=True
     )
@@ -348,35 +316,18 @@ def _write_store_dataset_repo(
         write_one(config_name, ds)
 
 
-def _repo_files_to_clear(api: HfApi, repo_id: str, addition_paths: set[str]) -> list[str]:
-    try:
-        files = list(api.list_repo_files(repo_id=repo_id, repo_type="dataset"))
-    except RepositoryNotFoundError:
-        return []
-    return [
-        path for path in files
-        if path not in addition_paths
-    ]
-
-
 def _commit_dataset_repo(
     *,
     api: HfApi,
     repo_id: str,
     folder_path: Path,
     commit_message: str,
-    clear: bool,
 ) -> None:
     additions = [
         path for path in sorted(folder_path.rglob("*"))
         if path.is_file()
     ]
-    addition_paths = {path.relative_to(folder_path).as_posix() for path in additions}
-    deletions = _repo_files_to_clear(api, repo_id, addition_paths) if clear else []
     operations = [
-        CommitOperationDelete(path_in_repo=path)
-        for path in deletions
-    ] + [
         CommitOperationAdd(
             path_in_repo=path.relative_to(folder_path).as_posix(),
             path_or_fileobj=path,
@@ -503,12 +454,13 @@ def push_to_hub(
         Default is ``"default"``. When loading later use
         ``load_stores_from_hub(repo_id=repo, store_names=[config_name], split=...)``.
     clear :
-        If ``True`` (default), totally wipe the dataset before uploading:
-        every existing parquet shard (all configs, not just ``config_name``),
-        ``dataset_infos.json``, and the README card are deleted so the fresh
-        push fully defines the repository. If ``False``, nothing is deleted
-        and this push is layered on top of the existing repository — you are
-        responsible for keeping the combined configs/splits consistent.
+        If ``True`` (default), delete the existing dataset repository (if any)
+        and recreate it before uploading. Same-named parquet shards overwritten
+        in place do not refresh Hugging Face's converted parquet / dataset
+        viewer; a new repository forces a fresh conversion. If ``False``,
+        nothing is deleted and this push is layered on top of the existing
+        repository — you are responsible for keeping the combined
+        configs/splits consistent.
 
     Returns
     -------
@@ -544,9 +496,9 @@ def push_to_hub(
 
     try:
         api = HfApi()
-        repo_url, hub_repo_id = _create_or_update_dataset_repo(private=private, api=api, repo_id=repo_id)
-        if clear:
-            _wipe_hub_repo_data(api=api, repo_id=hub_repo_id)
+        repo_url, hub_repo_id = _create_or_update_dataset_repo(
+            private=private, api=api, repo_id=repo_id, clear=clear
+        )
         _push_dataset_dict(repo_id=hub_repo_id, commit_message=commit_message, config_name=config_name, dataset_dict=dataset_dict)
     except HfHubHTTPError as e:
         _raise_for_hub_http_error(e, repo_id)
@@ -589,13 +541,14 @@ def push_stores_to_hub(
     commit_message :
         Commit message written to the Hub.
     clear :
-        If ``True`` (default), totally wipe the dataset: every remote file not
-        rewritten by this push is deleted in the same commit, so the pushed
-        stores fully define the repository. If ``False``, nothing is deleted
-        and the pushed configs are layered on top of the existing repository —
-        you are responsible for keeping the combined contents consistent
-        (including the README ``configs:`` block, which this push overwrites
-        with only the stores being pushed now).
+        If ``True`` (default), delete the existing dataset repository (if any)
+        and recreate it before uploading, so the pushed stores fully define
+        the repository and Hugging Face re-converts parquet for the viewer.
+        If ``False``, nothing is deleted and the pushed configs are layered
+        on top of the existing repository — you are responsible for keeping
+        the combined contents consistent (including the README ``configs:``
+        block, which this push overwrites with only the stores being pushed
+        now).
 
     Returns
     -------
@@ -654,11 +607,13 @@ def push_stores_to_hub(
 
     try:
         api = HfApi()
-        repo_url, hub_repo_id = _create_or_update_dataset_repo(private=private, api=api, repo_id=repo_id)
+        repo_url, hub_repo_id = _create_or_update_dataset_repo(
+            private=private, api=api, repo_id=repo_id, clear=clear
+        )
         with tempfile.TemporaryDirectory() as tmp:
             folder_path = Path(tmp)
             _write_store_dataset_repo(split=split, root=folder_path, prepared=prepared)
-            _commit_dataset_repo(repo_id=hub_repo_id, folder_path=folder_path, commit_message=commit_message, clear=clear, api=api)
+            _commit_dataset_repo(repo_id=hub_repo_id, folder_path=folder_path, commit_message=commit_message, api=api)
     except HfHubHTTPError as e:
         _raise_for_hub_http_error(e, repo_id)
 

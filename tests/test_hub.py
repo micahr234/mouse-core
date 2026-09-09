@@ -1,6 +1,5 @@
 from __future__ import annotations
 from pathlib import Path
-from typing import Any, cast
 import pytest
 from datasets import Dataset
 from mouse_core.data import Datastore
@@ -17,6 +16,7 @@ class _FakeHfApi:
     def __init__(self) -> None:
         self.settings_updates: list[tuple[str, bool]] = []
         self.commits: list[list[str]] = []
+        self.deleted_repos: list[str] = []
 
     def create_repo(self, *, repo_id: str, repo_type: str, private: bool, exist_ok: bool) -> _FakeRepoUrl:
         assert repo_id == 'test-dataset'
@@ -29,12 +29,10 @@ class _FakeHfApi:
         assert repo_type == 'dataset'
         self.settings_updates.append((repo_id, private))
 
-    def list_repo_files(self, *, repo_id: str, repo_type: str, revision: str | None=None, token: str | bool | None=None) -> list[str]:
-        assert repo_id == 'user/test-dataset'
+    def delete_repo(self, *, repo_id: str, repo_type: str, missing_ok: bool = False) -> None:
         assert repo_type == 'dataset'
-        assert revision is None
-        assert token is None
-        return ['README.md', 'dataset_infos.json', 'data/old-00000-of-00001.parquet', 'data/cartpole/train-00000-of-00001.parquet', 'notes/old.txt']
+        assert missing_ok is True
+        self.deleted_repos.append(repo_id)
 
     def create_commit(self, *, repo_id: str, repo_type: str, operations: list, commit_message: str) -> None:
         assert repo_id == 'user/test-dataset'
@@ -43,7 +41,6 @@ class _FakeHfApi:
         self.commits.append([op.path_in_repo for op in operations])
 
     def whoami(self, token: str | bool | None=None) -> dict[str, str]:
-        assert token == 'token'
         return {'name': 'user'}
 
 def _store(*actions: int, name: str | None=None) -> Datastore:
@@ -140,59 +137,55 @@ def test_push_stores_to_hub_pushes_one_config_per_store(monkeypatch: pytest.Monk
     commits: list[dict] = []
     monkeypatch.setattr(hub, 'HfApi', lambda: api)
 
-    def fake_commit_dataset_repo(*, api, repo_id: str, folder_path: Path, commit_message: str, clear: bool) -> None:
+    def fake_commit_dataset_repo(*, api, repo_id: str, folder_path: Path, commit_message: str) -> None:
         assert repo_id == 'user/test-dataset'
         assert commit_message == 'New rollout data'
-        commits.append({'files': sorted((path.relative_to(folder_path).as_posix() for path in folder_path.rglob('*') if path.is_file())), 'readme': (folder_path / 'README.md').read_text(encoding='utf-8'), 'clear': clear})
+        commits.append({'files': sorted((path.relative_to(folder_path).as_posix() for path in folder_path.rglob('*') if path.is_file())), 'readme': (folder_path / 'README.md').read_text(encoding='utf-8')})
     monkeypatch.setattr(hub, '_commit_dataset_repo', fake_commit_dataset_repo)
     url = hub.push_stores_to_hub(repo_id='test-dataset', split='train', private=True, stores=[_store(1, 2, name='cartpole'), _store(3, name='lunar')])
     assert url == 'https://huggingface.co/datasets/user/test-dataset'
     assert api.settings_updates == [('user/test-dataset', True)]
+    assert api.deleted_repos == ['user/test-dataset']
     assert api.commits == []
-    assert commits == [{'files': ['README.md', 'data/cartpole/train-00000-of-00001.parquet', 'data/lunar/train-00000-of-00001.parquet'], 'readme': '---\nconfigs:\n- config_name: cartpole\n  data_files:\n  - split: train\n    path: data/cartpole/train-*.parquet\n- config_name: lunar\n  data_files:\n  - split: train\n    path: data/lunar/train-*.parquet\n---\n', 'clear': True}]
+    assert commits == [{'files': ['README.md', 'data/cartpole/train-00000-of-00001.parquet', 'data/lunar/train-00000-of-00001.parquet'], 'readme': '---\nconfigs:\n- config_name: cartpole\n  data_files:\n  - split: train\n    path: data/cartpole/train-*.parquet\n- config_name: lunar\n  data_files:\n  - split: train\n    path: data/lunar/train-*.parquet\n---\n'}]
 
-def test_repo_files_to_clear_deletes_everything_except_replacements() -> None:
+def test_delete_dataset_repo_if_exists_scopes_short_names() -> None:
     api = _FakeHfApi()
-    to_delete = hub._repo_files_to_clear(cast(Any, api), repo_id='user/test-dataset', addition_paths={'README.md', 'data/cartpole/train-00000-of-00001.parquet'})
-    assert to_delete == ['dataset_infos.json', 'data/old-00000-of-00001.parquet', 'notes/old.txt']
+    hub._delete_dataset_repo_if_exists(api, 'test-dataset')
+    assert api.deleted_repos == ['user/test-dataset']
 
-def test_push_stores_to_hub_clear_true_wipes_whole_dataset(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """clear=True deletes every remote file not rewritten, across all configs."""
+def test_delete_dataset_repo_if_exists_keeps_scoped_names() -> None:
+    api = _FakeHfApi()
+    hub._delete_dataset_repo_if_exists(api, 'org/test-dataset')
+    assert api.deleted_repos == ['org/test-dataset']
+
+def test_push_stores_to_hub_clear_true_deletes_repo_then_uploads(monkeypatch: pytest.MonkeyPatch) -> None:
+    """clear=True deletes the existing repo so Hub parquet conversion starts fresh."""
     api = _FakeHfApi()
     monkeypatch.setattr(hub, 'HfApi', lambda: api)
     hub.push_stores_to_hub(repo_id='test-dataset', private=True, stores=[_store(1, name='cartpole')])
-    assert len(api.commits) == 1
-    committed = api.commits[0]
-    assert 'dataset_infos.json' in committed
-    assert 'data/old-00000-of-00001.parquet' in committed
-    assert 'notes/old.txt' in committed
-    assert 'README.md' in committed
-    assert 'data/cartpole/train-00000-of-00001.parquet' in committed
+    assert api.deleted_repos == ['user/test-dataset']
+    assert api.commits == [['README.md', 'data/cartpole/train-00000-of-00001.parquet']]
 
 def test_push_stores_to_hub_clear_false_deletes_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
     """clear=False layers the push on top of existing files: additions only."""
     api = _FakeHfApi()
     monkeypatch.setattr(hub, 'HfApi', lambda: api)
     hub.push_stores_to_hub(repo_id='test-dataset', clear=False, private=True, stores=[_store(1, name='cartpole')])
+    assert api.deleted_repos == []
     assert api.commits == [['README.md', 'data/cartpole/train-00000-of-00001.parquet']]
 
-def test_push_to_hub_clear_flag_controls_wipe(monkeypatch: pytest.MonkeyPatch) -> None:
-    wipes: list[str] = []
+def test_push_to_hub_clear_flag_deletes_repo(monkeypatch: pytest.MonkeyPatch) -> None:
+    api = _FakeHfApi()
     pushes: list[str] = []
-    monkeypatch.setattr(hub, 'HfApi', _FakeHfApi)
-    monkeypatch.setattr(hub, '_wipe_hub_repo_data', lambda *, api, repo_id: wipes.append(repo_id))
+    monkeypatch.setattr(hub, 'HfApi', lambda: api)
     monkeypatch.setattr(hub, '_push_dataset_dict', lambda dataset_dict, *, repo_id, commit_message, config_name: pushes.append(config_name))
     hub.push_to_hub(repo_id='test-dataset', private=True, splits={'train': [_store(1, name='cartpole')]})
-    assert wipes == ['user/test-dataset']
+    assert api.deleted_repos == ['user/test-dataset']
     assert pushes == ['default']
     hub.push_to_hub(repo_id='test-dataset', clear=False, private=True, splits={'train': [_store(1, name='cartpole')]})
-    assert wipes == ['user/test-dataset']
+    assert api.deleted_repos == ['user/test-dataset']
     assert pushes == ['default', 'default']
-
-def test_wipe_hub_repo_data_selects_all_shards_and_card() -> None:
-    api = _FakeHfApi()
-    hub._wipe_hub_repo_data(api=cast(Any, api), repo_id='user/test-dataset')
-    assert api.commits == [['README.md', 'dataset_infos.json', 'data/old-00000-of-00001.parquet', 'data/cartpole/train-00000-of-00001.parquet']]
 
 def test_push_stores_to_hub_requires_named_stores() -> None:
     with pytest.raises(ValueError, match='non-empty name'):
