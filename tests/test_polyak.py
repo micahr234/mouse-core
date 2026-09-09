@@ -257,6 +257,26 @@ def test_polyak_bf16_delayed_accumulates_in_fp32_shadow() -> None:
     assert torch.equal(naive, torch.full((8, 8), 0.9, dtype=torch.bfloat16))
 
 
+def test_polyak_fp32_shadow_false_lerps_in_param_dtype() -> None:
+    """Without the shadow, a tiny tau on bf16 is a no-op."""
+    online = nn.Linear(8, 8, bias=False).to(dtype=torch.bfloat16)
+    delayed = nn.Linear(8, 8, bias=False).to(dtype=torch.bfloat16)
+    online.weight.data.fill_(1.0)
+    delayed.weight.data.fill_(0.9)
+    before = delayed.weight.detach().clone()
+    state = _PolyakState(online, delayed, section="backbone", fp32_shadow=False)
+    for _ in range(2000):
+        state.update(0.0005)
+    assert torch.equal(delayed.weight, before)
+
+
+def test_polyak_fp32_shadow_flag_is_stored() -> None:
+    model = _tiny_model()
+    delayed = model.delayed_copy(heads=True)
+    assert Polyak(model, delayed).fp32_shadow
+    assert not Polyak(model, delayed, fp32_shadow=False).fp32_shadow
+
+
 def test_polyak_rejects_wrong_models() -> None:
     model = _tiny_model()
     delayed = model.delayed_copy(heads=True)

@@ -38,10 +38,13 @@ what a shared (non-copied) section is at every step — so a section whose
 non-``1`` ``tau`` for a shared section.
 
 Heads are always fp32. Encoder / backbone copies are typically bf16, and a
-small ``tau`` times the online/delayed gap is far below half a bf16 ULP, so
-each non-fp32 delayed parameter keeps a persistent fp32 shadow: the
-interpolation accumulates on the shadow and is cast into the parameter every
-update (an extra fp32 copy of the delayed trunk in memory).
+small ``tau`` times the online/delayed gap is far below half a bf16 ULP.
+``Polyak(..., fp32_shadow=True)`` (the default) keeps a persistent fp32
+shadow per non-fp32 delayed parameter: interpolation accumulates on the
+shadow and is cast into the parameter every update (an extra fp32 copy of
+the delayed trunk in memory). ``fp32_shadow=False`` lerps in the parameter
+dtype and skips that copy — a small ``tau`` then rounds away until the
+online/delayed gap reaches half a ULP.
 """
 
 from __future__ import annotations
@@ -59,10 +62,17 @@ class _PolyakState:
     """Pairs online/delayed parameters of one section and lerps them.
 
     fp32 parameters are lerped in place. Non-fp32 parameters get an fp32
-    shadow (see module docstring).
+    shadow when ``fp32_shadow`` is set (see module docstring).
     """
 
-    def __init__(self, online: nn.Module, delayed: nn.Module, *, section: str) -> None:
+    def __init__(
+        self,
+        online: nn.Module,
+        delayed: nn.Module,
+        *,
+        section: str,
+        fp32_shadow: bool = True,
+    ) -> None:
         online_params = dict(online.named_parameters())
         delayed_params = dict(delayed.named_parameters())
         if set(online_params) != set(delayed_params):
@@ -85,9 +95,9 @@ class _PolyakState:
                     f"online but {tuple(delayed_p.shape)} delayed."
                 )
             shadow = (
-                None
-                if delayed_p.dtype == torch.float32
-                else delayed_p.detach().to(dtype=torch.float32).clone()
+                delayed_p.detach().to(dtype=torch.float32).clone()
+                if fp32_shadow and delayed_p.dtype != torch.float32
+                else None
             )
             self._pairs.append((online_p, delayed_p, shadow))
 
@@ -96,7 +106,7 @@ class _PolyakState:
 
     @torch.no_grad()
     def update(self, tau: float) -> None:
-        """θ_delayed ← τ·θ_online + (1−τ)·θ_delayed (fp32 accumulation)."""
+        """θ_delayed ← τ·θ_online + (1−τ)·θ_delayed (fp32 when shadowed)."""
         if tau <= 0.0:
             return
         for online_p, delayed_p, shadow in self._pairs:
@@ -133,9 +143,11 @@ class Polyak:
     Args:
         online: Source model (encoder, backbone, heads).
         delayed: Model from ``online.delayed_copy(...)``.
+        fp32_shadow: Accumulate non-fp32 delayed interpolation in fp32
+            shadows (default). ``False`` lerps in the parameter dtype.
     """
 
-    def __init__(self, online: Model, delayed: Model) -> None:
+    def __init__(self, online: Model, delayed: Model, *, fp32_shadow: bool = True) -> None:
         from mouse_core.models.base import Model as _Model
 
         if not isinstance(online, _Model) or not isinstance(delayed, _Model):
@@ -145,31 +157,56 @@ class Polyak:
         if delayed is online:
             raise ValueError("delayed must come from Model.delayed_copy(), not be the online model.")
 
+        self._fp32_shadow = bool(fp32_shadow)
         self._heads: _PolyakState | None = None
         self._encoder: _PolyakState | None = None
         self._backbone: list[_PolyakState] = []
 
         if not _heads_shared(online, delayed):
-            self._heads = _PolyakState(online.heads, delayed.heads, section="heads")
+            self._heads = _PolyakState(
+                online.heads, delayed.heads, section="heads", fp32_shadow=self._fp32_shadow
+            )
         if delayed.encoder is not None and delayed.encoder is not online.encoder:
-            self._encoder = _PolyakState(online.encoder, delayed.encoder, section="encoder")
+            self._encoder = _PolyakState(
+                online.encoder, delayed.encoder, section="encoder", fp32_shadow=self._fp32_shadow
+            )
         if delayed.backbone is not None and delayed.backbone is not online.backbone:
             self._backbone.append(
-                _PolyakState(online.backbone, delayed.backbone, section="backbone")
+                _PolyakState(
+                    online.backbone,
+                    delayed.backbone,
+                    section="backbone",
+                    fp32_shadow=self._fp32_shadow,
+                )
             )
             if online.reasoner is not None and delayed.reasoner is not None:
                 self._backbone.append(
-                    _PolyakState(online.reasoner, delayed.reasoner, section="reasoner")
+                    _PolyakState(
+                        online.reasoner,
+                        delayed.reasoner,
+                        section="reasoner",
+                        fp32_shadow=self._fp32_shadow,
+                    )
                 )
             if online.recurrence is not None and delayed.recurrence is not None:
                 self._backbone.append(
-                    _PolyakState(online.recurrence, delayed.recurrence, section="recurrence")
+                    _PolyakState(
+                        online.recurrence,
+                        delayed.recurrence,
+                        section="recurrence",
+                        fp32_shadow=self._fp32_shadow,
+                    )
                 )
         if self._heads is None and self._encoder is None and not self._backbone:
             raise ValueError(
                 "the delayed model shares every section with the online model; "
                 "build it with delayed_copy(encoder=True / backbone=True / heads=True)."
             )
+
+    @property
+    def fp32_shadow(self) -> bool:
+        """Whether non-fp32 delayed parameters interpolate through fp32 shadows."""
+        return self._fp32_shadow
 
     @property
     def delays_encoder(self) -> bool:

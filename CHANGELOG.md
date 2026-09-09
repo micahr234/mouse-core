@@ -127,9 +127,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it frozen, ``1`` copies the online weights. Each ``tau`` is required
   for a delayed section and must be omitted or ``1`` for a shared one. ``Model.forward`` returns a ``ModelOutput`` with ``predictions``,
   ``last_hidden_state``, ``head_output_indices``, ``hidden_states``,
-  ``passes``, and ``cache``. ``Polyak`` matches parameters by name and
-  accumulates non-fp32 (bf16 encoder / backbone) interpolation in fp32
-  shadows so small ``tau`` updates are not rounded away.
+  ``passes``, and ``cache``. ``Polyak`` matches parameters by name.
+  ``Polyak(..., fp32_shadow=True)`` (default) accumulates non-fp32
+  (bf16 encoder / backbone) interpolation in fp32 shadows so small
+  ``tau`` updates are not rounded away; ``fp32_shadow=False`` lerps in
+  the parameter dtype and skips the extra trunk copy.
   ``examples/11_train_offline_dqn_model_delay.ipynb`` is the offline DQN
   loop with the encoder, backbone, and Q head all delayed.
 - ``examples/05_train_offline_sv.ipynb``: offline supervised-value training
