@@ -89,17 +89,24 @@ class TextTokenizerModalitySpec:
     ``text`` head-output field is tokenized as its own run so its token
     boundaries are exact; every step must emit at least one head-output token,
     so the head-output field must not be skippable on any step.
+
+    A ``text`` field requires ``format=``. ``token`` must not set ``format``.
+    ``learnable`` has no step I/O (no ``input_field=`` / ``format=``); set
+    ``output_field`` to name it (e.g. ``"value"``), else it is auto-named
+    ``__learnable_<i>``. ``tokens`` (default ``1``) is the number of scratch
+    rows. Learnable tokens are appended after the rendered step format.
     """
 
     type: str
     input_field: str | None = None
     output_field: str | None = None
     format: str | None = None
+    tokens: int | None = None
     skip: Any = None
     required: bool = True
     head_output: bool = False
 
-    _VALID_TYPES: ClassVar[tuple[str, ...]] = ("text", "token", "image")
+    _VALID_TYPES: ClassVar[tuple[str, ...]] = ("text", "token", "image", "learnable")
 
     def __post_init__(self) -> None:
         k = (self.type or "").lower()
@@ -109,6 +116,26 @@ class TextTokenizerModalitySpec:
                 f"expected one of {self._VALID_TYPES}"
             )
         object.__setattr__(self, "type", k)
+        if k == "learnable":
+            object.__setattr__(self, "required", False)
+            if self.input_field is not None:
+                raise TypeError(
+                    "learnable tokenizer modalities have no input_field="
+                )
+            if self.format is not None:
+                raise ValueError(
+                    f"learnable modality {self.output_field!r} must not set format="
+                )
+            n = int(self.tokens or 1)
+            if n <= 0:
+                raise ValueError("learnable tokens must be >= 1")
+            object.__setattr__(self, "tokens", n)
+            return
+        if self.tokens is not None:
+            raise TypeError(
+                f"text tokenizer modality type={k!r} does not accept tokens= "
+                "(learnable only)"
+            )
         if not self.input_field:
             raise ValueError(
                 f"text tokenizer modality type={k!r} requires input_field="
@@ -233,8 +260,12 @@ def expand_tokenizer_numeric_spec(
 
 
 def expand_tokenizer_text_spec(
-    spec: TextTokenizerModalitySpec,
+    spec: TextTokenizerModalitySpec, *, learnable_index: int = 0
 ) -> list[TextTokenizerModalitySpec]:
+    if spec.type == "learnable":
+        if spec.output_field:
+            return [spec]
+        return [replace(spec, output_field=f"__learnable_{learnable_index}")]
     if not spec.input_field or not spec.output_field:
         raise ValueError("text/token/image modalities must set input_field=")
     return [spec]

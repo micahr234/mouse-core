@@ -91,6 +91,10 @@ class StepTokens:
     grouping_field: str
     head_output_mask: np.ndarray  # [T] bool
     objective_fields: dict[str, Any] = field(default_factory=dict)
+    group_prefix_modality_ids: np.ndarray | None = None
+    group_prefix_ids: np.ndarray | None = None
+    group_prefix_values: np.ndarray | None = None
+    group_prefix_positions: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         if not self.grouping_field:
@@ -130,6 +134,54 @@ class StepTokens:
                 "every step (it must never be skipped)"
             )
         object.__setattr__(self, "head_output_mask", mask)
+        group_prefix_arrays = (
+            self.group_prefix_modality_ids,
+            self.group_prefix_ids,
+            self.group_prefix_values,
+            self.group_prefix_positions,
+        )
+        if all(a is None for a in group_prefix_arrays):
+            return
+        if any(a is None for a in group_prefix_arrays):
+            raise ValueError(
+                "group_prefix_modality_ids / group_prefix_ids / "
+                "group_prefix_values / group_prefix_positions must all be "
+                "set or all None"
+            )
+        pt = int(np.asarray(self.group_prefix_ids).shape[0])
+        if pt == 0:
+            raise ValueError("group_prefix token arrays must be non-empty when set")
+        for name in (
+            "group_prefix_modality_ids",
+            "group_prefix_ids",
+            "group_prefix_values",
+            "group_prefix_positions",
+        ):
+            arr = np.asarray(getattr(self, name))
+            if arr.shape != (pt,):
+                raise ValueError(f"{name} must have shape [{pt}], got {arr.shape}")
+            object.__setattr__(self, name, arr)
+        pmids = np.asarray(self.group_prefix_modality_ids, dtype=np.int64)
+        if pmids.min(initial=0) < 0 or pmids.max(initial=0) >= len(names):
+            raise ValueError(
+                f"group_prefix_modality_ids must be in [0, {len(names)}), got "
+                f"min={int(pmids.min())} max={int(pmids.max())}"
+            )
+        object.__setattr__(self, "group_prefix_modality_ids", pmids)
+        object.__setattr__(
+            self, "group_prefix_ids", np.asarray(self.group_prefix_ids, dtype=np.int64)
+        )
+        object.__setattr__(
+            self,
+            "group_prefix_values",
+            np.asarray(self.group_prefix_values, dtype=np.float32),
+        )
+        ppos = np.asarray(self.group_prefix_positions, dtype=np.int64)
+        if ppos.min(initial=0) < 0:
+            raise ValueError(
+                f"group_prefix_positions must be >= 0, got min={int(ppos.min())}"
+            )
+        object.__setattr__(self, "group_prefix_positions", ppos)
 
     @property
     def T(self) -> int:
@@ -444,11 +496,20 @@ def pack_token_batch(
     sequence_ids: Sequence[int] | None = None,
     batch_size: int | None = None,
     grouping_field: str | None = None,
+    prev_grouping_ids: Sequence[int | None] | None = None,
 ) -> tuple[TokenBatch, TensorDict]:
     """Pack per-step :class:`StepTokens` into model and objective inputs.
 
     All steps must share the same ``modality_names``, ``modality_map``, and
     ``grouping_field``. Returns ``(inputs, objective_data)``.
+
+    When a step carries ``group_prefix_*`` tokens (from
+    :class:`~mouse_core.data.text_tokenizer.TextTokenizer` ``group_prefix=``),
+    they are inserted at the start of each grouping-field segment: the first
+    step of a sequence, or a step whose ``grouping_id`` differs from the
+    previous step in that sequence. ``prev_grouping_ids`` is length ``B``
+    (optional ``None`` entries); pass the last grouping already in a cached
+    sequence so incremental decode does not emit the group prefix again.
     """
     empty_objective = TensorDict({}, batch_size=[0])
     if not steps:
@@ -499,8 +560,48 @@ def pack_token_batch(
     head_output_steps: list[int] = []
     head_output_counts: list[int] = []
 
+    inferred_B = (max(seq_per_step) + 1) if seq_per_step else 0
+    if batch_size is None:
+        B = inferred_B
+    else:
+        if batch_size < inferred_B:
+            raise ValueError(
+                f"batch_size ({batch_size}) must be >= inferred B ({inferred_B})"
+            )
+        B = int(batch_size)
+
+    last_gid: list[int | None]
+    if prev_grouping_ids is None:
+        last_gid = [None] * B
+    else:
+        if len(prev_grouping_ids) != B:
+            raise ValueError(
+                f"prev_grouping_ids length ({len(prev_grouping_ids)}) must "
+                f"match batch_size ({B})"
+            )
+        last_gid = [
+            None if g is None else int(g) for g in prev_grouping_ids
+        ]
+
     offset = 0
     for step_idx, (st, sid) in enumerate(zip(steps, seq_per_step)):
+        emit_group_prefix = (
+            st.group_prefix_ids is not None
+            and last_gid[sid] != st.grouping_id
+        )
+        if emit_group_prefix:
+            assert st.group_prefix_modality_ids is not None
+            assert st.group_prefix_ids is not None
+            assert st.group_prefix_values is not None
+            assert st.group_prefix_positions is not None
+            pt = int(st.group_prefix_ids.shape[0])
+            modality_ids.append(st.group_prefix_modality_ids)
+            ids.append(st.group_prefix_ids)
+            values.append(st.group_prefix_values)
+            positions.append(st.group_prefix_positions)
+            seq_ids.append(np.full(pt, sid, dtype=np.int64))
+            grouping_ids.append(np.full(pt, st.grouping_id, dtype=np.int64))
+            offset += pt
         t = st.T
         modality_ids.append(st.modality_ids)
         ids.append(st.ids)
@@ -513,16 +614,7 @@ def pack_token_batch(
         head_output_steps.extend([step_idx] * int(ho.size))
         head_output_counts.append(int(ho.size))
         offset += t
-
-    inferred_B = (max(seq_per_step) + 1) if seq_per_step else 0
-    if batch_size is None:
-        B = inferred_B
-    else:
-        if batch_size < inferred_B:
-            raise ValueError(
-                f"batch_size ({batch_size}) must be >= inferred B ({inferred_B})"
-            )
-        B = int(batch_size)
+        last_gid[sid] = st.grouping_id
 
     if offset == 0:
         return (

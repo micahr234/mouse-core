@@ -19,21 +19,19 @@ class _FakeTokenizer:
         return {"input_ids": torch.tensor([ids], dtype=torch.long)}
 
 
-_DEFAULT_MODALITIES = [
-    {"type": "token", "field": "action"},
-    {"type": "text", "field": "observation", "format": "observation={observation}"},
-    {"type": "text", "field": "reward", "format": "reward={reward}", "skip": 0.0},
-    {"type": "text", "field": "episode_done", "format": "episode_done={episode_done}", "skip": 0},
+_DEFAULT_FIELDS = [
+    {"type": "token", "input_field": "action"},
+    {"type": "text", "input_field": "observation", "format": "observation={observation}"},
+    {"type": "text", "input_field": "reward", "format": "reward={reward}", "skip": 0.0},
+    {"type": "text", "input_field": "episode_done", "format": "episode_done={episode_done}", "skip": 0},
 ]
 _DEFAULT_FORMAT = "<action={action},{observation},{reward},{episode_done}>"
 
 
-def _tokenizer_fields(modalities: list[dict], head_output: str = "action") -> list[dict]:
+def _tokenizer_fields(fields: list[dict], head_output: str = "action") -> list[dict]:
     out: list[dict] = []
-    for modality in modalities:
-        data = dict(modality)
-        if "field" in data:
-            data["input_field"] = data.pop("field")
+    for field in fields:
+        data = dict(field)
         if data.get("input_field") == head_output:
             data["head_output"] = True
         out.append(data)
@@ -52,7 +50,8 @@ def _text_pair(hidden_dim: int = 8, **kwargs):
         nn.init.normal_(emb.weight, std=0.02)
     hf_tok = kwargs.pop("tokenizer", _FakeTokenizer())
     format_str = kwargs.pop("format", _DEFAULT_FORMAT)
-    modalities = kwargs.pop("modalities", list(_DEFAULT_MODALITIES))
+    group_prefix = kwargs.pop("group_prefix", None)
+    input_fields = kwargs.pop("input_fields", list(_DEFAULT_FIELDS))
     image_processor = kwargs.pop("image_processor", None)
     objective_fields = kwargs.pop(
         "objective_fields",
@@ -60,22 +59,17 @@ def _text_pair(hidden_dim: int = 8, **kwargs):
     )
     head_output = kwargs.pop("head_output", "action")
     tokenizer = TextTokenizer(
-        input_fields=_tokenizer_fields(modalities, head_output=head_output),
+        input_fields=_tokenizer_fields(input_fields, head_output=head_output),
         format=format_str,
+        group_prefix=group_prefix,
         tokenizer=hf_tok,
         image_processor=image_processor,
         objective_fields=objective_fields,
         grouping_field="grouping_id",
     )
-    embedder_modalities = [
-        {k: v for k, v in m.items() if k not in ("skip", "required")}
-        for m in modalities
-    ]
     enc = TextEmbedder(
         hidden_dim=hidden_dim,
         embed_tokens=emb,
-        format=format_str,
-        modalities=embedder_modalities,
         **kwargs,
     )
     return tokenizer, enc
@@ -141,6 +135,57 @@ def test_text_embedder_skip_omits_value_keeps_commas() -> None:
     assert int(matches.sum().item()) == 1
 
 
+def test_text_tokenizer_appends_learnable() -> None:
+    tokenizer, enc = _text_pair(
+        format="{action}",
+        input_fields=[
+            {"type": "token", "input_field": "action"},
+            {"type": "learnable", "output_field": "value", "tokens": 1, "head_output": True},
+        ],
+        objective_fields=_obj("action"),
+        head_output="value",
+        learnable=[
+            {"type": "learnable", "field": "value", "tokens": 1, "std": 0.02, "positions": 1},
+        ],
+    )
+    st = tokenizer({"action": 3, "grouping_id": 0})
+    assert st.modality_names[-1] == "value"
+    assert st.head_output_mask.tolist() == [False, True]
+    embeds, indices = enc(batch_to_token_batch(tokenizer, [[{"action": 3}]]))
+    assert embeds.shape[0] == 2
+    assert indices.tolist() == [1]
+
+
+def test_text_tokenizer_learnable_rejects_input_field() -> None:
+    import pytest
+
+    with pytest.raises(TypeError, match="no input_field"):
+        TextTokenizer(
+            input_fields=[
+                {
+                    "type": "learnable",
+                    "input_field": "",
+                    "head_output": True,
+                },
+            ],
+            grouping_field="grouping_id",
+        )
+
+
+def test_text_tokenizer_requires_field_format() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="requires format="):
+        TextTokenizer(
+            input_fields=[
+                {"type": "text", "input_field": "observation", "head_output": True},
+            ],
+            format="{observation}",
+            tokenizer=_FakeTokenizer(),
+            grouping_field="grouping_id",
+        )
+
+
 def test_token_modality_is_single_embed_row() -> None:
     D = 8
     emb = nn.Embedding(32, D)
@@ -151,7 +196,7 @@ def test_token_modality_is_single_embed_row() -> None:
         hidden_dim=D,
         embed_tokens=emb,
         format="{action}",
-        modalities=[{"type": 'token', "field": "action"}],
+        input_fields=[{"type": "token", "input_field": "action"}],
         objective_fields=_obj("action"),
     )
     embeds, indices = enc(batch_to_token_batch(tokenizer, [[{"action": 16}]]))
@@ -160,25 +205,7 @@ def test_token_modality_is_single_embed_row() -> None:
     assert torch.equal(embeds[0], emb.weight[16])
 
 
-def test_text_embedder_rejects_learnable() -> None:
-    emb = nn.Embedding(32, 8)
-    try:
-        TextEmbedder(
-            hidden_dim=8,
-            embed_tokens=emb,
-            format="{action}",
-            modalities=[
-                {"type": 'token', "field": "action"},
-                {"type": "learnable"},
-            ],
-        )
-    except ValueError as exc:
-        assert "learnable" in str(exc).lower() or "NumericEmbedder" in str(exc)
-    else:
-        raise AssertionError("expected ValueError for learnable modality")
-
-
-def test_text_embedder_field_format_in_step_template() -> None:
+def test_text_tokenizer_field_format_in_step_template() -> None:
     seen: list[str] = []
 
     class _CaptureTok:
@@ -195,9 +222,9 @@ def test_text_embedder_field_format_in_step_template() -> None:
         tokenizer=_CaptureTok(),
         embed_tokens=emb,
         format="<{observation}|{action}>",
-        modalities=[
-            {"type": 'text', "field": "observation", "format": 'o={observation}'},
-            {"type": 'text', "field": "action", "format": 'a={action}'},
+        input_fields=[
+            {"type": "text", "input_field": "observation", "format": "o={observation}"},
+            {"type": "text", "input_field": "action", "format": "a={action}"},
         ],
         objective_fields=_obj("action"),
     )
@@ -219,9 +246,9 @@ def test_text_embedder_image_token_ids() -> None:
         embed_tokens=emb,
         image_processor=fake_image_tok,
         format="<{observation},{pixels}>",
-        modalities=[
-            {"type": 'text', "field": "observation", "format": '{observation}'},
-            {"type": 'image', "field": "pixels"},
+        input_fields=[
+            {"type": "text", "input_field": "observation", "format": "{observation}"},
+            {"type": "image", "input_field": "pixels"},
         ],
         objective_fields=_obj("observation", "pixels"),
         head_output="pixels",
@@ -246,7 +273,7 @@ def test_text_embedder_save_load(tmp_path) -> None:
         embed_tokens=emb,
         pretrained=None,
         format="<action={action}>",
-        modalities=[{"type": 'token', "field": "action"}],
+        input_fields=[{"type": "token", "input_field": "action"}],
     )
     enc.pretrained = None
     model = Model(
@@ -260,9 +287,9 @@ def test_text_embedder_save_load(tmp_path) -> None:
 
     cfg = _encoder_config(enc)
     assert cfg["type"] == "text"
-    assert cfg["kwargs"]["format"] == "<action={action}>"
-    assert cfg["kwargs"]["modalities"][0]["type"] == "token"
     assert cfg["kwargs"]["vocab_size"] == 32
+    assert "format" not in cfg["kwargs"]
+    assert "modalities" not in cfg["kwargs"]
     assert "std" not in cfg["kwargs"]
     assert "separator" not in cfg["kwargs"]
 
@@ -272,7 +299,7 @@ def test_text_embedder_save_load(tmp_path) -> None:
         hidden_dim=D,
         embed_tokens=emb,
         format="<action={action}>",
-        modalities=[{"type": 'token', "field": "action"}],
+        input_fields=[{"type": "token", "input_field": "action"}],
         objective_fields=_obj("action"),
     )
     batch = [[{"action": 1}, {"action": 3}]]
@@ -283,6 +310,46 @@ def test_text_embedder_save_load(tmp_path) -> None:
     assert isinstance(loaded.encoder, TextEmbedder)
     assert loaded.encoder.vocab_size == 32
     assert torch.equal(loaded.encoder.embed_tokens.weight, emb.weight)
+    actual = loaded(batch_to_token_batch(tokenizer, batch)).predictions
+    assert torch.allclose(actual["action_value"], expected["action_value"])
+
+
+def test_text_embedder_learnable_save_load(tmp_path) -> None:
+    D = 8
+    emb = nn.Embedding(32, D)
+    nn.init.normal_(emb.weight, std=0.02)
+    tokenizer, enc = _text_pair(
+        hidden_dim=D,
+        embed_tokens=emb,
+        format="{action}",
+        input_fields=[
+            {"type": "token", "input_field": "action"},
+            {"type": "learnable", "output_field": "value", "tokens": 1, "head_output": True},
+        ],
+        objective_fields=_obj("action"),
+        head_output="value",
+        learnable=[
+            {"type": "learnable", "field": "value", "tokens": 1, "std": 0.02, "positions": 1},
+        ],
+    )
+    from mouse_core.models.base import _encoder_config
+
+    cfg = _encoder_config(enc)
+    assert cfg["kwargs"]["learnable"][0]["field"] == "value"
+    model = Model(
+        encoder=enc,
+        backbone=IdentityBackbone(hidden_dim=D),
+        heads=DiscreteActionValueHead(
+            in_features=D, out_features=4, hidden_dim=D, num_layers=1
+        ),
+    ).eval()
+    batch = [[{"action": 1}, {"action": 3}]]
+    expected = model(batch_to_token_batch(tokenizer, batch)).predictions
+    from mouse_core.models import load_model, save_model
+
+    save_model(model, tmp_path)
+    loaded = load_model(tmp_path).eval()
+    assert len(loaded.encoder.learnable) == 1
     actual = loaded(batch_to_token_batch(tokenizer, batch)).predictions
     assert torch.allclose(actual["action_value"], expected["action_value"])
 
@@ -306,20 +373,185 @@ def test_text_tokenizer_keeps_length_one_vector_as_vector() -> None:
     assert st.objective_fields["q"].shape == (1,)
 
 
+def test_text_model_card_describes_tokenizer(tmp_path) -> None:
+    from mouse_core.models.base import _write_model_card
+
+    enc = TextEmbedder(hidden_dim=8, vocab_size=16)
+    enc.pretrained = "Qwen/Qwen3-0.6B"
+    model = Model(
+        encoder=enc,
+        backbone=IdentityBackbone(hidden_dim=8),
+        heads=DiscreteActionValueHead(
+            in_features=8, out_features=4, hidden_dim=8, num_layers=1
+        ),
+    )
+    path = tmp_path / "README.md"
+    _write_model_card(repo_id="user/mouse-text", model=model, path=path)
+    text = path.read_text()
+    assert "TextEmbedder" in text
+    assert "TextTokenizer" in text
+    assert "NumericTokenizer" not in text
+    assert 'pretrained="Qwen/Qwen3-0.6B"' in text
+    assert '{"input_field": "action"}' in text
+
+
 def test_text_embedder_requires_exactly_one_table_source() -> None:
     import pytest
 
     with pytest.raises(TypeError, match="exactly one of"):
-        TextEmbedder(hidden_dim=8, modalities=[{"type": "token", "field": "a"}], format="{a}")
+        TextEmbedder(hidden_dim=8)
     with pytest.raises(TypeError, match="exactly one of"):
         TextEmbedder(
             hidden_dim=8,
-            modalities=[{"type": "token", "field": "a"}],
-            format="{a}",
             embed_tokens=nn.Embedding(4, 8),
             vocab_size=4,
         )
-    enc = TextEmbedder(
-        hidden_dim=8, modalities=[{"type": "token", "field": "a"}], format="{a}", vocab_size=4
-    )
+    enc = TextEmbedder(hidden_dim=8, vocab_size=4)
     assert enc.embed_tokens.weight.shape == (4, 8)
+
+
+def _group_prefix_tokenizer(**kwargs):
+    return TextTokenizer(
+        input_fields=[
+            {"type": "token", "input_field": "action", "head_output": True},
+        ],
+        format="{action}",
+        group_prefix=kwargs.pop("group_prefix", "task={task_index}\n"),
+        tokenizer=kwargs.pop("tokenizer", _FakeTokenizer()),
+        objective_fields=_obj("action"),
+        grouping_field="task_index",
+        **kwargs,
+    )
+
+
+def test_text_tokenizer_group_prefix_carried_on_step() -> None:
+    tok = _group_prefix_tokenizer()
+    st = tok({"action": 1, "task_index": 7})
+    assert st.group_prefix_ids is not None
+    expected = _FakeTokenizer()("task=7\n")["input_ids"].view(-1).tolist()
+    assert st.group_prefix_ids.tolist() == expected
+    assert st.group_prefix_modality_ids.tolist() == [0] * len(expected)
+    assert st.head_output_mask.tolist() == [True]
+
+
+def test_pack_emits_group_prefix_once_per_grouping_segment() -> None:
+    from mouse_core.data import pack_token_batch
+
+    tok = _group_prefix_tokenizer()
+    steps = [
+        tok({"action": 1, "task_index": 0}),
+        tok({"action": 2, "task_index": 0}),
+        tok({"action": 3, "task_index": 1}),
+    ]
+    inputs, obj = pack_token_batch(steps, sequence_ids=[0, 0, 0], batch_size=1)
+    p = int(steps[0].group_prefix_ids.shape[0])
+    assert inputs.L == p + steps[0].T + steps[1].T + p + steps[2].T
+    assert obj["action"].tolist() == [1, 2, 3]
+    assert inputs.head_output_indices.tolist() == [
+        p + int(steps[0].head_output_mask.nonzero()[0][0]),
+        p + steps[0].T + int(steps[1].head_output_mask.nonzero()[0][0]),
+        p + steps[0].T + steps[1].T + p + int(steps[2].head_output_mask.nonzero()[0][0]),
+    ]
+    # Group-prefix tokens are __text__ and never head-output.
+    assert not any(
+        int(i) in set(inputs.head_output_indices.tolist())
+        for i in range(p)
+    )
+
+
+def test_pack_group_prefix_is_per_sequence() -> None:
+    from mouse_core.data import pack_token_batch
+
+    tok = _group_prefix_tokenizer()
+    steps = [
+        tok({"action": 1, "task_index": 0}),
+        tok({"action": 2, "task_index": 0}),
+    ]
+    inputs, _ = pack_token_batch(steps, sequence_ids=[0, 1], batch_size=2)
+    p = int(steps[0].group_prefix_ids.shape[0])
+    assert inputs.L == (p + steps[0].T) + (p + steps[1].T)
+    assert inputs.sequence_ids.tolist() == (
+        [0] * (p + steps[0].T) + [1] * (p + steps[1].T)
+    )
+
+
+def test_pack_prev_grouping_ids_suppresses_and_reemits_group_prefix() -> None:
+    from mouse_core.data import pack_token_batch
+
+    tok = _group_prefix_tokenizer()
+    continue_step = tok({"action": 1, "task_index": 5})
+    change_step = tok({"action": 2, "task_index": 6})
+    p = int(continue_step.group_prefix_ids.shape[0])
+
+    same, _ = pack_token_batch(
+        [continue_step],
+        sequence_ids=[0],
+        batch_size=1,
+        prev_grouping_ids=[5],
+    )
+    assert same.L == continue_step.T
+
+    changed, _ = pack_token_batch(
+        [change_step],
+        sequence_ids=[0],
+        batch_size=1,
+        prev_grouping_ids=[5],
+    )
+    assert changed.L == p + change_step.T
+
+    fresh, _ = pack_token_batch(
+        [continue_step],
+        sequence_ids=[0],
+        batch_size=1,
+        prev_grouping_ids=[None],
+    )
+    assert fresh.L == p + continue_step.T
+
+
+def test_text_tokenizer_group_prefix_missing_placeholder_raises() -> None:
+    import pytest
+
+    tok = _group_prefix_tokenizer(group_prefix="label={label}\n")
+    with pytest.raises(KeyError, match="label"):
+        tok({"action": 1, "task_index": 0})
+
+
+def test_text_tokenizer_empty_group_prefix_raises() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="non-empty"):
+        _group_prefix_tokenizer(group_prefix="")
+
+
+def test_text_tokenizer_group_prefix_without_text_fields_adds_text_modality() -> None:
+    tok = TextTokenizer(
+        input_fields=[
+            {"type": "learnable", "output_field": "value", "tokens": 1, "head_output": True},
+        ],
+        group_prefix="task={task_index}\n",
+        tokenizer=_FakeTokenizer(),
+        objective_fields=[],
+        grouping_field="task_index",
+    )
+    assert "__text__" in tok.modality_names
+    st = tok({"task_index": 3})
+    assert st.group_prefix_ids is not None
+    assert st.T == 1
+    assert st.modality_names[int(st.group_prefix_modality_ids[0])] == "__text__"
+
+
+def test_numeric_pack_ignores_missing_group_prefix() -> None:
+    from mouse_core.data import NumericTokenizer, pack_token_batch
+
+    tok = NumericTokenizer(
+        input_fields=[{"type": "discrete", "input_field": "action", "head_output": True}],
+        objective_fields=_obj("action"),
+        grouping_field="task_index",
+    )
+    steps = [
+        tok({"action": 1, "task_index": 0}),
+        tok({"action": 2, "task_index": 0}),
+    ]
+    inputs, _ = pack_token_batch(steps, sequence_ids=[0, 0], batch_size=1)
+    assert inputs.L == steps[0].T + steps[1].T
+    assert steps[0].group_prefix_ids is None

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from string import Formatter
 from typing import Any
 
 import torch
@@ -12,9 +11,10 @@ import torch.nn as nn
 from mouse_core.data.text_tokenizer import NAME_TEXT, NAME_VISION
 from mouse_core.data.token_batch import ModalityInfo, TokenBatch
 from mouse_core.models.embedding.embedding import Encoder
+from mouse_core.models.embedding.linear import ScaledEmbedding
 from mouse_core.models.embedding.modality import (
-    TextEmbedderModalitySpec,
-    expand_embedder_text_spec,
+    NumericEmbedderModalitySpec,
+    expand_embedder_numeric_spec,
 )
 
 
@@ -22,103 +22,33 @@ class TextEmbedder(Encoder):
     """Pretrained token embeddings over a flat :class:`TokenBatch`.
 
     Token packing lives in :class:`~mouse_core.data.text_tokenizer.TextTokenizer`
-    (constructed separately). Alignment is by modality name (``__text__`` /
-    ``__vision__``). This module only looks up ``embed_tokens``.
+    (constructed separately). This module looks up ``embed_tokens`` for
+    ``__text__`` / ``__vision__`` ids and optional ``learnable=`` scratch
+    tables (aligned by name with tokenizer ``output_field``).
 
-    The table comes from exactly one of ``embed_tokens=`` (an existing
-    ``nn.Embedding``), ``pretrained=`` (copied from a Hub checkpoint), or
-    ``vocab_size=`` (a fresh table, used by ``load_model`` so the saved
-    ``state_dict`` provides the weights without re-downloading the checkpoint).
+    The pretrained table comes from exactly one of ``embed_tokens=`` (an
+    existing ``nn.Embedding``), ``pretrained=`` (copied from a Hub
+    checkpoint), or ``vocab_size=`` (a fresh table, used by ``load_model``
+    so the saved ``state_dict`` provides the weights without re-downloading
+    the checkpoint).
     """
 
     def __init__(
         self,
         *,
         hidden_dim: int,
-        modalities: list[dict | TextEmbedderModalitySpec] | None = None,
-        format: str | None = None,
         pretrained: str | Path | None = None,
         embed_tokens: nn.Embedding | None = None,
         vocab_size: int | None = None,
         padding_idx: int | None = None,
         hub_kwargs: dict | None = None,
         freeze_embeddings: bool = False,
+        learnable: list[dict[str, Any] | NumericEmbedderModalitySpec] | None = None,
     ) -> None:
         super().__init__()
         self._hidden_dim = int(hidden_dim)
-        self.format = format
         self._hub_kwargs = dict(hub_kwargs or {})
         self._pretrained = str(pretrained) if pretrained is not None else None
-
-        raw = modalities or []
-        specs: list[TextEmbedderModalitySpec] = []
-        for m in raw:
-            if isinstance(m, TextEmbedderModalitySpec):
-                spec = m
-            else:
-                data = dict(m)
-                if "input_field" in data or "output_field" in data:
-                    raise TypeError(
-                        "embedder modalities use field= "
-                        "(not input_field=/output_field=); "
-                        "rename with the tokenizer input_field=/output_field="
-                    )
-                for banned in ("skip", "required"):
-                    if banned in data:
-                        raise TypeError(
-                            f"embedder modalities do not accept {banned}= "
-                            "(tokenizer packing knob)"
-                        )
-                spec = TextEmbedderModalitySpec(**data)
-            specs.extend(expand_embedder_text_spec(spec))
-        self.modalities: list[TextEmbedderModalitySpec] = specs
-
-        has_text = any(s.type == "text" for s in specs)
-        has_token = any(s.type == "token" for s in specs)
-        has_image = any(s.type == "image" for s in specs)
-        needs_format = has_text or has_image or has_token
-        if needs_format and format is None:
-            raise TypeError(
-                "TextEmbedder requires format= when text, token, or image modalities "
-                "are declared"
-            )
-        if format is not None and not (has_text or has_token or has_image):
-            raise TypeError("format= requires at least one text, token, or image modality")
-
-        if format is not None:
-            text_by_field = {
-                s.field
-                for s in specs
-                if s.type == "text" and isinstance(s.field, str)
-            }
-            token_by_field = {
-                s.field
-                for s in specs
-                if s.type == "token" and isinstance(s.field, str)
-            }
-            image_by_field = {
-                s.field
-                for s in specs
-                if s.type == "image" and isinstance(s.field, str)
-            }
-            for _, name, _, _ in Formatter().parse(format):
-                if name is None or name == "":
-                    continue
-                if (
-                    name not in text_by_field
-                    and name not in token_by_field
-                    and name not in image_by_field
-                ):
-                    raise ValueError(
-                        f"format placeholder {{{name}}} has no matching text/token/image modality"
-                    )
-
-        expected_names: set[str] = set()
-        if has_text or has_token:
-            expected_names.add(NAME_TEXT)
-        if has_image:
-            expected_names.add(NAME_VISION)
-        self._expected_names = frozenset(expected_names)
 
         sources = [
             name
@@ -153,6 +83,23 @@ class TextEmbedder(Encoder):
         if freeze_embeddings:
             self.embed_tokens.weight.requires_grad_(False)
 
+        self.learnable: list[NumericEmbedderModalitySpec] = _coerce_text_learnable(
+            learnable
+        )
+        self._learnable_tables = nn.ModuleDict()
+        self._learnable_type_vectors = nn.ParameterDict()
+        for spec in self.learnable:
+            assert isinstance(spec.field, str)
+            assert spec.std is not None
+            assert spec.positions is not None
+            n = int(spec.tokens or 1)
+            self._learnable_tables[spec.field] = ScaledEmbedding(
+                n, hidden_dim, scale=float(spec.std)
+            )
+            self._learnable_type_vectors[spec.field] = nn.Parameter(
+                torch.randn(int(spec.positions), hidden_dim) * float(spec.std)
+            )
+
     @property
     def vocab_size(self) -> int:
         return int(self.embed_tokens.num_embeddings)
@@ -176,7 +123,7 @@ class TextEmbedder(Encoder):
 
     @property
     def tokens_per_step(self) -> int:
-        return 0
+        return sum(int(spec.positions or 0) for spec in self.learnable)
 
     def forward(
         self, token_batch: TokenBatch
@@ -185,24 +132,35 @@ class TextEmbedder(Encoder):
         dtype = self.embed_tokens.weight.dtype
         t = token_batch.to_tensors(device)
         ids = t["ids"]
+        positions = t["positions"]
         modality_ids = t["modality_ids"]
         names: tuple[str, ...] = t["modality_names"]
         batch_map: dict[str, ModalityInfo] = t["modality_map"]
+        learnable_names = {spec.field for spec in self.learnable}
 
         for name in names:
-            if name not in self._expected_names:
+            info = batch_map[name]
+            if name == NAME_TEXT:
+                if info.type not in ("token", "text"):
+                    raise TypeError(
+                        f"modality {name!r} type mismatch: batch={info.type!r} expected token/text"
+                    )
+                continue
+            if name == NAME_VISION:
+                if info.type != "image":
+                    raise TypeError(
+                        f"modality {name!r} type mismatch: batch={info.type!r} expected image"
+                    )
+                continue
+            if name not in learnable_names:
                 raise KeyError(
                     f"TokenBatch modality {name!r} not expected by TextEmbedder "
-                    f"(have {sorted(self._expected_names)})"
+                    f"(expected {NAME_TEXT!r} / {NAME_VISION!r} and/or "
+                    f"learnable {sorted(learnable_names)})"
                 )
-            info = batch_map[name]
-            if name == NAME_TEXT and info.type not in ("token", "text"):
+            if info.type != "learnable":
                 raise TypeError(
-                    f"modality {name!r} type mismatch: batch={info.type!r} expected token/text"
-                )
-            if name == NAME_VISION and info.type != "image":
-                raise TypeError(
-                    f"modality {name!r} type mismatch: batch={info.type!r} expected image"
+                    f"modality {name!r} type mismatch: batch={info.type!r} expected learnable"
                 )
 
         L = ids.shape[0]
@@ -211,10 +169,56 @@ class TextEmbedder(Encoder):
         if L > 0:
             for local_id, name in enumerate(names):
                 mask = modality_ids == local_id
-                if bool(mask.any()):
+                if not bool(mask.any()):
+                    continue
+                if name in (NAME_TEXT, NAME_VISION):
                     embeds[mask] = self.embed_tokens(ids[mask]).to(dtype=dtype)
+                    continue
+                type_table = self._learnable_type_vectors[name]
+                pos = positions[mask]
+                if int(pos.max()) >= type_table.shape[0]:
+                    raise ValueError(
+                        f"modality {name!r} emitted {int(pos.max()) + 1} tokens in a "
+                        f"step but the embedder declares positions={type_table.shape[0]}"
+                    )
+                content = self._learnable_tables[name](ids[mask]).to(dtype=dtype)
+                embeds[mask] = content + type_table[pos].to(dtype=dtype)
 
         return embeds, t["head_output_indices"]
+
+
+def _coerce_text_learnable(
+    learnable: list[dict[str, Any] | NumericEmbedderModalitySpec] | None,
+) -> list[NumericEmbedderModalitySpec]:
+    raw = learnable or []
+    specs: list[NumericEmbedderModalitySpec] = []
+    n_learnable = 0
+    for m in raw:
+        if isinstance(m, NumericEmbedderModalitySpec):
+            spec = m
+        else:
+            data = dict(m)
+            data.setdefault("type", "learnable")
+            if data.get("type") != "learnable":
+                raise TypeError(
+                    "TextEmbedder learnable= entries must be type='learnable' "
+                    "(text/token/image packing lives on TextTokenizer)"
+                )
+            spec = NumericEmbedderModalitySpec(**data)
+        if spec.type != "learnable":
+            raise TypeError(
+                "TextEmbedder learnable= entries must be type='learnable' "
+                "(text/token/image packing lives on TextTokenizer)"
+            )
+        specs.extend(expand_embedder_numeric_spec(spec, learnable_index=n_learnable))
+        n_learnable += 1
+    seen: set[str] = set()
+    for spec in specs:
+        name = str(spec.field)
+        if name in seen:
+            raise ValueError(f"duplicate TextEmbedder learnable name {name!r}")
+        seen.add(name)
+    return specs
 
 
 def _load_embed_tokens(

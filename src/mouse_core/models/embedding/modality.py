@@ -121,37 +121,6 @@ class NumericEmbedderModalitySpec:
             )
 
 
-@dataclass
-class TextEmbedderModalitySpec:
-    """Modality for :class:`~mouse_core.models.embedding.text.TextEmbedder`."""
-
-    type: str
-    field: str | Sequence[str] | None = None
-    format: str | None = None
-
-    _VALID_TYPES: ClassVar[tuple[str, ...]] = ("text", "token", "image")
-
-    def __post_init__(self) -> None:
-        k = (self.type or "").lower()
-        if k not in self._VALID_TYPES:
-            raise ValueError(
-                f"unknown text embedder modality type {self.type!r}; "
-                f"expected one of {self._VALID_TYPES} "
-                "(learnable scratch tokens are NumericEmbedder-only)"
-            )
-        object.__setattr__(self, "type", k)
-        if self.field is None:
-            raise ValueError(
-                f"text embedder modality type={k!r} requires field="
-            )
-        if k == "text" and not self.format:
-            raise ValueError(f"text modality {self.field!r} requires format=")
-        if k == "token" and self.format is not None:
-            raise ValueError(
-                f"token modality {self.field!r} must not set format="
-            )
-
-
 KIND_DISCRETE = "discrete"
 KIND_FOURIER = "fourier"
 KIND_LEARNABLE = "learnable"
@@ -193,15 +162,6 @@ def expand_embedder_numeric_spec(
     names = _field_names(spec.field)
     if not names:
         raise ValueError("embedder modalities must set field= (modality name)")
-    return [replace(spec, field=name) for name in names]
-
-
-def expand_embedder_text_spec(
-    spec: TextEmbedderModalitySpec,
-) -> list[TextEmbedderModalitySpec]:
-    names = _field_names(spec.field)
-    if not names:
-        raise ValueError("text/token/image modalities must set field=")
     return [replace(spec, field=name) for name in names]
 
 

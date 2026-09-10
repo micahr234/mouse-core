@@ -39,9 +39,15 @@ class TextTokenizer:
     """CPU packer: format + HF/image tokenization → :class:`StepTokens`.
 
     Construct independently of the embedder. Alignment is by modality **name**
-    (``__text__`` / ``__vision__``). ``input_fields=`` are the tokens fed to the
-    transformer (each ``{type, input_field}``; optional ``output_field``).
-    ``objective_fields=`` is a list of ``{input_field}`` dicts (optional
+    (``__text__`` / ``__vision__`` / learnable ``output_field``).
+    ``input_fields=`` are the tokens fed to the transformer (each
+    ``{type, input_field}``; optional ``output_field``). A ``text`` field
+    requires ``format=``. ``learnable`` fields have no step I/O and are
+    appended after the rendered format. ``group_prefix=`` is a format string
+    over the raw step dict (placeholders need not be ``input_fields``); it is
+    tokenized as ``__text__`` and :func:`~mouse_core.data.token_batch.pack_token_batch`
+    inserts those tokens at the start of each grouping-field segment.
+    ``objective_fields=`` is a list of ``{input_field}`` dicts (optional)
     ``output_field``; defaults to the input name)
     copied into ``StepTokens.objective_fields`` (input fields are not
     auto-copied). TD / PPO / GRPO objectives read ``action``, ``reward``,
@@ -56,6 +62,7 @@ class TextTokenizer:
         input_fields: list[dict | TextTokenizerModalitySpec] | None = None,
         grouping_field: str,
         format: str | None = None,
+        group_prefix: str | None = None,
         tokenizer=None,
         image_processor=None,
         objective_fields: Sequence[dict[str, Any]] | None = None,
@@ -66,6 +73,7 @@ class TextTokenizer:
             raise ValueError("TextTokenizer requires a non-empty grouping_field")
         raw = input_fields or []
         specs: list[TextTokenizerModalitySpec] = []
+        n_learnable = 0
         for m in raw:
             if isinstance(m, TextTokenizerModalitySpec):
                 spec = m
@@ -77,7 +85,9 @@ class TextTokenizer:
                         "(not field=)"
                     )
                 spec = TextTokenizerModalitySpec(**data)
-            specs.extend(expand_tokenizer_text_spec(spec))
+            specs.extend(expand_tokenizer_text_spec(spec, learnable_index=n_learnable))
+            if spec.type == "learnable":
+                n_learnable += 1
 
         has_text = any(s.type == "text" for s in specs)
         has_token = any(s.type == "token" for s in specs)
@@ -128,7 +138,11 @@ class TextTokenizer:
                         f"format placeholder {{{name}}} has no matching text/token/image input field"
                     )
 
-        needs_tokenizer = format is not None and has_text
+        if group_prefix is not None and group_prefix == "":
+            raise ValueError(
+                "TextTokenizer group_prefix= must be a non-empty string"
+            )
+        needs_tokenizer = (format is not None and has_text) or group_prefix is not None
         if tokenizer is not None:
             tok = tokenizer
         elif pretrained is not None and needs_tokenizer:
@@ -136,7 +150,10 @@ class TextTokenizer:
 
             tok = AutoTokenizer.from_pretrained(pretrained, **dict(hub_kwargs or {}))
         elif needs_tokenizer:
-            raise TypeError("TextTokenizer with text input_fields requires tokenizer= or pretrained=")
+            raise TypeError(
+                "TextTokenizer with text input_fields or group_prefix= requires "
+                "tokenizer= or pretrained="
+            )
         else:
             tok = None
 
@@ -149,19 +166,28 @@ class TextTokenizer:
 
         names: list[str] = []
         mmap: dict[str, ModalityInfo] = {}
-        if has_text or has_token:
+        if has_text or has_token or group_prefix is not None:
             names.append(NAME_TEXT)
             mmap[NAME_TEXT] = ModalityInfo(type="token")
         if has_image:
             names.append(NAME_VISION)
             mmap[NAME_VISION] = ModalityInfo(type="image")
+        learnable_specs = [s for s in specs if s.type == "learnable"]
+        for spec in learnable_specs:
+            name = str(spec.output_field)
+            if name in mmap:
+                raise ValueError(f"duplicate tokenizer modality name {name!r}")
+            names.append(name)
+            mmap[name] = ModalityInfo(type="learnable")
 
         self.format = format
+        self.group_prefix = group_prefix
         self.input_fields: tuple[TextTokenizerModalitySpec, ...] = tuple(specs)
         self.grouping_field = grouping_field
         self._text_by_field = text_by_field
         self._token_by_field = token_by_field
         self._image_by_field = image_by_field
+        self._learnable_specs = tuple(learnable_specs)
         self.tokenizer = tok
         self.image_processor = image_processor
         self.objective_fields: tuple[tuple[str, str], ...] = coerce_io_fields(
@@ -181,11 +207,13 @@ class TextTokenizer:
         return _tokenize_text_step(
             row=step,
             format_str=self.format,
+            group_prefix_str=self.group_prefix,
             text_by_field=self._text_by_field,
             token_by_field=self._token_by_field,
             image_by_field=self._image_by_field,
             tokenizer=self.tokenizer,
             image_processor=self.image_processor,
+            learnable_specs=self._learnable_specs,
             objective_fields_keep=self.objective_fields,
             grouping_field=self.grouping_field,
             name_to_index=self._name_to_index,
@@ -230,11 +258,13 @@ def _tokenize_text_step(
     *,
     row: dict,
     format_str: str | None,
+    group_prefix_str: str | None,
     text_by_field: dict[str, TextTokenizerModalitySpec],
     token_by_field: dict[str, TextTokenizerModalitySpec],
     image_by_field: dict[str, TextTokenizerModalitySpec],
     tokenizer: Any,
     image_processor: Any,
+    learnable_specs: Sequence[TextTokenizerModalitySpec],
     objective_fields_keep: Sequence[tuple[str, str]],
     grouping_field: str,
     name_to_index: dict[str, int],
@@ -352,11 +382,44 @@ def _tokenize_text_step(
 
         flush_text()
 
+    for spec in learnable_specs:
+        n = int(spec.tokens or 1)
+        _emit(
+            list(range(n)),
+            name=str(spec.output_field),
+            head_output=spec.head_output,
+        )
+
     if not modality_ids:
         raise ValueError(
             "step has no tokens after skips; ensure the step format still "
             "produces at least one token"
         )
+
+    group_prefix_kwargs: dict[str, np.ndarray] = {}
+    if group_prefix_str is not None:
+        if NAME_TEXT not in name_to_index:
+            raise RuntimeError(
+                "group_prefix= requires a text or token input field so __text__ exists"
+            )
+        if tokenizer is None:
+            raise RuntimeError("tokenizer required to tokenize group_prefix=")
+        rendered = _render_group_prefix(group_prefix_str, row)
+        group_prefix_ids = _tokenize_ids(tokenizer, rendered)
+        if not group_prefix_ids:
+            raise ValueError(
+                f"group_prefix= {group_prefix_str!r} tokenized to no tokens "
+                "for this step"
+            )
+        mid = name_to_index[NAME_TEXT]
+        group_prefix_kwargs = {
+            "group_prefix_modality_ids": np.full(
+                len(group_prefix_ids), mid, dtype=np.int64
+            ),
+            "group_prefix_ids": np.asarray(group_prefix_ids, dtype=np.int64),
+            "group_prefix_values": np.zeros(len(group_prefix_ids), dtype=np.float32),
+            "group_prefix_positions": np.arange(len(group_prefix_ids), dtype=np.int64),
+        }
 
     return StepTokens(
         modality_ids=np.asarray(modality_ids, dtype=np.int64),
@@ -369,4 +432,19 @@ def _tokenize_text_step(
         grouping_field=grouping_field,
         head_output_mask=np.asarray(head_output_mask, dtype=bool),
         objective_fields=copy_keep_fields(row, objective_fields_keep),
+        **group_prefix_kwargs,
     )
+
+
+def _render_group_prefix(group_prefix: str, row: dict[str, Any]) -> str:
+    mapping: dict[str, Any] = {}
+    for _, name, _, _ in Formatter().parse(group_prefix):
+        if name is None or name == "":
+            continue
+        if name not in row:
+            raise KeyError(
+                f"group_prefix placeholder {{{name}}} missing from step "
+                f"(have {sorted(row)})"
+            )
+        mapping[name] = unwrap_scalar(row[name])
+    return group_prefix.format_map(mapping)

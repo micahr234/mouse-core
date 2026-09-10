@@ -9,7 +9,6 @@ from mouse_core.data.token_batch import (
 from mouse_core.models.embedding.embedding import Encoder, NumericEmbedder
 from mouse_core.models.embedding.modality import (
     NumericEmbedderModalitySpec,
-    TextEmbedderModalitySpec,
 )
 from mouse_core.models.embedding.text import TextEmbedder
 from mouse_core.models.embedding.encoding import StaticFourierFeatures
@@ -20,7 +19,6 @@ __all__ = [
     "NumericEmbedder",
     "TextEmbedder",
     "NumericEmbedderModalitySpec",
-    "TextEmbedderModalitySpec",
     "ModalityInfo",
     "StepTokens",
     "TokenBatch",

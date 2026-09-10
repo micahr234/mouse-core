@@ -68,13 +68,13 @@ The [example notebooks](examples/) are short usage docs, not full experiments. W
 | [03 — Train online DQN](examples/03_train_online_dqn.ipynb) | Live `mouse-gym` rollouts, in-memory replay, DQN updates |
 | [04 — Layerwise DQN offline](examples/04_train_offline_layerwise_dqn.ipynb) | Same offline loop as `02`, with per-layer Q heads and `LayerwiseDqnObjective` |
 | [05 — Train offline SV](examples/05_train_offline_sv.ipynb) | Same offline loop as `02`, regressing the action-value head onto `info_q_star` with `SvObjective` |
-| [06 — TextEmbedder offline DQN](examples/06_train_offline_text_dqn.ipynb) | Same offline loop as `02`, with `TextEmbedder` (`token` + `text`; `image` documented for VL checkpoints) |
+| [06 — TextTokenizer offline DQN](examples/06_train_offline_text_dqn.ipynb) | Same offline loop as `02`, with `TextTokenizer` + `TextEmbedder` and a trailing learnable `value` token (`text` / `token` / `image` / `learnable`) |
 | [07 — Train online PPO](examples/07_train_online_ppo.ipynb) | Online on-policy PPO (`DiscreteActionHead` + value head, `PpoObjective` with GAE) |
 | [08 — Train online GRPO](examples/08_train_online_grpo.ipynb) | Branched GRPO: fork env+context at many `L`, group-relative advantages, `GrpoObjective` |
 | [09 — Inference](examples/09_inference.ipynb) | Evaluation: load a Hub checkpoint and run batched FlexAttention cached inference (`max_cache` / `start_cache`) |
 | [10 — Train offline SP](examples/10_train_offline_sp.ipynb) | Same offline loop as `05`, but `SpObjective` CE onto a random argmax of `info_q_star` with `DiscreteActionHead` *(ranking check)* |
 | [11 — Full-model Polyak delay](examples/11_train_offline_dqn_model_delay.ipynb) | Same offline loop as `02`, with `model.delayed_copy(encoder=True, backbone=True, heads=True)`: delayed Q is recomputed through delayed encoder/backbone/head copies and `polyak.update` takes a `tau` per section |
-| [12 — Offline reasoning DQN](examples/12_train_offline_reasoning_dqn.ipynb) | Same offline loop as `02`, with a per-step learnable `value` prompt (`head_output: True`) and Coconut-style latent reasoning bursts (`LatentReasoner`, `sample_reasoning_splits`) trained through the DQN loss |
+| [12 — Offline reasoning DQN](examples/12_train_offline_reasoning_dqn.ipynb) | Same offline loop as `02` (including the trailing learnable `value` prompt), plus Coconut-style latent reasoning bursts (`LatentReasoner`, `sample_reasoning_splits`) trained through the DQN loss |
 | [13 — Offline recurrent DQN](examples/13_train_offline_recurrent_dqn.ipynb) | Same offline loop as `02`, with a `Recurrence` section: the backbone runs `num_passes` times per forward through a normalized input-injection adapter, `DqnObjective` runs on every pass in `out.passes` and the losses are averaged; cached inference keeps the same passes |
 
 ### Example dependencies

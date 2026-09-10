@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- ``TextTokenizer(group_prefix=)`` is a format string over the raw step
+  dict (placeholders need not be ``input_fields``). Those tokens are
+  ``__text__`` and ``pack_token_batch`` inserts them at the start of each
+  grouping-field segment. Incremental decode passes ``prev_grouping_ids``
+  (length ``B``, optional ``None`` entries) so a cached sequence does not
+  re-emit the group prefix.
 - ``DqnObjective`` and ``LayerwiseDqnObjective`` take ``reward_scale``
   / ``reward_shift`` and ``q_scale`` / ``q_shift`` (defaults ``1`` /
   ``0``). The TD target uses ``reward_scale * r + reward_shift``;
@@ -187,6 +193,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``grouping_field: str | None = None`` (``None`` ⇒ no grouping filter).
 
 ### Changed
+- Every training example ends a step with a trailing ``learnable`` token
+  named ``value``, flagged ``head_output: True``. Q / action outputs are
+  read from that token. ``examples/09_inference.ipynb`` reconstructs the
+  named learnable when building the eval tokenizer.
+- ``TextTokenizer`` accepts ``type: "learnable"`` (no ``input_field=``;
+  optional ``output_field=`` / ``tokens=``). Learnable tokens are appended
+  after the rendered step format. ``TextEmbedder`` looks up pretrained
+  ``embed_tokens`` for ``__text__`` / ``__vision__`` ids and optional
+  ``learnable=`` scratch tables (same ``field`` / ``tokens`` / ``std`` /
+  ``positions`` knobs as ``NumericEmbedder``). It no longer takes
+  ``format=`` or per-field text ``modalities=`` — step templates and field
+  packing live on ``TextTokenizer`` only. Saved text encoder configs store
+  ``hidden_dim`` / ``pretrained`` / ``vocab_size`` / ``padding_idx`` /
+  ``learnable``.
 - ``NumericEmbedder`` Fourier input range is set per modality: every
   ``fourier`` / ``continuous`` spec must pass ``fourier_min`` and
   ``fourier_max`` (no default). Each field owns its own
@@ -354,6 +374,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a cleared stream can restart without rebuilding the whole batch.
 
 ### Removed
+- ``TextEmbedderModalitySpec`` and embedder-side text field / format
+  specs. Reconstruct ``TextTokenizer`` for the data pipeline after
+  ``load_model``.
 - ``Selector``. Keep/rename is the tokenizer's ``input_field`` /
   ``output_field`` (and ``objective_fields``). Extra step keys are ignored.
   Train is ``compose(augmenter, tokenizer)``; eval is the tokenizer.

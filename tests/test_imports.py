@@ -15,7 +15,6 @@ from mouse_core.data import (
 )
 from mouse_core.models import (
     NumericEmbedderModalitySpec,
-    TextEmbedderModalitySpec,
 )
 
 
@@ -34,4 +33,3 @@ def test_public_data_exports() -> None:
     assert pack_token_batch is not None
     assert empty_token_batch is not None
     assert NumericEmbedderModalitySpec is not None
-    assert TextEmbedderModalitySpec is not None

@@ -165,9 +165,9 @@ def _write_model_card(
             f"\n- Recurrence: `num_passes={recurrence_cfg['num_passes']}` "
             "(applied on every forward, including cached decode)"
         )
-    modalities = config["encoder"]["kwargs"].get("modalities", [])
-    modality_table = _model_card_modality_table(modalities)
-    objective_data_example = _model_card_step_stream_example(modalities)
+    encoder_section, tokenizer_snippet, objective_data_example = _model_card_encoder_bits(
+        config
+    )
     text = f"""---
 library_name: mouse-core
 tags:
@@ -188,11 +188,7 @@ This repository contains a MOUSE model checkpoint.
 
 ### Encoder
 
-`NumericEmbedder` maps a tokenized :class:`~mouse_core.data.token_batch.TokenBatch`
-(discrete ids / continuous values) into the shared `{config["hidden_dim"]}`-dimensional
-token space before the backbone.
-
-{modality_table}
+{encoder_section}
 
 ## Install MouseCore
 
@@ -224,20 +220,7 @@ uses the tokenizer (no augmenter → `StepTokens`) and
 saved model.
 
 ```python
-from mouse_core.data import NumericTokenizer, pack_token_batch
-
-tokenizer = NumericTokenizer(
-    input_fields=[...],  # input_field=; optional output_field= matches embedder field=;
-                         # flag exactly one field head_output=True (the Q readout tokens)
-    objective_fields=[
-        {{"input_field": "action"}},
-        {{"input_field": "reward"}},
-        {{"input_field": "episode_done"}},
-        {{"input_field": "task_done"}},
-    ],
-    grouping_field="task_index",
-)
-eval_transform = tokenizer
+{tokenizer_snippet}
 
 {objective_data_example}
 
@@ -260,6 +243,84 @@ model calls): decoding runs through a FlexAttention session carried in the
 cache, so each row decodes exactly as it would alone.
 """
     path.write_text(text, encoding="utf-8")
+
+
+def _model_card_encoder_bits(config: dict[str, Any]) -> tuple[str, str, str]:
+    """Return ``(encoder_section, tokenizer_snippet, step_example)`` for the card."""
+    enc = config["encoder"]
+    hidden = config["hidden_dim"]
+    objective_fields = """    objective_fields=[
+        {"input_field": "action"},
+        {"input_field": "reward"},
+        {"input_field": "episode_done"},
+        {"input_field": "task_done"},
+    ],
+    grouping_field="task_index",
+)"""
+    if enc.get("type") == "text":
+        pretrained = enc["kwargs"].get("pretrained") or "..."
+        vocab = enc["kwargs"].get("vocab_size")
+        vocab_note = f" (`vocab_size={vocab}`)" if vocab is not None else ""
+        learnable = enc["kwargs"].get("learnable") or []
+        learnable_note = ""
+        if learnable:
+            names = ", ".join(
+                f"`{item.get('field') or 'learnable'}`" for item in learnable
+            )
+            learnable_note = (
+                f" Optional learnable scratch tokens ({names}) are embedded "
+                f"from a separate table and aligned by name with the tokenizer."
+            )
+        encoder_section = (
+            f"`TextEmbedder` looks up pretrained token embeddings{vocab_note} "
+            f"for `__text__` / `__vision__` ids in a tokenized "
+            f":class:`~mouse_core.data.token_batch.TokenBatch`, mapping them into "
+            f"the shared `{hidden}`-dimensional token space before the backbone. "
+            f"Step templates and field packing live on `TextTokenizer` "
+            f"(not saved with the checkpoint).{learnable_note}"
+        )
+        tokenizer_snippet = (
+            "from mouse_core.data import TextTokenizer, pack_token_batch\n"
+            "\n"
+            "tokenizer = TextTokenizer(\n"
+            "    input_fields=[...],  # type/input_field=; text fields require format=;\n"
+            "                         # flag exactly one field head_output=True (the Q readout tokens)\n"
+            '    format="...",\n'
+            f'    pretrained="{pretrained}",\n'
+            f"{objective_fields}\n"
+            "eval_transform = tokenizer"
+        )
+        step_example = """# Rebuild the same TextTokenizer used at train time, then pack steps.
+batch = [[
+    {
+        "action": 0,
+        "observation": 1,
+        "reward": 0.0,
+        "episode_done": 0,
+        "task_done": 0,
+        "task_index": 0,
+    }
+]]"""
+        return encoder_section, tokenizer_snippet, step_example
+
+    modalities = enc.get("kwargs", {}).get("modalities", [])
+    encoder_section = (
+        f"`NumericEmbedder` maps a tokenized "
+        f":class:`~mouse_core.data.token_batch.TokenBatch`\n"
+        f"(discrete ids / continuous values) into the shared `{hidden}`-dimensional\n"
+        f"token space before the backbone.\n\n"
+        f"{_model_card_modality_table(modalities)}"
+    )
+    tokenizer_snippet = (
+        "from mouse_core.data import NumericTokenizer, pack_token_batch\n"
+        "\n"
+        "tokenizer = NumericTokenizer(\n"
+        "    input_fields=[...],  # input_field=; optional output_field= matches embedder field=;\n"
+        "                         # flag exactly one field head_output=True (the Q readout tokens)\n"
+        f"{objective_fields}\n"
+        "eval_transform = tokenizer"
+    )
+    return encoder_section, tokenizer_snippet, _model_card_step_stream_example(modalities)
 
 
 def _model_card_modality_table(modalities: list[dict[str, Any]]) -> str:
@@ -400,17 +461,17 @@ def _encoder_config(encoder: Encoder) -> dict[str, Any]:
             },
         }
     if isinstance(encoder, TextEmbedder):
-        return {
-            "type": "text",
-            "kwargs": {
-                "hidden_dim": int(encoder.hidden_dim),
-                "modalities": [_public_modality_config(modality) for modality in encoder.modalities],
-                "pretrained": encoder.pretrained,
-                "format": encoder.format,
-                "vocab_size": encoder.vocab_size,
-                "padding_idx": encoder.padding_idx,
-            },
+        kwargs: dict[str, Any] = {
+            "hidden_dim": int(encoder.hidden_dim),
+            "pretrained": encoder.pretrained,
+            "vocab_size": encoder.vocab_size,
+            "padding_idx": encoder.padding_idx,
         }
+        if encoder.learnable:
+            kwargs["learnable"] = [
+                _public_modality_config(spec) for spec in encoder.learnable
+            ]
+        return {"type": "text", "kwargs": kwargs}
     raise TypeError(
         "save_model currently supports NumericEmbedder and TextEmbedder encoders. "
         f"Got {type(encoder).__name__}."
