@@ -52,7 +52,7 @@ mouse-core gives you three building blocks for in-context RL. Compose them in yo
 
 * **Data** (`mouse_core.data`) — stores sequential rows in `Datastore` and batches contiguous windows with `DataLoader`.
 * **Models** (`mouse_core.models`) — encoder + backbone (`LlamaBackbone`, `Qwen3Backbone`, or `IdentityBackbone`) + output heads (`DiscreteActionHead`, `DiscreteActionValueHead`, …).
-* **Objectives** (`mouse_core.objectives`) — training losses such as DQN, PPO, GRPO, SP, and SV.
+* **Objectives** (`mouse_core.objectives`) — training losses such as DQN, episode/task DQN, PPO, GRPO, SP, and SV.
 
 Backbone loading has one public path: instantiate the backbone. For example, `LlamaBackbone(pretrained="meta-llama/Llama-3.2-1B", num_layers=2)` reads the pretrained config, loads matching transformer weights, and exposes `backbone.hidden_dim` for the encoder and heads.
 
@@ -76,6 +76,7 @@ The [example notebooks](examples/) are short usage docs, not full experiments. W
 | [11 — Full-model Polyak delay](examples/11_train_offline_dqn_model_delay.ipynb) | Same offline loop as `02`, with `model.delayed_copy(encoder=True, backbone=True, heads=True)`: delayed Q is recomputed through delayed encoder/backbone/head copies and `polyak.update` takes a `tau` per section |
 | [12 — Offline reasoning DQN](examples/12_train_offline_reasoning_dqn.ipynb) | Same offline loop as `02` (including the trailing learnable `value` prompt), plus Coconut-style latent reasoning bursts (`LatentReasoner`, `sample_reasoning_splits`) trained through the DQN loss |
 | [13 — Offline recurrent DQN](examples/13_train_offline_recurrent_dqn.ipynb) | Same offline loop as `02`, with a `Recurrence` section: the backbone runs `num_passes` times per forward through a normalized input-injection adapter, `DqnObjective` runs on every pass in `out.passes` and the losses are averaged; cached inference keeps the same passes |
+| [14 — Offline episode/task DQN](examples/14_train_offline_episode_task_dqn.ipynb) | Same offline loop as `02`, with `action_value_episode` + `action_value_task` heads and `EpisodeTaskDqnObjective`: both heads share one delayed `a* = argmax(Q_e + Q_t)`; `get_action` maximizes the sum |
 
 ### Example dependencies
 

@@ -32,6 +32,8 @@ class HeadSpec:
     Supported names:
 
     - ``"action_value"``: DiscreteActionValueHead
+    - ``"action_value_episode"``: DiscreteActionValueHead (intra-episode Q)
+    - ``"action_value_task"``: DiscreteActionValueHead (subsequent-episode Q)
     - ``"action_value_layerwise"``: LayerwiseDiscreteActionValueHead
     - ``"action"``: DiscreteActionHead
     - ``"value"``: SwiGLUHead
@@ -48,6 +50,8 @@ class HeadSpec:
 
     _VALID: ClassVar[tuple[str, ...]] = (
         "action_value",
+        "action_value_episode",
+        "action_value_task",
         "action_value_layerwise",
         "action",
         "value",

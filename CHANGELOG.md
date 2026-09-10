@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Dual action-value heads ``action_value_episode`` and
+  ``action_value_task`` (both ``DiscreteActionValueHead``). They must be
+  used together and cannot be combined with ``action_value`` or
+  ``action_value_layerwise``. ``get_action`` maximizes
+  ``Q_episode + Q_task``. ``EpisodeTaskDqnObjective`` trains both heads
+  from one delayed ``a* = argmax_a (Q_e + Q_t)``: the episode head is
+  stepwise TD on env reward and does not bootstrap across episodes; the
+  task head drops current-episode reward and λ-skips to
+  ``Q_e(s', a*) + Q_t(s', a*)`` at the next episode start.
+  ``examples/14_train_offline_episode_task_dqn.ipynb`` is the offline
+  FrozenLake usage example.
 - ``TextTokenizer(group_prefix=)`` is a format string over the raw step
   dict (placeholders need not be ``input_fields``). Those tokens are
   ``__text__`` and ``pack_token_batch`` inserts them at the start of each

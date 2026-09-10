@@ -887,13 +887,20 @@ class Model(nn.Module):
         - a list of head instances (e.g. ``[DiscreteActionValueHead(...), SwiGLUHead(...)]``):
           you **must** also pass ``action_head`` (a canonical name) to select which one
           ``get_action`` uses;
-        - a dict mapping canonical names (``"action_value"``, ``"action"``, ``"value"``)
-          to head instances or ``None`` (for full control and/or multiple heads).
+        - a dict mapping canonical names (``"action_value"``,
+          ``"action_value_episode"``, ``"action_value_task"``, ``"action"``,
+          ``"value"``) to head instances or ``None`` (for full control and/or
+          multiple heads).
       When a plain head (SwiGLUHead) is passed without a name it defaults to ``"action"``;
       use the dict form if you want it under ``"value"``.
 
     ``action_head`` names which head ``get_action`` consults. If omitted,
-    it is auto-selected by preference: ``action_value`` > ``action`` > ``value``.
+    it is auto-selected by preference: ``action_value_episode`` (when the
+    episode/task pair is present) > ``action_value`` > ``action`` > ``value``.
+    ``action_value_episode`` and ``action_value_task`` must be used together
+    and cannot be combined with ``action_value`` or ``action_value_layerwise``.
+    When that pair is present, ``get_action`` always uses
+    ``Q_episode + Q_task``.
 
     Full construction::
 
@@ -914,7 +921,15 @@ class Model(nn.Module):
     ``examples/13_train_offline_recurrent_dqn.ipynb``.
     """
 
-    _VALID_HEADS = ("action_value", "action_value_layerwise", "action", "value")
+    _VALID_HEADS = (
+        "action_value",
+        "action_value_episode",
+        "action_value_task",
+        "action_value_layerwise",
+        "action",
+        "value",
+    )
+    _EPISODE_TASK_HEADS = ("action_value_episode", "action_value_task")
 
     @staticmethod
     def _normalize_heads(
@@ -970,7 +985,7 @@ class Model(nn.Module):
             if action_head is None:
                 raise TypeError(
                     "When passing heads as a list you must also specify action_head= "
-                    "(one of 'action_value', 'action', 'value') to select the head used by get_action()."
+                    "(a canonical name) to select the head used by get_action()."
                 )
             return result
 
@@ -1085,6 +1100,27 @@ class Model(nn.Module):
         self.heads = nn.ModuleDict(filtered)  # for parameters/state
         self._heads: dict[str, BaseHead] = filtered  # typed view for calling
 
+        has_episode = "action_value_episode" in self._heads
+        has_task = "action_value_task" in self._heads
+        if has_episode != has_task:
+            raise ValueError(
+                "action_value_episode and action_value_task must be used together."
+            )
+        if has_episode and (
+            "action_value" in self._heads or "action_value_layerwise" in self._heads
+        ):
+            raise ValueError(
+                "action_value_episode / action_value_task cannot be combined with "
+                "action_value or action_value_layerwise."
+            )
+        if has_episode:
+            for name in Model._EPISODE_TASK_HEADS:
+                if not isinstance(self._heads[name], DiscreteActionValueHead):
+                    raise TypeError(
+                        f"{name} must be a DiscreteActionValueHead, "
+                        f"got {type(self._heads[name]).__name__}."
+                    )
+
         # Determine action head
         if action_head is not None:
             if action_head not in self._VALID_HEADS:
@@ -1094,7 +1130,13 @@ class Model(nn.Module):
             self.action_head: str = action_head
         else:
             # Auto-detect preference order
-            for candidate in ("action_value_layerwise", "action_value", "action", "value"):
+            for candidate in (
+                "action_value_episode",
+                "action_value_layerwise",
+                "action_value",
+                "action",
+                "value",
+            ):
                 if candidate in self.heads:
                     self.action_head = candidate
                     break
@@ -1726,29 +1768,25 @@ class Model(nn.Module):
         temperature: float = 1.0,
         num_actions: int | None = None,
     ) -> torch.Tensor:
-        """Select an action using ``action_head`` at the last head-output token."""
-        raw = cast(torch.Tensor, out[self.action_head])
-        if self.action_head == "action_value_layerwise":
-            if raw.ndim == 4:
-                # Decode: [B, S, L, A] → last step, deepest layer
-                scores = raw[:, -1, -1, :]
-            elif raw.ndim == 3:
-                # Train flat: [N, L, A] → last step, deepest layer
-                scores = raw[-1, -1, :].unsqueeze(0)
-            else:
-                raise ValueError(
-                    f"action_value_layerwise expects [B, S, L, A] or [N, L, A], "
-                    f"got {tuple(raw.shape)}"
-                )
+        """Select an action at the last head-output token.
+
+        When ``action_value_episode`` and ``action_value_task`` are both
+        present, scores are ``Q_episode + Q_task``. Otherwise scores come
+        from ``action_head``.
+        """
+        if all(name in self._heads for name in Model._EPISODE_TASK_HEADS):
+            scores = _last_action_scores(
+                cast(torch.Tensor, out["action_value_episode"]),
+                name="action_value_episode",
+            ) + _last_action_scores(
+                cast(torch.Tensor, out["action_value_task"]),
+                name="action_value_task",
+            )
         else:
-            if raw.ndim == 3:
-                scores = raw[:, -1]
-            elif raw.ndim == 2:
-                scores = raw[-1].unsqueeze(0)
-            else:
-                raise ValueError(
-                    f"{self.action_head} expects [B, S, A] or [N, A], got {tuple(raw.shape)}"
-                )
+            scores = _last_action_scores(
+                cast(torch.Tensor, out[self.action_head]),
+                name=self.action_head,
+            )
         if num_actions is not None:
             scores = scores[:, :num_actions]
         if temperature == 0.0:
@@ -1756,6 +1794,28 @@ class Model(nn.Module):
         scores = scores - scores.max(dim=-1, keepdim=True).values
         probs = F.softmax(scores / temperature, dim=-1)
         return torch.multinomial(probs, num_samples=1).squeeze(-1)
+
+
+def _last_action_scores(raw: torch.Tensor, *, name: str) -> torch.Tensor:
+    """Last-step action scores from a head tensor.
+
+    ``action_value_layerwise``: ``[B, S, L, A]`` / ``[N, L, A]`` → last step,
+    deepest layer. Other Q / logit heads: ``[B, S, A]`` / ``[N, A]``.
+    """
+    if name == "action_value_layerwise":
+        if raw.ndim == 4:
+            return raw[:, -1, -1, :]
+        if raw.ndim == 3:
+            return raw[-1, -1, :].unsqueeze(0)
+        raise ValueError(
+            f"action_value_layerwise expects [B, S, L, A] or [N, L, A], "
+            f"got {tuple(raw.shape)}"
+        )
+    if raw.ndim == 3:
+        return raw[:, -1]
+    if raw.ndim == 2:
+        return raw[-1].unsqueeze(0)
+    raise ValueError(f"{name} expects [B, S, A] or [N, A], got {tuple(raw.shape)}")
 
 
 def preferred_dtype(device: torch.device | str | None = None) -> torch.dtype:
