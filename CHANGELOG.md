@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- ``install_compiled_decoder`` (``mouse_core.models.backbone``) compiles
+  the packed-train decoder body around FlexAttention. Subsequent
+  ``flex_packed_forward`` calls use that stack (except
+  ``output_hidden_states=True``, which stays eager). Idempotent.
+- ``ExponentialDecay`` and ``Piecewise`` schedules
+  (``from mouse_core import ExponentialDecay, Piecewise``) map
+  optimizer step → scalar. DQN uses ``ExponentialDecay`` for
+  per-section Polyak τ.
 - fp32 LoRA on a frozen bf16 backbone. ``Qwen3Backbone`` / ``LlamaBackbone``
   take ``lora=LoRAConfig(rank=16, alpha=32.0, dropout=0.0, targets=(q/k/v/o,
   gate/up/down))``: every attention / MLP ``nn.Linear`` named in ``targets``

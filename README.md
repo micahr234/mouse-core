@@ -56,6 +56,10 @@ mouse-core gives you three building blocks for in-context RL. Compose them in yo
 
 Backbone loading has one public path: instantiate the backbone. For example, `LlamaBackbone(pretrained="meta-llama/Llama-3.2-1B", num_layers=2)` reads the pretrained config, loads matching transformer weights, and exposes `backbone.hidden_dim` for the encoder and heads.
 
+On CUDA, call `install_compiled_decoder()` from `mouse_core.models.backbone` before training to `torch.compile` the packed-train decoder body around FlexAttention. It is idempotent; `output_hidden_states=True` stays eager.
+
+`ExponentialDecay` and `Piecewise` (`from mouse_core import ExponentialDecay, Piecewise`) schedule a scalar over optimizer steps. Full-model Polyak delay uses `ExponentialDecay` for each section's τ.
+
 
 ## Quick start 🚀
 

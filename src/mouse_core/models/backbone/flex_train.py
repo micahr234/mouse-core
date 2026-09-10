@@ -50,6 +50,57 @@ def _get_flex_kernel(device: torch.device, dtype: torch.dtype) -> _FlexKernel:
     return kern
 
 
+_compiled_decoder: Any | None = None
+
+
+def _run_decoder_layers(hf: Any, x: Any, cos: Any, sin: Any, block_mask: Any, flex: Any) -> Any:
+    """Llama / Qwen3 stack around Flex; compiled by :func:`install_compiled_decoder`."""
+    cfg = hf.config
+    n_heads = int(cfg.num_attention_heads)
+    n_kv_heads = int(cfg.num_key_value_heads)
+    head_dim = int(cfg.head_dim)
+    L = x.shape[1]
+    h = x
+    for layer in hf.layers:
+        residual = h
+        hn = layer.input_layernorm(h)
+        attn = layer.self_attn
+        q = attn.q_proj(hn).view(1, L, n_heads, head_dim)
+        k = attn.k_proj(hn).view(1, L, n_kv_heads, head_dim)
+        q_norm = getattr(attn, "q_norm", None)
+        if q_norm is not None:
+            q = q_norm(q)
+            k = attn.k_norm(k)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = attn.v_proj(hn).view(1, L, n_kv_heads, head_dim).transpose(1, 2)
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        o = flex(q, k, v, block_mask=block_mask, scale=attn.scaling, enable_gqa=True)
+        o = o.transpose(1, 2).reshape(1, L, -1)
+        h = residual + attn.o_proj(o)
+        h = h + layer.mlp(layer.post_attention_layernorm(h))
+    return hf.norm(h)
+
+
+def install_compiled_decoder(*, dynamo_cache_size: int = 64) -> bool:
+    """Compile the packed-train decoder body around FlexAttention.
+
+    Subsequent :func:`flex_packed_forward` calls (except
+    ``output_hidden_states=True``) run the compiled stack. Idempotent;
+    returns True on the first install in this process.
+    """
+    global _compiled_decoder
+    if _compiled_decoder is not None:
+        return False
+    import torch._dynamo
+
+    torch._dynamo.config.cache_size_limit = max(
+        int(torch._dynamo.config.cache_size_limit), dynamo_cache_size
+    )
+    _compiled_decoder = torch.compile(_run_decoder_layers, dynamic=True)
+    return True
+
+
 def flex_packed_forward(
     *,
     model: torch.nn.Module,
@@ -79,10 +130,6 @@ def flex_packed_forward(
     hf = cast(Any, model)
     param = next(hf.parameters())
     device, dtype = param.device, param.dtype
-    cfg = hf.config
-    n_heads = int(cfg.num_attention_heads)
-    n_kv_heads = int(cfg.num_key_value_heads)
-    head_dim = int(cfg.head_dim)
 
     x = embeds.to(device=device, dtype=dtype).unsqueeze(0)  # [1, L, D]
     seq = sequence_ids.to(device=device)
@@ -128,30 +175,33 @@ def flex_packed_forward(
     pos = position_ids.unsqueeze(0)  # [1, L]
     cos, sin = hf.rotary_emb(x, pos)
 
-    h = x
-    layer_hiddens: list[torch.Tensor] = []
-    for layer in hf.layers:
-        residual = h
-        hn = layer.input_layernorm(h)
-        attn = layer.self_attn
-        q = attn.q_proj(hn).view(1, L, n_heads, head_dim)
-        k = attn.k_proj(hn).view(1, L, n_kv_heads, head_dim)
-        q_norm = getattr(attn, "q_norm", None)
-        if q_norm is not None:
-            q = q_norm(q)
-            k = attn.k_norm(k)
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = attn.v_proj(hn).view(1, L, n_kv_heads, head_dim).transpose(1, 2)
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)
-        o = flex(q, k, v, block_mask=block_mask, scale=attn.scaling, enable_gqa=True)
-        o = o.transpose(1, 2).reshape(1, L, -1)
-        h = residual + attn.o_proj(o)
-        h = h + layer.mlp(layer.post_attention_layernorm(h))
-        if output_hidden_states:
-            layer_hiddens.append(h.squeeze(0))
-
-    h = hf.norm(h).squeeze(0)  # [L, D]
     if output_hidden_states:
-        return h, tuple(layer_hiddens)
-    return h
+        cfg = hf.config
+        n_heads = int(cfg.num_attention_heads)
+        n_kv_heads = int(cfg.num_key_value_heads)
+        head_dim = int(cfg.head_dim)
+        h = x
+        layer_hiddens: list[torch.Tensor] = []
+        for layer in hf.layers:
+            residual = h
+            hn = layer.input_layernorm(h)
+            attn = layer.self_attn
+            q = attn.q_proj(hn).view(1, L, n_heads, head_dim)
+            k = attn.k_proj(hn).view(1, L, n_kv_heads, head_dim)
+            q_norm = getattr(attn, "q_norm", None)
+            if q_norm is not None:
+                q = q_norm(q)
+                k = attn.k_norm(k)
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            v = attn.v_proj(hn).view(1, L, n_kv_heads, head_dim).transpose(1, 2)
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+            o = flex(q, k, v, block_mask=block_mask, scale=attn.scaling, enable_gqa=True)
+            o = o.transpose(1, 2).reshape(1, L, -1)
+            h = residual + attn.o_proj(o)
+            h = h + layer.mlp(layer.post_attention_layernorm(h))
+            layer_hiddens.append(h.squeeze(0))
+        return hf.norm(h).squeeze(0), tuple(layer_hiddens)
+
+    runner = _compiled_decoder if _compiled_decoder is not None else _run_decoder_layers
+    return runner(hf, x, cos, sin, block_mask, flex).squeeze(0)
