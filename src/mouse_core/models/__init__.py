@@ -9,6 +9,7 @@ from mouse_core.models.base import (
     push_model_to_hub,
 )
 from mouse_core.models.backbone import Backbone, LlamaBackbone, Qwen3Backbone, IdentityBackbone
+from mouse_core.models.lora import LoRAConfig
 from mouse_core.models.heads import (
     BaseHead,
     HeadSpec,
@@ -45,6 +46,7 @@ __all__ = [
     "BaseHead",
     "HeadSpec",
     "LatentReasoner",
+    "LoRAConfig",
     "Polyak",
     "Recurrence",
     "sample_reasoning_splits",

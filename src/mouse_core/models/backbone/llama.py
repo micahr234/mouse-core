@@ -19,6 +19,7 @@ from mouse_core.models.backbone.base import (
     _load_transformer_weights,
     _rope_parameters_from_config,
 )
+from mouse_core.models.lora import LoRAConfig
 
 
 def _disable_cudnn_sdp() -> None:
@@ -127,6 +128,10 @@ class LlamaBackbone(Backbone):
 
     The adapter translates the generic MOUSE call into the HF calling
     convention. Cached decoding goes through ``decode_session()``.
+
+    Without ``lora`` the backbone is fully trainable (keep the model fp32).
+    Pass ``lora=LoRAConfig(...)`` to freeze the base weights (bf16 on CUDA)
+    and train fp32 LoRA adapters on the attention / MLP projections instead.
     """
 
     def __init__(
@@ -137,6 +142,7 @@ class LlamaBackbone(Backbone):
         pretrained: str | Path | None = None,
         load_weights: bool = True,
         hub_kwargs: dict[str, Any] | None = None,
+        lora: LoRAConfig | None = None,
         **config_kwargs: Any,
     ) -> None:
         super().__init__()
@@ -152,9 +158,7 @@ class LlamaBackbone(Backbone):
                 )
             self.model = model
             self._config_kwargs = self._config_kwargs_from_model(model)
-            return
-
-        if pretrained is not None:
+        elif pretrained is not None:
             hf_kwargs = hub_kwargs or {}
             extracted_kwargs, extracted_hidden_dim = self._config_from_pretrained(
                 repo_id_or_path=pretrained,
@@ -172,18 +176,18 @@ class LlamaBackbone(Backbone):
                 self._load_pretrained_weights(
                     repo_id_or_path=pretrained, hub_kwargs=hf_kwargs
                 )
-            return
+        else:
+            if hidden_dim is None:
+                raise TypeError(
+                    "LlamaBackbone requires either a pre-built model, "
+                    "pretrained=, or hidden_dim plus backbone config arguments "
+                    "(e.g. LlamaBackbone(hidden_dim=128, num_layers=2, num_heads=4))."
+                )
+            cfg = _LlamaBackboneConfig(**config_kwargs)
+            self.model = cfg.build(hidden_dim)
+            self._config_kwargs = self._config_kwargs_from_model(self.model)
 
-        if hidden_dim is None:
-            raise TypeError(
-                "LlamaBackbone requires either a pre-built model, "
-                "pretrained=, or hidden_dim plus backbone config arguments "
-                "(e.g. LlamaBackbone(hidden_dim=128, num_layers=2, num_heads=4))."
-            )
-
-        cfg = _LlamaBackboneConfig(**config_kwargs)
-        self.model = cfg.build(hidden_dim)
-        self._config_kwargs = self._config_kwargs_from_model(self.model)
+        self._attach_lora(self.model, lora)
 
     @staticmethod
     def _config_from_pretrained(

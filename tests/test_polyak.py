@@ -233,48 +233,28 @@ def test_polyak_small_tau_accumulates_in_fp32() -> None:
     assert torch.allclose(delayed.weight, torch.full_like(delayed.weight, expected), atol=1e-4)
 
 
-def test_polyak_bf16_delayed_accumulates_in_fp32_shadow() -> None:
-    """A bf16 delayed copy would round a tiny tau away; the fp32 shadow must not."""
+def test_polyak_rejects_non_fp32_interpolated_params() -> None:
+    """A trainable bf16 copy would round a tiny tau away; Polyak refuses it."""
     online = nn.Linear(8, 8, bias=False).to(dtype=torch.bfloat16)
     delayed = nn.Linear(8, 8, bias=False).to(dtype=torch.bfloat16)
-    online.weight.data.fill_(1.0)
-    delayed.weight.data.fill_(0.9)
-    start = float(delayed.weight.float()[0, 0])  # 0.9 rounded to bf16
+    with pytest.raises(TypeError, match="fp32 parameters only"):
+        _PolyakState(online, delayed, section="backbone")
+
+
+def test_polyak_skips_shared_frozen_params_and_rejects_shared_trainable() -> None:
+    online = nn.Sequential(nn.Linear(8, 8, bias=False), nn.Linear(8, 8, bias=False))
+    online[0].requires_grad_(False)
+    delayed = nn.Sequential(online[0], nn.Linear(8, 8, bias=False))
     state = _PolyakState(online, delayed, section="backbone")
-    tau = 0.0005
-    steps = 2000
-    for _ in range(steps):
-        state.update(tau)
-    expected = 1.0 - (1.0 - start) * (1.0 - tau) ** steps  # ≈ 0.963
-    assert delayed.weight.dtype == torch.bfloat16
-    # Final value is the fp32 shadow rounded once to bf16 (half-ULP ≈ 2e-3 here).
-    assert torch.allclose(
-        delayed.weight.float(), torch.full((8, 8), expected), atol=2.5e-3
-    )
-    # Sanity: a direct bf16 lerp with this tau does not move at all.
-    naive = torch.full((8, 8), 0.9, dtype=torch.bfloat16)
-    naive.lerp_(torch.ones_like(naive), tau)
-    assert torch.equal(naive, torch.full((8, 8), 0.9, dtype=torch.bfloat16))
+    assert len(state) == 1  # the shared frozen layer is not interpolated
+    online[1].weight.data.fill_(1.0)
+    delayed[1].weight.data.fill_(0.0)
+    state.update(0.5)
+    assert torch.allclose(delayed[1].weight, torch.full((8, 8), 0.5))
 
-
-def test_polyak_fp32_shadow_false_lerps_in_param_dtype() -> None:
-    """Without the shadow, a tiny tau on bf16 is a no-op."""
-    online = nn.Linear(8, 8, bias=False).to(dtype=torch.bfloat16)
-    delayed = nn.Linear(8, 8, bias=False).to(dtype=torch.bfloat16)
-    online.weight.data.fill_(1.0)
-    delayed.weight.data.fill_(0.9)
-    before = delayed.weight.detach().clone()
-    state = _PolyakState(online, delayed, section="backbone", fp32_shadow=False)
-    for _ in range(2000):
-        state.update(0.0005)
-    assert torch.equal(delayed.weight, before)
-
-
-def test_polyak_fp32_shadow_flag_is_stored() -> None:
-    model = _tiny_model()
-    delayed = model.delayed_copy(heads=True)
-    assert Polyak(model, delayed).fp32_shadow
-    assert not Polyak(model, delayed, fp32_shadow=False).fp32_shadow
+    shared_trainable = nn.Sequential(online[0], online[1])  # trainable layer shared too
+    with pytest.raises(ValueError, match="same tensor online and delayed"):
+        _PolyakState(online, shared_trainable, section="backbone")
 
 
 def test_polyak_rejects_wrong_models() -> None:

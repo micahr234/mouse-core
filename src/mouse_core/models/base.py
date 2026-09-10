@@ -22,6 +22,7 @@ from mouse_core.models.heads.discrete_action import DiscreteActionHead
 from mouse_core.models.heads.dqn import DiscreteActionValueHead
 from mouse_core.models.heads.layerwise_dqn import LayerwiseDiscreteActionValueHead
 from mouse_core.models.heads.swiglu import SwiGLUHead
+from mouse_core.models.lora import LoRAConfig, lora_modules
 from mouse_core.models.reasoner import LatentReasoner, _InsertionPlan, _plan_insertions
 from mouse_core.models.recurrence import Recurrence
 
@@ -164,6 +165,12 @@ def _write_model_card(
         reasoner_line += (
             f"\n- Recurrence: `num_passes={recurrence_cfg['num_passes']}` "
             "(applied on every forward, including cached decode)"
+        )
+    lora_cfg = config["backbone"].get("lora")
+    if lora_cfg:
+        reasoner_line += (
+            f"\n- LoRA: `rank={lora_cfg['rank']}`, `alpha={lora_cfg['alpha']}` "
+            f"on `{', '.join(lora_cfg['targets'])}` (fp32 adapters over frozen base weights)"
         )
     encoder_section, tokenizer_snippet, objective_data_example = _model_card_encoder_bits(
         config
@@ -494,18 +501,15 @@ def _backbone_config(backbone: nn.Module) -> dict[str, Any]:
 
     if isinstance(backbone, IdentityBackbone):
         return {"type": "identity", "hidden_dim": backbone.hidden_dim}
-    if isinstance(backbone, LlamaBackbone):
-        return {
-            "type": "llama",
+    if isinstance(backbone, (LlamaBackbone, Qwen3Backbone)):
+        config: dict[str, Any] = {
+            "type": "llama" if isinstance(backbone, LlamaBackbone) else "qwen3",
             "hidden_dim": backbone.hidden_dim,
             "kwargs": dict(backbone._config_kwargs),
         }
-    if isinstance(backbone, Qwen3Backbone):
-        return {
-            "type": "qwen3",
-            "hidden_dim": backbone.hidden_dim,
-            "kwargs": dict(backbone._config_kwargs),
-        }
+        if backbone.lora is not None:
+            config["lora"] = asdict(backbone.lora)
+        return config
     raise TypeError(
         "save_model currently supports IdentityBackbone, LlamaBackbone, and Qwen3Backbone. "
         f"Got {type(backbone).__name__}."
@@ -688,14 +692,16 @@ def _build_backbone_from_config(config: dict[str, Any]) -> Backbone:
         from mouse_core.models.backbone import IdentityBackbone
 
         return IdentityBackbone(hidden_dim=config.get("hidden_dim"))
+    lora_cfg = config.get("lora")
+    lora = LoRAConfig(**lora_cfg) if lora_cfg is not None else None
     if backbone_type == "llama":
         from mouse_core.models.backbone import LlamaBackbone
 
-        return LlamaBackbone(hidden_dim=config["hidden_dim"], **config["kwargs"])
+        return LlamaBackbone(hidden_dim=config["hidden_dim"], lora=lora, **config["kwargs"])
     if backbone_type == "qwen3":
         from mouse_core.models.backbone import Qwen3Backbone
 
-        return Qwen3Backbone(hidden_dim=config["hidden_dim"], **config["kwargs"])
+        return Qwen3Backbone(hidden_dim=config["hidden_dim"], lora=lora, **config["kwargs"])
     raise ValueError(f"Unsupported backbone type {backbone_type!r}.")
 
 
@@ -1207,6 +1213,12 @@ class Model(nn.Module):
           through the delayed / shared sections and then the delayed or
           shared heads.
 
+        A delayed section copies only its trainable (fp32) parameters;
+        frozen parameters — the base weights of a LoRA backbone — are
+        shared by reference with the online model, so a delayed LoRA
+        backbone costs one extra copy of the adapters, not of the base. A
+        fully trainable fp32 backbone is copied whole.
+
         Construct after ``model.to(...)``. Do not call ``requires_grad_`` /
         ``to`` on a delayed model that shares sections: they would hit the
         online modules.
@@ -1220,7 +1232,10 @@ class Model(nn.Module):
             )
 
         def _copy(module: nn.Module) -> nn.Module:
-            delayed = copy.deepcopy(module)
+            # Frozen parameters (the backbone base weights) are shared by
+            # reference; only trainable parameters get their own copy.
+            shared = {id(p): p for p in module.parameters() if not p.requires_grad}
+            delayed = copy.deepcopy(module, memo=shared)
             delayed.requires_grad_(False)
             delayed.train()
             return delayed
@@ -1255,15 +1270,21 @@ class Model(nn.Module):
         )
 
     def to(self, *args: Any, **kwargs: Any) -> "Model":
-        """Move/cast the model; output heads always stay float32.
+        """Move/cast the model; only the backbone base takes a non-fp32 dtype.
 
         Accepts every ``nn.Module.to`` form (``to(device)``, ``to(dtype)``,
-        ``to(device, dtype)``, ``to(tensor)``, keyword variants). Only the
-        encoder and backbone take the requested dtype; heads are cast to
-        float32 so ``_run_heads`` (which feeds them fp32 features) matches.
+        ``to(device, dtype)``, ``to(tensor)``, keyword variants). A non-fp32
+        dtype applies to the backbone's base weights only; LoRA adapters,
+        encoder, reasoner, recurrence, and heads are cast to float32. Inputs
+        are cast to the backbone dtype at the backbone boundary and its
+        output is cast back to fp32 for the heads / adapters.
 
-        On CUDA, prefer ``model.to(device=device, dtype=preferred_dtype(device))``
-        so the encoder/backbone run in bfloat16 and FlexAttention compiles.
+        Training needs every trainable parameter in fp32 (``AdamW`` and
+        ``Polyak`` enforce it). Full fine-tuning: keep the model fp32 with
+        ``model.to(device=device)``. LoRA (``lora=`` on the backbone): the
+        base is frozen, so ``model.to(device=device,
+        dtype=preferred_dtype(device))`` runs it in bfloat16 on CUDA and
+        FlexAttention compiles. Inference may cast either kind of model.
         """
         device, dtype, non_blocking, memory_format = torch._C._nn._parse_to(*args, **kwargs)
         if dtype is None or dtype == torch.float32:
@@ -1275,15 +1296,14 @@ class Model(nn.Module):
             common["device"] = device
         if memory_format is not None:
             common["memory_format"] = memory_format
-        if self.encoder is not None:
-            self.encoder.to(dtype=dtype, **common)
         if self.backbone is not None:
             self.backbone.to(dtype=dtype, **common)
-        if self.reasoner is not None:
-            self.reasoner.to(dtype=dtype, **common)
-        if self.recurrence is not None:
-            self.recurrence.to(dtype=dtype, **common)
-        self.heads.to(dtype=torch.float32, **common)
+            for adapter in lora_modules(self.backbone):
+                adapter.lora_A.to(dtype=torch.float32, **common)
+                adapter.lora_B.to(dtype=torch.float32, **common)
+        for section in (self.encoder, self.reasoner, self.recurrence, self.heads):
+            if section is not None:
+                section.to(dtype=torch.float32, **common)
         return self
 
     def half(self) -> "Model":
@@ -1303,7 +1323,12 @@ class Model(nn.Module):
         grouping_ids: torch.Tensor,
         needs_layerwise: bool,
     ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
-        """Training backbone pass: Flex packed on CUDA, SDPA mask on CPU."""
+        """Training backbone pass: Flex packed on CUDA, SDPA mask on CPU.
+
+        ``embeds`` come from the fp32 encoder / adapters and are cast to the
+        backbone's base dtype here.
+        """
+        embeds = embeds.to(dtype=backbone.dtype)
         transformer = getattr(backbone, "model", None)
         use_flex = (
             transformer is not None
@@ -1819,12 +1844,13 @@ def _last_action_scores(raw: torch.Tensor, *, name: str) -> torch.Tensor:
 
 
 def preferred_dtype(device: torch.device | str | None = None) -> torch.dtype:
-    """Compute dtype for encoder/backbone: ``bfloat16`` on CUDA, else ``float32``.
+    """Dtype for a frozen backbone base: ``bfloat16`` on CUDA, else ``float32``.
 
-    Pass to ``Model.to(device=..., dtype=preferred_dtype(device))``. Heads stay
-    float32 via :meth:`Model.to`. Train with :class:`mouse_core.AdamW`, or
-    :class:`mouse_core.AdamWFp32` to keep fp32 masters of bf16 weights.
-    CUDA FlexAttention only fuses for bf16/fp16.
+    Pass to ``Model.to(device=..., dtype=preferred_dtype(device))`` for a
+    LoRA backbone (frozen base) or for inference; CUDA FlexAttention only
+    fuses for bf16/fp16. Every trainable section stays float32 via
+    :meth:`Model.to`. To fine-tune the whole backbone, do not cast: keep the
+    model fp32 with ``model.to(device=device)``.
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

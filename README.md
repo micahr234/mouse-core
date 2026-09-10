@@ -96,7 +96,12 @@ Without these, install fails with errors like `library 'SDL2' not found` or `lib
 
 Each notebook explains the relevant concepts inline. API details live in the Python docstrings (`load_model`, `Datastore`, `DqnObjective`, etc.).
 
-On CUDA, place models with `model.to(device=device, dtype=preferred_dtype(device))` so the encoder/backbone run in **bfloat16** and FlexAttention compiles; output heads stay float32. CPU stays float32. Train with `AdamW(...)`, or `AdamWFp32(...)` to keep **fp32 master weights** (and fp32 AdamW state) so updates smaller than a bf16 ULP accumulate instead of rounding away.
+Every trainable parameter is float32, so plain `AdamW(...)` steps it in place and `Polyak` interpolates in fp32 — no master weights or shadows. Two ways to train the backbone:
+
+- **Full fp32 fine-tuning** — `Qwen3Backbone(pretrained="Qwen/Qwen3-0.6B")` and place the model with `model.to(device=device)`; the whole model stays float32 (FlexAttention runs unfused).
+- **fp32 LoRA on a frozen bf16 base** — `Qwen3Backbone(pretrained="Qwen/Qwen3-0.6B", lora=LoRAConfig(rank=16, alpha=32))` and place it with `model.to(device=device, dtype=preferred_dtype(device))`: on CUDA the frozen base runs in **bfloat16** and FlexAttention compiles, while the LoRA adapters, encoder, reasoner / recurrence, and heads stay float32.
+
+`AdamW` and `Polyak` reject a trainable non-fp32 parameter, so casting a fully trainable model to bf16 fails loudly. For inference either kind of checkpoint can be cast with `preferred_dtype(device)`.
 
 
 ## Contributing 🔧

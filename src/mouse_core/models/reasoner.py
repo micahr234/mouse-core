@@ -35,7 +35,8 @@ class LatentReasoner(nn.Module):
     ``forward`` takes the backbone output at the previous position ``[B, D]``
     and returns the input embedding of the next latent thought ``[B, D]``
     (LayerNorm + Linear). Attach to a model with ``Model(reasoner=...)``;
-    it follows the encoder/backbone compute dtype under ``Model.to``.
+    it stays float32 under ``Model.to`` and casts the backbone output to its
+    own dtype.
 
     Args:
         hidden_dim: Backbone hidden dimension ``D``.
@@ -55,7 +56,7 @@ class LatentReasoner(nn.Module):
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
         """Next latent input embedding from the previous hidden state."""
-        return self.proj(self.norm(h))
+        return self.proj(self.norm(h.to(dtype=self.proj.weight.dtype)))
 
 
 def sample_reasoning_splits(

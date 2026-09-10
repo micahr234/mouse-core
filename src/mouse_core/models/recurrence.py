@@ -37,8 +37,8 @@ class Recurrence(nn.Module):
     Attach with ``Model(recurrence=Recurrence(hidden_dim=D, num_passes=K))``.
     ``forward(encodings, last_hidden_state)`` returns the next pass's
     backbone input ``encodings + proj(RMSNorm(last_hidden_state))``; ``proj``
-    is zero-initialised. Follows the encoder/backbone compute dtype under
-    ``Model.to``.
+    is zero-initialised. Stays float32 under ``Model.to``; the backbone
+    output is cast to the encodings' dtype.
 
     Args:
         hidden_dim: Backbone hidden dimension ``D``.

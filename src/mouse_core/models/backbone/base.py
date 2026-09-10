@@ -5,6 +5,15 @@ hidden states of the same shape. Full (uncached) forwards go through
 :meth:`Backbone.forward`; incremental decoding goes through a
 :class:`~mouse_core.models.backbone.flex_decode.FlexDecodeSession` created by
 :meth:`Backbone.decode_session`.
+
+Two ways to train a backbone, both with every trainable parameter in fp32:
+
+- full fine-tuning — no ``lora``; keep the whole model fp32
+  (``model.to(device=device)``), and the base weights train directly;
+- fp32 LoRA on a frozen base — ``lora=LoRAConfig(...)``; the base weights
+  are frozen and may be cast to bf16
+  (``model.to(device=device, dtype=preferred_dtype(device))``), the LoRA
+  adapters are the only trainable backbone parameters.
 """
 
 from __future__ import annotations
@@ -19,6 +28,7 @@ import torch
 import torch.nn as nn
 
 from mouse_core.models.backbone.flex_decode import FlexDecodeSession
+from mouse_core.models.lora import LoRAConfig, apply_lora
 
 
 class Backbone(nn.Module, ABC):
@@ -35,7 +45,37 @@ class Backbone(nn.Module, ABC):
 
     The only contract is the calling convention below and the shape of the
     returned hidden states.
+
+    ``lora`` is the backbone's :class:`~mouse_core.models.lora.LoRAConfig`
+    (``None`` for a fully trainable fp32 backbone).
     """
+
+    lora: LoRAConfig | None = None
+
+    def _attach_lora(self, model: nn.Module, lora: LoRAConfig | None) -> None:
+        """Freeze ``model`` and attach fp32 LoRA adapters when ``lora`` is set.
+
+        Without ``lora`` the backbone is left fully trainable. Call once the
+        pretrained weights are loaded: wrapping renames the adapted
+        ``nn.Linear`` keys to ``<target>.base.weight``.
+        """
+        self.lora = lora
+        if lora is not None:
+            apply_lora(model, lora)
+
+    @property
+    def dtype(self) -> torch.dtype:
+        """Dtype of the base weights; ``Model`` casts backbone inputs to it.
+
+        LoRA adapters are fp32 and skipped. A parameterless backbone
+        (:class:`~mouse_core.models.backbone.none.IdentityBackbone`) reports
+        ``float32``.
+        """
+        for name, param in self.named_parameters():
+            if ".lora_A." in name or ".lora_B." in name:
+                continue
+            return param.dtype
+        return torch.float32
 
     @abstractmethod
     def forward(

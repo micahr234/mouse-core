@@ -105,10 +105,10 @@ def flex_packed_forward(
     if not compile_masks and device.type == "cuda" and not _warned_unfused:
         warnings.warn(
             "FlexAttention training is running the unfused path because the "
-            f"backbone dtype is {dtype}. Use "
-            "`model.to(device=device, dtype=preferred_dtype(device))` "
-            "(bfloat16/float16 on CUDA) so `flex_attention` compiles. "
-            "`Model.to` keeps output heads in float32.",
+            f"backbone dtype is {dtype} (expected for full fp32 fine-tuning). "
+            "For the fused path, freeze the backbone with `lora=LoRAConfig(...)` "
+            "and cast it with `model.to(device=device, dtype=preferred_dtype(device))` "
+            "(bfloat16 on CUDA); trainable sections stay float32.",
             stacklevel=2,
         )
         _warned_unfused = True

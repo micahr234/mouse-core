@@ -15,7 +15,7 @@ from mouse_core.models import (
     load_model,
     save_model,
 )
-from mouse_core.models.backbone import LlamaBackbone
+from mouse_core.models.backbone import LlamaBackbone, LoRAConfig
 from mouse_core.models.embedding import NumericEmbedder
 from mouse_core.models.heads import DiscreteActionValueHead, LayerwiseDiscreteActionValueHead
 from mouse_core.objectives import DqnObjective
@@ -39,6 +39,7 @@ def _tiny_model(*, num_passes: int | None = 3, layerwise: bool = False) -> Model
         num_layers=2,
         num_heads=2,
         max_position_embeddings=128,
+        lora=LoRAConfig(rank=4),
     )
     if layerwise:
         heads = LayerwiseDiscreteActionValueHead(
@@ -200,7 +201,9 @@ def test_gradients_flow_through_all_passes() -> None:
     assert model.recurrence is not None
     assert model.recurrence.proj.weight.grad is not None
     assert float(model.recurrence.proj.weight.grad.abs().sum()) > 0.0
-    bb_grad = model.backbone.model.layers[0].self_attn.q_proj.weight.grad  # type: ignore[union-attr]
+    q_proj = model.backbone.model.layers[0].self_attn.q_proj  # type: ignore[union-attr]
+    assert q_proj.base.weight.grad is None  # frozen base
+    bb_grad = q_proj.lora_B.weight.grad
     assert bb_grad is not None and float(bb_grad.abs().sum()) > 0.0
     assert model.encoder is not None
     enc_grad = next(model.encoder.parameters()).grad

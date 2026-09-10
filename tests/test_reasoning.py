@@ -13,7 +13,7 @@ from mouse_core.models import (
     sample_reasoning_splits,
     save_model,
 )
-from mouse_core.models.backbone import LlamaBackbone
+from mouse_core.models.backbone import LlamaBackbone, LoRAConfig
 from mouse_core.models.embedding import NumericEmbedder
 from mouse_core.models.heads import DiscreteActionValueHead
 from mouse_core.models.reasoner import _plan_insertions
@@ -42,6 +42,7 @@ def _tiny_model(*, num_thoughts: int = 2, with_reasoner: bool = True) -> Model:
         num_layers=2,
         num_heads=2,
         max_position_embeddings=128,
+        lora=LoRAConfig(rank=4),
     )
     heads = DiscreteActionValueHead(
         in_features=_HIDDEN,
@@ -171,8 +172,10 @@ def test_gradients_flow_through_latent_chain() -> None:
     loss.backward()
     proj_grad = model.reasoner.proj.weight.grad  # type: ignore[union-attr]
     assert proj_grad is not None and float(proj_grad.abs().sum()) > 0.0
-    backbone_grad = model.backbone.model.layers[0].self_attn.q_proj.weight.grad  # type: ignore[union-attr]
-    assert backbone_grad is not None and float(backbone_grad.abs().sum()) > 0.0
+    q_proj = model.backbone.model.layers[0].self_attn.q_proj  # type: ignore[union-attr]
+    assert q_proj.base.weight.grad is None  # frozen base
+    lora_grad = q_proj.lora_B.weight.grad
+    assert lora_grad is not None and float(lora_grad.abs().sum()) > 0.0
 
 
 def test_pre_burst_loss_gives_no_reasoner_gradient() -> None:

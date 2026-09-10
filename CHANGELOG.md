@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- fp32 LoRA on a frozen bf16 backbone. ``Qwen3Backbone`` / ``LlamaBackbone``
+  take ``lora=LoRAConfig(rank=16, alpha=32.0, dropout=0.0, targets=(q/k/v/o,
+  gate/up/down))``: every attention / MLP ``nn.Linear`` named in ``targets``
+  becomes a ``LoRALinear`` (``base(x) + lora_B(lora_A(x)) * alpha / rank``,
+  ``lora_B`` zero-initialised), the base weights are frozen, and the
+  adapters are the backbone's only trainable parameters. They are always
+  fp32: the rank-``r`` matmuls run in fp32 on the fp32-cast input and the
+  delta is cast back to the base dtype, so updates land in fp32 tensors
+  with no master weights. Without ``lora=`` the backbone is fully trainable
+  and the model stays fp32 end to end (``model.to(device=device)``, no
+  dtype); every trainable parameter is fp32 on either path.
+  ``backbone.dtype`` reports the base dtype (``Model`` casts backbone inputs
+  to it). ``LoRAConfig`` is saved under ``config["backbone"]["lora"]`` and
+  rebuilt by ``load_model``; the model card lists it. Training notebooks
+  use ``Qwen3Backbone(pretrained="Qwen/Qwen3-0.6B", lora=LoRAConfig(rank=16,
+  alpha=32))``.
 - Dual action-value heads ``action_value_episode`` and
   ``action_value_task`` (both ``DiscreteActionValueHead``). They must be
   used together and cannot be combined with ``action_value`` or
@@ -118,19 +134,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ``examples/13_train_offline_recurrent_dqn.ipynb``: same offline DQN loop
   as ``02``, with a ``Recurrence`` section and the TD loss averaged over
   ``out.passes``.
-- ``AdamW.zero_grad`` and ``AdamWFp32.zero_grad`` accept ``set_to_none``
-  (default ``True``), matching ``torch.optim.Optimizer.zero_grad``.
-  ``AdamWFp32`` also clears fp32 master grads.
-- ``AdamW`` and ``AdamWFp32``: same defaults (``lr``, ``betas``, ``fused``).
-  ``AdamW`` is stock; ``AdamWFp32`` keeps fp32 master weights (and fp32
-  AdamW state) for non-fp32 compute parameters so updates smaller than a
-  bf16 ULP accumulate. Heads are already fp32 and are stepped in place.
-  Training notebooks use ``AdamW``; swap the class to opt into masters.
-  Both expose ``state_dict()`` / ``load_state_dict()``; ``AdamWFp32`` saves
-  the fp32 masters and re-syncs the compute parameters to them on load, so
-  a resumed run keeps its sub-ULP progress. Load model weights before
-  constructing ``AdamWFp32`` — the masters are the source of truth from then
-  on and every ``step`` writes them back over the compute parameters.
+- ``AdamW.zero_grad`` accepts ``set_to_none`` (default ``True``), matching
+  ``torch.optim.Optimizer.zero_grad``.
+- ``mouse_core.AdamW``: ``torch.optim.AdamW`` over the trainable
+  parameters with the project defaults (``betas=(0.9, 0.95)``, ``fused``
+  on CUDA). Every trainable parameter is fp32 (heads, encoder, reasoner /
+  recurrence, LoRA adapters), so it steps them in place; it raises on a
+  trainable non-fp32 parameter, whose sub-ULP updates would round away.
+  Exposes ``state_dict()`` / ``load_state_dict()``.
 - Delayed DQN is a ``Model`` from ``Model.delayed_copy(encoder=False,
   backbone=False, heads=False)``, interpolated with ``Polyak(online,
   delayed)``. Each section is delayed exactly when its ``tau`` is not
@@ -149,11 +160,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it frozen, ``1`` copies the online weights. Each ``tau`` is required
   for a delayed section and must be omitted or ``1`` for a shared one. ``Model.forward`` returns a ``ModelOutput`` with ``predictions``,
   ``last_hidden_state``, ``head_output_indices``, ``hidden_states``,
-  ``passes``, and ``cache``. ``Polyak`` matches parameters by name.
-  ``Polyak(..., fp32_shadow=True)`` (default) accumulates non-fp32
-  (bf16 encoder / backbone) interpolation in fp32 shadows so small
-  ``tau`` updates are not rounded away; ``fp32_shadow=False`` lerps in
-  the parameter dtype and skips the extra trunk copy.
+  ``passes``, and ``cache``. ``Polyak`` matches parameters by name and
+  lerps in place in fp32: a delayed section copies only its trainable
+  (fp32) parameters, frozen ones (the bf16 backbone base) are shared by
+  reference and skipped, and ``Polyak`` rejects a non-fp32 parameter it
+  would have to interpolate, so a small ``tau`` is never rounded away and
+  no fp32 shadows are kept.
   ``examples/11_train_offline_dqn_model_delay.ipynb`` is the offline DQN
   loop with the encoder, backbone, and Q head all delayed.
 - ``examples/05_train_offline_sv.ipynb``: offline supervised-value training
@@ -204,6 +216,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``grouping_field: str | None = None`` (``None`` ⇒ no grouping filter).
 
 ### Changed
+- ``Model.to(dtype=)`` casts only the backbone base weights to a non-fp32
+  dtype. Every other section — LoRA adapters, encoder, reasoner,
+  recurrence, heads — is cast to float32 (previously the encoder /
+  reasoner / recurrence followed the backbone dtype). The encoder output
+  and adapter outputs are cast to the backbone dtype at the backbone
+  boundary; the backbone output is cast to fp32 for the heads,
+  ``LatentReasoner``, and ``Recurrence``. ``preferred_dtype(device)`` is
+  the dtype for a frozen (LoRA) base or for inference; a fully trainable
+  backbone is kept fp32 with ``model.to(device=device)``.
+- ``Model.delayed_copy`` shares frozen parameters by reference and copies
+  only trainable ones, so a delayed LoRA backbone costs one extra copy of
+  the adapters, not of the bf16 base (a fully trainable fp32 backbone is
+  copied whole, as before).
 - Every training example ends a step with a trailing ``learnable`` token
   named ``value``, flagged ``head_output: True``. Q / action outputs are
   read from that token. ``examples/09_inference.ipynb`` reconstructs the
@@ -385,6 +410,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a cleared stream can restart without rebuilding the whole batch.
 
 ### Removed
+- ``AdamWFp32`` and ``Polyak(fp32_shadow=)``. Every trainable parameter is
+  fp32 — the whole model under full fine-tuning, or the LoRA adapters plus
+  encoder / heads over a frozen bf16 base — so there is nothing for fp32
+  masters or shadows to protect. Direct bf16 fine-tuning of the backbone is
+  gone; ``AdamW`` and ``Polyak`` reject trainable non-fp32 parameters.
 - ``TextEmbedderModalitySpec`` and embedder-side text field / format
   specs. Reconstruct ``TextTokenizer`` for the data pipeline after
   ``load_model``.
@@ -421,9 +451,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   surrogate no longer backpropagates through the value head via the
   advantage (previously the value head received a spurious policy gradient
   even with ``vf_coef=0``).
-- ``Polyak``: interpolation is accumulated in fp32 shadows for bf16
-  delayed weights. With a small ``tau`` (e.g. ``5e-4``) a direct bf16 lerp
-  rounded every update away and the delayed encoder/backbone never moved.
+- ``Polyak``: interpolation runs in fp32 (every interpolated parameter is
+  fp32). With a small ``tau`` (e.g. ``5e-4``) a direct bf16 lerp rounded
+  every update away and the delayed encoder/backbone never moved.
 - ``StaticFourierFeatures`` keeps its frequency/phase tables in fp32 through
   ``module.to(dtype=bfloat16)`` and evaluates ``cos(ωx + b)`` in fp32. Under
   bf16 the phase carried radians of error for ``|x| ≳ 1``, so Fourier
