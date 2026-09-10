@@ -7,13 +7,13 @@ output ``e``. Pass ``k`` reads ``e + proj(RMSNorm(h_{k-1}))`` where
 runs the heads, so a training loop can supervise each pass and average the
 losses; ``get_action`` reads the final pass.
 
-Why the adapter: the backbone's last-layer residual stream is not
-normalized (the final norm is ``Identity``) and on a pretrained backbone it
-is orders of magnitude larger than the encoder embeddings (Qwen3-0.6B:
-RMS ~20 with outlier dims ~500 versus ~0.03). Feeding it straight back as
-the next input compounds those outliers (~1e5 after one recycle) and in
-bf16 rounds the later passes' layer contributions away. The adapter
-normalizes the recycled state, re-injects the original encodings so no
+Why the adapter: the backbone output passes through the pretrained final
+RMSNorm, whose learned per-dim gain leaves it on a very different scale
+from the encoder embeddings (on Qwen3-0.6B the gain carries outlier dims,
+versus encoder embeddings of RMS ~0.03). Feeding it straight back as the
+next input lets those outliers compound pass over pass and in bf16 rounds
+the later passes' layer contributions away. The adapter re-normalizes the
+recycled state without a gain, re-injects the original encodings so no
 pass loses the input, and starts with a zero projection so at construction
 every pass equals pass 1 — the recurrence is an exact no-op until the
 optimizer turns it on.

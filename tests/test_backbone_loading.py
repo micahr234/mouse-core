@@ -23,6 +23,23 @@ def test_llama_backbone_loads_pretrained_checkpoint(tmp_path) -> None:
     source_layer = cast(Any, source.layers[0])
     assert torch.equal(loaded_layer.self_attn.q_proj.weight, source_layer.self_attn.q_proj.weight)
 
+def test_backbones_keep_and_load_the_final_norm(tmp_path) -> None:
+    source = _save_tiny_llama(tmp_path)
+    with torch.no_grad():
+        source.norm.weight.fill_(3.0)
+    source.save_pretrained(tmp_path)
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')
+        backbone = LlamaBackbone(pretrained=tmp_path)
+    assert type(backbone.model.norm).__name__.endswith('RMSNorm')
+    assert torch.equal(backbone.model.norm.weight, torch.full((8,), 3.0))
+    # Output is the residual stream through that norm: per-token RMS equals the gain.
+    with torch.no_grad():
+        out = backbone(torch.randn(1, 5, 8) * 50.0)
+    assert torch.allclose(out.pow(2).mean(-1).sqrt(), torch.full((1, 5), 3.0), atol=1e-3)
+    qwen = Qwen3Backbone(hidden_dim=8, num_layers=1, num_heads=2)
+    assert type(qwen.model.norm).__name__.endswith('RMSNorm')
+
 def test_llama_backbone_warns_on_unloaded_tensors(tmp_path) -> None:
     _save_tiny_llama(tmp_path)
     with pytest.warns(UserWarning, match='did not receive pretrained weights') as records:

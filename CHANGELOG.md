@@ -216,6 +216,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``grouping_field: str | None = None`` (``None`` ⇒ no grouping filter).
 
 ### Changed
+- ``LlamaBackbone`` and ``Qwen3Backbone`` keep the transformer's final
+  RMSNorm instead of replacing it with ``nn.Identity``; ``pretrained=``
+  loads its ``norm.weight`` alongside the layers, and the backbone output
+  is the normalized residual stream. The heads keep their own input
+  ``RMSNorm`` (``use_norm=True``) on top of it. Backbone state dicts gain
+  a ``norm.weight`` tensor, so checkpoints saved before this change no
+  longer load.
 - ``Model.to(dtype=)`` casts only the backbone base weights to a non-fp32
   dtype. Every other section — LoRA adapters, encoder, reasoner,
   recurrence, heads — is cast to float32 (previously the encoder /

@@ -149,8 +149,8 @@ def _load_transformer_weights(
 
     MOUSE backbones replace token embeddings with a MOUSE encoder
     (:class:`~mouse_core.models.embedding.NumericEmbedder` or
-    :class:`~mouse_core.models.embedding.TextEmbedder`) and replace
-    the final norm with ``Identity``, so those pretrained keys are skipped.
+    :class:`~mouse_core.models.embedding.TextEmbedder`), so the
+    ``embed_tokens`` keys are skipped. The final norm is kept and loaded.
 
     Warns in both directions: backbone tensors that did not receive pretrained
     weights (missing from the checkpoint or shape-mismatched, so they keep
@@ -165,14 +165,12 @@ def _load_transformer_weights(
     target_state = model.state_dict()
     pretrained_state = pretrained.state_dict()
     skipped_prefixes = ("embed_tokens",)
-    skipped_keys = ("norm.weight", "norm.bias")
     loadable = {
         key: value
         for key, value in pretrained_state.items()
         if key in target_state
         and target_state[key].shape == value.shape
         and not key.startswith(skipped_prefixes)
-        and key not in skipped_keys
     }
 
     not_loaded = [
@@ -194,7 +192,6 @@ def _load_transformer_weights(
         for key in pretrained_state
         if key not in loadable
         and not key.startswith(skipped_prefixes)
-        and key not in skipped_keys
         and not _is_dropped_layer_key(key, kept_layers)
     ]
     if unconsumed:

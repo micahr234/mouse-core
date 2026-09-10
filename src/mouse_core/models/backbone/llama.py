@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Any
 
 import torch
-import torch.nn as nn
 from transformers import LlamaConfig, LlamaModel
 
 from mouse_core.models.backbone.base import (
@@ -34,7 +33,8 @@ class _LlamaBackboneConfig:
     """Configuration for a Llama transformer backbone.
 
     Builds a HuggingFace ``LlamaModel`` with SDPA attention and no token
-    embedding or final layer norm (norm is replaced with ``nn.Identity``).
+    embedding (``vocab_size=1``; the MOUSE encoder supplies ``inputs_embeds``).
+    The final RMSNorm is kept, so the backbone output is normalized.
 
     Args:
         num_layers: Number of transformer decoder layers.
@@ -78,7 +78,7 @@ class _LlamaBackboneConfig:
             hidden_dim: Model hidden dimension ``D``; must be divisible by ``num_heads``.
 
         Returns:
-            ``LlamaModel`` with the final norm replaced by ``nn.Identity``.
+            ``LlamaModel`` (token embedding unused, final norm kept).
         """
         _disable_cudnn_sdp()
         if hidden_dim % self.num_heads != 0:
@@ -102,9 +102,7 @@ class _LlamaBackboneConfig:
             config_kwargs["rope_parameters"] = self.rope_parameters
         config = LlamaConfig(**config_kwargs)
         config._attn_implementation = "sdpa"
-        model = LlamaModel(config)
-        model.norm = nn.Identity()  # type: ignore[assignment]
-        return model
+        return LlamaModel(config)
 
 
 class LlamaBackbone(Backbone):
@@ -154,7 +152,7 @@ class LlamaBackbone(Backbone):
             if not isinstance(model, LlamaModel):
                 raise TypeError(
                     "When passing a model to LlamaBackbone, it must be a "
-                    "transformers.LlamaModel (with vocab_size=1 and norm=Identity)."
+                    "transformers.LlamaModel (with vocab_size=1)."
                 )
             self.model = model
             self._config_kwargs = self._config_kwargs_from_model(model)

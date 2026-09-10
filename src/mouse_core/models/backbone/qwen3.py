@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Any
 
 import torch
-import torch.nn as nn
 from transformers import Qwen3Config, Qwen3Model
 
 from mouse_core.models.backbone.base import (
@@ -34,7 +33,8 @@ class _Qwen3BackboneConfig:
     """Configuration for a Qwen3 transformer backbone.
 
     Builds a HuggingFace ``Qwen3Model`` with SDPA attention and no token
-    embedding or final layer norm (norm is replaced with ``nn.Identity``).
+    embedding (``vocab_size=1``; the MOUSE encoder supplies ``inputs_embeds``).
+    The final RMSNorm is kept, so the backbone output is normalized.
 
     Args:
         num_layers: Number of transformer decoder layers.
@@ -83,7 +83,7 @@ class _Qwen3BackboneConfig:
                 must be divisible by ``num_heads``.
 
         Returns:
-            ``Qwen3Model`` with the final norm replaced by ``nn.Identity``.
+            ``Qwen3Model`` (token embedding unused, final norm kept).
         """
         _disable_cudnn_sdp()
         if self.head_dim is None:
@@ -113,9 +113,7 @@ class _Qwen3BackboneConfig:
             config_kwargs["rope_parameters"] = self.rope_parameters
         config = Qwen3Config(**config_kwargs)
         config._attn_implementation = "sdpa"
-        model = Qwen3Model(config)
-        model.norm = nn.Identity()  # type: ignore[assignment]
-        return model
+        return Qwen3Model(config)
 
 
 class Qwen3Backbone(Backbone):
@@ -145,7 +143,7 @@ class Qwen3Backbone(Backbone):
             if not isinstance(model, Qwen3Model):
                 raise TypeError(
                     "When passing a model to Qwen3Backbone, it must be a "
-                    "transformers.Qwen3Model (with vocab_size=1 and norm=Identity)."
+                    "transformers.Qwen3Model (with vocab_size=1)."
                 )
             self.model = model
             self._config_kwargs = self._config_kwargs_from_model(model)
