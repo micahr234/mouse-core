@@ -8,24 +8,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import torch
 from transformers import LlamaConfig, LlamaModel
 
 from mouse_core.models.backbone.base import (
     Backbone,
+    DecodeKernel,
+    TrainKernel,
+    _disable_cudnn_sdp,
     _load_transformer_weights,
     _rope_parameters_from_config,
 )
 from mouse_core.models.lora import LoRAConfig
-
-
-def _disable_cudnn_sdp() -> None:
-    """Disable the cuDNN SDPA backend to avoid driver-specific errors."""
-    enable_cudnn_sdp = getattr(torch.backends.cuda, "enable_cudnn_sdp", None)
-    if enable_cudnn_sdp is not None:
-        enable_cudnn_sdp(enabled=False)
 
 
 @dataclass
@@ -111,6 +107,9 @@ class LlamaBackbone(Backbone):
     Construct directly from config args::
 
            backbone = LlamaBackbone(
+               train_kernel="varlen",
+               decode_kernel="flex",
+               dtype=torch.float32,
                hidden_dim=128,
                num_layers=4,
                num_heads=4,
@@ -120,6 +119,9 @@ class LlamaBackbone(Backbone):
     Or load architecture and transformer weights from a pretrained Llama repo::
 
            backbone = LlamaBackbone(
+               train_kernel="varlen",
+               decode_kernel="flex",
+               dtype=preferred_dtype(device),
                pretrained="meta-llama/Llama-3.2-1B",
                num_layers=2,
            )
@@ -127,14 +129,25 @@ class LlamaBackbone(Backbone):
     The adapter translates the generic MOUSE call into the HF calling
     convention. Cached decoding goes through ``decode_session()``.
 
+    ``train_kernel`` (``"varlen"`` / ``"flex"``), ``decode_kernel``
+    (``"flex"``) and ``dtype`` are required: the uncached-forward kernel, the
+    cached-decode kernel, and the dtype of the base weights (``torch.float32``
+    to fine-tune them, ``preferred_dtype(device)`` for a frozen LoRA base or
+    inference). See ``Backbone``. ``Model.to(device)`` moves and never casts.
+
     Without ``lora`` the backbone is fully trainable (keep the model fp32).
     Pass ``lora=LoRAConfig(...)`` to freeze the base weights (bf16 on CUDA)
     and train fp32 LoRA adapters on the attention / MLP projections instead.
     """
 
+    model: LlamaModel
+
     def __init__(
         self,
         *,
+        train_kernel: TrainKernel,
+        decode_kernel: DecodeKernel,
+        dtype: torch.dtype,
         model: LlamaModel | None = None,
         hidden_dim: int | None = None,
         pretrained: str | Path | None = None,
@@ -144,6 +157,9 @@ class LlamaBackbone(Backbone):
         **config_kwargs: Any,
     ) -> None:
         super().__init__()
+        self._set_kernels(train_kernel, decode_kernel)
+        if not isinstance(dtype, torch.dtype) or not dtype.is_floating_point:
+            raise TypeError(f"dtype must be a floating point torch.dtype, got {dtype!r}.")
 
         if model is not None and pretrained is not None:
             raise TypeError("LlamaBackbone accepts either model= or pretrained=, not both.")
@@ -185,6 +201,7 @@ class LlamaBackbone(Backbone):
             self.model = cfg.build(hidden_dim)
             self._config_kwargs = self._config_kwargs_from_model(self.model)
 
+        cast(torch.nn.Module, self.model).to(dtype)  # base weights; LoRA adapters below are always fp32
         self._attach_lora(self.model, lora)
 
     @staticmethod

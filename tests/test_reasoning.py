@@ -38,6 +38,7 @@ _TOKENS_PER_STEP = 5
 def _tiny_model(*, num_thoughts: int = 2, with_reasoner: bool = True) -> Model:
     encoder = NumericEmbedder(hidden_dim=_HIDDEN, modalities=_MODALITIES)
     backbone = LlamaBackbone(
+        train_kernel="varlen", decode_kernel="flex", dtype=torch.float32,
         hidden_dim=_HIDDEN,
         num_layers=2,
         num_heads=2,
@@ -222,45 +223,29 @@ def test_reasoning_errors() -> None:
         model(batch, reasoning=[1])
 
 
-def test_delayed_heads_parity_with_reasoning() -> None:
-    """At construction the delayed heads equal the online heads, so delayed Q
-    on the online last-hidden states matches the online predictions."""
+def test_delayed_model_parity_with_reasoning() -> None:
+    """At construction the delayed model equals the online model, so the
+    delayed reasoning forward on the same bursts matches the online one."""
     torch.manual_seed(0)
     model = _tiny_model().eval()
-    delayed = model.delayed_copy(heads=True)
+    delayed = model.delayed_copy().eval()
+    assert delayed.reasoner is not None and delayed.reasoner is not model.reasoner
     batch = _token_batch(model, _BATCH)
     out = model(batch, reasoning=[1, 0])
     with torch.no_grad():
-        delayed_out = delayed(
-            last_hidden_state=out.last_hidden_state,
-            head_output_indices=out.head_output_indices,
-        )
+        delayed_out = delayed(batch, reasoning=[1, 0])
+    assert torch.equal(out.head_output_indices, delayed_out.head_output_indices)
     assert torch.allclose(
         out.predictions["action_value"], delayed_out.predictions["action_value"], atol=1e-5
     )
     assert not delayed_out.predictions["action_value"].requires_grad
 
 
-def test_delayed_copy_is_heads_only() -> None:
-    """The delayed model has no encoder/backbone/reasoner: it always reads the
-    online stream (with the thoughts already inserted)."""
-    model = _tiny_model()
-    delayed = model.delayed_copy(heads=True)
-    assert delayed.encoder is None and delayed.backbone is None
-    assert delayed.reasoner is None
-    batch = _token_batch(model, _BATCH)
-    with pytest.raises(ValueError, match="heads-only"):
-        delayed(batch)
-    with pytest.raises(ValueError, match="heads-only"):
-        delayed(batch, reasoning=[1, 0])
-
-
 def test_delayed_reasoning_builds_no_autograd_graph() -> None:
     torch.manual_seed(0)
     model = _tiny_model().train()
-    delayed = model.delayed_copy(heads=True)
+    delayed = model.delayed_copy()
     batch = _token_batch(model, _BATCH)
-    out = model(batch, reasoning=[1, 0])
     saved = {"n": 0}
 
     def pack(tensor: torch.Tensor) -> torch.Tensor:
@@ -269,10 +254,7 @@ def test_delayed_reasoning_builds_no_autograd_graph() -> None:
 
     with torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t):
         with torch.no_grad():
-            delayed_out = delayed(
-                last_hidden_state=out.last_hidden_state,
-                head_output_indices=out.head_output_indices,
-            )
+            delayed_out = delayed(batch, reasoning=[1, 0])
     assert saved["n"] == 0
     assert delayed_out.predictions["action_value"].grad_fn is None
 
@@ -289,7 +271,7 @@ def test_save_load_roundtrip_with_reasoner(tmp_path) -> None:
     torch.manual_seed(0)
     model = _tiny_model(num_thoughts=3).eval()
     save_model(model, tmp_path)
-    loaded = load_model(str(tmp_path), map_location="cpu").eval()
+    loaded = load_model(str(tmp_path), train_kernel="varlen", decode_kernel="flex", dtype=torch.float32, map_location="cpu").eval()
     assert loaded.reasoner is not None
     assert loaded.reasoner.num_thoughts == 3
     batch = _token_batch(model, _BATCH)

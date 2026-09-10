@@ -40,6 +40,7 @@ class SvObjective(Objective):
         self,
         objective_data: TensorDict,
         predictions: TensorDict,
+        delayed_predictions: TensorDict | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         logits: torch.Tensor = predictions[self.predictions_key]
 

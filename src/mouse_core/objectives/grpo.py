@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import torch
 import torch.nn.functional as F
 from tensordict import TensorDict
@@ -122,6 +124,7 @@ class GrpoObjective(Objective):
         self,
         objective_data: TensorDict,
         predictions: TensorDict,
+        delayed_predictions: TensorDict | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         logits: torch.Tensor = predictions[self.predictions_key]
 
@@ -131,8 +134,8 @@ class GrpoObjective(Objective):
                 f"got {tuple(logits.shape)}."
             )
         N, A = logits.shape
-        device = logits.device
-        dtype = logits.dtype
+        device = cast(torch.device, logits.device)
+        dtype = cast(torch.dtype, logits.dtype)
 
         if self.num_actions is not None:
             if self.num_actions <= 0 or self.num_actions > A:

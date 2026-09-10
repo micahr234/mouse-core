@@ -41,15 +41,25 @@ def _head(hidden_dim: int = 8, out_features: int = 3) -> DiscreteActionValueHead
     )
 
 
+def _model(heads: dict[str, DiscreteActionValueHead], hidden_dim: int = 8) -> Model:
+    encoder = NumericEmbedder(
+        hidden_dim=hidden_dim,
+        modalities=[
+            {"type": "discrete", "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}
+        ],
+    )
+    return Model(encoder=encoder, backbone=IdentityBackbone(hidden_dim=hidden_dim), heads=heads)
+
+
 def test_episode_task_heads_must_appear_together() -> None:
     try:
-        Model(heads={"action_value_episode": _head()})
+        _model({"action_value_episode": _head()})
     except ValueError as e:
         assert "together" in str(e)
     else:
         raise AssertionError("expected ValueError for episode head without task head")
     try:
-        Model(heads={"action_value_task": _head()})
+        _model({"action_value_task": _head()})
     except ValueError as e:
         assert "together" in str(e)
     else:
@@ -58,8 +68,8 @@ def test_episode_task_heads_must_appear_together() -> None:
 
 def test_episode_task_heads_cannot_combine_with_action_value() -> None:
     try:
-        Model(
-            heads={
+        _model(
+            {
                 "action_value": _head(),
                 "action_value_episode": _head(),
                 "action_value_task": _head(),
@@ -72,8 +82,8 @@ def test_episode_task_heads_cannot_combine_with_action_value() -> None:
 
 
 def test_get_action_sums_episode_and_task_q() -> None:
-    model = Model(
-        heads={
+    model = _model(
+        {
             "action_value_episode": _head(out_features=3),
             "action_value_task": _head(out_features=3),
         }
@@ -91,8 +101,8 @@ def test_get_action_sums_episode_and_task_q() -> None:
 
 
 def test_get_action_sums_batched_decode_scores() -> None:
-    model = Model(
-        heads={
+    model = _model(
+        {
             "action_value_episode": _head(out_features=2),
             "action_value_task": _head(out_features=2),
         }
@@ -145,7 +155,7 @@ def test_episode_task_save_load_roundtrip(tmp_path) -> None:
     batch = [[{"action": 0, "reward": 0.0}, {"action": 1, "reward": 1.0}]]
     expected = model(batch_to_token_batch(tok_from_encoder(model.encoder), batch)).predictions
     save_model(model, tmp_path)
-    loaded = load_model(tmp_path).eval()
+    loaded = load_model(tmp_path, train_kernel="varlen", decode_kernel="flex", dtype=torch.float32).eval()
     actual = loaded(batch_to_token_batch(tok_from_encoder(loaded.encoder), batch)).predictions
     assert torch.allclose(actual["action_value_episode"], expected["action_value_episode"])
     assert torch.allclose(actual["action_value_task"], expected["action_value_task"])

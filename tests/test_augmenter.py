@@ -375,14 +375,6 @@ def test_augmenter_rename_writes_output_keeps_input() -> None:
     assert out["reward_aug"] == 2.0
 
 
-def test_augmenter_rejects_legacy_field_key() -> None:
-    with pytest.raises(TypeError, match="input_field"):
-        Augmenter(
-            seed_field="task_index",
-            fields=[{"field": "reward", "type": "linear", "mask_prob": 0.0}],
-        )
-
-
 def test_invalid_mask_probability_raises() -> None:
     with pytest.raises(ValueError, match="reward"):
         SequenceAugmentFieldSpec(input_field="reward",

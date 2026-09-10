@@ -58,7 +58,7 @@ class NumericTokenizer:
     def __init__(
         self,
         *,
-        input_fields: list[dict[str, Any] | NumericTokenizerModalitySpec] | None = None,
+        input_fields: Sequence[dict[str, Any] | NumericTokenizerModalitySpec] | None = None,
         grouping_field: str,
         image_tokenizer: Callable[[Any], Sequence[int]] | None = None,
         objective_fields: Sequence[dict[str, Any]] | None = None,

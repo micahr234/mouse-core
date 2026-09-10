@@ -28,7 +28,7 @@ def test_discrete_action_head_save_load_roundtrip(tmp_path) -> None:
     batch = [[{'action': 0, 'reward': 0.0}, {'action': 1, 'reward': 1.0}]]
     expected = model(batch_to_token_batch(_tok(model.encoder), batch)).predictions
     save_model(model, tmp_path)
-    loaded = load_model(tmp_path).eval()
+    loaded = load_model(tmp_path, train_kernel="varlen", decode_kernel="flex", dtype=torch.float32).eval()
     actual = loaded(batch_to_token_batch(_tok(loaded.encoder), batch)).predictions
     assert torch.allclose(actual['action'], expected['action'])
     assert loaded.action_head == 'action'

@@ -95,7 +95,7 @@ class NumericEmbedder(Encoder):
         self,
         *,
         hidden_dim: int,
-        modalities: list[dict[str, Any] | NumericEmbedderModalitySpec]
+        modalities: Sequence[dict[str, Any] | NumericEmbedderModalitySpec]
         | Mapping[str, dict[str, Any]]
         | None = None,
     ) -> None:

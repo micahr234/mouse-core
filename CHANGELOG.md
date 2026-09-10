@@ -8,10 +8,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- ``packed_forward`` (``mouse_core.models.backbone.packed_train``): the one
+  uncached training forward for transformer backbones. Tokens are stably
+  regrouped into contiguous ``(sequence_id, grouping_id)`` classes
+  (recurring ids attend back and keep one RoPE counter), all decoder
+  layers run in that order, and outputs are restored to stream order.
+  ``train_kernel`` (required on the backbone, not saved) selects the
+  attention kernel over those segments: ``"varlen"`` is FlashAttention
+  varlen on CUDA bf16/fp16 and masked SDPA otherwise; ``"flex"`` is
+  FlexAttention with a block-sparse mask, compiled on CUDA in every dtype
+  and forward-only on CPU.
 - ``install_compiled_decoder`` (``mouse_core.models.backbone``) compiles
-  the packed-train decoder body around FlexAttention. Subsequent
-  ``flex_packed_forward`` calls use that stack (except
-  ``output_hidden_states=True``, which stays eager). Idempotent.
+  the per-layer decoder body once with ``torch.compile(dynamic=True)``;
+  every layer, stream length, group count, and
+  ``output_hidden_states=True`` reuse it. Idempotent.
+- ``backbone.gradient_checkpointing = True`` recomputes each decoder
+  layer in backward instead of storing its activations: about a 10x cut
+  in activation memory (7.4 GB to 0.8 GB for 28 layers at 4096 tokens)
+  for about 1.4x the step time. Off by default; not saved with the model.
+- ``scripts/bench_packed_forward.py``: forward, forward+backward, full
+  LoRA training step, tokens/second, peak memory, and compile warmup for
+  the eager, compiled, and checkpointed packed forward with each
+  ``--train-kernel`` (``varlen``, ``flex``; outputs cross-checked)
+  across short, long, high-variance, recurring-group, and many-small-group
+  streams.
 - ``ExponentialDecay`` and ``Piecewise`` schedules
   (``from mouse_core import ExponentialDecay, Piecewise``) map
   optimizer step → scalar. DQN uses ``ExponentialDecay`` for
@@ -25,13 +45,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fp32: the rank-``r`` matmuls run in fp32 on the fp32-cast input and the
   delta is cast back to the base dtype, so updates land in fp32 tensors
   with no master weights. Without ``lora=`` the backbone is fully trainable
-  and the model stays fp32 end to end (``model.to(device=device)``, no
-  dtype); every trainable parameter is fp32 on either path.
+  and is built with ``dtype=torch.float32``; every trainable parameter is
+  fp32 on either path.
   ``backbone.dtype`` reports the base dtype (``Model`` casts backbone inputs
   to it). ``LoRAConfig`` is saved under ``config["backbone"]["lora"]`` and
   rebuilt by ``load_model``; the model card lists it. Training notebooks
-  use ``Qwen3Backbone(pretrained="Qwen/Qwen3-0.6B", lora=LoRAConfig(rank=16,
-  alpha=32))``.
+  use ``Qwen3Backbone(train_kernel="varlen", decode_kernel="flex",
+  dtype=preferred_dtype(device), pretrained="Qwen/Qwen3-0.6B",
+  lora=LoRAConfig(rank=16, alpha=32))``.
 - Dual action-value heads ``action_value_episode`` and
   ``action_value_task`` (both ``DiscreteActionValueHead``). They must be
   used together and cannot be combined with ``action_value`` or
@@ -41,7 +62,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stepwise TD on env reward and does not bootstrap across episodes; the
   task head drops current-episode reward and λ-skips to
   ``Q_e(s', a*) + Q_t(s', a*)`` at the next episode start.
-  ``examples/14_train_offline_episode_task_dqn.ipynb`` is the offline
+  ``examples/13_train_offline_episode_task_dqn.ipynb`` is the offline
   FrozenLake usage example.
 - ``TextTokenizer(group_prefix=)`` is a format string over the raw step
   dict (placeholders need not be ``input_fields``). Those tokens are
@@ -110,12 +131,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Generation costs ``num_thoughts + 1`` backbone passes per batch.
   ``sample_reasoning_splits(batch, generator)`` picks one burst step per
   sequence, uniform over steps whose next step shares the grouping.
-  The heads-only delayed copy reads the online last-layer states of the
-  extended stream, which already include the thoughts.
+  The delayed model runs the same ``reasoning=`` bursts through its own
+  delayed reasoner.
 - Learnable modalities accept an explicit name: ``field=`` on the embedder
   spec and ``output_field=`` on the tokenizer spec (they must match).
   Unnamed learnables keep the ``__learnable_<i>`` auto-name.
-- ``examples/12_train_offline_reasoning_dqn.ipynb``: same offline DQN loop
+- ``examples/11_train_offline_reasoning_dqn.ipynb``: same offline DQN loop
   as ``02``, with a trailing ``learnable`` action-prompt token named
   ``value`` on every step (flagged ``head_output: True``; Q is read from it)
   and per-batch latent reasoning bursts via ``LatentReasoner`` +
@@ -139,7 +160,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ``DecodeCache``: the object carried between ``use_cache=True`` calls
   (``out.cache``), one ``FlexDecodeSession`` per backbone pass, with
   ``reset_rows(rows)`` applying to every pass.
-- ``examples/13_train_offline_recurrent_dqn.ipynb``: same offline DQN loop
+- ``examples/12_train_offline_recurrent_dqn.ipynb``: same offline DQN loop
   as ``02``, with a ``Recurrence`` section and the TD loss averaged over
   ``out.passes``.
 - ``AdamW.zero_grad`` accepts ``set_to_none`` (default ``True``), matching
@@ -150,32 +171,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recurrence, LoRA adapters), so it steps them in place; it raises on a
   trainable non-fp32 parameter, whose sub-ULP updates would round away.
   Exposes ``state_dict()`` / ``load_state_dict()``.
-- Delayed DQN is a ``Model`` from ``Model.delayed_copy(encoder=False,
-  backbone=False, heads=False)``, interpolated with ``Polyak(online,
-  delayed)``. Each section is delayed exactly when its ``tau`` is not
-  ``1``: a flagged section is a frozen deep copy, an unflagged one is the
-  online module shared by reference, at least one flag is required, and
-  the reasoner / recurrence section follows ``backbone``.
-  ``delayed_copy(heads=True)`` is heads-only and runs on the online token
-  states (``delayed(last_hidden_state=out.last_hidden_state,
-  head_output_indices=out.head_output_indices,
-  hidden_states=out.hidden_states)``), so encoder, backbone, reasoning
-  latents, and recurrent passes are shared with the online forward.
-  With ``encoder=True`` and/or ``backbone=True`` it is a full model run
-  on the ``TokenBatch`` (``delayed(inputs)``, same ``reasoning=`` as the
-  online forward). ``polyak.update(tau_heads=..., tau_encoder=...,
-  tau_backbone=...)`` takes this step's factor per section: ``0`` keeps
-  it frozen, ``1`` copies the online weights. Each ``tau`` is required
-  for a delayed section and must be omitted or ``1`` for a shared one. ``Model.forward`` returns a ``ModelOutput`` with ``predictions``,
-  ``last_hidden_state``, ``head_output_indices``, ``hidden_states``,
-  ``passes``, and ``cache``. ``Polyak`` matches parameters by name and
-  lerps in place in fp32: a delayed section copies only its trainable
-  (fp32) parameters, frozen ones (the bf16 backbone base) are shared by
-  reference and skipped, and ``Polyak`` rejects a non-fp32 parameter it
-  would have to interpolate, so a small ``tau`` is never rounded away and
-  no fp32 shadows are kept.
-  ``examples/11_train_offline_dqn_model_delay.ipynb`` is the offline DQN
-  loop with the encoder, backbone, and Q head all delayed.
+- Delayed DQN is a ``Model`` from ``Model.delayed_copy()``, interpolated
+  with ``Polyak(online, delayed)``. The delayed model is a frozen copy of
+  the online model: every trainable parameter gets its own copy and every
+  frozen parameter (the bf16 base weights of a LoRA backbone) is shared by
+  reference, so a delayed LoRA backbone costs one extra copy of the
+  adapters, not of the base (a fully trainable fp32 backbone is copied
+  whole). It runs on the same ``TokenBatch`` as the online model
+  (``delayed(inputs)``, same ``reasoning=`` as the online forward; a
+  recurrent model's ``delayed_out.passes`` pair up with ``out.passes``).
+  ``polyak.update(tau_heads=..., tau_encoder=..., tau_backbone=...)``
+  takes this step's factor for every section (all three required; the
+  reasoner / recurrence section follows ``tau_backbone``): ``0`` keeps it
+  frozen, ``1`` copies the online weights. ``Model.forward`` returns a
+  ``ModelOutput`` with ``predictions``, ``last_hidden_state``,
+  ``head_output_indices``, ``hidden_states``, ``passes``, and ``cache``.
+  ``Polyak`` matches parameters by name and lerps in place in fp32:
+  shared frozen parameters are skipped, and ``Polyak`` rejects a non-fp32
+  parameter it would have to interpolate, so a small ``tau`` is never
+  rounded away and no fp32 shadows are kept.
 - ``examples/05_train_offline_sv.ipynb``: offline supervised-value training
   (``SvObjective`` regresses ``action_value`` onto ``info_q_star``). The action
   permute spec sets ``input_vector_field`` / ``output_vector_field`` to
@@ -224,6 +238,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``grouping_field: str | None = None`` (``None`` ⇒ no grouping filter).
 
 ### Changed
+- Cached decode (``FlexDecodeSession``, behind ``Model.forward(...,
+  use_cache=True)``) stores K/V in a **paged pool** shared by the whole
+  batch instead of one ``[B, kv_heads, capacity, head_dim]`` buffer sized
+  to the longest row. Each sequence owns ``ceil(len / 128)`` 128-token
+  pages through a page table; the FlexAttention block mask is built in
+  logical coordinates and its block indices remapped through the table,
+  so the kernel only visits the pages a row owns. The pool starts at one
+  page per row and doubles when it runs out; ``reset_rows`` returns a
+  row's pages to the pool. ``session.pages_in_use`` / ``session.n_pages``
+  report the footprint. Measured on an RTX 3090 Ti (Qwen3-0.6B shape,
+  bf16, one new token per row per step): decode latency is unchanged
+  (28-30 ms/step, launch-bound) while the cache shrinks from 3.6 GB to
+  0.9 GB at ``B=4`` with one 4096-token row, from 14.3 GB to 0.9 GB at
+  ``B=16``, and ``B=64`` with a 2048-token row now runs (1.8 GB) where
+  the dense buffer needed 14 GB and failed. Results match the dense
+  cache to fp32 precision (1e-6) and bf16 differences are at the bf16
+  noise floor; page bookkeeping is host-side (no device sync per step)
+  and adds about 0.1 ms/step.
+- ``Backbone.decode_session(batch_size)`` and ``FlexDecodeSession(model,
+  batch_size)`` no longer take ``capacity``; the pool sizes itself.
+- FlexAttention is compiled on CUDA in every dtype, not only bf16/fp16.
+  fp32 cached decode previously ran the eager kernel, which materializes
+  the score matrix; on an RTX 3090 Ti (Qwen3-0.6B shape, 28 layers) a
+  decode step drops from 358-554 ms to 29-71 ms and peak memory from
+  5-17 GB to 3-6 GB, still exact fp32. With
+  ``torch.set_float32_matmul_precision("high")`` (TF32) it is 27 ms/step
+  in every batch shape, the same as bf16. The eager kernel is used when
+  Inductor rejects a shape (e.g. ``head_dim < 16``). The same switch makes
+  ``packed_forward(train_kernel="flex")`` on an fp32 backbone a
+  compiled block-sparse kernel outside the compiled decoder body too, so
+  ``"flex"`` is the kernel for full fp32 fine-tuning: with TF32 and the
+  compiled body, 8 layers at 4096 tokens take 136 ms fwd+bwd and 3.5 GB
+  against 357 ms and 14.9 GB for the masked-SDPA reference. ``"varlen"``
+  on an fp32 CUDA backbone still runs that reference and now warns once
+  with this recommendation.
+- ``Qwen3Backbone``, ``LlamaBackbone`` and ``load_model`` take three
+  required keyword arguments that describe how the model runs on the
+  current machine rather than what it is, so none is stored in the
+  checkpoint: ``train_kernel`` (``"varlen"`` / ``"flex"``; also the
+  required ``packed_forward`` argument) for the uncached forward,
+  ``decode_kernel`` (``"flex"``: paged FlexAttention, the only kernel that
+  reads K/V through a page table; explicit so a second one can be added
+  without changing call sites) for cached decode, and ``dtype`` for the
+  base weights (``torch.float32`` to fine-tune them,
+  ``preferred_dtype(device)`` for a frozen LoRA base or inference;
+  ``load_model`` casts the saved weights into it). The kernels can be
+  reassigned at any time (``backbone.train_kernel = "flex"``); the
+  ``Backbone.decode_kernel`` attribute is what ``decode_session`` runs.
+- Transformer backbones train through ``packed_forward`` on every device.
+  The CPU / fp32 route no longer goes through the HuggingFace
+  ``model.forward`` with a dense additive mask; it runs the same decoder
+  body as CUDA with a boolean block-causal SDPA mask. Consequently the
+  per-layer ``hidden_states`` a layerwise head sees on CPU are now every
+  layer's output before the final norm (the CUDA and cached-decode
+  contract); HuggingFace's tuple replaced the last one with the normed
+  output. ``Backbone.forward`` (rectangular ``[B, T, D]``) is unchanged
+  and still serves non-transformer backbones.
+- ``packed_forward`` raises for ``use_sliding_window=True`` configs
+  instead of silently running full causal attention, matching
+  ``FlexDecodeSession``. Unsupported configurations and kernel errors
+  raise; there is no catch-and-retry onto another attention kernel.
 - ``LlamaBackbone`` and ``Qwen3Backbone`` keep the transformer's final
   RMSNorm instead of replacing it with ``nn.Identity``; ``pretrained=``
   loads its ``norm.weight`` alongside the layers, and the backbone output
@@ -231,19 +306,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``RMSNorm`` (``use_norm=True``) on top of it. Backbone state dicts gain
   a ``norm.weight`` tensor, so checkpoints saved before this change no
   longer load.
-- ``Model.to(dtype=)`` casts only the backbone base weights to a non-fp32
-  dtype. Every other section — LoRA adapters, encoder, reasoner,
-  recurrence, heads — is cast to float32 (previously the encoder /
-  reasoner / recurrence followed the backbone dtype). The encoder output
-  and adapter outputs are cast to the backbone dtype at the backbone
-  boundary; the backbone output is cast to fp32 for the heads,
-  ``LatentReasoner``, and ``Recurrence``. ``preferred_dtype(device)`` is
-  the dtype for a frozen (LoRA) base or for inference; a fully trainable
-  backbone is kept fp32 with ``model.to(device=device)``.
-- ``Model.delayed_copy`` shares frozen parameters by reference and copies
-  only trainable ones, so a delayed LoRA backbone costs one extra copy of
-  the adapters, not of the bf16 base (a fully trainable fp32 backbone is
-  copied whole, as before).
+- ``Model.to`` and ``Backbone.to`` move devices only and raise
+  ``TypeError`` on any dtype (``to(dtype)``, ``to(device, dtype)``,
+  ``to(tensor)``, ``.half()``, ``.bfloat16()``, ``.double()``,
+  ``.float()``). The backbone base dtype is the constructor ``dtype``
+  argument; every other section — LoRA adapters, encoder, reasoner,
+  recurrence, heads — is float32 (previously ``Model.to(dtype=)`` cast the
+  base and forced the rest back to fp32). The encoder output and adapter
+  outputs are cast to the backbone dtype at the backbone boundary; the
+  backbone output is cast to fp32 for the heads, ``LatentReasoner``, and
+  ``Recurrence``.
 - Every training example ends a step with a trailing ``learnable`` token
   named ``value``, flagged ``head_output: True``. Q / action outputs are
   read from that token. ``examples/09_inference.ipynb`` reconstructs the
@@ -282,11 +354,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ``Model.forward`` returns a ``ModelOutput`` with ``predictions``,
   ``last_hidden_state`` (last-layer backbone output, on the autograd
   tape), ``head_output_indices``, ``hidden_states``, per-pass
-  ``passes``, and ``cache`` (a ``DecodeCache``). A heads-only delayed
-  copy has neither encoder nor backbone and runs from
-  ``last_hidden_state=`` + ``head_output_indices=``; those arguments
-  (and ``hidden_states=``) are rejected on a normal ``batch`` forward.
-  Recurrent depth is the ``Recurrence`` section (replacing the
+  ``passes``, and ``cache`` (a ``DecodeCache``). ``Model`` always has an
+  encoder and a backbone; the delayed model is a full copy that runs on
+  the ``TokenBatch``. Recurrent depth is the ``Recurrence`` section (replacing the
   ``encodings=`` training-loop pattern and ``hidden=``). Cached decode
   passes ``out.cache`` back as ``cache=``.
 - ``Encoder.pool_step_reprs`` is removed; ``Model`` pools head-output
@@ -300,7 +370,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   model device before the objective.
 - DQN target Q is no longer inside ``Model`` or the action-value heads.
   ``DqnObjective`` / ``LayerwiseDqnObjective`` no longer take ``tau``.
-  After ``optimizer.step()``, call ``polyak.update(tau_heads=...)``.
+  After ``optimizer.step()``, call ``polyak.update(tau_heads=...,
+  tau_encoder=..., tau_backbone=...)``.
   ``DqnObjective`` / ``LayerwiseDqnObjective`` take
   ``(objective_data, predictions, delayed_predictions)`` — delayed Q is
   ``delayed_predictions["action_value"]`` (or ``action_value_layerwise``)
@@ -425,6 +496,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a cleared stream can restart without rebuilding the whole batch.
 
 ### Removed
+- ``flex_packed_forward`` and the ``mouse_core.models.backbone.flex_train``
+  module (a separate FlexAttention training forward with its own decoder
+  loop, whole-stack compile, and ``InductorError`` fallback).
+  ``packed_forward(train_kernel="flex")`` is the FlexAttention training
+  path now, sharing everything but the attention call with ``"varlen"``;
+  ``FlexDecodeSession`` still handles cached decoding.
+- ``examples/11_train_offline_dqn_model_delay.ipynb``. Delayed Q is
+  ``model.delayed_copy()`` in every DQN example.
 - ``AdamWFp32`` and ``Polyak(fp32_shadow=)``. Every trainable parameter is
   fp32 — the whole model under full fine-tuning, or the LoRA adapters plus
   encoder / heads over a frozen bf16 base — so there is nothing for fp32
@@ -438,6 +517,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Train is ``compose(augmenter, tokenizer)``; eval is the tokenizer.
 
 ### Fixed
+- Packed train and cached decode take the backbone **base** dtype (skipping
+  fp32 LoRA adapters) instead of ``next(parameters())``, so a LoRA stack
+  still runs the bf16 kernels if parameter order puts an adapter first.
+- Cached decode compiles ``create_block_mask`` once with a stable
+  ``mask_mod`` holder, so the compiled wrapper is reused across steps.
 - ``push_to_hub`` and ``push_stores_to_hub`` with ``clear=True`` delete
   the existing Hub dataset repository, upload the new files with
   ``viewer: false``, then set ``viewer: true`` so converted parquet
@@ -445,7 +529,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ``DqnObjective`` / ``LayerwiseDqnObjective`` detach delayed Q before
   the Bellman target, so a gradient tape on the delayed tensor cannot
   flow into the TD error.
-- Delayed Q is produced by the heads-only delayed model under
+- Delayed Q is produced by the delayed model under
   ``torch.no_grad``, so it never records an autograd graph.
   ``DqnObjective`` still detaches delayed Q before the Bellman target.
 - ``Qwen3Backbone(pretrained=...)`` and ``LlamaBackbone(pretrained=...)`` copy
@@ -474,10 +558,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bf16 the phase carried radians of error for ``|x| ≳ 1``, so Fourier
   (reward / continuous) embeddings were mostly noise on the recommended CUDA
   bf16 configuration. Callers cast the fp32 features to the compute dtype.
-- ``Model.to`` parses every ``nn.Module.to`` call form (positional
-  ``dtype``, ``to(device, dtype)``, ``to(tensor)``, ``.bfloat16()``/``.half()``)
-  and always keeps the heads fp32. ``model.to(torch.bfloat16)`` previously
-  cast the heads too and the fp32 head input then failed with a dtype error.
 - RoPE positions use one rule everywhere — the count of earlier tokens with
   the same ``(sequence, grouping_id)`` — in the CPU/eager train path, the
   FlexAttention train path, and cached decode. Training previously reset the

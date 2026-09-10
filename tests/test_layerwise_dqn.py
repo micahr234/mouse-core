@@ -24,7 +24,7 @@ def test_layerwise_head_forward_shape() -> None:
     assert q.shape == (1, 3, 2, 4)
 
 def test_model_layerwise_forward_and_objective() -> None:
-    backbone = Qwen3Backbone(hidden_dim=16, num_layers=2, num_heads=2)
+    backbone = Qwen3Backbone(train_kernel="varlen", decode_kernel="flex", dtype=torch.float32, hidden_dim=16, num_layers=2, num_heads=2)
     encoder = NumericEmbedder(hidden_dim=backbone.hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}, {"type": 'discrete', "field": "observation", "vocab_size": 8, "std": 0.02, "positions": 1}, {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3, "std": 0.02, "positions": 1}])
     head = LayerwiseDiscreteActionValueHead(num_backbone_layers=2, in_features=backbone.hidden_dim, out_features=4, hidden_dim=backbone.hidden_dim, num_layers=1, scale=0.1)
     model = Model(encoder=encoder, backbone=backbone, heads=head)
@@ -36,15 +36,11 @@ def test_model_layerwise_forward_and_objective() -> None:
         ),
         batch,
     )
-    delayed = model.delayed_copy(heads=True)
+    delayed = model.delayed_copy()
     out = model(token_batch)
     predictions = out.predictions
     with torch.no_grad():
-        delayed_predictions = delayed(
-            last_hidden_state=out.last_hidden_state,
-            head_output_indices=out.head_output_indices,
-            hidden_states=out.hidden_states,
-        ).predictions
+        delayed_predictions = delayed(token_batch).predictions
     assert 'action_value_layerwise' in predictions.keys()
     assert predictions['action_value_layerwise'].shape[-2:] == (2, 4)
     objective = LayerwiseDqnObjective(num_backbone_layers=2, gamma_step_start=0.0, gamma_step=0.99)
@@ -53,7 +49,7 @@ def test_model_layerwise_forward_and_objective() -> None:
     assert metrics['action_value_layerwise'] >= 0.0
     action = model.get_action(predictions, temperature=0.0, num_actions=4)
     assert action.shape == (1,)
-    Polyak(model, delayed).update(tau_heads=0.1)
+    Polyak(model, delayed).update(tau_heads=0.1, tau_encoder=0.1, tau_backbone=0.1)
 
 def test_layerwise_objective_q_metrics_use_curr_max_q() -> None:
     """q_values_mean and layer_q_mean report max online Q at the current state."""

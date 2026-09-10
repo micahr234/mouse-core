@@ -35,6 +35,7 @@ _MODALITIES = [
 def _tiny_model(*, num_passes: int | None = 3, layerwise: bool = False) -> Model:
     encoder = NumericEmbedder(hidden_dim=_HIDDEN, modalities=_MODALITIES)
     backbone = LlamaBackbone(
+        train_kernel="varlen", decode_kernel="flex", dtype=torch.float32,
         hidden_dim=_HIDDEN,
         num_layers=2,
         num_heads=2,
@@ -102,7 +103,7 @@ def test_recurrence_validates_arguments() -> None:
     with pytest.raises(ValueError, match="cannot be combined"):
         Model(
             encoder=NumericEmbedder(hidden_dim=_HIDDEN, modalities=_MODALITIES),
-            backbone=LlamaBackbone(hidden_dim=_HIDDEN, num_layers=1, num_heads=2),
+            backbone=LlamaBackbone(train_kernel="varlen", decode_kernel="flex", dtype=torch.float32, hidden_dim=_HIDDEN, num_layers=1, num_heads=2),
             heads=DiscreteActionValueHead(
                 in_features=_HIDDEN, out_features=_ACTIONS, hidden_dim=_HIDDEN, num_layers=1
             ),
@@ -112,7 +113,7 @@ def test_recurrence_validates_arguments() -> None:
     with pytest.raises(ValueError, match="hidden_dim mismatch"):
         Model(
             encoder=NumericEmbedder(hidden_dim=_HIDDEN, modalities=_MODALITIES),
-            backbone=LlamaBackbone(hidden_dim=_HIDDEN, num_layers=1, num_heads=2),
+            backbone=LlamaBackbone(train_kernel="varlen", decode_kernel="flex", dtype=torch.float32, hidden_dim=_HIDDEN, num_layers=1, num_heads=2),
             heads=DiscreteActionValueHead(
                 in_features=_HIDDEN, out_features=_ACTIONS, hidden_dim=_HIDDEN, num_layers=1
             ),
@@ -221,19 +222,18 @@ def test_zero_init_adapter_still_receives_gradient() -> None:
     assert grad is not None and float(grad.abs().sum()) > 0.0
 
 
-def test_delayed_heads_parity_per_pass() -> None:
+def test_delayed_model_parity_per_pass() -> None:
     torch.manual_seed(0)
     model = _tiny_model(num_passes=3).eval()
     _turn_on_recurrence(model)
-    delayed = model.delayed_copy(heads=True)
+    delayed = model.delayed_copy().eval()
+    assert delayed.recurrence is not None and delayed.recurrence is not model.recurrence
     batch = _token_batch(model, _BATCH)
     out = model(batch)
-    for p in out.passes:
-        with torch.no_grad():
-            target = delayed(
-                last_hidden_state=p.last_hidden_state,
-                head_output_indices=out.head_output_indices,
-            )
+    with torch.no_grad():
+        delayed_out = delayed(batch)
+    assert len(delayed_out.passes) == 3
+    for p, target in zip(out.passes, delayed_out.passes, strict=True):
         assert torch.allclose(p.predictions["action_value"], target.predictions["action_value"], atol=1e-5)
         assert not target.predictions["action_value"].requires_grad
 
@@ -242,29 +242,25 @@ def test_layerwise_recurrent_passes_carry_hidden_states() -> None:
     torch.manual_seed(0)
     model = _tiny_model(num_passes=2, layerwise=True).eval()
     _turn_on_recurrence(model)
-    delayed = model.delayed_copy(heads=True)
+    delayed = model.delayed_copy().eval()
     batch = _token_batch(model, _BATCH)
     with torch.no_grad():
         out = model(batch)
-        for p in out.passes:
-            assert p.hidden_states is not None and len(p.hidden_states) == 2
-            target = delayed(
-                last_hidden_state=p.last_hidden_state,
-                head_output_indices=out.head_output_indices,
-                hidden_states=p.hidden_states,
-            )
-            assert torch.allclose(
-                p.predictions["action_value_layerwise"],
-                target.predictions["action_value_layerwise"],
-                atol=1e-5,
-            )
+        delayed_out = delayed(batch)
+    for p, target in zip(out.passes, delayed_out.passes, strict=True):
+        assert p.hidden_states is not None and len(p.hidden_states) == 2
+        assert torch.allclose(
+            p.predictions["action_value_layerwise"],
+            target.predictions["action_value_layerwise"],
+            atol=1e-5,
+        )
 
 
 def test_mean_loss_over_passes_trains() -> None:
     torch.manual_seed(0)
     model = _tiny_model(num_passes=3).train()
     _turn_on_recurrence(model)
-    delayed = model.delayed_copy(heads=True)
+    delayed = model.delayed_copy()
     batch = [[{**row, "task_done": 0} for row in seq] for seq in _BATCH]
     assert model.encoder is not None
     tok = tok_from_encoder(
@@ -275,13 +271,11 @@ def test_mean_loss_over_passes_trains() -> None:
     inputs, objective_data = batch_to_packed(tok, batch, grouping_field="task_index")
     objective = DqnObjective(gamma_step=1.0, grouping_field="task_index")
     out = model(inputs)
+    with torch.no_grad():
+        delayed_out = delayed(inputs)
     losses = []
-    for p in out.passes:
-        with torch.no_grad():
-            target = delayed(
-                last_hidden_state=p.last_hidden_state,
-                head_output_indices=out.head_output_indices,
-            )
+    metrics: dict[str, float] = {}
+    for p, target in zip(out.passes, delayed_out.passes, strict=True):
         step_loss, metrics = objective(objective_data, p.predictions, target.predictions)
         losses.append(step_loss)
     loss = torch.stack(losses).mean()
@@ -340,7 +334,7 @@ def test_save_load_roundtrip_keeps_recurrence(tmp_path) -> None:
     save_model(model, tmp_path)
     config = json.loads((tmp_path / "config.json").read_text())
     assert config["recurrence"] == {"num_passes": 3}
-    loaded = load_model(str(tmp_path)).eval()
+    loaded = load_model(str(tmp_path), train_kernel="varlen", decode_kernel="flex", dtype=torch.float32).eval()
     assert loaded.recurrence is not None and loaded.recurrence.num_passes == 3
     batch = _token_batch(model, _BATCH)
     with torch.no_grad():

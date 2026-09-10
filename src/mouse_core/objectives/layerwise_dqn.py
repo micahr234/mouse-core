@@ -83,8 +83,8 @@ class LayerwiseDqnObjective(Objective):
     (one row per head-output token; ``objective_data["head_output_count"]`` maps
     rows to steps). Every head-output row of step ``i`` trains toward the same
     per-layer target; the bootstrap reads step ``i+1``'s last head-output row.
-    Delayed Q comes from a delayed :class:`~mouse_core.models.base.Model`
-    and is detached
+    Delayed Q comes from the delayed :class:`~mouse_core.models.base.Model`
+    (``model.delayed_copy()``) run on the same ``TokenBatch`` and is detached
     before the Bellman target, so the TD error does not backprop through it.
     Each layer and each episode/task done-code uses its own discount, built at construction
     from explicit shallow/deep endpoint pairs. A run is the same
@@ -240,8 +240,10 @@ class LayerwiseDqnObjective(Objective):
         self,
         objective_data: TensorDict,
         predictions: TensorDict,
-        delayed_predictions: TensorDict,
+        delayed_predictions: TensorDict | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
+        if delayed_predictions is None:
+            raise ValueError("LayerwiseDqnObjective requires delayed_predictions.")
         q: torch.Tensor = predictions["action_value_layerwise"]
         q_target: torch.Tensor = delayed_predictions["action_value_layerwise"].detach()
 

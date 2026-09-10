@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from typing import cast
+
 import pytest
 import torch
+import torch.nn as nn
 
 from mouse_core.data import NumericTokenizer
 from mouse_core.models.embedding import NumericEmbedder
@@ -169,7 +172,7 @@ def test_numeric_embedder_rejects_unknown_constructor_kwargs() -> None:
         NumericEmbedder(
             hidden_dim=8,
             modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}],
-            include_type_token=True,
+            **{"include_type_token": True},
         )
 
 
@@ -295,14 +298,14 @@ def test_numeric_embedder_requires_positions_per_modality() -> None:
     with pytest.raises(TypeError):
         NumericEmbedder(
             hidden_dim=8,
-            std=0.02,
             modalities=[{"type": "fourier", "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0}],
+            **{"std": 0.02},
         )
     with pytest.raises(TypeError):
         NumericEmbedder(
             hidden_dim=8,
-            fourier_min=0.01,
             modalities=[{"type": "fourier", "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0}],
+            **{"fourier_min": 0.01},
         )
 
 
@@ -372,8 +375,10 @@ def test_numeric_embedder_std_scales_tables_and_type_vectors() -> None:
         ],
     )
     for name, std in (("action", 0.02), ("observation", 0.5)):
-        table_rms = float(encoder._tables[name].weight.pow(2).mean().sqrt().item())
-        type_rms = float(encoder._type_vectors[name].pow(2).mean().sqrt().item())
+        table = cast(nn.Embedding, encoder._tables[name])
+        type_vec = cast(torch.Tensor, encoder._type_vectors[name])
+        table_rms = float(table.weight.pow(2).mean().sqrt().item())
+        type_rms = float(type_vec.pow(2).mean().sqrt().item())
         assert table_rms == pytest.approx(std, rel=0.1)
         assert type_rms == pytest.approx(std, rel=0.2)
 
@@ -599,11 +604,12 @@ def test_numeric_embedder_type_vectors_are_per_position_for_learnable() -> None:
     torch.manual_seed(0)
     encoder = _enc(hidden_dim=8, modalities=[{"type": "learnable", "tokens": 3, "std": 0.02, "positions": 3}])
     name = encoder.modalities[0].field
+    assert isinstance(name, str)
     assert encoder._type_vectors[name].shape == (3, 8)
     tb = _tb(encoder, [[{}]])
     assert tb.positions.tolist() == [0, 1, 2]
     embeds, _ = encoder(tb)
-    content = encoder._tables[name](torch.arange(3))
+    content = cast(nn.Embedding, encoder._tables[name])(torch.arange(3))
     assert torch.allclose(embeds, content + encoder._type_vectors[name])
 
 

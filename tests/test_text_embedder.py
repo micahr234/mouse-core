@@ -2,6 +2,8 @@ from __future__ import annotations
 
 """Tests for TextEmbedder / TextTokenizer (fake tokenizer / embeddings, no Hub)."""
 
+from typing import Any
+
 import torch
 import torch.nn as nn
 from mouse_core.data import TextTokenizer
@@ -19,7 +21,7 @@ class _FakeTokenizer:
         return {"input_ids": torch.tensor([ids], dtype=torch.long)}
 
 
-_DEFAULT_FIELDS = [
+_DEFAULT_FIELDS: list[dict[str, Any]] = [
     {"type": "token", "input_field": "action"},
     {"type": "text", "input_field": "observation", "format": "observation={observation}"},
     {"type": "text", "input_field": "reward", "format": "reward={reward}", "skip": 0.0},
@@ -28,8 +30,8 @@ _DEFAULT_FIELDS = [
 _DEFAULT_FORMAT = "<action={action},{observation},{reward},{episode_done}>"
 
 
-def _tokenizer_fields(fields: list[dict], head_output: str = "action") -> list[dict]:
-    out: list[dict] = []
+def _tokenizer_fields(fields: list[dict[str, Any]], head_output: str = "action") -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
     for field in fields:
         data = dict(field)
         if data.get("input_field") == head_output:
@@ -306,7 +308,7 @@ def test_text_embedder_save_load(tmp_path) -> None:
     model.eval()
     expected = model(batch_to_token_batch(tokenizer, batch)).predictions
     save_model(model, tmp_path)
-    loaded = load_model(tmp_path).eval()
+    loaded = load_model(tmp_path, train_kernel="varlen", decode_kernel="flex", dtype=torch.float32).eval()
     assert isinstance(loaded.encoder, TextEmbedder)
     assert loaded.encoder.vocab_size == 32
     assert torch.equal(loaded.encoder.embed_tokens.weight, emb.weight)
@@ -348,7 +350,8 @@ def test_text_embedder_learnable_save_load(tmp_path) -> None:
     from mouse_core.models import load_model, save_model
 
     save_model(model, tmp_path)
-    loaded = load_model(tmp_path).eval()
+    loaded = load_model(tmp_path, train_kernel="varlen", decode_kernel="flex", dtype=torch.float32).eval()
+    assert isinstance(loaded.encoder, TextEmbedder)
     assert len(loaded.encoder.learnable) == 1
     actual = loaded(batch_to_token_batch(tokenizer, batch)).predictions
     assert torch.allclose(actual["action_value"], expected["action_value"])
@@ -428,6 +431,7 @@ def test_text_tokenizer_group_prefix_carried_on_step() -> None:
     tok = _group_prefix_tokenizer()
     st = tok({"action": 1, "task_index": 7})
     assert st.group_prefix_ids is not None
+    assert st.group_prefix_modality_ids is not None
     expected = _FakeTokenizer()("task=7\n")["input_ids"].view(-1).tolist()
     assert st.group_prefix_ids.tolist() == expected
     assert st.group_prefix_modality_ids.tolist() == [0] * len(expected)
@@ -444,7 +448,9 @@ def test_pack_emits_group_prefix_once_per_grouping_segment() -> None:
         tok({"action": 3, "task_index": 1}),
     ]
     inputs, obj = pack_token_batch(steps, sequence_ids=[0, 0, 0], batch_size=1)
-    p = int(steps[0].group_prefix_ids.shape[0])
+    prefix = steps[0].group_prefix_ids
+    assert prefix is not None
+    p = int(prefix.shape[0])
     assert inputs.L == p + steps[0].T + steps[1].T + p + steps[2].T
     assert obj["action"].tolist() == [1, 2, 3]
     assert inputs.head_output_indices.tolist() == [
@@ -468,7 +474,9 @@ def test_pack_group_prefix_is_per_sequence() -> None:
         tok({"action": 2, "task_index": 0}),
     ]
     inputs, _ = pack_token_batch(steps, sequence_ids=[0, 1], batch_size=2)
-    p = int(steps[0].group_prefix_ids.shape[0])
+    prefix = steps[0].group_prefix_ids
+    assert prefix is not None
+    p = int(prefix.shape[0])
     assert inputs.L == (p + steps[0].T) + (p + steps[1].T)
     assert inputs.sequence_ids.tolist() == (
         [0] * (p + steps[0].T) + [1] * (p + steps[1].T)
@@ -481,7 +489,9 @@ def test_pack_prev_grouping_ids_suppresses_and_reemits_group_prefix() -> None:
     tok = _group_prefix_tokenizer()
     continue_step = tok({"action": 1, "task_index": 5})
     change_step = tok({"action": 2, "task_index": 6})
-    p = int(continue_step.group_prefix_ids.shape[0])
+    prefix = continue_step.group_prefix_ids
+    assert prefix is not None
+    p = int(prefix.shape[0])
 
     same, _ = pack_token_batch(
         [continue_step],
@@ -536,6 +546,7 @@ def test_text_tokenizer_group_prefix_without_text_fields_adds_text_modality() ->
     assert "__text__" in tok.modality_names
     st = tok({"task_index": 3})
     assert st.group_prefix_ids is not None
+    assert st.group_prefix_modality_ids is not None
     assert st.T == 1
     assert st.modality_names[int(st.group_prefix_modality_ids[0])] == "__text__"
 

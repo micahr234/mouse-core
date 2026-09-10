@@ -8,24 +8,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import torch
 from transformers import Qwen3Config, Qwen3Model
 
 from mouse_core.models.backbone.base import (
     Backbone,
+    DecodeKernel,
+    TrainKernel,
+    _disable_cudnn_sdp,
     _load_transformer_weights,
     _rope_parameters_from_config,
 )
 from mouse_core.models.lora import LoRAConfig
-
-
-def _disable_cudnn_sdp() -> None:
-    """Disable the cuDNN SDPA backend to avoid driver-specific errors."""
-    enable_cudnn_sdp = getattr(torch.backends.cuda, "enable_cudnn_sdp", None)
-    if enable_cudnn_sdp is not None:
-        enable_cudnn_sdp(enabled=False)
 
 
 @dataclass
@@ -119,14 +115,25 @@ class _Qwen3BackboneConfig:
 class Qwen3Backbone(Backbone):
     """Backbone adapter wrapping a ``transformers.Qwen3Model``.
 
+    ``train_kernel`` (``"varlen"`` / ``"flex"``), ``decode_kernel``
+    (``"flex"``) and ``dtype`` are required: the uncached-forward kernel, the
+    cached-decode kernel, and the dtype of the base weights (``torch.float32``
+    to fine-tune them, ``preferred_dtype(device)`` for a frozen LoRA base or
+    inference). See ``Backbone``. ``Model.to(device)`` moves and never casts.
+
     Without ``lora`` the backbone is fully trainable (keep the model fp32).
     Pass ``lora=LoRAConfig(...)`` to freeze the base weights (bf16 on CUDA)
     and train fp32 LoRA adapters on the attention / MLP projections instead.
     """
 
+    model: Qwen3Model
+
     def __init__(
         self,
         *,
+        train_kernel: TrainKernel,
+        decode_kernel: DecodeKernel,
+        dtype: torch.dtype,
         model: Qwen3Model | None = None,
         hidden_dim: int | None = None,
         pretrained: str | Path | None = None,
@@ -136,6 +143,9 @@ class Qwen3Backbone(Backbone):
         **config_kwargs: Any,
     ) -> None:
         super().__init__()
+        self._set_kernels(train_kernel, decode_kernel)
+        if not isinstance(dtype, torch.dtype) or not dtype.is_floating_point:
+            raise TypeError(f"dtype must be a floating point torch.dtype, got {dtype!r}.")
         if model is not None and pretrained is not None:
             raise TypeError("Qwen3Backbone accepts either model= or pretrained=, not both.")
 
@@ -175,6 +185,7 @@ class Qwen3Backbone(Backbone):
             self.model = _Qwen3BackboneConfig(**config_kwargs).build(hidden_dim)
             self._config_kwargs = self._config_kwargs_from_model(self.model)
 
+        cast(torch.nn.Module, self.model).to(dtype)  # base weights; LoRA adapters below are always fp32
         self._attach_lora(self.model, lora)
 
     @staticmethod

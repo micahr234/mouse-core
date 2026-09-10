@@ -8,7 +8,7 @@ MOUSE is actively developed and contributions are very welcome — whether that'
 - **Feature requests** — open an issue describing the use case. If you have a design idea, sketching it out in the issue first helps align before writing code.
 - **Pull requests** — see the workflow below.
 - **Experiments and results** — if you run MOUSE on a new environment or task, sharing results (even negative ones) as an issue or discussion is valuable.
-- **Documentation** — edits to Markdown under `docs/` or the README are welcome (no doc site build step).
+- **Documentation** — edits to the README or inline notebook docs are welcome.
 
 ## Development setup
 
@@ -44,12 +44,12 @@ Notebooks under [`examples/`](examples/) are committed **without** cell outputs.
    ```
 4. Open a pull request against `main` with a clear description of what changed and why.
 
-If you add a new feature, include a short usage example in the PR description or in the relevant `docs/` page / `examples/`.
+If you add a new feature, include a short usage example in the PR description or in `examples/`.
 
 ## Code style
 
 - Python 3.14+ (free-threaded `3.14t` for multi-worker DataLoader), type-annotated throughout.
-- Follow the existing patterns: base classes in `base.py`, public API in `__init__.py`, documentation in `docs/`.
+- Follow the existing patterns: base classes in `base.py`, public API in `__init__.py`, usage in `examples/`.
 - Avoid silent fallbacks — if a precondition isn't met, raise a clear error.
 - Comments should explain *why*, not *what*.
 

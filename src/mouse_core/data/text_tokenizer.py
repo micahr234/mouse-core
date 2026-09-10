@@ -59,7 +59,7 @@ class TextTokenizer:
     def __init__(
         self,
         *,
-        input_fields: list[dict | TextTokenizerModalitySpec] | None = None,
+        input_fields: Sequence[dict | TextTokenizerModalitySpec] | None = None,
         grouping_field: str,
         format: str | None = None,
         group_prefix: str | None = None,
@@ -79,11 +79,6 @@ class TextTokenizer:
                 spec = m
             else:
                 data = dict(m)
-                if "field" in data and "input_field" not in data:
-                    raise TypeError(
-                        "tokenizer input_fields use input_field=/output_field= "
-                        "(not field=)"
-                    )
                 spec = TextTokenizerModalitySpec(**data)
             specs.extend(expand_tokenizer_text_spec(spec, learnable_index=n_learnable))
             if spec.type == "learnable":

@@ -1,5 +1,6 @@
 from __future__ import annotations
 from pathlib import Path
+from typing import Any, cast
 import tempfile
 import pytest
 from datasets import Dataset
@@ -179,7 +180,7 @@ def test_push_stores_to_hub_pushes_one_config_per_store(monkeypatch: pytest.Monk
 
 def test_delete_dataset_repo_if_exists_scopes_short_names() -> None:
     api = _FakeHfApi()
-    assert hub._delete_dataset_repo_if_exists(api, 'test-dataset') == 'user/test-dataset'
+    assert hub._delete_dataset_repo_if_exists(cast(Any, api), 'test-dataset') == 'user/test-dataset'
     assert api.deleted_repos == ['user/test-dataset']
 
 def test_card_with_viewer_sets_true_and_false() -> None:

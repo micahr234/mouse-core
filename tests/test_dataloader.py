@@ -19,6 +19,8 @@ from mouse_core.data import (
     NumericTokenizer,
     compose,
 )
+from tensordict import TensorDict
+
 from mouse_core.data.token_batch import StepTokens, TokenBatch
 from mouse_core.models.embedding import NumericEmbedder
 from tests._token_batch_helpers import tok_from_encoder
@@ -264,7 +266,7 @@ def test_dataloader_snapshots_loaded_source_and_appended_rows() -> None:
     assert set(actions) <= {1, 2, 3}
 
 
-def _tb_signature(packed: tuple[TokenBatch, object]) -> tuple:
+def _tb_signature(packed: tuple[TokenBatch, TensorDict]) -> tuple:
     tb, obj = packed
     return (
         tb.B,

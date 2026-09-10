@@ -497,10 +497,6 @@ def _coerce_field(spec: Mapping[str, Any] | SequenceAugmentFieldSpec) -> Sequenc
     if isinstance(spec, SequenceAugmentFieldSpec):
         return spec
     data = dict(spec)
-    if "field" in data and "input_field" not in data:
-        raise TypeError(
-            "Augmenter fields use input_field= (optional output_field=; not field=)"
-        )
     return SequenceAugmentFieldSpec(**data)
 
 

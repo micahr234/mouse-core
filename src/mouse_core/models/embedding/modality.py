@@ -166,14 +166,14 @@ def expand_embedder_numeric_spec(
 
 
 def _coerce_numeric_modalities(
-    modalities: list[dict[str, Any] | NumericEmbedderModalitySpec]
+    modalities: Sequence[dict[str, Any] | NumericEmbedderModalitySpec]
     | Mapping[str, dict[str, Any]]
     | None,
 ) -> list[dict[str, Any] | NumericEmbedderModalitySpec]:
     if modalities is None:
         return []
     if isinstance(modalities, Mapping):
-        out: list[dict[str, Any]] = []
+        out: list[dict[str, Any] | NumericEmbedderModalitySpec] = []
         for name, cfg in modalities.items():
             data = dict(cfg)
             data.setdefault("field", name)
@@ -183,7 +183,7 @@ def _coerce_numeric_modalities(
 
 
 def resolve_embedder_numeric_modalities(
-    modalities: list[dict[str, Any] | NumericEmbedderModalitySpec]
+    modalities: Sequence[dict[str, Any] | NumericEmbedderModalitySpec]
     | Mapping[str, dict[str, Any]]
     | None = None,
 ) -> tuple[list[NumericEmbedderModalitySpec], list[EmbedderModalityMeta]]:

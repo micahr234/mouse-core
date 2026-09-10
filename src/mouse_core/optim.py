@@ -21,8 +21,8 @@ def _trainable(params: Iterable[nn.Parameter]) -> list[nn.Parameter]:
         if p.dtype != torch.float32:
             raise TypeError(
                 f"AdamW trains fp32 parameters only, got a trainable {p.dtype} parameter "
-                f"of shape {tuple(p.shape)}. Keep the model fp32 (model.to(device)) to "
-                "fine-tune the backbone, or freeze it with lora= before casting to bf16."
+                f"of shape {tuple(p.shape)}. Build the backbone with dtype=torch.float32 to "
+                "fine-tune it, or freeze it with lora= to use a bf16 base."
             )
     return trainable
 

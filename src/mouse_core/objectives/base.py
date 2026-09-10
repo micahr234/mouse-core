@@ -17,6 +17,7 @@ Example — custom objective::
             self,
             objective_data: TensorDict,
             predictions: TensorDict,
+            delayed_predictions: TensorDict | None = None,
         ) -> tuple[torch.Tensor, dict[str, float]]:
             ...
             return loss, {"my_objective": loss.item()}
@@ -42,6 +43,7 @@ class Objective(ABC):
         self,
         objective_data: TensorDict,
         predictions: TensorDict,
+        delayed_predictions: TensorDict | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         """Compute a scalar loss and return diagnostic metrics.
 
@@ -51,6 +53,8 @@ class Objective(ABC):
                 keyed by flat step index with ``sequence_id``.
             predictions: ``TensorDict[N]`` of model head outputs from
                 :meth:`~mouse_core.models.base.Model.forward`.
+            delayed_predictions: Delayed-model head outputs. Required by DQN
+                family objectives; ignored by the others.
 
         Returns:
             ``(scalar_loss, metrics)`` where ``metrics`` is a ``dict[str, float]``

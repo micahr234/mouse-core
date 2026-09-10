@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import cast
+from typing import Any, cast
 import json
 import pytest
 import torch
@@ -23,7 +23,7 @@ def test_composed_model_roundtrip(tmp_path) -> None:
     batch = [[{'action': 0, 'reward': 0.0, 'episode_done': 0, 'task_done': 0}, {'action': 1, 'reward': 1.0, 'episode_done': 0, 'task_done': 0}, {'action': 2, 'reward': 2.0, 'episode_done': 1, 'task_done': 0}]]
     expected = model(batch_to_token_batch(_tok(model.encoder), batch)).predictions
     save_model(model, tmp_path)
-    loaded = load_model(tmp_path).eval()
+    loaded = load_model(tmp_path, train_kernel="varlen", decode_kernel="flex", dtype=torch.float32).eval()
     actual = loaded(batch_to_token_batch(_tok(loaded.encoder), batch)).predictions
     assert torch.allclose(actual['action_value'], expected['action_value'])
     assert loaded.hidden_dim == hidden_dim
@@ -50,6 +50,32 @@ def test_composed_model_roundtrip(tmp_path) -> None:
     assert all('fourier_min' not in m for m in enc_kwargs['modalities'] if m['type'] != 'fourier')
     assert 'modality_fusion' not in enc_kwargs
     assert 'include_type_token' not in enc_kwargs
+
+def test_kernels_and_dtype_are_not_saved_and_come_from_the_loader(tmp_path) -> None:
+    hidden_dim = 8
+    encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}])
+    backbone = Qwen3Backbone(train_kernel="varlen", decode_kernel="flex", dtype=torch.float32, hidden_dim=hidden_dim, num_layers=1, num_heads=2)
+    heads = DiscreteActionValueHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1)
+    save_model(Model(encoder=encoder, backbone=backbone, heads=heads), tmp_path)
+    with (tmp_path / 'config.json').open() as fh:
+        cfg = json.load(fh)['backbone']
+    assert 'train_kernel' not in cfg and 'decode_kernel' not in cfg and 'dtype' not in cfg
+    loaded = cast(Qwen3Backbone, load_model(tmp_path, train_kernel="flex", decode_kernel="flex", dtype=torch.float32).backbone)
+    assert (loaded.train_kernel, loaded.decode_kernel) == ('flex', 'flex')
+    with pytest.raises(TypeError, match="train_kernel.*decode_kernel.*dtype"):
+        load_model(tmp_path)  # type: ignore[call-arg]
+
+
+def test_transformer_backbone_requires_kernels_and_dtype() -> None:
+    with pytest.raises(TypeError, match="train_kernel.*decode_kernel.*dtype"):
+        Qwen3Backbone(hidden_dim=8, num_layers=1, num_heads=2)  # type: ignore[call-arg]
+    with pytest.raises(ValueError, match="train_kernel"):
+        Qwen3Backbone(train_kernel=cast(Any, "sdpa"), decode_kernel="flex", dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2)
+    with pytest.raises(ValueError, match="decode_kernel"):
+        Qwen3Backbone(train_kernel="varlen", decode_kernel=cast(Any, "sdpa"), dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2)
+    with pytest.raises(TypeError, match="dtype"):
+        Qwen3Backbone(train_kernel="varlen", decode_kernel="flex", dtype=torch.int8, hidden_dim=8, num_layers=1, num_heads=2)
+
 
 def test_roundtrip_multi_field_spec_before_learnable(tmp_path) -> None:
     """Learnable table names must not depend on the raw (unexpanded) spec index."""
@@ -83,7 +109,7 @@ def test_roundtrip_multi_field_spec_before_learnable(tmp_path) -> None:
     batch = [[{'action': 0, 'prev_action': 1, 'reward': 0.5, 'task_index': 0}, {'action': 2, 'prev_action': 0, 'reward': 1.0, 'task_index': 0}]]
     expected = model(batch_to_token_batch(tokenizer, batch, grouping_field="task_index")).predictions
     save_model(model, tmp_path)
-    loaded = load_model(tmp_path).eval()
+    loaded = load_model(tmp_path, train_kernel="varlen", decode_kernel="flex", dtype=torch.float32).eval()
     assert set(model.state_dict()) == set(loaded.state_dict())
     actual = loaded(batch_to_token_batch(tokenizer, batch, grouping_field="task_index")).predictions
     assert torch.allclose(actual['action_value'], expected['action_value'])
@@ -100,12 +126,15 @@ def test_composed_model_roundtrip_static_fourier(tmp_path) -> None:
     batch = [[{'action': 1, 'reward': 0.5}, {'action': 2, 'reward': -0.1}]]
     expected = model(batch_to_token_batch(_tok(model.encoder), batch)).predictions
     save_model(model, tmp_path)
-    loaded = load_model(tmp_path).eval()
+    loaded = load_model(tmp_path, train_kernel="varlen", decode_kernel="flex", dtype=torch.float32).eval()
     actual = loaded(batch_to_token_batch(_tok(loaded.encoder), batch)).predictions
     assert torch.allclose(actual['action_value'], expected['action_value'])
     enc = cast(NumericEmbedder, model.encoder)
     loaded_enc = cast(NumericEmbedder, loaded.encoder)
-    assert torch.equal(enc.fourier["reward"].freqs, loaded_enc.fourier["reward"].freqs)
+    assert torch.equal(
+        cast(Any, enc.fourier["reward"]).freqs,
+        cast(Any, loaded_enc.fourier["reward"]).freqs,
+    )
 
 def test_model_card_includes_usage_and_architecture(tmp_path) -> None:
     model = Model(encoder=NumericEmbedder(hidden_dim=8, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}, {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3, "std": 0.02, "positions": 1}]), backbone=IdentityBackbone(hidden_dim=8), heads=DiscreteActionValueHead(in_features=8, out_features=4, hidden_dim=8, num_layers=1))
@@ -119,7 +148,7 @@ def test_model_card_includes_usage_and_architecture(tmp_path) -> None:
     assert text.index('## Load The Model') < text.index('## Run Inference')
     assert 'What This Contains' not in text
     assert 'pip install mouse-core' in text
-    assert 'load_model("user/mouse-example-model"' in text
+    assert 'load_model(' in text and 'train_kernel="varlen"' in text and 'decode_kernel="flex"' in text and 'dtype=preferred_dtype(device)' in text
     assert 'NumericTokenizer' in text
     assert '| `action` | `discrete` | `[B, S]` | `torch.long` | integer ids in `[0, 3]` |' in text
     assert 'Fourier range `[0.01, 10.0]`' in text
@@ -137,8 +166,30 @@ def test_model_card_includes_usage_and_architecture(tmp_path) -> None:
     assert 'Backbone: `identity`' in text
     assert 'Heads: `action_value`' in text
 
+
+def _lora_model(dtype: torch.dtype) -> Model:
+    hidden_dim = 8
+    encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}, {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3, "std": 0.02, "positions": 1}])
+    backbone = Qwen3Backbone(train_kernel="varlen", decode_kernel="flex", dtype=dtype, hidden_dim=hidden_dim, num_layers=1, num_heads=2, lora=LoRAConfig(rank=2))
+    heads = DiscreteActionValueHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1)
+    return Model(encoder=encoder, backbone=backbone, heads=heads).eval()
+
+
+def test_backbone_dtype_applies_to_base_only_and_trainable_sections_stay_float32() -> None:
+    model = _lora_model(torch.bfloat16)
+    assert {p.dtype for p in model.encoder.parameters()} == {torch.float32}
+    assert {p.dtype for p in model.heads.parameters()} == {torch.float32}
+    assert {p.dtype for p in model.backbone.parameters() if not p.requires_grad} == {torch.bfloat16}
+    assert {p.dtype for p in model.backbone.parameters() if p.requires_grad} == {torch.float32}
+    assert model.backbone.dtype == torch.bfloat16
+    batch = [[{'action': 0, 'reward': 0.5, 'episode_done': 0, 'task_done': 0}, {'action': 1, 'reward': 1.0, 'episode_done': 0, 'task_done': 0}]]
+    with torch.no_grad():
+        preds = model(batch_to_token_batch(_tok(model.encoder), batch)).predictions
+    assert preds['action_value'].dtype == torch.float32
+
+
 @pytest.mark.parametrize(
-    "cast",
+    "cast_fn",
     [
         lambda m: m.to(torch.bfloat16),
         lambda m: m.to(dtype=torch.bfloat16),
@@ -146,36 +197,40 @@ def test_model_card_includes_usage_and_architecture(tmp_path) -> None:
         lambda m: m.to(device="cpu", dtype=torch.bfloat16),
         lambda m: m.to(torch.zeros(1, dtype=torch.bfloat16)),
         lambda m: m.bfloat16(),
-        lambda m: m.to(dtype=torch.bfloat16).to("cpu"),
+        lambda m: m.half(),
+        lambda m: m.double(),
+        lambda m: m.float(),
+        lambda m: m.backbone.to(dtype=torch.bfloat16),
+        lambda m: m.backbone.bfloat16(),
     ],
-    ids=["pos-dtype", "kw-dtype", "pos-device-dtype", "kw-device-dtype", "tensor", "bfloat16()", "then-device"],
+    ids=["pos-dtype", "kw-dtype", "pos-device-dtype", "kw-device-dtype", "tensor", "bfloat16()", "half()", "double()", "float()", "backbone-to", "backbone-bfloat16()"],
 )
-def test_model_to_every_form_keeps_trainable_sections_float32(cast) -> None:
-    hidden_dim = 8
-    encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}, {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0}])
-    backbone = Qwen3Backbone(hidden_dim=hidden_dim, num_layers=1, num_heads=2, lora=LoRAConfig(rank=2))
-    heads = DiscreteActionValueHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1)
-    model = cast(Model(encoder=encoder, backbone=backbone, heads=heads).eval())
-    assert {p.dtype for p in model.encoder.parameters()} == {torch.float32}
-    assert {p.dtype for p in model.heads.parameters()} == {torch.float32}
-    assert {p.dtype for p in model.backbone.parameters() if not p.requires_grad} == {torch.bfloat16}
-    assert {p.dtype for p in model.backbone.parameters() if p.requires_grad} == {torch.float32}
-    assert model.backbone.dtype == torch.bfloat16
-    batch = [[{'action': 0, 'reward': 0.5, 'task_index': 0}, {'action': 1, 'reward': 1.0, 'task_index': 0}]]
-    with torch.no_grad():
-        preds = model(batch_to_token_batch(_tok(model.encoder), batch)).predictions
-    assert preds['action_value'].dtype == torch.float32
+def test_model_and_backbone_refuse_dtype_casts(cast_fn) -> None:
+    """dtype is a backbone constructor argument; ``.to`` only moves."""
+    model = _lora_model(torch.float32)
+    with pytest.raises(TypeError, match="dtype"):
+        cast_fn(model)
+    assert model.backbone.dtype == torch.float32
+    model.to("cpu")  # device-only moves still work
+    model.to(device="cpu")
 
 
-def test_model_to_bfloat16_cuda_keeps_trainable_sections_float32() -> None:
+def test_load_model_casts_saved_weights_into_requested_dtype(tmp_path) -> None:
+    model = _lora_model(torch.bfloat16)
+    save_model(model, tmp_path)
+    loaded = load_model(tmp_path, train_kernel="varlen", decode_kernel="flex", dtype=torch.float32)
+    assert loaded.backbone.dtype == torch.float32
+    assert {p.dtype for p in loaded.backbone.parameters()} == {torch.float32}
+    saved: dict[str, torch.Tensor] = {n: cast(torch.Tensor, p) for n, p in model.backbone.named_parameters()}
+    for n, p in loaded.backbone.named_parameters():
+        if not p.requires_grad:
+            assert torch.equal(cast(torch.Tensor, p), saved[n].float())
+
+
+def test_model_to_cuda_moves_without_casting() -> None:
     if not torch.cuda.is_available():
         pytest.skip('CUDA required')
-    hidden_dim = 8
-    encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}, {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3, "std": 0.02, "positions": 1}])
-    backbone = Qwen3Backbone(hidden_dim=hidden_dim, num_layers=1, num_heads=2, lora=LoRAConfig(rank=2))
-    heads = DiscreteActionValueHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1)
-    model = Model(encoder=encoder, backbone=backbone, heads=heads).eval()
-    model = model.to(device=torch.device('cuda'), dtype=torch.bfloat16)
+    model = _lora_model(torch.bfloat16).to(torch.device('cuda'))
     assert next(model.encoder.parameters()).dtype == torch.float32
     assert model.backbone.dtype == torch.bfloat16
     assert {p.dtype for p in model.backbone.parameters() if p.requires_grad} == {torch.float32}
@@ -184,3 +239,4 @@ def test_model_to_bfloat16_cuda_keeps_trainable_sections_float32() -> None:
     with torch.no_grad():
         preds = model(batch_to_token_batch(_tok(model.encoder), batch), use_cache=True).predictions
     assert preds['action_value'].dtype == torch.float32
+

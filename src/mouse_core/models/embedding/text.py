@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -43,7 +44,7 @@ class TextEmbedder(Encoder):
         padding_idx: int | None = None,
         hub_kwargs: dict | None = None,
         freeze_embeddings: bool = False,
-        learnable: list[dict[str, Any] | NumericEmbedderModalitySpec] | None = None,
+        learnable: Sequence[dict[str, Any] | NumericEmbedderModalitySpec] | None = None,
     ) -> None:
         super().__init__()
         self._hidden_dim = int(hidden_dim)
@@ -136,7 +137,7 @@ class TextEmbedder(Encoder):
         modality_ids = t["modality_ids"]
         names: tuple[str, ...] = t["modality_names"]
         batch_map: dict[str, ModalityInfo] = t["modality_map"]
-        learnable_names = {spec.field for spec in self.learnable}
+        learnable_names = {str(spec.field) for spec in self.learnable}
 
         for name in names:
             info = batch_map[name]
@@ -188,7 +189,7 @@ class TextEmbedder(Encoder):
 
 
 def _coerce_text_learnable(
-    learnable: list[dict[str, Any] | NumericEmbedderModalitySpec] | None,
+    learnable: Sequence[dict[str, Any] | NumericEmbedderModalitySpec] | None,
 ) -> list[NumericEmbedderModalitySpec]:
     raw = learnable or []
     specs: list[NumericEmbedderModalitySpec] = []

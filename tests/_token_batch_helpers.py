@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import asdict, is_dataclass
+from typing import Any, cast
 
 from tensordict import TensorDict
 
@@ -13,15 +14,15 @@ from mouse_core.data.token_batch import StepTokens, TokenBatch
 DEFAULT_GROUPING_FIELD = "grouping_id"
 
 
-def _tokenizer_input_fields_from_encoder(encoder) -> list[dict]:
+def _tokenizer_input_fields_from_encoder(encoder) -> list[dict[str, Any]]:
     """Map embedder modality specs to tokenizer packing specs (by name).
 
     The last modality is flagged ``head_output=True`` (tokenizers require
     exactly one head-output field; tests list the readout modality last).
     """
-    out: list[dict] = []
+    out: list[dict[str, Any]] = []
     for m in encoder.modalities:
-        data = asdict(m) if is_dataclass(m) else dict(m)
+        data = asdict(cast(Any, m)) if is_dataclass(m) else dict(m)
         kind = str(data["type"]).lower()
         if kind == "learnable":
             entry = {"type": "learnable", "tokens": data.get("tokens")}
@@ -47,24 +48,27 @@ def tok_from_encoder(
     encoder,
     *,
     grouping_field: str = DEFAULT_GROUPING_FIELD,
-    objective_fields: list[dict[str, str]] | list[str] | None = None,
+    objective_fields: list[dict[str, Any]] | list[str] | None = None,
     **kwargs,
 ) -> NumericTokenizer:
     # Default keep-list: non-learnable modality names (common for tests/objectives).
+    resolved: list[dict[str, Any]]
     if objective_fields is None:
-        objective_fields = []
+        resolved = []
         for m in encoder.modalities:
-            data = asdict(m) if is_dataclass(m) else dict(m)
+            data = asdict(cast(Any, m)) if is_dataclass(m) else dict(m)
             if str(data["type"]).lower() == "learnable":
                 continue
             name = data.get("field")
             if isinstance(name, str):
-                objective_fields.append({"input_field": name})
+                resolved.append({"input_field": name})
     elif objective_fields and isinstance(objective_fields[0], str):
-        objective_fields = [{"input_field": name} for name in objective_fields]
+        resolved = [{"input_field": name} for name in cast(list[str], objective_fields)]
+    else:
+        resolved = cast(list[dict[str, Any]], objective_fields)
     return NumericTokenizer(
         input_fields=_tokenizer_input_fields_from_encoder(encoder),
-        objective_fields=objective_fields,
+        objective_fields=resolved,
         grouping_field=grouping_field,
         **kwargs,
     )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from typing import Any, cast
 
 import pytest
 import torch
@@ -40,8 +41,8 @@ _BATCH = [
 ]
 
 
-def _backbone(lora: LoRAConfig | None, *, cls=Qwen3Backbone):
-    return cls(hidden_dim=_HIDDEN, num_layers=2, num_heads=2, max_position_embeddings=64, lora=lora)
+def _backbone(lora: LoRAConfig | None, *, cls=Qwen3Backbone, dtype: torch.dtype = torch.float32):
+    return cls(train_kernel="varlen", decode_kernel="flex", dtype=dtype, hidden_dim=_HIDDEN, num_layers=2, num_heads=2, max_position_embeddings=64, lora=lora)
 
 
 def _model(
@@ -49,10 +50,11 @@ def _model(
     *,
     reasoner: bool = False,
     recurrence: bool = False,
+    dtype: torch.dtype = torch.float32,
 ) -> Model:
     return Model(
         encoder=NumericEmbedder(hidden_dim=_HIDDEN, modalities=_MODALITIES),
-        backbone=_backbone(lora),
+        backbone=_backbone(lora, dtype=dtype),
         heads=DiscreteActionValueHead(
             in_features=_HIDDEN, out_features=_ACTIONS, hidden_dim=_HIDDEN, num_layers=1
         ),
@@ -91,7 +93,8 @@ def test_apply_lora_wraps_targets_and_freezes_base() -> None:
     wrapped = apply_lora(inner, cfg)
     assert all(not p.requires_grad for n, p in inner.named_parameters() if ".lora_" not in n)
     assert wrapped == 2 * 2  # two targets per layer, two layers
-    for layer in inner.layers:
+    for raw_layer in inner.layers:
+        layer = cast(Any, raw_layer)
         assert isinstance(layer.self_attn.q_proj, LoRALinear)
         assert isinstance(layer.mlp.down_proj, LoRALinear)
         assert isinstance(layer.self_attn.k_proj, nn.Linear)
@@ -170,9 +173,45 @@ def test_only_lora_params_receive_gradients() -> None:
 # ---- Model.to precision policy -----------------------------------------------
 
 
+def test_module_device_dtype_skips_lora_adapters() -> None:
+    """Flex train/decode must not take dtype from an fp32 adapter that happens to be first."""
+    from mouse_core.models.backbone.flex_decode import module_device_dtype
+
+    class _Adapter(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(2, dtype=torch.float32))
+
+    class _Stack(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            # Register adapters first so next(parameters()) is fp32.
+            self.q_proj = nn.Module()
+            self.q_proj.lora_A = _Adapter()
+            self.q_proj.lora_B = _Adapter()
+            self.base = nn.Module()
+            self.base.weight = nn.Parameter(torch.ones(3, dtype=torch.bfloat16))
+
+    stack = _Stack()
+    first = next(stack.parameters())
+    assert first.dtype == torch.float32
+    device, dtype = module_device_dtype(stack)
+    assert dtype == torch.bfloat16
+    assert device == first.device
+
+
+def test_decode_session_dtype_skips_lora_adapters() -> None:
+    torch.manual_seed(0)
+    model = _model(dtype=torch.bfloat16)
+    assert model.backbone is not None
+    session = model.backbone.decode_session(batch_size=1)
+    assert session.dtype == torch.bfloat16
+    assert model.backbone.dtype == torch.bfloat16
+
+
 def test_model_to_bf16_keeps_every_trainable_section_fp32() -> None:
     torch.manual_seed(0)
-    model = _model(reasoner=True).to(torch.bfloat16)
+    model = _model(reasoner=True, dtype=torch.bfloat16)
     assert model.backbone is not None and model.encoder is not None and model.reasoner is not None
     assert model.backbone.dtype == torch.bfloat16
     for name, p in model.named_parameters():
@@ -186,9 +225,9 @@ def test_model_to_bf16_keeps_every_trainable_section_fp32() -> None:
 
 
 def test_bf16_backbone_forward_backward_on_cpu() -> None:
-    """fp32 encoder → bf16 backbone → fp32 heads, through the SDPA fallback."""
+    """fp32 encoder → bf16 backbone → fp32 heads, through masked SDPA on CPU."""
     torch.manual_seed(0)
-    model = _model(recurrence=True).train().to(torch.bfloat16)
+    model = _model(recurrence=True, dtype=torch.bfloat16).train()
     batch = _batch(model)
     out = model(batch)
     q = out.predictions["action_value"]
@@ -208,7 +247,7 @@ def test_bf16_backbone_forward_backward_on_cpu() -> None:
 
 def test_bf16_reasoner_forward_on_cpu() -> None:
     torch.manual_seed(0)
-    model = _model(reasoner=True).train().to(torch.bfloat16)
+    model = _model(reasoner=True, dtype=torch.bfloat16).train()
     batch = _batch(model)
     out = model(batch, reasoning=[1, -1])
     out.predictions["action_value"].sum().backward()
@@ -218,7 +257,7 @@ def test_bf16_reasoner_forward_on_cpu() -> None:
 
 def test_adamw_trains_bf16_backbone_model_through_lora() -> None:
     torch.manual_seed(0)
-    model = _model().train().to(torch.bfloat16)
+    model = _model(dtype=torch.bfloat16).train()
     optimizer = AdamW(model.parameters(), lr=1e-3, fused=False)
     n_trainable = sum(1 for p in model.parameters() if p.requires_grad)
     assert sum(len(g["params"]) for g in optimizer.param_groups) == n_trainable
@@ -241,7 +280,7 @@ def test_full_fp32_path_trains_backbone_directly_with_adamw_and_polyak() -> None
     model = _model(None).train().to(device=torch.device("cpu"))
     assert all(p.requires_grad and p.dtype == torch.float32 for p in model.parameters())
     assert model.backbone is not None and model.backbone.dtype == torch.float32
-    delayed = model.delayed_copy(backbone=True, heads=True)
+    delayed = model.delayed_copy()
     assert delayed.backbone is not None
     online = dict(model.backbone.named_parameters())
     for name, p in delayed.backbone.named_parameters():
@@ -258,17 +297,17 @@ def test_full_fp32_path_trains_backbone_directly_with_adamw_and_polyak() -> None
     assert q_proj.weight.grad is not None
     optimizer.step()
     assert not torch.equal(q_proj.weight, before)
-    polyak.update(tau_heads=0.5, tau_backbone=0.5)
+    polyak.update(tau_heads=0.5, tau_encoder=0.5, tau_backbone=0.5)
     delayed_after = delayed.backbone.model.layers[0].self_attn.q_proj.weight  # type: ignore[union-attr]
     assert torch.allclose(delayed_after, 0.5 * delayed_before + 0.5 * q_proj.weight)
 
 
 def test_full_fp32_model_cast_to_bf16_is_rejected_by_adamw_and_polyak() -> None:
     torch.manual_seed(0)
-    model = _model(None).to(torch.bfloat16)
-    with pytest.raises(TypeError, match="model.to\\(device\\)"):
+    model = _model(None, dtype=torch.bfloat16)
+    with pytest.raises(TypeError, match="dtype=torch.float32"):
         AdamW(model.parameters(), lr=1e-3, fused=False)
-    delayed = model.delayed_copy(backbone=True, heads=True)
+    delayed = model.delayed_copy()
     with pytest.raises(TypeError, match="fp32 parameters only"):
         Polyak(model, delayed)
 
@@ -294,7 +333,7 @@ def test_save_load_roundtrip_with_lora(tmp_path) -> None:
         "dropout": 0.0,
         "targets": ["q_proj", "v_proj"],
     }
-    loaded = load_model(tmp_path).eval()
+    loaded = load_model(tmp_path, train_kernel="varlen", decode_kernel="flex", dtype=torch.float32).eval()
     assert loaded.backbone is not None
     assert loaded.backbone.lora == model.backbone.lora  # type: ignore[union-attr]
     assert set(loaded.state_dict()) == set(model.state_dict())
@@ -309,7 +348,7 @@ def test_save_load_roundtrip_without_lora_has_no_lora_key(tmp_path) -> None:
     with (tmp_path / "config.json").open() as fh:
         config = json.load(fh)
     assert "lora" not in config["backbone"]
-    assert load_model(tmp_path).backbone.lora is None  # type: ignore[union-attr]
+    assert load_model(tmp_path, train_kernel="varlen", decode_kernel="flex", dtype=torch.float32).backbone.lora is None  # type: ignore[union-attr]
 
 
 # ---- delayed copy / Polyak ---------------------------------------------------
@@ -317,8 +356,8 @@ def test_save_load_roundtrip_without_lora_has_no_lora_key(tmp_path) -> None:
 
 def test_delayed_backbone_shares_frozen_base_and_copies_adapters() -> None:
     torch.manual_seed(0)
-    model = _model().to(torch.bfloat16)
-    delayed = model.delayed_copy(backbone=True, heads=True)
+    model = _model(dtype=torch.bfloat16)
+    delayed = model.delayed_copy()
     assert model.backbone is not None and delayed.backbone is not None
     online = dict(model.backbone.named_parameters())
     for name, p in delayed.backbone.named_parameters():
@@ -333,10 +372,9 @@ def test_delayed_backbone_shares_frozen_base_and_copies_adapters() -> None:
 
 def test_polyak_interpolates_lora_adapters_in_fp32_without_shadows() -> None:
     torch.manual_seed(0)
-    model = _model().eval().to(torch.bfloat16)
-    delayed = model.delayed_copy(backbone=True, heads=True).eval()
+    model = _model(dtype=torch.bfloat16).eval()
+    delayed = model.delayed_copy().eval()
     polyak = Polyak(model, delayed)
-    assert polyak.delays_backbone
     assert model.backbone is not None and delayed.backbone is not None
     online_b = [m.lora_B.weight for m in lora_modules(model.backbone)]
     delayed_b = [m.lora_B.weight for m in lora_modules(delayed.backbone)]
@@ -345,7 +383,7 @@ def test_polyak_interpolates_lora_adapters_in_fp32_without_shadows() -> None:
             w.fill_(1.0)
     tau = 0.0005
     for _ in range(200):
-        polyak.update(tau_heads=0.0, tau_backbone=tau)
+        polyak.update(tau_heads=0.0, tau_encoder=0.0, tau_backbone=tau)
     expected = 1.0 - (1.0 - tau) ** 200
     for w in delayed_b:
         assert torch.allclose(w, torch.full_like(w, expected), atol=1e-6)
@@ -354,7 +392,7 @@ def test_polyak_interpolates_lora_adapters_in_fp32_without_shadows() -> None:
         online_q = model(batch).predictions["action_value"]
         delayed_q = delayed(batch).predictions["action_value"]
     assert not torch.allclose(online_q, delayed_q)
-    polyak.update(tau_heads=1.0, tau_backbone=1.0)
+    polyak.update(tau_heads=1.0, tau_encoder=1.0, tau_backbone=1.0)
     with torch.no_grad():
         copied_q = delayed(batch).predictions["action_value"]
     assert torch.allclose(online_q, copied_q)

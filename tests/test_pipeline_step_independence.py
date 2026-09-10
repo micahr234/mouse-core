@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 import pytest
 import torch
@@ -24,7 +26,7 @@ def _io(*pairs: tuple[str, str]) -> list[dict[str, str]]:
 
 def _tok_in(
     *names: str, type: str = "discrete", head_output: str | None = None
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     return [
         {
             "type": type,
@@ -54,14 +56,6 @@ def test_missing_objective_fields_key_raises() -> None:
     )
     with pytest.raises(KeyError, match="old_log_prob"):
         tokenizer({"action": 1, "task_index": 0})
-
-
-def test_tokenizer_rejects_legacy_field_key() -> None:
-    with pytest.raises(TypeError, match="input_field=/output_field="):
-        NumericTokenizer(
-            input_fields=[{"type": "discrete", "field": "action"}],
-            grouping_field="task_index",
-        )
 
 
 def test_tokenizer_output_defaults_to_input() -> None:

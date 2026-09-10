@@ -10,13 +10,6 @@ import numpy as np
 import torch
 
 
-def _reject_legacy_field_key(data: dict[str, Any], *, who: str) -> None:
-    if "field" in data and "input_field" not in data:
-        raise TypeError(
-            f"{who} input_fields use input_field=/output_field= (not field=)"
-        )
-
-
 @dataclass
 class NumericTokenizerModalitySpec:
     """How the numeric tokenizer packs one modality from a step dict.
@@ -284,7 +277,7 @@ class TokenizerModalityMeta:
 
 
 def resolve_tokenizer_numeric_modalities(
-    input_fields: list[dict[str, Any] | NumericTokenizerModalitySpec] | None = None,
+    input_fields: Sequence[dict[str, Any] | NumericTokenizerModalitySpec] | None = None,
 ) -> tuple[list[NumericTokenizerModalitySpec], list[TokenizerModalityMeta]]:
     """Expand tokenizer input-field specs; each slot is keyed by ``output_field``."""
     raw = input_fields or []
@@ -295,7 +288,6 @@ def resolve_tokenizer_numeric_modalities(
             spec = m
         else:
             data = dict(m)
-            _reject_legacy_field_key(data, who="tokenizer")
             spec = NumericTokenizerModalitySpec(**data)
         specs.extend(expand_tokenizer_numeric_spec(spec, learnable_index=n_learnable))
         if spec.type == "learnable":

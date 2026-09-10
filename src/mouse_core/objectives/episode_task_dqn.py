@@ -168,8 +168,10 @@ class EpisodeTaskDqnObjective(Objective):
         self,
         objective_data: TensorDict,
         predictions: TensorDict,
-        delayed_predictions: TensorDict,
+        delayed_predictions: TensorDict | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
+        if delayed_predictions is None:
+            raise ValueError("EpisodeTaskDqnObjective requires delayed_predictions.")
         q_e = _require_q(predictions, "action_value_episode")
         q_t = _require_q(predictions, "action_value_task")
         q_e_target = _require_q(delayed_predictions, "action_value_episode").detach()

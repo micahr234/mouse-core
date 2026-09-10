@@ -17,7 +17,10 @@ import torch.nn as nn
 from tensordict import TensorDict
 from mouse_core.models import Model
 from mouse_core.models.backbone import LlamaBackbone, Qwen3Backbone
+from mouse_core.models.backbone import packed_train as packed_train_mod
 from mouse_core.models.backbone.flex_decode import _decode_rope_positions
+from mouse_core.models.backbone.packed_train import install_compiled_decoder
+from mouse_core.models.lora import LoRAConfig
 from mouse_core.models.embedding import NumericEmbedder
 from mouse_core.models.heads import DiscreteActionValueHead
 from tests._token_batch_helpers import batch_to_token_batch, tok_from_encoder
@@ -61,10 +64,10 @@ def _as_rect(preds: torch.Tensor) -> torch.Tensor:
         return preds.unsqueeze(0)
     return preds
 
-def _tiny_model(backbone_cls, tokens: int=1) -> Model:
+def _tiny_model(backbone_cls, tokens: int=1, dtype: torch.dtype = torch.float32, **backbone_kwargs) -> Model:
     hidden_dim = 16
     encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}, {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3, "std": 0.02, "positions": 1}])
-    backbone = backbone_cls(hidden_dim=hidden_dim, num_layers=2, num_heads=2)
+    backbone = backbone_cls(train_kernel="varlen", decode_kernel="flex", dtype=dtype, hidden_dim=hidden_dim, num_layers=2, num_heads=2, **backbone_kwargs)
     head = DiscreteActionValueHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1)
     return Model(encoder=encoder, backbone=backbone, heads=head).eval()
 
@@ -121,11 +124,11 @@ def test_recurring_grouping_id_matches_between_full_and_cached(backbone_cls) -> 
     assert torch.allclose(incremental, _as_rect(full['action_value']), atol=1e-05)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason='compiled Flex train/decode paths are CUDA bf16')
-def test_cuda_bf16_flex_train_matches_cached_decode_with_recurring_ids() -> None:
-    """Recommended config end to end: compiled Flex train forward == Flex cached decode."""
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='flash varlen train / compiled Flex decode are CUDA bf16')
+def test_cuda_bf16_packed_train_matches_cached_decode_with_recurring_ids() -> None:
+    """Recommended config end to end: flash varlen packed forward == Flex cached decode."""
     torch.manual_seed(4)
-    model = _tiny_model(Qwen3Backbone).to(device=torch.device('cuda'), dtype=torch.bfloat16)
+    model = _tiny_model(Qwen3Backbone, dtype=torch.bfloat16).to(torch.device('cuda'))
     steps = _steps(8)
     for step, task in zip(steps, (0, 0, 1, 1, 0, 0, 2, 0)):
         step["task_index"] = task
@@ -140,6 +143,74 @@ def test_cuda_bf16_flex_train_matches_cached_decode_with_recurring_ids() -> None
     full_q = _as_rect(full['action_value'])
     assert full_q.dtype == torch.float32
     assert torch.allclose(incremental, full_q, atol=0.05), (incremental - full_q).abs().max().item()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='compiled fp32 Flex decode is CUDA-only')
+def test_cuda_fp32_decode_is_compiled_and_matches_full_forward() -> None:
+    """fp32 on CUDA compiles the Flex decode kernel (no eager fallback) and stays exact."""
+    torch.manual_seed(5)
+    # head_dim >= 16: the compiled kernel's minimum (the default 8-wide test heads would fall back to eager).
+    model = _tiny_model(Qwen3Backbone, head_dim=16).to(device=torch.device('cuda'))
+    steps = _steps(200)  # crosses a 128-token page boundary
+    for step, task in zip(steps, [0] * 100 + [1] * 60 + [0] * 40):
+        step["task_index"] = task
+    with torch.no_grad():
+        full, _ = _fwd(model, [steps])
+        preds_a, cache = _fwd(model, [steps[:150]], use_cache=True)
+        preds_b, cache = _fwd(model, [steps[150:]], cache=cache, use_cache=True)
+        incremental = torch.cat([preds_a['action_value'], preds_b['action_value']], dim=1)
+    session = cache.sessions[0]
+    assert session._flex._compiled is not None
+    assert session._flex._active is session._flex._compiled
+    assert session._compile_masks
+    full_q = _as_rect(full['action_value'])
+    assert torch.allclose(incremental, full_q, atol=1e-4), (incremental - full_q).abs().max().item()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='flash varlen train / compiled Flex decode are CUDA bf16')
+def test_cuda_bf16_lora_compiled_train_matches_cached_decode() -> None:
+    """LoRA + compiled decoder body: packed forward == Flex cached decode."""
+    torch.manual_seed(5)
+    hidden_dim = 64
+    encoder = NumericEmbedder(
+        hidden_dim=hidden_dim,
+        modalities=[
+            {"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1},
+            {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0},
+            {"type": 'discrete', "field": "episode_done", "vocab_size": 3, "std": 0.02, "positions": 1},
+        ],
+    )
+    backbone = Qwen3Backbone(
+        train_kernel="varlen", decode_kernel="flex", dtype=torch.bfloat16,
+        hidden_dim=hidden_dim,
+        num_layers=2,
+        num_heads=4,
+        lora=LoRAConfig(rank=4, alpha=8.0),
+    )
+    head = DiscreteActionValueHead(
+        in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1
+    )
+    model = Model(encoder=encoder, backbone=backbone, heads=head).eval().to(torch.device('cuda'))
+    steps = _steps(8)
+    for step, task in zip(steps, (0, 0, 1, 1, 0, 0, 2, 0)):
+        step["task_index"] = task
+    was = packed_train_mod._compiled_layer
+    try:
+        packed_train_mod._compiled_layer = None
+        install_compiled_decoder()
+        with torch.no_grad():
+            full, _ = _fwd(model, [steps])
+            cache = None
+            last_step_preds = []
+            for step in steps:
+                preds, cache = _fwd(model, [[step]], cache=cache, use_cache=True)
+                last_step_preds.append(preds['action_value'][:, -1])
+            incremental = torch.stack(last_step_preds, dim=1)
+        full_q = _as_rect(full['action_value'])
+        assert full_q.dtype == torch.float32
+        assert torch.allclose(incremental, full_q, atol=0.05), (incremental - full_q).abs().max().item()
+    finally:
+        packed_train_mod._compiled_layer = was
 
 
 def test_packed_rope_positions_count_same_group_tokens() -> None:
@@ -275,7 +346,7 @@ def test_concat_fusion_ragged_chunks_match_unbatched() -> None:
     torch.manual_seed(6)
     hidden_dim = 16
     encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}, {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3, "std": 0.02, "positions": 1}, {'type': 'learnable', 'tokens': 1, "std": 0.02, "positions": 1}])
-    backbone = Qwen3Backbone(hidden_dim=hidden_dim, num_layers=2, num_heads=2)
+    backbone = Qwen3Backbone(train_kernel="varlen", decode_kernel="flex", dtype=torch.float32, hidden_dim=hidden_dim, num_layers=2, num_heads=2)
     head = DiscreteActionValueHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1)
     model = Model(encoder=encoder, backbone=backbone, heads=head).eval()
     assert model.encoder.tokens_per_step == 4
@@ -410,7 +481,7 @@ def test_flex_decode_session_drops_without_cyclic_gc() -> None:
     from mouse_core.models.backbone.flex_decode import FlexDecodeSession
     model = _tiny_model(Qwen3Backbone)
     inner = cast(nn.Module, cast(Any, model.backbone).model)
-    session = FlexDecodeSession(inner, batch_size=2, capacity=64)
+    session = FlexDecodeSession(inner, batch_size=2)
     wr = weakref.ref(session)
     gc.disable()
     try:
@@ -418,6 +489,107 @@ def test_flex_decode_session_drops_without_cyclic_gc() -> None:
         assert wr() is None, 'FlexDecodeSession stayed alive without cyclic GC'
     finally:
         gc.enable()
+
+def test_ragged_batched_decode_across_page_boundary_matches_full_forward() -> None:
+    """A row that spans several 128-token pages, batched with a short row, must
+    match its unbatched full forward (page remap + RoPE across pages)."""
+    torch.manual_seed(5)
+    model = _tiny_model(Qwen3Backbone)
+    long_row = _steps(60)  # 3 tokens per step -> 180 tokens, 2 pages
+    short_row = _steps(4, start=200)
+    with torch.no_grad():
+        ref_long = _fwd(model, [long_row])[0]['action_value']
+        ref_short = _fwd(model, [short_row])[0]['action_value']
+        cache = None
+        collected = [[], []]
+        consumed = [0, 0]
+        for lengths in ([30, 1], [20, 0], [10, 3]):
+            batch = [long_row[consumed[0]:consumed[0] + lengths[0]], short_row[consumed[1]:consumed[1] + lengths[1]]]
+            consumed = [c + n for c, n in zip(consumed, lengths)]
+            preds, cache = _fwd(model, batch, cache=cache, use_cache=True)
+            padded = max(lengths)
+            for b, n in enumerate(lengths):
+                if n:
+                    collected[b].append(preds['action_value'][b, padded - n:])
+        assert cache is not None
+        session = cache.sessions[0]
+    assert session.lengths.tolist() == [180, 12]
+    assert session.pages_in_use == 2 + 1
+    assert torch.allclose(torch.cat(collected[0], dim=0), ref_long, atol=1e-05)
+    assert torch.allclose(torch.cat(collected[1], dim=0), ref_short, atol=1e-05)
+
+
+def _raw_session(batch_size: int):
+    from mouse_core.models.backbone.flex_decode import FlexDecodeSession
+    model = _tiny_model(Qwen3Backbone)
+    inner = cast(nn.Module, cast(Any, model.backbone).model)
+    return FlexDecodeSession(inner, batch_size=batch_size), model.hidden_dim
+
+
+def _decode(session, counts: list[int], hidden: int) -> torch.Tensor:
+    S = max(max(counts), 1)
+    embeds = torch.randn(len(counts), S, hidden)
+    gids = torch.zeros(len(counts), S, dtype=torch.long)
+    return session.forward(embeds=embeds, lengths=counts, grouping_ids=gids)
+
+
+def test_paged_cache_footprint_tracks_row_lengths_not_batch_max() -> None:
+    """One long row plus short rows costs the sum of pages, not B x longest."""
+    torch.manual_seed(0)
+    session, hidden = _raw_session(4)
+    page = session.page
+    assert session.pages_in_use == 4  # one page per row up front
+    with torch.no_grad():
+        _decode(session, [3 * page + 5, 2, 0, 1], hidden)
+    assert session.lengths.tolist() == [3 * page + 5, 2, 0, 1]
+    assert session.pages_in_use == 4 + 3  # row 0 needs 4 pages; the rest keep 1
+    dense_pages = 4 * 4
+    assert session.pages_in_use < dense_pages
+    assert session.k_cache.shape[2] == session.n_pages * page
+
+
+def test_paged_cache_grows_pool_and_keeps_history() -> None:
+    torch.manual_seed(1)
+    session, hidden = _raw_session(2)
+    page = session.page
+    with torch.no_grad():
+        first = _decode(session, [page - 1, 1], hidden)
+        n_pages_before = session.n_pages
+        # Crossing into a second page for row 0 needs a free page: none left -> pool doubles.
+        _decode(session, [2, 0], hidden)
+    assert session.n_pages > n_pages_before
+    assert session.pages_in_use == 3
+    assert session.lengths.tolist() == [page + 1, 1]
+    assert first.shape[0] == 2
+    # Row 1's first slot must have survived the pool copy: decoding row 1 alone
+    # from scratch in a fresh session with the same inputs is covered by the
+    # end-to-end tests; here we check the address map stayed consistent.
+    row1_page = session._row_pages[1][0]
+    assert session.page_table[1, 0].item() == row1_page
+    assert session._mask_holder["page_row"][row1_page].item() == 1
+
+
+def test_reset_rows_returns_pages_to_pool() -> None:
+    torch.manual_seed(2)
+    session, hidden = _raw_session(3)
+    page = session.page
+    with torch.no_grad():
+        _decode(session, [2 * page + 1, page + 1, 1], hidden)
+    assert session.pages_in_use == 3 + 2 + 1
+    session.reset_rows([0])
+    assert session.pages_in_use == 1 + 2 + 1
+    assert session.lengths.tolist() == [0, page + 1, 1]
+    assert session.page_table[0, 1:].eq(-1).all()
+    session.reset_rows()
+    assert session.pages_in_use == 3
+    assert session.lengths.tolist() == [0, 0, 0]
+    assert session.n_pages >= 6  # pool keeps its size; pages are just free again
+    with torch.no_grad():
+        # Freed pages are reused rather than growing the pool.
+        _decode(session, [page + 1, page + 1, page + 1], hidden)
+    assert session.pages_in_use == 6
+    assert session.n_pages >= 6
+
 
 @pytest.mark.parametrize('backbone_cls', [Qwen3Backbone, LlamaBackbone])
 def test_decode_task_mask_isolates_without_reset(backbone_cls) -> None:

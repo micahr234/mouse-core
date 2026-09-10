@@ -1,19 +1,23 @@
 """Backbone interface for MOUSE models.
 
 A backbone is a sequence processor that takes token embeddings and returns
-hidden states of the same shape. Full (uncached) forwards go through
-:meth:`Backbone.forward`; incremental decoding goes through a
+hidden states of the same shape. Transformer backbones train through the
+packed stream forward (:func:`~mouse_core.models.backbone.packed_train.packed_forward`
+over ``self.model``); :meth:`Backbone.forward` is the rectangular ``[B, T, D]``
+forward used by non-transformer backbones; incremental decoding goes through a
 :class:`~mouse_core.models.backbone.flex_decode.FlexDecodeSession` created by
 :meth:`Backbone.decode_session`.
 
 Two ways to train a backbone, both with every trainable parameter in fp32:
 
-- full fine-tuning — no ``lora``; keep the whole model fp32
-  (``model.to(device=device)``), and the base weights train directly;
+- full fine-tuning — no ``lora``; build it with ``dtype=torch.float32`` and
+  the base weights train directly;
 - fp32 LoRA on a frozen base — ``lora=LoRAConfig(...)``; the base weights
-  are frozen and may be cast to bf16
-  (``model.to(device=device, dtype=preferred_dtype(device))``), the LoRA
-  adapters are the only trainable backbone parameters.
+  are frozen and may be built in bf16 (``dtype=preferred_dtype(device)``),
+  the LoRA adapters are the only trainable backbone parameters.
+
+The base dtype is a constructor argument of the transformer backbones; the
+model is placed with ``model.to(device)``, which moves and never casts.
 """
 
 from __future__ import annotations
@@ -22,13 +26,26 @@ import warnings
 from contextlib import contextmanager
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any
+from typing import Any, Self, cast
 
 import torch
 import torch.nn as nn
 
-from mouse_core.models.backbone.flex_decode import FlexDecodeSession
+from mouse_core.models.backbone.flex_decode import (
+    DecodeKernel,
+    FlexDecodeSession,
+    check_decode_kernel,
+    module_device_dtype,
+)
+from mouse_core.models.backbone.packed_train import TrainKernel, check_train_kernel
 from mouse_core.models.lora import LoRAConfig, apply_lora
+
+
+def _disable_cudnn_sdp() -> None:
+    """Disable the cuDNN SDPA backend to avoid driver-specific errors."""
+    enable_cudnn_sdp = getattr(torch.backends.cuda, "enable_cudnn_sdp", None)
+    if enable_cudnn_sdp is not None:
+        enable_cudnn_sdp(enabled=False)
 
 
 class Backbone(nn.Module, ABC):
@@ -48,9 +65,55 @@ class Backbone(nn.Module, ABC):
 
     ``lora`` is the backbone's :class:`~mouse_core.models.lora.LoRAConfig`
     (``None`` for a fully trainable fp32 backbone).
+
+    ``gradient_checkpointing`` makes the packed training forward recompute
+    each decoder layer in backward instead of storing its activations:
+    activation memory drops by roughly the layer count for about 1.4x the
+    step time. Set ``backbone.gradient_checkpointing = True`` before
+    training; it is not saved with the model.
+
+    Two attention kernels are required constructor arguments of every
+    transformer backbone, so both choices are always explicit:
+
+    - ``train_kernel`` runs the uncached packed forward (training, and any
+      forward without a cache): ``"varlen"`` (flash varlen on CUDA
+      bf16/fp16, masked SDPA otherwise) or ``"flex"`` (FlexAttention block
+      mask, compiled on CUDA in every dtype). Both give the same result.
+    - ``decode_kernel`` runs cached decode (``use_cache=True``): ``"flex"``
+      (paged FlexAttention), currently the only kernel that reads K/V
+      through a page table.
+
+    Like ``gradient_checkpointing`` they are execution choices for the
+    current machine, not model properties: not saved with the model
+    (``load_model`` takes them as arguments) and reassignable at any time
+    (``backbone.train_kernel = "flex"``).
     """
 
     lora: LoRAConfig | None = None
+    gradient_checkpointing: bool = False
+    train_kernel: TrainKernel
+    decode_kernel: DecodeKernel
+
+    def _set_kernels(self, train_kernel: TrainKernel, decode_kernel: DecodeKernel) -> None:
+        self.train_kernel = check_train_kernel(train_kernel)
+        self.decode_kernel = check_decode_kernel(decode_kernel)
+
+    def to(self, *args: Any, **kwargs: Any) -> Self:
+        """Move the backbone; the base dtype is fixed at construction (``dtype=``)."""
+        _reject_dtype_cast(type(self).__name__, *args, **kwargs)
+        return super().to(*args, **kwargs)
+
+    def half(self) -> "Backbone":
+        raise TypeError(f"{type(self).__name__}.half() is not supported; pass dtype= when building it.")
+
+    def bfloat16(self) -> "Backbone":
+        raise TypeError(f"{type(self).__name__}.bfloat16() is not supported; pass dtype= when building it.")
+
+    def double(self) -> "Backbone":
+        raise TypeError(f"{type(self).__name__}.double() is not supported; pass dtype= when building it.")
+
+    def float(self) -> "Backbone":
+        raise TypeError(f"{type(self).__name__}.float() is not supported; pass dtype= when building it.")
 
     def _attach_lora(self, model: nn.Module, lora: LoRAConfig | None) -> None:
         """Freeze ``model`` and attach fp32 LoRA adapters when ``lora`` is set.
@@ -71,11 +134,10 @@ class Backbone(nn.Module, ABC):
         (:class:`~mouse_core.models.backbone.none.IdentityBackbone`) reports
         ``float32``.
         """
-        for name, param in self.named_parameters():
-            if ".lora_A." in name or ".lora_B." in name:
-                continue
-            return param.dtype
-        return torch.float32
+        try:
+            return module_device_dtype(self)[1]
+        except ValueError:
+            return torch.float32
 
     @abstractmethod
     def forward(
@@ -98,19 +160,32 @@ class Backbone(nn.Module, ABC):
         """
         ...
 
-    def decode_session(self, batch_size: int, capacity: int) -> FlexDecodeSession:
+    def decode_session(self, batch_size: int) -> FlexDecodeSession:
         """Create a cached-decode session over ``batch_size`` sequences.
 
         ``Model.forward`` calls this on the first ``use_cache=True`` call and
-        carries the session inside its cache dict. Requires the backbone to
-        expose a ``transformers`` decoder stack as ``self.model``.
+        carries the session inside its ``DecodeCache``. The session runs
+        ``self.decode_kernel``; its paged KV pool sizes itself as rows grow.
+        Requires the backbone to expose a ``transformers`` decoder stack as
+        ``self.model``.
         """
         model = getattr(self, "model", None)
         if model is None:
             raise NotImplementedError(
                 f"{type(self).__name__} does not support cached decoding."
             )
-        return FlexDecodeSession(model, batch_size=batch_size, capacity=capacity)
+        check_decode_kernel(self.decode_kernel)  # "flex" is the only kernel; paged FlexAttention.
+        return FlexDecodeSession(model, batch_size=batch_size)
+
+
+def _reject_dtype_cast(what: str, *args: Any, **kwargs: Any) -> None:
+    """``.to()`` on a MOUSE module moves devices only; dtype is a backbone constructor argument."""
+    _device, dtype, _non_blocking, _memory_format = cast(Any, torch._C)._nn._parse_to(*args, **kwargs)
+    if dtype is not None:
+        raise TypeError(
+            f"{what}.to() does not cast dtypes. The backbone dtype is fixed when it is built "
+            f"(e.g. Qwen3Backbone(dtype=preferred_dtype(device), ...)); use .to(device) to move."
+        )
 
 
 @contextmanager

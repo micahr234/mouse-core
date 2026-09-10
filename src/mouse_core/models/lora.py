@@ -10,7 +10,7 @@ in fp32 tensors and nothing needs fp32 master weights or Polyak shadows.
 from __future__ import annotations
 
 import math
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 
 import torch
@@ -42,7 +42,7 @@ class LoRAConfig:
     rank: int = 16
     alpha: float = 32.0
     dropout: float = 0.0
-    targets: tuple[str, ...] = _DEFAULT_TARGETS
+    targets: Sequence[str] = _DEFAULT_TARGETS
 
     def __post_init__(self) -> None:
         if int(self.rank) < 1:

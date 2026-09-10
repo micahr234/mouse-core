@@ -6,7 +6,7 @@ import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Self, cast
 
 import numpy as np
 import torch
@@ -15,14 +15,15 @@ import torch.nn.functional as F
 from tensordict import TensorDict
 
 from mouse_core.models.embedding.embedding import Encoder
-from mouse_core.models.backbone.base import Backbone
-from mouse_core.models.backbone.flex_decode import FlexDecodeSession, packed_rope_positions
+from mouse_core.models.backbone.base import Backbone, _reject_dtype_cast
+from mouse_core.models.backbone.flex_decode import DecodeKernel, FlexDecodeSession, packed_rope_positions
+from mouse_core.models.backbone.packed_train import TrainKernel
 from mouse_core.models.heads.base import BaseHead
 from mouse_core.models.heads.discrete_action import DiscreteActionHead
 from mouse_core.models.heads.dqn import DiscreteActionValueHead
 from mouse_core.models.heads.layerwise_dqn import LayerwiseDiscreteActionValueHead
 from mouse_core.models.heads.swiglu import SwiGLUHead
-from mouse_core.models.lora import LoRAConfig, lora_modules
+from mouse_core.models.lora import LoRAConfig
 from mouse_core.models.reasoner import LatentReasoner, _InsertionPlan, _plan_insertions
 from mouse_core.models.recurrence import Recurrence
 
@@ -70,7 +71,10 @@ def save_model(model: "Model", path: str | Path) -> None:
     Example::
 
         save_model(model, "./checkpoints/step-10000")
-        model2 = load_model("./checkpoints/step-10000")
+        model2 = load_model(
+            "./checkpoints/step-10000",
+            train_kernel="varlen", decode_kernel="flex", dtype=torch.float32,
+        )
     """
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
@@ -212,9 +216,15 @@ from mouse_core.models import preferred_dtype
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = (
-    load_model("{repo_id}", map_location="cpu")
+    load_model(
+        "{repo_id}",
+        train_kernel="varlen",
+        decode_kernel="flex",
+        dtype=preferred_dtype(device),
+        map_location="cpu",
+    )
     .eval()
-    .to(device=device, dtype=preferred_dtype(device))
+    .to(device)
 )
 ```
 
@@ -439,8 +449,6 @@ def _model_card_field_example(modality: dict[str, Any]) -> str:
 
 
 def _model_config(model: "Model") -> dict[str, Any]:
-    if model.encoder is None or model.backbone is None:
-        raise TypeError("save_model requires encoder and backbone.")
     config: dict[str, Any] = {
         "format": "mouse-core-model-v1",
         "hidden_dim": int(model.hidden_dim),
@@ -580,6 +588,10 @@ def _drop_none(data: dict[str, Any]) -> dict[str, Any]:
 
 def load_model(
     repo_id_or_path: str,
+    *,
+    train_kernel: TrainKernel,
+    decode_kernel: DecodeKernel,
+    dtype: torch.dtype,
     force_download: bool = True,
     local_dir: str | Path | None = None,
     **kwargs: Any,
@@ -590,11 +602,22 @@ def load_model(
         repo_id_or_path: A local path to a checkpoint directory or a HF Hub
             repo id (e.g. ``"my-model"`` or ``"your-org/your-model"``).
             Unscoped Hub names are resolved under the authenticated user.
+        train_kernel: Kernel for the uncached (packed) forward of a
+            transformer backbone, ``"varlen"`` or ``"flex"``.
+        decode_kernel: Kernel for cached decode, ``"flex"``.
+        dtype: Dtype of the transformer backbone's base weights
+            (``preferred_dtype(device)`` for inference or a LoRA base,
+            ``torch.float32`` to fine-tune them). The saved weights are cast
+            into it.
+
+            All three are execution choices for the loading machine, not
+            model properties, so they are never stored in the checkpoint and
+            must be given here (ignored by backbones without a transformer
+            stack).
         force_download: If ``True`` (default), bypass the HF Hub cache and re-download.
             Ignored for local paths.
-        local_dir: Directory where Hub files are saved after download.  When
-            set, ``hf_hub_download`` writes files there and
-            set, Hub files are saved there before loading. Ignored for local paths.
+        local_dir: Directory where Hub files are saved after download.
+            Ignored for local paths.
         **kwargs: Supports ``map_location`` for ``torch.load`` and forwards Hub
             download kwargs such as ``revision`` or ``token``.
 
@@ -625,15 +648,19 @@ def load_model(
             "with save_model(...)."
         )
 
-    model = _build_model_from_config(config)
+    model = _build_model_from_config(config, train_kernel=train_kernel, decode_kernel=decode_kernel, dtype=dtype)
     state = torch.load(weights_path, map_location=map_location)
     model.load_state_dict(state)
     return model
 
 
-def _build_model_from_config(config: dict[str, Any]) -> "Model":
+def _build_model_from_config(
+    config: dict[str, Any], *, train_kernel: TrainKernel, decode_kernel: DecodeKernel, dtype: torch.dtype
+) -> "Model":
     encoder = _build_encoder_from_config(config["encoder"])
-    backbone = _build_backbone_from_config(config["backbone"])
+    backbone = _build_backbone_from_config(
+        config["backbone"], train_kernel=train_kernel, decode_kernel=decode_kernel, dtype=dtype
+    )
     heads_cfg = config["heads"]
     heads = _build_heads_from_config(heads_cfg["heads"])
     reasoner_cfg = config.get("reasoner")
@@ -667,7 +694,6 @@ def _build_model_from_config(config: dict[str, Any]) -> "Model":
 def _build_encoder_from_config(config: dict[str, Any]) -> Encoder:
     enc_type = config.get("type")
     kwargs = dict(config.get("kwargs") or {})
-    kwargs.pop("extra_fields", None)  # removed; objective_fields live on the tokenizer
     if enc_type == "numeric":
         from mouse_core.models.embedding import NumericEmbedder
 
@@ -686,7 +712,9 @@ def _build_encoder_from_config(config: dict[str, Any]) -> Encoder:
     raise ValueError(f"Unsupported encoder type {enc_type!r}.")
 
 
-def _build_backbone_from_config(config: dict[str, Any]) -> Backbone:
+def _build_backbone_from_config(
+    config: dict[str, Any], *, train_kernel: TrainKernel, decode_kernel: DecodeKernel, dtype: torch.dtype
+) -> Backbone:
     backbone_type = config.get("type")
     if backbone_type == "identity":
         from mouse_core.models.backbone import IdentityBackbone
@@ -694,14 +722,15 @@ def _build_backbone_from_config(config: dict[str, Any]) -> Backbone:
         return IdentityBackbone(hidden_dim=config.get("hidden_dim"))
     lora_cfg = config.get("lora")
     lora = LoRAConfig(**lora_cfg) if lora_cfg is not None else None
+    runtime: dict[str, Any] = dict(train_kernel=train_kernel, decode_kernel=decode_kernel, dtype=dtype)
     if backbone_type == "llama":
         from mouse_core.models.backbone import LlamaBackbone
 
-        return LlamaBackbone(hidden_dim=config["hidden_dim"], lora=lora, **config["kwargs"])
+        return LlamaBackbone(hidden_dim=config["hidden_dim"], lora=lora, **runtime, **config["kwargs"])
     if backbone_type == "qwen3":
         from mouse_core.models.backbone import Qwen3Backbone
 
-        return Qwen3Backbone(hidden_dim=config["hidden_dim"], lora=lora, **config["kwargs"])
+        return Qwen3Backbone(hidden_dim=config["hidden_dim"], lora=lora, **runtime, **config["kwargs"])
     raise ValueError(f"Unsupported backbone type {backbone_type!r}.")
 
 
@@ -822,7 +851,11 @@ class DecodeCache:
     sessions: tuple[FlexDecodeSession, ...]
 
     def reset_rows(self, rows: Sequence[int] | None = None) -> None:
-        """Restart the given batch rows (all rows when ``None``) in every pass."""
+        """Restart the given batch rows (all rows when ``None``) in every pass.
+
+        The rows' next tokens start at position 0 and their KV pages return
+        to the shared pool.
+        """
         for session in self.sessions:
             session.reset_rows(rows)
 
@@ -849,18 +882,15 @@ class ModelOutput:
     ``predictions``, ``last_hidden_state``, and ``hidden_states`` are the
     final backbone pass. ``passes`` holds every pass in order (one entry on
     a plain model; ``num_passes`` on a recurrent model) so a training loop
-    can supervise each pass::
+    can supervise each pass against the delayed model's matching pass::
 
         out = model(inputs)
         with torch.no_grad():
-            targets = [
-                delayed_model(
-                    last_hidden_state=p.last_hidden_state,
-                    head_output_indices=out.head_output_indices,
-                    hidden_states=p.hidden_states,
-                ).predictions
-                for p in out.passes
-            ]
+            delayed_out = delayed_model(inputs)
+        losses = [
+            objective(data, online.predictions, delayed.predictions)[0]
+            for online, delayed in zip(out.passes, delayed_out.passes)
+        ]
 
     ``head_output_indices`` maps token states to the rows heads read. A
     reasoning forward extends the stream, so those indices and the states
@@ -879,8 +909,7 @@ class ModelOutput:
 class Model(nn.Module):
     """Composable MOUSE model: encoder, backbone, and heads as distinct sections.
 
-    The model is assembled from three pluggable parts (a heads-only delayed
-    copy from :meth:`delayed_copy` has neither encoder nor backbone):
+    The model is assembled from three pluggable parts:
 
     - ``encoder``: :class:`~mouse_core.models.embedding.embedding.Encoder`
       Converts a :class:`~mouse_core.data.token_batch.TokenBatch` into token
@@ -918,13 +947,13 @@ class Model(nn.Module):
 
     ``forward`` returns a :class:`ModelOutput` with ``predictions``,
     ``last_hidden_state``, and per-pass ``passes``. The delayed DQN model
-    comes from :meth:`delayed_copy`: heads-only (run on the online token
-    states) or with a delayed encoder / backbone (run on the ``TokenBatch``);
-    interpolate it with :class:`~mouse_core.polyak.Polyak`.
+    comes from :meth:`delayed_copy` (a copy of every trainable parameter;
+    frozen weights shared by reference), runs on the same ``TokenBatch``,
+    and is interpolated per section with :class:`~mouse_core.polyak.Polyak`.
     Recurrent-depth refinement is a
     :class:`~mouse_core.models.recurrence.Recurrence` section
     (``num_passes`` backbone passes per forward, saved with the model). See
-    ``examples/13_train_offline_recurrent_dqn.ipynb``.
+    ``examples/12_train_offline_recurrent_dqn.ipynb``.
     """
 
     _VALID_HEADS = (
@@ -1019,8 +1048,8 @@ class Model(nn.Module):
     def __init__(
         self,
         *,
-        encoder: Encoder | None = None,
-        backbone: Backbone | None = None,
+        encoder: Encoder,
+        backbone: Backbone,
         heads: BaseHead | list[BaseHead] | Mapping[str, BaseHead | None] | None = None,
         action_head: str | None = None,
         reasoner: LatentReasoner | None = None,
@@ -1028,50 +1057,40 @@ class Model(nn.Module):
     ):
         """Construct a Model from encoder, backbone, and heads.
 
-        Encoder and backbone are both present on a trainable model and both
-        absent on a heads-only delayed copy (which runs from
-        ``last_hidden_state=``). ``reasoner`` enables Coconut-style latent
-        reasoning via ``forward(batch, reasoning=...)``. ``recurrence``
-        makes every forward run the backbone ``num_passes`` times through
-        the adapter; the two extra sections cannot be combined.
+        ``reasoner`` enables Coconut-style latent reasoning via
+        ``forward(batch, reasoning=...)``. ``recurrence`` makes every forward
+        run the backbone ``num_passes`` times through the adapter; the two
+        extra sections cannot be combined.
         """
         super().__init__()
 
-        if encoder is not None and not isinstance(encoder, Encoder):
+        if not isinstance(encoder, Encoder):
             raise TypeError("encoder must be an instance of Encoder (from mouse_core.models.embedding).")
-        if (encoder is None) != (backbone is None):
-            raise TypeError(
-                "encoder and backbone must be given together (or both omitted "
-                "for a heads-only delayed copy)."
-            )
-        if reasoner is not None and backbone is None:
-            raise TypeError("reasoner requires backbone.")
-        if recurrence is not None and backbone is None:
-            raise TypeError("recurrence requires backbone.")
+        if not isinstance(backbone, Backbone):
+            raise TypeError("backbone must be a Backbone (from mouse_core.models.backbone).")
         if reasoner is not None and recurrence is not None:
             raise ValueError("reasoner and recurrence cannot be combined on one model.")
 
-        enc_dim = getattr(encoder, "hidden_dim", None) if encoder is not None else None
-        bb_dim = getattr(backbone, "hidden_dim", None) if backbone is not None else None
-        if enc_dim is not None and bb_dim is not None and enc_dim != bb_dim:
+        enc_dim = int(encoder.hidden_dim)
+        bb_dim = getattr(backbone, "hidden_dim", None)
+        if bb_dim is not None and enc_dim != bb_dim:
             raise ValueError(
                 f"hidden_dim mismatch between encoder ({enc_dim}) and backbone ({bb_dim}). "
                 "The embedder and the backbone must agree on the hidden dimension."
             )
 
-        self.encoder: Encoder | None = encoder
-        self.backbone: Backbone | None = backbone
+        self.encoder: Encoder = encoder
+        self.backbone: Backbone = backbone
 
         if reasoner is not None:
             if not isinstance(reasoner, LatentReasoner):
                 raise TypeError(
                     f"reasoner must be a LatentReasoner, got {type(reasoner).__name__}."
                 )
-            dim = enc_dim if enc_dim is not None else bb_dim
-            if dim is not None and reasoner.hidden_dim != dim:
+            if reasoner.hidden_dim != enc_dim:
                 raise ValueError(
                     f"hidden_dim mismatch between reasoner ({reasoner.hidden_dim}) "
-                    f"and model ({dim})."
+                    f"and model ({enc_dim})."
                 )
         self.reasoner: LatentReasoner | None = reasoner
 
@@ -1153,33 +1172,19 @@ class Model(nn.Module):
             layerwise_head = self._heads["action_value_layerwise"]
             if not isinstance(layerwise_head, LayerwiseDiscreteActionValueHead):
                 raise TypeError("action_value_layerwise head has unexpected type.")
-            if self.backbone is not None:
-                bb_layers = _backbone_num_layers(self.backbone)
-                if bb_layers is None:
-                    raise ValueError(
-                        "action_value_layerwise requires a backbone with a known layer count "
-                        "(e.g. Qwen3Backbone or LlamaBackbone)."
-                    )
-                if layerwise_head.num_backbone_layers != bb_layers:
-                    raise ValueError(
-                        f"Layerwise head expects {layerwise_head.num_backbone_layers} backbone layers "
-                        f"but backbone has {bb_layers}."
-                    )
-
-        if encoder is not None:
-            self.hidden_dim = int(encoder.hidden_dim)
-        elif bb_dim is not None:
-            self.hidden_dim = int(bb_dim)
-        else:
-            in_features = next(
-                (getattr(h, "in_features", None) for h in self._heads.values()),
-                None,
-            )
-            if not isinstance(in_features, int) or in_features < 1:
+            bb_layers = _backbone_num_layers(self.backbone)
+            if bb_layers is None:
                 raise ValueError(
-                    "Cannot infer hidden_dim without encoder, backbone, or a head with in_features."
+                    "action_value_layerwise requires a backbone with a known layer count "
+                    "(e.g. Qwen3Backbone or LlamaBackbone)."
                 )
-            self.hidden_dim = int(in_features)
+            if layerwise_head.num_backbone_layers != bb_layers:
+                raise ValueError(
+                    f"Layerwise head expects {layerwise_head.num_backbone_layers} backbone layers "
+                    f"but backbone has {bb_layers}."
+                )
+
+        self.hidden_dim = enc_dim
         # Best-effort inference of action cardinality for introspection only.
         self.max_num_actions: int = 0
         for _name, h in self.heads.items():
@@ -1188,132 +1193,74 @@ class Model(nn.Module):
                 self.max_num_actions = out
                 break
 
-    def delayed_copy(
-        self, *, encoder: bool = False, backbone: bool = False, heads: bool = False
-    ) -> "Model":
-        """Build the delayed model for TD targets.
+    def delayed_copy(self) -> "Model":
+        """Build the delayed model for TD targets: a frozen copy of this model.
 
-        Each flag chooses whether that section is delayed — a section is
-        delayed exactly when its Polyak ``tau`` is not ``1``. A section set to
-        ``True`` is a frozen deep copy (``train()``) that
-        :class:`~mouse_core.polyak.Polyak` interpolates; a section left
-        ``False`` is the online module itself, shared by reference
-        (equivalent to ``tau = 1`` every step). At least one flag must be
-        ``True``. The reasoner / recurrence section follows ``backbone``.
-
-        - ``delayed_copy(heads=True)`` — heads-only model. Called as
-          ``delayed(last_hidden_state=out.last_hidden_state,
-          head_output_indices=out.head_output_indices,
-          hidden_states=out.hidden_states)``: the delayed heads read the
-          online token states, so encoder, backbone, reasoning latents, and
-          recurrent passes are shared with the online forward.
-        - ``encoder=True`` and/or ``backbone=True`` — full model. Called as
-          ``delayed(inputs)`` (same ``TokenBatch`` and ``reasoning=`` as the
-          online forward, under ``torch.no_grad()``); it re-runs the trunk
-          through the delayed / shared sections and then the delayed or
-          shared heads.
-
-        A delayed section copies only its trainable (fp32) parameters;
-        frozen parameters — the base weights of a LoRA backbone — are
+        Every trainable parameter gets its own copy; every frozen parameter
+        (``requires_grad=False`` — the base weights of a LoRA backbone) is
         shared by reference with the online model, so a delayed LoRA
         backbone costs one extra copy of the adapters, not of the base. A
-        fully trainable fp32 backbone is copied whole.
+        fully trainable fp32 backbone is copied whole. The copy has every
+        parameter frozen and is left in ``train()`` mode.
+
+        Run it as ``delayed(inputs)`` with the same ``TokenBatch`` (and
+        ``reasoning=``) as the online forward, under ``torch.no_grad()``.
+        Interpolate it with :class:`~mouse_core.polyak.Polyak`, which takes
+        one ``tau`` per section (heads, encoder, backbone) on every update.
 
         Construct after ``model.to(...)``. Do not call ``requires_grad_`` /
-        ``to`` on a delayed model that shares sections: they would hit the
-        online modules.
+        ``to`` on the delayed model: shared frozen parameters belong to the
+        online model too.
         """
-        if self.backbone is None:
-            raise ValueError("delayed_copy is for the online model, not a delayed copy.")
-        if not (encoder or backbone or heads):
+        if not any(p.requires_grad for p in self.parameters()):
             raise ValueError(
-                "delayed_copy needs at least one delayed section: pass encoder=True, "
-                "backbone=True, and/or heads=True (a section with tau = 1 is shared)."
+                "delayed_copy needs a trainable online model (no parameter requires grad)."
             )
 
         def _copy(module: nn.Module) -> nn.Module:
-            # Frozen parameters (the backbone base weights) are shared by
-            # reference; only trainable parameters get their own copy.
             shared = {id(p): p for p in module.parameters() if not p.requires_grad}
             delayed = copy.deepcopy(module, memo=shared)
             delayed.requires_grad_(False)
             delayed.train()
             return delayed
 
-        delayed_heads = {
-            name: (cast(BaseHead, _copy(head)) if heads else head)
-            for name, head in self._heads.items()
-        }
-        if not encoder and not backbone:
-            return Model(heads=delayed_heads, action_head=self.action_head)
-
-        assert self.encoder is not None
-        delayed_encoder = cast(Encoder, _copy(self.encoder)) if encoder else self.encoder
-        delayed_backbone = cast(Backbone, _copy(self.backbone)) if backbone else self.backbone
-        delayed_reasoner = (
-            None
-            if self.reasoner is None
-            else (cast(LatentReasoner, _copy(self.reasoner)) if backbone else self.reasoner)
-        )
-        delayed_recurrence = (
-            None
-            if self.recurrence is None
-            else (cast(Recurrence, _copy(self.recurrence)) if backbone else self.recurrence)
-        )
         return Model(
-            encoder=delayed_encoder,
-            backbone=delayed_backbone,
-            heads=delayed_heads,
+            encoder=cast(Encoder, _copy(self.encoder)),
+            backbone=cast(Backbone, _copy(self.backbone)),
+            heads={name: cast(BaseHead, _copy(head)) for name, head in self._heads.items()},
             action_head=self.action_head,
-            reasoner=delayed_reasoner,
-            recurrence=delayed_recurrence,
+            reasoner=None if self.reasoner is None else cast(LatentReasoner, _copy(self.reasoner)),
+            recurrence=(
+                None if self.recurrence is None else cast(Recurrence, _copy(self.recurrence))
+            ),
         )
 
-    def to(self, *args: Any, **kwargs: Any) -> "Model":
-        """Move/cast the model; only the backbone base takes a non-fp32 dtype.
+    def to(self, *args: Any, **kwargs: Any) -> Self:
+        """Move the model to a device; never casts.
 
-        Accepts every ``nn.Module.to`` form (``to(device)``, ``to(dtype)``,
-        ``to(device, dtype)``, ``to(tensor)``, keyword variants). A non-fp32
-        dtype applies to the backbone's base weights only; LoRA adapters,
-        encoder, reasoner, recurrence, and heads are cast to float32. Inputs
-        are cast to the backbone dtype at the backbone boundary and its
-        output is cast back to fp32 for the heads / adapters.
-
-        Training needs every trainable parameter in fp32 (``AdamW`` and
-        ``Polyak`` enforce it). Full fine-tuning: keep the model fp32 with
-        ``model.to(device=device)``. LoRA (``lora=`` on the backbone): the
-        base is frozen, so ``model.to(device=device,
-        dtype=preferred_dtype(device))`` runs it in bfloat16 on CUDA and
-        FlexAttention compiles. Inference may cast either kind of model.
+        Dtypes are fixed when the pieces are built: the transformer backbone
+        takes ``dtype=`` (``torch.float32`` to fine-tune the base weights,
+        ``preferred_dtype(device)`` for a frozen LoRA base or inference) and
+        every other section — LoRA adapters, encoder, reasoner, recurrence,
+        heads — is float32, which ``AdamW`` and ``Polyak`` require of every
+        trainable parameter. Inputs are cast to the backbone dtype at the
+        backbone boundary and its output back to fp32 for the heads. Passing
+        a dtype here raises ``TypeError``.
         """
-        device, dtype, non_blocking, memory_format = torch._C._nn._parse_to(*args, **kwargs)
-        if dtype is None or dtype == torch.float32:
-            return super().to(*args, **kwargs)
-        if not dtype.is_floating_point:
-            raise TypeError(f"Model.to only accepts floating point dtypes, got {dtype}.")
-        common: dict[str, Any] = {"non_blocking": non_blocking}
-        if device is not None:
-            common["device"] = device
-        if memory_format is not None:
-            common["memory_format"] = memory_format
-        if self.backbone is not None:
-            self.backbone.to(dtype=dtype, **common)
-            for adapter in lora_modules(self.backbone):
-                adapter.lora_A.to(dtype=torch.float32, **common)
-                adapter.lora_B.to(dtype=torch.float32, **common)
-        for section in (self.encoder, self.reasoner, self.recurrence, self.heads):
-            if section is not None:
-                section.to(dtype=torch.float32, **common)
-        return self
+        _reject_dtype_cast("Model", *args, **kwargs)
+        return super().to(*args, **kwargs)
 
     def half(self) -> "Model":
-        return self.to(torch.float16)
+        raise TypeError("Model.half() is not supported; set the backbone dtype when building it.")
 
     def bfloat16(self) -> "Model":
-        return self.to(torch.bfloat16)
+        raise TypeError("Model.bfloat16() is not supported; set the backbone dtype when building it.")
 
     def double(self) -> "Model":
-        return self.to(torch.float64)
+        raise TypeError("Model.double() is not supported; set the backbone dtype when building it.")
+
+    def float(self) -> "Model":
+        raise TypeError("Model.float() is not supported; set the backbone dtype when building it.")
 
     def _train_backbone_forward(
         self,
@@ -1323,28 +1270,29 @@ class Model(nn.Module):
         grouping_ids: torch.Tensor,
         needs_layerwise: bool,
     ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
-        """Training backbone pass: Flex packed on CUDA, SDPA mask on CPU.
+        """Uncached backbone pass over the flat packed stream.
 
-        ``embeds`` come from the fp32 encoder / adapters and are cast to the
-        backbone's base dtype here.
+        Transformer backbones run :func:`packed_forward` with the backbone's
+        ``train_kernel`` (``"varlen"``: flash varlen on CUDA bf16/fp16,
+        masked SDPA otherwise; ``"flex"``: FlexAttention). Backbones
+        without a decoder stack (``IdentityBackbone``, custom) take the
+        rectangular route with a dense sequence/grouping mask. ``embeds``
+        come from the fp32 encoder / adapters and are cast to the backbone's
+        base dtype here.
         """
         embeds = embeds.to(dtype=backbone.dtype)
         transformer = getattr(backbone, "model", None)
-        use_flex = (
-            transformer is not None
-            and hasattr(transformer, "layers")
-            and embeds.device.type == "cuda"
-        )
-        if use_flex:
-            from mouse_core.models.backbone.flex_train import flex_packed_forward
+        if transformer is not None and hasattr(transformer, "layers"):
+            from mouse_core.models.backbone.packed_train import packed_forward
 
-            assert transformer is not None
-            return flex_packed_forward(
-                output_hidden_states=needs_layerwise,
+            return packed_forward(
                 model=cast(nn.Module, transformer),
                 embeds=embeds,
                 sequence_ids=sequence_ids,
                 grouping_ids=grouping_ids,
+                output_hidden_states=needs_layerwise,
+                checkpoint=backbone.gradient_checkpointing,
+                train_kernel=backbone.train_kernel,
             )
         attention_mask = _flat_sequence_causal_mask(
             dtype=embeds.dtype,
@@ -1413,7 +1361,6 @@ class Model(nn.Module):
         """
         reasoner = self.reasoner
         assert reasoner is not None
-        assert self.backbone is not None
         R = plan.num_thoughts
         device = embeds.device
         nb = int(plan.burst_rows.size)
@@ -1482,37 +1429,24 @@ class Model(nn.Module):
 
     def forward(
         self,
-        batch: TokenBatch | None = None,
+        batch: TokenBatch,
         *,
-        last_hidden_state: torch.Tensor | None = None,
-        hidden_states: tuple[torch.Tensor, ...] | None = None,
-        head_output_indices: torch.Tensor | None = None,
         cache: DecodeCache | None = None,
         use_cache: bool = False,
         reasoning: Sequence[int] | np.ndarray | None = None,
     ) -> ModelOutput:
-        """Run a forward pass over a :class:`TokenBatch`, or run heads on given states.
+        """Run a forward pass over a :class:`TokenBatch`.
 
         Training: ``inputs, objective_data = loader.next_batch()`` then
-        ``out = model(inputs)``. Delayed DQN with heads-only delay:
-        ``delayed_model = model.delayed_copy(heads=True)`` then
-        ``delayed_model(last_hidden_state=out.last_hidden_state,
-        head_output_indices=out.head_output_indices,
-        hidden_states=out.hidden_states)``. With a delayed encoder and/or
-        backbone (``delayed_copy(encoder=..., backbone=...)``) run
-        ``delayed_model(inputs)`` instead. Interpolate with
-        ``Polyak(model, delayed_model)`` and ``polyak.update(tau_heads=...)``
-        (plus ``tau_encoder`` / ``tau_backbone`` for delayed trunk sections).
+        ``out = model(inputs)``. Delayed DQN: ``delayed_model =
+        model.delayed_copy()`` then ``delayed_model(inputs)`` under
+        ``torch.no_grad()`` (same ``TokenBatch`` and ``reasoning=`` as the
+        online forward); interpolate with ``Polyak(model, delayed_model)``
+        and ``polyak.update(tau_heads=..., tau_encoder=..., tau_backbone=...)``.
         Online / inference: ``inputs, _ = pack_token_batch([eval_transform(step)],
         sequence_ids=[0])`` then ``model(inputs, use_cache=True)``
         (optionally ragged; empty-only batches raise). Pass ``out.cache``
         back as ``cache=``.
-
-        ``last_hidden_state=`` (heads-only delayed copy) skips encoder and
-        backbone and runs the heads after pooling with
-        ``head_output_indices``; ``hidden_states=`` supplies the per-layer
-        states a layerwise head needs. ``head_output_indices=`` and
-        ``hidden_states=`` are only accepted with ``last_hidden_state=``.
 
         A model with a :class:`~mouse_core.models.recurrence.Recurrence`
         section runs the backbone ``num_passes`` times (pass ``k`` reads
@@ -1530,13 +1464,14 @@ class Model(nn.Module):
         immediately before that step's first head-output token, so the Q
         readout and all later same-run tokens attend to them. Predictions
         keep the flat ``[P, ...]`` contract; ``last_hidden_state`` /
-        ``head_output_indices`` describe the extended stream, so the
-        heads-only delayed copy reads the same thoughts.
+        ``head_output_indices`` describe the extended stream.
 
-        Training attention uses FlexAttention over the flat concatenated token
-        stream (causal within the same ``(sequence_id, grouping_id)`` run). Cached
-        decode keeps one ``FlexDecodeSession`` per backbone pass with per-sequence
-        KV caches and the same grouping-id isolation.
+        Training attention runs the packed stream forward over the flat
+        concatenated token stream (causal within the same ``(sequence_id,
+        grouping_id)`` class; kernel chosen by ``backbone.train_kernel``). Cached
+        decode keeps one ``FlexDecodeSession`` per backbone pass, a paged KV
+        pool in which each sequence owns only the pages its own history needs,
+        with the same grouping-id isolation.
 
         Training predictions are flat over head-output tokens (``[P, ...]``,
         one row per head-output token; ``objective_data["head_output_count"]``
@@ -1545,38 +1480,13 @@ class Model(nn.Module):
         """
         from mouse_core.data.token_batch import TokenBatch as _TokenBatch
 
-        if last_hidden_state is not None:
-            if batch is not None:
-                raise ValueError("Pass batch= or last_hidden_state=, not both.")
-            if use_cache or cache is not None:
-                raise ValueError("last_hidden_state= is not supported with use_cache=True.")
-            if reasoning is not None:
-                raise ValueError("last_hidden_state= is not supported with reasoning=.")
-            if head_output_indices is None:
-                raise ValueError("last_hidden_state= requires head_output_indices=.")
-            return self._forward_from_hidden(
-                last_hidden_state,
-                hidden_states=hidden_states,
-                head_output_indices=head_output_indices,
-            )
-        if head_output_indices is not None:
-            raise ValueError("head_output_indices= is only accepted with last_hidden_state=.")
-        if hidden_states is not None:
-            raise ValueError("hidden_states= is only accepted with last_hidden_state=.")
         if cache is not None and not use_cache:
             raise ValueError("Passing cache= requires use_cache=True.")
-        if batch is None:
-            raise TypeError("Model.forward requires a TokenBatch (or last_hidden_state=).")
         if not isinstance(batch, _TokenBatch):
             raise TypeError(
                 f"Model.forward expects a TokenBatch, got {type(batch).__name__}. "
                 "Use pack_token_batch([transform(step)], ...) "
                 "or DataLoader(transform=...)."
-            )
-        if self.encoder is None or self.backbone is None:
-            raise ValueError(
-                "this is a heads-only delayed copy; pass last_hidden_state= "
-                "and head_output_indices= from the online ModelOutput."
             )
 
         token_batch = batch
@@ -1643,10 +1553,8 @@ class Model(nn.Module):
                     )
                 sessions = cache.sessions
             else:
-                capacity = max(batched_embeds.shape[1], 1)
                 sessions = tuple(
-                    self.backbone.decode_session(batch_size=B, capacity=capacity)
-                    for _ in range(num_passes)
+                    self.backbone.decode_session(batch_size=B) for _ in range(num_passes)
                 )
             flex_embeds, resolved_indices = left_align_content(
                 batched_embeds, local_indices
@@ -1688,7 +1596,6 @@ class Model(nn.Module):
                     grouping_ids=grouping_ids,
                     plan=plan,
                 )
-            # Training: Flex packed on CUDA; SDPA mask fallback on CPU (no Flex backward).
             pass_input = embeds
             for _ in range(num_passes):
                 session_out = self._train_backbone_forward(
@@ -1723,54 +1630,6 @@ class Model(nn.Module):
             head_output_indices=resolved_indices,
             hidden_states=final.hidden_states,
             cache=new_cache,
-        )
-
-    def _forward_from_hidden(
-        self,
-        last_hidden_state: torch.Tensor,
-        *,
-        hidden_states: tuple[torch.Tensor, ...] | None,
-        head_output_indices: torch.Tensor,
-    ) -> ModelOutput:
-        if last_hidden_state.ndim not in (2, 3):
-            raise ValueError(
-                "last_hidden_state must have shape [L, D] or [B, S, D], "
-                f"got {tuple(last_hidden_state.shape)}."
-            )
-        if last_hidden_state.shape[-1] != self.hidden_dim:
-            raise ValueError(
-                f"last_hidden_state last dim must be hidden_dim={self.hidden_dim}, "
-                f"got {int(last_hidden_state.shape[-1])}."
-            )
-        needs_layerwise = "action_value_layerwise" in self._heads
-        if needs_layerwise:
-            if hidden_states is None:
-                raise ValueError(
-                    "layerwise heads require hidden_states= from the online ModelOutput."
-                )
-            h = torch.stack(
-                [
-                    _pool_head_outputs(layer_h, head_output_indices)
-                    for layer_h in hidden_states
-                ],
-                dim=1,
-            )
-        else:
-            h = _pool_head_outputs(last_hidden_state, head_output_indices)
-        predictions = self.head(h=h)
-        return ModelOutput(
-            predictions=predictions,
-            last_hidden_state=last_hidden_state,
-            passes=(
-                PassOutput(
-                    last_hidden_state=last_hidden_state,
-                    predictions=predictions,
-                    hidden_states=hidden_states,
-                ),
-            ),
-            head_output_indices=head_output_indices,
-            hidden_states=hidden_states,
-            cache=None,
         )
 
     def head(
@@ -1846,11 +1705,11 @@ def _last_action_scores(raw: torch.Tensor, *, name: str) -> torch.Tensor:
 def preferred_dtype(device: torch.device | str | None = None) -> torch.dtype:
     """Dtype for a frozen backbone base: ``bfloat16`` on CUDA, else ``float32``.
 
-    Pass to ``Model.to(device=..., dtype=preferred_dtype(device))`` for a
-    LoRA backbone (frozen base) or for inference; CUDA FlexAttention only
-    fuses for bf16/fp16. Every trainable section stays float32 via
-    :meth:`Model.to`. To fine-tune the whole backbone, do not cast: keep the
-    model fp32 with ``model.to(device=device)``.
+    Pass as the backbone ``dtype`` (``Qwen3Backbone(dtype=preferred_dtype(device),
+    ...)`` or ``load_model(..., dtype=preferred_dtype(device))``) for a LoRA
+    backbone (frozen base) or for inference; the CUDA flash varlen kernel
+    needs bf16/fp16. Every trainable section is float32 regardless. To
+    fine-tune the whole backbone, build it with ``dtype=torch.float32``.
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1941,7 +1800,7 @@ def _flat_sequence_position_ids(
 ) -> torch.Tensor:
     """RoPE positions ``[1, L]``: count of earlier same-``(sequence, grouping_id)`` tokens.
 
-    Same rule as the FlexAttention train path and cached decode, so all three
+    Same rule as the packed train forward and cached decode, so all three
     agree even when a grouping id recurs after a different one.
     """
     return packed_rope_positions(

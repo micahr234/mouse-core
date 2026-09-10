@@ -278,9 +278,9 @@ class DqnObjective(Objective):
     Instantiate with hyperparameters, then call with
     ``(objective_data, predictions, delayed_predictions)``. Online Q is
     ``predictions["action_value"]``; bootstrap Q is
-    ``delayed_predictions["action_value"]`` from the heads-only delayed
-    :class:`~mouse_core.models.base.Model` (``model.delayed_copy(heads=True)``) run on
-    the online token states. The delayed tensor is detached before
+    ``delayed_predictions["action_value"]`` from the delayed
+    :class:`~mouse_core.models.base.Model` (``model.delayed_copy()``) run on
+    the same ``TokenBatch``. The delayed tensor is detached before
     the Bellman target, so the TD error does not backprop through it.
 
     Q rows are **per head-output token** (``[P, A]``), not per step: a step may
@@ -441,8 +441,10 @@ class DqnObjective(Objective):
         self,
         objective_data: TensorDict,
         predictions: TensorDict,
-        delayed_predictions: TensorDict,
+        delayed_predictions: TensorDict | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
+        if delayed_predictions is None:
+            raise ValueError("DqnObjective requires delayed_predictions.")
         q: torch.Tensor = predictions["action_value"]
         q_target: torch.Tensor = delayed_predictions["action_value"].detach()
 

@@ -33,6 +33,7 @@ _TOKENS_PER_STEP = 6
 def _tiny_model(*, with_reasoner: bool = False) -> Model:
     encoder = NumericEmbedder(hidden_dim=_HIDDEN, modalities=_MODALITIES)
     backbone = LlamaBackbone(
+        train_kernel="varlen", decode_kernel="flex", dtype=torch.float32,
         hidden_dim=_HIDDEN,
         num_layers=2,
         num_heads=2,
@@ -277,13 +278,10 @@ def test_reasoning_forward_and_delayed_parity_multi_head_output() -> None:
     torch.manual_seed(0)
     model = _tiny_model(with_reasoner=True).eval()
     batch, _ = _packed(model)
-    delayed = model.delayed_copy(heads=True)
+    delayed = model.delayed_copy().eval()
     with torch.no_grad():
         out = model(batch, reasoning=[1, 0])
-        delayed_out = delayed(
-            last_hidden_state=out.last_hidden_state,
-            head_output_indices=out.head_output_indices,
-        )
+        delayed_out = delayed(batch, reasoning=[1, 0])
     assert out.predictions["action_value"].shape == (batch.P, _ACTIONS)
     assert torch.allclose(
         out.predictions["action_value"], delayed_out.predictions["action_value"], atol=1e-4
