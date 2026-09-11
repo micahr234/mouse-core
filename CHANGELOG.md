@@ -26,12 +26,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   layer in backward instead of storing its activations: about a 10x cut
   in activation memory (7.4 GB to 0.8 GB for 28 layers at 4096 tokens)
   for about 1.4x the step time. Off by default; not saved with the model.
-- ``scripts/bench_packed_forward.py``: forward, forward+backward, full
-  LoRA training step, tokens/second, peak memory, and compile warmup for
-  the eager, compiled, and checkpointed packed forward with each
-  ``--train-kernel`` (``varlen``, ``flex``; outputs cross-checked)
-  across short, long, high-variance, recurring-group, and many-small-group
-  streams.
+- ``bench/`` microbenches (not pytest): ``bench_train.py`` (packed
+  ``packed_forward``: forward, forward+backward, full LoRA step,
+  tokens/second, peak memory, compile warmup; ``varlen`` / ``flex``
+  cross-checked), ``bench_inference.py`` (paged FlexAttention
+  ``FlexDecodeSession``: prefill + one-token decode, tokens/second,
+  peak memory, compile warmup), and ``bench_dataloader.py``
+  (``next_batch`` wait — average and max — plus steps/second and
+  tokens/second for the FrozenLake augmenter + ``NumericTokenizer``
+  pipeline across workers). Env step rate lives in mouse-gym
+  ``bench/bench_env.py``.
 - ``ExponentialDecay`` and ``Piecewise`` schedules
   (``from mouse_core import ExponentialDecay, Piecewise``) map
   optimizer step → scalar. DQN uses ``ExponentialDecay`` for
@@ -238,6 +242,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``grouping_field: str | None = None`` (``None`` ⇒ no grouping filter).
 
 ### Changed
+- ``DataLoader`` batches are numbered ``k = 0, 1, 2, ...`` in
+  ``next_batch`` order, and batch ``k`` is a pure function of ``(seed, k,
+  store snapshot)``: windows are sampled from ``SeedSequence(seed,
+  spawn_key=(k,))`` and the transform is reseeded with
+  ``reseed(generation=k)``. Workers claim indices from a shared counter,
+  tag their results, and the consumer returns them in index order, so
+  ``num_workers`` changes throughput but never the stream (``num_workers=0``
+  and ``num_workers=4`` yield identical batches for the same ``seed``).
+  ``refresh()`` resumes numbering at the next batch the consumer has not
+  received. ``seed=None`` draws the loader's entropy once at construction.
+  Previously each worker had its own RNG stream and batches arrived in
+  thread-scheduling order, so multi-worker runs were not reproducible even
+  with ``seed`` set.
+- ``Augmenter.reseed(generation=None)`` replaces ``reseed(seed=None)``.
+  ``generation=None`` advances the shared counter and pins it on the
+  calling thread (as before); ``generation=k`` pins ``k`` on the calling
+  thread without touching the counter — this is what ``DataLoader`` calls
+  with the batch index. The draw cache is per thread and dropped by that
+  thread's ``reseed``; a reseed on one worker no longer evicts another
+  worker's draws. ``compose(...).reseed(generation=None)`` forwards the same
+  argument. The old ``seed=`` form (replace base seed, reset counter) is
+  gone.
 - Dependency floors raised to current PyPI latest: ``torch>=2.14.0``,
   ``numpy>=2.5.3``, ``transformers>=5.17.0``, ``tokenizers>=0.23.2``,
   ``tensordict>=0.14.2``, ``huggingface_hub>=1.31.0``, ``pyright>=1.1.414``,

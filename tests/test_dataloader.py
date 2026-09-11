@@ -152,9 +152,10 @@ def test_dataloader_reseeds_transform_each_batch() -> None:
         transform=compose(_stamp_task, augmenter, _stamp_grouping, _tokenizer()),
     )
     loader.next_batch()
-    assert augmenter._generation == 1
+    assert augmenter._generation_for_call() == 0  # batch k=0 pinned on this thread
     loader.next_batch()
-    assert augmenter._generation == 2
+    assert augmenter._generation_for_call() == 1
+    assert augmenter._generation == 0  # the shared counter is untouched
 
 
 class _ThreadMarkerTransform:
@@ -295,6 +296,82 @@ def test_dataloader_seed_is_deterministic_with_workers() -> None:
     finally:
         loader_a.close()
         loader_b.close()
+
+
+def _augmented_transform() -> Any:
+    def _stamp(step: dict) -> dict:
+        out = dict(step)
+        out.setdefault("task_index", step["action"] % 3)
+        out.setdefault("grouping_id", 0)
+        return out
+
+    augment = Augmenter(
+        seed=0,
+        seed_field="task_index",
+        fields=[
+            {
+                "type": "discrete",
+                "input_field": "action",
+                "output_field": "action",
+                "vocab_size": 16,
+                "permute": True,
+            }
+        ],
+    )
+    return compose(_stamp, augment, _tokenizer(objective_fields=_obj("action")))
+
+
+def _signatures(loader: DataLoader, n: int) -> list[tuple]:
+    return [_tb_signature(loader.next_batch()) for _ in range(n)]
+
+
+def test_dataloader_batch_k_is_independent_of_num_workers() -> None:
+    """Sync and threaded loaders with the same seed yield the identical ordered stream."""
+    store = _store_with_actions()
+    sync = _loader(
+        sequence_length=3, batch_size=2, num_workers=0, seed=7, stores=store,
+        transform=_augmented_transform(),
+    )
+    expected = _signatures(sync, 12)
+    assert len(set(expected)) > 1  # the stream actually varies over k
+    if not _free_threading_ok():
+        return
+    threaded = _loader(
+        sequence_length=3, batch_size=2, num_workers=4, prefetch=2, seed=7, stores=store,
+        transform=_augmented_transform(),
+    )
+    try:
+        assert _signatures(threaded, 12) == expected
+    finally:
+        threaded.close()
+
+
+@pytest.mark.skipif(not _free_threading_ok(), reason="free-threading (GIL disabled) required")
+def test_dataloader_refresh_resumes_numbering_at_next_unseen_batch() -> None:
+    store = _store_with_actions()
+    reference = _loader(sequence_length=3, batch_size=2, num_workers=0, seed=3, stores=store)
+    expected = _signatures(reference, 8)
+    loader = _loader(
+        sequence_length=3, batch_size=2, num_workers=3, prefetch=4, seed=3, stores=store
+    )
+    try:
+        got = _signatures(loader, 3)
+        loader.refresh()  # drops prefetched 3.. and rebuilds them with the same indices
+        got += _signatures(loader, 5)
+        assert got == expected
+        assert loader._next_k == 8
+    finally:
+        loader.close()
+
+
+def test_dataloader_unseeded_stream_is_still_ordered_and_fresh() -> None:
+    store = _store_with_actions()
+    a = _loader(sequence_length=3, batch_size=2, num_workers=0, stores=store)
+    b = _loader(sequence_length=3, batch_size=2, num_workers=0, stores=store)
+    assert a.seed is None and b.seed is None
+    assert a._entropy != b._entropy
+    a.next_batch()
+    assert a._next_k == 1
 
 
 def test_dataloader_index_field_stamps_store_offset() -> None:

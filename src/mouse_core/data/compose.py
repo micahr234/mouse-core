@@ -19,19 +19,21 @@ class _Compose:
             value = stage(value)
         return value
 
-    def reseed(self, seed: int | None = None) -> None:
-        """Call ``reseed`` on every stage that defines it."""
+    def reseed(self, generation: int | None = None) -> None:
+        """Call ``reseed(generation=...)`` on every stage that defines it."""
         for stage in self._stages:
             fn = getattr(stage, "reseed", None)
             if callable(fn):
-                fn(seed=seed)
+                fn(generation=generation)
 
 
 def compose(*stages: Callable[[Any], Any]) -> _Compose:
     """Return ``fn`` such that ``fn(x) == stages[-1](...stages[0](x)...)``.
 
-    The result is callable and exposes ``reseed(...)``, which forwards to any
-    stage that defines ``reseed`` (e.g. :class:`~mouse_core.data.augmenter.Augmenter`).
+    The result is callable and exposes ``reseed(generation=None)``, which
+    forwards to any stage that defines ``reseed`` (e.g.
+    :class:`~mouse_core.data.augmenter.Augmenter`). ``DataLoader`` calls it
+    with the batch index.
 
     Train includes the augmenter; eval leaves it out so the model sees raw
     values::

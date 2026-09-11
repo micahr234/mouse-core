@@ -10,8 +10,23 @@ A ``Datastore`` is a flat sequence of arbitrary rows. The loader samples
 The loader is stage-agnostic: compose augmenter / tokenizer
 (or any ``dict → StepTokens`` callable) outside and pass the result as
 ``transform=``. At the start of each batch fetch, if ``transform`` defines
-``reseed()``, it is called once (so an :class:`~mouse_core.data.augmenter.Augmenter`
-in the compose pipeline draws a new augmentation set per batch).
+``reseed()``, it is called as ``reseed(generation=k)`` with the batch index
+(so an :class:`~mouse_core.data.augmenter.Augmenter` in the compose pipeline
+draws the augmentation set that belongs to batch ``k``).
+
+Determinism
+-----------
+Batches are numbered ``k = 0, 1, 2, ...`` in the order :meth:`DataLoader.next_batch`
+returns them. Batch ``k`` samples its windows from
+``SeedSequence(seed, spawn_key=(k,))`` and reseeds the transform with
+``generation=k``, so it is a pure function of ``(seed, k, store snapshot)``:
+``num_workers`` changes only throughput, never the stream. Workers claim
+indices from a shared counter and the consumer hands batches out in index
+order (a small reorder buffer absorbs the interleaving). :meth:`DataLoader.refresh`
+discards prefetched batches and resumes numbering at the next batch the
+consumer has not seen, so the sequence after a refresh depends only on when
+(in batches) it was called. ``seed=None`` draws the entropy once at
+construction (a fresh stream per loader, still numbered and ordered).
 
 Usage
 -----
@@ -105,14 +120,22 @@ def _fetch_sequence(
     return rows
 
 
+def _batch_rng(entropy: int, k: int) -> np.random.Generator:
+    """Window-sampling RNG of batch ``k``: ``SeedSequence(entropy, spawn_key=(k,))``."""
+    return np.random.default_rng(np.random.SeedSequence(entropy, spawn_key=(k,)))
+
+
 def _fetch_one_batch(
     cfg: _SnapshotConfig,
-    rng: np.random.Generator,
+    entropy: int,
+    k: int,
     transform: StepTransform,
 ) -> tuple[TokenBatch, TensorDict]:
+    """Build batch ``k``: reseed the transform to generation ``k``, sample, pack."""
     reseed = getattr(transform, "reseed", None)
     if callable(reseed):
-        reseed()
+        reseed(generation=k)
+    rng = _batch_rng(entropy, k)
     sequences = [_fetch_sequence(cfg, rng) for _ in range(cfg.batch_size)]
     steps: list[StepTokens] = []
     sequence_ids: list[int] = []
@@ -150,25 +173,45 @@ class _WorkerFailure:
                 self.exc = exc
 
 
+class _BatchCounter:
+    """Hands out batch indices ``k`` to whichever worker asks next.
+
+    One instance per worker generation: a worker that outlives
+    ``_stop_workers`` keeps claiming from its own (stale) counter and can
+    never punch a hole in the live numbering.
+    """
+
+    def __init__(self, start: int) -> None:
+        self._lock = threading.Lock()
+        self._next = int(start)
+
+    def claim(self) -> int:
+        with self._lock:
+            k = self._next
+            self._next += 1
+            return k
+
+
 def _worker_loop(
     result_queue: queue.Queue,
     stop_event: threading.Event,
     failure: _WorkerFailure,
+    counter: _BatchCounter,
     cfg: _SnapshotConfig,
-    sample_seed: Any,
+    entropy: int,
     transform: StepTransform,
 ) -> None:
-    """Prefetch loop run inside a worker thread."""
-    rng = np.random.default_rng(seed=sample_seed)
+    """Prefetch loop run inside a worker thread: claim ``k``, build batch ``k``, enqueue ``(k, item)``."""
     while not stop_event.is_set():
+        k = counter.claim()
         try:
-            item = _fetch_one_batch(cfg, rng, transform)
+            item = _fetch_one_batch(cfg, entropy, k, transform)
         except Exception as exc:  # noqa: BLE001
             failure.record(exc)
             return
         while not stop_event.is_set():
             try:
-                result_queue.put(item, timeout=0.05)
+                result_queue.put((k, item), timeout=0.05)
                 break
             except queue.Full:
                 pass
@@ -192,8 +235,12 @@ class DataLoader:
     index_field :
         Optional key. When set, each fetched step is stamped with its absolute
         store offset under this name before ``transform`` runs.
-    weights / weight_mode / prefetch / num_workers / seed :
-        Sampling and worker controls (unchanged semantics).
+    weights / weight_mode / prefetch / num_workers :
+        Sampling and worker controls.
+    seed :
+        Entropy of the batch stream. Batch ``k`` is a pure function of
+        ``(seed, k, snapshot)`` for any ``num_workers`` (see module
+        docstring). ``None`` draws fresh entropy for this loader.
     """
 
     def __init__(
@@ -215,9 +262,12 @@ class DataLoader:
         self._stop: threading.Event | None = None
         self._result_queue: queue.Queue | None = None
         self._workers: list[threading.Thread] = []
-        self._sync_rng: np.random.Generator | None = None
-        self._sync_transform: StepTransform | None = None
         self._failure = _WorkerFailure()
+        # Batch numbering: the consumer returns _next_k next and parks
+        # out-of-order worker arrivals in _reorder. Workers claim indices from
+        # a counter created per _start_workers call, starting at _next_k.
+        self._next_k = 0
+        self._reorder: dict[int, tuple[TokenBatch, TensorDict]] = {}
 
         if isinstance(stores, _DS):
             stores = [stores]
@@ -260,8 +310,8 @@ class DataLoader:
         self._weights: np.ndarray = (
             np.ones(len(stores)) if weights is None else np.asarray(weights, dtype=float)
         )
-        self._seed_seq: np.random.SeedSequence | None = (
-            np.random.SeedSequence(seed) if seed is not None else None
+        self._entropy: int = (
+            int(seed) if seed is not None else int(np.random.SeedSequence().entropy)  # type: ignore[arg-type]
         )
 
         self._datasets: list = []
@@ -269,10 +319,7 @@ class DataLoader:
         self._probs: np.ndarray = np.empty(0)
         self._resnapshot_stores()
 
-        if num_workers == 0:
-            self._sync_rng = np.random.default_rng(seed=seed)
-            self._sync_transform = transform
-        else:
+        if num_workers > 0:
             self._start_workers()
 
     @property
@@ -282,33 +329,44 @@ class DataLoader:
         return max(0, (total_windows + self.batch_size - 1) // self.batch_size)
 
     def refresh(self) -> None:
-        """Drop prefetched batches and re-snapshot all stores."""
+        """Drop prefetched batches and re-snapshot all stores.
+
+        Numbering resumes at the next batch the consumer has not received,
+        so batches after the refresh are rebuilt against the new snapshot
+        with their original indices.
+        """
         if self._num_workers > 0:
             self._stop_workers()
+        self._reorder.clear()
         self._resnapshot_stores()
         if self._num_workers > 0:
             self._start_workers()
 
     def next_batch(self) -> tuple[TokenBatch, TensorDict]:
-        """Return ``(inputs, objective_data)``.
+        """Return ``(inputs, objective_data)`` for the next batch index.
 
         ``inputs`` is the packed :class:`TokenBatch`. ``objective_data``
         is a CPU :class:`~tensordict.TensorDict` of tokenizer
         ``objective_fields`` (plus ``sequence_id`` and the grouping column).
         """
-        if self._sync_rng is not None:
-            cfg = self._snapshot_config()
-            assert self._sync_transform is not None
-            return _fetch_one_batch(cfg, self._sync_rng, self._sync_transform)
+        k = self._next_k
+        if self._num_workers == 0:
+            item = _fetch_one_batch(self._snapshot_config(), self._entropy, k, self.transform)
+            self._next_k = k + 1
+            return item
         assert self._result_queue is not None
-        while True:
+        while k not in self._reorder:
             if self._failure.exc is not None:
                 raise RuntimeError("A prefetch worker raised an exception.") from self._failure.exc
             try:
-                return self._result_queue.get(timeout=0.05)
+                got_k, got_item = self._result_queue.get(timeout=0.05)
             except queue.Empty:
                 if self._failure.exc is None and not any(w.is_alive() for w in self._workers):
                     raise RuntimeError("All prefetch workers stopped unexpectedly.")
+                continue
+            self._reorder[got_k] = got_item
+        self._next_k = k + 1
+        return self._reorder.pop(k)
 
     def close(self) -> None:
         """Stop background workers and drain the queue."""
@@ -342,19 +400,13 @@ class DataLoader:
             index_field=self.index_field,
         )
 
-    def _worker_seeds(self) -> list[Any]:
-        n = self._num_workers
-        if self._seed_seq is None:
-            return [None] * n
-        return list(self._seed_seq.spawn(n))
-
     def _start_workers(self) -> None:
         assert self._num_workers > 0
         self._failure = _WorkerFailure()
         self._result_queue = queue.Queue(maxsize=self._prefetch)
         self._stop = threading.Event()
         cfg = self._snapshot_config()
-        sample_seeds = self._worker_seeds()
+        counter = _BatchCounter(self._next_k)
         self._workers = []
         for i in range(self._num_workers):
             thread = threading.Thread(
@@ -363,8 +415,9 @@ class DataLoader:
                     self._result_queue,
                     self._stop,
                     self._failure,
+                    counter,
                     cfg,
-                    sample_seeds[i],
+                    self._entropy,
                     self.transform,
                 ),
                 daemon=True,

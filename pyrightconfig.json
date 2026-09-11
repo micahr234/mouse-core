@@ -2,7 +2,7 @@
   "pythonVersion": "3.14",
   "venvPath": ".",
   "venv": ".venv",
-  "include": ["src", "tests", "examples"],
+  "include": ["src", "tests", "examples", "bench"],
   "extraPaths": [
     "src",
     ".venv/lib/python3.14t/site-packages"

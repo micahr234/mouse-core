@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import threading
 
 import numpy as np
 import pytest
@@ -225,11 +226,44 @@ def test_reseed_replaces_draw_cache() -> None:
     )
     for key in range(5):
         augment({"action": 0, "task_index": key})
-    assert len(augment._draw_cache) == 5
+    assert len(augment._thread_draw_cache()) == 5
     augment.reseed()
-    assert len(augment._draw_cache) == 0
+    assert len(augment._thread_draw_cache()) == 0
     augment({"action": 0, "task_index": 0})
-    assert len(augment._draw_cache) == 1
+    assert len(augment._thread_draw_cache()) == 1
+
+
+def test_reseed_generation_pins_thread_without_advancing_counter() -> None:
+    augment = Augmenter(
+        seed=0,
+        seed_field="task_index",
+        fields=[
+            {"type": "discrete", "input_field": "action", "output_field": "action", "vocab_size": 10, "permute": True}
+        ],
+    )
+    augment.reseed(generation=7)
+    assert augment._generation == 0
+    out = augment({"action": 0, "task_index": 3})
+    assert out["action"] == int(
+        _rng_for_key(seed=0, seed_field="task_index", key=3, generation=7).permutation(10)[0]
+    )
+    # Another thread on a different generation neither sees nor disturbs this pin.
+    seen: dict[str, int] = {}
+
+    def _other() -> None:
+        augment.reseed(generation=8)
+        seen["gen"] = augment._generation_for_call()
+        seen["action"] = augment({"action": 0, "task_index": 3})["action"]
+
+    t = threading.Thread(target=_other)
+    t.start()
+    t.join()
+    assert seen["gen"] == 8
+    assert seen["action"] == int(
+        _rng_for_key(seed=0, seed_field="task_index", key=3, generation=8).permutation(10)[0]
+    )
+    assert augment._generation_for_call() == 7
+    assert augment({"action": 0, "task_index": 3})["action"] == out["action"]
 
 
 def test_multi_field_mask_uses_one_decision_per_step() -> None:

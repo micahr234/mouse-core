@@ -10,9 +10,9 @@ CUDA is synchronized around every measurement; medians and min/max over
 ``--iters`` iterations. Each kernel's outputs are also checked against the
 other's on the same inputs (max abs diff printed per workload).
 
-    PYTHON_GIL=0 .venv/bin/python scripts/bench_packed_forward.py --layers 8
-    PYTHON_GIL=0 .venv/bin/python scripts/bench_packed_forward.py --layers 28 --workloads mid long
-    PYTHON_GIL=0 .venv/bin/python scripts/bench_packed_forward.py --train-kernel flex --modes compiled
+    PYTHON_GIL=0 .venv/bin/python bench/bench_train.py --layers 8
+    PYTHON_GIL=0 .venv/bin/python bench/bench_train.py --layers 28 --workloads mid long
+    PYTHON_GIL=0 .venv/bin/python bench/bench_train.py --train-kernel flex --modes compiled
 
 Default shape is Qwen3-0.6B (hidden 1024, 16 q / 8 kv heads, head_dim 128,
 FFN 3072) with fp32 LoRA rank 16 on a frozen bf16 base; ``--layers`` trims the

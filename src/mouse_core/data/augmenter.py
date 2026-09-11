@@ -17,9 +17,11 @@ id share draws within one :meth:`Augmenter.reseed` generation. Mask decisions
 Discrete permute specs remap ``input_field`` ids; optional
 ``input_vector_field`` / ``output_vector_field`` vectors share that
 permutation (inverse-permuted along the last axis).
-``DataLoader`` calls ``train_transform.reseed()`` once per batch. Eval /
-decode uses a second compose that omits the augmenter so raw values reach
-the model.
+``DataLoader`` calls ``train_transform.reseed(generation=k)`` with the batch
+index before building batch ``k``, so every draw is a pure function of
+``(seed, k, seed_field value)`` no matter which worker thread builds the
+batch. The generation and its draw cache are per thread. Eval / decode uses
+a second compose that omits the augmenter so raw values reach the model.
 """
 
 from __future__ import annotations
@@ -303,7 +305,6 @@ class Augmenter:
         self._generation = 0
         self._lock = threading.Lock()
         self._tls = threading.local()
-        self._draw_cache: dict[tuple[int, Any], dict[int, dict[str, Any]]] = {}
 
     def __call__(self, step: dict) -> dict:
         """Return an augmented copy of ``step``."""
@@ -327,27 +328,28 @@ class Augmenter:
                 row[out_f] = self._apply_value_permutation(spec, draw, row[in_f])
         return row
 
-    def reseed(self, seed: int | None = None) -> None:
-        """Advance to a new draw set for every ``seed_field`` key.
+    def reseed(self, generation: int | None = None) -> None:
+        """Move the calling thread to a new draw set for every ``seed_field`` key.
 
         Within one generation, steps that share the seed-field value share
-        permute/scale/shift draws. After ``reseed()``, those keys get a fresh
-        set and the cached draws from previous generations are discarded (a
-        thread still on an older pinned generation recomputes them on demand).
-        Pins the new generation on the calling thread so a batch or eval run
-        is not interrupted by another thread's reseed.
+        permute/scale/shift draws; the mask stream restarts per generation.
+        Draws are a pure function of ``(seed, generation, seed_field value)``.
 
-        If ``seed`` is given, replaces the base seed, resets the generation
-        counter, then advances once.
+        ``generation=None`` advances a shared counter and pins the new value
+        on this thread (a thread on an older pin is not disturbed).
+        ``generation=k`` pins ``k`` on this thread without touching the
+        counter — ``DataLoader`` passes the batch index so batch ``k`` gets
+        the same augmentation whichever worker builds it. Either way the
+        calling thread's draw cache is dropped.
         """
-        with self._lock:
-            if seed is not None:
-                self._base_seed = int(seed)
-                self._generation = 0
-            self._generation += 1
-            gen = self._generation
-            self._draw_cache = {}
+        if generation is None:
+            with self._lock:
+                self._generation += 1
+                gen = self._generation
+        else:
+            gen = int(generation)
         self._tls.generation = gen
+        self._tls.draw_cache = {}
 
     def fork(self, *, seed: int | None = None) -> Augmenter:
         """Create an equivalent augmenter with a different base seed."""
@@ -364,6 +366,14 @@ class Augmenter:
             return int(pinned)
         return self._generation
 
+    def _thread_draw_cache(self) -> dict[tuple[int, Any], dict[int, dict[str, Any]]]:
+        """This thread's ``(generation, key) -> draws`` cache (created on first use)."""
+        cache = getattr(self._tls, "draw_cache", None)
+        if cache is None:
+            cache = {}
+            self._tls.draw_cache = cache
+        return cache
+
     def _draws_for_step(self, step: dict) -> dict[int, dict[str, Any]]:
         if self.seed_field not in step:
             raise KeyError(
@@ -378,7 +388,8 @@ class Augmenter:
                 pass
         generation = self._generation_for_call()
         cache_key = (generation, key)
-        cached = self._draw_cache.get(cache_key)
+        cache = self._thread_draw_cache()
+        cached = cache.get(cache_key)
         if cached is not None:
             return cached
         base = 0 if self._base_seed is None else int(self._base_seed)
@@ -391,7 +402,7 @@ class Augmenter:
             index: self._draw_field(spec, rng)
             for index, spec in enumerate(self.fields)
         }
-        self._draw_cache[cache_key] = draws
+        cache[cache_key] = draws
         return draws
 
     def _draw_field(
