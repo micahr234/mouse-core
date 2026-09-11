@@ -17,13 +17,13 @@ classifiers = [
     "Programming Language :: Python :: 3.14",
 ]
 dependencies = [
-    "torch>=2.13.0",
-    "numpy>=2.5.2",
-    "transformers>=5.16.1",
-    "tokenizers>=0.23.1",
-    "tensordict>=0.14.0",
+    "torch>=2.14.0",
+    "numpy>=2.5.3",
+    "transformers>=5.17.0",
+    "tokenizers>=0.23.2",
+    "tensordict>=0.14.2",
     "datasets>=5.0.1",
-    "huggingface_hub>=1.29.0",
+    "huggingface_hub>=1.31.0",
 ]
 
 [project.urls]
@@ -44,15 +44,15 @@ all = [
     "mouse-core[examples]",
 ]
 dev = [
-    "pyright>=1.1.411",
+    "pyright>=1.1.414",
     "pytest>=9.1.1",
-    "build>=1.6.0",
+    "build>=1.6.1",
     "twine>=7.0.0",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "."]
 
 [tool.setuptools.package-data]
 mouse_core = ["py.typed"]

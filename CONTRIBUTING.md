@@ -23,7 +23,7 @@ This installs the package in editable mode with the `dev` and `all` extras (`all
 
 ### Temporary `PYTHON_GIL=0` (remove when possible)
 
-`scripts/install.sh` and CI set `PYTHON_GIL=0` so the free-threaded interpreter **keeps the GIL off** after imports. `tokenizers>=0.23.1` declares `Py_MOD_GIL_NOT_USED`. Triton still does not, so importing `triton._C.libtriton` (pulled in by torch) would otherwise re-enable the GIL.
+`scripts/install.sh` and CI set `PYTHON_GIL=0` so the free-threaded interpreter **keeps the GIL off** after imports. `tokenizers>=0.23.2` declares `Py_MOD_GIL_NOT_USED`. Triton still does not, so importing `triton._C.libtriton` (pulled in by torch) would otherwise re-enable the GIL.
 
 **Follow-up:** when Triton declares `Py_MOD_GIL_NOT_USED`, drop `PYTHON_GIL=0` from [`scripts/install.sh`](scripts/install.sh) and [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 

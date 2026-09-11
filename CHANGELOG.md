@@ -238,6 +238,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``grouping_field: str | None = None`` (``None`` ⇒ no grouping filter).
 
 ### Changed
+- Dependency floors raised to current PyPI latest: ``torch>=2.14.0``,
+  ``numpy>=2.5.3``, ``transformers>=5.17.0``, ``tokenizers>=0.23.2``,
+  ``tensordict>=0.14.2``, ``huggingface_hub>=1.31.0``, ``pyright>=1.1.414``,
+  ``build>=1.6.1``.
 - Cached decode (``FlexDecodeSession``, behind ``Model.forward(...,
   use_cache=True)``) stores K/V in a **paged pool** shared by the whole
   batch instead of one ``[B, kv_heads, capacity, head_dim]`` buffer sized

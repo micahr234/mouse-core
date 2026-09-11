@@ -74,7 +74,7 @@ setup_venv() {
     success "Virtual environment created"
 
     # TEMPORARY: Triton still re-enables the GIL on import (no Py_mod_gil slot).
-    # tokenizers>=0.23.1 is free-thread-safe. Drop PYTHON_GIL=0 when Triton
+    # tokenizers>=0.23.2 is free-thread-safe. Drop PYTHON_GIL=0 when Triton
     # declares Py_MOD_GIL_NOT_USED — see CONTRIBUTING.md.
     if ! grep -qxF 'export PYTHON_GIL=0' .venv/bin/activate 2>/dev/null; then
         echo 'export PYTHON_GIL=0' >> .venv/bin/activate
