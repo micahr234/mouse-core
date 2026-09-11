@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -17,9 +21,9 @@ jobs:
       # Remove once Triton declares Py_MOD_GIL_NOT_USED — see CONTRIBUTING.md.
       PYTHON_GIL: "0"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - uses: astral-sh/setup-uv@v8.1.0
+      - uses: astral-sh/setup-uv@v10.1.0
         with:
           enable-cache: true
           cache-dependency-glob: "pyproject.toml"
@@ -28,6 +32,8 @@ jobs:
         run: |
           uv python install 3.14t
           uv venv --python 3.14t
+          # Install CPU-only torch first so the large CUDA wheel is never fetched in CI.
+          uv pip install torch --index-url https://download.pytorch.org/whl/cpu --python .venv/bin/python
           uv pip install -e ".[dev]" --python .venv/bin/python
 
       - name: Type check
@@ -35,3 +41,24 @@ jobs:
 
       - name: Run tests
         run: .venv/bin/pytest -q
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10.1.0
+        with:
+          enable-cache: true
+
+      - name: Install free-threaded Python and build tools
+        run: |
+          uv python install 3.14t
+          uv venv --python 3.14t
+          uv pip install "build>=1.2" "twine>=6.1" --python .venv/bin/python
+
+      - name: Build wheel and sdist
+        run: .venv/bin/python -m build
+
+      - name: Validate distributions
+        run: .venv/bin/python -m twine check dist/*

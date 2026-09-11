@@ -48,7 +48,7 @@ def _tiny_model(*, with_reasoner: bool = False) -> Model:
     reasoner = (
         LatentReasoner(hidden_dim=_HIDDEN, num_thoughts=2) if with_reasoner else None
     )
-    return Model(encoder=encoder, backbone=backbone, heads=heads, reasoner=reasoner)
+    return Model(encoder=encoder, backbone=backbone, heads=heads, action_head="action_value", reasoner=reasoner, recurrence=None)
 
 
 def _rows(n: int, offset: int = 0) -> list[dict]:

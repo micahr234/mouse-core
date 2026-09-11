@@ -115,7 +115,7 @@ class _Qwen3BackboneConfig:
 class Qwen3Backbone(Backbone):
     """Backbone adapter wrapping a ``transformers.Qwen3Model``.
 
-    ``train_kernel`` (``"varlen"`` / ``"flex"``), ``decode_kernel``
+    ``train_kernel`` (``"varlen"`` / ``"padded"`` / ``"flex"``), ``decode_kernel``
     (``"flex"``) and ``dtype`` are required: the uncached-forward kernel, the
     cached-decode kernel, and the dtype of the base weights (``torch.float32``
     to fine-tune them, ``preferred_dtype(device)`` for a frozen LoRA base or

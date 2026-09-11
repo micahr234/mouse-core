@@ -62,7 +62,7 @@ def _tiny_model(*, num_passes: int | None = 3, layerwise: bool = False) -> Model
         if num_passes is not None
         else None
     )
-    return Model(encoder=encoder, backbone=backbone, heads=heads, recurrence=recurrence)
+    return Model(encoder=encoder, backbone=backbone, heads=heads, action_head="action_value_layerwise" if layerwise else "action_value", reasoner=None, recurrence=recurrence)
 
 
 def _rows(n: int, offset: int = 0) -> list[dict]:
@@ -107,6 +107,7 @@ def test_recurrence_validates_arguments() -> None:
             heads=DiscreteActionValueHead(
                 in_features=_HIDDEN, out_features=_ACTIONS, hidden_dim=_HIDDEN, num_layers=1
             ),
+            action_head="action_value",
             reasoner=LatentReasoner(hidden_dim=_HIDDEN, num_thoughts=2),
             recurrence=Recurrence(hidden_dim=_HIDDEN, num_passes=2),
         )
@@ -117,6 +118,8 @@ def test_recurrence_validates_arguments() -> None:
             heads=DiscreteActionValueHead(
                 in_features=_HIDDEN, out_features=_ACTIONS, hidden_dim=_HIDDEN, num_layers=1
             ),
+            action_head="action_value",
+            reasoner=None,
             recurrence=Recurrence(hidden_dim=_HIDDEN * 2, num_passes=2),
         )
 

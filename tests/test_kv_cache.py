@@ -69,7 +69,7 @@ def _tiny_model(backbone_cls, tokens: int=1, dtype: torch.dtype = torch.float32,
     encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}, {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3, "std": 0.02, "positions": 1}])
     backbone = backbone_cls(train_kernel="varlen", decode_kernel="flex", dtype=dtype, hidden_dim=hidden_dim, num_layers=2, num_heads=2, **backbone_kwargs)
     head = DiscreteActionValueHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1)
-    return Model(encoder=encoder, backbone=backbone, heads=head).eval()
+    return Model(encoder=encoder, backbone=backbone, heads=head, action_head="action_value", reasoner=None, recurrence=None).eval()
 
 def _steps(n: int, start: int=0) -> list[dict]:
     return [{'action': i % 4, 'reward': float(i), 'episode_done': int(i % 7 == 6), 'task_done': 0} for i in range(start, start + n)]
@@ -163,6 +163,8 @@ def test_cuda_fp32_decode_is_compiled_and_matches_full_forward() -> None:
     assert session._flex._compiled is not None
     assert session._flex._active is session._flex._compiled
     assert session._compile_masks
+    from mouse_core.models.backbone import flex_decode as flex_decode_mod
+    assert flex_decode_mod._compiled_decode_pre is not None
     full_q = _as_rect(full['action_value'])
     assert torch.allclose(incremental, full_q, atol=1e-4), (incremental - full_q).abs().max().item()
 
@@ -190,7 +192,7 @@ def test_cuda_bf16_lora_compiled_train_matches_cached_decode() -> None:
     head = DiscreteActionValueHead(
         in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1
     )
-    model = Model(encoder=encoder, backbone=backbone, heads=head).eval().to(torch.device('cuda'))
+    model = Model(encoder=encoder, backbone=backbone, heads=head, action_head="action_value", reasoner=None, recurrence=None).eval().to(torch.device('cuda'))
     steps = _steps(8)
     for step, task in zip(steps, (0, 0, 1, 1, 0, 0, 2, 0)):
         step["task_index"] = task
@@ -209,8 +211,53 @@ def test_cuda_bf16_lora_compiled_train_matches_cached_decode() -> None:
         full_q = _as_rect(full['action_value'])
         assert full_q.dtype == torch.float32
         assert torch.allclose(incremental, full_q, atol=0.05), (incremental - full_q).abs().max().item()
+        assert cache is not None
+        from mouse_core.models.backbone import flex_decode as flex_decode_mod
+        assert flex_decode_mod._compiled_decode_pre is not None
     finally:
         packed_train_mod._compiled_layer = was
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='S=1 CUDA graph is CUDA-only')
+def test_cuda_s1_cudagraph_matches_eager_decode() -> None:
+    """After compile warmup, the S=1 graph matches eager compiled decode."""
+    from mouse_core.models.backbone.flex_decode import FlexDecodeSession
+
+    torch.manual_seed(0)
+    device = torch.device('cuda')
+    backbone = Qwen3Backbone(
+        train_kernel="varlen", decode_kernel="flex", dtype=torch.bfloat16,
+        hidden_dim=64, num_layers=2, num_heads=4, lora=LoRAConfig(rank=4, alpha=8.0),
+    ).to(device).eval()
+    for n, p in backbone.named_parameters():
+        if ".lora_B." in n:
+            torch.nn.init.normal_(p, std=0.05)
+    inner = cast(nn.Module, cast(Any, backbone).model)
+    B, D = 2, 64
+    pre = torch.randn(B, 8, D, device=device, dtype=torch.bfloat16)
+    preg = torch.zeros(B, 8, dtype=torch.long, device=device)
+    steps = [torch.randn(B, 1, D, device=device, dtype=torch.bfloat16) for _ in range(4)]
+    stepg = torch.zeros(B, 1, dtype=torch.long, device=device)
+
+    def run(*, graph: bool) -> list[torch.Tensor]:
+        session = FlexDecodeSession(inner, batch_size=B)
+        if not graph:
+            session._graph_disabled = True
+        outs: list[torch.Tensor] = []
+        with torch.no_grad():
+            session.forward(embeds=pre, lengths=[8, 8], grouping_ids=preg)
+            for embeds in steps:
+                outs.append(session.forward(embeds=embeds, lengths=[1, 1], grouping_ids=stepg).clone())
+        if graph:
+            assert session._graph is not None or session._graph_disabled
+        return outs
+
+    graphed = run(graph=True)
+    eager = run(graph=False)
+    for i, (a, b) in enumerate(zip(graphed, eager)):
+        assert torch.allclose(a.float(), b.float(), atol=5e-2, rtol=5e-2), (
+            i, (a - b).abs().max().item()
+        )
 
 
 def test_packed_rope_positions_count_same_group_tokens() -> None:
@@ -348,7 +395,7 @@ def test_concat_fusion_ragged_chunks_match_unbatched() -> None:
     encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}, {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3, "std": 0.02, "positions": 1}, {'type': 'learnable', 'tokens': 1, "std": 0.02, "positions": 1}])
     backbone = Qwen3Backbone(train_kernel="varlen", decode_kernel="flex", dtype=torch.float32, hidden_dim=hidden_dim, num_layers=2, num_heads=2)
     head = DiscreteActionValueHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1)
-    model = Model(encoder=encoder, backbone=backbone, heads=head).eval()
+    model = Model(encoder=encoder, backbone=backbone, heads=head, action_head="action_value", reasoner=None, recurrence=None).eval()
     assert model.encoder.tokens_per_step == 4
     chunk_lengths = [[1, 4, 2], [3, 0, 1], [2, 2, 3]]
     totals = [sum((call[b] for call in chunk_lengths)) for b in range(3)]

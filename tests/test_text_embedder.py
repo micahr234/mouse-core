@@ -284,6 +284,9 @@ def test_text_embedder_save_load(tmp_path) -> None:
         heads=DiscreteActionValueHead(
             in_features=D, out_features=4, hidden_dim=D, num_layers=1
         ),
+        action_head="action_value",
+        reasoner=None,
+        recurrence=None,
     )
     from mouse_core.models.base import _encoder_config
 
@@ -344,6 +347,9 @@ def test_text_embedder_learnable_save_load(tmp_path) -> None:
         heads=DiscreteActionValueHead(
             in_features=D, out_features=4, hidden_dim=D, num_layers=1
         ),
+        action_head="action_value",
+        reasoner=None,
+        recurrence=None,
     ).eval()
     batch = [[{"action": 1}, {"action": 3}]]
     expected = model(batch_to_token_batch(tokenizer, batch)).predictions
@@ -387,6 +393,9 @@ def test_text_model_card_describes_tokenizer(tmp_path) -> None:
         heads=DiscreteActionValueHead(
             in_features=8, out_features=4, hidden_dim=8, num_layers=1
         ),
+        action_head="action_value",
+        reasoner=None,
+        recurrence=None,
     )
     path = tmp_path / "README.md"
     _write_model_card(repo_id="user/mouse-text", model=model, path=path)

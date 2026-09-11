@@ -19,7 +19,7 @@ def test_composed_model_roundtrip(tmp_path) -> None:
     encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}, {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3, "std": 0.02, "positions": 1}])
     backbone = IdentityBackbone(hidden_dim=hidden_dim)
     heads = DiscreteActionValueHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1)
-    model = Model(encoder=encoder, backbone=backbone, heads=heads).eval()
+    model = Model(encoder=encoder, backbone=backbone, heads=heads, action_head="action_value", reasoner=None, recurrence=None).eval()
     batch = [[{'action': 0, 'reward': 0.0, 'episode_done': 0, 'task_done': 0}, {'action': 1, 'reward': 1.0, 'episode_done': 0, 'task_done': 0}, {'action': 2, 'reward': 2.0, 'episode_done': 1, 'task_done': 0}]]
     expected = model(batch_to_token_batch(_tok(model.encoder), batch)).predictions
     save_model(model, tmp_path)
@@ -56,7 +56,7 @@ def test_kernels_and_dtype_are_not_saved_and_come_from_the_loader(tmp_path) -> N
     encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}])
     backbone = Qwen3Backbone(train_kernel="varlen", decode_kernel="flex", dtype=torch.float32, hidden_dim=hidden_dim, num_layers=1, num_heads=2)
     heads = DiscreteActionValueHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1)
-    save_model(Model(encoder=encoder, backbone=backbone, heads=heads), tmp_path)
+    save_model(Model(encoder=encoder, backbone=backbone, heads=heads, action_head="action_value", reasoner=None, recurrence=None), tmp_path)
     with (tmp_path / 'config.json').open() as fh:
         cfg = json.load(fh)['backbone']
     assert 'train_kernel' not in cfg and 'decode_kernel' not in cfg and 'dtype' not in cfg
@@ -94,7 +94,7 @@ def test_roundtrip_multi_field_spec_before_learnable(tmp_path) -> None:
     assert "encoder._tables.__learnable_1.weight" in {f"encoder.{k}" for k in encoder.state_dict()}
     backbone = IdentityBackbone(hidden_dim=hidden_dim)
     heads = DiscreteActionValueHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1)
-    model = Model(encoder=encoder, backbone=backbone, heads=heads).eval()
+    model = Model(encoder=encoder, backbone=backbone, heads=heads, action_head="action_value", reasoner=None, recurrence=None).eval()
     tokenizer = NumericTokenizer(
         input_fields=[
             {"type": "discrete", "input_field": "action"},
@@ -122,7 +122,7 @@ def test_composed_model_roundtrip_static_fourier(tmp_path) -> None:
     encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}, {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0}])
     backbone = IdentityBackbone(hidden_dim=hidden_dim)
     heads = DiscreteActionValueHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1)
-    model = Model(encoder=encoder, backbone=backbone, heads=heads).eval()
+    model = Model(encoder=encoder, backbone=backbone, heads=heads, action_head="action_value", reasoner=None, recurrence=None).eval()
     batch = [[{'action': 1, 'reward': 0.5}, {'action': 2, 'reward': -0.1}]]
     expected = model(batch_to_token_batch(_tok(model.encoder), batch)).predictions
     save_model(model, tmp_path)
@@ -137,7 +137,7 @@ def test_composed_model_roundtrip_static_fourier(tmp_path) -> None:
     )
 
 def test_model_card_includes_usage_and_architecture(tmp_path) -> None:
-    model = Model(encoder=NumericEmbedder(hidden_dim=8, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}, {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3, "std": 0.02, "positions": 1}]), backbone=IdentityBackbone(hidden_dim=8), heads=DiscreteActionValueHead(in_features=8, out_features=4, hidden_dim=8, num_layers=1))
+    model = Model(encoder=NumericEmbedder(hidden_dim=8, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}, {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3, "std": 0.02, "positions": 1}]), backbone=IdentityBackbone(hidden_dim=8), heads=DiscreteActionValueHead(in_features=8, out_features=4, hidden_dim=8, num_layers=1), action_head="action_value", reasoner=None, recurrence=None)
     path = tmp_path / 'README.md'
     _write_model_card(repo_id='user/mouse-example-model', model=model, path=path)
     text = path.read_text()
@@ -148,7 +148,7 @@ def test_model_card_includes_usage_and_architecture(tmp_path) -> None:
     assert text.index('## Load The Model') < text.index('## Run Inference')
     assert 'What This Contains' not in text
     assert 'pip install mouse-core' in text
-    assert 'load_model(' in text and 'train_kernel="varlen"' in text and 'decode_kernel="flex"' in text and 'dtype=preferred_dtype(device)' in text
+    assert 'load_model(' in text and 'train_kernel="flex"' in text and 'decode_kernel="flex"' in text and 'dtype=preferred_dtype(device)' in text
     assert 'NumericTokenizer' in text
     assert '| `action` | `discrete` | `[B, S]` | `torch.long` | integer ids in `[0, 3]` |' in text
     assert 'Fourier range `[0.01, 10.0]`' in text
@@ -172,7 +172,7 @@ def _lora_model(dtype: torch.dtype) -> Model:
     encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}, {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3, "std": 0.02, "positions": 1}])
     backbone = Qwen3Backbone(train_kernel="varlen", decode_kernel="flex", dtype=dtype, hidden_dim=hidden_dim, num_layers=1, num_heads=2, lora=LoRAConfig(rank=2))
     heads = DiscreteActionValueHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1)
-    return Model(encoder=encoder, backbone=backbone, heads=heads).eval()
+    return Model(encoder=encoder, backbone=backbone, heads=heads, action_head="action_value", reasoner=None, recurrence=None).eval()
 
 
 def test_backbone_dtype_applies_to_base_only_and_trainable_sections_stay_float32() -> None:

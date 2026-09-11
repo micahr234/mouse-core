@@ -73,7 +73,7 @@ def save_model(model: "Model", path: str | Path) -> None:
         save_model(model, "./checkpoints/step-10000")
         model2 = load_model(
             "./checkpoints/step-10000",
-            train_kernel="varlen", decode_kernel="flex", dtype=torch.float32,
+            train_kernel="flex", decode_kernel="flex", dtype=torch.float32,
         )
     """
     path = Path(path)
@@ -218,7 +218,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = (
     load_model(
         "{repo_id}",
-        train_kernel="varlen",
+        train_kernel="flex",
         decode_kernel="flex",
         dtype=preferred_dtype(device),
         map_location="cpu",
@@ -603,7 +603,7 @@ def load_model(
             repo id (e.g. ``"my-model"`` or ``"your-org/your-model"``).
             Unscoped Hub names are resolved under the authenticated user.
         train_kernel: Kernel for the uncached (packed) forward of a
-            transformer backbone, ``"varlen"`` or ``"flex"``.
+            transformer backbone, ``"varlen"``, ``"padded"``, or ``"flex"``.
         decode_kernel: Kernel for cached decode, ``"flex"``.
         dtype: Dtype of the transformer backbone's base weights
             (``preferred_dtype(device)`` for inference or a LoRA base,
@@ -685,7 +685,7 @@ def _build_model_from_config(
         encoder=encoder,
         backbone=backbone,
         heads=heads,
-        action_head=heads_cfg.get("action_head"),
+        action_head=heads_cfg["action_head"],
         reasoner=reasoner,
         recurrence=recurrence,
     )
@@ -918,10 +918,9 @@ class Model(nn.Module):
       module that maps encodings to last-layer hidden states ``[L, D]``.
     - ``heads``: heads can be provided in several ergonomic ways:
         - a single :class:`~mouse_core.models.heads.base.BaseHead` (e.g. ``DiscreteActionValueHead(...)``):
-          it becomes the only enabled head and the implicit ``action_head``;
+          it becomes the only enabled head;
         - a list of head instances (e.g. ``[DiscreteActionValueHead(...), SwiGLUHead(...)]``):
-          you **must** also pass ``action_head`` (a canonical name) to select which one
-          ``get_action`` uses;
+          names are inferred; ``action_head`` selects which one ``get_action`` uses;
         - a dict mapping canonical names (``"action_value"``,
           ``"action_value_episode"``, ``"action_value_task"``, ``"action"``,
           ``"value"``) to head instances or ``None`` (for full control and/or
@@ -929,13 +928,12 @@ class Model(nn.Module):
       When a plain head (SwiGLUHead) is passed without a name it defaults to ``"action"``;
       use the dict form if you want it under ``"value"``.
 
-    ``action_head`` names which head ``get_action`` consults. If omitted,
-    it is auto-selected by preference: ``action_value_episode`` (when the
-    episode/task pair is present) > ``action_value`` > ``action`` > ``value``.
+    ``action_head`` names which head ``get_action`` consults. Required.
     ``action_value_episode`` and ``action_value_task`` must be used together
     and cannot be combined with ``action_value`` or ``action_value_layerwise``.
     When that pair is present, ``get_action`` always uses
-    ``Q_episode + Q_task``.
+    ``Q_episode + Q_task``. ``reasoner`` and ``recurrence`` are required
+    (pass ``None`` when unused) and cannot be combined.
 
     Full construction::
 
@@ -943,7 +941,14 @@ class Model(nn.Module):
         backbone = LlamaBackbone(...)   # or any Backbone
         heads = DiscreteActionValueHead(...)            # or a dict/list of heads
 
-        model = Model(encoder=encoder, backbone=backbone, heads=heads)
+        model = Model(
+            encoder=encoder,
+            backbone=backbone,
+            heads=heads,
+            action_head="action_value",
+            reasoner=None,
+            recurrence=None,
+        )
 
     ``forward`` returns a :class:`ModelOutput` with ``predictions``,
     ``last_hidden_state``, and per-pass ``passes``. The delayed DQN model
@@ -1050,17 +1055,18 @@ class Model(nn.Module):
         *,
         encoder: Encoder,
         backbone: Backbone,
-        heads: BaseHead | list[BaseHead] | Mapping[str, BaseHead | None] | None = None,
-        action_head: str | None = None,
-        reasoner: LatentReasoner | None = None,
-        recurrence: Recurrence | None = None,
+        heads: BaseHead | list[BaseHead] | Mapping[str, BaseHead | None],
+        action_head: str,
+        reasoner: LatentReasoner | None,
+        recurrence: Recurrence | None,
     ):
         """Construct a Model from encoder, backbone, and heads.
 
-        ``reasoner`` enables Coconut-style latent reasoning via
-        ``forward(batch, reasoning=...)``. ``recurrence`` makes every forward
-        run the backbone ``num_passes`` times through the adapter; the two
-        extra sections cannot be combined.
+        Every argument is required. ``reasoner`` enables Coconut-style latent
+        reasoning via ``forward(batch, reasoning=...)``. ``recurrence`` makes
+        every forward run the backbone ``num_passes`` times through the
+        adapter. Pass ``None`` for either unused section; the two cannot be
+        combined.
         """
         super().__init__()
 
@@ -1106,9 +1112,6 @@ class Model(nn.Module):
                 )
         self.recurrence: Recurrence | None = recurrence
 
-        if heads is None:
-            raise TypeError("Model requires heads (a BaseHead, list of heads, or dict of named heads).")
-
         # Normalize flexible heads input (single instance, list, or dict) into the
         # canonical internal dict form.
         heads_dict: dict[str, BaseHead] = Model._normalize_heads(heads, action_head)
@@ -1146,27 +1149,11 @@ class Model(nn.Module):
                         f"got {type(self._heads[name]).__name__}."
                     )
 
-        # Determine action head
-        if action_head is not None:
-            if action_head not in self._VALID_HEADS:
-                raise ValueError(f"action_head must be one of {self._VALID_HEADS}, got {action_head!r}.")
-            if action_head not in self.heads:
-                raise ValueError(f"action_head={action_head!r} but no such head is enabled.")
-            self.action_head: str = action_head
-        else:
-            # Auto-detect preference order
-            for candidate in (
-                "action_value_episode",
-                "action_value_layerwise",
-                "action_value",
-                "action",
-                "value",
-            ):
-                if candidate in self.heads:
-                    self.action_head = candidate
-                    break
-            else:
-                raise ValueError("No output head is enabled; cannot determine action_head.")
+        if action_head not in self._VALID_HEADS:
+            raise ValueError(f"action_head must be one of {self._VALID_HEADS}, got {action_head!r}.")
+        if action_head not in self.heads:
+            raise ValueError(f"action_head={action_head!r} but no such head is enabled.")
+        self.action_head: str = action_head
 
         if "action_value_layerwise" in self._heads:
             layerwise_head = self._heads["action_value_layerwise"]
@@ -1274,7 +1261,8 @@ class Model(nn.Module):
 
         Transformer backbones run :func:`packed_forward` with the backbone's
         ``train_kernel`` (``"varlen"``: flash varlen on CUDA bf16/fp16,
-        masked SDPA otherwise; ``"flex"``: FlexAttention). Backbones
+        masked SDPA otherwise; ``"padded"``: dense causal SDPA on
+        segments padded to ``max_seqlen``; ``"flex"``: FlexAttention). Backbones
         without a decoder stack (``IdentityBackbone``, custom) take the
         rectangular route with a dense sequence/grouping mask. ``embeds``
         come from the fp32 encoder / adapters and are cast to the backbone's

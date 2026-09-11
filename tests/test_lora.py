@@ -58,6 +58,7 @@ def _model(
         heads=DiscreteActionValueHead(
             in_features=_HIDDEN, out_features=_ACTIONS, hidden_dim=_HIDDEN, num_layers=1
         ),
+        action_head="action_value",
         reasoner=LatentReasoner(hidden_dim=_HIDDEN, num_thoughts=1) if reasoner else None,
         recurrence=Recurrence(hidden_dim=_HIDDEN, num_passes=2) if recurrence else None,
     )
@@ -141,6 +142,30 @@ def test_lora_linear_matches_base_until_b_moves() -> None:
     assert not torch.allclose(out, expected)
     delta = (x @ lora.lora_A.weight.T @ lora.lora_B.weight.T) * (4.0 / 2)
     assert torch.allclose(out, expected + delta, atol=1e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="compiled LoRA is CUDA")
+def test_cuda_fused_lora_matches_eager_and_trains() -> None:
+    from mouse_core.models import lora as lora_mod
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    base = nn.Linear(8, 6).to(device=device, dtype=torch.bfloat16)
+    lora = LoRALinear(base, LoRAConfig(rank=2, alpha=4.0)).to(device)
+    with torch.no_grad():
+        lora.lora_B.weight.fill_(0.1)
+    x = torch.randn(3, 8, device=device, dtype=torch.bfloat16, requires_grad=True)
+    eager = lora_mod._lora_linear(
+        x, base.weight, base.bias, lora.lora_A.weight, lora.lora_B.weight,
+        lora.scale, lora.dropout_p, lora.training,
+    )
+    out = lora(x)
+    assert torch.allclose(out.float(), eager.float(), atol=2e-2, rtol=2e-2)
+    assert lora_mod._compiled_lora is not None
+    out.float().sum().backward()
+    assert base.weight.grad is None
+    assert lora.lora_A.weight.grad is not None and lora.lora_A.weight.grad.dtype == torch.float32
+    assert lora.lora_B.weight.grad is not None and lora.lora_B.weight.grad.dtype == torch.float32
 
 
 def test_lora_linear_runs_fp32_adapters_over_bf16_base() -> None:

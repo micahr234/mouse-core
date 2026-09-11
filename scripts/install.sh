@@ -1,8 +1,9 @@
 #!/bin/bash
 # Install dependencies and set up the dev environment.
 # Run with: source scripts/install.sh
-
-cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
+#
+# Uses `return` throughout (never `exit`) because this script is sourced —
+# `exit` would terminate the user's shell.
 
 log() {
     echo "[INFO] $1"
@@ -23,54 +24,48 @@ success() {
 # Install uv package manager
 install_uv() {
     log "Installing uv package manager..."
-    
-    # Check if uv is already installed
+
     if command -v uv >/dev/null 2>&1; then
         success "uv is already installed: $(uv --version)"
         return
     fi
-    
-    # Download and install uv
+
     if ! curl -LsSf https://astral.sh/uv/install.sh | sh; then
         error "Failed to install uv."
-        exit 1
+        return 1
     fi
-    
-    # Add to PATH for current session
+
     export PATH="$HOME/.local/bin:$PATH"
-    
-    # Verify installation
+
     if ! command -v uv >/dev/null 2>&1; then
         error "Failed to install uv."
-        exit 1
+        return 1
     fi
-    
+
     success "uv installed successfully: $(uv --version)"
 }
 
 # Create and setup virtual environment
 setup_venv() {
     log "Creating virtual environment..."
-    
-    # Remove existing venv if it exists
+
     if [ -d ".venv" ]; then
         warn "Removing existing virtual environment..."
         rm -rf .venv
     fi
-    
+
     # Free-threaded 3.14t so DataLoader(num_workers>0) can use real thread parallelism.
     log "Ensuring free-threaded Python 3.14t is available..."
     if ! uv python install 3.14t; then
         error "Failed to install Python 3.14t"
-        exit 1
+        return 1
     fi
 
-    # Create new virtual environment
     if ! uv venv --python 3.14t; then
         error "Failed to create virtual environment"
-        exit 1
+        return 1
     fi
-    
+
     success "Virtual environment created"
 
     # TEMPORARY: Triton still re-enables the GIL on import (no Py_mod_gil slot).
@@ -79,12 +74,14 @@ setup_venv() {
     if ! grep -qxF 'export PYTHON_GIL=0' .venv/bin/activate 2>/dev/null; then
         echo 'export PYTHON_GIL=0' >> .venv/bin/activate
     fi
-    
+
     # Install project dependencies (core + all optional extras).
     log "Installing project dependencies..."
-    if ! uv pip install -e ".[dev,all]" --python .venv/bin/python --index-strategy unsafe-best-match; then
+    # --refresh bypasses uv's cache so branch-pinned git extras (mouse-gym@main,
+    # procedural-frozenlake@main) re-resolve to the current head.
+    if ! uv pip install -e ".[dev,all]" --python .venv/bin/python --index-strategy unsafe-best-match --refresh; then
         error "Failed to install project dependencies"
-        exit 1
+        return 1
     fi
 
     success "Project dependencies installed"
@@ -92,13 +89,15 @@ setup_venv() {
 
 # Main installation process: uv, venv, project dependencies
 main() {
+    cd "$(dirname "${BASH_SOURCE[0]}")/.." || return 1
+
     echo "Starting Installation"
     echo "=================================="
-    
+
     log "Installing packages..."
-    install_uv
-    setup_venv
-    
+    install_uv || return 1
+    setup_venv || return 1
+
     echo ""
     echo "Installation complete!"
     echo ""
@@ -106,5 +105,4 @@ main() {
     echo "  source .venv/bin/activate"
 }
 
-# Run main function
 main "$@"

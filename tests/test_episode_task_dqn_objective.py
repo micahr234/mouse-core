@@ -48,7 +48,7 @@ def _model(heads: dict[str, DiscreteActionValueHead], hidden_dim: int = 8) -> Mo
             {"type": "discrete", "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}
         ],
     )
-    return Model(encoder=encoder, backbone=IdentityBackbone(hidden_dim=hidden_dim), heads=heads)
+    return Model(encoder=encoder, backbone=IdentityBackbone(hidden_dim=hidden_dim), heads=heads, action_head="action_value_episode", reasoner=None, recurrence=None)
 
 
 def test_episode_task_heads_must_appear_together() -> None:
@@ -151,6 +151,9 @@ def test_episode_task_save_load_roundtrip(tmp_path) -> None:
             "action_value_episode": _head(hidden_dim, 4),
             "action_value_task": _head(hidden_dim, 4),
         },
+        action_head="action_value_episode",
+        reasoner=None,
+        recurrence=None,
     ).eval()
     batch = [[{"action": 0, "reward": 0.0}, {"action": 1, "reward": 1.0}]]
     expected = model(batch_to_token_batch(tok_from_encoder(model.encoder), batch)).predictions

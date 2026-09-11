@@ -44,7 +44,7 @@ def _tiny_model() -> Model:
     hidden_dim = 8
     encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=_MODALITIES)
     backbone = IdentityBackbone(hidden_dim=hidden_dim)
-    return Model(encoder=encoder, backbone=backbone, heads=_head(hidden_dim))
+    return Model(encoder=encoder, backbone=backbone, heads=_head(hidden_dim), action_head="action_value", reasoner=None, recurrence=None)
 
 
 def _llama_model(*, layerwise: bool = False) -> Model:
@@ -65,7 +65,7 @@ def _llama_model(*, layerwise: bool = False) -> Model:
         )
     else:
         head = _head(hidden_dim)
-    return Model(encoder=encoder, backbone=backbone, heads=head)
+    return Model(encoder=encoder, backbone=backbone, heads=head, action_head="action_value_layerwise" if layerwise else "action_value", reasoner=None, recurrence=None)
 
 
 def _token_batch(model: Model):
@@ -144,6 +144,8 @@ def test_delayed_copy_carries_reasoner_and_recurrence() -> None:
         encoder=NumericEmbedder(hidden_dim=hidden_dim, modalities=_MODALITIES),
         backbone=IdentityBackbone(hidden_dim=hidden_dim),
         heads=_head(hidden_dim),
+        action_head="action_value",
+        reasoner=None,
         recurrence=Recurrence(hidden_dim=hidden_dim, num_passes=2),
     )
     d = recurrent.delayed_copy()
@@ -154,7 +156,9 @@ def test_delayed_copy_carries_reasoner_and_recurrence() -> None:
         encoder=NumericEmbedder(hidden_dim=hidden_dim, modalities=_MODALITIES),
         backbone=IdentityBackbone(hidden_dim=hidden_dim),
         heads=_head(hidden_dim),
+        action_head="action_value",
         reasoner=LatentReasoner(hidden_dim=hidden_dim, num_thoughts=1),
+        recurrence=None,
     )
     dr = reasoning.delayed_copy()
     assert dr.reasoner is not None and dr.reasoner is not reasoning.reasoner
@@ -281,6 +285,8 @@ def test_tau_backbone_also_moves_recurrence_and_reasoner() -> None:
         encoder=NumericEmbedder(hidden_dim=hidden_dim, modalities=_MODALITIES),
         backbone=IdentityBackbone(hidden_dim=hidden_dim),
         heads=_head(hidden_dim),
+        action_head="action_value",
+        reasoner=None,
         recurrence=Recurrence(hidden_dim=hidden_dim, num_passes=2),
     )
     d = recurrent.delayed_copy()
@@ -294,7 +300,9 @@ def test_tau_backbone_also_moves_recurrence_and_reasoner() -> None:
         encoder=NumericEmbedder(hidden_dim=hidden_dim, modalities=_MODALITIES),
         backbone=IdentityBackbone(hidden_dim=hidden_dim),
         heads=_head(hidden_dim),
+        action_head="action_value",
         reasoner=LatentReasoner(hidden_dim=hidden_dim, num_thoughts=1),
+        recurrence=None,
     )
     dr = reasoning.delayed_copy()
     assert reasoning.reasoner is not None and dr.reasoner is not None
@@ -373,6 +381,9 @@ def test_polyak_rejects_wrong_models() -> None:
         encoder=NumericEmbedder(hidden_dim=8, modalities=_MODALITIES),
         backbone=IdentityBackbone(hidden_dim=8),
         heads=DiscreteActionValueHead(in_features=8, out_features=4, hidden_dim=8, num_layers=2),
+        action_head="action_value",
+        reasoner=None,
+        recurrence=None,
     ).requires_grad_(False)
     with pytest.raises(ValueError, match="parameter names"):
         Polyak(model, mismatched)

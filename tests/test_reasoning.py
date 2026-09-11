@@ -56,7 +56,7 @@ def _tiny_model(*, num_thoughts: int = 2, with_reasoner: bool = True) -> Model:
         if with_reasoner
         else None
     )
-    return Model(encoder=encoder, backbone=backbone, heads=heads, reasoner=reasoner)
+    return Model(encoder=encoder, backbone=backbone, heads=heads, action_head="action_value", reasoner=reasoner, recurrence=None)
 
 
 def _rows(n: int, offset: int = 0, groups: list[int] | None = None) -> list[dict]:

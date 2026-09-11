@@ -15,21 +15,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   layers run in that order, and outputs are restored to stream order.
   ``train_kernel`` (required on the backbone, not saved) selects the
   attention kernel over those segments: ``"varlen"`` is FlashAttention
-  varlen on CUDA bf16/fp16 and masked SDPA otherwise; ``"flex"`` is
-  FlexAttention with a block-sparse mask, compiled on CUDA in every dtype
-  and forward-only on CPU.
+  varlen on CUDA bf16/fp16 and masked SDPA otherwise; ``"padded"`` is
+  dense causal SDPA on segments right-padded to ``max_seqlen``; ``"flex"``
+  is FlexAttention with a block-sparse mask, compiled on CUDA in every
+  dtype and forward-only on CPU.
 - ``install_compiled_decoder`` (``mouse_core.models.backbone``) compiles
-  the per-layer decoder body once with ``torch.compile(dynamic=True)``;
+  the per-layer train decoder body once with ``torch.compile(dynamic=True)``;
   every layer, stream length, group count, and
-  ``output_hidden_states=True`` reuse it. Idempotent.
+  ``output_hidden_states=True`` reuse it. On CUDA it also compiles the
+  cached-decode per-layer body. Idempotent.
 - ``backbone.gradient_checkpointing = True`` recomputes each decoder
   layer in backward instead of storing its activations: about a 10x cut
   in activation memory (7.4 GB to 0.8 GB for 28 layers at 4096 tokens)
   for about 1.4x the step time. Off by default; not saved with the model.
 - ``bench/`` microbenches (not pytest): ``bench_train.py`` (packed
   ``packed_forward``: forward, forward+backward, full LoRA step,
-  tokens/second, peak memory, compile warmup; ``varlen`` / ``flex``
-  cross-checked), ``bench_inference.py`` (paged FlexAttention
+  tokens/second, peak memory, compile warmup; ``varlen`` / ``flex`` /
+  ``padded`` cross-checked), ``bench_inference.py`` (paged FlexAttention)
   ``FlexDecodeSession``: prefill + one-token decode, tokens/second,
   peak memory, compile warmup), and ``bench_dataloader.py``
   (``next_batch`` wait — average and max — plus steps/second and
@@ -54,7 +56,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``backbone.dtype`` reports the base dtype (``Model`` casts backbone inputs
   to it). ``LoRAConfig`` is saved under ``config["backbone"]["lora"]`` and
   rebuilt by ``load_model``; the model card lists it. Training notebooks
-  use ``Qwen3Backbone(train_kernel="varlen", decode_kernel="flex",
+  use ``Qwen3Backbone(train_kernel="flex", decode_kernel="flex",
   dtype=preferred_dtype(device), pretrained="Qwen/Qwen3-0.6B",
   lora=LoRAConfig(rank=16, alpha=32))``.
 - Dual action-value heads ``action_value_episode`` and
@@ -242,6 +244,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``grouping_field: str | None = None`` (``None`` ⇒ no grouping filter).
 
 ### Changed
+- ``LoRALinear`` runs ``y = W x + scale · B(A(x_fp32))`` as one function
+  (casts inside the graph). Packed train and cached decode share it. On
+  CUDA it is ``torch.compile``d into a single op; inside an already-compiled
+  decoder body the eager math is inlined so Inductor fuses it into the
+  parent graph.
+- ``FlexDecodeSession`` compiles the per-layer decode body on CUDA in two
+  pieces (pre: norms, QKV, RoPE, KV scatter; post: o-proj, MLP) so the
+  in-place cache write is visible to FlexAttention, and CUDA-graphs the
+  common incremental step (every row adds one token, ``S=1``) after
+  compile warmup. Page-table growth, mask build, and address setup stay
+  eager; prefills and rebuilds use the compiled-but-not-graphed path.
+- ``Model`` constructor arguments are all required: ``encoder``,
+  ``backbone``, ``heads``, ``action_head``, ``reasoner``, and
+  ``recurrence``. Pass ``None`` for an unused reasoner or recurrence.
+  ``action_head`` is no longer inferred when omitted.
+- Training notebooks and the model-card ``load_model`` snippet use
+  ``train_kernel="flex"`` (``decode_kernel`` was already ``"flex"``).
 - ``DataLoader`` batches are numbered ``k = 0, 1, 2, ...`` in
   ``next_batch`` order, and batch ``k`` is a pure function of ``(seed, k,
   store snapshot)``: windows are sampled from ``SeedSequence(seed,
@@ -306,8 +325,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ``Qwen3Backbone``, ``LlamaBackbone`` and ``load_model`` take three
   required keyword arguments that describe how the model runs on the
   current machine rather than what it is, so none is stored in the
-  checkpoint: ``train_kernel`` (``"varlen"`` / ``"flex"``; also the
-  required ``packed_forward`` argument) for the uncached forward,
+  checkpoint: ``train_kernel`` (``"varlen"`` / ``"padded"`` / ``"flex"``;
+  also the required ``packed_forward`` argument) for the uncached forward,
   ``decode_kernel`` (``"flex"``: paged FlexAttention, the only kernel that
   reads K/V through a page table; explicit so a second one can be added
   without changing call sites) for cached decode, and ``dtype`` for the
@@ -547,6 +566,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Train is ``compose(augmenter, tokenizer)``; eval is the tokenizer.
 
 ### Fixed
+- ``scripts/install.sh`` uses ``return`` instead of ``exit`` so
+  ``source scripts/install.sh`` no longer kills the calling shell on
+  failure, and ``--refresh`` re-resolves git extras
+  (``mouse-gym`` / ``procedural-frozenlake``) to the current head.
 - Cached-decode RoPE (``_decode_rope_positions``) uses the same stable
   sort + cummax as ``packed_rope_positions`` instead of pairwise
   ``[B, S, S]`` / ``[B, S, cache]`` tables. A long prefill (8 × 16384)

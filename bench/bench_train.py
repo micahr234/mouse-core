@@ -3,7 +3,8 @@
 Measures, per workload: steady-state forward, forward+backward, a complete
 LoRA training step (AdamW), real tokens/second, and peak allocated memory
 above the parameter baseline, for every ``--train-kernel`` (``varlen``:
-flash varlen; ``flex``: FlexAttention block mask) in each ``--modes`` body
+flash varlen; ``flex``: FlexAttention block mask; ``padded``: dense causal
+SDPA on segments padded to ``max_seqlen``) in each ``--modes`` body
 (eager, compiled via ``install_compiled_decoder``, compiled with
 ``gradient_checkpointing``). Warmup / compile time is reported separately.
 CUDA is synchronized around every measurement; medians and min/max over
@@ -120,7 +121,7 @@ def main() -> None:
         default=["short", "mid", "mid_recurring", "high_variance", "long", "long_recurring", "long_manysmall"],
     )
     parser.add_argument("--modes", nargs="+", default=["eager", "compiled", "compiled+checkpoint"])
-    parser.add_argument("--train-kernel", nargs="+", default=["varlen", "flex"], choices=["varlen", "flex"])
+    parser.add_argument("--train-kernel", nargs="+", default=["varlen", "flex", "padded"], choices=["varlen", "flex", "padded"])
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -162,7 +163,10 @@ def main() -> None:
             install_compiled_decoder()
         backbone.gradient_checkpointing = "checkpoint" in mode
         for kernel in kernels:
-            other: TrainKernel = "flex" if kernel == "varlen" else "varlen"
+            other: TrainKernel = next(
+                (k for k in ("varlen", "flex", "padded") if k != kernel and k in kernels),
+                "varlen" if kernel != "varlen" else "flex",
+            )
             print(f"\n### mode: {mode} | train_kernel: {kernel}")
             for wname in args.workloads:
                 seq, grp = _workload(wname, device)

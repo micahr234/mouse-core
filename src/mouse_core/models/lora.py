@@ -12,6 +12,7 @@ from __future__ import annotations
 import math
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -60,6 +61,52 @@ class LoRAConfig:
         object.__setattr__(self, "targets", targets)
 
 
+def _lora_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    lora_A: torch.Tensor,
+    lora_B: torch.Tensor,
+    scale: float,
+    dropout_p: float,
+    training: bool,
+) -> torch.Tensor:
+    """``y = W x + scale · B(A(x_fp32))`` with the casts inside one function.
+
+    Packed train and cached decode both call this (via :class:`LoRALinear`),
+    so the two paths cannot drift. On CUDA the function is ``torch.compile``d
+    into one kernel graph unless a parent decoder body is already compiling,
+    in which case the eager math is inlined and fused into that parent.
+    """
+    y = F.linear(x, weight, bias)
+    xd = F.dropout(x, p=dropout_p, training=training) if dropout_p > 0.0 else x
+    a = F.linear(xd.to(dtype=torch.float32), lora_A)
+    delta = F.linear(a, lora_B) * scale
+    return y + delta.to(dtype=y.dtype)
+
+
+_compiled_lora: Any | None = None
+
+
+def _apply_lora(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    lora_A: torch.Tensor,
+    lora_B: torch.Tensor,
+    scale: float,
+    dropout_p: float,
+    training: bool,
+) -> torch.Tensor:
+    """Dispatch :func:`_lora_linear` — compiled on CUDA, inlined under compile."""
+    if torch.compiler.is_compiling() or x.device.type != "cuda":
+        return _lora_linear(x, weight, bias, lora_A, lora_B, scale, dropout_p, training)
+    global _compiled_lora
+    if _compiled_lora is None:
+        _compiled_lora = torch.compile(_lora_linear, dynamic=True)
+    return _compiled_lora(x, weight, bias, lora_A, lora_B, scale, dropout_p, training)
+
+
 class LoRALinear(nn.Module):
     """``base(x) + lora_B(lora_A(x)) * alpha / rank`` with fp32 adapters.
 
@@ -68,6 +115,10 @@ class LoRALinear(nn.Module):
     parameters; the adapter input is cast to fp32 and the delta is cast back
     to the base output dtype. ``lora_B`` starts at zero so the wrapped
     module's output is unchanged at construction.
+
+    The three matmuls live in one function (:func:`_lora_linear`) so packed
+    train leftovers and cached decode stay identical; on CUDA that function
+    is compiled into a single op.
     """
 
     def __init__(self, base: nn.Linear, config: LoRAConfig) -> None:
@@ -78,7 +129,7 @@ class LoRALinear(nn.Module):
         self.base.requires_grad_(False)
         self.rank = config.rank
         self.scale = config.alpha / config.rank
-        self.dropout = nn.Dropout(config.dropout) if config.dropout > 0.0 else nn.Identity()
+        self.dropout_p = config.dropout
         self.lora_A = nn.Linear(base.in_features, config.rank, bias=False, dtype=torch.float32)
         self.lora_B = nn.Linear(config.rank, base.out_features, bias=False, dtype=torch.float32)
         nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
@@ -93,10 +144,16 @@ class LoRALinear(nn.Module):
         return self.base.out_features
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = self.base(x)
-        a = F.linear(self.dropout(x).to(dtype=torch.float32), self.lora_A.weight)
-        delta = F.linear(a, self.lora_B.weight) * self.scale
-        return y + delta.to(dtype=y.dtype)
+        return _apply_lora(
+            x,
+            self.base.weight,
+            self.base.bias,
+            self.lora_A.weight,
+            self.lora_B.weight,
+            self.scale,
+            self.dropout_p,
+            self.training,
+        )
 
 
 def lora_modules(module: nn.Module) -> Iterator[LoRALinear]:

@@ -1,0 +1,13 @@
+---
+description: No silent defaults; write every choice at the call site
+alwaysApply: true
+---
+
+# No Defaults
+
+Be explicit. Do not pick a value for the caller.
+
+- If a value changes behavior, it is required and has no default.
+- A missing value raises. It does not fall back to a common or previous choice.
+- Do not add a default because one value is usual in examples or docs.
+- Call sites, examples, and docs pass every value they rely on.

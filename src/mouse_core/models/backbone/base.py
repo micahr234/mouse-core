@@ -72,13 +72,15 @@ class Backbone(nn.Module, ABC):
     step time. Set ``backbone.gradient_checkpointing = True`` before
     training; it is not saved with the model.
 
-    Two attention kernels are required constructor arguments of every
-    transformer backbone, so both choices are always explicit:
+    Attention kernels are required constructor arguments of every
+    transformer backbone, so the choices are always explicit:
 
     - ``train_kernel`` runs the uncached packed forward (training, and any
       forward without a cache): ``"varlen"`` (flash varlen on CUDA
-      bf16/fp16, masked SDPA otherwise) or ``"flex"`` (FlexAttention block
-      mask, compiled on CUDA in every dtype). Both give the same result.
+      bf16/fp16, masked SDPA otherwise), ``"padded"`` (dense causal SDPA
+      on segments padded to ``max_seqlen``), or ``"flex"`` (FlexAttention
+      block mask, compiled on CUDA in every dtype). All three give the
+      same result.
     - ``decode_kernel`` runs cached decode (``use_cache=True``): ``"flex"``
       (paged FlexAttention), currently the only kernel that reads K/V
       through a page table.

@@ -13,7 +13,9 @@ from mouse_core.models.backbone import packed_train as packed_train_mod
 from mouse_core.models.backbone.flex_decode import packed_rope_positions
 from mouse_core.models.backbone.packed_train import (
     TrainKernel,
+    _pad_packed,
     _packing_plan,
+    _unpad_packed,
     install_compiled_decoder,
     packed_forward,
 )
@@ -26,7 +28,7 @@ from tests._token_batch_helpers import batch_to_packed, batch_to_token_batch, to
 _tok = tok_from_encoder
 _cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 _DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
-_KERNELS: list[TrainKernel] = ["varlen", "flex"]
+_KERNELS: list[TrainKernel] = ["varlen", "flex", "padded"]
 
 
 @pytest.fixture
@@ -135,6 +137,17 @@ def test_packing_plan_ids_shared_across_sequences_stay_separate() -> None:
     assert plan.cu_seqlens.tolist() == [0, 2, 4]
 
 
+def test_pad_unpad_roundtrip_and_right_padding() -> None:
+    x = torch.arange(10 * 2 * 3, dtype=torch.float32).view(10, 2, 3)
+    cu = torch.tensor([0, 3, 10], dtype=torch.int32)
+    padded = _pad_packed(x, cu, 7)
+    assert padded.shape == (2, 2, 7, 3)
+    assert torch.equal(padded[0, :, :3], x[:3].transpose(0, 1))
+    assert torch.equal(padded[0, :, 3:], torch.zeros(2, 4, 3))
+    assert torch.equal(padded[1, :, :7], x[3:].transpose(0, 1))
+    assert torch.equal(_unpad_packed(padded, cu, 10), x)
+
+
 def test_packing_plan_large_sparse_ids_do_not_collide() -> None:
     seq = torch.tensor([0, 2**40, 0, 2**40])
     grp = torch.tensor([-(2**50), 7, -(2**50), 7])
@@ -228,7 +241,7 @@ def test_cuda_fused_forward_matches_fp32_reference_within_half_precision_noise(
 @pytest.mark.parametrize("kernel", _KERNELS)
 @pytest.mark.parametrize("L", [40, 300])
 def test_cuda_fp32_matches_dense_reference(no_compiled_decoder: None, kernel: TrainKernel, L: int) -> None:
-    """fp32 on CUDA: varlen runs the masked-SDPA reference, flex the compiled fp32 block-sparse kernel."""
+    """fp32 on CUDA: varlen is packed-stream SDPA, padded is rectangular SDPA, flex is compiled block-sparse."""
     torch.manual_seed(0)
     device = torch.device("cuda")
     bb = cast(Any, _backbone(Qwen3Backbone, kv_heads=2).to(device))
@@ -287,7 +300,8 @@ def test_isolation_and_recurring_group_causality(no_compiled_decoder: None, devi
 # ---- gradients -------------------------------------------------------------------
 
 
-def test_cpu_fp32_gradients_match_dense_reference(no_compiled_decoder: None) -> None:
+@pytest.mark.parametrize("kernel", ["varlen", "padded"])
+def test_cpu_fp32_gradients_match_dense_reference(no_compiled_decoder: None, kernel: TrainKernel) -> None:
     torch.manual_seed(2)
     bb = _backbone(LlamaBackbone, kv_heads=2)
     _scale_up(bb)
@@ -296,7 +310,7 @@ def test_cpu_fp32_gradients_match_dense_reference(no_compiled_decoder: None) -> 
     embeds = torch.randn(L, 64, requires_grad=True)
     weight = torch.randn(L, 64)
 
-    got = packed_forward(model=bb.model, embeds=embeds, sequence_ids=seq, grouping_ids=grp, train_kernel="varlen")
+    got = packed_forward(model=bb.model, embeds=embeds, sequence_ids=seq, grouping_ids=grp, train_kernel=kernel)
     (got * weight).sum().backward()
     got_grads = {n: p.grad.clone() for n, p in bb.named_parameters() if p.grad is not None}
     assert embeds.grad is not None
@@ -315,7 +329,8 @@ def test_cpu_fp32_gradients_match_dense_reference(no_compiled_decoder: None) -> 
         torch.testing.assert_close(got_grads[n], ref_grad, atol=1e-4, rtol=1e-4, msg=lambda m: f"{n}: {m}")
 
 
-def test_gradient_checkpointing_matches_plain_backward(no_compiled_decoder: None) -> None:
+@pytest.mark.parametrize("kernel", ["varlen", "padded"])
+def test_gradient_checkpointing_matches_plain_backward(no_compiled_decoder: None, kernel: TrainKernel) -> None:
     torch.manual_seed(3)
     bb = _backbone(Qwen3Backbone, layers=3, kv_heads=2)
     L = 31
@@ -323,7 +338,7 @@ def test_gradient_checkpointing_matches_plain_backward(no_compiled_decoder: None
     embeds = torch.randn(L, 64, requires_grad=True)
 
     def grads(checkpoint: bool) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        out = packed_forward(model=bb.model, embeds=embeds, sequence_ids=seq, grouping_ids=grp, train_kernel="varlen", checkpoint=checkpoint)
+        out = packed_forward(model=bb.model, embeds=embeds, sequence_ids=seq, grouping_ids=grp, train_kernel=kernel, checkpoint=checkpoint)
         out.square().sum().backward()
         assert embeds.grad is not None
         result = (out.detach(), [embeds.grad.clone()] + [p.grad.clone() for p in bb.parameters() if p.grad is not None])
@@ -426,7 +441,7 @@ def test_cuda_bf16_lora_compiled_body_matches_eager_and_trains(no_compiled_decod
     encoder = NumericEmbedder(hidden_dim=64, modalities=[{"type": "discrete", "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}])
     backbone = _backbone(Qwen3Backbone, kv_heads=2, lora=LoRAConfig(rank=4, alpha=8.0), dtype=torch.bfloat16)
     head = DiscreteActionValueHead(in_features=64, out_features=4, hidden_dim=64, num_layers=1)
-    model = Model(encoder=encoder, backbone=backbone, heads=head).to(device)
+    model = Model(encoder=encoder, backbone=backbone, heads=head, action_head="action_value", reasoner=None, recurrence=None).to(device)
     bb = cast(Qwen3Backbone, model.backbone)
     for n, p in bb.named_parameters():
         if ".lora_B." in n:
@@ -523,7 +538,7 @@ def test_model_forward_isolates_sequences(no_compiled_decoder: None, device: str
     backbone = Qwen3Backbone(train_kernel=kernel, decode_kernel="flex", dtype=torch.float32, hidden_dim=64, num_layers=2, num_heads=4, num_key_value_heads=4)
     encoder = NumericEmbedder(hidden_dim=backbone.hidden_dim, modalities=[{"type": "discrete", "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}, {"type": "learnable", "tokens": 1, "std": 0.02, "positions": 1}])
     head = DiscreteActionValueHead(in_features=backbone.hidden_dim, out_features=4, hidden_dim=backbone.hidden_dim, num_layers=1)
-    model = Model(encoder=encoder, backbone=backbone, heads=head).to(device).eval()
+    model = Model(encoder=encoder, backbone=backbone, heads=head, action_head="action_value", reasoner=None, recurrence=None).to(device).eval()
     batch = [[{"action": i % 4} for i in range(3)], [{"action": i % 4} for i in range(3)]]
     tb = batch_to_token_batch(_tok(encoder), batch)
     with torch.no_grad():
@@ -552,7 +567,7 @@ def test_model_train_isolates_tasks_within_sequence(no_compiled_decoder: None) -
         ],
     )
     head = DiscreteActionValueHead(in_features=backbone.hidden_dim, out_features=4, hidden_dim=backbone.hidden_dim, num_layers=1)
-    model = Model(encoder=encoder, backbone=backbone, heads=head).eval()
+    model = Model(encoder=encoder, backbone=backbone, heads=head, action_head="action_value", reasoner=None, recurrence=None).eval()
     task0 = [
         {"action": 0, "episode_done": 0, "task_done": 0, "task_index": 0},
         {"action": 1, "episode_done": 0, "task_done": 0, "task_index": 0},
@@ -576,7 +591,7 @@ def test_model_gradient_checkpointing_flag_reaches_backward(no_compiled_decoder:
     backbone = Qwen3Backbone(train_kernel="varlen", decode_kernel="flex", dtype=torch.float32, hidden_dim=32, num_layers=2, num_heads=4)
     encoder = NumericEmbedder(hidden_dim=32, modalities=[{"type": "discrete", "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}])
     head = DiscreteActionValueHead(in_features=32, out_features=4, hidden_dim=32, num_layers=1)
-    model = Model(encoder=encoder, backbone=backbone, heads=head)
+    model = Model(encoder=encoder, backbone=backbone, heads=head, action_head="action_value", reasoner=None, recurrence=None)
     tb = batch_to_token_batch(_tok(encoder), [[{"action": i % 4} for i in range(5)], [{"action": 1}]])
 
     def step() -> list[torch.Tensor]:

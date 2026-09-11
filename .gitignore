@@ -1,15 +1,16 @@
-# Local clone of sibling repo (optional dev)
 __pycache__/
 *.pyc
 *.pyo
 *.egg-info/
 dist/
 build/
-.venv
+.venv/
 uv.lock
 site/
 .cache/
 .pytest_cache/
-.tmp_hf_cache/
 .ipynb_checkpoints/
+.env
+.tmp/
+.tmp_hf_cache/
 runs/

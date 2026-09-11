@@ -40,6 +40,14 @@ How it works:
   Python list), so a decode step issues no device→host sync; new pages are
   assigned with one small device write, only when a row crosses a page
   boundary.
+* The per-layer body is compiled on CUDA in two pieces (like the train-side
+  :func:`~mouse_core.models.backbone.packed_train.install_compiled_decoder`):
+  pre (norms, QKV, RoPE, KV scatter) and post (o-proj, MLP). FlexAttention
+  stays the existing compiled kernel so the scatter is visible. Page-table
+  growth, mask build, and address setup stay in eager Python.
+* After compile warmup, the common incremental step (every row adds one
+  token, ``S=1``) is captured in a CUDA graph. Prefills and rebuilds stay
+  on the compiled-but-not-graphed path.
 
 The session wraps the backbone's ``transformers`` model in place (shared
 weights, decoder loop reimplemented) and supports both ``Qwen3Model`` and
@@ -50,6 +58,7 @@ when the segment ends.
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Sequence
 from typing import Any, Callable, Literal, cast, get_args
 
@@ -222,6 +231,101 @@ def _decode_rope_positions(
     return out
 
 
+def _inductor_rejected(exc: BaseException) -> bool:
+    name = type(exc).__name__
+    return name in {"InductorError", "LoweringException"} or "InductorError" in name
+
+
+def _decode_pre(
+    layer: Any,
+    h: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    addr: torch.Tensor,
+    real_rows: torch.Tensor,
+    real_cols: torch.Tensor,
+    n_heads: int,
+    n_kv_heads: int,
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor, float]:
+    """Norms, QKV, RoPE, KV scatter. Compiled separately from attention.
+
+    Returning after the in-place scatter makes the write visible to FlexAttention
+    (a single compiled graph can read the pre-write cache and diverge from train).
+    """
+    B, S, _ = h.shape
+    hn = layer.input_layernorm(h)
+    attn = layer.self_attn
+    q = attn.q_proj(hn).view(B, S, n_heads, head_dim)
+    k = attn.k_proj(hn).view(B, S, n_kv_heads, head_dim)
+    q_norm = getattr(attn, "q_norm", None)  # Qwen3 yes, Llama no
+    if q_norm is not None:
+        q = q_norm(q)
+        k = attn.k_norm(k)
+    q = q.transpose(1, 2)
+    k = k.transpose(1, 2)
+    v = attn.v_proj(hn).view(B, S, n_kv_heads, head_dim).transpose(1, 2)
+    q, k = apply_rotary_pos_emb(q, k, cos, sin)
+    k_cache[:, addr] = k[real_rows, :, real_cols].transpose(0, 1)
+    v_cache[:, addr] = v[real_rows, :, real_cols].transpose(0, 1)
+    return h, q, attn.scaling
+
+
+def _decode_post(layer: Any, residual: torch.Tensor, o: torch.Tensor) -> torch.Tensor:
+    """Output projection and MLP. Compiled separately from attention."""
+    B, S, _ = residual.shape
+    o = o.transpose(1, 2).reshape(B, S, -1)
+    h = residual + layer.self_attn.o_proj(o)
+    return h + layer.mlp(layer.post_attention_layernorm(h))
+
+
+_compiled_decode_pre: Any | None = None
+_compiled_decode_post: Any | None = None
+
+
+def install_compiled_decode_layer() -> bool:
+    """Compile the per-layer cached-decode pre/post bodies. CUDA only; idempotent.
+
+    Attention stays outside those graphs so the KV scatter is visible.
+    Returns True on the first successful install.
+    """
+    global _compiled_decode_pre, _compiled_decode_post
+    if _compiled_decode_pre is not None:
+        return False
+    if not torch.cuda.is_available():
+        return False
+    _compiled_decode_pre = torch.compile(_decode_pre, dynamic=True)
+    _compiled_decode_post = torch.compile(_decode_post, dynamic=True)
+    return True
+
+
+_BLOCK_MASK_TENSORS: tuple[str, ...] = (
+    "kv_num_blocks",
+    "kv_indices",
+    "full_kv_num_blocks",
+    "full_kv_indices",
+    "q_num_blocks",
+    "q_indices",
+    "full_q_num_blocks",
+    "full_q_indices",
+)
+
+
+def _copy_block_mask(dst: BlockMask, src: BlockMask) -> bool:
+    """Copy ``src`` kv/q tables into ``dst``. False if a shape differs."""
+    for name in _BLOCK_MASK_TENSORS:
+        d = getattr(dst, name, None)
+        s = getattr(src, name, None)
+        if d is None and s is None:
+            continue
+        if d is None or s is None or d.shape != s.shape or d.dtype != s.dtype:
+            return False
+        d.copy_(s)
+    return True
+
+
 class _FlexKernel:
     """Call flex_attention; compile on CUDA, fall back to eager if Inductor rejects a call."""
 
@@ -234,11 +338,9 @@ class _FlexKernel:
         try:
             return self._active(*args, **kwargs)
         except Exception as exc:
-            if self._compiled is not None and self._active is self._compiled:
-                name = type(exc).__name__
-                if name in {"InductorError", "LoweringException"} or "InductorError" in name:
-                    self._active = self._eager
-                    return self._eager(*args, **kwargs)
+            if self._compiled is not None and self._active is self._compiled and _inductor_rejected(exc):
+                self._active = self._eager
+                return self._eager(*args, **kwargs)
             raise
 
 
@@ -283,6 +385,7 @@ class FlexDecodeSession:
         self.device, self.dtype = module_device_dtype(hf)
         self._flex = _FlexKernel(self.device)
         self._compile_masks = _use_flex_compile(self.device)
+        self._use_compiled_layer = self.device.type == "cuda"
 
         # Physical pool: one page per row to start (a row always owns >= 1 page
         # so logical block 0 maps to real memory even for pad-only queries).
@@ -353,6 +456,21 @@ class FlexDecodeSession:
         self._mask_mod = mask_mod
         self._physical_mask_mod = physical_mask_mod
 
+        # S=1 CUDA graph: captured after compile warmup; rebuilt when the
+        # pool is replaced or BlockMask table shapes change.
+        self._graph: torch.cuda.CUDAGraph | None = None
+        self._graph_disabled = False
+        self._g_h: torch.Tensor | None = None
+        self._g_cos: torch.Tensor | None = None
+        self._g_sin: torch.Tensor | None = None
+        self._g_addr: torch.Tensor | None = None
+        self._g_rows: torch.Tensor | None = None
+        self._g_cols: torch.Tensor | None = None
+        self._g_mask: BlockMask | None = None
+        self._g_out: torch.Tensor | None = None
+        self._g_hiddens: list[torch.Tensor] | None = None
+        self._g_cache_id: int | None = None
+
     # ------------------------------------------------------------------
 
     @property
@@ -381,6 +499,7 @@ class FlexDecodeSession:
             )
             new[:, :, :old_len] = old
             setattr(self, name, new)
+        self._invalidate_graph()
         fill = torch.zeros(new_n - self.n_pages, dtype=torch.long, device=self.device)
         self._mask_holder["page_logical"] = torch.cat([self._mask_holder["page_logical"], fill])
         self._mask_holder["page_row"] = torch.cat([self._mask_holder["page_row"], fill - 1])
@@ -434,6 +553,203 @@ class FlexDecodeSession:
             seq_lengths=(q_len, self.n_pages * self.page),
             compute_q_blocks=False,
         )
+
+    def _invalidate_graph(self) -> None:
+        self._graph = None
+        self._g_mask = None
+        self._g_cache_id = None
+
+    def _update_mask_tables(self, t: torch.Tensor, q_mask: torch.Tensor) -> None:
+        """Write query tables; copy in-place when the CUDA graph closed over them."""
+        ht = self._mask_holder["t"]
+        hq = self._mask_holder["q_mask"]
+        if (
+            ht.shape == t.shape
+            and hq.shape == q_mask.shape
+            and ht.dtype == t.dtype
+            and hq.dtype == q_mask.dtype
+            and ht.device == t.device
+        ):
+            ht.copy_(t)
+            hq.copy_(q_mask)
+        else:
+            self._mask_holder["t"] = t.contiguous()
+            self._mask_holder["q_mask"] = q_mask.contiguous()
+        self._mask_holder["kv_mask"] = self.grouping_ids
+
+    def _run_layers(
+        self,
+        h: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        addr: torch.Tensor,
+        real_rows: torch.Tensor,
+        real_cols: torch.Tensor,
+        block_mask: BlockMask,
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        use_compiled = self._use_compiled_layer and _compiled_decode_pre is not None
+        pre = _compiled_decode_pre if use_compiled else _decode_pre
+        post = _compiled_decode_post if use_compiled else _decode_post
+        flex_fn: Callable[..., torch.Tensor] = self._flex
+        layer_hiddens: list[torch.Tensor] = []
+        h_in = h
+        try:
+            for li, layer in enumerate(self.model.layers):
+                residual, q, scale = pre(
+                    layer, h, cos, sin,
+                    self.k_cache[li], self.v_cache[li],
+                    addr, real_rows, real_cols,
+                    self.n_heads, self.n_kv_heads, self.head_dim,
+                )
+                o = flex_fn(
+                    q, self.k_cache[li][None], self.v_cache[li][None],
+                    block_mask=block_mask, scale=scale, enable_gqa=True,
+                )
+                h = post(layer, residual, o)
+                layer_hiddens.append(h)
+        except Exception as exc:
+            if use_compiled and _inductor_rejected(exc):
+                self._use_compiled_layer = False
+                return self._run_layers(h_in, cos, sin, addr, real_rows, real_cols, block_mask)
+            raise
+        return self.model.norm(h), layer_hiddens
+
+    def _graph_input_ready(
+        self,
+        h: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        addr: torch.Tensor,
+        real_rows: torch.Tensor,
+        real_cols: torch.Tensor,
+    ) -> bool:
+        bufs = (self._g_h, self._g_cos, self._g_sin, self._g_addr, self._g_rows, self._g_cols)
+        srcs = (h, cos, sin, addr, real_rows, real_cols)
+        if any(b is None for b in bufs):
+            return False
+        return all(b.shape == s.shape and b.dtype == s.dtype for b, s in zip(bufs, srcs))
+
+    def _copy_graph_inputs(
+        self,
+        h: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        addr: torch.Tensor,
+        real_rows: torch.Tensor,
+        real_cols: torch.Tensor,
+        block_mask: BlockMask,
+    ) -> bool:
+        if not self._graph_input_ready(h, cos, sin, addr, real_rows, real_cols):
+            return False
+        assert self._g_h is not None and self._g_cos is not None and self._g_sin is not None
+        assert self._g_addr is not None and self._g_rows is not None and self._g_cols is not None
+        self._g_h.copy_(h)
+        self._g_cos.copy_(cos)
+        self._g_sin.copy_(sin)
+        self._g_addr.copy_(addr)
+        self._g_rows.copy_(real_rows)
+        self._g_cols.copy_(real_cols)
+        if self._g_mask is None or not _copy_block_mask(self._g_mask, block_mask):
+            return False
+        return True
+
+    def _try_s1_graph(
+        self,
+        h: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        addr: torch.Tensor,
+        real_rows: torch.Tensor,
+        real_cols: torch.Tensor,
+        block_mask: BlockMask,
+    ) -> tuple[torch.Tensor, list[torch.Tensor]] | None:
+        """Replay or capture the S=1 layer stack. None → use the compiled path."""
+        if (
+            self._graph_disabled
+            or self.device.type != "cuda"
+            or not self._use_compiled_layer
+            or _compiled_decode_pre is None
+            or h.shape[1] != 1
+            or addr.numel() != self.B
+        ):
+            return None
+        if (
+            self._graph is not None
+            and self._g_cache_id == id(self.k_cache)
+            and self._copy_graph_inputs(h, cos, sin, addr, real_rows, real_cols, block_mask)
+        ):
+            assert self._graph is not None and self._g_out is not None and self._g_hiddens is not None
+            self._graph.replay()
+            return self._g_out, self._g_hiddens
+        return self._capture_s1_graph(h, cos, sin, addr, real_rows, real_cols, block_mask)
+
+    def _capture_s1_graph(
+        self,
+        h: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        addr: torch.Tensor,
+        real_rows: torch.Tensor,
+        real_cols: torch.Tensor,
+        block_mask: BlockMask,
+    ) -> tuple[torch.Tensor, list[torch.Tensor]] | None:
+        self._g_h = h.clone()
+        self._g_cos = cos.clone()
+        self._g_sin = sin.clone()
+        self._g_addr = addr.clone()
+        self._g_rows = real_rows.clone()
+        self._g_cols = real_cols.clone()
+        self._g_mask = block_mask
+        if not self._copy_graph_inputs(h, cos, sin, addr, real_rows, real_cols, block_mask):
+            self._invalidate_graph()
+            return self._run_layers(h, cos, sin, addr, real_rows, real_cols, block_mask)
+
+        def _restore_static() -> None:
+            assert self._g_h is not None and self._g_cos is not None and self._g_sin is not None
+            assert self._g_addr is not None and self._g_rows is not None and self._g_cols is not None
+            self._g_h.copy_(h)
+            self._g_cos.copy_(cos)
+            self._g_sin.copy_(sin)
+            self._g_addr.copy_(addr)
+            self._g_rows.copy_(real_rows)
+            self._g_cols.copy_(real_cols)
+
+        def _run_static() -> tuple[torch.Tensor, list[torch.Tensor]]:
+            assert self._g_h is not None and self._g_cos is not None and self._g_sin is not None
+            assert self._g_addr is not None and self._g_rows is not None and self._g_cols is not None
+            assert self._g_mask is not None
+            return self._run_layers(
+                self._g_h, self._g_cos, self._g_sin,
+                self._g_addr, self._g_rows, self._g_cols, self._g_mask,
+            )
+
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(2):
+                _restore_static()
+                out, hiddens = _run_static()
+        torch.cuda.current_stream().wait_stream(side)
+        if not self._use_compiled_layer or _compiled_decode_pre is None:
+            return out, hiddens
+        _restore_static()
+        try:
+            graph = torch.cuda.CUDAGraph()
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                with torch.cuda.graph(graph):
+                    self._g_out, self._g_hiddens = _run_static()
+            empty = any("CUDA Graph is empty" in str(w.message) for w in caught)
+        except Exception:
+            empty = True
+        if empty or self._g_out is None or not torch.allclose(self._g_out.float(), out.float(), atol=5e-2, rtol=5e-2):
+            self._graph_disabled = True
+            self._invalidate_graph()
+            return out, hiddens
+        self._graph = graph
+        self._g_cache_id = id(self.k_cache)
+        assert self._g_hiddens is not None
+        return self._g_out, self._g_hiddens
 
     def reset_rows(self, rows: Sequence[int] | None = None) -> None:
         """Restart decode positions for selected rows (or the whole batch).
@@ -495,6 +811,8 @@ class FlexDecodeSession:
         B, S, _ = embeds.shape
         if B != self.B:
             raise ValueError(f"Session was created for batch_size={self.B}, got {B}.")
+        if self.device.type == "cuda":
+            install_compiled_decode_layer()
         if grouping_ids.shape != (B, S):
             raise ValueError(
                 f"grouping_ids must have shape [{B}, {S}], got {tuple(grouping_ids.shape)}."
@@ -516,9 +834,7 @@ class FlexDecodeSession:
         # Pad columns get earlier/negative values; clamp keeps the causal mask
         # finite (pad outputs are discarded by the caller either way).
         cache_pos = self.lengths[:, None] + col - pad
-        self._mask_holder["t"] = cache_pos.clamp_min(0)
-        self._mask_holder["q_mask"] = mid
-        self._mask_holder["kv_mask"] = self.grouping_ids
+        self._update_mask_tables(cache_pos.clamp_min(0), mid)
 
         # Real tokens are the trailing lengths[b] columns; only they are
         # written to the cache, at their own sequence's slots.
@@ -557,40 +873,14 @@ class FlexDecodeSession:
 
         cos, sin = self.model.rotary_emb(x, rope_pos)
 
-        h = x
-        layer_hiddens: list[torch.Tensor] = []
-        for li, layer in enumerate(self.model.layers):
-            residual = h
-            hn = layer.input_layernorm(h)
-            attn = layer.self_attn
-            q = attn.q_proj(hn).view(B, S, self.n_heads, self.head_dim)
-            k = attn.k_proj(hn).view(B, S, self.n_kv_heads, self.head_dim)
-            q_norm = getattr(attn, "q_norm", None)  # Qwen3 yes, Llama no
-            if q_norm is not None:
-                q = q_norm(q)
-                k = attn.k_norm(k)
-            q = q.transpose(1, 2)
-            k = k.transpose(1, 2)
-            v = attn.v_proj(hn).view(B, S, self.n_kv_heads, self.head_dim).transpose(1, 2)
-            q, k = apply_rotary_pos_emb(q, k, cos, sin)
-
-            # [N, kv_heads, hd] -> [kv_heads, N, hd] into the pool at ``addr``.
-            self.k_cache[li][:, addr] = k[real_rows, :, real_cols].transpose(0, 1)
-            self.v_cache[li][:, addr] = v[real_rows, :, real_cols].transpose(0, 1)
-
-            # K/V batch dim 1 broadcasts against the batched block mask: every
-            # row reads its own pages out of the shared pool.
-            o = self._flex(
-                q, self.k_cache[li][None], self.v_cache[li][None],
-                block_mask=block_mask, scale=attn.scaling, enable_gqa=True,
+        graphed = self._try_s1_graph(x, cos, sin, addr, real_rows, real_cols, block_mask)
+        if graphed is None:
+            h, layer_hiddens = self._run_layers(
+                x, cos, sin, addr, real_rows, real_cols, block_mask,
             )
-            o = o.transpose(1, 2).reshape(B, S, -1)
-            h = residual + attn.o_proj(o)
-            h = h + layer.mlp(layer.post_attention_layernorm(h))
-            if output_hidden_states:
-                layer_hiddens.append(h)
+        else:
+            h, layer_hiddens = graphed
 
-        h = self.model.norm(h)
         self.lengths = self.lengths + n
         self._lengths_host = needed
         if output_hidden_states:

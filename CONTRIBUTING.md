@@ -42,6 +42,7 @@ Notebooks under [`examples/`](examples/) are committed **without** cell outputs.
    pyright src/ tests/
    pytest
    ```
+   CI runs the same two checks (plus a wheel/sdist build) on every pull request and on pushes to `main`.
 4. Open a pull request against `main` with a clear description of what changed and why.
 
 If you add a new feature, include a short usage example in the PR description or in `examples/`.

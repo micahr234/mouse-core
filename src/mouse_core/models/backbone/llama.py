@@ -107,7 +107,7 @@ class LlamaBackbone(Backbone):
     Construct directly from config args::
 
            backbone = LlamaBackbone(
-               train_kernel="varlen",
+               train_kernel="flex",
                decode_kernel="flex",
                dtype=torch.float32,
                hidden_dim=128,
@@ -119,7 +119,7 @@ class LlamaBackbone(Backbone):
     Or load architecture and transformer weights from a pretrained Llama repo::
 
            backbone = LlamaBackbone(
-               train_kernel="varlen",
+               train_kernel="flex",
                decode_kernel="flex",
                dtype=preferred_dtype(device),
                pretrained="meta-llama/Llama-3.2-1B",
@@ -129,7 +129,7 @@ class LlamaBackbone(Backbone):
     The adapter translates the generic MOUSE call into the HF calling
     convention. Cached decoding goes through ``decode_session()``.
 
-    ``train_kernel`` (``"varlen"`` / ``"flex"``), ``decode_kernel``
+    ``train_kernel`` (``"varlen"`` / ``"padded"`` / ``"flex"``), ``decode_kernel``
     (``"flex"``) and ``dtype`` are required: the uncached-forward kernel, the
     cached-decode kernel, and the dtype of the base weights (``torch.float32``
     to fine-tune them, ``preferred_dtype(device)`` for a frozen LoRA base or

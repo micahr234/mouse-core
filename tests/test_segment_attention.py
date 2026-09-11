@@ -69,6 +69,9 @@ def test_model_forward_injects_sequence_id_and_runs_flat() -> None:
         heads=DiscreteActionValueHead(
             in_features=8, out_features=4, hidden_dim=8, num_layers=1
         ),
+        action_head="action_value",
+        reasoner=None,
+        recurrence=None,
     )
     batch = [[{"action": i % 4} for i in range(3)], [{"action": 1}, {"action": 2}]]
     tb, objective_data = batch_to_packed(_tok(model.encoder), batch)

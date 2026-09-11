@@ -15,7 +15,7 @@ inside each class), all decoder layers run in that order, and the outputs
 are restored to the original order before returning. Causal attention over
 the packed segments is then exactly the predicate above.
 
-Two attention kernels run the same packed segments; ``train_kernel``
+Three attention kernels run the same packed segments; ``train_kernel``
 (``Backbone.train_kernel``, a required constructor argument, / the
 ``packed_forward`` argument) selects one so they can be compared on equal
 terms. Everything else — the regrouping, RoPE positions, decoder body,
@@ -28,6 +28,11 @@ compiled body, gradient checkpointing, the hidden-state contract — is shared.
   :func:`torch.nn.functional.scaled_dot_product_attention` over a
   block-causal boolean mask built once per forward — the fp32 reference
   mode (O(L^2) memory), not a fallback.
+- ``"padded"``. Each packed segment is right-padded to ``max_seqlen`` and
+  run as a dense causal SDPA call ``[n_seg, H, S, Dh]`` (Flash when the
+  backend picks it). Pad keys are masked; attention is not truncated.
+  Cost tracks ``n_seg * S^2``, so a few long groups beat ``"varlen"``'s
+  packed-stream ``L^2`` fallback, and many short groups waste pad.
 - ``"flex"``. :func:`torch.nn.attention.flex_attention` with a block-sparse
   mask over the packed segments (128-token blocks; masked blocks are
   skipped). Compiled on CUDA in every dtype — inside the compiled decoder
@@ -35,8 +40,9 @@ compiled body, gradient checkpointing, the hidden-state contract — is shared.
   compiled kernel of its own — and unfused (scores materialized) on CPU,
   where it is forward-only. The kernel of choice for full fp32 fine-tuning.
 
-:func:`install_compiled_decoder` compiles the per-layer decoder body once
-(``torch.compile(dynamic=True)``); the same compiled function serves every
+:func:`install_compiled_decoder` compiles the per-layer train decoder body
+once (``torch.compile(dynamic=True)``) and, on CUDA, the cached-decode
+per-layer body as well. The same compiled train function serves every
 layer, stream length, group count and kernel. ``Backbone.gradient_checkpointing``
 recomputes each layer in backward instead of storing its activations.
 """
@@ -59,10 +65,11 @@ from mouse_core.models.backbone.flex_decode import (
     _FlexKernel,
     _use_flex_compile,
     flex_block_mask,
+    install_compiled_decode_layer,
     module_device_dtype,
 )
 
-TrainKernel = Literal["varlen", "flex"]
+TrainKernel = Literal["varlen", "flex", "padded"]
 
 
 def check_train_kernel(kernel: object) -> TrainKernel:
@@ -167,6 +174,38 @@ def _flex_block_mask(plan: _PackingPlan, device: torch.device) -> BlockMask:
     )
 
 
+def _pad_packed(x: torch.Tensor, cu_seqlens: torch.Tensor, max_seqlen: int) -> torch.Tensor:
+    """``x [L, H, D]`` → right-padded ``[n_seg, H, S, D]``."""
+    L, h, d = x.shape
+    n_seg = cu_seqlens.numel() - 1
+    idx = torch.arange(L, device=x.device)
+    ends = cu_seqlens[1:].to(dtype=idx.dtype)
+    seg = torch.searchsorted(ends, idx, right=True)
+    pos = idx - cu_seqlens.to(dtype=idx.dtype)[seg]
+    out = x.new_zeros(n_seg, h, max_seqlen, d)
+    out[seg, :, pos] = x
+    return out
+
+
+def _unpad_packed(x: torch.Tensor, cu_seqlens: torch.Tensor, length: int) -> torch.Tensor:
+    """``x [n_seg, H, S, D]`` → packed ``[L, H, D]``."""
+    idx = torch.arange(length, device=x.device)
+    ends = cu_seqlens[1:].to(dtype=idx.dtype)
+    seg = torch.searchsorted(ends, idx, right=True)
+    pos = idx - cu_seqlens.to(dtype=idx.dtype)[seg]
+    return x[seg, :, pos]
+
+
+def _padded_causal_mask(cu_seqlens: torch.Tensor, max_seqlen: int) -> torch.Tensor:
+    """``[n_seg, 1, S, S]`` bool: causal within each segment, pad keys dropped."""
+    device = cu_seqlens.device
+    lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.long)
+    t = torch.arange(max_seqlen, device=device)
+    valid = t.unsqueeze(0) < lengths.unsqueeze(1)
+    causal = t[:, None] >= t[None, :]
+    return (valid.unsqueeze(2) & valid.unsqueeze(1) & causal).unsqueeze(1)
+
+
 def _flex_fn(device: torch.device) -> Callable[..., torch.Tensor]:
     """Flex kernel for the eager body: compiled on CUDA, eager on CPU.
 
@@ -192,15 +231,16 @@ def _decoder_layer(
     attn_mask: torch.Tensor | None,
     block_mask: BlockMask | None,
     flex_fn: Callable[..., torch.Tensor] | None,
+    padded: bool,
     n_heads: int,
     n_kv_heads: int,
     head_dim: int,
 ) -> torch.Tensor:
     """One Llama / Qwen3 decoder layer over a packed stream ``h [L, D]``.
 
-    ``block_mask`` selects FlexAttention; otherwise ``attn_mask is None``
-    selects the flash varlen kernel and a mask selects SDPA over it.
-    Compiled by :func:`install_compiled_decoder`.
+    ``block_mask`` selects FlexAttention; ``padded`` selects rectangular
+    causal SDPA; otherwise ``attn_mask is None`` selects flash varlen and a
+    mask selects packed-stream SDPA. Compiled by :func:`install_compiled_decoder`.
     """
     L = h.shape[0]
     attn = layer.self_attn
@@ -233,6 +273,23 @@ def _decoder_layer(
             enable_gqa=gqa,
             kernel_options={"FORCE_USE_FLEX_ATTENTION": True},
         )[0].transpose(0, 1)
+    elif padded:
+        q_p = _pad_packed(q[0].transpose(0, 1), cu_seqlens, max_seqlen)
+        k_p = _pad_packed(k[0].transpose(0, 1), cu_seqlens, max_seqlen)
+        v_p = _pad_packed(v, cu_seqlens, max_seqlen)
+        o = _unpad_packed(
+            F.scaled_dot_product_attention(
+                q_p,
+                k_p,
+                v_p,
+                attn_mask=attn_mask,
+                is_causal=attn_mask is None,
+                scale=attn.scaling,
+                enable_gqa=gqa,
+            ),
+            cu_seqlens,
+            L,
+        )
     elif attn_mask is None:
         o = cast(
             torch.Tensor,
@@ -263,18 +320,21 @@ def _decoder_layer(
 
 
 def install_compiled_decoder() -> bool:
-    """Compile the per-layer decoder body used by :func:`packed_forward`.
+    """Compile the per-layer train and (on CUDA) decode decoder bodies.
 
-    One ``torch.compile(dynamic=True)`` function serves every layer of every
-    backbone in the process, any stream length and group count, and
-    ``output_hidden_states=True``. Idempotent; returns True on the first
-    install.
+    One ``torch.compile(dynamic=True)`` function serves every train layer of
+    every backbone in the process, any stream length and group count, and
+    ``output_hidden_states=True``. A second compiled function serves cached
+    decode. Idempotent; returns True if anything was installed.
     """
     global _compiled_layer
-    if _compiled_layer is not None:
-        return False
-    _compiled_layer = torch.compile(_decoder_layer, dynamic=True)
-    return True
+    installed = False
+    if _compiled_layer is None:
+        _compiled_layer = torch.compile(_decoder_layer, dynamic=True)
+        installed = True
+    if install_compiled_decode_layer():
+        installed = True
+    return installed
 
 
 @overload
@@ -336,10 +396,11 @@ def packed_forward(
         sequence_ids: ``[L]`` sequence id per token.
         grouping_ids: ``[L]`` grouping id per token (any integer values).
         train_kernel: ``"varlen"`` (flash varlen on CUDA bf16/fp16,
-            masked SDPA otherwise) or ``"flex"`` (FlexAttention block mask,
-            compiled on CUDA); see the module docstring. Required so the
-            kernel is always an explicit choice; ``Model`` passes
-            ``Backbone.train_kernel``.
+            masked SDPA otherwise), ``"padded"`` (dense causal SDPA on
+            segments padded to ``max_seqlen``), or ``"flex"`` (FlexAttention
+            block mask, compiled on CUDA); see the module docstring.
+            Required so the kernel is always an explicit choice; ``Model``
+            passes ``Backbone.train_kernel``.
         output_hidden_states: Also return every layer's output (before the
             final norm) for layerwise heads.
         checkpoint: Recompute each layer in backward instead of storing its
@@ -374,10 +435,15 @@ def packed_forward(
     attn_mask: torch.Tensor | None = None
     block_mask: BlockMask | None = None
     flex_fn: Callable[..., torch.Tensor] | None = None
+    padded = train_kernel == "padded"
     if train_kernel == "flex":
         block_mask = _flex_block_mask(plan, device)
         flex_fn = _flex_fn(device)
-    elif not fused:
+    elif train_kernel == "padded":
+        lengths = plan.cu_seqlens[1:] - plan.cu_seqlens[:-1]
+        if not bool((lengths == plan.max_seqlen).all()):
+            attn_mask = _padded_causal_mask(plan.cu_seqlens, plan.max_seqlen)
+    elif train_kernel == "varlen" and not fused:
         attn_mask = _block_causal_mask(plan)
         if device.type == "cuda" and not _warned_reference_cuda:
             warnings.warn(
@@ -402,7 +468,7 @@ def packed_forward(
     for layer in hf.layers:
         args = (
             layer, h, cos, sin, plan.cu_seqlens, plan.max_seqlen,
-            attn_mask, block_mask, flex_fn, n_heads, n_kv_heads, head_dim,
+            attn_mask, block_mask, flex_fn, padded, n_heads, n_kv_heads, head_dim,
         )
         h = _checkpoint(body, *args, use_reentrant=False) if recompute else body(*args)
         if output_hidden_states:

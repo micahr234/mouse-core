@@ -3,7 +3,7 @@
 Measures, per workload: prefill of a context into an empty paged KV pool,
 then a one-token-per-row decode step against that history. Reports median
 wall time, peak allocated memory above the parameter baseline, tokens/second,
-and first-call (compile / page-grow) time. Decode is ``decode_kernel="flex"``
+and first-call (compile / page-grow / S=1 CUDA-graph capture) time. Decode is ``decode_kernel="flex"``
 only. ``torch.set_float32_matmul_precision("high")`` is set so fp32 matches
 the README TF32 path.
 
