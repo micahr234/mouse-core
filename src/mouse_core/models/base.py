@@ -1459,7 +1459,8 @@ class Model(nn.Module):
         grouping_id)`` class; kernel chosen by ``backbone.train_kernel``). Cached
         decode keeps one ``FlexDecodeSession`` per backbone pass, a paged KV
         pool in which each sequence owns only the pages its own history needs,
-        with the same grouping-id isolation.
+        with the same grouping-id isolation. On CUDA the pool grows by mapping
+        more physical pages (no copy of existing K/V).
 
         Training predictions are flat over head-output tokens (``[P, ...]``,
         one row per head-output token; ``objective_data["head_output_count"]``

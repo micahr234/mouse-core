@@ -605,13 +605,14 @@ def test_paged_cache_grows_pool_and_keeps_history() -> None:
     with torch.no_grad():
         first = _decode(session, [page - 1, 1], hidden)
         n_pages_before = session.n_pages
-        # Crossing into a second page for row 0 needs a free page: none left -> pool doubles.
+        # Crossing into a second page for row 0 needs a free page: none left -> pool grows.
         _decode(session, [2, 0], hidden)
     assert session.n_pages > n_pages_before
+    assert session.n_pages == 3  # grows by the pages needed, not a doubling
     assert session.pages_in_use == 3
     assert session.lengths.tolist() == [page + 1, 1]
     assert first.shape[0] == 2
-    # Row 1's first slot must have survived the pool copy: decoding row 1 alone
+    # Row 1's first slot must have survived the pool grow: decoding row 1 alone
     # from scratch in a fresh session with the same inputs is covered by the
     # end-to-end tests; here we check the address map stayed consistent.
     row1_page = session._row_pages[1][0]
@@ -714,3 +715,76 @@ def test_decode_rope_positions_matches_loop_and_ignores_pads() -> None:
     # row0: cache has two gid-1 slots; chunk adds 0 then 1 → positions 2, 3.
     # Pad gid 0 must not contribute. row1: three cached gid-2 → position 3.
     assert got.tolist() == [[0, 2, 3], [0, 0, 3], [0, 0, 0]]
+
+
+def test_expandable_kv_cpu_grow_keeps_prefix() -> None:
+    from mouse_core.models.backbone.expandable_kv import ExpandableKvTensor
+
+    store = ExpandableKvTensor((2, 2, 4, 8), dtype=torch.float32, device=torch.device("cpu"))
+    assert not store.uses_vmm
+    store.tensor[0, 0, 0, 0] = 3.5
+    store.tensor[0, 0, 3, 1] = 7.25
+    store.grow_token_dim(12)
+    assert store.tensor.shape == (2, 2, 12, 8)
+    assert store.tensor[0, 0, 0, 0].item() == 3.5
+    assert store.tensor[0, 0, 3, 1].item() == 7.25
+    assert store.tensor[0, 0, 4, 0].item() == 0.0
+    store.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA VMM page-pool grow")
+def test_expandable_kv_cuda_grows_without_copy() -> None:
+    from mouse_core.models.backbone.expandable_kv import ExpandableKvTensor
+
+    device = torch.device("cuda")
+    # Large enough that growing past one 2 MiB VMM granule needs another map.
+    store = ExpandableKvTensor((4, 8, 128, 64), dtype=torch.bfloat16, device=device)
+    assert store.uses_vmm
+    ptr = store.tensor.data_ptr()
+    committed0 = store.committed_bytes
+    store.tensor[0, 0, 0, 0] = 1.5
+    store.tensor[0, 0, 127, 3] = 2.25
+    store.tensor[3, 7, 10, 5] = -4.0
+    store.grow_token_dim(128 * 8)
+    assert store.tensor.shape[2] == 128 * 8
+    assert store.tensor.data_ptr() == ptr
+    assert abs(float(store.tensor[0, 0, 0, 0]) - 1.5) < 0.1
+    assert abs(float(store.tensor[0, 0, 127, 3]) - 2.25) < 0.1
+    assert abs(float(store.tensor[3, 7, 10, 5]) + 4.0) < 0.1
+    assert float(store.tensor[0, 0, 128, 0]) == 0.0
+    # Physical commit grows by the extra mapping, not by allocating a second full copy.
+    assert store.committed_bytes >= committed0
+    assert store.committed_bytes < committed0 + int(store.tensor.nbytes)
+    # Moving the reservation must keep the prefix without a memcpy.
+    store._remap(max(store._reserve * 2, store._mapped * 2))
+    store._set_view((4, 8, 128 * 8, 64))
+    assert abs(float(store.tensor[0, 0, 0, 0]) - 1.5) < 0.1
+    assert abs(float(store.tensor[0, 0, 127, 3]) - 2.25) < 0.1
+    assert abs(float(store.tensor[3, 7, 10, 5]) + 4.0) < 0.1
+    store.close()
+    assert store.tensor.numel() == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA VMM page-pool grow")
+def test_cuda_paged_pool_grows_in_place() -> None:
+    """Assigning a new page maps more VMM memory; the pool pointer does not move."""
+    from mouse_core.models.backbone.flex_decode import FlexDecodeSession
+
+    torch.manual_seed(11)
+    device = torch.device("cuda")
+    model = _tiny_model(Qwen3Backbone, dtype=torch.bfloat16).to(device)
+    inner = cast(nn.Module, cast(Any, model.backbone).model)
+    session = FlexDecodeSession(inner, batch_size=2)
+    assert session._k_store.uses_vmm
+    ptr_k = session.k_cache.data_ptr()
+    ptr_v = session.v_cache.data_ptr()
+    page = session.page
+    hidden = model.hidden_dim
+    with torch.no_grad():
+        _decode(session, [page - 1, 1], hidden)
+        _decode(session, [2, 0], hidden)
+    assert session.n_pages == 3
+    assert session.pages_in_use == 3
+    assert session.k_cache.data_ptr() == ptr_k
+    assert session.v_cache.data_ptr() == ptr_v
+    torch.cuda.synchronize()

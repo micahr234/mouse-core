@@ -247,6 +247,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``grouping_field: str | None = None`` (``None`` ⇒ no grouping filter).
 
 ### Changed
+- On CUDA, the paged KV pool (``FlexDecodeSession``) grows by mapping more
+  physical pages under a reserved virtual address instead of allocating a
+  new tensor and copying. Existing K/V stay in place; the pool grows to
+  the pages actually needed rather than doubling. CPU still reallocates.
 - ``LoRALinear`` runs ``y = W x + scale · B(A(x_fp32))`` as one function
   (casts inside the graph). Packed train and cached decode share it. On
   CUDA it is ``torch.compile``d into a single op; inside an already-compiled
@@ -570,6 +574,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Train is ``compose(augmenter, tokenizer)``; eval is the tokenizer.
 
 ### Fixed
+- Growing the decode page pool no longer holds the old K/V tensors and a
+  2× copy at the same time (the deployment memory spike).
 - ``scripts/install.sh`` uses ``return`` instead of ``exit`` so
   ``source scripts/install.sh`` no longer kills the calling shell on
   failure, and ``--refresh`` re-resolves git extras

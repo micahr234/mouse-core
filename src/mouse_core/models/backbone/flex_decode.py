@@ -16,9 +16,11 @@ How it works:
   ``ceil(len / 128)`` pages (at least one), mapped through a page table from
   its logical slot ``0..len`` to a physical slot in the pool, so a batch with
   one long row and many short rows costs the sum of the rows' lengths, not
-  ``B * max_len``. Pad tokens are never written. The pool doubles when it
-  runs out of free pages; :meth:`reset_rows` returns a row's pages to the
-  pool.
+  ``B * max_len``. Pad tokens are never written. When the pool runs out of
+  free pages it grows by the pages actually needed. On CUDA that maps more
+  physical memory under a reserved virtual address (existing K/V are not
+  copied); elsewhere the prefix is copied into a larger tensor.
+  :meth:`reset_rows` returns a row's pages to the pool.
 * Attention runs through :func:`torch.nn.attention.flex_attention` with a
   BlockMask that keeps each query inside its own sequence's causal prefix
   **and** the same grouping-id run (``grouping_ids``). The mask is built in
@@ -67,6 +69,8 @@ from torch.nn.attention.flex_attention import BlockMask, create_block_mask, flex
 
 # Identical implementations; either import works for both architectures.
 from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
+
+from mouse_core.models.backbone.expandable_kv import ExpandableKvTensor
 
 DecodeKernel = Literal["flex"]
 """Cached-decode attention kernel. ``"flex"`` (paged FlexAttention) is the only
@@ -381,8 +385,8 @@ class FlexDecodeSession:
     does this automatically and carries the session inside its ``cache``.
 
     The KV cache is a paged pool shared by all rows (see module docstring).
-    It starts with one 128-token page per row and doubles whenever a row
-    needs a page and none is free, so no capacity has to be chosen up front.
+    It starts with one 128-token page per row and grows by the pages a row
+    needs when none is free, so no capacity has to be chosen up front.
 
     Args:
         model: A ``transformers`` decoder stack (``Qwen3Model`` / ``LlamaModel``)
@@ -421,11 +425,11 @@ class FlexDecodeSession:
         # so logical block 0 maps to real memory even for pad-only queries).
         n_layers = len(hf.layers)
         self.n_pages = self.B
-        self.k_cache = torch.zeros(
-            n_layers, self.n_kv_heads, self.n_pages * self.page, self.head_dim,
-            device=self.device, dtype=self.dtype,
-        )
-        self.v_cache = torch.zeros_like(self.k_cache)
+        kv_shape = (n_layers, self.n_kv_heads, self.n_pages * self.page, self.head_dim)
+        self._k_store = ExpandableKvTensor(kv_shape, dtype=self.dtype, device=self.device)
+        self._v_store = ExpandableKvTensor(kv_shape, dtype=self.dtype, device=self.device)
+        self.k_cache = self._k_store.tensor
+        self.v_cache = self._v_store.tensor
 
         # Logical (per-row) tables, ``logical_cap`` slots wide.
         self.logical_cap = self.page
@@ -487,7 +491,7 @@ class FlexDecodeSession:
         self._physical_mask_mod = physical_mask_mod
 
         # Incremental-step CUDA graph: captured the second time a shape
-        # repeats; rebuilt when the pool is replaced or BlockMask tables change.
+        # repeats; rebuilt when the pool grows or BlockMask tables change.
         self._graph: torch.cuda.CUDAGraph | None = None
         self._graph_disabled = False
         self._g_key: tuple[int, int, int, int] | None = None
@@ -502,6 +506,17 @@ class FlexDecodeSession:
         self._g_out: torch.Tensor | None = None
         self._g_hiddens: list[torch.Tensor] | None = None
         self._g_cache_id: int | None = None
+
+    def __del__(self) -> None:
+        # Drop views before the VMM store unmaps so teardown cannot race a
+        # still-live k_cache / v_cache pointer.
+        try:
+            self.k_cache = torch.empty(0)
+            self.v_cache = torch.empty(0)
+            self._k_store.close()
+            self._v_store.close()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
 
@@ -521,16 +536,14 @@ class FlexDecodeSession:
         self.logical_cap = new_cap
 
     def _grow_pool(self, min_pages: int) -> None:
-        new_n = max(min_pages, 2 * self.n_pages)
-        old_len = self.n_pages * self.page
-        for name in ("k_cache", "v_cache"):
-            old = getattr(self, name)
-            new = torch.zeros(
-                old.shape[0], self.n_kv_heads, new_n * self.page, self.head_dim,
-                device=self.device, dtype=self.dtype,
-            )
-            new[:, :, :old_len] = old
-            setattr(self, name, new)
+        new_n = min_pages
+        if new_n <= self.n_pages:
+            return
+        new_tokens = new_n * self.page
+        self._k_store.grow_token_dim(new_tokens)
+        self._v_store.grow_token_dim(new_tokens)
+        self.k_cache = self._k_store.tensor
+        self.v_cache = self._v_store.tensor
         self._invalidate_graph()
         fill = torch.zeros(new_n - self.n_pages, dtype=torch.long, device=self.device)
         self._mask_holder["page_logical"] = torch.cat([self._mask_holder["page_logical"], fill])
