@@ -191,21 +191,35 @@ def _decode_rope_positions(
     Position = (same-``grouping_id`` count in the cache prefix) + (earlier
     real tokens in this chunk with the same id). Pad columns stay 0. Matches
     :func:`packed_rope_positions` on the equivalent flat stream.
+
+    Built by flattening each row's cache prefix plus this chunk's real tokens
+    and calling :func:`packed_rope_positions` (stable sort + cummax). The old
+    pairwise form allocated ``[B, S, S]`` and ``[B, S, cache]`` bool tables —
+    16 GiB at ``B=8, S=16384`` — and OOMed on long prefills.
     """
-    _B, S = chunk_grouping_ids.shape
+    B, S = chunk_grouping_ids.shape
     cap = cached_grouping_ids.shape[-1]
     device = chunk_grouping_ids.device
-    col = torch.arange(S, device=device)
-    kv = torch.arange(cap, device=device)
+    out = torch.zeros(B, S, dtype=torch.long, device=device)
+    if B == 0 or S == 0:
+        return out
 
-    same_chunk = chunk_grouping_ids.unsqueeze(-1) == chunk_grouping_ids.unsqueeze(-2)
-    earlier = col[:, None] > col[None, :]
-    local = (same_chunk & real.unsqueeze(-1) & real.unsqueeze(-2) & earlier).sum(-1)
+    row = torch.arange(B, device=device)
+    cache_ok = torch.arange(cap, device=device).unsqueeze(0) < prior_lengths.unsqueeze(1)
+    cache_seq = row.unsqueeze(1).expand(B, cap)[cache_ok]
+    cache_grp = cached_grouping_ids[cache_ok]
+    chunk_seq = row.unsqueeze(1).expand(B, S)[real]
+    chunk_grp = chunk_grouping_ids[real]
+    if cache_seq.numel() == 0 and chunk_seq.numel() == 0:
+        return out
 
-    cached_valid = kv.unsqueeze(0) < prior_lengths.unsqueeze(1)
-    same_cache = chunk_grouping_ids.unsqueeze(-1) == cached_grouping_ids.unsqueeze(1)
-    bases = (same_cache & cached_valid.unsqueeze(1)).sum(-1)
-    return torch.where(real, bases + local, torch.zeros_like(local))
+    pos = packed_rope_positions(
+        sequence_ids=torch.cat([cache_seq, chunk_seq]),
+        grouping_ids=torch.cat([cache_grp, chunk_grp]),
+    )
+    n_cache = cache_seq.numel()
+    out[real] = pos[n_cache:]
+    return out
 
 
 class _FlexKernel:

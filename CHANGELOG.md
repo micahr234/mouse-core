@@ -547,6 +547,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Train is ``compose(augmenter, tokenizer)``; eval is the tokenizer.
 
 ### Fixed
+- Cached-decode RoPE (``_decode_rope_positions``) uses the same stable
+  sort + cummax as ``packed_rope_positions`` instead of pairwise
+  ``[B, S, S]`` / ``[B, S, cache]`` tables. A long prefill (8 × 16384)
+  no longer allocates ~16 GiB just to count grouping ids.
 - Packed train and cached decode take the backbone **base** dtype (skipping
   fp32 LoRA adapters) instead of ``next(parameters())``, so a LoRA stack
   still runs the bf16 kernels if parameter order puts an adapter first.
