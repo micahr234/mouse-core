@@ -164,7 +164,7 @@ def test_cuda_fp32_decode_is_compiled_and_matches_full_forward() -> None:
     assert session._flex._active is session._flex._compiled
     assert session._compile_masks
     from mouse_core.models.backbone import flex_decode as flex_decode_mod
-    assert flex_decode_mod._compiled_decode_pre is not None
+    assert flex_decode_mod._compiled_decode_layer is not None
     full_q = _as_rect(full['action_value'])
     assert torch.allclose(incremental, full_q, atol=1e-4), (incremental - full_q).abs().max().item()
 
@@ -213,14 +213,15 @@ def test_cuda_bf16_lora_compiled_train_matches_cached_decode() -> None:
         assert torch.allclose(incremental, full_q, atol=0.05), (incremental - full_q).abs().max().item()
         assert cache is not None
         from mouse_core.models.backbone import flex_decode as flex_decode_mod
-        assert flex_decode_mod._compiled_decode_pre is not None
+        assert flex_decode_mod._compiled_decode_layer is not None
     finally:
         packed_train_mod._compiled_layer = was
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason='S=1 CUDA graph is CUDA-only')
-def test_cuda_s1_cudagraph_matches_eager_decode() -> None:
-    """After compile warmup, the S=1 graph matches eager compiled decode."""
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='decode CUDA graph is CUDA-only')
+@pytest.mark.parametrize('S', [1, 4], ids=['S=1', 'S=4'])
+def test_cuda_step_cudagraph_matches_eager_decode(S: int) -> None:
+    """After compile warmup, a repeated incremental shape matches compiled decode."""
     from mouse_core.models.backbone.flex_decode import FlexDecodeSession
 
     torch.manual_seed(0)
@@ -236,8 +237,9 @@ def test_cuda_s1_cudagraph_matches_eager_decode() -> None:
     B, D = 2, 64
     pre = torch.randn(B, 8, D, device=device, dtype=torch.bfloat16)
     preg = torch.zeros(B, 8, dtype=torch.long, device=device)
-    steps = [torch.randn(B, 1, D, device=device, dtype=torch.bfloat16) for _ in range(4)]
-    stepg = torch.zeros(B, 1, dtype=torch.long, device=device)
+    steps = [torch.randn(B, S, D, device=device, dtype=torch.bfloat16) for _ in range(4)]
+    stepg = torch.zeros(B, S, dtype=torch.long, device=device)
+    step_lens = [S, S]
 
     def run(*, graph: bool) -> list[torch.Tensor]:
         session = FlexDecodeSession(inner, batch_size=B)
@@ -247,9 +249,10 @@ def test_cuda_s1_cudagraph_matches_eager_decode() -> None:
         with torch.no_grad():
             session.forward(embeds=pre, lengths=[8, 8], grouping_ids=preg)
             for embeds in steps:
-                outs.append(session.forward(embeds=embeds, lengths=[1, 1], grouping_ids=stepg).clone())
+                outs.append(session.forward(embeds=embeds, lengths=step_lens, grouping_ids=stepg).clone())
         if graph:
-            assert session._graph is not None or session._graph_disabled
+            assert session._graph is not None
+            assert not session._graph_disabled
         return outs
 
     graphed = run(graph=True)

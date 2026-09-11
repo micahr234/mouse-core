@@ -41,9 +41,9 @@ compiled body, gradient checkpointing, the hidden-state contract — is shared.
   where it is forward-only. The kernel of choice for full fp32 fine-tuning.
 
 :func:`install_compiled_decoder` compiles the per-layer train decoder body
-once (``torch.compile(dynamic=True)``) and, on CUDA, the cached-decode
-per-layer body as well. The same compiled train function serves every
-layer, stream length, group count and kernel. ``Backbone.gradient_checkpointing``
+once (``torch.compile(dynamic=True)``) and, on CUDA, the full cached-decode
+stack as well. The same compiled train function serves every layer, stream
+length, group count and kernel. ``Backbone.gradient_checkpointing``
 recomputes each layer in backward instead of storing its activations.
 """
 
@@ -320,12 +320,13 @@ def _decoder_layer(
 
 
 def install_compiled_decoder() -> bool:
-    """Compile the per-layer train and (on CUDA) decode decoder bodies.
+    """Compile the per-layer train body and (on CUDA) the decode layer.
 
     One ``torch.compile(dynamic=True)`` function serves every train layer of
     every backbone in the process, any stream length and group count, and
-    ``output_hidden_states=True``. A second compiled function serves cached
-    decode. Idempotent; returns True if anything was installed.
+    ``output_hidden_states=True``. Decode compiles the same per-layer body
+    (attention inside; graph break after the KV scatter). Idempotent;
+    returns True if anything was installed.
     """
     global _compiled_layer
     installed = False

@@ -10,10 +10,12 @@ SDPA on segments padded to ``max_seqlen``) in each ``--modes`` body
 CUDA is synchronized around every measurement; medians and min/max over
 ``--iters`` iterations. Each kernel's outputs are also checked against the
 other's on the same inputs (max abs diff printed per workload).
+``--profile`` adds a ``torch.profiler`` CPU/CUDA breakdown after warmup.
 
     PYTHON_GIL=0 .venv/bin/python bench/bench_train.py --layers 8
     PYTHON_GIL=0 .venv/bin/python bench/bench_train.py --layers 28 --workloads mid long
     PYTHON_GIL=0 .venv/bin/python bench/bench_train.py --train-kernel flex --modes compiled
+    PYTHON_GIL=0 .venv/bin/python bench/bench_train.py --layers 8 --workloads short --modes compiled --train-kernel flex --profile
 
 Default shape is Qwen3-0.6B (hidden 1024, 16 q / 8 kv heads, head_dim 128,
 FFN 3072) with fp32 LoRA rank 16 on a frozen bf16 base; ``--layers`` trims the
@@ -41,8 +43,10 @@ from __future__ import annotations
 
 import argparse
 import statistics
+import sys
 import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any, cast
 
 import torch
@@ -50,6 +54,11 @@ import torch
 from mouse_core.models.backbone import TrainKernel, Qwen3Backbone, install_compiled_decoder, packed_forward
 from mouse_core.models.lora import LoRAConfig
 from mouse_core.optim import AdamW
+
+_BENCH_DIR = Path(__file__).resolve().parent
+if str(_BENCH_DIR) not in sys.path:
+    sys.path.insert(0, str(_BENCH_DIR))
+from bench_profile import add_profile_args, profile_call, wants_profile
 
 
 def _workload(name: str, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
@@ -122,6 +131,7 @@ def main() -> None:
     )
     parser.add_argument("--modes", nargs="+", default=["eager", "compiled", "compiled+checkpoint"])
     parser.add_argument("--train-kernel", nargs="+", default=["varlen", "flex", "padded"], choices=["varlen", "flex", "padded"])
+    add_profile_args(parser)
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -212,6 +222,20 @@ def main() -> None:
                     f"{L / med_b * 1e3:>9,.0f} tok/s | first fwd {first_f:.0f} ms, first fwd+bwd {first_b:.0f} ms | "
                     f"vs {other} {diff:.2e}"
                 )
+                if wants_profile(args):
+                    tag = f"{mode} {kernel} {wname}"
+                    profile_call(
+                        fwd, label=f"{tag} fwd", steps=iters,
+                        cuda=True, trace_dir=args.profile_trace,
+                    )
+                    profile_call(
+                        fwd_bwd, label=f"{tag} fwd+bwd", steps=iters,
+                        cuda=True, trace_dir=args.profile_trace,
+                    )
+                    profile_call(
+                        train_step, label=f"{tag} step", steps=iters,
+                        cuda=True, trace_dir=args.profile_trace,
+                    )
                 del embeds
                 torch.cuda.empty_cache()
 

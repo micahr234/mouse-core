@@ -1,15 +1,18 @@
 """Benchmark cached FlexAttention decode (``FlexDecodeSession``) on CUDA.
 
 Measures, per workload: prefill of a context into an empty paged KV pool,
-then a one-token-per-row decode step against that history. Reports median
-wall time, peak allocated memory above the parameter baseline, tokens/second,
-and first-call (compile / page-grow / S=1 CUDA-graph capture) time. Decode is ``decode_kernel="flex"``
-only. ``torch.set_float32_matmul_precision("high")`` is set so fp32 matches
-the README TF32 path.
+then a decode step of ``--step`` new tokens per row against that history.
+Reports median wall time, peak allocated memory above the parameter
+baseline, tokens/second, and first-call (compile / page-grow / incremental
+CUDA-graph capture) time. ``--profile`` adds a ``torch.profiler`` CPU/CUDA
+breakdown after warmup. Decode is ``decode_kernel="flex"`` only.
+``torch.set_float32_matmul_precision("high")`` is set so fp32 matches the
+README TF32 path.
 
-    PYTHON_GIL=0 .venv/bin/python bench/bench_inference.py --layers 8
-    PYTHON_GIL=0 .venv/bin/python bench/bench_inference.py --layers 28 --workloads mid long
-    PYTHON_GIL=0 .venv/bin/python bench/bench_inference.py --no-lora
+    PYTHON_GIL=0 .venv/bin/python bench/bench_inference.py --layers 8 --step 1
+    PYTHON_GIL=0 .venv/bin/python bench/bench_inference.py --layers 28 --workloads mid long --step 1
+    PYTHON_GIL=0 .venv/bin/python bench/bench_inference.py --no-lora --step 1
+    PYTHON_GIL=0 .venv/bin/python bench/bench_inference.py --layers 8 --step 1 --profile --workloads short
 
 Default shape is Qwen3-0.6B (hidden 1024, 16 q / 8 kv heads, head_dim 128,
 FFN 3072) with fp32 LoRA rank 16 on a frozen bf16 base; ``--layers`` trims the
@@ -21,8 +24,10 @@ from __future__ import annotations
 
 import argparse
 import statistics
+import sys
 import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -30,27 +35,32 @@ import torch
 from mouse_core.models.backbone import Qwen3Backbone
 from mouse_core.models.lora import LoRAConfig
 
+_BENCH_DIR = Path(__file__).resolve().parent
+if str(_BENCH_DIR) not in sys.path:
+    sys.path.insert(0, str(_BENCH_DIR))
+from bench_profile import add_profile_args, profile_call, wants_profile
 
-def _workload(name: str) -> tuple[int, list[int], list[int] | None]:
-    """Return ``(B, lengths, grouping_pattern)``.
+
+def _workload(name: str) -> tuple[list[int], str | None]:
+    """Return ``(lengths, grouping_pattern)``.
 
     ``grouping_pattern`` is ``None`` (one group) or a per-token pattern
     broadcast across rows: ``"recurring"`` or ``"manysmall"``.
     """
     if name == "short":
-        return 4, [512] * 4, None
+        return [512] * 4, None
     if name == "mid":
-        return 8, [4096] * 8, None
+        return [4096] * 8, None
     if name == "mid_recurring":
-        return 4, [4096] * 4, "recurring"
+        return [4096] * 4, "recurring"
     if name == "long":
-        return 4, [16384] * 4, None
+        return [16384] * 4, None
     if name == "long_recurring":
-        return 4, [16384] * 4, "recurring"
+        return [16384] * 4, "recurring"
     if name == "long_manysmall":
-        return 8, [16384] * 8, "manysmall"
+        return [16384] * 8, "manysmall"
     if name == "high_variance":
-        return 8, [17, 3000, 5, 900, 4000, 61, 2400, 1], None
+        return [17, 3000, 5, 900, 4000, 61, 2400, 1], None
     raise ValueError(f"unknown workload {name!r}")
 
 
@@ -111,13 +121,22 @@ def main() -> None:
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--ffn", type=int, default=3072)
     parser.add_argument("--no-lora", action="store_true", help="fp32 backbone (no LoRA)")
+    parser.add_argument(
+        "--step",
+        type=int,
+        required=True,
+        help="new tokens every row adds on the decode step (any constant S)",
+    )
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument(
         "--workloads",
         nargs="+",
         default=["short", "mid", "mid_recurring", "high_variance", "long", "long_recurring", "long_manysmall"],
     )
+    add_profile_args(parser)
     args = parser.parse_args()
+    if args.step < 1:
+        raise SystemExit("--step must be >= 1")
 
     if not torch.cuda.is_available():
         raise SystemExit("this benchmark needs CUDA")
@@ -149,19 +168,21 @@ def main() -> None:
     print(
         f"{props.name} | torch {torch.__version__} | layers={args.layers} base dtype={dtype} "
         f"lora={'off' if lora is None else f'r{lora.rank}'} params={sum(p.numel() for p in backbone.parameters())/1e6:.1f}M "
-        f"| decode_kernel=flex TF32=high"
+        f"| decode_kernel=flex TF32=high step={args.step}"
     )
 
+    step_s = args.step
     for wname in args.workloads:
-        B, lengths, grouping = _workload(wname)
+        lengths, grouping = _workload(wname)
+        B = len(lengths)
         prefill_embeds, prefill_lens, prefill_grp = _left_pad(
             lengths, args.hidden, device, dtype, grouping
         )
         tokens = sum(prefill_lens)
         S = prefill_embeds.shape[1]
-        step_embeds = torch.randn(B, 1, args.hidden, device=device, dtype=dtype)
-        step_grp = torch.zeros(B, 1, dtype=torch.long, device=device)
-        step_lens = [1] * B
+        step_embeds = torch.randn(B, step_s, args.hidden, device=device, dtype=dtype)
+        step_grp = torch.zeros(B, step_s, dtype=torch.long, device=device)
+        step_lens = [step_s] * B
         session = backbone.decode_session(batch_size=B)
 
         def prefill() -> None:
@@ -179,13 +200,24 @@ def main() -> None:
         session.forward(embeds=prefill_embeds, lengths=prefill_lens, grouping_ids=prefill_grp)
         first_d, med_d, lo_d, hi_d, peak_d = _timed(decode_step, iters)
         print(
-            f"  {wname:15s} B={B} S={S:5d} tokens={tokens:6d} | "
+            f"  {wname:15s} B={B} S={S:5d} tokens={tokens:6d} step={step_s} | "
             f"prefill {med_p:8.2f} ms [{lo_p:.1f},{hi_p:.1f}] (+{peak_p:6.0f} MB) | "
             f"{tokens / med_p * 1e3:>9,.0f} tok/s | "
             f"decode {med_d:8.2f} ms [{lo_d:.1f},{hi_d:.1f}] (+{peak_d:6.0f} MB) | "
-            f"{B / med_d * 1e3:>8,.0f} tok/s | "
+            f"{B * step_s / med_d * 1e3:>8,.0f} tok/s | "
             f"first prefill {first_p:.0f} ms, first decode {first_d:.0f} ms"
         )
+        if wants_profile(args):
+            profile_call(
+                prefill, label=f"{wname} prefill", steps=iters,
+                cuda=True, trace_dir=args.profile_trace,
+            )
+            session.reset_rows()
+            session.forward(embeds=prefill_embeds, lengths=prefill_lens, grouping_ids=prefill_grp)
+            profile_call(
+                decode_step, label=f"{wname} decode S={step_s}", steps=iters,
+                cuda=True, trace_dir=args.profile_trace,
+            )
         del session, prefill_embeds, step_embeds
         torch.cuda.empty_cache()
 

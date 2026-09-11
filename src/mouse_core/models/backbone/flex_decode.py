@@ -40,14 +40,14 @@ How it works:
   Python list), so a decode step issues no device→host sync; new pages are
   assigned with one small device write, only when a row crosses a page
   boundary.
-* The per-layer body is compiled on CUDA in two pieces (like the train-side
-  :func:`~mouse_core.models.backbone.packed_train.install_compiled_decoder`):
-  pre (norms, QKV, RoPE, KV scatter) and post (o-proj, MLP). FlexAttention
-  stays the existing compiled kernel so the scatter is visible. Page-table
-  growth, mask build, and address setup stay in eager Python.
-* After compile warmup, the common incremental step (every row adds one
-  token, ``S=1``) is captured in a CUDA graph. Prefills and rebuilds stay
-  on the compiled-but-not-graphed path.
+* Each decoder layer (norms, QKV, RoPE, KV scatter, FlexAttention, o-proj,
+  MLP) is compiled on CUDA like train's ``_decoder_layer``. A graph break
+  after the KV scatter keeps FlexAttention from reading the pre-write
+  cache. Page-table growth, mask build, and address setup stay eager.
+* After a call's ``[B, S]`` and real-token count repeat, the eager full
+  stack is CUDA-graphed so that steady incremental shape is one replay.
+  ``S`` is whatever the caller keeps sending; only one-off shapes (prefills,
+  rebuilds) stay compiled-but-not-graphed.
 
 The session wraps the backbone's ``transformers`` model in place (shared
 weights, decoder loop reimplemented) and supports both ``Qwen3Model`` and
@@ -236,7 +236,7 @@ def _inductor_rejected(exc: BaseException) -> bool:
     return name in {"InductorError", "LoweringException"} or "InductorError" in name
 
 
-def _decode_pre(
+def _decode_layer(
     layer: Any,
     h: torch.Tensor,
     cos: torch.Tensor,
@@ -246,16 +246,15 @@ def _decode_pre(
     addr: torch.Tensor,
     real_rows: torch.Tensor,
     real_cols: torch.Tensor,
+    block_mask: BlockMask,
+    flex_fn: Callable[..., torch.Tensor],
     n_heads: int,
     n_kv_heads: int,
     head_dim: int,
-) -> tuple[torch.Tensor, torch.Tensor, float]:
-    """Norms, QKV, RoPE, KV scatter. Compiled separately from attention.
-
-    Returning after the in-place scatter makes the write visible to FlexAttention
-    (a single compiled graph can read the pre-write cache and diverge from train).
-    """
+) -> torch.Tensor:
+    """One Llama / Qwen3 decode layer over a left-padded chunk ``h [B, S, D]``."""
     B, S, _ = h.shape
+    residual = h
     hn = layer.input_layernorm(h)
     attn = layer.self_attn
     q = attn.q_proj(hn).view(B, S, n_heads, head_dim)
@@ -270,34 +269,65 @@ def _decode_pre(
     q, k = apply_rotary_pos_emb(q, k, cos, sin)
     k_cache[:, addr] = k[real_rows, :, real_cols].transpose(0, 1)
     v_cache[:, addr] = v[real_rows, :, real_cols].transpose(0, 1)
-    return h, q, attn.scaling
-
-
-def _decode_post(layer: Any, residual: torch.Tensor, o: torch.Tensor) -> torch.Tensor:
-    """Output projection and MLP. Compiled separately from attention."""
-    B, S, _ = residual.shape
+    # A compiled graph that includes this write and FlexAttention can read the
+    # pre-write pool. Break so the write is visible; CUDA-graph the eager
+    # stack for repeated incremental shapes instead.
+    torch._dynamo.graph_break()
+    o = flex_fn(
+        q, k_cache[None], v_cache[None],
+        block_mask=block_mask, scale=attn.scaling, enable_gqa=True,
+    )
     o = o.transpose(1, 2).reshape(B, S, -1)
-    h = residual + layer.self_attn.o_proj(o)
+    h = residual + attn.o_proj(o)
     return h + layer.mlp(layer.post_attention_layernorm(h))
 
 
-_compiled_decode_pre: Any | None = None
-_compiled_decode_post: Any | None = None
+def _decode_stack(
+    layers: Any,
+    norm: Any,
+    h: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    addr: torch.Tensor,
+    real_rows: torch.Tensor,
+    real_cols: torch.Tensor,
+    block_mask: BlockMask,
+    flex_fn: Callable[..., torch.Tensor],
+    n_heads: int,
+    n_kv_heads: int,
+    head_dim: int,
+) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    """Every decoder layer plus the final norm. Eager; CUDA-graphed on a repeated shape."""
+    layer_hiddens: list[torch.Tensor] = []
+    for li in range(k_cache.shape[0]):
+        h = _decode_layer(
+            layers[li], h, cos, sin, k_cache[li], v_cache[li],
+            addr, real_rows, real_cols, block_mask, flex_fn,
+            n_heads, n_kv_heads, head_dim,
+        )
+        layer_hiddens.append(h)
+    return norm(h), layer_hiddens
+
+
+_compiled_decode_layer: Any | None = None
 
 
 def install_compiled_decode_layer() -> bool:
-    """Compile the per-layer cached-decode pre/post bodies. CUDA only; idempotent.
+    """Compile one cached-decode layer (attention inside). CUDA only; idempotent.
 
-    Attention stays outside those graphs so the KV scatter is visible.
-    Returns True on the first successful install.
+    A graph break after the KV scatter keeps FlexAttention correct. The
+    session CUDA-graphs the eager full stack for whatever incremental
+    ``[B, S]`` the caller keeps repeating, so that shape is one replay,
+    not ``n_layers`` launches.
     """
-    global _compiled_decode_pre, _compiled_decode_post
-    if _compiled_decode_pre is not None:
+    global _compiled_decode_layer
+    if _compiled_decode_layer is not None:
         return False
     if not torch.cuda.is_available():
         return False
-    _compiled_decode_pre = torch.compile(_decode_pre, dynamic=True)
-    _compiled_decode_post = torch.compile(_decode_post, dynamic=True)
+    _compiled_decode_layer = torch.compile(_decode_layer, dynamic=True)
     return True
 
 
@@ -456,10 +486,12 @@ class FlexDecodeSession:
         self._mask_mod = mask_mod
         self._physical_mask_mod = physical_mask_mod
 
-        # S=1 CUDA graph: captured after compile warmup; rebuilt when the
-        # pool is replaced or BlockMask table shapes change.
+        # Incremental-step CUDA graph: captured the second time a shape
+        # repeats; rebuilt when the pool is replaced or BlockMask tables change.
         self._graph: torch.cuda.CUDAGraph | None = None
         self._graph_disabled = False
+        self._g_key: tuple[int, int, int, int] | None = None
+        self._pending_graph_key: tuple[int, int, int, int] | None = None
         self._g_h: torch.Tensor | None = None
         self._g_cos: torch.Tensor | None = None
         self._g_sin: torch.Tensor | None = None
@@ -556,8 +588,12 @@ class FlexDecodeSession:
 
     def _invalidate_graph(self) -> None:
         self._graph = None
+        self._g_key = None
         self._g_mask = None
         self._g_cache_id = None
+
+    def _step_graph_key(self, h: torch.Tensor, addr: torch.Tensor) -> tuple[int, int, int, int]:
+        return (h.shape[0], h.shape[1], addr.numel(), id(self.k_cache))
 
     def _update_mask_tables(self, t: torch.Tensor, q_mask: torch.Tensor) -> None:
         """Write query tables; copy in-place when the CUDA graph closed over them."""
@@ -587,25 +623,19 @@ class FlexDecodeSession:
         real_cols: torch.Tensor,
         block_mask: BlockMask,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        use_compiled = self._use_compiled_layer and _compiled_decode_pre is not None
-        pre = _compiled_decode_pre if use_compiled else _decode_pre
-        post = _compiled_decode_post if use_compiled else _decode_post
-        flex_fn: Callable[..., torch.Tensor] = self._flex
+        use_compiled = self._use_compiled_layer and _compiled_decode_layer is not None
+        body = _compiled_decode_layer if use_compiled else _decode_layer
+        flex_fn: Callable[..., torch.Tensor] = flex_attention if use_compiled else self._flex
         layer_hiddens: list[torch.Tensor] = []
         h_in = h
         try:
-            for li, layer in enumerate(self.model.layers):
-                residual, q, scale = pre(
-                    layer, h, cos, sin,
+            for li in range(self.k_cache.shape[0]):
+                h = body(
+                    self.model.layers[li], h, cos, sin,
                     self.k_cache[li], self.v_cache[li],
-                    addr, real_rows, real_cols,
+                    addr, real_rows, real_cols, block_mask, flex_fn,
                     self.n_heads, self.n_kv_heads, self.head_dim,
                 )
-                o = flex_fn(
-                    q, self.k_cache[li][None], self.v_cache[li][None],
-                    block_mask=block_mask, scale=scale, enable_gqa=True,
-                )
-                h = post(layer, residual, o)
                 layer_hiddens.append(h)
         except Exception as exc:
             if use_compiled and _inductor_rejected(exc):
@@ -653,7 +683,7 @@ class FlexDecodeSession:
             return False
         return True
 
-    def _try_s1_graph(
+    def _try_step_graph(
         self,
         h: torch.Tensor,
         cos: torch.Tensor,
@@ -663,27 +693,31 @@ class FlexDecodeSession:
         real_cols: torch.Tensor,
         block_mask: BlockMask,
     ) -> tuple[torch.Tensor, list[torch.Tensor]] | None:
-        """Replay or capture the S=1 layer stack. None → use the compiled path."""
+        """Replay or capture a repeated incremental shape. None → compiled path."""
         if (
             self._graph_disabled
             or self.device.type != "cuda"
-            or not self._use_compiled_layer
-            or _compiled_decode_pre is None
-            or h.shape[1] != 1
-            or addr.numel() != self.B
+            or addr.numel() == 0
         ):
             return None
+        key = self._step_graph_key(h, addr)
         if (
             self._graph is not None
+            and self._g_key == key
             and self._g_cache_id == id(self.k_cache)
             and self._copy_graph_inputs(h, cos, sin, addr, real_rows, real_cols, block_mask)
         ):
             assert self._graph is not None and self._g_out is not None and self._g_hiddens is not None
             self._graph.replay()
             return self._g_out, self._g_hiddens
-        return self._capture_s1_graph(h, cos, sin, addr, real_rows, real_cols, block_mask)
+        # One-off shapes (prefills) stay compiled. Capture the shape that
+        # just repeated — S is part of the key, not chosen here.
+        if self._pending_graph_key != key:
+            self._pending_graph_key = key
+            return None
+        return self._capture_step_graph(h, cos, sin, addr, real_rows, real_cols, block_mask)
 
-    def _capture_s1_graph(
+    def _capture_step_graph(
         self,
         h: torch.Tensor,
         cos: torch.Tensor,
@@ -718,22 +752,29 @@ class FlexDecodeSession:
             assert self._g_h is not None and self._g_cos is not None and self._g_sin is not None
             assert self._g_addr is not None and self._g_rows is not None and self._g_cols is not None
             assert self._g_mask is not None
-            return self._run_layers(
+            # Eager stack (compiled Flex kernel, eager LoRA) so launches record.
+            # A compiled ``_decode_layer`` entry point does not.
+            return _decode_stack(
+                self.model.layers, self.model.norm,
                 self._g_h, self._g_cos, self._g_sin,
+                self.k_cache, self.v_cache,
                 self._g_addr, self._g_rows, self._g_cols, self._g_mask,
+                self._flex, self.n_heads, self.n_kv_heads, self.head_dim,
             )
 
-        side = torch.cuda.Stream()
-        side.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(side):
-            for _ in range(2):
-                _restore_static()
-                out, hiddens = _run_static()
-        torch.cuda.current_stream().wait_stream(side)
-        if not self._use_compiled_layer or _compiled_decode_pre is None:
-            return out, hiddens
-        _restore_static()
+        import mouse_core.models.lora as lora_mod
+
+        was_eager_lora = lora_mod._force_eager_lora
+        lora_mod._force_eager_lora = True
         try:
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                for _ in range(2):
+                    _restore_static()
+                    out, hiddens = _run_static()
+            torch.cuda.current_stream().wait_stream(side)
+            _restore_static()
             graph = torch.cuda.CUDAGraph()
             with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always")
@@ -742,13 +783,24 @@ class FlexDecodeSession:
             empty = any("CUDA Graph is empty" in str(w.message) for w in caught)
         except Exception:
             empty = True
-        if empty or self._g_out is None or not torch.allclose(self._g_out.float(), out.float(), atol=5e-2, rtol=5e-2):
+            out, hiddens = self._run_layers(h, cos, sin, addr, real_rows, real_cols, block_mask)
+        finally:
+            lora_mod._force_eager_lora = was_eager_lora
+        # Capture allocates into the graph pool; those tensors read as zeros
+        # until replay. Replay, then check against warmup.
+        if empty or self._g_out is None or self._g_hiddens is None:
+            self._graph_disabled = True
+            self._invalidate_graph()
+            return out, hiddens
+        _restore_static()
+        graph.replay()
+        if not torch.allclose(self._g_out.float(), out.float(), atol=5e-2, rtol=5e-2):
             self._graph_disabled = True
             self._invalidate_graph()
             return out, hiddens
         self._graph = graph
+        self._g_key = self._step_graph_key(h, addr)
         self._g_cache_id = id(self.k_cache)
-        assert self._g_hiddens is not None
         return self._g_out, self._g_hiddens
 
     def reset_rows(self, rows: Sequence[int] | None = None) -> None:
@@ -873,7 +925,7 @@ class FlexDecodeSession:
 
         cos, sin = self.model.rotary_emb(x, rope_pos)
 
-        graphed = self._try_s1_graph(x, cos, sin, addr, real_rows, real_cols, block_mask)
+        graphed = self._try_step_graph(x, cos, sin, addr, real_rows, real_cols, block_mask)
         if graphed is None:
             h, layer_hiddens = self._run_layers(
                 x, cos, sin, addr, real_rows, real_cols, block_mask,

@@ -4,12 +4,14 @@ Builds an in-memory ``Datastore`` (no Hub) with the same augmenter +
 ``NumericTokenizer`` pipeline as ``examples/02_train_offline_dqn.ipynb``, then
 times ``next_batch()`` for every ``--workloads`` × ``--workers`` pair. Reports
 average and max consumer wait (how long ``next_batch`` blocks), first-call
-(queue fill) time, steps/second, and tokens/second. ``num_workers>0`` needs
+(queue fill) time, steps/second, and tokens/second. ``--profile`` adds a
+``torch.profiler`` CPU breakdown after warmup. ``num_workers>0`` needs
 free-threaded CPython with the GIL off.
 
     PYTHON_GIL=0 .venv/bin/python bench/bench_dataloader.py
     PYTHON_GIL=0 .venv/bin/python bench/bench_dataloader.py --workers 0 1 4 8
     PYTHON_GIL=0 .venv/bin/python bench/bench_dataloader.py --workloads notebook long
+    PYTHON_GIL=0 .venv/bin/python bench/bench_dataloader.py --workloads notebook --workers 0 --profile
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ import sys
 import sysconfig
 import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -27,6 +30,11 @@ from datasets import Dataset
 
 from mouse_core.data import Augmenter, DataLoader, Datastore, NumericTokenizer, compose
 from mouse_core.data.token_batch import TokenBatch
+
+_BENCH_DIR = Path(__file__).resolve().parent
+if str(_BENCH_DIR) not in sys.path:
+    sys.path.insert(0, str(_BENCH_DIR))
+from bench_profile import add_profile_args, profile_call, wants_profile
 
 
 _WORKLOADS: dict[str, tuple[int, int]] = {
@@ -150,6 +158,7 @@ def main() -> None:
     parser.add_argument("--store-steps", type=int, default=8192)
     parser.add_argument("--prefetch", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0)
+    add_profile_args(parser)
     args = parser.parse_args()
 
     unknown = [w for w in args.workloads if w not in _WORKLOADS]
@@ -198,6 +207,14 @@ def main() -> None:
                 f"{steps / avg_wait * 1e3:>8,.0f} step/s | {tokens / avg_wait * 1e3:>8,.0f} tok/s | "
                 f"N={steps} L={tokens} | first {first:.0f} ms"
             )
+            if wants_profile(args):
+                profile_call(
+                    next_batch,
+                    label=f"{wname} workers={n_workers} next_batch",
+                    steps=args.iters,
+                    cuda=False,
+                    trace_dir=args.profile_trace,
+                )
             loader.close()
 
 

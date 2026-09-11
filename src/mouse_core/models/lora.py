@@ -86,6 +86,7 @@ def _lora_linear(
 
 
 _compiled_lora: Any | None = None
+_force_eager_lora = False
 
 
 def _apply_lora(
@@ -99,7 +100,7 @@ def _apply_lora(
     training: bool,
 ) -> torch.Tensor:
     """Dispatch :func:`_lora_linear` — compiled on CUDA, inlined under compile."""
-    if torch.compiler.is_compiling() or x.device.type != "cuda":
+    if _force_eager_lora or torch.compiler.is_compiling() or x.device.type != "cuda":
         return _lora_linear(x, weight, bias, lora_A, lora_B, scale, dropout_p, training)
     global _compiled_lora
     if _compiled_lora is None:

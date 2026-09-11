@@ -23,7 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the per-layer train decoder body once with ``torch.compile(dynamic=True)``;
   every layer, stream length, group count, and
   ``output_hidden_states=True`` reuse it. On CUDA it also compiles the
-  cached-decode per-layer body. Idempotent.
+  cached-decode layer (attention inside). Idempotent.
 - ``backbone.gradient_checkpointing = True`` recomputes each decoder
   layer in backward instead of storing its activations: about a 10x cut
   in activation memory (7.4 GB to 0.8 GB for 28 layers at 4096 tokens)
@@ -32,11 +32,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``packed_forward``: forward, forward+backward, full LoRA step,
   tokens/second, peak memory, compile warmup; ``varlen`` / ``flex`` /
   ``padded`` cross-checked), ``bench_inference.py`` (paged FlexAttention)
-  ``FlexDecodeSession``: prefill + one-token decode, tokens/second,
-  peak memory, compile warmup), and ``bench_dataloader.py``
-  (``next_batch`` wait — average and max — plus steps/second and
-  tokens/second for the FrozenLake augmenter + ``NumericTokenizer``
-  pipeline across workers). Env step rate lives in mouse-gym
+  ``FlexDecodeSession``: prefill + decode step of ``--step`` new tokens
+  per row, tokens/second, peak memory, compile warmup),
+  and ``bench_dataloader.py`` (``next_batch`` wait — average and max —
+  plus steps/second and tokens/second for the FrozenLake augmenter +
+  ``NumericTokenizer`` pipeline across workers). ``--profile`` prints a
+  ``torch.profiler`` CPU/CUDA breakdown plus a ``cProfile`` host stack
+  after warmup; ``--profile-trace DIR`` writes Chrome traces. Env step
+  rate lives in mouse-gym
   ``bench/bench_env.py``.
 - ``ExponentialDecay`` and ``Piecewise`` schedules
   (``from mouse_core import ExponentialDecay, Piecewise``) map
@@ -249,12 +252,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   CUDA it is ``torch.compile``d into a single op; inside an already-compiled
   decoder body the eager math is inlined so Inductor fuses it into the
   parent graph.
-- ``FlexDecodeSession`` compiles the per-layer decode body on CUDA in two
-  pieces (pre: norms, QKV, RoPE, KV scatter; post: o-proj, MLP) so the
-  in-place cache write is visible to FlexAttention, and CUDA-graphs the
-  common incremental step (every row adds one token, ``S=1``) after
-  compile warmup. Page-table growth, mask build, and address setup stay
-  eager; prefills and rebuilds use the compiled-but-not-graphed path.
+- ``FlexDecodeSession`` compiles each decode layer (attention inside) on
+  CUDA, with a graph break after the KV scatter so FlexAttention sees the
+  write. A repeated incremental ``[B, S]`` (whatever ``S`` the caller
+  keeps sending) is CUDA-graphed as one eager stack replay so that shape
+  is not ``n_layers`` Python launches. Page-table growth, mask build, and
+  address setup stay eager; one-off prefills and rebuilds stay
+  compiled-but-not-graphed.
 - ``Model`` constructor arguments are all required: ``encoder``,
   ``backbone``, ``heads``, ``action_head``, ``reasoner``, and
   ``recurrence``. Pass ``None`` for an unused reasoner or recurrence.
