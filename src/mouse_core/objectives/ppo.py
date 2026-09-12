@@ -108,7 +108,7 @@ class PpoObjective(Objective):
     (same step as ``action``) and include them in the tokenizer ``objective_fields``
     keep-list so they land in ``objective_data``::
 
-        tokenizer = NumericTokenizer(
+        tokenizer = Tokenizer(
             ...,
             objective_fields=[
                 {"input_field": "action"},

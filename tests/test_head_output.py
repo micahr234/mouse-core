@@ -7,7 +7,7 @@ import pytest
 import torch
 from tensordict import TensorDict
 
-from mouse_core.data import NumericTokenizer, pack_token_batch
+from mouse_core.data import Tokenizer, pack_token_batch
 from mouse_core.models import LatentReasoner, Model
 from mouse_core.models.backbone import LlamaBackbone
 from mouse_core.models.embedding import NumericEmbedder
@@ -79,12 +79,12 @@ def _packed(model: Model):
 
 def test_tokenizer_requires_exactly_one_head_output_field() -> None:
     with pytest.raises(ValueError, match="exactly one input field with"):
-        NumericTokenizer(
+        Tokenizer(
             input_fields=[{"type": "discrete", "input_field": "action"}],
             grouping_field="task_index",
         )
     with pytest.raises(ValueError, match="exactly one input field with"):
-        NumericTokenizer(
+        Tokenizer(
             input_fields=[
                 {"type": "discrete", "input_field": "action", "head_output": True},
                 {"type": "discrete", "input_field": "obs", "head_output": True},
@@ -94,7 +94,7 @@ def test_tokenizer_requires_exactly_one_head_output_field() -> None:
 
 
 def test_step_without_head_output_token_raises() -> None:
-    tok = NumericTokenizer(
+    tok = Tokenizer(
         input_fields=[
             {"type": "discrete", "input_field": "action"},
             {

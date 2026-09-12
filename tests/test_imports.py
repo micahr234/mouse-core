@@ -2,11 +2,9 @@ from mouse_core.data import (
     Augmenter,
     DataLoader,
     Datastore,
-    NumericTokenizer,
-    NumericTokenizerModalitySpec,
+    Tokenizer,
+    TokenizerModalitySpec,
     SequenceAugmentFieldSpec,
-    TextTokenizer,
-    TextTokenizerModalitySpec,
     StepTokens,
     TokenBatch,
     compose,
@@ -22,10 +20,8 @@ def test_public_data_exports() -> None:
     assert Augmenter is not None
     assert DataLoader is not None
     assert Datastore is not None
-    assert NumericTokenizer is not None
-    assert TextTokenizer is not None
-    assert NumericTokenizerModalitySpec is not None
-    assert TextTokenizerModalitySpec is not None
+    assert Tokenizer is not None
+    assert TokenizerModalitySpec is not None
     assert SequenceAugmentFieldSpec is not None
     assert StepTokens is not None
     assert TokenBatch is not None

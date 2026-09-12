@@ -1,6 +1,6 @@
 """NumericEmbedder — typed GPU maps over a flat TokenBatch.
 
-Token packing lives in :class:`~mouse_core.data.numeric_tokenizer.NumericTokenizer`
+Token packing lives in :class:`~mouse_core.data.tokenizer.Tokenizer`
 (constructed separately). Alignment is by modality **name** (not list order).
 This module only applies embedding tables and static Fourier features.
 """

@@ -63,8 +63,7 @@ def _validate_modality_table(
 class StepTokens:
     """Tokens and step-level fields for a single environment / dataset step.
 
-    Produced by :class:`~mouse_core.data.numeric_tokenizer.NumericTokenizer` /
-    :class:`~mouse_core.data.text_tokenizer.TextTokenizer`. Pack many steps into
+    Produced by :class:`~mouse_core.data.tokenizer.Tokenizer`. Pack many steps into
     a :class:`TokenBatch` with :func:`pack_token_batch`.
 
     ``modality_ids[t]`` indexes ``modality_names``; type/kind comes from
@@ -504,7 +503,7 @@ def pack_token_batch(
     ``grouping_field``. Returns ``(inputs, objective_data)``.
 
     When a step carries ``group_prefix_*`` tokens (from
-    :class:`~mouse_core.data.text_tokenizer.TextTokenizer` ``group_prefix=``),
+    :class:`~mouse_core.data.tokenizer.Tokenizer` ``group_prefix=``),
     they are inserted at the start of each grouping-field segment: the first
     step of a sequence, or a step whose ``grouping_id`` differs from the
     previous step in that sequence. ``prev_grouping_ids`` is length ``B``

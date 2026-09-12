@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from mouse_core.data import (
-    NumericTokenizer,
+    Tokenizer,
     pack_token_batch,
 )
 
@@ -49,7 +49,7 @@ def _rows() -> list[dict]:
 
 
 def test_missing_objective_fields_key_raises() -> None:
-    tokenizer = NumericTokenizer(
+    tokenizer = Tokenizer(
         input_fields=_tok_in("action", head_output="action"),
         objective_fields=_io(("action", "action"), ("old_log_prob", "old_log_prob")),
         grouping_field="task_index",
@@ -59,7 +59,7 @@ def test_missing_objective_fields_key_raises() -> None:
 
 
 def test_tokenizer_output_defaults_to_input() -> None:
-    tokenizer = NumericTokenizer(
+    tokenizer = Tokenizer(
         input_fields=_tok_in("action", head_output="action"),
         objective_fields=_io(("reward", "reward")),
         grouping_field="task_index",
@@ -70,7 +70,7 @@ def test_tokenizer_output_defaults_to_input() -> None:
 
 
 def test_tokenizer_renames_input_and_objective_fields() -> None:
-    tokenizer = NumericTokenizer(
+    tokenizer = Tokenizer(
         input_fields=[
             {
                 "type": "discrete",
@@ -89,7 +89,7 @@ def test_tokenizer_renames_input_and_objective_fields() -> None:
 
 def test_tokenizer_full_matches_per_step_concat() -> None:
     """Full-window pack == head/tail step lists packed together."""
-    tokenizer = NumericTokenizer(
+    tokenizer = Tokenizer(
         input_fields=[
             *_tok_in("action", "observation"),
             *_tok_in("reward", type="fourier"),

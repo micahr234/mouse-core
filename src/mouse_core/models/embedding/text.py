@@ -9,7 +9,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from mouse_core.data.text_tokenizer import NAME_TEXT, NAME_VISION
+from mouse_core.data.modality import NAME_TEXT
 from mouse_core.data.token_batch import ModalityInfo, TokenBatch
 from mouse_core.models.embedding.embedding import Encoder
 from mouse_core.models.embedding.linear import ScaledEmbedding
@@ -22,10 +22,11 @@ from mouse_core.models.embedding.modality import (
 class TextEmbedder(Encoder):
     """Pretrained token embeddings over a flat :class:`TokenBatch`.
 
-    Token packing lives in :class:`~mouse_core.data.text_tokenizer.TextTokenizer`
+    Token packing lives in :class:`~mouse_core.data.tokenizer.Tokenizer`
     (constructed separately). This module looks up ``embed_tokens`` for
-    ``__text__`` / ``__vision__`` ids and optional ``learnable=`` scratch
-    tables (aligned by name with tokenizer ``output_field``).
+    ``__text__`` ids and ``type="image"`` modalities, plus optional
+    ``learnable=`` scratch tables (aligned by name with tokenizer
+    ``output_field``).
 
     The pretrained table comes from exactly one of ``embed_tokens=`` (an
     existing ``nn.Embedding``), ``pretrained=`` (copied from a Hub
@@ -147,16 +148,12 @@ class TextEmbedder(Encoder):
                         f"modality {name!r} type mismatch: batch={info.type!r} expected token/text"
                     )
                 continue
-            if name == NAME_VISION:
-                if info.type != "image":
-                    raise TypeError(
-                        f"modality {name!r} type mismatch: batch={info.type!r} expected image"
-                    )
+            if info.type == "image":
                 continue
             if name not in learnable_names:
                 raise KeyError(
                     f"TokenBatch modality {name!r} not expected by TextEmbedder "
-                    f"(expected {NAME_TEXT!r} / {NAME_VISION!r} and/or "
+                    f"(expected {NAME_TEXT!r} / type=image and/or "
                     f"learnable {sorted(learnable_names)})"
                 )
             if info.type != "learnable":
@@ -172,7 +169,7 @@ class TextEmbedder(Encoder):
                 mask = modality_ids == local_id
                 if not bool(mask.any()):
                     continue
-                if name in (NAME_TEXT, NAME_VISION):
+                if name == NAME_TEXT or batch_map[name].type == "image":
                     embeds[mask] = self.embed_tokens(ids[mask]).to(dtype=dtype)
                     continue
                 type_table = self._learnable_type_vectors[name]
@@ -203,13 +200,13 @@ def _coerce_text_learnable(
             if data.get("type") != "learnable":
                 raise TypeError(
                     "TextEmbedder learnable= entries must be type='learnable' "
-                    "(text/token/image packing lives on TextTokenizer)"
+                    "(text/token/image packing lives on Tokenizer)"
                 )
             spec = NumericEmbedderModalitySpec(**data)
         if spec.type != "learnable":
             raise TypeError(
                 "TextEmbedder learnable= entries must be type='learnable' "
-                "(text/token/image packing lives on TextTokenizer)"
+                "(text/token/image packing lives on Tokenizer)"
             )
         specs.extend(expand_embedder_numeric_spec(spec, learnable_index=n_learnable))
         n_learnable += 1

@@ -290,24 +290,23 @@ def _model_card_encoder_bits(config: dict[str, Any]) -> tuple[str, str, str]:
             )
         encoder_section = (
             f"`TextEmbedder` looks up pretrained token embeddings{vocab_note} "
-            f"for `__text__` / `__vision__` ids in a tokenized "
+            f"for `__text__` ids and image-field tokens in a tokenized "
             f":class:`~mouse_core.data.token_batch.TokenBatch`, mapping them into "
             f"the shared `{hidden}`-dimensional token space before the backbone. "
-            f"Step templates and field packing live on `TextTokenizer` "
+            f"Step templates and field packing live on `Tokenizer` "
             f"(not saved with the checkpoint).{learnable_note}"
         )
         tokenizer_snippet = (
-            "from mouse_core.data import TextTokenizer, pack_token_batch\n"
+            "from mouse_core.data import Tokenizer, pack_token_batch\n"
             "\n"
-            "tokenizer = TextTokenizer(\n"
-            "    input_fields=[...],  # type/input_field=; text fields require format=;\n"
+            "tokenizer = Tokenizer(\n"
+            "    input_fields=[...],  # type/input_field=; text fields require format=\"{field}\";\n"
             "                         # flag exactly one field head_output=True (the Q readout tokens)\n"
-            '    format="...",\n'
             f'    pretrained="{pretrained}",\n'
             f"{objective_fields}\n"
             "eval_transform = tokenizer"
         )
-        step_example = """# Rebuild the same TextTokenizer used at train time, then pack steps.
+        step_example = """# Rebuild the same Tokenizer used at train time, then pack steps.
 batch = [[
     {
         "action": 0,
@@ -329,9 +328,9 @@ batch = [[
         f"{_model_card_modality_table(modalities)}"
     )
     tokenizer_snippet = (
-        "from mouse_core.data import NumericTokenizer, pack_token_batch\n"
+        "from mouse_core.data import Tokenizer, pack_token_batch\n"
         "\n"
-        "tokenizer = NumericTokenizer(\n"
+        "tokenizer = Tokenizer(\n"
         "    input_fields=[...],  # input_field=; optional output_field= matches embedder field=;\n"
         "                         # flag exactly one field head_output=True (the Q readout tokens)\n"
         f"{objective_fields}\n"
@@ -702,7 +701,7 @@ def _build_encoder_from_config(config: dict[str, Any]) -> Encoder:
         from mouse_core.models.embedding import TextEmbedder
 
         # HF tokenizer / image_tokenizer are not part of the embedder; rebuild
-        # TextTokenizer separately for the data pipeline after load. The table
+        # Tokenizer separately for the data pipeline after load. The table
         # weights come from the saved state_dict, so build a fresh table of the
         # saved size instead of re-downloading ``pretrained``.
         pretrained = kwargs.pop("pretrained", None)

@@ -370,7 +370,7 @@ class DqnObjective(Objective):
     ``task_done`` is an objective column only — do not add it as a tokenizer
     input field or embedder modality, or it will be fed to the transformer::
 
-        tokenizer = NumericTokenizer(
+        tokenizer = Tokenizer(
             ...,
             objective_fields=[
                 {"input_field": "action"},

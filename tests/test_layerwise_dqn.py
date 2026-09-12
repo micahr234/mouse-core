@@ -5,7 +5,7 @@ import torch
 from tensordict import TensorDict
 from mouse_core.models.backbone import Qwen3Backbone
 from mouse_core.models.embedding import NumericEmbedder
-from mouse_core.data import NumericTokenizer
+from mouse_core.data import Tokenizer
 from mouse_core.models.heads import LayerwiseDiscreteActionValueHead
 from mouse_core.models.base import Model
 from mouse_core.objectives import LayerwiseDqnObjective

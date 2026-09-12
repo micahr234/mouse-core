@@ -8,6 +8,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- ``Tokenizer`` text fields with no ``input_field=`` are consts
+  (no step I/O). ``output_field=`` names the field; ``format=`` is the
+  literal string to tokenize (no placeholders; ``{{`` / ``}}`` for a
+  literal brace, like every ``format=``). Consts and ``learnable``
+  fields always emit and reject ``skip=`` / ``required=False``.
+  ``examples/06_train_offline_text_dqn.ipynb`` uses
+  ``output_field="value"`` / ``format="\n"`` as the ``head_output``
+  readout.
+- ``Tokenizer`` text ``skip=`` requires ``format_skipped=`` (a
+  literal string, ``""`` emits no tokens). When the step value matches
+  ``skip``, that string is tokenized instead of ``format=``. A
+  ``required=False`` field whose value is missing / ``None`` emits
+  nothing (``format_skipped=`` does not apply). ``required`` defaults
+  to ``True``.
+- ``Tokenizer`` ``text`` / ``image`` fields accept optional
+  ``max_tokens=``. If the field emits more ids than that, the tokenizer
+  raises. Fixed-count types (``token`` / ``discrete`` / ``fourier`` /
+  ``continuous`` / ``learnable``) reject it.
+  ``examples/06_train_offline_text_dqn.ipynb`` sets
+  ``max_tokens=1`` on the const ``value`` readout.
+- ``Tokenizer`` rejects duplicate field names across every type
+  (``text`` / ``token`` ``output_field`` included), not only named
+  modalities.
 - ``packed_forward`` (``mouse_core.models.backbone.packed_train``): the one
   uncached training forward for transformer backbones. Tokens are stably
   regrouped into contiguous ``(sequence_id, grouping_id)`` classes
@@ -36,7 +59,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per row, tokens/second, peak memory, compile warmup),
   and ``bench_dataloader.py`` (``next_batch`` wait — average and max —
   plus steps/second and tokens/second for the FrozenLake augmenter +
-  ``NumericTokenizer`` pipeline across workers). ``--profile`` prints a
+  ``Tokenizer`` pipeline across workers). ``--profile`` prints a
   ``torch.profiler`` CPU/CUDA breakdown plus a ``cProfile`` host stack
   after warmup; ``--profile-trace DIR`` writes Chrome traces. Env step
   rate lives in mouse-gym
@@ -73,7 +96,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``Q_e(s', a*) + Q_t(s', a*)`` at the next episode start.
   ``examples/13_train_offline_episode_task_dqn.ipynb`` is the offline
   FrozenLake usage example.
-- ``TextTokenizer(group_prefix=)`` is a format string over the raw step
+- ``Tokenizer(group_prefix=)`` is a format string over the raw step
   dict (placeholders need not be ``input_fields``). Those tokens are
   ``__text__`` and ``pack_token_batch`` inserts them at the start of each
   grouping-field segment. Incremental decode passes ``prev_grouping_ids``
@@ -228,9 +251,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Embedder modalities still use ``field=`` (modality name). Learnable numeric
   embedder modalities remain field-free.
 - Separate tokenizer vs embedder modality spec types
-  (``NumericTokenizerModalitySpec`` / ``TextTokenizerModalitySpec`` vs
-  ``NumericEmbedderModalitySpec`` / ``TextEmbedderModalitySpec``). Packing knobs
-  (``skip``, ``required``) stay on tokenizers; ``vocab_size`` / ``std`` stay on
+  (``TokenizerModalitySpec`` vs ``NumericEmbedderModalitySpec``). Packing knobs
+  (``skip``, ``required``) stay on the tokenizer; ``vocab_size`` / ``std`` stay on
   embedders. Alignment is by modality **name** (tokenizer ``output_field`` /
   embedder ``field``), not list order.
 - ``StepTokens`` / ``TokenBatch`` ``modality_names`` + ``modality_map`` (name →
@@ -239,19 +261,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Tokenizer ``objective_fields=`` is a list of ``{input_field}`` dicts
   (optional ``output_field``) copied into ``StepTokens.objective_fields`` /
   ``objective_data`` (input fields are not auto-copied).
-- Required ``grouping_field`` on ``StepTokens`` / ``TokenBatch``,
-  ``NumericTokenizer``, and ``TextTokenizer``. It names the step key used for
-  attention isolation (typically ``task_index``). Int coercion happens when
-  packing ``TokenBatch.grouping_ids``.
+- Required ``grouping_field`` on ``StepTokens`` / ``TokenBatch`` and
+  ``Tokenizer``. It names the step key used for attention isolation
+  (typically ``task_index``). Int coercion happens when packing
+  ``TokenBatch.grouping_ids``.
 - Objectives (DQN / Layerwise / PPO / GRPO) take
   ``grouping_field: str | None = None`` (``None`` ⇒ no grouping filter).
 
 ### Changed
+- Step-backed ``Tokenizer`` text ``format=`` interpolates ``{field}``
+  (optional spec, e.g. ``{field:.0f}``). The placeholder is no longer
+  the field's ``output_field`` name.
+- ``NumericTokenizer`` and ``TextTokenizer`` are one ``Tokenizer``
+  (``TokenizerModalitySpec``). ``text`` / ``token`` fields share the
+  ``__text__`` stream; ``discrete`` / ``fourier`` / ``continuous`` /
+  ``image`` / ``learnable`` use ``output_field`` as the modality name
+  (image no longer collapses to ``__vision__``). ``group_prefix=``,
+  ``tokenizer=`` / ``pretrained=``, and ``image_tokenizer=`` live on
+  that class. ``TextEmbedder`` looks up ``embed_tokens`` for
+  ``__text__`` and any ``type="image"`` modality.
+- ``Tokenizer`` tokenizes each ``input_fields`` entry as its own
+  run (no whole-step ``format=``). Step-backed ``text`` fields
+  require ``format=`` with exactly one placeholder ``{field}``.
+  Const text fields take ``output_field=`` and a
+  literal ``format=`` (no placeholders). Fields emit in list order,
+  including ``learnable``. ``examples/06_train_offline_text_dqn.ipynb``
+  uses a per-field ``format=`` and a const ``value`` readout
+  (``head_output: True``); ``TextEmbedder`` has no ``learnable=``
+  table.
 - ``DataLoader`` requires ``num_workers`` (no default). ``0`` is
   in-process; ``> 0`` still needs free-threaded CPython. Offline
   notebooks that omitted it now pass ``num_workers=0``.
-- ``TextTokenizer`` image callable is ``image_tokenizer=`` (same name
-  as ``NumericTokenizer``).
 - ``get_action`` requires ``temperature=`` and rejects flat training
   outputs with more than one row. Use cached-decode ``[B, S, A]``.
 - ``sp_js`` multiplies the mean JS by ``T²``, matching its docstring
@@ -577,6 +617,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a cleared stream can restart without rebuilding the whole batch.
 
 ### Removed
+- ``TextTokenizer(format=)`` (the whole-step template). Text values
+  render through per-field ``format=`` only.
 - ``flex_packed_forward`` and the ``mouse_core.models.backbone.flex_train``
   module (a separate FlexAttention training forward with its own decoder
   loop, whole-stack compile, and ``InductorError`` fallback).

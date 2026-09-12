@@ -72,7 +72,7 @@ class GrpoObjective(Objective):
             for row in rows:                     # or suffix-only
                 row["advantage"] = float(adv[g])
 
-        tokenizer = NumericTokenizer(
+        tokenizer = Tokenizer(
             ...,
             objective_fields=[
                 {"input_field": "action"},

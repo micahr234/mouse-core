@@ -6,7 +6,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from mouse_core.data import NumericTokenizer
+from mouse_core.data import Tokenizer
 from mouse_core.models.embedding import NumericEmbedder
 from tests._token_batch_helpers import batch_to_packed, batch_to_token_batch, tok_from_encoder
 
@@ -60,7 +60,7 @@ def test_numeric_embedder_keeps_optional_missing_modality() -> None:
             {"type": "fourier", "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0},
         ],
     )
-    tokenizer = NumericTokenizer(
+    tokenizer = Tokenizer(
         input_fields=[
             {
                 "type": "discrete",
@@ -209,7 +209,7 @@ def test_numeric_embedder_skip_shortens_step() -> None:
             {"type": "learnable", "tokens": 1, "std": 0.02, "positions": 1},
         ],
     )
-    tokenizer = NumericTokenizer(
+    tokenizer = Tokenizer(
         input_fields=[
             {"type": "discrete", "input_field": "action", "output_field": "action"},
             {"type": "fourier", "input_field": "reward", "output_field": "reward", "skip": 0.0},
@@ -231,9 +231,9 @@ def test_numeric_embedder_skip_shortens_step() -> None:
 
 def test_numeric_tokenizer_image_requires_callable() -> None:
     with pytest.raises(TypeError, match="image_tokenizer"):
-        NumericTokenizer(
+        Tokenizer(
             input_fields=[
-                {"type": "image", "input_field": "img", "output_field": "img"}
+                {"type": "image", "input_field": "img", "output_field": "img", "head_output": True}
             ],
             grouping_field="grouping_id",
         )
@@ -392,7 +392,7 @@ def test_numeric_embedder_fourier_honors_per_modality_std() -> None:
             {"type": "fourier", "field": "bonus", "std": 0.10, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0},
         ],
     )
-    tokenizer = NumericTokenizer(
+    tokenizer = Tokenizer(
         input_fields=[
             {"type": "fourier", "input_field": "reward"},
             {"type": "fourier", "input_field": "bonus", "head_output": True},
@@ -500,7 +500,7 @@ def test_numeric_embedder_extra_fields_in_objective_fields() -> None:
         hidden_dim=8,
         modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}],
     )
-    tokenizer = NumericTokenizer(
+    tokenizer = Tokenizer(
         input_fields=[
             {
                 "type": "discrete",
@@ -534,7 +534,7 @@ def test_task_done_is_objective_field_not_input_field() -> None:
             {"type": "discrete", "field": "episode_done", "vocab_size": 3, "std": 0.02, "positions": 1},
         ],
     )
-    tokenizer = NumericTokenizer(
+    tokenizer = Tokenizer(
         input_fields=[
             {"type": "discrete", "input_field": "action", "output_field": "action"},
             {

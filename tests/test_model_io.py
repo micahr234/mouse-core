@@ -7,7 +7,7 @@ from mouse_core.models import Model, load_model, save_model
 from mouse_core.models.base import _write_model_card
 from mouse_core.models.backbone import IdentityBackbone, LoRAConfig, Qwen3Backbone
 from mouse_core.models.embedding import NumericEmbedder
-from mouse_core.data import NumericTokenizer
+from mouse_core.data import Tokenizer
 from mouse_core.models.heads import DiscreteActionValueHead
 from tests._token_batch_helpers import batch_to_token_batch, tok_from_encoder
 
@@ -95,7 +95,7 @@ def test_roundtrip_multi_field_spec_before_learnable(tmp_path) -> None:
     backbone = IdentityBackbone(hidden_dim=hidden_dim)
     heads = DiscreteActionValueHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1)
     model = Model(encoder=encoder, backbone=backbone, heads=heads, action_head="action_value", reasoner=None, recurrence=None).eval()
-    tokenizer = NumericTokenizer(
+    tokenizer = Tokenizer(
         input_fields=[
             {"type": "discrete", "input_field": "action"},
             {"type": "discrete", "input_field": "prev_action"},
@@ -149,7 +149,7 @@ def test_model_card_includes_usage_and_architecture(tmp_path) -> None:
     assert 'What This Contains' not in text
     assert 'pip install mouse-core' in text
     assert 'load_model(' in text and 'train_kernel="flex"' in text and 'decode_kernel="flex"' in text and 'dtype=preferred_dtype(device)' in text
-    assert 'NumericTokenizer' in text
+    assert 'Tokenizer' in text
     assert '| `action` | `discrete` | `[B, S]` | `torch.long` | integer ids in `[0, 3]` |' in text
     assert 'Fourier range `[0.01, 10.0]`' in text
     assert '"action": 0,' in text

@@ -5,11 +5,11 @@ import numpy as np
 import pytest
 import torch
 
-from mouse_core.data import NumericTokenizer, pack_token_batch
+from mouse_core.data import Tokenizer, pack_token_batch
 
 
-def _tok(**kwargs) -> NumericTokenizer:
-    return NumericTokenizer(
+def _tok(**kwargs) -> Tokenizer:
+    return Tokenizer(
         input_fields=[
             {"type": "discrete", "input_field": "action", "head_output": True}
         ],
@@ -40,7 +40,7 @@ def test_objective_column_stays_int_when_all_steps_are_int() -> None:
 
 
 def test_objective_vector_column_promotes_dtype() -> None:
-    tok = NumericTokenizer(
+    tok = Tokenizer(
         input_fields=[
             {"type": "discrete", "input_field": "action", "head_output": True}
         ],
@@ -57,7 +57,7 @@ def test_objective_vector_column_promotes_dtype() -> None:
 
 
 def test_objective_mixed_rank_raises() -> None:
-    tok = NumericTokenizer(
+    tok = Tokenizer(
         input_fields=[
             {"type": "discrete", "input_field": "action", "head_output": True}
         ],
@@ -73,7 +73,7 @@ def test_objective_mixed_rank_raises() -> None:
 
 
 def test_continuous_dim_mismatch_raises() -> None:
-    tok = NumericTokenizer(
+    tok = Tokenizer(
         input_fields=[
             {"type": "continuous", "input_field": "obs", "dim": 3, "head_output": True}
         ],
@@ -89,7 +89,7 @@ def test_continuous_dim_mismatch_raises() -> None:
 
 
 def test_skip_on_vector_modality_compares_elementwise() -> None:
-    tok = NumericTokenizer(
+    tok = Tokenizer(
         input_fields=[
             {"type": "discrete", "input_field": "action", "head_output": True},
             {"type": "continuous", "input_field": "obs", "dim": 2, "skip": 0.0},
@@ -99,7 +99,7 @@ def test_skip_on_vector_modality_compares_elementwise() -> None:
     )
     assert tok({"action": 0, "obs": np.array([0.0, 0.0]), "task_index": 0}).T == 1
     assert tok({"action": 0, "obs": np.array([0.0, 1.0]), "task_index": 0}).T == 3
-    tok_vec = NumericTokenizer(
+    tok_vec = Tokenizer(
         input_fields=[
             {"type": "discrete", "input_field": "action", "head_output": True},
             {"type": "continuous", "input_field": "obs", "dim": 2, "skip": [1.0, 2.0]},
@@ -112,7 +112,7 @@ def test_skip_on_vector_modality_compares_elementwise() -> None:
 
 
 def test_positions_index_tokens_within_modality_per_step() -> None:
-    tok = NumericTokenizer(
+    tok = Tokenizer(
         input_fields=[
             {"type": "discrete", "input_field": "action"},
             {"type": "continuous", "input_field": "obs", "dim": 3},

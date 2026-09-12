@@ -16,7 +16,7 @@ from mouse_core.data import (
     Augmenter,
     DataLoader,
     Datastore,
-    NumericTokenizer,
+    Tokenizer,
     compose,
 )
 from tensordict import TensorDict
@@ -44,13 +44,13 @@ def _obj(*names: str) -> list[dict[str, str]]:
     return [{"input_field": name} for name in names]
 
 
-def _tokenizer(*, objective_fields: list[dict[str, str]] | None = None) -> NumericTokenizer:
+def _tokenizer(*, objective_fields: list[dict[str, str]] | None = None) -> Tokenizer:
     keep = (
         objective_fields
         if objective_fields is not None
         else _obj("action", "reward", "episode_done", "task_done")
     )
-    return NumericTokenizer(
+    return Tokenizer(
         input_fields=[
             {"type": "discrete", "input_field": "action"},
             {"type": "fourier", "input_field": "reward", "head_output": True},
@@ -172,7 +172,7 @@ def test_dataloader_reseeds_transform_each_batch() -> None:
 class _ThreadMarkerTransform:
     """Marks which thread ran the per-step transform."""
 
-    def __init__(self, base: NumericTokenizer) -> None:
+    def __init__(self, base: Tokenizer) -> None:
         self.base = base
         self.grouper = _stamp_grouping
         self.captured: list[dict] = []

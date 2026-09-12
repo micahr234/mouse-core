@@ -6,12 +6,8 @@ from mouse_core.data.augmenter import (
     SequenceAugmentFieldSpec,
 )
 from mouse_core.data.compose import compose
-from mouse_core.data.modality import (
-    NumericTokenizerModalitySpec,
-    TextTokenizerModalitySpec,
-)
-from mouse_core.data.numeric_tokenizer import NumericTokenizer
-from mouse_core.data.text_tokenizer import TextTokenizer
+from mouse_core.data.modality import TokenizerModalitySpec
+from mouse_core.data.tokenizer import Tokenizer
 from mouse_core.data.token_batch import (
     ModalityInfo,
     StepTokens,
@@ -27,10 +23,8 @@ __all__ = [
     "DataLoader",
     "Datastore",
     "SequenceAugmentFieldSpec",
-    "NumericTokenizerModalitySpec",
-    "TextTokenizerModalitySpec",
-    "NumericTokenizer",
-    "TextTokenizer",
+    "TokenizerModalitySpec",
+    "Tokenizer",
     "ModalityInfo",
     "StepTokens",
     "TokenBatch",

@@ -1,7 +1,7 @@
 """Benchmark ``DataLoader.next_batch`` on a synthetic FrozenLake-shaped store.
 
 Builds an in-memory ``Datastore`` (no Hub) with the same augmenter +
-``NumericTokenizer`` pipeline as ``examples/02_train_offline_dqn.ipynb``, then
+``Tokenizer`` pipeline as ``examples/02_train_offline_dqn.ipynb``, then
 times ``next_batch()`` for every ``--workloads`` × ``--workers`` pair. Reports
 average and max consumer wait (how long ``next_batch`` blocks), first-call
 (queue fill) time, steps/second, and tokens/second. ``--profile`` adds a
@@ -28,7 +28,7 @@ from typing import Any
 import numpy as np
 from datasets import Dataset
 
-from mouse_core.data import Augmenter, DataLoader, Datastore, NumericTokenizer, compose
+from mouse_core.data import Augmenter, DataLoader, Datastore, Tokenizer, compose
 from mouse_core.data.token_batch import TokenBatch
 
 _BENCH_DIR = Path(__file__).resolve().parent
@@ -116,7 +116,7 @@ def _train_transform() -> Any:
             },
         ],
     )
-    tokenizer = NumericTokenizer(
+    tokenizer = Tokenizer(
         input_fields=[
             {"type": "discrete", "input_field": "action"},
             {"type": "discrete", "input_field": "observation"},
@@ -175,7 +175,7 @@ def main() -> None:
     stores = _stores(n_stores=args.stores, steps=args.store_steps)
     transform = _train_transform()
     print(
-        f"stores={args.stores}×{args.store_steps} | augmenter+NumericTokenizer | "
+        f"stores={args.stores}×{args.store_steps} | augmenter+Tokenizer | "
         f"prefetch={args.prefetch} seed={args.seed} | gil_off={_free_threading_ok()}"
     )
 

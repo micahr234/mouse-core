@@ -8,7 +8,7 @@ from typing import Any, cast
 
 from tensordict import TensorDict
 
-from mouse_core.data import NumericTokenizer, compose, pack_token_batch
+from mouse_core.data import Tokenizer, compose, pack_token_batch
 from mouse_core.data.token_batch import StepTokens, TokenBatch
 
 DEFAULT_GROUPING_FIELD = "grouping_id"
@@ -36,7 +36,7 @@ def _tokenizer_input_fields_from_encoder(encoder) -> list[dict[str, Any]]:
             "type": kind,
             "input_field": name,
         }
-        if data.get("dim") is not None:
+        if kind == "continuous" and data.get("dim") is not None:
             entry["dim"] = data["dim"]
         out.append(entry)
     if out:
@@ -50,7 +50,7 @@ def tok_from_encoder(
     grouping_field: str = DEFAULT_GROUPING_FIELD,
     objective_fields: list[dict[str, Any]] | list[str] | None = None,
     **kwargs,
-) -> NumericTokenizer:
+) -> Tokenizer:
     # Default keep-list: non-learnable modality names (common for tests/objectives).
     resolved: list[dict[str, Any]]
     if objective_fields is None:
@@ -66,7 +66,7 @@ def tok_from_encoder(
         resolved = [{"input_field": name} for name in cast(list[str], objective_fields)]
     else:
         resolved = cast(list[dict[str, Any]], objective_fields)
-    return NumericTokenizer(
+    return Tokenizer(
         input_fields=_tokenizer_input_fields_from_encoder(encoder),
         objective_fields=resolved,
         grouping_field=grouping_field,

@@ -5,7 +5,7 @@ from mouse_core.models import Model, load_model, save_model
 from mouse_core.models.backbone import IdentityBackbone
 from mouse_core.models.base import Model as ModelClass
 from mouse_core.models.embedding import NumericEmbedder
-from mouse_core.data import NumericTokenizer
+from mouse_core.data import Tokenizer
 from mouse_core.models.heads import DiscreteActionHead
 from tests._token_batch_helpers import batch_to_token_batch, tok_from_encoder
 
