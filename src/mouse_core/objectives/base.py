@@ -54,7 +54,7 @@ class Objective(ABC):
             predictions: ``TensorDict[N]`` of model head outputs from
                 :meth:`~mouse_core.models.base.Model.forward`.
             delayed_predictions: Delayed-model head outputs. Required by DQN
-                family objectives; ignored by the others.
+                family objectives; ignored by AWR, PPO, GRPO, SP, and SV.
 
         Returns:
             ``(scalar_loss, metrics)`` where ``metrics`` is a ``dict[str, float]``

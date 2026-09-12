@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- ``AwrObjective``: Advantage-Weighted Regression (Peng et al., 2019). Q
+  regresses onto in-batch Monte Carlo returns
+  ``G_i = r + γ G_{i+1}`` (no value bootstrap, no delayed network).
+  ``γ`` uses the same done-code table as ``DqnObjective``
+  (``gamma_step``, ``gamma_episode_*``, ``gamma_task_*``): a ``0``
+  gamma stops the sum; a non-zero gamma carries later rewards through,
+  discounted. The policy is weighted log-likelihood
+  ``w = min(exp(A / β), ω_max)`` with ``A = G − max_a Q(s, a)``.
+  ``advantage_temperature``, ``weight_clip``, and ``policy_coef`` are
+  required. Dual heads ``action_value`` + ``action``; act with
+  ``action_head="action"``. See ``examples/14_train_offline_awr.ipynb``.
 - ``Tokenizer`` text fields with no ``input_field=`` are consts
   (no step I/O). ``output_field=`` names the field; ``format=`` is the
   literal string to tokenize (no placeholders; ``{{`` / ``}}`` for a

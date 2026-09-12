@@ -1,3 +1,4 @@
+from mouse_core.objectives.awr import AwrObjective
 from mouse_core.objectives.base import Objective
 from mouse_core.objectives.dqn import DqnObjective
 from mouse_core.objectives.episode_task_dqn import EpisodeTaskDqnObjective
@@ -13,6 +14,7 @@ from mouse_core.objectives.sv import SvObjective
 
 __all__ = [
     "Objective",
+    "AwrObjective",
     "DqnObjective",
     "EpisodeTaskDqnObjective",
     "GrpoObjective",
