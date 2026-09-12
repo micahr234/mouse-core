@@ -845,7 +845,10 @@ class DecodeCache:
 
     One :class:`~mouse_core.models.backbone.flex_decode.FlexDecodeSession`
     per backbone pass (a plain model has one; a recurrent model has
-    ``num_passes``). Pass ``out.cache`` back as ``cache=``.
+    ``num_passes``). Pass ``out.cache`` back as ``cache=``. Call
+    :meth:`close` when the rollout is finished so VMM pages unmap before
+    the next train step (``__del__`` is too late if a CUDA graph still
+    holds views).
     """
 
     sessions: tuple[FlexDecodeSession, ...]
@@ -858,6 +861,11 @@ class DecodeCache:
         """
         for session in self.sessions:
             session.reset_rows(rows)
+
+    def close(self) -> None:
+        """Unmap every session's VMM pool and drop captured CUDA graphs."""
+        for session in self.sessions:
+            session.close()
 
 
 @dataclass
@@ -1460,7 +1468,8 @@ class Model(nn.Module):
         decode keeps one ``FlexDecodeSession`` per backbone pass, a paged KV
         pool in which each sequence owns only the pages its own history needs,
         with the same grouping-id isolation. On CUDA the pool grows by mapping
-        more physical pages (no copy of existing K/V).
+        more physical pages (no copy of existing K/V). Call
+        ``out.cache.close()`` when the rollout ends.
 
         Training predictions are flat over head-output tokens (``[P, ...]``,
         one row per head-output token; ``objective_data["head_output_count"]``

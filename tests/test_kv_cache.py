@@ -524,6 +524,43 @@ def test_reset_rows_restarts_one_sequence_without_rebuild(backbone_cls) -> None:
     assert torch.allclose(got0, ref0, atol=1e-05)
     assert torch.allclose(got1, ref1, atol=1e-05)
 
+def test_decode_mask_mod_is_module_level_and_shared() -> None:
+    """Every session uses the same mask_mod function object (stable for Dynamo)."""
+    from mouse_core.models.backbone.flex_decode import (
+        FlexDecodeSession,
+        _logical_mask_mod,
+        _physical_mask_mod,
+    )
+    model = _tiny_model(Qwen3Backbone)
+    inner = cast(nn.Module, cast(Any, model.backbone).model)
+    a = FlexDecodeSession(inner, batch_size=1)
+    b = FlexDecodeSession(inner, batch_size=2)
+    assert a._mask_holder is not b._mask_holder
+    assert _logical_mask_mod.__qualname__ == "_logical_mask_mod"
+    assert _physical_mask_mod.__qualname__ == "_physical_mask_mod"
+    from mouse_core.models.backbone.flex_decode import _logical_mask_mod as again
+    assert again is _logical_mask_mod
+    a.close()
+    b.close()
+
+
+def test_decode_cache_close_unmaps_and_drops_graph() -> None:
+    from mouse_core.models import DecodeCache
+    from mouse_core.models.backbone.flex_decode import FlexDecodeSession
+
+    session, hidden = _raw_session(2)
+    with torch.no_grad():
+        _decode(session, [2, 1], hidden)
+    cache = DecodeCache(sessions=(session,))
+    cache.close()
+    assert session._closed
+    assert session._graph is None
+    assert session._k_store._closed
+    assert session._v_store._closed
+    with pytest.raises(RuntimeError, match="close"):
+        _decode(session, [1, 0], hidden)
+
+
 def test_flex_decode_session_drops_without_cyclic_gc() -> None:
     """mask_mod must not close over the session (that kept KV alive until gc)."""
     import gc

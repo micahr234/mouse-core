@@ -20,7 +20,8 @@ How it works:
   free pages it grows by the pages actually needed. On CUDA that maps more
   physical memory under a reserved virtual address (existing K/V are not
   copied); elsewhere the prefix is copied into a larger tensor.
-  :meth:`reset_rows` returns a row's pages to the pool.
+  :meth:`reset_rows` returns a row's pages to the pool. :meth:`close`
+  unmaps the VMM stores and drops the CUDA graph.
 * Attention runs through :func:`torch.nn.attention.flex_attention` with a
   BlockMask that keeps each query inside its own sequence's causal prefix
   **and** the same grouping-id run (``grouping_ids``). The mask is built in
@@ -137,14 +138,15 @@ def flex_block_mask(
 ) -> Any:
     """Build a Flex ``BlockMask``. Compiles ``create_block_mask`` once.
 
-    A stable ``mask_mod`` (holder pattern, not a fresh closure) lets the
-    compiled wrapper reuse its graph across steps.
+    A stable ``mask_mod`` (module-level, holder pattern) lets the compiled
+    wrapper reuse its graph. ``dynamic=True`` keeps one graph across
+    ``(Q_LEN, KV_LEN)`` pairs.
     """
     global _compiled_create_block_mask
     builder: Any = create_block_mask
     if compile_masks:
         if _compiled_create_block_mask is None:
-            _compiled_create_block_mask = torch.compile(create_block_mask)
+            _compiled_create_block_mask = torch.compile(create_block_mask, dynamic=True)
         builder = _compiled_create_block_mask
     return builder(
         mask_mod,
@@ -190,6 +192,46 @@ def packed_rope_positions(
     positions = torch.empty(L, dtype=torch.long, device=device)
     positions[order] = sorted_pos
     return positions
+
+
+# Stable mask_mod identity (reads per-call tables from this holder) so
+# torch.compile / Dynamo reuse one graph. Nested defs in ``__init__`` each
+# get a new function object and recompile. Bind a session's tables with
+# :func:`_bind_decode_mask_holder` before building a mask.
+_decode_mask_holder: dict[str, torch.Tensor] = {}
+
+
+def _bind_decode_mask_holder(holder: dict[str, torch.Tensor]) -> None:
+    """Point the module-level mask_mod tables at ``holder``'s tensors."""
+    dst = _decode_mask_holder
+    dst["t"] = holder["t"]
+    dst["q_mask"] = holder["q_mask"]
+    dst["kv_mask"] = holder["kv_mask"]
+    dst["page_logical"] = holder["page_logical"]
+    dst["page_row"] = holder["page_row"]
+
+
+def _logical_mask_mod(b, h, q_idx, kv_idx):
+    """Causal + same-grouping-id in logical cache coordinates."""
+    holder = _decode_mask_holder
+    q_pos = holder["t"][b, q_idx]
+    return (kv_idx <= q_pos) & (
+        holder["kv_mask"][b, kv_idx] == holder["q_mask"][b, q_idx]
+    )
+
+
+def _physical_mask_mod(b, h, q_idx, kv_idx):
+    """Same predicate over pool addresses, remapped through the page table."""
+    holder = _decode_mask_holder
+    page = _BLOCK_SIZE
+    blk = kv_idx // page
+    logical_kv = holder["page_logical"][blk] * page + kv_idx % page
+    q_pos = holder["t"][b, q_idx]
+    return (
+        (holder["page_row"][blk] == b)
+        & (logical_kv <= q_pos)
+        & (holder["kv_mask"][b, logical_kv] == holder["q_mask"][b, q_idx])
+    )
 
 
 def _decode_rope_positions(
@@ -383,6 +425,7 @@ class FlexDecodeSession:
 
     Create via ``backbone.decode_session(batch_size)``; ``Model.forward``
     does this automatically and carries the session inside its ``cache``.
+    Call :meth:`close` (or ``cache.close()``) when the session is done.
 
     The KV cache is a paged pool shared by all rows (see module docstring).
     It starts with one 128-token page per row and grows by the pages a row
@@ -453,45 +496,23 @@ class FlexDecodeSession:
         # captures ``self`` creates a reference cycle (session → mask_mod →
         # session). Cyclic GC may not run between rollout and train, so the KV
         # buffers stay allocated and online training OOMs after a few cycles.
-        holder: dict[str, torch.Tensor] = {
+        # Per-session tables. ``_logical_mask_mod`` / ``_physical_mask_mod``
+        # are module-level (one function object for Dynamo); ``forward``
+        # binds this holder into ``_decode_mask_holder`` before the mask
+        # is built. Closing over ``self`` would cycle (session → mask_mod
+        # → session) and pin KV buffers until cyclic GC.
+        self._mask_holder: dict[str, torch.Tensor] = {
             "t": torch.zeros(0, 0, dtype=torch.long, device=self.device),
             "q_mask": torch.zeros(0, 0, dtype=torch.long, device=self.device),
             "kv_mask": self.grouping_ids,
             "page_logical": page_logical,
             "page_row": page_row,
         }
-        self._mask_holder = holder
-        page = self.page
-
-        def mask_mod(b, h, q_idx, kv_idx):
-            # Logical coordinates: causal within each sequence, offset by its
-            # cached history, and only within the same grouping-id run. Pad
-            # queries carry a clamped position (a prefix of real slots), so
-            # they stay finite; their K/V are never written and their outputs
-            # are discarded by the caller.
-            q_pos = holder["t"][b, q_idx]
-            return (kv_idx <= q_pos) & (
-                holder["kv_mask"][b, kv_idx] == holder["q_mask"][b, q_idx]
-            )
-
-        def physical_mask_mod(b, h, q_idx, kv_idx):
-            # Same predicate over pool addresses: map the page back to the
-            # row's logical slot. The owner check makes the eager (dense)
-            # path exact; the compiled kernel only ever visits owned pages.
-            blk = kv_idx // page
-            logical_kv = holder["page_logical"][blk] * page + kv_idx % page
-            q_pos = holder["t"][b, q_idx]
-            return (
-                (holder["page_row"][blk] == b)
-                & (logical_kv <= q_pos)
-                & (holder["kv_mask"][b, logical_kv] == holder["q_mask"][b, q_idx])
-            )
-
-        self._mask_mod = mask_mod
-        self._physical_mask_mod = physical_mask_mod
+        _bind_decode_mask_holder(self._mask_holder)
 
         # Incremental-step CUDA graph: captured the second time a shape
         # repeats; rebuilt when the pool grows or BlockMask tables change.
+        self._closed = False
         self._graph: torch.cuda.CUDAGraph | None = None
         self._graph_disabled = False
         self._g_key: tuple[int, int, int, int] | None = None
@@ -507,14 +528,36 @@ class FlexDecodeSession:
         self._g_hiddens: list[torch.Tensor] | None = None
         self._g_cache_id: int | None = None
 
-    def __del__(self) -> None:
-        # Drop views before the VMM store unmaps so teardown cannot race a
-        # still-live k_cache / v_cache pointer.
-        try:
-            self.k_cache = torch.empty(0)
-            self.v_cache = torch.empty(0)
+    def close(self) -> None:
+        """Unmap the VMM K/V stores and drop the CUDA graph.
+
+        Call this when the session is finished (``DecodeCache.close`` does).
+        ``__del__`` also calls it, but that is too late if a captured graph
+        still holds views of the pool.
+        """
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        self._invalidate_graph()
+        self._graph_disabled = True
+        self._g_h = None
+        self._g_cos = None
+        self._g_sin = None
+        self._g_addr = None
+        self._g_rows = None
+        self._g_cols = None
+        self._g_out = None
+        self._g_hiddens = None
+        self.k_cache = torch.empty(0)
+        self.v_cache = torch.empty(0)
+        if hasattr(self, "_k_store"):
             self._k_store.close()
+        if hasattr(self, "_v_store"):
             self._v_store.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
         except Exception:
             pass
 
@@ -530,6 +573,7 @@ class FlexDecodeSession:
         new_ids[:, : self.logical_cap] = self.grouping_ids
         self.grouping_ids = new_ids
         self._mask_holder["kv_mask"] = new_ids
+        _bind_decode_mask_holder(self._mask_holder)
         new_table = torch.full((self.B, new_cap // self.page), -1, dtype=torch.long, device=self.device)
         new_table[:, : self.page_table.shape[1]] = self.page_table
         self.page_table = new_table
@@ -548,6 +592,7 @@ class FlexDecodeSession:
         fill = torch.zeros(new_n - self.n_pages, dtype=torch.long, device=self.device)
         self._mask_holder["page_logical"] = torch.cat([self._mask_holder["page_logical"], fill])
         self._mask_holder["page_row"] = torch.cat([self._mask_holder["page_row"], fill - 1])
+        _bind_decode_mask_holder(self._mask_holder)
         self._free_pages.extend(range(self.n_pages, new_n))
         self.n_pages = new_n
 
@@ -594,7 +639,7 @@ class FlexDecodeSession:
             full_num,
             None if full_idx is None else remap(full_idx),
             BLOCK_SIZE=logical.BLOCK_SIZE,
-            mask_mod=self._physical_mask_mod,
+            mask_mod=_physical_mask_mod,
             seq_lengths=(q_len, self.n_pages * self.page),
             compute_q_blocks=False,
         )
@@ -625,6 +670,7 @@ class FlexDecodeSession:
             self._mask_holder["t"] = t.contiguous()
             self._mask_holder["q_mask"] = q_mask.contiguous()
         self._mask_holder["kv_mask"] = self.grouping_ids
+        _bind_decode_mask_holder(self._mask_holder)
 
     def _run_layers(
         self,
@@ -873,6 +919,8 @@ class FlexDecodeSession:
             meaningless), plus a tuple of per-layer hidden states when
             ``output_hidden_states=True``.
         """
+        if self._closed:
+            raise RuntimeError("FlexDecodeSession.close() has been called.")
         B, S, _ = embeds.shape
         if B != self.B:
             raise ValueError(f"Session was created for batch_size={self.B}, got {B}.")
@@ -926,7 +974,7 @@ class FlexDecodeSession:
         )
 
         logical_mask = flex_block_mask(
-            self._mask_mod,
+            _logical_mask_mod,
             B=B,
             Q_LEN=S,
             KV_LEN=self.logical_cap,

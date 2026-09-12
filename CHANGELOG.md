@@ -247,6 +247,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``grouping_field: str | None = None`` (``None`` ⇒ no grouping filter).
 
 ### Changed
+- Cached-decode ``mask_mod`` is a pair of module-level functions
+  (``_logical_mask_mod`` / ``_physical_mask_mod``) that read a holder
+  dict. Every ``FlexDecodeSession`` uses the same function object so
+  Dynamo does not recompile on a new ``__code__`` id. ``flex_block_mask``
+  compiles ``create_block_mask`` with ``dynamic=True`` so ``(Q_LEN,
+  KV_LEN)`` changes reuse one graph.
+- ``FlexDecodeSession.close`` / ``DecodeCache.close`` unmap the VMM K/V
+  stores and drop the CUDA graph. Call ``cache.close()`` when a rollout
+  ends; ``__del__`` is too late if a captured graph still holds views.
 - On CUDA, the paged KV pool (``FlexDecodeSession``) grows by mapping more
   physical pages under a reserved virtual address instead of allocating a
   new tensor and copying. Existing K/V stay in place; the pool grows to
