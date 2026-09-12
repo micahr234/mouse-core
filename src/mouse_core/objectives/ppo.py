@@ -12,7 +12,9 @@ from mouse_core.objectives.base import Objective
 from mouse_core.objectives.dqn import (
     _boundary_discounts,
     _pair_weight,
+    _require_action_ids,
     _require_done_codes,
+    _require_step_aligned_predictions,
     _weighted_mean,
 )
 
@@ -238,10 +240,18 @@ class PpoObjective(Objective):
         action = objective_data[self.action_key]
         if action.dtype != torch.int64:
             raise TypeError(f"action must be int64, got {action.dtype}.")
+        if action.ndim != 1:
+            raise ValueError(
+                f"PPO objective expects action shape [N], got {tuple(action.shape)}."
+            )
+        _require_step_aligned_predictions(
+            objective_data, n_pred=N, n_steps=int(action.shape[0]), who="PPO"
+        )
         if action.shape != torch.Size([N]):
             raise ValueError(
                 f"PPO objective expects action shape [{N}], got {tuple(action.shape)}."
             )
+        _require_action_ids(action, A)
 
         reward = objective_data[self.reward_key]
         if reward.dtype != torch.float32:

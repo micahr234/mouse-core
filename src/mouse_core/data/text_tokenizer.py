@@ -64,7 +64,7 @@ class TextTokenizer:
         format: str | None = None,
         group_prefix: str | None = None,
         tokenizer=None,
-        image_processor=None,
+        image_tokenizer=None,
         objective_fields: Sequence[dict[str, Any]] | None = None,
         pretrained: str | Path | None = None,
         hub_kwargs: dict | None = None,
@@ -153,9 +153,9 @@ class TextTokenizer:
             tok = None
 
         if has_image:
-            if image_processor is None or not callable(image_processor):
+            if image_tokenizer is None or not callable(image_tokenizer):
                 raise TypeError(
-                    "TextTokenizer with image input_fields requires image_processor= "
+                    "TextTokenizer with image input_fields requires image_tokenizer= "
                     "callable that returns discrete token ids"
                 )
 
@@ -184,7 +184,7 @@ class TextTokenizer:
         self._image_by_field = image_by_field
         self._learnable_specs = tuple(learnable_specs)
         self.tokenizer = tok
-        self.image_processor = image_processor
+        self.image_tokenizer = image_tokenizer
         self.objective_fields: tuple[tuple[str, str], ...] = coerce_io_fields(
             objective_fields or (),
             who="tokenizer objective_fields",
@@ -207,7 +207,7 @@ class TextTokenizer:
             token_by_field=self._token_by_field,
             image_by_field=self._image_by_field,
             tokenizer=self.tokenizer,
-            image_processor=self.image_processor,
+            image_tokenizer=self.image_tokenizer,
             learnable_specs=self._learnable_specs,
             objective_fields_keep=self.objective_fields,
             grouping_field=self.grouping_field,
@@ -258,7 +258,7 @@ def _tokenize_text_step(
     token_by_field: dict[str, TextTokenizerModalitySpec],
     image_by_field: dict[str, TextTokenizerModalitySpec],
     tokenizer: Any,
-    image_processor: Any,
+    image_tokenizer: Any,
     learnable_specs: Sequence[TextTokenizerModalitySpec],
     objective_fields_keep: Sequence[tuple[str, str]],
     grouping_field: str,
@@ -341,20 +341,20 @@ def _tokenize_text_step(
                         continue
                     if spec.skip is not None and values_equal(value, spec.skip):
                         continue
-                    if image_processor is None:
-                        raise RuntimeError("image_processor is not configured")
-                    out = image_processor(value)
+                    if image_tokenizer is None:
+                        raise RuntimeError("image_tokenizer is not configured")
+                    out = image_tokenizer(value)
                     if isinstance(out, torch.Tensor):
                         if out.ndim == 2 and out.shape[-1] > 1:
                             raise TypeError(
-                                "image_processor must return token ids, not embeddings"
+                                "image_tokenizer must return token ids, not embeddings"
                             )
                         img_ids = [int(x) for x in out.view(-1).tolist()]
                     elif isinstance(out, (list, tuple, np.ndarray)):
                         img_ids = [int(x) for x in np.asarray(out).ravel().tolist()]
                     else:
                         raise TypeError(
-                            "image_processor must return a sequence of token ids"
+                            "image_tokenizer must return a sequence of token ids"
                         )
                     _emit(img_ids, name=NAME_VISION, head_output=spec.head_output)
                 continue

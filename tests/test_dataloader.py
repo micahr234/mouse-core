@@ -73,6 +73,7 @@ def _transform(**kwargs):
 def _loader(**kwargs) -> DataLoader:
     kwargs.setdefault("transform", _transform())
     kwargs.setdefault("stores", _store_with_actions())
+    kwargs.setdefault("num_workers", 0)
     return DataLoader(**kwargs)
 
 
@@ -81,6 +82,16 @@ def _free_threading_ok() -> bool:
         return False
     is_gil_enabled = getattr(sys, "_is_gil_enabled", None)
     return not (callable(is_gil_enabled) and is_gil_enabled())
+
+
+def test_dataloader_requires_num_workers() -> None:
+    with pytest.raises(TypeError, match="num_workers"):
+        DataLoader(
+            sequence_length=3,
+            batch_size=1,
+            transform=_transform(),
+            stores=_store_with_actions(),
+        )
 
 
 def test_dataloader_requires_transform() -> None:

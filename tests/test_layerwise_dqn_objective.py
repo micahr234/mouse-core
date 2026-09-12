@@ -104,3 +104,20 @@ def test_layerwise_dqn_objective_does_not_backprop_through_delayed_q() -> None:
     loss.backward()
     assert online.grad is not None
     assert delayed.grad is None
+
+
+def test_single_layer_rejects_mismatched_start_and_deep_gamma() -> None:
+    with pytest.raises(ValueError, match="num_backbone_layers=1"):
+        LayerwiseDqnObjective(
+            num_backbone_layers=1,
+            gamma_step_start=0.0,
+            gamma_step=0.99,
+        )
+    objective = LayerwiseDqnObjective(
+        num_backbone_layers=1,
+        gamma_step_start=0.5,
+        gamma_step=0.5,
+        gamma_episode_terminal_start=0.0,
+        gamma_episode_terminal=0.0,
+    )
+    assert objective.layer_gamma_step == [0.5]

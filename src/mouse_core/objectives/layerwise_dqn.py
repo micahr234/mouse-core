@@ -16,6 +16,7 @@ from mouse_core.objectives.dqn import (
     _pair_values_to_rows,
     _pair_weight,
     _head_output_layout,
+    _require_action_ids,
     _require_done_codes,
     _td_lambda_targets,
     _weighted_mean,
@@ -56,7 +57,13 @@ def _build_layer_gamma_schedule(
     if num_layers < 1:
         raise ValueError(f"num_backbone_layers must be >= 1, got {num_layers}.")
     if num_layers == 1:
-        return [gamma_deep]
+        if gamma_start != gamma_deep:
+            raise ValueError(
+                f"num_backbone_layers=1 cannot interpolate between "
+                f"gamma_start={gamma_start} and gamma_deep={gamma_deep}; "
+                "pass the same value for both."
+            )
+        return [gamma_start]
 
     if gamma_start == gamma_deep:
         return [gamma_deep] * num_layers
@@ -153,6 +160,9 @@ class LayerwiseDqnObjective(Objective):
         td_lambda: λ of the TD(λ) target in ``[0, 1]``. ``0.0`` (default) is
             the one-step target; ``1.0`` is the full in-run n-step return.
         watkins: Cut the λ-trace at non-greedy actions (Watkins's Q(λ)).
+        grouping_field: Step column that isolates runs (typically
+            ``task_index``). ``None`` skips the grouping check. When set, the
+            column must be present in ``objective_data``.
     """
 
     def __init__(
@@ -282,6 +292,7 @@ class LayerwiseDqnObjective(Objective):
                 f"Layerwise DQN objective expects action shape [N], got {tuple(action.shape)}."
             )
         N = int(action.shape[0])
+        _require_action_ids(action, A)
 
         if N < 2:
             raise ValueError("Not enough valid q values in data.")

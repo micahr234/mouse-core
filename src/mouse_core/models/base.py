@@ -244,7 +244,7 @@ saved model.
 with torch.no_grad():
     steps = [eval_transform(step) for step in batch[0]]
     inputs, _ = pack_token_batch(steps, sequence_ids=[0] * len(steps))
-    out = model(inputs)
+    out = model(inputs, use_cache=True)
     action = model.get_action(out.predictions, temperature=0.0)
 ```
 
@@ -701,7 +701,7 @@ def _build_encoder_from_config(config: dict[str, Any]) -> Encoder:
     if enc_type == "text":
         from mouse_core.models.embedding import TextEmbedder
 
-        # HF tokenizer / image_processor are not part of the embedder; rebuild
+        # HF tokenizer / image_tokenizer are not part of the embedder; rebuild
         # TextTokenizer separately for the data pipeline after load. The table
         # weights come from the saved state_dict, so build a fresh table of the
         # saved size instead of re-downloading ``pretrained``.
@@ -1555,7 +1555,7 @@ class Model(nn.Module):
                     self.backbone.decode_session(batch_size=B) for _ in range(num_passes)
                 )
             flex_embeds, resolved_indices = left_align_content(
-                batched_embeds, local_indices
+                batched_embeds, local_indices, token_lengths
             )
             # Left-align mask ids to the same trailing-column layout as embeds.
             Lmax = batched_grouping_ids.shape[1]
@@ -1647,10 +1647,15 @@ class Model(nn.Module):
     def get_action(
         self,
         out: TensorDict,
-        temperature: float = 1.0,
+        *,
+        temperature: float,
         num_actions: int | None = None,
     ) -> torch.Tensor:
-        """Select an action at the last head-output token.
+        """Select an action at the last head-output token of each decode row.
+
+        ``out`` must be cached-decode scores ``[B, S, A]`` (or layerwise
+        ``[B, S, L, A]``). Flat training outputs ``[N, A]`` are rejected
+        unless ``N == 1``.
 
         When ``action_value_episode`` and ``action_value_task`` are both
         present, scores are ``Q_episode + Q_task``. Otherwise scores come
@@ -1688,6 +1693,12 @@ def _last_action_scores(raw: torch.Tensor, *, name: str) -> torch.Tensor:
         if raw.ndim == 4:
             return raw[:, -1, -1, :]
         if raw.ndim == 3:
+            if raw.shape[0] != 1:
+                raise ValueError(
+                    f"action_value_layerwise has shape {tuple(raw.shape)}; "
+                    "get_action on flat [N, L, A] training outputs needs N=1. "
+                    "Use cached-decode [B, S, L, A] outputs for a batch."
+                )
             return raw[-1, -1, :].unsqueeze(0)
         raise ValueError(
             f"action_value_layerwise expects [B, S, L, A] or [N, L, A], "
@@ -1696,6 +1707,12 @@ def _last_action_scores(raw: torch.Tensor, *, name: str) -> torch.Tensor:
     if raw.ndim == 3:
         return raw[:, -1]
     if raw.ndim == 2:
+        if raw.shape[0] != 1:
+            raise ValueError(
+                f"{name} has shape {tuple(raw.shape)}; get_action on flat "
+                "[N, A] training outputs needs N=1 (one step). Use "
+                "cached-decode [B, S, A] outputs for a batch."
+            )
         return raw[-1].unsqueeze(0)
     raise ValueError(f"{name} expects [B, S, A] or [N, A], got {tuple(raw.shape)}")
 

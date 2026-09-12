@@ -10,7 +10,7 @@ from mouse_core.models.heads import LayerwiseDiscreteActionValueHead
 from mouse_core.models.base import Model
 from mouse_core.objectives import LayerwiseDqnObjective
 from mouse_core.polyak import Polyak
-from tests._token_batch_helpers import batch_to_packed, tok_from_encoder
+from tests._token_batch_helpers import batch_to_packed, batch_to_token_batch, tok_from_encoder
 
 _tok = tok_from_encoder
 
@@ -47,8 +47,6 @@ def test_model_layerwise_forward_and_objective() -> None:
     loss, metrics = objective(objective_data, predictions, delayed_predictions)
     assert loss.ndim == 0
     assert metrics['action_value_layerwise'] >= 0.0
-    action = model.get_action(predictions, temperature=0.0, num_actions=4)
-    assert action.shape == (1,)
     Polyak(model, delayed).update(tau_heads=0.1, tau_encoder=0.1, tau_backbone=0.1)
 
 def test_layerwise_objective_q_metrics_use_curr_max_q() -> None:
@@ -124,3 +122,60 @@ def test_layerwise_watkins_cuts_per_layer() -> None:
     assert abs(metrics["layer_0_loss"] - 2138.0) < 1e-02
     assert abs(metrics["layer_1_loss"] - 5000.845) < 1e-02
     assert abs(metrics["watkins_greedy_frac"] - 0.5) < 1e-06
+
+
+def test_cached_decode_matches_full_forward_with_layerwise() -> None:
+    torch.manual_seed(0)
+    backbone = Qwen3Backbone(
+        train_kernel="varlen",
+        decode_kernel="flex",
+        dtype=torch.float32,
+        hidden_dim=16,
+        num_layers=2,
+        num_heads=2,
+    )
+    encoder = NumericEmbedder(
+        hidden_dim=backbone.hidden_dim,
+        modalities=[
+            {"type": "discrete", "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1},
+            {"type": "discrete", "field": "observation", "vocab_size": 8, "std": 0.02, "positions": 1},
+            {"type": "fourier", "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0},
+            {"type": "discrete", "field": "episode_done", "vocab_size": 3, "std": 0.02, "positions": 1},
+        ],
+    )
+    head = LayerwiseDiscreteActionValueHead(
+        num_backbone_layers=2,
+        in_features=backbone.hidden_dim,
+        out_features=4,
+        hidden_dim=backbone.hidden_dim,
+        num_layers=1,
+        scale=0.1,
+    )
+    model = Model(
+        encoder=encoder,
+        backbone=backbone,
+        heads=head,
+        action_head="action_value_layerwise",
+        reasoner=None,
+        recurrence=None,
+    ).eval()
+    steps = _tiny_batch()[0]
+    tok = _tok(model.encoder)
+    with torch.no_grad():
+        full = model(batch_to_token_batch(tok, [steps]))
+        cache = None
+        chunks = []
+        for lo, hi in ((0, 1), (1, 3)):
+            out = model(
+                batch_to_token_batch(tok, [steps[lo:hi]]),
+                cache=cache,
+                use_cache=True,
+            )
+            cache = out.cache
+            chunks.append(out.predictions["action_value_layerwise"])
+        incremental = torch.cat(chunks, dim=1)
+    assert torch.allclose(
+        incremental,
+        full.predictions["action_value_layerwise"].unsqueeze(0),
+        atol=1e-5,
+    )

@@ -38,6 +38,7 @@ Usage
         sequence_length=64,
         batch_size=8,
         transform=train_transform,
+        num_workers=0,
     )
     inputs, objective_data = loader.next_batch()
 """
@@ -56,6 +57,7 @@ import numpy as np
 
 from tensordict import TensorDict
 
+from mouse_core.data.datastore import _normalize_value
 from mouse_core.data.token_batch import StepTokens, TokenBatch, pack_token_batch
 
 if TYPE_CHECKING:
@@ -113,7 +115,9 @@ def _fetch_sequence(
     end = min(start + S_max, n)
     hf_slice = ds[start:end]
     count = end - start
-    rows = [{k: hf_slice[k][i] for k in hf_slice} for i in range(count)]
+    rows = [
+        {k: _normalize_value(hf_slice[k][i]) for k in hf_slice} for i in range(count)
+    ]
     if cfg.index_field is not None:
         for i, row in enumerate(rows):
             row[cfg.index_field] = start + i
@@ -236,7 +240,8 @@ class DataLoader:
         Optional key. When set, each fetched step is stamped with its absolute
         store offset under this name before ``transform`` runs.
     weights / weight_mode / prefetch / num_workers :
-        Sampling and worker controls.
+        Sampling and worker controls. ``num_workers`` is required: ``0`` is
+        in-process; ``> 0`` needs free-threaded CPython with the GIL off.
     seed :
         Entropy of the batch stream. Batch ``k`` is a pure function of
         ``(seed, k, snapshot)`` for any ``num_workers`` (see module
@@ -249,12 +254,12 @@ class DataLoader:
         stores: Datastore | list[Datastore],
         sequence_length: int,
         batch_size: int,
-        transform: StepTransform | None = None,
+        transform: StepTransform,
         index_field: str | None = None,
         weights: list[float] | None = None,
         weight_mode: str = "per_store",
         prefetch: int = 4,
-        num_workers: int = 1,
+        num_workers: int,
         seed: int | None = None,
     ) -> None:
         from mouse_core.data.datastore import Datastore as _DS
@@ -273,7 +278,7 @@ class DataLoader:
             stores = [stores]
         if not stores or not all(isinstance(s, _DS) for s in stores):
             raise TypeError("DataLoader requires a Datastore or a non-empty list of Datastores.")
-        if transform is None or not callable(transform):
+        if not callable(transform):
             raise TypeError(
                 "DataLoader requires transform= "
                 "(callable dict → StepTokens, e.g. compose(...))."
@@ -379,6 +384,8 @@ class DataLoader:
         self.close()
 
     def __del__(self) -> None:
+        if getattr(self, "_workers", None) is None:
+            return
         self.close()
 
     def __repr__(self) -> str:

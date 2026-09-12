@@ -34,22 +34,14 @@ def test_dqn_objective_rejects_wrong_action_shape() -> None:
     n, a = (4, 3)
     step_stream = TensorDict({'action': torch.randint(0, a, (n, 1)), 'reward': torch.randn(n), 'episode_done': torch.zeros(n, dtype=torch.long), 'task_done': torch.zeros(n, dtype=torch.long)}, batch_size=[n])
     predictions, delayed = _q(torch.randn(n, a), torch.randn(n, a))
-    try:
+    with pytest.raises(ValueError, match="action shape"):
         DqnObjective(gamma_step=0.99)(step_stream, predictions, delayed)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError('expected ValueError for action shape [N, 1]')
 
 def test_dqn_objective_requires_min_sequence() -> None:
     step_stream = TensorDict({'action': torch.zeros(1, dtype=torch.long), 'reward': torch.zeros(1), 'episode_done': torch.zeros(1, dtype=torch.long), 'task_done': torch.zeros(1, dtype=torch.long)}, batch_size=[1])
     predictions, delayed = _q(torch.zeros(1, 2), torch.zeros(1, 2))
-    try:
+    with pytest.raises(ValueError, match="Not enough"):
         DqnObjective()(step_stream, predictions, delayed)
-    except ValueError as e:
-        assert 'Not enough' in str(e)
-    else:
-        raise AssertionError('expected ValueError for N < 2')
 
 def test_dqn_objective_trains_on_terminal_transitions() -> None:
     """Transitions *from* terminal states must contribute to the loss."""
@@ -232,6 +224,27 @@ def test_pair_weight_zeros_window_cut_and_task_change() -> None:
         _pair_weight(reset, 3, 'cpu', grouping_field='task_index'),
         torch.tensor([1.0, 1.0]),
     )
+
+
+def test_pair_weight_missing_grouping_field_raises() -> None:
+    data = TensorDict({'sequence_id': torch.tensor([0, 0])}, batch_size=[2])
+    with pytest.raises(KeyError, match="grouping_field"):
+        _pair_weight(data, 2, 'cpu', grouping_field='task_index')
+
+
+def test_dqn_objective_rejects_out_of_range_action() -> None:
+    step_stream = TensorDict(
+        {
+            'action': torch.tensor([0, 9]),
+            'reward': torch.tensor([0.0, 1.0]),
+            'episode_done': torch.zeros(2, dtype=torch.long),
+            'task_done': torch.zeros(2, dtype=torch.long),
+        },
+        batch_size=[2],
+    )
+    predictions, delayed = _q(torch.zeros(2, 3), torch.zeros(2, 3))
+    with pytest.raises(ValueError, match="action ids must be in"):
+        DqnObjective()(step_stream, predictions, delayed)
 
 
 def test_weighted_mean_all_zero_is_zero() -> None:

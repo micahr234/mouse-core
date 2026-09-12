@@ -187,3 +187,21 @@ def test_contiguous_sequence_ids_with_gaps_accepted() -> None:
     steps = [tok({"action": 0, "reward": 0.0, "task_index": 0}) for _ in range(3)]
     inputs, _ = pack_token_batch(steps, sequence_ids=[0, 2, 2], batch_size=3)
     assert inputs.step_counts().tolist() == [1, 0, 2]
+
+
+def test_pack_rejects_negative_sequence_ids() -> None:
+    tok = _tok()
+    steps = [tok({"action": 0, "reward": 0.0, "task_index": 0})]
+    with pytest.raises(ValueError, match="sequence_ids must be >= 0"):
+        pack_token_batch(steps, sequence_ids=[-1], batch_size=2)
+
+
+def test_pack_rejects_objective_key_missing_on_some_steps() -> None:
+    tok = _tok()
+    steps = [
+        tok({"action": 0, "reward": 1.0, "task_index": 0}),
+        tok({"action": 1, "reward": 0.0, "task_index": 0}),
+    ]
+    steps[1].objective_fields.pop("reward")
+    with pytest.raises(KeyError, match="reward"):
+        pack_token_batch(steps, sequence_ids=[0, 0], batch_size=1)

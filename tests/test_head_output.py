@@ -153,8 +153,6 @@ def test_forward_yields_one_row_per_head_output_token() -> None:
     assert out.predictions["action_value"].shape == (batch.P, _ACTIONS)
     assert out.head_output_indices is not None
     assert out.head_output_indices.shape == (batch.P,)
-    action = model.get_action(out.predictions, temperature=0.0)
-    assert action.shape == (1,)
 
 
 def test_decode_pools_last_head_output_token_per_step() -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 from tensordict import TensorDict
 
@@ -119,6 +120,23 @@ def test_get_action_sums_batched_decode_scores() -> None:
     )
     action = model.get_action(preds, temperature=0.0)
     assert action.tolist() == [1, 1]
+
+
+def test_get_action_rejects_flat_multi_step_train_outputs() -> None:
+    model = _model(
+        {
+            "action_value_episode": _head(out_features=2),
+            "action_value_task": _head(out_features=2),
+        }
+    )
+    preds = TensorDict(
+        {
+            "action_value_episode": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+            "action_value_task": torch.tensor([[0.0, 0.0], [0.0, 0.0]]),
+        }
+    )
+    with pytest.raises(ValueError, match="N=1"):
+        model.get_action(preds, temperature=0.0)
 
 
 def test_episode_task_save_load_roundtrip(tmp_path) -> None:

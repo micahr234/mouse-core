@@ -87,10 +87,6 @@ class NumericTokenizer:
             )
             for m in meta
         }
-        # Normalize continuous → fourier in map type for embedder agreement.
-        for m in meta:
-            if m.kind == KIND_FOURIER:
-                self.modality_map[m.name] = ModalityInfo(type="fourier", dim=m.dim)
         self._name_to_index = {n: i for i, n in enumerate(self.modality_names)}
         self.grouping_field = grouping_field
         self.image_tokenizer = image_tokenizer

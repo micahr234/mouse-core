@@ -116,3 +116,18 @@ def test_getitem_mixed_source_and_buffer() -> None:
     store2.append({'action': 30, 'reward': 0.0, 'episode_done': 0, 'task_done': 0})
     rows = store2.__getitem__([0, 1, 2])
     assert [r['action'] for r in rows] == [10, 20, 30]
+
+
+def test_from_dataset_unwraps_zero_dim_arrays() -> None:
+    import numpy as np
+    from datasets import Dataset
+
+    store = Datastore()
+    store.from_dataset(
+        Dataset.from_list([{"action": np.array(3), "reward": np.array(0.5)}])
+    )
+    row = store[0][0]
+    assert row["action"] == 3
+    assert row["reward"] == 0.5
+    assert not isinstance(row["action"], np.ndarray)
+    assert not isinstance(row["reward"], np.ndarray)

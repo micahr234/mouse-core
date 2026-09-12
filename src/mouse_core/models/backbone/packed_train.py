@@ -49,6 +49,7 @@ recomputes each layer in backward instead of storing its activations.
 
 from __future__ import annotations
 
+import threading
 import warnings
 from dataclasses import dataclass
 from typing import Any, Callable, Literal, cast, get_args, overload
@@ -152,6 +153,7 @@ def _block_causal_mask(plan: _PackingPlan) -> torch.Tensor:
 # Stable mask_mod identity (reads the current stream's segment ids from a
 # holder) so the compiled ``create_block_mask`` is traced once, not per call.
 _segment_holder: dict[str, torch.Tensor] = {}
+_segment_lock = threading.Lock()
 
 
 def _segment_mask_mod(b, h, q_idx, kv_idx):
@@ -161,17 +163,18 @@ def _segment_mask_mod(b, h, q_idx, kv_idx):
 
 def _flex_block_mask(plan: _PackingPlan, device: torch.device) -> BlockMask:
     """Block-sparse Flex mask over the packed order: causal within each segment."""
-    _segment_holder["segment"] = _segment_ids(plan)
-    L = plan.order.shape[0]
-    return flex_block_mask(
-        _segment_mask_mod,
-        B=1,
-        Q_LEN=L,
-        KV_LEN=L,
-        device=device,
-        block_size=_BLOCK_SIZE,
-        compile_masks=_use_flex_compile(device),
-    )
+    with _segment_lock:
+        _segment_holder["segment"] = _segment_ids(plan)
+        L = plan.order.shape[0]
+        return flex_block_mask(
+            _segment_mask_mod,
+            B=1,
+            Q_LEN=L,
+            KV_LEN=L,
+            device=device,
+            block_size=_BLOCK_SIZE,
+            compile_masks=_use_flex_compile(device),
+        )
 
 
 def _pad_packed(x: torch.Tensor, cu_seqlens: torch.Tensor, max_seqlen: int) -> torch.Tensor:

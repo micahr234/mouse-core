@@ -247,6 +247,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``grouping_field: str | None = None`` (``None`` ⇒ no grouping filter).
 
 ### Changed
+- ``DataLoader`` requires ``num_workers`` (no default). ``0`` is
+  in-process; ``> 0`` still needs free-threaded CPython. Offline
+  notebooks that omitted it now pass ``num_workers=0``.
+- ``TextTokenizer`` image callable is ``image_tokenizer=`` (same name
+  as ``NumericTokenizer``).
+- ``get_action`` requires ``temperature=`` and rejects flat training
+  outputs with more than one row. Use cached-decode ``[B, S, A]``.
+- ``sp_js`` multiplies the mean JS by ``T²``, matching its docstring
+  and standard distillation scaling.
+- ``LayerwiseDqnObjective`` with ``num_backbone_layers=1`` requires
+  matching start and deep gammas (layer 0 is both endpoints).
 - ``TextEmbedder`` Hub load (``_load_embed_tokens``) uses the same
   ``_quiet_transformers_load`` wrapper as the backbone, so
   ``lm_head.weight | UNEXPECTED`` is not printed when copying
@@ -587,6 +598,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Train is ``compose(augmenter, tokenizer)``; eval is the tokenizer.
 
 ### Fixed
+- ``left_align_content`` takes ``token_lengths`` so an idle decode row
+  (zero new tokens) is not treated as length 1.
+- ``grouping_field`` set but missing from ``objective_data`` raises
+  instead of silently training across task boundaries.
+- Hub / ``from_dataset`` / DataLoader rows unwrap 0-d arrays the same
+  way ``Datastore.append`` does.
+- ``pack_token_batch`` rejects negative ``sequence_ids`` before
+  group-prefix bookkeeping, and requires every stacked objective key
+  on every step.
+- ``Augmenter`` raises ``KeyError`` when a configured input field is
+  missing from the step.
+- ``FlexDecodeSession.reset_rows`` drops the captured CUDA graph.
+- PPO / GRPO reject multi-token ``head_output_count`` layouts (one
+  prediction row per step).
+- Action ids outside ``[0, A)`` raise in DQN / PPO / GRPO.
 - Growing the decode page pool no longer holds the old K/V tensors and a
   2× copy at the same time (the deployment memory spike).
 - ``scripts/install.sh`` uses ``return`` instead of ``exit`` so

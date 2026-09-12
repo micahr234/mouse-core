@@ -273,7 +273,6 @@ class TokenizerModalityMeta:
     kind: str
     dim: int = 0
     n_learnable: int = 0
-    freq_sets: int = 1
 
 
 def resolve_tokenizer_numeric_modalities(
@@ -319,7 +318,6 @@ def resolve_tokenizer_numeric_modalities(
                     name=name,
                     kind=KIND_FOURIER,
                     dim=dim,
-                    freq_sets=dim,
                 )
             )
         elif k == "learnable":

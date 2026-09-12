@@ -14,6 +14,7 @@ from mouse_core.objectives.dqn import (
     _in_run_stats,
     _pair_values_to_rows,
     _pair_weight,
+    _require_action_ids,
     _require_done_codes,
     _td_lambda_targets,
     _weighted_mean,
@@ -190,7 +191,7 @@ class EpisodeTaskDqnObjective(Objective):
         q_t = _affine(q_t, scale=self.q_scale, shift=self.q_shift)
         q_e_target = _affine(q_e_target, scale=self.q_scale, shift=self.q_shift)
         q_t_target = _affine(q_t_target, scale=self.q_scale, shift=self.q_shift)
-        P, _A = q_e.shape
+        P, A = q_e.shape
         device = q_e.device
         value_dtype = q_e.dtype
 
@@ -202,6 +203,7 @@ class EpisodeTaskDqnObjective(Objective):
                 f"DQN objective expects action shape [N], got {tuple(action.shape)}."
             )
         N = int(action.shape[0])
+        _require_action_ids(action, A)
         if N < 2:
             raise ValueError("Not enough valid q values in data.")
 

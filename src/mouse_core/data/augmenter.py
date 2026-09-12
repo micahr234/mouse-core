@@ -317,7 +317,9 @@ class Augmenter:
             mask_this_step = self._sample_mask(spec)
             for in_f, out_f in zip(spec.input_fields, spec.output_fields):
                 if in_f not in row:
-                    continue
+                    raise KeyError(
+                        f"Augmenter field {in_f!r} is missing from the step"
+                    )
                 value = row[in_f]
                 value = self._apply_permutation(spec, draw, value)
                 value = self._apply_scale_shift(spec, draw, value)

@@ -111,7 +111,7 @@ def sp_js(
         nan=0.0,
     ).sum(dim=-1)
     js = 0.5 * (kl_pm + kl_qm)
-    return js.mean()
+    return js.mean() * (temp * temp)
 
 
 def sp_kl(
@@ -210,7 +210,9 @@ class SpObjective(Objective):
             random each forward); the soft variants treat it as a distribution.
         temperature: Softmax temperature applied to targets before soft losses
             (ignored for ``"ce"``).
-        label_smoothing: Label-smoothing coefficient (applied to hard ``"ce"`` only).
+        label_smoothing: Mixes uniform mass into the teacher. On hard ``"ce"``
+            this is ``F.cross_entropy`` smoothing; on soft losses it is applied
+            to the teacher distribution only.
         predictions_key: Key in ``predictions`` that holds the ``[B, S, A]`` action logits.
         targets_key: Key in ``objective_data`` that holds ``[B, S, A]`` Q targets
             (default ``"info_q_star"`` from env expert Q; use e.g. ``"action_value"``

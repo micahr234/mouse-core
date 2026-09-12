@@ -61,6 +61,7 @@ when the segment ends.
 
 from __future__ import annotations
 
+import threading
 import warnings
 from collections.abc import Sequence
 from typing import Any, Callable, Literal, cast, get_args
@@ -199,6 +200,7 @@ def packed_rope_positions(
 # get a new function object and recompile. Bind a session's tables with
 # :func:`_bind_decode_mask_holder` before building a mask.
 _decode_mask_holder: dict[str, torch.Tensor] = {}
+_decode_mask_lock = threading.Lock()
 
 
 def _bind_decode_mask_holder(holder: dict[str, torch.Tensor]) -> None:
@@ -889,6 +891,8 @@ class FlexDecodeSession:
             freed_t = torch.as_tensor(freed, dtype=torch.long, device=self.device)
             self._mask_holder["page_logical"][freed_t] = 0
             self._mask_holder["page_row"][freed_t] = -1
+        self._invalidate_graph()
+        self._pending_graph_key = None
 
     # ------------------------------------------------------------------
 
@@ -947,10 +951,6 @@ class FlexDecodeSession:
         # Pad columns get earlier/negative values; clamp keeps the causal mask
         # finite (pad outputs are discarded by the caller either way).
         cache_pos = self.lengths[:, None] + col - pad
-        self._update_mask_tables(cache_pos.clamp_min(0), mid)
-
-        # Real tokens are the trailing lengths[b] columns; only they are
-        # written to the cache, at their own sequence's slots.
         real_rows, real_cols = (col >= pad).nonzero(as_tuple=True)
         cache_slots = cache_pos[real_rows, real_cols]
         # Pool address of each real token's slot: its row's page for that block.
@@ -973,16 +973,20 @@ class FlexDecodeSession:
             prior_lengths=self.lengths,
         )
 
-        logical_mask = flex_block_mask(
-            _logical_mask_mod,
-            B=B,
-            Q_LEN=S,
-            KV_LEN=self.logical_cap,
-            device=self.device,
-            block_size=self.page,
-            compile_masks=self._compile_masks,
-        )
-        block_mask = self._physical_block_mask(logical_mask, S)
+        # Global mask_mod tables: hold the lock across bind + create_block_mask
+        # so two sessions cannot interleave holder updates.
+        with _decode_mask_lock:
+            self._update_mask_tables(cache_pos.clamp_min(0), mid)
+            logical_mask = flex_block_mask(
+                _logical_mask_mod,
+                B=B,
+                Q_LEN=S,
+                KV_LEN=self.logical_cap,
+                device=self.device,
+                block_size=self.page,
+                compile_masks=self._compile_masks,
+            )
+            block_mask = self._physical_block_mask(logical_mask, S)
 
         cos, sin = self.model.rotary_emb(x, rope_pos)
 

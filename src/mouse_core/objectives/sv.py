@@ -15,8 +15,10 @@ class SvObjective(Objective):
     """Supervised value regression objective on per-action Q targets.
 
     Reads ``predictions[predictions_key]`` (shape ``[B, S, A]``) and regresses toward
-    ``objective_data[targets_key]``. Only finite target entries participate; ``-inf``
-    sentinels used for padded or invalid actions are automatically excluded.
+    ``objective_data[targets_key]``. Every finite target entry participates,
+    including terminal / truncated rows — unlike :class:`~mouse_core.objectives.sp.SpObjective`,
+    there is no ``mask_key``. ``-inf`` sentinels used for padded or invalid
+    actions are excluded.
 
     Args:
         loss_type: ``"mse"`` (L2) or ``"mae"`` (L1) regression loss.

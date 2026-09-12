@@ -436,11 +436,14 @@ def _stack_objective_fields(
     out: dict[str, np.ndarray] = {}
     for key in sorted(keys):
         raw = [st.objective_fields.get(key) for st in steps]
-        arrays = [_as_field_array(v) if v is not None else None for v in raw]
-        present = [a for a in arrays if a is not None]
-        if not present:
-            out[key] = np.zeros(n, dtype=np.int64)
-            continue
+        missing = [i for i, v in enumerate(raw) if v is None]
+        if missing:
+            raise KeyError(
+                f"objective field {key!r} is missing on steps {missing}; "
+                "every step must provide every stacked key"
+            )
+        arrays = [_as_field_array(v) for v in raw]
+        present = arrays
         # Column dtype is decided by *every* step, not the first one: a single
         # float anywhere makes the column float32, so int-typed steps can
         # never truncate later float values.
@@ -459,16 +462,13 @@ def _stack_objective_fields(
         if ndim == 0:
             buf = np.zeros(n, dtype=dtype)
             for i, a in enumerate(arrays):
-                if a is not None:
-                    buf[i] = a.reshape(())
+                buf[i] = a.reshape(())
             out[key] = buf
         else:
             shapes = [a.shape for a in present]
             max_shape = tuple(max(s[d] for s in shapes) for d in range(ndim))
             buf = np.zeros((n, *max_shape), dtype=dtype)
             for i, a in enumerate(arrays):
-                if a is None:
-                    continue
                 slicer = tuple(slice(0, a.shape[d]) for d in range(a.ndim))
                 buf[i][slicer] = a
             out[key] = buf
@@ -549,6 +549,10 @@ def pack_token_batch(
                 f"steps ({len(steps)})"
             )
         seq_per_step = [int(s) for s in sequence_ids]
+        if any(s < 0 for s in seq_per_step):
+            raise ValueError(
+                f"sequence_ids must be >= 0, got min={min(seq_per_step)}"
+            )
 
     modality_ids: list[np.ndarray] = []
     ids: list[np.ndarray] = []
@@ -615,14 +619,6 @@ def pack_token_batch(
         head_output_counts.append(int(ho.size))
         offset += t
         last_gid[sid] = st.grouping_id
-
-    if offset == 0:
-        return (
-            empty_token_batch(
-                B, grouping_field=gf, modality_names=names, modality_map=mmap
-            ),
-            empty_objective,
-        )
 
     fields = _stack_objective_fields(
         steps, sequence_ids=seq_per_step, grouping_field=gf

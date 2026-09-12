@@ -120,9 +120,10 @@ def _pair_weight(
 ) -> torch.Tensor:
     """``[N-1]`` weights: ``1.0`` when ``(i, i+1)`` share a run, else ``0.0``.
 
-    A run is the same ``sequence_id`` and, when ``grouping_field`` is set and
-    present, the same grouping column. Batches without those columns skip the
-    corresponding check (every pair stays weight ``1``).
+    A run is the same ``sequence_id`` (when that column is present) and, when
+    ``grouping_field`` is set, the same grouping column. ``grouping_field``
+    set but missing from ``objective_data`` is an error — it must not silently
+    train across task boundaries.
     """
     if device is None:
         device = torch.device("cpu")
@@ -136,7 +137,12 @@ def _pair_weight(
                 f"sequence_id must have shape [{N}], got {tuple(sequence_id.shape)}."
             )
         same_run &= sequence_id[1:] == sequence_id[:-1]
-    if grouping_field is not None and grouping_field in objective_data.keys():
+    if grouping_field is not None:
+        if grouping_field not in objective_data.keys():
+            raise KeyError(
+                f"grouping_field={grouping_field!r} is not a column in "
+                "objective_data; include it in tokenizer objective_fields."
+            )
         grouping = objective_data[grouping_field]
         if grouping.shape != torch.Size([N]):
             raise ValueError(
@@ -144,6 +150,41 @@ def _pair_weight(
             )
         same_run &= grouping[1:] == grouping[:-1]
     return same_run.to(dtype=dtype)
+
+
+def _require_action_ids(action: torch.Tensor, A: int) -> None:
+    """Raise unless every action id is in ``[0, A)``."""
+    if bool((action < 0).any() or (action >= A).any()):
+        raise ValueError(
+            f"action ids must be in [0, {A}), got min={int(action.min())} "
+            f"max={int(action.max())}."
+        )
+
+
+def _require_step_aligned_predictions(
+    objective_data: TensorDict,
+    *,
+    n_pred: int,
+    n_steps: int,
+    who: str,
+) -> None:
+    """PPO / GRPO read one prediction row per step.
+
+    DQN-family objectives expand multi-token steps via ``head_output_count``.
+    Policy objectives do not: more than one head-output token per step is an
+    alignment error, not a silent gather of the wrong rows.
+    """
+    if "head_output_count" not in objective_data.keys():
+        return
+    counts = objective_data["head_output_count"]
+    total = int(counts.sum())
+    if counts.shape != torch.Size([n_steps]) or total != n_pred or n_pred != n_steps:
+        raise ValueError(
+            f"{who} expects one prediction row per step "
+            f"(got {n_pred} prediction rows, {n_steps} steps, "
+            f"head_output_count sum {total}). Use a single head-output token "
+            "per step, or a DQN-family objective."
+        )
 
 
 def _weighted_mean(values: torch.Tensor, pair_weight: torch.Tensor) -> torch.Tensor:
@@ -476,6 +517,7 @@ class DqnObjective(Objective):
                 f"DQN objective expects action shape [N], got {tuple(action.shape)}."
             )
         N = int(action.shape[0])
+        _require_action_ids(action, A)
 
         if N < 2:
             raise ValueError("Not enough valid q values in data.")

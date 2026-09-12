@@ -54,7 +54,7 @@ def _text_pair(hidden_dim: int = 8, **kwargs):
     format_str = kwargs.pop("format", _DEFAULT_FORMAT)
     group_prefix = kwargs.pop("group_prefix", None)
     input_fields = kwargs.pop("input_fields", list(_DEFAULT_FIELDS))
-    image_processor = kwargs.pop("image_processor", None)
+    image_tokenizer = kwargs.pop("image_tokenizer", None)
     objective_fields = kwargs.pop(
         "objective_fields",
         _obj("action", "observation", "reward", "episode_done", "task_done"),
@@ -65,7 +65,7 @@ def _text_pair(hidden_dim: int = 8, **kwargs):
         format=format_str,
         group_prefix=group_prefix,
         tokenizer=hf_tok,
-        image_processor=image_processor,
+        image_tokenizer=image_tokenizer,
         objective_fields=objective_fields,
         grouping_field="grouping_id",
     )
@@ -246,7 +246,7 @@ def test_text_embedder_image_token_ids() -> None:
     tokenizer, enc = _text_pair(
         hidden_dim=D,
         embed_tokens=emb,
-        image_processor=fake_image_tok,
+        image_tokenizer=fake_image_tok,
         format="<{observation},{pixels}>",
         input_fields=[
             {"type": "text", "input_field": "observation", "format": "{observation}"},
@@ -408,13 +408,26 @@ def test_text_model_card_describes_tokenizer(tmp_path) -> None:
 
 
 def test_load_embed_tokens_quiets_transformers() -> None:
-    import inspect
+    from unittest.mock import MagicMock, patch
 
-    from mouse_core.models.embedding import text as text_mod
+    from mouse_core.models.backbone.base import _quiet_transformers_load
+    from mouse_core.models.embedding.text import _load_embed_tokens
 
-    src = inspect.getsource(text_mod._load_embed_tokens)
-    assert "_quiet_transformers_load" in src
-    assert src.index("_quiet_transformers_load") < src.index("from_pretrained")
+    src = nn.Embedding(4, 8)
+    fake_model = MagicMock()
+    fake_model.get_input_embeddings.return_value = src
+    with (
+        patch(
+            "mouse_core.models.backbone.base._quiet_transformers_load",
+            wraps=_quiet_transformers_load,
+        ) as quiet,
+        patch("transformers.AutoModel.from_pretrained", return_value=fake_model) as load,
+    ):
+        emb = _load_embed_tokens(pretrained="dummy", hidden_dim=8, hub_kwargs=None)
+    quiet.assert_called()
+    load.assert_called_once()
+    assert emb.num_embeddings == 4
+    assert torch.equal(emb.weight, src.weight)
 
 
 def test_text_embedder_requires_exactly_one_table_source() -> None:

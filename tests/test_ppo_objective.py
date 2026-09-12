@@ -1,5 +1,6 @@
 """Tests for PPO objective on synthetic tensors."""
 from __future__ import annotations
+import pytest
 import torch
 from tensordict import TensorDict
 from mouse_core.objectives import PpoObjective, sample_discrete_action
@@ -40,22 +41,14 @@ def test_ppo_objective_accepts_squeezed_value() -> None:
 def test_ppo_objective_rejects_wrong_action_shape() -> None:
     objective_data, predictions = _ppo_batch()
     objective_data['action'] = torch.randint(0, 3, (8, 1))
-    try:
+    with pytest.raises(ValueError, match="action shape"):
         PpoObjective()(objective_data, predictions)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError('expected ValueError for action shape [N, 1]')
 
 def test_ppo_objective_requires_min_sequence() -> None:
     objective_data = TensorDict({'action': torch.zeros(1, dtype=torch.long), 'reward': torch.zeros(1), 'episode_done': torch.zeros(1, dtype=torch.long), 'task_done': torch.zeros(1, dtype=torch.long)}, batch_size=[1])
     predictions = TensorDict({'action': torch.zeros(1, 2), 'value': torch.zeros(1, 1)}, batch_size=[1])
-    try:
+    with pytest.raises(ValueError, match="N >= 2"):
         PpoObjective()(objective_data, predictions)
-    except ValueError as e:
-        assert 'N >= 2' in str(e)
-    else:
-        raise AssertionError('expected ValueError for N < 2')
 
 def test_ppo_objective_closed_form_single_transition() -> None:
     objective_data = TensorDict({'action': torch.tensor([0, 0]), 'reward': torch.tensor([0.0, 4.0]), 'episode_done': torch.tensor([0, 0]), 'task_done': torch.tensor([0, 0]), 'old_log_prob': torch.tensor([0.0, 0.0])}, batch_size=[2])
@@ -97,3 +90,10 @@ def test_sample_discrete_action_shapes() -> None:
     actions, log_probs = sample_discrete_action(num_actions=3, logits=logits)
     assert actions.shape == (4,)
     assert log_probs.shape == (4,)
+
+
+def test_ppo_rejects_multi_head_output_rows() -> None:
+    objective_data, predictions = _ppo_batch(n=4)
+    objective_data["head_output_count"] = torch.tensor([2, 2, 1, 1])
+    with pytest.raises(ValueError, match="one prediction row per step"):
+        PpoObjective()(objective_data, predictions)

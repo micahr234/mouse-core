@@ -30,16 +30,29 @@ datasets.disable_progress_bar()
 
 
 def _normalize_value(value: Any) -> Any:
-    """Unwrap 0-dim arrays/tensors to plain Python scalars.
+    """Unwrap 0-dim arrays/tensors (and HF's 1-element list encoding of them).
 
     Environments (e.g. mouse-gym) emit step fields as 0-dim NumPy arrays.
-    ``Dataset.from_list`` would serialize those as 1-element lists, breaking
-    scalar consumers downstream, so scalars are unwrapped once at append time.
+    ``Dataset.from_list`` serializes those as 1-element lists, which
+    ``int(...)`` / tokenizers reject, so scalars are unwrapped on append
+    and again when reading Hub / ``from_dataset`` rows.
     """
     item = getattr(value, "item", None)
     if item is not None and getattr(value, "ndim", None) == 0:
         return item()
+    if isinstance(value, (list, tuple)) and len(value) == 1:
+        inner = value[0]
+        if isinstance(inner, (bool, int, float, str)):
+            return inner
+        inner_item = getattr(inner, "item", None)
+        if inner_item is not None and getattr(inner, "ndim", None) == 0:
+            return inner_item()
     return value
+
+
+def _normalize_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Copy ``row`` with 0-d arrays/tensors unwrapped to Python scalars."""
+    return {k: _normalize_value(v) for k, v in row.items()}
 
 
 def _hf_batch_to_rows(batch: dict[str, Any]) -> list[dict]:
@@ -47,7 +60,7 @@ def _hf_batch_to_rows(batch: dict[str, Any]) -> list[dict]:
     if not batch:
         return []
     n = len(next(iter(batch.values())))
-    return [{k: batch[k][i] for k in batch} for i in range(n)]
+    return [_normalize_row({k: batch[k][i] for k in batch}) for i in range(n)]
 
 
 class Datastore:
@@ -141,7 +154,7 @@ class Datastore:
                 result[pos] = src_rows[k]
 
         for pos in np.where(~src_mask)[0]:
-            result[pos] = dict(self._rows[int(idx[pos]) - src_len])
+            result[pos] = _normalize_row(self._rows[int(idx[pos]) - src_len])
 
         return result
 

@@ -359,6 +359,17 @@ def test_missing_seed_field_raises() -> None:
         augment({"action": 0})
 
 
+def test_missing_input_field_raises() -> None:
+    augment = Augmenter(
+        seed_field="task_index",
+        fields=[
+            {"type": 'discrete', "input_field": 'action', "output_field": 'action', "vocab_size": 10, "permute": True}
+        ],
+    )
+    with pytest.raises(KeyError, match="action"):
+        augment({"task_index": 0})
+
+
 def test_discrete_and_done_permutations_use_configured_vocab_sizes() -> None:
     step = {"episode_done": 2, "observation": 1, "task_index": 0}
     rng = _rng_for_key(seed=0, seed_field="task_index", key=0)

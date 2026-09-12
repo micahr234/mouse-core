@@ -4,7 +4,7 @@ import torch
 from tensordict import TensorDict
 
 from mouse_core.objectives import SpObjective
-from mouse_core.objectives.sp import _argmax_random_tie, sp_ce
+from mouse_core.objectives.sp import _argmax_random_tie, sp_ce, sp_js
 
 
 def _episode_done(*shape: int, fill: int = 0) -> torch.Tensor:
@@ -138,3 +138,24 @@ def test_sp_objective_custom_targets_key() -> None:
         objective_data, predictions
     )
     assert loss.item() > 0.0
+
+
+def test_sp_js_scales_by_temperature_squared() -> None:
+    q = torch.tensor([[1.0, 0.0, -1.0]])
+    logits = torch.tensor([[0.5, 0.2, -0.1]])
+    unscaled = sp_js(q, logits, temperature=1.0)
+    scaled = sp_js(q, logits, temperature=2.0)
+    # Softmax(x/T) at T=2 is not 4× the T=1 JS; only the explicit T² factor
+    # is asserted relative to the T=1 formula on the T=2 distributions.
+    from mouse_core.objectives.sp import _soft_distributions
+    import math
+    import torch.nn.functional as F
+
+    log_t, log_s = _soft_distributions(q, logits, 2.0, 0.0)
+    log_m = torch.logaddexp(log_t, log_s) - math.log(2.0)
+    js = 0.5 * (
+        F.kl_div(log_m, log_t, log_target=True, reduction="none").sum(-1)
+        + F.kl_div(log_m, log_s, log_target=True, reduction="none").sum(-1)
+    ).mean()
+    assert torch.allclose(scaled, js * 4.0)
+    assert unscaled.ndim == 0

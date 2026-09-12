@@ -9,7 +9,12 @@ import torch.nn.functional as F
 from tensordict import TensorDict
 
 from mouse_core.objectives.base import Objective
-from mouse_core.objectives.dqn import _pair_weight, _weighted_mean
+from mouse_core.objectives.dqn import (
+    _pair_weight,
+    _require_action_ids,
+    _require_step_aligned_predictions,
+    _weighted_mean,
+)
 
 
 def group_relative_advantages(
@@ -41,7 +46,7 @@ def group_relative_advantages(
     mean = rewards.mean()
     # Population std so a two-sample group is well-defined.
     std = rewards.std(correction=0)
-    if float(std.item()) < eps:
+    if std < eps:
         return torch.zeros_like(rewards)
     return (rewards - mean) / (std + eps)
 
@@ -151,11 +156,20 @@ class GrpoObjective(Objective):
         action = objective_data[self.action_key]
         if action.dtype != torch.int64:
             raise TypeError(f"action must be int64, got {action.dtype}.")
+        if action.ndim != 1:
+            raise ValueError(
+                f"GRPO objective expects action shape [N], "
+                f"got {tuple(action.shape)}."
+            )
+        _require_step_aligned_predictions(
+            objective_data, n_pred=N, n_steps=int(action.shape[0]), who="GRPO"
+        )
         if action.shape != torch.Size([N]):
             raise ValueError(
                 f"GRPO objective expects action shape [{N}], "
                 f"got {tuple(action.shape)}."
             )
+        _require_action_ids(action, A)
 
         if self.advantage_key not in objective_data.keys():
             raise KeyError(
