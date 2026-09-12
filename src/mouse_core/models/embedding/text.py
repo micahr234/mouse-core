@@ -230,7 +230,10 @@ def _load_embed_tokens(
 ) -> nn.Embedding:
     from transformers import AutoModel
 
-    model = AutoModel.from_pretrained(pretrained, **dict(hub_kwargs or {}))
+    from mouse_core.models.backbone.base import _quiet_transformers_load
+
+    with _quiet_transformers_load():
+        model = AutoModel.from_pretrained(pretrained, **dict(hub_kwargs or {}))
     src = model.get_input_embeddings()
     if src.embedding_dim != hidden_dim:
         raise ValueError(

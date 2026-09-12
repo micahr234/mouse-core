@@ -407,6 +407,16 @@ def test_text_model_card_describes_tokenizer(tmp_path) -> None:
     assert '{"input_field": "action"}' in text
 
 
+def test_load_embed_tokens_quiets_transformers() -> None:
+    import inspect
+
+    from mouse_core.models.embedding import text as text_mod
+
+    src = inspect.getsource(text_mod._load_embed_tokens)
+    assert "_quiet_transformers_load" in src
+    assert src.index("_quiet_transformers_load") < src.index("from_pretrained")
+
+
 def test_text_embedder_requires_exactly_one_table_source() -> None:
     import pytest
 

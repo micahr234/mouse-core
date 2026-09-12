@@ -247,6 +247,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``grouping_field: str | None = None`` (``None`` ⇒ no grouping filter).
 
 ### Changed
+- ``TextEmbedder`` Hub load (``_load_embed_tokens``) uses the same
+  ``_quiet_transformers_load`` wrapper as the backbone, so
+  ``lm_head.weight | UNEXPECTED`` is not printed when copying
+  ``embed_tokens`` from a causal-LM checkpoint.
 - Cached-decode ``mask_mod`` is a pair of module-level functions
   (``_logical_mask_mod`` / ``_physical_mask_mod``) that read a holder
   dict. Every ``FlexDecodeSession`` uses the same function object so
