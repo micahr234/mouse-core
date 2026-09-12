@@ -23,11 +23,11 @@ def _q_pair(
     n = online_e.shape[0]
     return (
         TensorDict(
-            {"action_value_episode": online_e, "action_value_task": online_t},
+            {"episode": online_e, "task": online_t},
             batch_size=[n],
         ),
         TensorDict(
-            {"action_value_episode": delayed_e, "action_value_task": delayed_t},
+            {"episode": delayed_e, "task": delayed_t},
             batch_size=[n],
         ),
     )
@@ -49,51 +49,21 @@ def _model(heads: dict[str, DiscreteActionValueHead], hidden_dim: int = 8) -> Mo
             {"type": "discrete", "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}
         ],
     )
-    return Model(encoder=encoder, backbone=IdentityBackbone(hidden_dim=hidden_dim), heads=heads, action_head="action_value_episode", reasoner=None, recurrence=None)
-
-
-def test_episode_task_heads_must_appear_together() -> None:
-    try:
-        _model({"action_value_episode": _head()})
-    except ValueError as e:
-        assert "together" in str(e)
-    else:
-        raise AssertionError("expected ValueError for episode head without task head")
-    try:
-        _model({"action_value_task": _head()})
-    except ValueError as e:
-        assert "together" in str(e)
-    else:
-        raise AssertionError("expected ValueError for task head without episode head")
-
-
-def test_episode_task_heads_cannot_combine_with_action_value() -> None:
-    try:
-        _model(
-            {
-                "action_value": _head(),
-                "action_value_episode": _head(),
-                "action_value_task": _head(),
-            }
-        )
-    except ValueError as e:
-        assert "cannot be combined" in str(e)
-    else:
-        raise AssertionError("expected ValueError for mixed Q-head names")
+    return Model(encoder=encoder, backbone=IdentityBackbone(hidden_dim=hidden_dim), heads=heads, action_head=("episode", "task"), reasoner=None, recurrence=None)
 
 
 def test_get_action_sums_episode_and_task_q() -> None:
     model = _model(
         {
-            "action_value_episode": _head(out_features=3),
-            "action_value_task": _head(out_features=3),
+            "episode": _head(out_features=3),
+            "task": _head(out_features=3),
         }
     )
     # Episode prefers 0, task prefers 2, sum prefers 1.
     preds = TensorDict(
         {
-            "action_value_episode": torch.tensor([[3.0, 1.0, 0.0]]),
-            "action_value_task": torch.tensor([[0.0, 3.0, 2.0]]),
+            "episode": torch.tensor([[3.0, 1.0, 0.0]]),
+            "task": torch.tensor([[0.0, 3.0, 2.0]]),
         }
     )
     action = model.get_action(preds, temperature=0.0)
@@ -104,16 +74,16 @@ def test_get_action_sums_episode_and_task_q() -> None:
 def test_get_action_sums_batched_decode_scores() -> None:
     model = _model(
         {
-            "action_value_episode": _head(out_features=2),
-            "action_value_task": _head(out_features=2),
+            "episode": _head(out_features=2),
+            "task": _head(out_features=2),
         }
     )
     preds = TensorDict(
         {
-            "action_value_episode": torch.tensor(
+            "episode": torch.tensor(
                 [[[1.0, 0.0], [0.0, 1.0]], [[2.0, 0.0], [4.0, 0.0]]]
             ),
-            "action_value_task": torch.tensor(
+            "task": torch.tensor(
                 [[[0.0, 0.0], [0.0, 0.0]], [[0.0, 5.0], [0.0, 5.0]]]
             ),
         }
@@ -125,14 +95,14 @@ def test_get_action_sums_batched_decode_scores() -> None:
 def test_get_action_rejects_flat_multi_step_train_outputs() -> None:
     model = _model(
         {
-            "action_value_episode": _head(out_features=2),
-            "action_value_task": _head(out_features=2),
+            "episode": _head(out_features=2),
+            "task": _head(out_features=2),
         }
     )
     preds = TensorDict(
         {
-            "action_value_episode": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
-            "action_value_task": torch.tensor([[0.0, 0.0], [0.0, 0.0]]),
+            "episode": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+            "task": torch.tensor([[0.0, 0.0], [0.0, 0.0]]),
         }
     )
     with pytest.raises(ValueError, match="N=1"):
@@ -166,10 +136,10 @@ def test_episode_task_save_load_roundtrip(tmp_path) -> None:
         encoder=encoder,
         backbone=IdentityBackbone(hidden_dim=hidden_dim),
         heads={
-            "action_value_episode": _head(hidden_dim, 4),
-            "action_value_task": _head(hidden_dim, 4),
+            "episode": _head(hidden_dim, 4),
+            "task": _head(hidden_dim, 4),
         },
-        action_head="action_value_episode",
+        action_head=("episode", "task"),
         reasoner=None,
         recurrence=None,
     ).eval()
@@ -178,9 +148,9 @@ def test_episode_task_save_load_roundtrip(tmp_path) -> None:
     save_model(model, tmp_path)
     loaded = load_model(tmp_path, train_kernel="varlen", decode_kernel="flex", dtype=torch.float32).eval()
     actual = loaded(batch_to_token_batch(tok_from_encoder(loaded.encoder), batch)).predictions
-    assert torch.allclose(actual["action_value_episode"], expected["action_value_episode"])
-    assert torch.allclose(actual["action_value_task"], expected["action_value_task"])
-    assert loaded.action_head == "action_value_episode"
+    assert torch.allclose(actual["episode"], expected["episode"])
+    assert torch.allclose(actual["task"], expected["task"])
+    assert loaded.action_head == ("episode", "task")
     assert set(model.state_dict()) == set(loaded.state_dict())
 
 
@@ -203,22 +173,26 @@ def test_shared_astar_not_per_head_argmax() -> None:
     delayed_t = torch.tensor([[0.0, 0.0], [0.0, 3.0]])
     preds, delayed = _q_pair(online_e, online_t, delayed_e, delayed_t)
     loss, metrics = EpisodeTaskDqnObjective(
-        gamma_step=1.0,
-        gamma_episode_terminal=0.0,
-        episode_td_lambda=0.0,
-        task_td_lambda=0.0,
+        episode_gamma_step=1.0,
+        episode_gamma_episode_terminal=0.0,
         task_gamma_step=1.0,
-    )(step_stream, preds, delayed)
+        episode_gamma_episode_truncated=0.0,
+        episode_gamma_task_terminal=0.0,
+        episode_gamma_task_truncated=0.0,
+        task_gamma_episode_terminal=1.0,
+        task_gamma_episode_truncated=1.0,
+        task_gamma_task_terminal=0.0,
+        task_gamma_task_truncated=0.0)(step_stream, preds, delayed)
     # Episode: gathered Q=4, target = 0 + 1 * Q_e[a*]=4 → 0.
     # Task: gathered Q=3, target = 0 + 1 * Q_t[a*]=3 → 0.
     # Own-max episode target would be 5 and loss_e would be 1.
-    assert abs(metrics["action_value_episode"] - 0.0) < 1e-5
-    assert abs(metrics["action_value_task"] - 0.0) < 1e-5
+    assert abs(metrics["episode"] - 0.0) < 1e-5
+    assert abs(metrics["task"] - 0.0) < 1e-5
     assert abs(loss.item() - 0.0) < 1e-5
 
 
 def test_episode_head_ignores_next_episode_reward() -> None:
-    """gamma_episode=0 so the episode head target is just the step reward."""
+    """episode_gamma_episode_*=0 so the episode head target is just the step reward."""
     step_stream = TensorDict(
         {
             "action": torch.tensor([0, 1, 0]),
@@ -235,18 +209,23 @@ def test_episode_head_ignores_next_episode_reward() -> None:
     delayed_t = torch.tensor([[0.0, 0.0], [1.0, 0.0], [0.0, 0.0]])
     preds, delayed = _q_pair(online_e, online_t, delayed_e, delayed_t)
     _, metrics = EpisodeTaskDqnObjective(
-        gamma_step=0.0,
-        gamma_episode_terminal=0.0,
-        episode_td_lambda=0.0,
-        task_td_lambda=0.0,
-    )(step_stream, preds, delayed)
+        episode_gamma_step=0.0,
+        episode_gamma_episode_terminal=0.0,
+        episode_gamma_episode_truncated=0.0,
+        episode_gamma_task_terminal=0.0,
+        episode_gamma_task_truncated=0.0,
+        task_gamma_step=1.0,
+        task_gamma_episode_terminal=1.0,
+        task_gamma_episode_truncated=1.0,
+        task_gamma_task_terminal=0.0,
+        task_gamma_task_truncated=0.0)(step_stream, preds, delayed)
     # Both pairs have γ=0, so targets are rewards 1 and 5: (2-1)^2, (3-5)^2 → 2.5.
     # Bootstrapping the next-episode start into pair 0 would use Q_e[a*]=9.
-    assert abs(metrics["action_value_episode"] - 2.5) < 1e-5
+    assert abs(metrics["episode"] - 2.5) < 1e-5
 
 
-def test_task_lambda_one_bootstraps_sum_at_next_episode() -> None:
-    """λ=1 skips intra-episode steps to (Q_e + Q_t)[a*] at the next start."""
+def test_task_head_bootstraps_sum_at_next_episode() -> None:
+    """Task return skips intra-episode steps to (Q_e + Q_t)[a*] at the next start."""
     step_stream = TensorDict(
         {
             "action": torch.tensor([0, 0, 0]),
@@ -263,15 +242,18 @@ def test_task_lambda_one_bootstraps_sum_at_next_episode() -> None:
     # Step 2 sum [4, 2], a*=0, V_sum = 4. Env reward is ignored by the task head.
     preds, delayed = _q_pair(online_e, online_t, delayed_e, delayed_t)
     _, metrics = EpisodeTaskDqnObjective(
-        gamma_step=0.0,
-        gamma_episode_terminal=0.0,
-        episode_td_lambda=0.0,
-        task_td_lambda=1.0,
+        episode_gamma_step=0.0,
+        episode_gamma_episode_terminal=0.0,
         task_gamma_step=1.0,
         task_gamma_episode_terminal=1.0,
-    )(step_stream, preds, delayed)
+        episode_gamma_episode_truncated=0.0,
+        episode_gamma_task_terminal=0.0,
+        episode_gamma_task_truncated=0.0,
+        task_gamma_episode_truncated=1.0,
+        task_gamma_task_terminal=0.0,
+        task_gamma_task_truncated=0.0)(step_stream, preds, delayed)
     # Both in-run pairs target 4; online task Q gathered is 0 → MSE 16.
-    assert abs(metrics["action_value_task"] - 16.0) < 1e-5
+    assert abs(metrics["task"] - 16.0) < 1e-5
 
 
 def test_task_head_zero_at_task_end() -> None:
@@ -290,14 +272,17 @@ def test_task_head_zero_at_task_end() -> None:
     delayed_t = torch.tensor([[0.0, 0.0], [4.0, 0.0]])
     preds, delayed = _q_pair(online_e, online_t, delayed_e, delayed_t)
     _, metrics = EpisodeTaskDqnObjective(
-        gamma_step=0.0,
-        gamma_episode_terminal=0.0,
-        gamma_task_truncated=0.0,
-        episode_td_lambda=0.0,
-        task_td_lambda=1.0,
+        episode_gamma_step=0.0,
+        episode_gamma_episode_terminal=0.0,
+        episode_gamma_task_truncated=0.0,
         task_gamma_episode_terminal=1.0,
-    )(step_stream, preds, delayed)
-    assert abs(metrics["action_value_task"] - 0.0) < 1e-5
+        task_gamma_task_truncated=0.0,
+        episode_gamma_episode_truncated=0.0,
+        episode_gamma_task_terminal=0.0,
+        task_gamma_step=1.0,
+        task_gamma_episode_truncated=1.0,
+        task_gamma_task_terminal=0.0)(step_stream, preds, delayed)
+    assert abs(metrics["task"] - 0.0) < 1e-5
 
 
 def test_episode_task_objective_metrics() -> None:
@@ -318,10 +303,10 @@ def test_episode_task_objective_metrics() -> None:
         torch.randn(n, a),
         torch.randn(n, a),
     )
-    loss, metrics = EpisodeTaskDqnObjective()(step_stream, preds, delayed)
+    loss, metrics = EpisodeTaskDqnObjective(episode_gamma_step=1.0, episode_gamma_episode_terminal=0.0, episode_gamma_episode_truncated=0.0, episode_gamma_task_terminal=0.0, episode_gamma_task_truncated=0.0, task_gamma_step=1.0, task_gamma_episode_terminal=1.0, task_gamma_episode_truncated=1.0, task_gamma_task_terminal=0.0, task_gamma_task_truncated=0.0)(step_stream, preds, delayed)
     assert loss.ndim == 0
-    assert metrics["action_value_episode"] >= 0.0
-    assert metrics["action_value_task"] >= 0.0
+    assert metrics["episode"] >= 0.0
+    assert metrics["task"] >= 0.0
     assert "q_episode_mean" in metrics
     assert "q_task_mean" in metrics
     assert "watkins_greedy_frac" not in metrics

@@ -52,7 +52,7 @@ mouse-core gives you three building blocks for in-context RL. Compose them in yo
 
 * **Data** (`mouse_core.data`) — stores sequential rows in `Datastore` and batches contiguous windows with `DataLoader`.
 * **Models** (`mouse_core.models`) — encoder + backbone (`LlamaBackbone`, `Qwen3Backbone`, or `IdentityBackbone`) + output heads (`DiscreteActionHead`, `DiscreteActionValueHead`, …).
-* **Objectives** (`mouse_core.objectives`) — training losses such as DQN, AWR, episode/task DQN, PPO, GRPO, SP, and SV.
+* **Objectives** (`mouse_core.objectives`) — training losses such as DQN, n-step DQN, max-over-n-step DQN, episode/task DQN, PPO, GRPO, SP, and SV.
 
 Backbone loading has one public path: instantiate the backbone. For example, `LlamaBackbone(train_kernel="flex", decode_kernel="flex", dtype=preferred_dtype(device), pretrained="meta-llama/Llama-3.2-1B", num_layers=2)` reads the pretrained config, loads matching transformer weights, and exposes `backbone.hidden_dim` for the encoder and heads. Three arguments are required on every transformer backbone (and on `load_model`) because they describe how the model runs on your machine, not what it is, so they are never saved with it: `train_kernel` for the uncached forward, `decode_kernel` for cached decode (`"flex"`, paged FlexAttention, the only kernel that reads K/V through a page table), and `dtype` for the base weights. `model.to(device)` moves and never casts; every part other than the backbone base is float32.
 
@@ -81,8 +81,9 @@ The [example notebooks](examples/) are short usage docs, not full experiments. W
 | [10 — Train offline SP](examples/10_train_offline_sp.ipynb) | Same offline loop as `05`, but `SpObjective` CE onto a random argmax of `info_q_star` with `DiscreteActionHead` *(ranking check)* |
 | [11 — Offline reasoning DQN](examples/11_train_offline_reasoning_dqn.ipynb) | Same offline loop as `02` (including the trailing learnable `value` prompt), plus Coconut-style latent reasoning bursts (`LatentReasoner`, `sample_reasoning_splits`) trained through the DQN loss |
 | [12 — Offline recurrent DQN](examples/12_train_offline_recurrent_dqn.ipynb) | Same offline loop as `02`, with a `Recurrence` section: the backbone runs `num_passes` times per forward through a normalized input-injection adapter, `DqnObjective` runs on every pass in `out.passes` and the losses are averaged; cached inference keeps the same passes |
-| [13 — Offline episode/task DQN](examples/13_train_offline_episode_task_dqn.ipynb) | Same offline loop as `02`, with `action_value_episode` + `action_value_task` heads and `EpisodeTaskDqnObjective`: both heads share one delayed `a* = argmax(Q_e + Q_t)`; `get_action` maximizes the sum |
-| [14 — Train offline AWR](examples/14_train_offline_awr.ipynb) | Same offline loop as `02`, with `DiscreteActionValueHead` + `DiscreteActionHead` and `AwrObjective`: Q fits in-batch Monte Carlo returns; the policy is advantage-weighted regression (`action_head="action"`) |
+| [13 — Offline episode/task DQN](examples/13_train_offline_episode_task_dqn.ipynb) | Same offline loop as `02`, with `episode` + `task` heads and `EpisodeTaskDqnObjective`: both heads share one delayed `a* = argmax(Q_e + Q_t)`; `action_head=("episode", "task")` makes `get_action` sum them |
+| [14 — Offline n-step DQN](examples/14_train_offline_n_step_dqn.ipynb) | Same offline loop as `02`, with `NStepDqnObjective`: the TD target is the n-step return (`n=3` here), bootstrapping delayed max-Q after `n` rewards (or at the last in-run next state) |
+| [15 — Offline max-over-n-step DQN](examples/15_train_offline_max_n_step_dqn.ipynb) | Same offline loop as `02`, with `selector` + `max_return` heads and `MaxNStepDqnObjective`: max of complete n-step targets (`horizons=(1, 3, 5, 10)`); `action_head="selector"` is the deployed policy |
 
 ### Example dependencies
 
@@ -104,10 +105,10 @@ Each notebook explains the relevant concepts inline. API details live in the Pyt
 
 Every trainable parameter is float32, so plain `AdamW(...)` steps it in place and `Polyak` interpolates in fp32 — no master weights or shadows. Two ways to train the backbone:
 
-- **Full fp32 fine-tuning** — `Qwen3Backbone(train_kernel="flex", decode_kernel="flex", dtype=torch.float32, pretrained="Qwen/Qwen3-0.6B")`; the whole model is float32. Use `"flex"` here: it is compiled and block-sparse in fp32, whereas `"varlen"` on an fp32 base falls to the masked-SDPA reference (the flash kernel needs bf16/fp16) and warns.
+- **Full fp32 fine-tuning** — `Qwen3Backbone(train_kernel="flex", decode_kernel="flex", dtype=torch.float32, pretrained="Qwen/Qwen3-0.6B")`; the whole model is float32. Use `"flex"` here: it is compiled and block-sparse in fp32, whereas `"varlen"` on an fp32 base falls to the masked-SDPA reference (the flash kernel needs bf16/fp16) and warns. The training notebooks use this path.
 - **fp32 LoRA on a frozen bf16 base** — `Qwen3Backbone(train_kernel="flex", decode_kernel="flex", dtype=preferred_dtype(device), pretrained="Qwen/Qwen3-0.6B", lora=LoRAConfig(rank=16, alpha=32))`: on CUDA the frozen base is **bfloat16** and runs FlexAttention, while the LoRA adapters, encoder, reasoner / recurrence, and heads are float32.
 
-Then `model.to(device)`. `AdamW` and `Polyak` reject a trainable non-fp32 parameter, so a fully trainable backbone built in bf16 fails loudly at training time. For inference either kind of checkpoint can be loaded with `dtype=preferred_dtype(device)`.
+Then `model.to(device)`. `AdamW` and `Polyak` reject a trainable non-fp32 parameter, so a fully trainable backbone built in bf16 fails loudly at training time. The example notebooks load checkpoints with `dtype=torch.float32`.
 
 
 ## Contributing 🔧

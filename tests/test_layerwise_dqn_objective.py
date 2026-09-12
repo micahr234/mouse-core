@@ -10,13 +10,13 @@ def test_effective_horizon() -> None:
     assert effective_horizon(0.99) == pytest.approx(100.0)
 
 def test_layerwise_dqn_objective_anchors_endpoints() -> None:
-    objective = LayerwiseDqnObjective(num_backbone_layers=4, gamma_step_start=1.0, gamma_step=1.0, gamma_episode_terminal_start=0.0, gamma_episode_terminal=0.99)
+    objective = LayerwiseDqnObjective(num_backbone_layers=4, gamma_step_start=1.0, gamma_step=1.0, gamma_episode_terminal_start=0.0, gamma_episode_terminal=0.99, gamma_episode_truncated_start=0.0, gamma_episode_truncated=0.0, gamma_task_terminal_start=0.0, gamma_task_terminal=0.0, gamma_task_truncated_start=0.0, gamma_task_truncated=0.0)
     assert objective.layer_gamma_step == [1.0, 1.0, 1.0, 1.0]
     assert objective.layer_gamma_episode_terminal[0] == 0.0
     assert objective.layer_gamma_episode_terminal[-1] == 0.99
 
 def test_layerwise_dqn_objective_linear_horizon() -> None:
-    objective = LayerwiseDqnObjective(num_backbone_layers=4, gamma_step_start=0.0, gamma_step=0.99)
+    objective = LayerwiseDqnObjective(num_backbone_layers=4, gamma_step_start=0.0, gamma_step=0.99, gamma_episode_terminal_start=0.0, gamma_episode_terminal=0.0, gamma_episode_truncated_start=0.0, gamma_episode_truncated=0.0, gamma_task_terminal_start=0.0, gamma_task_terminal=0.0, gamma_task_truncated_start=0.0, gamma_task_truncated=0.0)
     horizons = [effective_horizon(g) for g in objective.layer_gamma_step]
     assert horizons == pytest.approx([1.0, 34.0, 67.0, 100.0])
     assert objective.layer_gamma_step[0] == 0.0
@@ -27,7 +27,7 @@ def test_layerwise_dqn_objective_runs() -> None:
     step_stream = TensorDict({'action': torch.randint(0, a, (n,)), 'reward': torch.randn(n), 'episode_done': torch.zeros(n, dtype=torch.long), 'task_done': torch.zeros(n, dtype=torch.long), 'sequence_id': torch.tensor([0, 0, 0, 0, 1, 1, 1, 1])}, batch_size=[n])
     predictions = TensorDict({'action_value_layerwise': torch.randn(n, layers, a)}, batch_size=[n])
     delayed = TensorDict({'action_value_layerwise': torch.randn(n, layers, a)}, batch_size=[n])
-    objective = LayerwiseDqnObjective(num_backbone_layers=layers, gamma_step_start=0.0, gamma_step=0.99)
+    objective = LayerwiseDqnObjective(num_backbone_layers=layers, gamma_step_start=0.0, gamma_step=0.99, gamma_episode_terminal_start=0.0, gamma_episode_terminal=0.0, gamma_episode_truncated_start=0.0, gamma_episode_truncated=0.0, gamma_task_terminal_start=0.0, gamma_task_terminal=0.0, gamma_task_truncated_start=0.0, gamma_task_truncated=0.0)
     loss, metrics = objective(step_stream, predictions, delayed)
     assert loss.ndim == 0
     assert 'action_value_layerwise' in metrics
@@ -42,7 +42,7 @@ def test_layerwise_dqn_objective_skips_transitions_across_sequences() -> None:
     step_stream = TensorDict({'action': torch.randint(0, a, (n,)), 'reward': torch.randn(n), 'episode_done': torch.zeros(n, dtype=torch.long), 'task_done': torch.zeros(n, dtype=torch.long), 'sequence_id': torch.tensor([0, 0, 1, 1, 1])}, batch_size=[n])
     predictions = TensorDict({'action_value_layerwise': torch.randn(n, layers, a)}, batch_size=[n])
     delayed = TensorDict({'action_value_layerwise': torch.randn(n, layers, a)}, batch_size=[n])
-    objective = LayerwiseDqnObjective(num_backbone_layers=layers, gamma_step_start=0.0, gamma_step=0.99)
+    objective = LayerwiseDqnObjective(num_backbone_layers=layers, gamma_step_start=0.0, gamma_step=0.99, gamma_episode_terminal_start=0.0, gamma_episode_terminal=0.0, gamma_episode_truncated_start=0.0, gamma_episode_truncated=0.0, gamma_task_terminal_start=0.0, gamma_task_terminal=0.0, gamma_task_truncated_start=0.0, gamma_task_truncated=0.0)
     loss_before, _ = objective(step_stream, predictions, delayed)
     corrupted = step_stream.clone()
     corrupted['reward'][2] = 1000000.0
@@ -63,8 +63,15 @@ def test_layerwise_dqn_all_out_of_run_pairs_yield_zero_loss() -> None:
     predictions = TensorDict({'action_value_layerwise': torch.randn(3, 2, 2)}, batch_size=[3])
     delayed = TensorDict({'action_value_layerwise': torch.randn(3, 2, 2)}, batch_size=[3])
     loss, metrics = LayerwiseDqnObjective(
-        num_backbone_layers=2, gamma_step_start=0.0, gamma_step=0.99
-    )(step_stream, predictions, delayed)
+        num_backbone_layers=2, gamma_step_start=0.0, gamma_step=0.99,
+        gamma_episode_terminal_start=0.0,
+        gamma_episode_terminal=0.0,
+        gamma_episode_truncated_start=0.0,
+        gamma_episode_truncated=0.0,
+        gamma_task_terminal_start=0.0,
+        gamma_task_terminal=0.0,
+        gamma_task_truncated_start=0.0,
+        gamma_task_truncated=0.0)(step_stream, predictions, delayed)
     assert abs(loss.item()) < 1e-05
     assert abs(metrics['q_values_mean']) < 1e-05
 
@@ -73,7 +80,7 @@ def test_layerwise_dqn_objective_rejects_layer_mismatch() -> None:
     step_stream = TensorDict({'action': torch.zeros(3, dtype=torch.long), 'reward': torch.zeros(3), 'episode_done': torch.zeros(3, dtype=torch.long), 'task_done': torch.zeros(3, dtype=torch.long)}, batch_size=[3])
     predictions = TensorDict({'action_value_layerwise': torch.zeros(3, 2, 2)}, batch_size=[3])
     delayed = TensorDict({'action_value_layerwise': torch.zeros(3, 2, 2)}, batch_size=[3])
-    objective = LayerwiseDqnObjective(num_backbone_layers=3, gamma_step_start=0.0, gamma_step=0.99)
+    objective = LayerwiseDqnObjective(num_backbone_layers=3, gamma_step_start=0.0, gamma_step=0.99, gamma_episode_terminal_start=0.0, gamma_episode_terminal=0.0, gamma_episode_truncated_start=0.0, gamma_episode_truncated=0.0, gamma_task_terminal_start=0.0, gamma_task_terminal=0.0, gamma_task_truncated_start=0.0, gamma_task_truncated=0.0)
     try:
         objective(step_stream, predictions, delayed)
     except ValueError as exc:
@@ -99,8 +106,15 @@ def test_layerwise_dqn_objective_does_not_backprop_through_delayed_q() -> None:
     predictions = TensorDict({"action_value_layerwise": online}, batch_size=[n])
     delayed_td = TensorDict({"action_value_layerwise": delayed}, batch_size=[n])
     loss, _ = LayerwiseDqnObjective(
-        num_backbone_layers=layers, gamma_step_start=1.0, gamma_step=1.0
-    )(step_stream, predictions, delayed_td)
+        num_backbone_layers=layers, gamma_step_start=1.0, gamma_step=1.0,
+        gamma_episode_terminal_start=0.0,
+        gamma_episode_terminal=0.0,
+        gamma_episode_truncated_start=0.0,
+        gamma_episode_truncated=0.0,
+        gamma_task_terminal_start=0.0,
+        gamma_task_terminal=0.0,
+        gamma_task_truncated_start=0.0,
+        gamma_task_truncated=0.0)(step_stream, predictions, delayed_td)
     loss.backward()
     assert online.grad is not None
     assert delayed.grad is None
@@ -112,12 +126,24 @@ def test_single_layer_rejects_mismatched_start_and_deep_gamma() -> None:
             num_backbone_layers=1,
             gamma_step_start=0.0,
             gamma_step=0.99,
-        )
+            gamma_episode_terminal_start=0.0,
+            gamma_episode_terminal=0.0,
+            gamma_episode_truncated_start=0.0,
+            gamma_episode_truncated=0.0,
+            gamma_task_terminal_start=0.0,
+            gamma_task_terminal=0.0,
+            gamma_task_truncated_start=0.0,
+            gamma_task_truncated=0.0)
     objective = LayerwiseDqnObjective(
         num_backbone_layers=1,
         gamma_step_start=0.5,
         gamma_step=0.5,
         gamma_episode_terminal_start=0.0,
         gamma_episode_terminal=0.0,
-    )
+        gamma_episode_truncated_start=0.0,
+        gamma_episode_truncated=0.0,
+        gamma_task_terminal_start=0.0,
+        gamma_task_terminal=0.0,
+        gamma_task_truncated_start=0.0,
+        gamma_task_truncated=0.0)
     assert objective.layer_gamma_step == [0.5]

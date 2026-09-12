@@ -14,7 +14,7 @@ backbone)::
     with torch.no_grad():
         delayed_out = delayed_model(inputs)
     ...
-    polyak.update(tau_heads=0.0005, tau_encoder=0.0005, tau_backbone=0.0005)
+    polyak.update(tau_heads=0.0001, tau_encoder=0.01, tau_backbone=0.01)
 
 Per section, ``θ_delayed ← τ·θ_online + (1−τ)·θ_delayed``. ``τ = 0`` keeps
 that section frozen; ``τ = 1`` copies the online weights (no delay).

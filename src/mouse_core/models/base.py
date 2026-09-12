@@ -529,7 +529,10 @@ def _heads_config(model: "Model") -> dict[str, Any]:
         spec = _head_config(name, head)
         if spec is not None:
             heads.append(spec)
-    return {"action_head": model.action_head, "heads": heads}
+    action_head = model.action_head
+    if isinstance(action_head, tuple):
+        action_head = list(action_head)
+    return {"action_head": action_head, "heads": heads}
 
 
 def _head_config(name: str, head: BaseHead) -> dict[str, Any] | None:
@@ -927,19 +930,15 @@ class Model(nn.Module):
         - a single :class:`~mouse_core.models.heads.base.BaseHead` (e.g. ``DiscreteActionValueHead(...)``):
           it becomes the only enabled head;
         - a list of head instances (e.g. ``[DiscreteActionValueHead(...), SwiGLUHead(...)]``):
-          names are inferred; ``action_head`` selects which one ``get_action`` uses;
-        - a dict mapping canonical names (``"action_value"``,
-          ``"action_value_episode"``, ``"action_value_task"``, ``"action"``,
-          ``"value"``) to head instances or ``None`` (for full control and/or
-          multiple heads).
+          names are inferred from type; ``action_head`` selects which
+          ``get_action`` uses;
+        - a dict mapping caller-chosen names to head instances or ``None``.
       When a plain head (SwiGLUHead) is passed without a name it defaults to ``"action"``;
-      use the dict form if you want it under ``"value"``.
+      use the dict form to pick the key.
 
-    ``action_head`` names which head ``get_action`` consults. Required.
-    ``action_value_episode`` and ``action_value_task`` must be used together
-    and cannot be combined with ``action_value`` or ``action_value_layerwise``.
-    When that pair is present, ``get_action`` always uses
-    ``Q_episode + Q_task``. ``reasoner`` and ``recurrence`` are required
+    ``action_head`` names which head(s) ``get_action`` consults. Required.
+    A string selects one head; a sequence of names sums those heads'
+    scores. ``reasoner`` and ``recurrence`` are required
     (pass ``None`` when unused) and cannot be combined.
 
     Full construction::
@@ -968,29 +967,20 @@ class Model(nn.Module):
     ``examples/12_train_offline_recurrent_dqn.ipynb``.
     """
 
-    _VALID_HEADS = (
-        "action_value",
-        "action_value_episode",
-        "action_value_task",
-        "action_value_layerwise",
-        "action",
-        "value",
-    )
-    _EPISODE_TASK_HEADS = ("action_value_episode", "action_value_task")
-
     @staticmethod
     def _normalize_heads(
         heads: BaseHead | list[BaseHead] | Mapping[str, BaseHead | None] | None,
-        action_head: str | None,
+        action_head: str | Sequence[str] | None,
     ) -> dict[str, BaseHead]:
         """Convert the flexible ``heads=`` argument into the internal ``name -> head`` dict.
 
         Supported inputs:
-          - dict (canonical names to head or None): passed through with validation.
+          - dict (caller-chosen names to head or None): passed through.
           - single BaseHead instance: becomes the only head; name is inferred
-            (SwiGLUHead defaults to "action"; you can pass action_head="value" to select it).
+            from type (SwiGLUHead defaults to "action"; pass a string
+            ``action_head`` to store it under that key).
           - list/tuple of BaseHead: each gets an inferred name; you *must* provide
-            action_head= to declare which one is used by get_action().
+            action_head= to declare which heads get_action() uses.
         """
         if heads is None:
             return {}
@@ -1000,8 +990,10 @@ class Model(nn.Module):
             filtered: dict[str, BaseHead] = {}
             for name, h in heads.items():
                 if h is not None:
-                    if name not in Model._VALID_HEADS:
-                        raise ValueError(f"head name {name!r} is not one of {Model._VALID_HEADS}")
+                    if not isinstance(name, str) or not name:
+                        raise ValueError(
+                            f"head name must be a non-empty string, got {name!r}"
+                        )
                     if not isinstance(h, BaseHead):
                         raise TypeError(f"head {name!r} must be a BaseHead or None, got {type(h)}")
                     filtered[name] = h
@@ -1009,7 +1001,8 @@ class Model(nn.Module):
 
         # Single head instance gives an implicit single-head model.
         if isinstance(heads, BaseHead):
-            name = Model._infer_head_name(heads, preferred=action_head)
+            preferred = action_head if isinstance(action_head, str) else None
+            name = Model._infer_head_name(heads, preferred=preferred)
             return {name: heads}
 
         # List of heads → explicit action_head required
@@ -1023,7 +1016,7 @@ class Model(nn.Module):
                 nm = Model._infer_head_name(h, preferred=None)
                 if nm in result:
                     raise ValueError(
-                        f"Multiple heads would map to the same canonical name {nm!r}. "
+                        f"Multiple heads would map to the same inferred name {nm!r}. "
                         "Use a dict form to provide distinct names, e.g. "
                         "heads={'action_value': h1, 'action': h2}."
                     )
@@ -1032,7 +1025,7 @@ class Model(nn.Module):
             if action_head is None:
                 raise TypeError(
                     "When passing heads as a list you must also specify action_head= "
-                    "(a canonical name) to select the head used by get_action()."
+                    "to select the head(s) used by get_action()."
                 )
             return result
 
@@ -1043,18 +1036,18 @@ class Model(nn.Module):
 
     @staticmethod
     def _infer_head_name(head: BaseHead, preferred: str | None = None) -> str:
-        """Infer the canonical storage / output key for a concrete head instance."""
+        """Infer a default storage key from the head type when no dict key is given."""
         if isinstance(head, LayerwiseDiscreteActionValueHead):
             return "action_value_layerwise"
         if isinstance(head, DiscreteActionValueHead):
             return "action_value"
         if isinstance(head, SwiGLUHead):
-            if preferred in ("action", "value"):
+            if preferred is not None:
                 return preferred
             return "action"
         raise TypeError(
-            f"Cannot infer canonical name for head of type {type(head).__name__}. "
-            f"Use the dict form with an explicit key from {Model._VALID_HEADS}."
+            f"Cannot infer a name for head of type {type(head).__name__}. "
+            "Use the dict form with an explicit key."
         )
 
     def __init__(
@@ -1063,7 +1056,7 @@ class Model(nn.Module):
         encoder: Encoder,
         backbone: Backbone,
         heads: BaseHead | list[BaseHead] | Mapping[str, BaseHead | None],
-        action_head: str,
+        action_head: str | Sequence[str],
         reasoner: LatentReasoner | None,
         recurrence: Recurrence | None,
     ):
@@ -1127,55 +1120,38 @@ class Model(nn.Module):
         filtered: dict[str, BaseHead] = {}
         for name, head in heads_dict.items():
             if head is not None:
-                if name not in self._VALID_HEADS:
-                    raise ValueError(f"head name {name!r} is not one of {self._VALID_HEADS}")
                 if not isinstance(head, BaseHead):
                     raise TypeError(f"head {name!r} must be a BaseHead or None, got {type(head)}")
                 filtered[name] = head
         self.heads = nn.ModuleDict(filtered)  # for parameters/state
         self._heads: dict[str, BaseHead] = filtered  # typed view for calling
 
-        has_episode = "action_value_episode" in self._heads
-        has_task = "action_value_task" in self._heads
-        if has_episode != has_task:
+        action_names = _action_head_names(action_head)
+        missing = [name for name in action_names if name not in self.heads]
+        if missing:
             raise ValueError(
-                "action_value_episode and action_value_task must be used together."
+                f"action_head names {missing} are not enabled; "
+                f"heads are {tuple(self.heads)}."
             )
-        if has_episode and (
-            "action_value" in self._heads or "action_value_layerwise" in self._heads
-        ):
-            raise ValueError(
-                "action_value_episode / action_value_task cannot be combined with "
-                "action_value or action_value_layerwise."
-            )
-        if has_episode:
-            for name in Model._EPISODE_TASK_HEADS:
-                if not isinstance(self._heads[name], DiscreteActionValueHead):
-                    raise TypeError(
-                        f"{name} must be a DiscreteActionValueHead, "
-                        f"got {type(self._heads[name]).__name__}."
-                    )
+        self.action_head: str | tuple[str, ...] = (
+            action_names[0] if len(action_names) == 1 else action_names
+        )
 
-        if action_head not in self._VALID_HEADS:
-            raise ValueError(f"action_head must be one of {self._VALID_HEADS}, got {action_head!r}.")
-        if action_head not in self.heads:
-            raise ValueError(f"action_head={action_head!r} but no such head is enabled.")
-        self.action_head: str = action_head
-
-        if "action_value_layerwise" in self._heads:
-            layerwise_head = self._heads["action_value_layerwise"]
-            if not isinstance(layerwise_head, LayerwiseDiscreteActionValueHead):
-                raise TypeError("action_value_layerwise head has unexpected type.")
-            bb_layers = _backbone_num_layers(self.backbone)
+        bb_layers: int | None = None
+        for name, head in self._heads.items():
+            if not isinstance(head, LayerwiseDiscreteActionValueHead):
+                continue
             if bb_layers is None:
+                bb_layers = _backbone_num_layers(self.backbone)
+                if bb_layers is None:
+                    raise ValueError(
+                        f"{name} is layerwise and needs a backbone with a known "
+                        "layer count (e.g. Qwen3Backbone or LlamaBackbone)."
+                    )
+            if head.num_backbone_layers != bb_layers:
                 raise ValueError(
-                    "action_value_layerwise requires a backbone with a known layer count "
-                    "(e.g. Qwen3Backbone or LlamaBackbone)."
-                )
-            if layerwise_head.num_backbone_layers != bb_layers:
-                raise ValueError(
-                    f"Layerwise head expects {layerwise_head.num_backbone_layers} backbone layers "
-                    f"but backbone has {bb_layers}."
+                    f"Layerwise head {name!r} expects {head.num_backbone_layers} "
+                    f"backbone layers but backbone has {bb_layers}."
                 )
 
         self.hidden_dim = enc_dim
@@ -1656,22 +1632,20 @@ class Model(nn.Module):
         ``[B, S, L, A]``). Flat training outputs ``[N, A]`` are rejected
         unless ``N == 1``.
 
-        When ``action_value_episode`` and ``action_value_task`` are both
-        present, scores are ``Q_episode + Q_task``. Otherwise scores come
-        from ``action_head``.
+        Scores come from ``action_head``: one name, or the sum of each
+        named head.
         """
-        if all(name in self._heads for name in Model._EPISODE_TASK_HEADS):
-            scores = _last_action_scores(
-                cast(torch.Tensor, out["action_value_episode"]),
-                name="action_value_episode",
-            ) + _last_action_scores(
-                cast(torch.Tensor, out["action_value_task"]),
-                name="action_value_task",
-            )
-        else:
-            scores = _last_action_scores(
-                cast(torch.Tensor, out[self.action_head]),
-                name=self.action_head,
+        names = _action_head_names(self.action_head)
+        scores = _last_action_scores(
+            cast(torch.Tensor, out[names[0]]),
+            name=names[0],
+            head=self._heads[names[0]],
+        )
+        for name in names[1:]:
+            scores = scores + _last_action_scores(
+                cast(torch.Tensor, out[name]),
+                name=name,
+                head=self._heads[name],
             )
         if num_actions is not None:
             scores = scores[:, :num_actions]
@@ -1682,25 +1656,45 @@ class Model(nn.Module):
         return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
 
-def _last_action_scores(raw: torch.Tensor, *, name: str) -> torch.Tensor:
+def _action_head_names(action_head: str | Sequence[str]) -> tuple[str, ...]:
+    """Normalize ``action_head`` to one or more non-empty names."""
+    if isinstance(action_head, str):
+        names = (action_head,)
+    else:
+        names = tuple(action_head)
+    if not names:
+        raise ValueError("action_head must name at least one head.")
+    for name in names:
+        if not isinstance(name, str) or not name:
+            raise ValueError(
+                f"action_head names must be non-empty strings, got {name!r}."
+            )
+    if len(set(names)) != len(names):
+        raise ValueError(f"action_head has duplicate names: {names}.")
+    return names
+
+
+def _last_action_scores(
+    raw: torch.Tensor, *, name: str, head: BaseHead
+) -> torch.Tensor:
     """Last-step action scores from a head tensor.
 
-    ``action_value_layerwise``: ``[B, S, L, A]`` / ``[N, L, A]`` → last step,
-    deepest layer. Other Q / logit heads: ``[B, S, A]`` / ``[N, A]``.
+    Layerwise Q: ``[B, S, L, A]`` / ``[N, L, A]`` → last step, deepest
+    layer. Other Q / logit heads: ``[B, S, A]`` / ``[N, A]``.
     """
-    if name == "action_value_layerwise":
+    if isinstance(head, LayerwiseDiscreteActionValueHead):
         if raw.ndim == 4:
             return raw[:, -1, -1, :]
         if raw.ndim == 3:
             if raw.shape[0] != 1:
                 raise ValueError(
-                    f"action_value_layerwise has shape {tuple(raw.shape)}; "
+                    f"{name} has shape {tuple(raw.shape)}; "
                     "get_action on flat [N, L, A] training outputs needs N=1. "
                     "Use cached-decode [B, S, L, A] outputs for a batch."
                 )
             return raw[-1, -1, :].unsqueeze(0)
         raise ValueError(
-            f"action_value_layerwise expects [B, S, L, A] or [N, L, A], "
+            f"{name} expects [B, S, L, A] or [N, L, A], "
             f"got {tuple(raw.shape)}"
         )
     if raw.ndim == 3:

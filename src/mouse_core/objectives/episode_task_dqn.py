@@ -70,61 +70,68 @@ def _head_td_loss(
 class EpisodeTaskDqnObjective(Objective):
     """Two-head Bellman objective with a shared delayed next action.
 
-    Online Q is ``predictions["action_value_episode"]`` and
-    ``predictions["action_value_task"]``. Bootstrap Q comes from the matching
+    Online Q is ``predictions["episode"]`` and
+    ``predictions["task"]``. Bootstrap Q comes from the matching
     delayed tensors. One next action
     ``a* = argmax_a (Q_e(s', a) + Q_t(s', a))`` is read from the **delayed**
     sum; both heads gather that ``a*`` instead of taking their own ``max``.
 
     The episode head is stepwise TD on env reward and does not bootstrap
-    across episode boundaries (``gamma_episode_* = 0``). Bootstrap value is
-    ``Q_e(s', a*)``.
+    across episode boundaries (``episode_gamma_episode_* = 0``). Bootstrap
+    value is ``Q_e(s', a*)``.
 
     The task head predicts return in **subsequent** episodes only (env reward
-    is dropped). Intra-episode discount is ``1.0`` and ``task_td_lambda=1``
-    so the λ-return skips to the next episode start. At a mid-task episode
-    boundary the bootstrap is ``Q_e(s', a*) + Q_t(s', a*)``; mid-episode it
-    is ``Q_t(s', a*)``. Task-end discounts zero the bootstrap.
+    is dropped). Intra-episode discount is ``1.0`` and the target is the
+    full in-run return, so it skips to the next episode start. At a mid-task
+    episode boundary the bootstrap is ``Q_e(s', a*) + Q_t(s', a*)``;
+    mid-episode it is ``Q_t(s', a*)``. Task-end discounts zero the bootstrap.
 
     A run is the same ``sequence_id`` and, when ``grouping_field`` is set and
     present, the same grouping column. Out-of-run pairs have weight ``0``.
     ``action``, ``reward``, ``episode_done``, and ``task_done`` must be in the
     tokenizer ``objective_fields`` keep-list.
 
+    Each head has its own five discounts (same roles as ``DqnObjective``).
+    ``episode_gamma_*`` is the episode head; ``task_gamma_*`` is the task head.
+
     Args:
-        gamma_step: Episode-head discount on running transitions.
-        gamma_episode_terminal: Episode-head discount when the episode
-            terminates. Default ``0`` — remaining return is this episode only.
-        gamma_episode_truncated: Episode-head discount when the episode is
-            truncated. Default ``0``.
-        gamma_task_terminal: Extra discount when the task terminates
-            (multiplies the episode discount). Shared by both heads.
-        gamma_task_truncated: Extra discount when the task is truncated.
-            Shared by both heads. ``0`` zeros the bootstrap.
+        episode_gamma_step: Episode-head discount on running transitions.
+        episode_gamma_episode_terminal: Episode-head discount when the
+            episode terminates. ``0`` — remaining return is this episode
+            only.
+        episode_gamma_episode_truncated: Episode-head discount when the
+            episode is truncated.
+        episode_gamma_task_terminal: Episode-head extra discount when the
+            task terminates (multiplies the episode discount).
+        episode_gamma_task_truncated: Episode-head extra discount when the
+            task is truncated. ``0`` zeros the bootstrap.
         task_gamma_step: Task-head discount on running transitions
-            (default ``1`` so λ=1 skips to the episode boundary).
+            (``1`` so the in-run return skips to the episode boundary).
         task_gamma_episode_terminal: Task-head discount at a natural episode
-            end (default ``1`` — bootstrap the next-episode start).
+            end (``1`` bootstraps the next-episode start).
         task_gamma_episode_truncated: Task-head discount at a truncated
-            episode end (default ``1``).
-        episode_td_lambda: λ for the episode head (default ``0`` = one-step).
-        task_td_lambda: λ for the task head (default ``1`` = skip to the
-            next boundary or the end of the run).
-        watkins: Cut both λ-traces where the taken action is not the online
-            argmax of ``Q_e + Q_t``.
+            episode end.
+        task_gamma_task_terminal: Task-head extra discount when the task
+            terminates (multiplies the episode discount).
+        task_gamma_task_truncated: Task-head extra discount when the task
+            is truncated. ``0`` zeros the bootstrap.
+        watkins: Cut the task-head return where the taken action is not
+            the online argmax of ``Q_e + Q_t``.
     """
 
     def __init__(
         self,
         *,
-        gamma_step: float = 0.99,
-        gamma_episode_terminal: float = 0.0,
-        gamma_episode_truncated: float = 0.0,
-        gamma_task_terminal: float = 0.0,
-        gamma_task_truncated: float = 0.0,
-        task_gamma_step: float = 1.0,
-        task_gamma_episode_terminal: float = 1.0,
-        task_gamma_episode_truncated: float = 1.0,
+        episode_gamma_step: float,
+        episode_gamma_episode_terminal: float,
+        episode_gamma_episode_truncated: float,
+        episode_gamma_task_terminal: float,
+        episode_gamma_task_truncated: float,
+        task_gamma_step: float,
+        task_gamma_episode_terminal: float,
+        task_gamma_episode_truncated: float,
+        task_gamma_task_terminal: float,
+        task_gamma_task_truncated: float,
         action_key: str = "action",
         reward_key: str = "reward",
         reward_scale: float = 1.0,
@@ -134,24 +141,18 @@ class EpisodeTaskDqnObjective(Objective):
         episode_done_key: str = "episode_done",
         task_done_key: str = "task_done",
         grouping_field: str | None = None,
-        episode_td_lambda: float = 0.0,
-        task_td_lambda: float = 1.0,
         watkins: bool = False,
     ) -> None:
-        if not 0.0 <= float(episode_td_lambda) <= 1.0:
-            raise ValueError(
-                f"episode_td_lambda must be in [0, 1], got {episode_td_lambda}."
-            )
-        if not 0.0 <= float(task_td_lambda) <= 1.0:
-            raise ValueError(f"task_td_lambda must be in [0, 1], got {task_td_lambda}.")
-        self.gamma_step = gamma_step
-        self.gamma_episode_terminal = gamma_episode_terminal
-        self.gamma_episode_truncated = gamma_episode_truncated
-        self.gamma_task_terminal = gamma_task_terminal
-        self.gamma_task_truncated = gamma_task_truncated
+        self.episode_gamma_step = episode_gamma_step
+        self.episode_gamma_episode_terminal = episode_gamma_episode_terminal
+        self.episode_gamma_episode_truncated = episode_gamma_episode_truncated
+        self.episode_gamma_task_terminal = episode_gamma_task_terminal
+        self.episode_gamma_task_truncated = episode_gamma_task_truncated
         self.task_gamma_step = task_gamma_step
         self.task_gamma_episode_terminal = task_gamma_episode_terminal
         self.task_gamma_episode_truncated = task_gamma_episode_truncated
+        self.task_gamma_task_terminal = task_gamma_task_terminal
+        self.task_gamma_task_truncated = task_gamma_task_truncated
         self.action_key = action_key
         self.reward_key = reward_key
         self.reward_scale = float(reward_scale)
@@ -161,8 +162,6 @@ class EpisodeTaskDqnObjective(Objective):
         self.episode_done_key = episode_done_key
         self.task_done_key = task_done_key
         self.grouping_field = grouping_field
-        self.episode_td_lambda = float(episode_td_lambda)
-        self.task_td_lambda = float(task_td_lambda)
         self.watkins = bool(watkins)
 
     def __call__(
@@ -173,10 +172,10 @@ class EpisodeTaskDqnObjective(Objective):
     ) -> tuple[torch.Tensor, dict[str, float]]:
         if delayed_predictions is None:
             raise ValueError("EpisodeTaskDqnObjective requires delayed_predictions.")
-        q_e = _require_q(predictions, "action_value_episode")
-        q_t = _require_q(predictions, "action_value_task")
-        q_e_target = _require_q(delayed_predictions, "action_value_episode").detach()
-        q_t_target = _require_q(delayed_predictions, "action_value_task").detach()
+        q_e = _require_q(predictions, "episode")
+        q_t = _require_q(predictions, "task")
+        q_e_target = _require_q(delayed_predictions, "episode").detach()
+        q_t_target = _require_q(delayed_predictions, "task").detach()
         if q_e.shape != q_t.shape:
             raise ValueError(
                 f"episode action_value shape {tuple(q_e.shape)} must match "
@@ -246,11 +245,11 @@ class EpisodeTaskDqnObjective(Objective):
         episode_discount = _boundary_discounts(
             episode_done=episode_done,
             task_done=task_done,
-            gamma_step=self.gamma_step,
-            gamma_episode_terminal=self.gamma_episode_terminal,
-            gamma_episode_truncated=self.gamma_episode_truncated,
-            gamma_task_terminal=self.gamma_task_terminal,
-            gamma_task_truncated=self.gamma_task_truncated,
+            gamma_step=self.episode_gamma_step,
+            gamma_episode_terminal=self.episode_gamma_episode_terminal,
+            gamma_episode_truncated=self.episode_gamma_episode_truncated,
+            gamma_task_terminal=self.episode_gamma_task_terminal,
+            gamma_task_truncated=self.episode_gamma_task_truncated,
             dtype=value_dtype,
             device=device,
         )
@@ -260,8 +259,8 @@ class EpisodeTaskDqnObjective(Objective):
             gamma_step=self.task_gamma_step,
             gamma_episode_terminal=self.task_gamma_episode_terminal,
             gamma_episode_truncated=self.task_gamma_episode_truncated,
-            gamma_task_terminal=self.gamma_task_terminal,
-            gamma_task_truncated=self.gamma_task_truncated,
+            gamma_task_terminal=self.task_gamma_task_terminal,
+            gamma_task_truncated=self.task_gamma_task_truncated,
             dtype=value_dtype,
             device=device,
         )
@@ -280,7 +279,7 @@ class EpisodeTaskDqnObjective(Objective):
             action=action,
             step_of=step_of,
             pair_weight=pair_weight,
-            td_lambda=self.episode_td_lambda,
+            td_lambda=0.0,
             greedy_from=greedy_from,
         )
         loss_t, _ = _head_td_loss(
@@ -291,7 +290,7 @@ class EpisodeTaskDqnObjective(Objective):
             action=action,
             step_of=step_of,
             pair_weight=pair_weight,
-            td_lambda=self.task_td_lambda,
+            td_lambda=1.0,
             greedy_from=greedy_from,
         )
         loss = loss_e + loss_t
@@ -311,8 +310,8 @@ class EpisodeTaskDqnObjective(Objective):
             "q_task_std": q_t_std,
             "q_task_min": q_t_min,
             "q_task_max": q_t_max,
-            "action_value_episode": loss_e.detach(),
-            "action_value_task": loss_t.detach(),
+            "episode": loss_e.detach(),
+            "task": loss_t.detach(),
         }
         if greedy_from is not None:
             named["watkins_greedy_frac"] = _weighted_mean(greedy_from, pair_weight)

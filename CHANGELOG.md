@@ -8,17 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- ``AwrObjective``: Advantage-Weighted Regression (Peng et al., 2019). Q
-  regresses onto in-batch Monte Carlo returns
-  ``G_i = r + γ G_{i+1}`` (no value bootstrap, no delayed network).
-  ``γ`` uses the same done-code table as ``DqnObjective``
-  (``gamma_step``, ``gamma_episode_*``, ``gamma_task_*``): a ``0``
-  gamma stops the sum; a non-zero gamma carries later rewards through,
-  discounted. The policy is weighted log-likelihood
-  ``w = min(exp(A / β), ω_max)`` with ``A = G − max_a Q(s, a)``.
-  ``advantage_temperature``, ``weight_clip``, and ``policy_coef`` are
-  required. Dual heads ``action_value`` + ``action``; act with
-  ``action_head="action"``. See ``examples/14_train_offline_awr.ipynb``.
+- ``MaxNStepDqnObjective``: two heads ``selector`` (deployed
+  policy) and ``max_return``. For each start, complete n-step
+  targets in required ``horizons`` (must include ``1``) bootstrap
+  delayed ``max_return`` at the online selector's endpoint action;
+  the max-return head trains on their max and the selector on the
+  one-step candidate. Incomplete horizons are masked, not shortened.
+  ``examples/15_train_offline_max_n_step_dqn.ipynb`` uses
+  ``horizons=(1, 3, 5, 10)`` and ``action_head="selector"``.
+- ``NStepDqnObjective``: DQN TD target is the n-step return
+  (``n`` required, ``>= 1``). ``n=1`` is one-step TD; larger ``n``
+  uses that many observed rewards then bootstraps delayed max-Q.
+  No ``td_lambda`` and no Watkins cut.
+  ``examples/14_train_offline_n_step_dqn.ipynb`` uses ``n=3`` in
+  the same offline loop as ``02``.
 - ``Tokenizer`` text fields with no ``input_field=`` are consts
   (no step I/O). ``output_field=`` names the field; ``format=`` is the
   literal string to tokenize (no placeholders; ``{{`` / ``}}`` for a
@@ -93,20 +96,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``backbone.dtype`` reports the base dtype (``Model`` casts backbone inputs
   to it). ``LoRAConfig`` is saved under ``config["backbone"]["lora"]`` and
   rebuilt by ``load_model``; the model card lists it. Training notebooks
-  use ``Qwen3Backbone(train_kernel="flex", decode_kernel="flex",
-  dtype=preferred_dtype(device), pretrained="Qwen/Qwen3-0.6B",
-  lora=LoRAConfig(rank=16, alpha=32))``.
-- Dual action-value heads ``action_value_episode`` and
-  ``action_value_task`` (both ``DiscreteActionValueHead``). They must be
-  used together and cannot be combined with ``action_value`` or
-  ``action_value_layerwise``. ``get_action`` maximizes
-  ``Q_episode + Q_task``. ``EpisodeTaskDqnObjective`` trains both heads
-  from one delayed ``a* = argmax_a (Q_e + Q_t)``: the episode head is
-  stepwise TD on env reward and does not bootstrap across episodes; the
-  task head drops current-episode reward and λ-skips to
+  fine-tune the whole backbone in fp32
+  (``dtype=torch.float32``, no ``lora=``).
+- Dual action-value heads ``episode`` and ``task`` (both
+  ``DiscreteActionValueHead``). ``EpisodeTaskDqnObjective`` reads
+  those keys and trains both heads from one delayed
+  ``a* = argmax_a (Q_e + Q_t)``: the episode head is stepwise TD on
+  env reward and does not bootstrap across episodes; the task head
+  drops current-episode reward and λ-skips to
   ``Q_e(s', a*) + Q_t(s', a*)`` at the next episode start.
-  ``examples/13_train_offline_episode_task_dqn.ipynb`` is the offline
-  FrozenLake usage example.
+  ``examples/13_train_offline_episode_task_dqn.ipynb`` uses
+  ``action_head=("episode", "task")`` so ``get_action`` sums them.
 - ``Tokenizer(group_prefix=)`` is a format string over the raw step
   dict (placeholders need not be ``input_fields``). Those tokens are
   ``__text__`` and ``pack_token_batch`` inserts them at the start of each
@@ -280,6 +280,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``grouping_field: str | None = None`` (``None`` ⇒ no grouping filter).
 
 ### Changed
+- DQN discounts have no defaults. ``DqnObjective`` and
+  ``LayerwiseDqnObjective`` require all five ``gamma_*`` values
+  (layerwise also requires every ``gamma_*_start``).
+  ``EpisodeTaskDqnObjective`` requires all ten ``episode_gamma_*`` /
+  ``task_gamma_*`` values. PPO discounts are unchanged.
+- Example notebooks train and infer in fp32: training builds
+  ``Qwen3Backbone`` with ``dtype=torch.float32`` and no LoRA;
+  ``09_inference.ipynb`` loads with ``dtype=torch.float32``.
+- ``EpisodeTaskDqnObjective`` discounts are per-head: ``episode_gamma_*``
+  for the episode head and ``task_gamma_*`` for the task head (each has
+  the five ``DqnObjective`` roles). Shared ``gamma_step`` /
+  ``gamma_episode_*`` / ``gamma_task_*`` names are gone.
+- ``Model`` does not whitelist or special-case head names. Dict keys
+  are caller-chosen; ``action_head`` is one name or a sequence of
+  names whose scores ``get_action`` sums.
+  ``examples/13_train_offline_episode_task_dqn.ipynb`` uses
+  ``episode`` / ``task`` with ``action_head=("episode", "task")``.
+- DQN example notebooks set ``POLYAK_TAU_HEADS = 0.0001``,
+  ``POLYAK_TAU_ENCODER = 0.01``, and ``POLYAK_TAU_BACKBONE = 0.01``.
 - Step-backed ``Tokenizer`` text ``format=`` interpolates ``{field}``
   (optional spec, e.g. ``{field:.0f}``). The placeholder is no longer
   the field's ``output_field`` name.
@@ -628,6 +647,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a cleared stream can restart without rebuilding the whole batch.
 
 ### Removed
+- ``EpisodeTaskDqnObjective`` ``episode_td_lambda`` and ``task_td_lambda``.
+  The episode head is one-step TD; the task head is the full in-run
+  return (skips to the next episode start).
+- ``AwrObjective`` and ``examples/14_train_offline_awr.ipynb``.
 - ``TextTokenizer(format=)`` (the whole-step template). Text values
   render through per-field ``format=`` only.
 - ``flex_packed_forward`` and the ``mouse_core.models.backbone.flex_train``

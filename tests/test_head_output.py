@@ -204,7 +204,7 @@ def test_dqn_duplicated_rows_match_single_head_output() -> None:
     N, A = 5, _ACTIONS
     q = torch.randn(N, A)
     q_target = torch.randn(N, A)
-    objective = DqnObjective(gamma_step=0.9)
+    objective = DqnObjective(gamma_step=0.9, gamma_episode_terminal=0.0, gamma_episode_truncated=0.0, gamma_task_terminal=0.0, gamma_task_truncated=0.0)
 
     base_loss, base_metrics = objective(
         _objective_data(N),
@@ -230,7 +230,7 @@ def test_dqn_multi_head_output_shares_step_target() -> None:
     gamma = 0.9
     q = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
     q_target = torch.tensor([[10.0, 20.0], [30.0, 40.0], [50.0, 60.0]])
-    objective = DqnObjective(gamma_step=gamma)
+    objective = DqnObjective(gamma_step=gamma, gamma_episode_terminal=0.0, gamma_episode_truncated=0.0, gamma_task_terminal=0.0, gamma_task_truncated=0.0)
     data = _objective_data(2, counts=[2, 1], actions=[0, 1])
     data["reward"] = torch.tensor([0.0, 0.5])
     loss, _ = objective(
@@ -247,7 +247,7 @@ def test_dqn_misaligned_head_output_count_raises() -> None:
     N = 3
     q = torch.randn(2 * N, _ACTIONS)
     preds = TensorDict({"action_value": q}, batch_size=[2 * N])
-    objective = DqnObjective()
+    objective = DqnObjective(gamma_step=1.0, gamma_episode_terminal=0.0, gamma_episode_truncated=0.0, gamma_task_terminal=0.0, gamma_task_truncated=0.0)
     with pytest.raises(ValueError, match="misaligned"):
         objective(_objective_data(N, counts=[2, 2, 1]), preds, preds.clone())
     with pytest.raises(ValueError, match="head_output_count column"):

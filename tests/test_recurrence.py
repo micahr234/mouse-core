@@ -272,7 +272,7 @@ def test_mean_loss_over_passes_trains() -> None:
         grouping_field="task_index",
     )
     inputs, objective_data = batch_to_packed(tok, batch, grouping_field="task_index")
-    objective = DqnObjective(gamma_step=1.0, grouping_field="task_index")
+    objective = DqnObjective(gamma_step=1.0, grouping_field="task_index", gamma_episode_terminal=0.0, gamma_episode_truncated=0.0, gamma_task_terminal=0.0, gamma_task_truncated=0.0)
     out = model(inputs)
     with torch.no_grad():
         delayed_out = delayed(inputs)

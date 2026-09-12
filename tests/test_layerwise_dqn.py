@@ -43,7 +43,7 @@ def test_model_layerwise_forward_and_objective() -> None:
         delayed_predictions = delayed(token_batch).predictions
     assert 'action_value_layerwise' in predictions.keys()
     assert predictions['action_value_layerwise'].shape[-2:] == (2, 4)
-    objective = LayerwiseDqnObjective(num_backbone_layers=2, gamma_step_start=0.0, gamma_step=0.99)
+    objective = LayerwiseDqnObjective(num_backbone_layers=2, gamma_step_start=0.0, gamma_step=0.99, gamma_episode_terminal_start=0.0, gamma_episode_terminal=0.0, gamma_episode_truncated_start=0.0, gamma_episode_truncated=0.0, gamma_task_terminal_start=0.0, gamma_task_terminal=0.0, gamma_task_truncated_start=0.0, gamma_task_truncated=0.0)
     loss, metrics = objective(objective_data, predictions, delayed_predictions)
     assert loss.ndim == 0
     assert metrics['action_value_layerwise'] >= 0.0
@@ -54,7 +54,7 @@ def test_layerwise_objective_q_metrics_use_curr_max_q() -> None:
     step_stream = TensorDict({'action': torch.tensor([0, 1, 0]), 'reward': torch.tensor([0.0, 1.0, 5.0]), 'episode_done': torch.tensor([0, 0, 0]), 'task_done': torch.tensor([0, 0, 0])}, batch_size=[3])
     predictions = TensorDict({'action_value_layerwise': torch.tensor([[[0.0, 2.0], [3.0, 0.0]], [[0.0, 0.0], [0.0, 0.0]], [[0.0, 0.0], [0.0, 0.0]]])}, batch_size=[3])
     delayed = TensorDict({'action_value_layerwise': torch.zeros(3, 2, 2)}, batch_size=[3])
-    _, metrics = LayerwiseDqnObjective(num_backbone_layers=2, gamma_step_start=0.0, gamma_step=0.0)(step_stream, predictions, delayed)
+    _, metrics = LayerwiseDqnObjective(num_backbone_layers=2, gamma_step_start=0.0, gamma_step=0.0, gamma_episode_terminal_start=0.0, gamma_episode_terminal=0.0, gamma_episode_truncated_start=0.0, gamma_episode_truncated=0.0, gamma_task_terminal_start=0.0, gamma_task_terminal=0.0, gamma_task_truncated_start=0.0, gamma_task_truncated=0.0)(step_stream, predictions, delayed)
     assert abs(metrics['q_values_mean'] - 1.5) < 1e-05
     assert abs(metrics['layer_0_q_mean'] - 1.0) < 1e-05
     assert abs(metrics['layer_1_q_mean'] - 1.5) < 1e-05
@@ -94,7 +94,14 @@ def _layerwise(td_lambda: float = 0.0, watkins: bool = False) -> LayerwiseDqnObj
     return LayerwiseDqnObjective(
         num_backbone_layers=2, gamma_step_start=0.5, gamma_step=0.9,
         td_lambda=td_lambda, watkins=watkins,
-    )
+        gamma_episode_terminal_start=0.0,
+        gamma_episode_terminal=0.0,
+        gamma_episode_truncated_start=0.0,
+        gamma_episode_truncated=0.0,
+        gamma_task_terminal_start=0.0,
+        gamma_task_terminal=0.0,
+        gamma_task_truncated_start=0.0,
+        gamma_task_truncated=0.0)
 
 
 def test_layerwise_td_lambda_zero_is_one_step() -> None:

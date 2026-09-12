@@ -400,12 +400,11 @@ class DqnObjective(Objective):
         gamma_step: Discount factor for running (non-terminal) transitions
             (``episode_done == 0``).
         gamma_episode_terminal: Discount applied when the episode terminates
-            naturally (``episode_done == 1``). Set to ``1.0`` to bootstrap
-            across episode boundaries (recommended for multi-episode MOUSE
-            tasks).
+            naturally (``episode_done == 1``). ``1.0`` bootstraps across
+            episode boundaries (usual for multi-episode MOUSE tasks).
         gamma_episode_truncated: Discount applied when the episode is truncated
-            (``episode_done == 2``). Set to ``1.0`` to bootstrap across
-            episode boundaries.
+            (``episode_done == 2``). ``1.0`` bootstraps across episode
+            boundaries.
         gamma_task_terminal: Extra discount when the task terminates
             (``task_done == 1``; reserved, unused by mouse-gym today).
             Multiplies the episode discount. ``task_done == 0`` uses ``1.0``.
@@ -438,11 +437,11 @@ class DqnObjective(Objective):
     def __init__(
         self,
         *,
-        gamma_step: float = 0.99,
-        gamma_episode_terminal: float = 0.0,
-        gamma_episode_truncated: float = 0.0,
-        gamma_task_terminal: float = 0.0,
-        gamma_task_truncated: float = 0.0,
+        gamma_step: float,
+        gamma_episode_terminal: float,
+        gamma_episode_truncated: float,
+        gamma_task_terminal: float,
+        gamma_task_truncated: float,
         action_key: str = "action",
         reward_key: str = "reward",
         reward_scale: float = 1.0,
