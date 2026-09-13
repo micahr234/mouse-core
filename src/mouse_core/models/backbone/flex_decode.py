@@ -685,7 +685,11 @@ class FlexDecodeSession:
         block_mask: BlockMask,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         use_compiled = self._use_compiled_layer and _compiled_decode_layer is not None
-        body = _compiled_decode_layer if use_compiled else _decode_layer
+        if use_compiled:
+            body = _compiled_decode_layer
+            assert body is not None
+        else:
+            body = _decode_layer
         flex_fn: Callable[..., torch.Tensor] = flex_attention if use_compiled else self._flex
         layer_hiddens: list[torch.Tensor] = []
         h_in = h
@@ -716,9 +720,14 @@ class FlexDecodeSession:
     ) -> bool:
         bufs = (self._g_h, self._g_cos, self._g_sin, self._g_addr, self._g_rows, self._g_cols)
         srcs = (h, cos, sin, addr, real_rows, real_cols)
-        if any(b is None for b in bufs):
-            return False
-        return all(b.shape == s.shape and b.dtype == s.dtype for b, s in zip(bufs, srcs))
+        ready: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for buf, src in zip(bufs, srcs, strict=True):
+            if buf is None:
+                return False
+            ready.append((buf, src))
+        return all(
+            buf.shape == src.shape and buf.dtype == src.dtype for buf, src in ready
+        )
 
     def _copy_graph_inputs(
         self,
@@ -827,6 +836,10 @@ class FlexDecodeSession:
 
         was_eager_lora = lora_mod._force_eager_lora
         lora_mod._force_eager_lora = True
+        out: torch.Tensor | None = None
+        hiddens: list[torch.Tensor] | None = None
+        graph: torch.cuda.CUDAGraph | None = None
+        empty = False
         try:
             side = torch.cuda.Stream()
             side.wait_stream(torch.cuda.current_stream())
@@ -849,11 +862,14 @@ class FlexDecodeSession:
             lora_mod._force_eager_lora = was_eager_lora
         # Capture allocates into the graph pool; those tensors read as zeros
         # until replay. Replay, then check against warmup.
+        if out is None or hiddens is None:
+            out, hiddens = self._run_layers(h, cos, sin, addr, real_rows, real_cols, block_mask)
         if empty or self._g_out is None or self._g_hiddens is None:
             self._graph_disabled = True
             self._invalidate_graph()
             return out, hiddens
         _restore_static()
+        assert graph is not None
         graph.replay()
         if not torch.allclose(self._g_out.float(), out.float(), atol=5e-2, rtol=5e-2):
             self._graph_disabled = True

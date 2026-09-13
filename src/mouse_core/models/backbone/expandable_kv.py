@@ -30,7 +30,7 @@ def _device_index(device: torch.device) -> int:
 
 
 def _check_drv(result: Any, label: str) -> Any:
-    from cuda.bindings import driver as drv
+    from cuda.bindings import driver as drv  # type: ignore[attr-defined]
 
     if not isinstance(result, tuple):
         result = (result,)
@@ -164,7 +164,7 @@ class ExpandableKvTensor:
         self._shape = new_shape
 
     def _init_vmm(self, shape: tuple[int, int, int, int]) -> None:
-        from cuda.bindings import driver as drv
+        from cuda.bindings import driver as drv  # type: ignore[attr-defined]
 
         torch.cuda.init()
         idx = _device_index(self.device)
@@ -283,7 +283,7 @@ class ExpandableKvTensor:
     def _set_view(self, shape: tuple[int, int, int, int]) -> None:
         nbytes = self._nbytes(shape)
         storage = torch._C._construct_storage_from_data_pointer(self._base, self.device, nbytes)
-        self._raw.set_(storage, 0, _raw_shape(shape))
+        self._raw.set_(storage, 0, _raw_shape(shape))  # type: ignore[call-overload]
         self._tensor = self._raw.permute(1, 2, 0, 3)
         self._shape = shape
 

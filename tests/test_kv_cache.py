@@ -249,7 +249,11 @@ def test_cuda_step_cudagraph_matches_eager_decode(S: int) -> None:
         with torch.no_grad():
             session.forward(embeds=pre, lengths=[8, 8], grouping_ids=preg)
             for embeds in steps:
-                outs.append(session.forward(embeds=embeds, lengths=step_lens, grouping_ids=stepg).clone())
+                hidden = session.forward(
+                    embeds=embeds, lengths=step_lens, grouping_ids=stepg
+                )
+                assert isinstance(hidden, torch.Tensor)
+                outs.append(hidden.clone())
         if graph:
             assert session._graph is not None
             assert not session._graph_disabled

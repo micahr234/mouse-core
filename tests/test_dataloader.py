@@ -86,7 +86,7 @@ def _free_threading_ok() -> bool:
 
 def test_dataloader_requires_num_workers() -> None:
     with pytest.raises(TypeError, match="num_workers"):
-        DataLoader(
+        DataLoader(  # type: ignore[call-arg]
             sequence_length=3,
             batch_size=1,
             transform=_transform(),

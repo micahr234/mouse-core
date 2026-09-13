@@ -506,7 +506,7 @@ def test_text_tokenizer_max_tokens_only_on_variable_length_types() -> None:
         {"type": "learnable", "output_field": "v"},
     ):
         with pytest.raises(TypeError, match="does not accept max_tokens="):
-            TokenizerModalitySpec(max_tokens=1, **kwargs)
+            TokenizerModalitySpec(max_tokens=1, **kwargs)  # type: ignore[arg-type]
     assert TokenizerModalitySpec(type="image", input_field="img", max_tokens=4).max_tokens == 4
     assert (
         TokenizerModalitySpec(type="text", input_field="a", format="{field}", max_tokens=4).max_tokens

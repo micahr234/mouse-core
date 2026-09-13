@@ -20,16 +20,27 @@ def _q(online: torch.Tensor, delayed: torch.Tensor) -> tuple[TensorDict, TensorD
     )
 
 
-def _objective(*, n: int, **kwargs) -> NStepDqnObjective:
-    defaults = dict(
-        gamma_step=1.0,
-        gamma_episode_terminal=0.0,
-        gamma_episode_truncated=0.0,
-        gamma_task_terminal=0.0,
-        gamma_task_truncated=0.0,
+def _objective(
+    *,
+    n: int,
+    gamma_step: float = 1.0,
+    gamma_episode_terminal: float = 0.0,
+    gamma_episode_truncated: float = 0.0,
+    gamma_task_terminal: float = 0.0,
+    gamma_task_truncated: float = 0.0,
+    reward_scale: float = 1.0,
+    reward_shift: float = 0.0,
+) -> NStepDqnObjective:
+    return NStepDqnObjective(
+        n=n,
+        gamma_step=gamma_step,
+        gamma_episode_terminal=gamma_episode_terminal,
+        gamma_episode_truncated=gamma_episode_truncated,
+        gamma_task_terminal=gamma_task_terminal,
+        gamma_task_truncated=gamma_task_truncated,
+        reward_scale=reward_scale,
+        reward_shift=reward_shift,
     )
-    defaults.update(kwargs)
-    return NStepDqnObjective(n=n, **defaults)
 
 
 def _return_fixture() -> tuple[TensorDict, TensorDict, TensorDict]:

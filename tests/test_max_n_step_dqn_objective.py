@@ -27,18 +27,25 @@ def _heads(
     )
 
 
-def _objective(**kwargs) -> MaxNStepDqnObjective:
-    defaults = dict(
-        horizons=(1, 3),
-        max_return_weight=1.0,
-        gamma_step=1.0,
-        gamma_episode_terminal=0.0,
-        gamma_episode_truncated=0.0,
-        gamma_task_terminal=0.0,
-        gamma_task_truncated=0.0,
+def _objective(
+    *,
+    horizons: tuple[int, ...] | list[int] = (1, 3),
+    max_return_weight: float = 1.0,
+    gamma_step: float = 1.0,
+    gamma_episode_terminal: float = 0.0,
+    gamma_episode_truncated: float = 0.0,
+    gamma_task_terminal: float = 0.0,
+    gamma_task_truncated: float = 0.0,
+) -> MaxNStepDqnObjective:
+    return MaxNStepDqnObjective(
+        horizons=horizons,
+        max_return_weight=max_return_weight,
+        gamma_step=gamma_step,
+        gamma_episode_terminal=gamma_episode_terminal,
+        gamma_episode_truncated=gamma_episode_truncated,
+        gamma_task_terminal=gamma_task_terminal,
+        gamma_task_truncated=gamma_task_truncated,
     )
-    defaults.update(kwargs)
-    return MaxNStepDqnObjective(**defaults)
 
 
 def test_pdf_numerical_example() -> None:

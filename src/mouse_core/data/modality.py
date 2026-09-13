@@ -278,7 +278,8 @@ def _validate_skip_pair(spec: TokenizerModalitySpec) -> None:
         return
     if not isinstance(spec.format_skipped, str):
         raise TypeError(f"text modality {name!r} format_skipped= must be a string")
-    if _literal_placeholders(spec.format_skipped, who=name):
+    who = name if name is not None else "text"
+    if _literal_placeholders(spec.format_skipped, who=who):
         raise ValueError(
             f"text modality {name!r} format_skipped= is a literal string "
             "and must not contain placeholders"
