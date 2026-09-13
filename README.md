@@ -82,8 +82,8 @@ The [example notebooks](examples/) are short usage docs, not full experiments. W
 | [11 — Offline reasoning DQN](examples/11_train_offline_reasoning_dqn.ipynb) | Same offline loop as `02` (including the trailing learnable `value` prompt), plus Coconut-style latent reasoning bursts (`LatentReasoner`, `sample_reasoning_splits`) trained through the DQN loss |
 | [12 — Offline recurrent DQN](examples/12_train_offline_recurrent_dqn.ipynb) | Same offline loop as `02`, with a `Recurrence` section: the backbone runs `num_passes` times per forward through a normalized input-injection adapter, `DqnObjective` runs on every pass in `out.passes` and the losses are averaged; cached inference keeps the same passes |
 | [13 — Offline episode/task DQN](examples/13_train_offline_episode_task_dqn.ipynb) | Same offline loop as `02`, with `episode` + `task` heads and `EpisodeTaskDqnObjective`: both heads share one delayed `a* = argmax(Q_e + Q_t)`; `action_head=("episode", "task")` makes `get_action` sum them |
-| [14 — Offline n-step DQN](examples/14_train_offline_n_step_dqn.ipynb) | Same offline loop as `02`, with `NStepDqnObjective`: the TD target is the n-step return (`n=3` here), bootstrapping delayed max-Q after `n` rewards (or at the last in-run next state) |
-| [15 — Offline max-over-n-step DQN](examples/15_train_offline_max_n_step_dqn.ipynb) | Same offline loop as `02`, with `selector` + `max_return` heads and `MaxNStepDqnObjective`: max of complete n-step targets (`horizons=(1, 3, 5, 10)`); `action_head="selector"` is the deployed policy |
+| [14 — Offline n-step DQN](examples/14_train_offline_n_step_dqn.ipynb) | Same offline loop as `02`, with `NStepDqnObjective`: the TD target is the n-step return (`n=3` here), bootstrapping delayed max-Q after `n` rewards; incomplete windows are masked |
+| [15 — Offline max-over-n-step DQN](examples/15_train_offline_max_n_step_dqn.ipynb) | Same complete n-step returns as `14`, then `MaxNStepDqnObjective` extras: `selector` + `max_return` heads, max over `horizons=(1, 3, 5, 10)`, bootstrap at the selector's action; `action_head="selector"` is the deployed policy |
 
 ### Example dependencies
 

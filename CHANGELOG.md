@@ -9,19 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - ``MaxNStepDqnObjective``: two heads ``selector`` (deployed
-  policy) and ``max_return``. For each start, complete n-step
-  targets in required ``horizons`` (must include ``1``) bootstrap
-  delayed ``max_return`` at the online selector's endpoint action;
-  the max-return head trains on their max and the selector on the
-  one-step candidate. Incomplete horizons are masked, not shortened.
+  policy) and ``max_return``. Same complete n-step returns as
+  ``NStepDqnObjective`` (incomplete windows masked, not shortened).
+  The extras are the max over required ``horizons`` (must include
+  ``1``) and the selector that picks the delayed ``max_return``
+  bootstrap action; the max-return head trains on that max and the
+  selector on the one-step candidate.
   ``examples/15_train_offline_max_n_step_dqn.ipynb`` uses
   ``horizons=(1, 3, 5, 10)`` and ``action_head="selector"``.
 - ``NStepDqnObjective``: DQN TD target is the n-step return
   (``n`` required, ``>= 1``). ``n=1`` is one-step TD; larger ``n``
   uses that many observed rewards then bootstraps delayed max-Q.
-  No ``td_lambda`` and no Watkins cut.
-  ``examples/14_train_offline_n_step_dqn.ipynb`` uses ``n=3`` in
-  the same offline loop as ``02``.
+  Incomplete windows (fewer than ``n`` in-run steps ahead, and no
+  ``γ == 0`` stop) are masked, not shortened. No ``td_lambda`` and
+  no Watkins cut. ``examples/14_train_offline_n_step_dqn.ipynb``
+  uses ``n=3`` in the same offline loop as ``02``.
 - ``Tokenizer`` text fields with no ``input_field=`` are consts
   (no step I/O). ``output_field=`` names the field; ``format=`` is the
   literal string to tokenize (no placeholders; ``{{`` / ``}}`` for a

@@ -8,27 +8,16 @@ from tensordict import TensorDict
 from mouse_core.objectives.base import Objective
 from mouse_core.objectives.dqn import (
     _affine,
-    _boundary_discounts,
-    _head_output_layout,
     _in_run_stats,
     _pair_values_to_rows,
-    _pair_weight,
-    _require_action_ids,
-    _require_done_codes,
     _weighted_mean,
 )
-
-
-def _require_q(predictions: TensorDict, key: str) -> torch.Tensor:
-    """Validate a float32 ``[P, A]`` action-value tensor."""
-    q: torch.Tensor = predictions[key]
-    if q.ndim != 2:
-        raise ValueError(f"DQN expects {key} shape [P, A], got {tuple(q.shape)}.")
-    if q.dtype != torch.float32:
-        raise TypeError(
-            f"DQN expects float32 {key} (heads always run in fp32), got {q.dtype}."
-        )
-    return q
+from mouse_core.objectives.n_step_dqn import (
+    _n_step_batch,
+    _n_step_horizon_targets,
+    _pair_valid_to_rows,
+    _require_q,
+)
 
 
 def _require_horizons(horizons: tuple[int, ...] | list[int]) -> tuple[int, ...]:
@@ -51,106 +40,29 @@ def _require_horizons(horizons: tuple[int, ...] | list[int]) -> tuple[int, ...]:
     return tuple(sorted(out))
 
 
-def _shift_pair(values: torch.Tensor, offset: int) -> torch.Tensor:
-    """``out[t] = values[t + offset]``, filled with ``0`` / ``False`` at the tail."""
-    t = int(values.shape[0])
-    if offset == 0:
-        return values
-    if offset >= t:
-        return values.new_zeros(t)
-    return torch.cat([values[offset:], values.new_zeros(offset)])
-
-
-def _bootstrap_at(bootstrap: torch.Tensor, n: int, p: int) -> torch.Tensor:
-    """``out[t] = bootstrap[t + n]`` for ``t in [0, p)``, ``0`` if past the end."""
-    n_steps = int(bootstrap.shape[0])
-    out = bootstrap.new_zeros(p)
-    take = min(p, max(0, n_steps - n))
-    if take > 0:
-        out[:take] = bootstrap[n : n + take]
-    return out
-
-
-@torch.no_grad()
-def _max_n_step_targets(
-    *,
-    reward: torch.Tensor,
-    discount_all: torch.Tensor,
-    bootstrap: torch.Tensor,
-    pair_weight: torch.Tensor,
-    horizons: tuple[int, ...],
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-horizon n-step targets and validity, shapes ``[N-1, H]``.
-
-    Pair ``t`` is the transition out of step ``t`` (reward / gamma stored at
-    ``t+1``). Horizon ``n`` uses the next ``n`` recorded rewards and, unless
-    a ``gamma == 0`` stop fires first, bootstraps ``bootstrap[t + n]``.
-    Incomplete horizons stay ``-inf`` / ``False`` — they are never silently
-    shortened. A zero gamma includes that reward, then fills every remaining
-    ``n >= k+1`` with the stopped sum and needs no later endpoint.
-    """
-    r = reward[1:].to(dtype=bootstrap.dtype)
-    g = discount_all[1:].to(dtype=bootstrap.dtype)
-    in_run = pair_weight > 0
-    p = int(r.shape[0])
-    h_count = len(horizons)
-    horizon_index = {n: i for i, n in enumerate(horizons)}
-    max_h = horizons[-1]
-
-    acc = r.new_zeros(p)
-    discount = r.new_ones(p)
-    alive = in_run.clone()
-    stopped = torch.zeros(p, dtype=torch.bool, device=r.device)
-    candidates = r.new_full((p, h_count), float("-inf"))
-    valid = torch.zeros(p, h_count, dtype=torch.bool, device=r.device)
-
-    for k in range(max_h):
-        n = k + 1
-        r_k = _shift_pair(r, k)
-        g_k = _shift_pair(g, k)
-        run_k = _shift_pair(in_run, k)
-        usable = alive & ~stopped & run_k
-        acc = acc + discount * r_k * usable.to(dtype=acc.dtype)
-        zero_g = usable & (g_k == 0)
-
-        if n in horizon_index:
-            h = horizon_index[n]
-            boot = usable & ~zero_g
-            b_end = _bootstrap_at(bootstrap, n, p)
-            bootstrapped = acc + discount * g_k * b_end
-            candidates[:, h] = torch.where(boot, bootstrapped, candidates[:, h])
-            candidates[:, h] = torch.where(zero_g, acc, candidates[:, h])
-            valid[:, h] = valid[:, h] | boot | zero_g
-
-        if n < max_h and bool(zero_g.any()):
-            for m in horizons:
-                if m > n:
-                    hm = horizon_index[m]
-                    candidates[:, hm] = torch.where(zero_g, acc, candidates[:, hm])
-                    valid[:, hm] = valid[:, hm] | zero_g
-
-        stopped = stopped | zero_g
-        alive = alive & (usable | stopped)
-        discount = torch.where(usable, discount * g_k, discount)
-
-    return candidates, valid
-
-
 class MaxNStepDqnObjective(Objective):
     """Two-head max-over-n-step Bellman objective with a delayed target network.
 
+    Same complete n-step returns as :class:`NStepDqnObjective` (incomplete
+    windows masked, ``γ == 0`` completes early). The extras unique to
+    maximizing over n-steps are the two heads and the max / actor
+    selection: bootstrap values come from delayed ``max_return`` gathered
+    at the action the *online* ``selector`` chooses at each endpoint, the
+    max-return head trains toward the max valid candidate, and the
+    selector (deployed policy) trains toward the one-step candidate.
+
     Instantiate with hyperparameters, then call with
     ``(objective_data, predictions, delayed_predictions)``. Online Q is
-    ``predictions["selector"]`` (deployed policy) and
-    ``predictions["max_return"]``. Bootstrap values come from delayed
-    ``max_return`` only, gathered at the action the *online* selector
-    chooses at each endpoint. Delayed tensors are detached before the
-    targets, so the TD error does not backprop through them.
+    ``predictions["selector"]`` and ``predictions["max_return"]``.
+    Delayed tensors are detached before the targets, so the TD error does
+    not backprop through them.
 
     For each in-run start ``i`` and each horizon ``n`` in ``horizons``, the
     candidate is the recorded n-step return
-    ``Y_i^{(n)} = r + γ r' + … + D_n Q̄_max(s_{i+n}, a*)`` with
-    ``a* = argmax_a Q_selector(s_{i+n})``. Incomplete horizons are masked,
+    ``Y_i^{(n)} = r_{i+1} + γ_{i+1} r_{i+2} + … + (∏_{k=1}^{n} γ_{i+k}) Q̄_max(s_{i+n}, a*)``
+    with ``a* = argmax_a Q_selector(s_{i+n})``. Each ``γ`` is that
+    transition's done-code discount; a ``0`` in the product zeros the
+    rest. Incomplete horizons are masked,
     never shortened. ``γ == 0`` includes that reward, then every remaining
     longer horizon shares that stopped sum and needs no later Q. The
     max-return head trains toward ``Y^{(M)} = max valid Y^{(n)}``; the
@@ -272,71 +184,39 @@ class MaxNStepDqnObjective(Objective):
         device = q_sel.device
         value_dtype = q_sel.dtype
 
-        action = objective_data[self.action_key]
-        if action.dtype != torch.int64:
-            raise TypeError(f"action must be int64, got {action.dtype}.")
-        if action.ndim != 1:
-            raise ValueError(
-                f"DQN objective expects action shape [N], got {tuple(action.shape)}."
-            )
-        n_steps = int(action.shape[0])
-        _require_action_ids(action, n_actions)
-        if n_steps < 2:
-            raise ValueError("Not enough valid q values in data.")
-
-        reward = objective_data[self.reward_key]
-        if reward.dtype != torch.float32:
-            raise TypeError(f"reward must be float32, got {reward.dtype}.")
-        if reward.shape != torch.Size([n_steps]):
-            raise ValueError(
-                f"DQN objective expects reward shape [{n_steps}], "
-                f"got {tuple(reward.shape)}."
-            )
-        reward = _affine(reward, scale=self.reward_scale, shift=self.reward_shift)
-
-        episode_done, task_done = _require_done_codes(
+        batch = _n_step_batch(
             objective_data,
+            n_pred=p_rows,
+            n_actions=n_actions,
+            device=device,
+            dtype=value_dtype,
+            action_key=self.action_key,
+            reward_key=self.reward_key,
+            reward_scale=self.reward_scale,
+            reward_shift=self.reward_shift,
             episode_done_key=self.episode_done_key,
             task_done_key=self.task_done_key,
-            N=n_steps,
-        )
-
-        step_of, last_rows = _head_output_layout(
-            objective_data, N=n_steps, P=p_rows, device=device
-        )
-        pair_weight = _pair_weight(
-            objective_data,
-            n_steps,
-            device,
             grouping_field=self.grouping_field,
-            dtype=value_dtype,
-        )
-
-        discount_all = _boundary_discounts(
-            episode_done=episode_done,
-            task_done=task_done,
             gamma_step=self.gamma_step,
             gamma_episode_terminal=self.gamma_episode_terminal,
             gamma_episode_truncated=self.gamma_episode_truncated,
             gamma_task_terminal=self.gamma_task_terminal,
             gamma_task_truncated=self.gamma_task_truncated,
-            dtype=value_dtype,
-            device=device,
         )
 
         # a* from the online selector at each step's last head-output row;
         # bootstrap value from delayed max-return at that action.
-        sel_step = q_sel.detach()[last_rows]
+        sel_step = q_sel.detach()[batch.last_rows]
         a_star = sel_step.argmax(dim=-1)
-        bootstrap = q_max_delayed[last_rows].gather(
+        bootstrap = q_max_delayed[batch.last_rows].gather(
             dim=-1, index=a_star.unsqueeze(-1)
         ).squeeze(-1)
 
-        candidates, valid = _max_n_step_targets(
-            reward=reward,
-            discount_all=discount_all,
+        candidates, valid = _n_step_horizon_targets(
+            reward=batch.reward,
+            discount_all=batch.discount_all,
             bootstrap=bootstrap,
-            pair_weight=pair_weight,
+            pair_weight=batch.pair_weight,
             horizons=self.horizons,
         )
         valid_max = valid.any(dim=-1)
@@ -347,26 +227,20 @@ class MaxNStepDqnObjective(Objective):
         y_one_safe = torch.where(valid_one, y_one, zero)
         y_max_safe = torch.where(valid_max, y_max, zero)
 
-        step_next = (step_of + 1).clamp(max=n_steps - 1)
-        next_actions = action[step_next]
         q_sel_taken = q_sel.gather(
-            dim=-1, index=next_actions.unsqueeze(-1)
+            dim=-1, index=batch.next_actions.unsqueeze(-1)
         ).squeeze(-1)
         q_max_taken = q_max.gather(
-            dim=-1, index=next_actions.unsqueeze(-1)
+            dim=-1, index=batch.next_actions.unsqueeze(-1)
         ).squeeze(-1)
 
-        td_one = _pair_values_to_rows(y_one_safe, step_of)
-        td_max = _pair_values_to_rows(y_max_safe, step_of)
-        row_w_one = torch.cat(
-            [valid_one.to(dtype=value_dtype), pair_weight.new_zeros(1)]
-        )[step_of]
-        row_w_max = torch.cat(
-            [valid_max.to(dtype=value_dtype), pair_weight.new_zeros(1)]
-        )[step_of]
-        row_w_run = torch.cat(
-            [pair_weight, pair_weight.new_zeros(1)]
-        )[step_of]
+        td_one = _pair_values_to_rows(y_one_safe, batch.step_of)
+        td_max = _pair_values_to_rows(y_max_safe, batch.step_of)
+        row_w_one = _pair_valid_to_rows(valid_one, batch.step_of, dtype=value_dtype)
+        row_w_max = _pair_valid_to_rows(valid_max, batch.step_of, dtype=value_dtype)
+        row_w_run = _pair_valid_to_rows(
+            batch.pair_weight > 0, batch.step_of, dtype=value_dtype
+        )
 
         loss_sel = _weighted_mean((q_sel_taken - td_one) ** 2, row_w_one)
         loss_max = _weighted_mean((q_max_taken - td_max) ** 2, row_w_max)
@@ -395,7 +269,7 @@ class MaxNStepDqnObjective(Objective):
         }
         for h, n in enumerate(self.horizons):
             named[f"horizon_{n}_valid_frac"] = _weighted_mean(
-                valid[:, h].to(dtype=value_dtype), pair_weight
+                valid[:, h].to(dtype=value_dtype), batch.pair_weight
             )
             named[f"horizon_{n}_selected_frac"] = _weighted_mean(
                 (selected == h).to(dtype=value_dtype),

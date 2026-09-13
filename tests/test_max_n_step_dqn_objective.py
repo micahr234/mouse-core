@@ -5,7 +5,10 @@ import torch
 from tensordict import TensorDict
 
 from mouse_core.objectives import MaxNStepDqnObjective
-from mouse_core.objectives.max_n_step_dqn import _max_n_step_targets
+from mouse_core.objectives.n_step_dqn import (
+    _n_step_horizon_targets,
+    _n_step_return_targets,
+)
 import pytest
 
 
@@ -44,7 +47,7 @@ def test_pdf_numerical_example() -> None:
     discount = torch.tensor([0.0, 0.9, 0.8, 0.5])
     bootstrap = torch.tensor([0.0, 4.0, 0.0, 10.0])
     pair_weight = torch.ones(3)
-    candidates, valid = _max_n_step_targets(
+    candidates, valid = _n_step_horizon_targets(
         reward=reward,
         discount_all=discount,
         bootstrap=bootstrap,
@@ -87,7 +90,7 @@ def test_pdf_numerical_example_through_objective() -> None:
     reward = step_stream["reward"]
     discount = torch.tensor([0.0, 0.9, 0.8, 0.5])
     bootstrap = torch.tensor([0.0, 4.0, 0.0, 10.0])
-    candidates, valid = _max_n_step_targets(
+    candidates, valid = _n_step_horizon_targets(
         reward=reward,
         discount_all=discount,
         bootstrap=bootstrap,
@@ -135,7 +138,7 @@ def test_zero_discount_fills_longer_horizons_without_later_q() -> None:
     reward = torch.tensor([0.0, 1.0, 2.0, 3.0])
     discount = torch.tensor([0.0, 0.0, 0.8, 0.5])
     bootstrap = torch.tensor([0.0, 4.0, 0.0, 10.0])
-    candidates, valid = _max_n_step_targets(
+    candidates, valid = _n_step_horizon_targets(
         reward=reward,
         discount_all=discount,
         bootstrap=bootstrap,
@@ -152,7 +155,7 @@ def test_truncation_masks_longer_horizon_keeps_shorter() -> None:
     discount = torch.tensor([0.0, 0.9, 0.8, 0.5])
     bootstrap = torch.tensor([0.0, 4.0, 0.0, 10.0])
     pair_weight = torch.tensor([1.0, 0.0, 1.0])
-    candidates, valid = _max_n_step_targets(
+    candidates, valid = _n_step_horizon_targets(
         reward=reward,
         discount_all=discount,
         bootstrap=bootstrap,
@@ -186,7 +189,7 @@ def test_negative_returns_are_selected_when_they_are_the_max() -> None:
     reward = torch.tensor([0.0, -5.0, -1.0, 0.0])
     discount = torch.ones(4)
     bootstrap = torch.zeros(4)
-    candidates, valid = _max_n_step_targets(
+    candidates, valid = _n_step_horizon_targets(
         reward=reward,
         discount_all=discount,
         bootstrap=bootstrap,
@@ -227,7 +230,7 @@ def test_horizons_one_makes_both_targets_coincide() -> None:
     reward = torch.tensor([0.0, 1.0, 2.0])
     discount = torch.tensor([0.0, 0.5, 0.5])
     bootstrap = torch.tensor([0.0, 4.0, 8.0])
-    candidates, valid = _max_n_step_targets(
+    candidates, valid = _n_step_horizon_targets(
         reward=reward,
         discount_all=discount,
         bootstrap=bootstrap,
@@ -315,3 +318,31 @@ def test_multi_token_rows_share_the_step_target() -> None:
     # pair (0,1) valid, pair (1,2) valid with Y=0+0=0. s1 taken action 0, Q=0.
     # s0 two rows + s1 one row: (4+4+0)/3 = 8/3
     assert metrics["selector"] == pytest.approx(8.0 / 3.0, rel=1e-05)
+
+
+def test_max_horizons_match_n_step_returns() -> None:
+    """Each max-n-step candidate is the same complete n-step return."""
+    reward = torch.tensor([0.0, 1.0, 10.0, 100.0])
+    discount = torch.ones(4)
+    bootstrap = torch.tensor([0.0, 3.0, 7.0, 1000.0])
+    pair_weight = torch.ones(3)
+    horizons = (1, 2, 3)
+    candidates, valid = _n_step_horizon_targets(
+        reward=reward,
+        discount_all=discount,
+        bootstrap=bootstrap,
+        pair_weight=pair_weight,
+        horizons=horizons,
+    )
+    for h, n in enumerate(horizons):
+        target, ok = _n_step_return_targets(
+            reward=reward,
+            discount_all=discount,
+            bootstrap=bootstrap,
+            pair_weight=pair_weight,
+            n=n,
+        )
+        assert torch.equal(ok, valid[:, h])
+        assert torch.equal(
+            target, torch.where(ok, candidates[:, h], torch.zeros_like(target))
+        )
