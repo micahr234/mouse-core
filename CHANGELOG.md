@@ -109,15 +109,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   optimizer step → scalar. DQN uses ``ExponentialDecay`` for
   per-section Polyak τ.
 - fp32 LoRA on a frozen bf16 backbone. ``Qwen3Backbone`` / ``LlamaBackbone``
-  take ``lora=LoRAConfig(rank=16, alpha=32.0, dropout=0.0, targets=(q/k/v/o,
-  gate/up/down))``: every attention / MLP ``nn.Linear`` named in ``targets``
-  becomes a ``LoRALinear`` (``base(x) + lora_B(lora_A(x)) * alpha / rank``,
-  ``lora_B`` zero-initialised), the base weights are frozen, and the
-  adapters are the backbone's only trainable parameters. They are always
-  fp32: the rank-``r`` matmuls run in fp32 on the fp32-cast input and the
-  delta is cast back to the base dtype, so updates land in fp32 tensors
-  with no master weights. Without ``lora=`` the backbone is fully trainable
-  and is built with ``dtype=torch.float32``; every trainable parameter is
+  take ``lora=LoRAConfig(rank=16, alpha=32.0, dropout=0.0)``: every
+  ``nn.Linear`` in the backbone becomes a ``LoRALinear``
+  (``base(x) + lora_B(lora_A(x)) * alpha / rank``, ``lora_B``
+  zero-initialised), the base weights are frozen, and the adapters are
+  the backbone's only trainable parameters. They are always fp32: the
+  rank-``r`` matmuls run in fp32 on the fp32-cast input and the delta is
+  cast back to the base dtype, so updates land in fp32 tensors with no
+  master weights. Without ``lora=`` the backbone is fully trainable and
+  is built with ``dtype=torch.float32``; every trainable parameter is
   fp32 on either path.
   ``backbone.dtype`` reports the base dtype (``Model`` casts backbone inputs
   to it). ``LoRAConfig`` is saved under ``config["backbone"]["lora"]`` and
@@ -306,6 +306,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``grouping_field: str | None = None`` (``None`` ⇒ no grouping filter).
 
 ### Changed
+- LoRA adapts every ``nn.Linear`` in the backbone (attention and MLP
+  projections on Llama / Qwen3). ``LoRAConfig.targets`` is gone — there
+  is no named subset.
 - Train kernels are strict; there are no fallbacks between kernels.
   ``train_kernel="varlen"`` always means the flash varlen kernel and
   requires CUDA with bf16/fp16 q/k/v (a bf16/fp16 backbone or fp32
@@ -685,6 +688,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a cleared stream can restart without rebuilding the whole batch.
 
 ### Removed
+- ``LoRAConfig.targets`` (and the default q/k/v/o/gate/up/down list).
+  ``apply_lora`` wraps every ``nn.Linear``.
 - ``EpisodeTaskDqnObjective`` ``episode_td_lambda`` and ``task_td_lambda``.
   The episode head is one-step TD; the task head is the full in-run
   return (skips to the next episode start).

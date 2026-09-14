@@ -141,7 +141,7 @@ class LlamaBackbone(Backbone):
 
     Without ``lora`` the backbone is fully trainable (keep the model fp32).
     Pass ``lora=LoRAConfig(...)`` to freeze the base weights (bf16 on CUDA)
-    and train fp32 LoRA adapters on the attention / MLP projections instead.
+    and train fp32 LoRA adapters on every ``nn.Linear`` instead.
     """
 
     model: LlamaModel

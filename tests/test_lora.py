@@ -72,42 +72,59 @@ def _batch(model: Model):
 # ---- LoRAConfig / apply_lora -------------------------------------------------
 
 
+def _unadapted_linears(module: nn.Module) -> list[str]:
+    """``nn.Linear`` children whose parent is not already a ``LoRALinear``."""
+    leftover: list[str] = []
+    for parent_name, parent in module.named_modules():
+        if isinstance(parent, LoRALinear):
+            continue
+        for name, child in parent.named_children():
+            if isinstance(child, nn.Linear):
+                leftover.append(f"{parent_name}.{name}" if parent_name else name)
+    return leftover
+
+
 def test_lora_config_validates_and_normalizes() -> None:
-    cfg = LoRAConfig(rank=4, alpha=8, targets=["q_proj"])
-    assert cfg.rank == 4 and cfg.alpha == 8.0 and cfg.targets == ("q_proj",)
+    cfg = LoRAConfig(rank=4, alpha=8)
+    assert cfg.rank == 4 and cfg.alpha == 8.0
     with pytest.raises(ValueError, match="rank"):
         LoRAConfig(rank=0)
     with pytest.raises(ValueError, match="alpha"):
         LoRAConfig(alpha=0.0)
     with pytest.raises(ValueError, match="dropout"):
         LoRAConfig(dropout=1.0)
-    with pytest.raises(ValueError, match="targets"):
-        LoRAConfig(targets=())
 
 
-def test_apply_lora_wraps_targets_and_freezes_base() -> None:
+def test_apply_lora_wraps_every_linear_and_freezes_base() -> None:
     torch.manual_seed(0)
-    cfg = LoRAConfig(rank=2, targets=("q_proj", "down_proj"))
+    cfg = LoRAConfig(rank=2)
     backbone = _backbone(None)
     inner = backbone.model
+    n_linear = sum(isinstance(m, nn.Linear) for m in inner.modules())
+    assert n_linear == 7 * 2  # q/k/v/o + gate/up/down, two layers
     assert all(p.requires_grad for p in inner.parameters())
     wrapped = apply_lora(inner, cfg)
     assert all(not p.requires_grad for n, p in inner.named_parameters() if ".lora_" not in n)
-    assert wrapped == 2 * 2  # two targets per layer, two layers
+    assert wrapped == n_linear
+    assert _unadapted_linears(inner) == []
     for raw_layer in inner.layers:
         layer = cast(Any, raw_layer)
         assert isinstance(layer.self_attn.q_proj, LoRALinear)
+        assert isinstance(layer.self_attn.k_proj, LoRALinear)
+        assert isinstance(layer.self_attn.v_proj, LoRALinear)
+        assert isinstance(layer.self_attn.o_proj, LoRALinear)
+        assert isinstance(layer.mlp.gate_proj, LoRALinear)
+        assert isinstance(layer.mlp.up_proj, LoRALinear)
         assert isinstance(layer.mlp.down_proj, LoRALinear)
-        assert isinstance(layer.self_attn.k_proj, nn.Linear)
     trainable = {n for n, p in inner.named_parameters() if p.requires_grad}
     assert trainable
     assert all(".lora_A." in n or ".lora_B." in n for n in trainable)
     assert len(list(lora_modules(inner))) == wrapped
 
 
-def test_apply_lora_rejects_missing_targets() -> None:
-    with pytest.raises(ValueError, match="no nn.Linear named"):
-        apply_lora(nn.Sequential(nn.Linear(4, 4)), LoRAConfig(targets=("nope",)))
+def test_apply_lora_rejects_module_without_linear() -> None:
+    with pytest.raises(ValueError, match="no nn.Linear found"):
+        apply_lora(nn.Sequential(nn.ReLU()), LoRAConfig(rank=2))
 
 
 def test_backbone_without_lora_is_fully_trainable() -> None:
@@ -123,6 +140,7 @@ def test_backbone_lora_kwarg_on_both_transformers(cls) -> None:
     backbone = _backbone(LoRAConfig(rank=2), cls=cls)
     assert backbone.lora == LoRAConfig(rank=2)
     assert len(list(lora_modules(backbone))) == 7 * 2
+    assert _unadapted_linears(backbone) == []
 
 
 # ---- LoRALinear forward / gradients -----------------------------------------
@@ -342,7 +360,7 @@ def test_full_fp32_model_cast_to_bf16_is_rejected_by_adamw_and_polyak() -> None:
 
 def test_save_load_roundtrip_with_lora(tmp_path) -> None:
     torch.manual_seed(0)
-    model = _model(LoRAConfig(rank=2, alpha=4.0, targets=("q_proj", "v_proj"))).eval()
+    model = _model(LoRAConfig(rank=2, alpha=4.0)).eval()
     with torch.no_grad():
         for adapter in lora_modules(model.backbone):  # type: ignore[arg-type]
             adapter.lora_B.weight.normal_()
@@ -356,7 +374,6 @@ def test_save_load_roundtrip_with_lora(tmp_path) -> None:
         "rank": 2,
         "alpha": 4.0,
         "dropout": 0.0,
-        "targets": ["q_proj", "v_proj"],
     }
     loaded = load_model(tmp_path, train_kernel="reference", decode_kernel="flex", dtype=torch.float32).eval()
     assert loaded.backbone is not None

@@ -150,8 +150,8 @@ class Backbone(nn.Module, ABC):
         """Freeze ``model`` and attach fp32 LoRA adapters when ``lora`` is set.
 
         Without ``lora`` the backbone is left fully trainable. Call once the
-        pretrained weights are loaded: wrapping renames the adapted
-        ``nn.Linear`` keys to ``<target>.base.weight``.
+        pretrained weights are loaded: wrapping renames every
+        ``nn.Linear`` key to ``<name>.base.weight``.
         """
         self.lora = lora
         if lora is not None:

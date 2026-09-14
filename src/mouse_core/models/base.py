@@ -174,7 +174,7 @@ def _write_model_card(
     if lora_cfg:
         reasoner_line += (
             f"\n- LoRA: `rank={lora_cfg['rank']}`, `alpha={lora_cfg['alpha']}` "
-            f"on `{', '.join(lora_cfg['targets'])}` (fp32 adapters over frozen base weights)"
+            f"on every backbone `nn.Linear` (fp32 adapters over frozen base weights)"
         )
     encoder_section, tokenizer_snippet, objective_data_example = _model_card_encoder_bits(
         config
