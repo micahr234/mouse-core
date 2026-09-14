@@ -652,7 +652,7 @@ def test_text_embedder_save_load(tmp_path) -> None:
     model.eval()
     expected = model(batch_to_token_batch(tokenizer, batch)).predictions
     save_model(model, tmp_path)
-    loaded = load_model(tmp_path, train_kernel="varlen", decode_kernel="flex", dtype=torch.float32).eval()
+    loaded = load_model(tmp_path, train_kernel="reference", decode_kernel="flex", dtype=torch.float32).eval()
     assert isinstance(loaded.encoder, TextEmbedder)
     assert loaded.encoder.vocab_size == 32
     assert torch.equal(loaded.encoder.embed_tokens.weight, emb.weight)
@@ -696,7 +696,7 @@ def test_text_embedder_learnable_save_load(tmp_path) -> None:
     from mouse_core.models import load_model, save_model
 
     save_model(model, tmp_path)
-    loaded = load_model(tmp_path, train_kernel="varlen", decode_kernel="flex", dtype=torch.float32).eval()
+    loaded = load_model(tmp_path, train_kernel="reference", decode_kernel="flex", dtype=torch.float32).eval()
     assert isinstance(loaded.encoder, TextEmbedder)
     assert len(loaded.encoder.learnable) == 1
     actual = loaded(batch_to_token_batch(tokenizer, batch)).predictions
@@ -887,6 +887,23 @@ def test_pack_prev_grouping_ids_suppresses_and_reemits_group_prefix() -> None:
         prev_grouping_ids=[None],
     )
     assert fresh.L == p + continue_step.T
+
+
+def test_tokenizer_pack_rows_forwards_prev_grouping_ids() -> None:
+    tok = _group_prefix_tokenizer()
+    row = {"action": 1, "task_index": 5}
+    st = tok(row)
+    assert st.group_prefix_ids is not None
+    p = int(st.group_prefix_ids.shape[0])
+
+    fresh = tok.pack_rows([[row]], prev_grouping_ids=None)
+    assert fresh.L == p + st.T
+
+    same_task_cached = tok.pack_rows([[row]], prev_grouping_ids=[5])
+    assert same_task_cached.L == st.T
+
+    changed_task = tok.pack_rows([[row]], prev_grouping_ids=[4])
+    assert changed_task.L == p + st.T
 
 
 def test_text_tokenizer_group_prefix_missing_placeholder_raises() -> None:

@@ -6,8 +6,9 @@ I/O
 * **out:** :class:`~mouse_core.data.token_batch.StepTokens`
 
 ``text`` / ``token`` fields share the ``__text__`` stream. Every other
-field is tagged by ``output_field`` (modality name). Pack many steps with
-:func:`~mouse_core.data.token_batch.pack_token_batch`.
+field is tagged by ``output_field`` (modality name). Pack ragged
+per-sequence rows with :meth:`Tokenizer.pack_rows`; pack already-tokenized
+steps with :func:`~mouse_core.data.token_batch.pack_token_batch`.
 """
 
 from __future__ import annotations
@@ -37,7 +38,12 @@ from mouse_core.data.modality import (
     unwrap_scalar,
     values_equal,
 )
-from mouse_core.data.token_batch import ModalityInfo, StepTokens
+from mouse_core.data.token_batch import (
+    ModalityInfo,
+    StepTokens,
+    TokenBatch,
+    pack_token_batch,
+)
 
 
 class Tokenizer:
@@ -187,6 +193,45 @@ class Tokenizer:
             modality_names=self.modality_names,
             modality_map=self.modality_map,
         )
+
+    def pack_rows(
+        self,
+        rows: Sequence[Sequence[dict]],
+        *,
+        prev_grouping_ids: Sequence[int | None] | None,
+    ) -> TokenBatch:
+        """Tokenize ragged per-sequence rows into packed model inputs.
+
+        ``rows`` holds one list of step dicts per sequence; entries may be
+        empty (incremental decode where a sequence contributes no new
+        steps). Each step goes through this tokenizer, then
+        :func:`~mouse_core.data.token_batch.pack_token_batch` with
+        ``batch_size=len(rows)`` — empty sequences keep their batch slot —
+        and this tokenizer's ``grouping_field``. Returns the
+        :class:`~mouse_core.data.token_batch.TokenBatch` only; objective
+        columns are for training, which packs via ``DataLoader``.
+
+        ``prev_grouping_ids`` is the last grouping id already cached per
+        sequence (length ``len(rows)``, ``None`` entries where nothing is
+        cached), so incremental decode with ``group_prefix=`` does not
+        re-emit a cached grouping segment's prefix. Pass ``None`` when no
+        sequence has cached steps (fresh sequences / full prefill).
+        Without ``group_prefix=`` the value has no effect.
+        """
+        steps: list[StepTokens] = []
+        sids: list[int] = []
+        for i, row_steps in enumerate(rows):
+            for step in row_steps:
+                steps.append(self(step))
+                sids.append(i)
+        inputs, _ = pack_token_batch(
+            steps,
+            sequence_ids=sids if steps else None,
+            batch_size=len(rows),
+            grouping_field=self.grouping_field,
+            prev_grouping_ids=prev_grouping_ids,
+        )
+        return inputs
 
 
 def _field_text_value(spec: TokenizerModalitySpec, row: dict[str, Any]) -> str | None:

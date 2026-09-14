@@ -28,7 +28,9 @@ from tests._token_batch_helpers import batch_to_packed, batch_to_token_batch, to
 _tok = tok_from_encoder
 _cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 _DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
-_KERNELS: list[TrainKernel] = ["varlen", "flex", "padded"]
+_KERNELS: list[TrainKernel] = ["varlen", "flex", "padded", "reference"]
+# "varlen" is strict (CUDA + bf16/fp16 q/k/v only), so fp32-without-autocast runs use these.
+_CPU_KERNELS: list[TrainKernel] = ["reference", "flex", "padded"]
 
 
 @pytest.fixture
@@ -42,8 +44,8 @@ def no_compiled_decoder() -> Iterator[None]:
         packed_train_mod._compiled_layer = was
 
 
-def _backbone(cls, *, hidden: int = 64, layers: int = 2, heads: int = 4, kv_heads: int = 4, head_dim: int | None = None, lora: LoRAConfig | None = None, kernel: TrainKernel = "varlen", dtype: torch.dtype = torch.float32):
-    kwargs: dict[str, Any] = dict(train_kernel=kernel, decode_kernel="flex", dtype=dtype, hidden_dim=hidden, num_layers=layers, num_heads=heads, num_key_value_heads=kv_heads, lora=lora)
+def _backbone(cls, *, hidden: int = 64, layers: int = 2, heads: int = 4, kv_heads: int = 4, head_dim: int | None = None, lora: LoRAConfig | None = None, kernel: TrainKernel = "varlen", dtype: torch.dtype = torch.float32, autocast_dtype: torch.dtype | None = None):
+    kwargs: dict[str, Any] = dict(train_kernel=kernel, decode_kernel="flex", dtype=dtype, train_autocast_dtype=autocast_dtype, hidden_dim=hidden, num_layers=layers, num_heads=heads, num_key_value_heads=kv_heads, lora=lora)
     if head_dim is not None:
         kwargs["head_dim"] = head_dim
     return cls(**kwargs)
@@ -181,7 +183,7 @@ def test_packed_rope_positions_match_brute_force_with_recurring_ids(device: str)
     ids=["qwen3-mha", "qwen3-gqa-hd24", "llama-mha", "llama-gqa"],
 )
 @pytest.mark.parametrize("L", [1, 3, 7, 61, 300])
-@pytest.mark.parametrize("kernel", _KERNELS)
+@pytest.mark.parametrize("kernel", _CPU_KERNELS)
 def test_cpu_fp32_forward_matches_dense_reference(no_compiled_decoder: None, cls, kv_heads: int, head_dim: int | None, L: int, kernel: TrainKernel) -> None:
     torch.manual_seed(0)
     bb = _backbone(cls, kv_heads=kv_heads, head_dim=head_dim)
@@ -238,10 +240,10 @@ def test_cuda_fused_forward_matches_fp32_reference_within_half_precision_noise(
 
 
 @_cuda
-@pytest.mark.parametrize("kernel", _KERNELS)
+@pytest.mark.parametrize("kernel", _CPU_KERNELS)
 @pytest.mark.parametrize("L", [40, 300])
 def test_cuda_fp32_matches_dense_reference(no_compiled_decoder: None, kernel: TrainKernel, L: int) -> None:
-    """fp32 on CUDA: varlen is packed-stream SDPA, padded is rectangular SDPA, flex is compiled block-sparse."""
+    """fp32 on CUDA: reference is packed-stream SDPA, padded is rectangular SDPA, flex is compiled block-sparse."""
     torch.manual_seed(0)
     device = torch.device("cuda")
     bb = cast(Any, _backbone(Qwen3Backbone, kv_heads=2).to(device))
@@ -254,12 +256,129 @@ def test_cuda_fp32_matches_dense_reference(no_compiled_decoder: None, kernel: Tr
     torch.testing.assert_close(got, ref, atol=1e-4, rtol=1e-4)
 
 
+@_cuda
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+@pytest.mark.parametrize("L", [12, 300], ids=["L<block", "L>block"])
+@pytest.mark.parametrize("kernel", _KERNELS)
+def test_cuda_fp32_autocast_fused_matches_fp32_reference(
+    no_compiled_decoder: None, dtype: torch.dtype, L: int, kernel: TrainKernel
+) -> None:
+    """fp32 weights with autocast_dtype: every kernel (varlen takes the flash path)
+    stays within the half-precision floor of the fp32 dense reference."""
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    bb32 = _backbone(Qwen3Backbone, kv_heads=2).to(device)
+    _scale_up(bb32)
+    bb16 = _backbone(Qwen3Backbone, kv_heads=2, dtype=dtype).to(device)
+    bb16.load_state_dict(bb32.state_dict())
+    seq, grp = _stream(L, n_seq=3, n_grp=3, seed=L, device="cuda")
+    embeds = torch.randn(L, 64, device=device)
+    with torch.no_grad():
+        got = packed_forward(
+            model=bb32.model, embeds=embeds, sequence_ids=seq, grouping_ids=grp,
+            train_kernel=kernel, autocast_dtype=dtype,
+        ).float()
+        ref32 = _reference(bb32, embeds, seq, grp)
+        ref16 = _reference(bb16, embeds.to(dtype), seq, grp).float()
+    # autocast_dtype keeps norms and residuals fp32, so the full
+    # half-precision model's error is a generous bound.
+    err = (got - ref32).abs()
+    floor = (ref16 - ref32).abs().max().item()
+    assert err.max().item() <= 2.0 * floor + 2e-3, (
+        f"max {err.max().item():.4g} rms {err.pow(2).mean().sqrt().item():.4g} vs {dtype} floor {floor:.4g}"
+    )
+
+
+@_cuda
+@pytest.mark.parametrize("kernel", _KERNELS)
+def test_cuda_fp32_autocast_gradients_flow(no_compiled_decoder: None, kernel: TrainKernel) -> None:
+    """fp32 base params get finite fp32 grads through every kernel with autocast_dtype=bf16."""
+    torch.manual_seed(4)
+    device = torch.device("cuda")
+    bb = cast(Any, _backbone(Qwen3Backbone, kv_heads=2).to(device))
+    L = 40
+    seq, grp = _stream(L, n_seq=2, n_grp=2, seed=7, device="cuda")
+    embeds = torch.randn(L, 64, device=device, requires_grad=True)
+    out = packed_forward(
+        model=bb.model, embeds=embeds, sequence_ids=seq, grouping_ids=grp,
+        train_kernel=kernel, autocast_dtype=torch.bfloat16,
+    )
+    out.float().pow(2).sum().backward()
+    assert embeds.grad is not None and torch.isfinite(embeds.grad).all()
+    grads = {n: p.grad for n, p in bb.named_parameters() if p.grad is not None}
+    assert any(".self_attn.q_proj" in n for n in grads)
+    for n, g in grads.items():
+        assert g.dtype is torch.float32 and torch.isfinite(g).all(), n
+
+
+# ---- strictness: no fallbacks, declared precision --------------------------------
+
+
+def test_varlen_is_strict_no_fallback(no_compiled_decoder: None) -> None:
+    """fp32 without autocast_dtype never silently runs another kernel."""
+    bb = _backbone(Qwen3Backbone)
+    ids = torch.zeros(4, dtype=torch.long)
+    embeds = torch.randn(4, 64)
+    with pytest.raises(ValueError, match="no fallback"):
+        packed_forward(model=bb.model, embeds=embeds, sequence_ids=ids, grouping_ids=ids, train_kernel="varlen")
+    if torch.cuda.is_available():
+        bb = bb.to("cuda")
+        with pytest.raises(ValueError, match="no fallback"):
+            packed_forward(model=bb.model, embeds=embeds, sequence_ids=ids, grouping_ids=ids, train_kernel="varlen")
+
+
+def test_varlen_rejects_bf16_base_on_cpu(no_compiled_decoder: None) -> None:
+    """The flash kernel needs CUDA, not just a flash dtype."""
+    bb = _backbone(Qwen3Backbone, dtype=torch.bfloat16)
+    ids = torch.zeros(4, dtype=torch.long)
+    with pytest.raises(ValueError, match="no fallback"):
+        packed_forward(model=bb.model, embeds=torch.zeros(4, 64), sequence_ids=ids, grouping_ids=ids, train_kernel="varlen")
+
+
+def test_ambient_autocast_is_rejected(no_compiled_decoder: None) -> None:
+    """Precision is declared at construction; packed_forward inside torch.autocast raises."""
+    bb = _backbone(Qwen3Backbone)
+    ids = torch.zeros(4, dtype=torch.long)
+    embeds = torch.randn(4, 64)
+    with torch.autocast("cpu", dtype=torch.bfloat16), pytest.raises(RuntimeError, match="torch.autocast"):
+        packed_forward(model=bb.model, embeds=embeds, sequence_ids=ids, grouping_ids=ids, train_kernel="reference")
+    if torch.cuda.is_available():
+        bb = bb.to("cuda")
+        with torch.autocast("cuda", dtype=torch.bfloat16), pytest.raises(RuntimeError, match="torch.autocast"):
+            packed_forward(
+                model=bb.model, embeds=embeds.to("cuda"), sequence_ids=ids.to("cuda"),
+                grouping_ids=ids.to("cuda"), train_kernel="flex",
+            )
+
+
+def test_autocast_dtype_is_validated(no_compiled_decoder: None) -> None:
+    """bf16/fp16 over fp32 base only — both declarations, at construction and at packed_forward."""
+    with pytest.raises(ValueError, match="fp32 base"):
+        _backbone(Qwen3Backbone, dtype=torch.bfloat16, autocast_dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="autocast_dtype must be"):
+        _backbone(Qwen3Backbone, autocast_dtype=torch.float32)
+    with pytest.raises(ValueError, match="fp32 base"):
+        Qwen3Backbone(
+            train_kernel="reference", decode_kernel="flex", dtype=torch.bfloat16,
+            decode_autocast_dtype=torch.bfloat16, hidden_dim=64, num_layers=1, num_heads=4,
+        )
+    bb = _backbone(Qwen3Backbone)
+    ids = torch.zeros(4, dtype=torch.long)
+    with pytest.raises(ValueError, match="autocast_dtype must be"):
+        packed_forward(
+            model=bb.model, embeds=torch.zeros(4, 64), sequence_ids=ids, grouping_ids=ids,
+            train_kernel="reference", autocast_dtype=torch.float32,
+        )
+
+
 # ---- isolation and causality -----------------------------------------------------
 
 
 @pytest.mark.parametrize("device", _DEVICES)
 @pytest.mark.parametrize("kernel", _KERNELS)
 def test_isolation_and_recurring_group_causality(no_compiled_decoder: None, device: str, kernel: TrainKernel) -> None:
+    if device == "cpu" and kernel == "varlen":
+        pytest.skip("varlen is strict: CUDA with bf16/fp16 q/k/v only")
     torch.manual_seed(1)
     dtype = torch.bfloat16 if device == "cuda" else torch.float32
     bb = cast(Any, _backbone(Qwen3Backbone, kv_heads=2, dtype=dtype).to(device))
@@ -300,7 +419,7 @@ def test_isolation_and_recurring_group_causality(no_compiled_decoder: None, devi
 # ---- gradients -------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("kernel", ["varlen", "padded"])
+@pytest.mark.parametrize("kernel", ["reference", "padded"])
 def test_cpu_fp32_gradients_match_dense_reference(no_compiled_decoder: None, kernel: TrainKernel) -> None:
     torch.manual_seed(2)
     bb = _backbone(LlamaBackbone, kv_heads=2)
@@ -329,7 +448,7 @@ def test_cpu_fp32_gradients_match_dense_reference(no_compiled_decoder: None, ker
         torch.testing.assert_close(got_grads[n], ref_grad, atol=1e-4, rtol=1e-4, msg=lambda m: f"{n}: {m}")
 
 
-@pytest.mark.parametrize("kernel", ["varlen", "padded"])
+@pytest.mark.parametrize("kernel", ["reference", "padded"])
 def test_gradient_checkpointing_matches_plain_backward(no_compiled_decoder: None, kernel: TrainKernel) -> None:
     torch.manual_seed(3)
     bb = _backbone(Qwen3Backbone, layers=3, kv_heads=2)
@@ -408,7 +527,7 @@ def test_install_compiled_decoder_idempotent(no_compiled_decoder: None) -> None:
 
 
 @pytest.mark.parametrize("cls", [Qwen3Backbone, LlamaBackbone])
-@pytest.mark.parametrize("kernel", _KERNELS)
+@pytest.mark.parametrize("kernel", _CPU_KERNELS)
 def test_cpu_compiled_body_matches_eager_across_layouts(no_compiled_decoder: None, cls, kernel: TrainKernel) -> None:
     torch.manual_seed(5)
     bb = _backbone(cls, hidden=32, heads=4, kv_heads=2)
@@ -470,13 +589,46 @@ def test_cuda_bf16_lora_compiled_body_matches_eager_and_trains(no_compiled_decod
             assert p.grad is None, n
 
 
+@_cuda
+@pytest.mark.parametrize("kernel", _KERNELS)
+def test_cuda_fp32_autocast_compiled_body_matches_eager(no_compiled_decoder: None, kernel: TrainKernel) -> None:
+    """The q/k autocast dtype cast compiles: eager and compiled agree with autocast_dtype=bf16."""
+    torch.manual_seed(7)
+    device = torch.device("cuda")
+    bb = cast(Any, _backbone(Qwen3Backbone, kv_heads=2).to(device))
+    _scale_up(bb)
+    L = 200
+    seq, grp = _stream(L, n_seq=3, n_grp=2, seed=L, device="cuda")
+    embeds = torch.randn(L, 64, device=device, requires_grad=True)
+
+    def run() -> tuple[torch.Tensor, list[torch.Tensor]]:
+        out = packed_forward(
+            model=bb.model, embeds=embeds, sequence_ids=seq, grouping_ids=grp,
+            train_kernel=kernel, autocast_dtype=torch.bfloat16,
+        )
+        out.float().sum().backward()
+        assert embeds.grad is not None
+        grads = [embeds.grad.float().clone()] + [cast(torch.Tensor, p.grad).clone() for p in bb.parameters() if p.grad is not None]
+        embeds.grad = None
+        bb.zero_grad()
+        return out.detach().float(), grads
+
+    eager_out, eager_grads = run()
+    install_compiled_decoder()
+    compiled_out, compiled_grads = run()
+    assert (compiled_out - eager_out).abs().max().item() < 0.1
+    assert all(torch.isfinite(g).all() for g in compiled_grads)
+    for a, b in zip(compiled_grads, eager_grads, strict=True):
+        assert (a - b).abs().max().item() <= 0.05 * b.abs().max().item() + 1e-2
+
+
 # ---- contract edges --------------------------------------------------------------
 
 
 def test_empty_stream(no_compiled_decoder: None) -> None:
     bb = _backbone(Qwen3Backbone)
     empty = torch.zeros(0, dtype=torch.long)
-    out, layers = packed_forward(model=bb.model, embeds=torch.zeros(0, 64), sequence_ids=empty, grouping_ids=empty, train_kernel="varlen", output_hidden_states=True)
+    out, layers = packed_forward(model=bb.model, embeds=torch.zeros(0, 64), sequence_ids=empty, grouping_ids=empty, train_kernel="reference", output_hidden_states=True)
     assert out.shape == (0, 64)
     assert len(layers) == 2 and all(x.shape == (0, 64) for x in layers)
 
@@ -485,16 +637,16 @@ def test_shape_validation(no_compiled_decoder: None) -> None:
     bb = _backbone(Qwen3Backbone)
     ids = torch.zeros(4, dtype=torch.long)
     with pytest.raises(ValueError, match=r"\[L, D\]"):
-        packed_forward(model=bb.model, embeds=torch.zeros(1, 4, 64), sequence_ids=ids, grouping_ids=ids, train_kernel="varlen")
+        packed_forward(model=bb.model, embeds=torch.zeros(1, 4, 64), sequence_ids=ids, grouping_ids=ids, train_kernel="reference")
     with pytest.raises(ValueError, match="grouping_ids"):
-        packed_forward(model=bb.model, embeds=torch.zeros(4, 64), sequence_ids=ids, grouping_ids=ids[:3], train_kernel="varlen")
+        packed_forward(model=bb.model, embeds=torch.zeros(4, 64), sequence_ids=ids, grouping_ids=ids[:3], train_kernel="reference")
 
 
 def test_sliding_window_config_is_rejected(no_compiled_decoder: None) -> None:
-    bb = Qwen3Backbone(train_kernel="varlen", decode_kernel="flex", dtype=torch.float32, hidden_dim=64, num_layers=1, num_heads=4, use_sliding_window=True)
+    bb = Qwen3Backbone(train_kernel="reference", decode_kernel="flex", dtype=torch.float32, hidden_dim=64, num_layers=1, num_heads=4, use_sliding_window=True)
     ids = torch.zeros(4, dtype=torch.long)
     with pytest.raises(ValueError, match="sliding-window"):
-        packed_forward(model=bb.model, embeds=torch.zeros(4, 64), sequence_ids=ids, grouping_ids=ids, train_kernel="varlen")
+        packed_forward(model=bb.model, embeds=torch.zeros(4, 64), sequence_ids=ids, grouping_ids=ids, train_kernel="reference")
 
 
 def test_unknown_train_kernel_is_rejected(no_compiled_decoder: None) -> None:
@@ -532,7 +684,7 @@ def test_prepare_sequence_id_col_matches_step_counts() -> None:
 
 
 @pytest.mark.parametrize("device", _DEVICES)
-@pytest.mark.parametrize("kernel", _KERNELS)
+@pytest.mark.parametrize("kernel", _CPU_KERNELS)  # fp32 backbone on both devices; strict varlen would raise
 def test_model_forward_isolates_sequences(no_compiled_decoder: None, device: str, kernel: TrainKernel) -> None:
     torch.manual_seed(2)
     backbone = Qwen3Backbone(train_kernel=kernel, decode_kernel="flex", dtype=torch.float32, hidden_dim=64, num_layers=2, num_heads=4, num_key_value_heads=4)
@@ -557,7 +709,7 @@ def test_model_forward_isolates_sequences(no_compiled_decoder: None, device: str
 def test_model_train_isolates_tasks_within_sequence(no_compiled_decoder: None) -> None:
     """Packed train forward on a two-task window matches a single-task suffix forward."""
     torch.manual_seed(11)
-    backbone = Qwen3Backbone(train_kernel="varlen", decode_kernel="flex", dtype=torch.float32, hidden_dim=32, num_layers=2, num_heads=4, num_key_value_heads=4)
+    backbone = Qwen3Backbone(train_kernel="reference", decode_kernel="flex", dtype=torch.float32, hidden_dim=32, num_layers=2, num_heads=4, num_key_value_heads=4)
     encoder = NumericEmbedder(
         hidden_dim=backbone.hidden_dim,
         modalities=[
@@ -588,7 +740,7 @@ def test_model_train_isolates_tasks_within_sequence(no_compiled_decoder: None) -
 
 def test_model_gradient_checkpointing_flag_reaches_backward(no_compiled_decoder: None) -> None:
     torch.manual_seed(12)
-    backbone = Qwen3Backbone(train_kernel="varlen", decode_kernel="flex", dtype=torch.float32, hidden_dim=32, num_layers=2, num_heads=4)
+    backbone = Qwen3Backbone(train_kernel="reference", decode_kernel="flex", dtype=torch.float32, hidden_dim=32, num_layers=2, num_heads=4)
     encoder = NumericEmbedder(hidden_dim=32, modalities=[{"type": "discrete", "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}])
     head = DiscreteActionValueHead(in_features=32, out_features=4, hidden_dim=32, num_layers=1)
     model = Model(encoder=encoder, backbone=backbone, heads=head, action_head="action_value", reasoner=None, recurrence=None)
@@ -606,3 +758,22 @@ def test_model_gradient_checkpointing_flag_reaches_backward(no_compiled_decoder:
     assert len(plain) == len(ckpt) > 0
     for a, b in zip(plain, ckpt):
         torch.testing.assert_close(a, b, atol=1e-6, rtol=1e-5)
+
+
+@_cuda
+def test_model_forwards_autocast_dtype_to_packed_forward(no_compiled_decoder: None) -> None:
+    """A fp32 Model built with train_autocast_dtype=bf16 trains through the varlen kernel."""
+    torch.manual_seed(13)
+    backbone = Qwen3Backbone(
+        train_kernel="varlen", decode_kernel="flex", dtype=torch.float32,
+        train_autocast_dtype=torch.bfloat16,
+        hidden_dim=32, num_layers=2, num_heads=4,
+    )
+    assert backbone.train_autocast_dtype is torch.bfloat16 and backbone.decode_autocast_dtype is None
+    encoder = NumericEmbedder(hidden_dim=32, modalities=[{"type": "discrete", "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}])
+    head = DiscreteActionValueHead(in_features=32, out_features=4, hidden_dim=32, num_layers=1)
+    model = Model(encoder=encoder, backbone=backbone, heads=head, action_head="action_value", reasoner=None, recurrence=None).to("cuda")
+    tb = batch_to_token_batch(_tok(encoder), [[{"action": i % 4} for i in range(5)], [{"action": 1}]])
+    model(tb).predictions["action_value"].square().sum().backward()
+    grads = [cast(torch.Tensor, p.grad) for p in model.parameters() if p.grad is not None]
+    assert grads and all(g.dtype is torch.float32 and torch.isfinite(g).all() for g in grads)

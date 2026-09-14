@@ -146,7 +146,7 @@ def test_episode_task_save_load_roundtrip(tmp_path) -> None:
     batch = [[{"action": 0, "reward": 0.0}, {"action": 1, "reward": 1.0}]]
     expected = model(batch_to_token_batch(tok_from_encoder(model.encoder), batch)).predictions
     save_model(model, tmp_path)
-    loaded = load_model(tmp_path, train_kernel="varlen", decode_kernel="flex", dtype=torch.float32).eval()
+    loaded = load_model(tmp_path, train_kernel="reference", decode_kernel="flex", dtype=torch.float32).eval()
     actual = loaded(batch_to_token_batch(tok_from_encoder(loaded.encoder), batch)).predictions
     assert torch.allclose(actual["episode"], expected["episode"])
     assert torch.allclose(actual["task"], expected["task"])

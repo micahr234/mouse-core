@@ -19,6 +19,40 @@ def _tok(**kwargs) -> Tokenizer:
     )
 
 
+def test_tokenizer_pack_rows_packs_ragged_rows() -> None:
+    tok = _tok()
+    rows = [
+        [
+            {"action": 0, "reward": 0.0, "task_index": 0},
+            {"action": 1, "reward": 1.0, "task_index": 0},
+        ],
+        [],
+        [{"action": 2, "reward": 0.5, "task_index": 3}],
+    ]
+    inputs = tok.pack_rows(rows, prev_grouping_ids=None)
+    assert inputs.B == 3
+    assert inputs.step_counts().tolist() == [2, 0, 1]
+    assert inputs.grouping_field == "task_index"
+    manual, _ = pack_token_batch(
+        [tok(step) for row in rows for step in row],
+        sequence_ids=[0, 0, 2],
+        batch_size=3,
+        grouping_field="task_index",
+    )
+    assert inputs.ids.tolist() == manual.ids.tolist()
+    assert inputs.sequence_ids.tolist() == manual.sequence_ids.tolist()
+    assert inputs.grouping_ids.tolist() == manual.grouping_ids.tolist()
+    assert inputs.head_output_indices.tolist() == manual.head_output_indices.tolist()
+
+
+def test_tokenizer_pack_rows_all_empty_keeps_batch_slots() -> None:
+    tok = _tok()
+    inputs = tok.pack_rows([[], [], []], prev_grouping_ids=None)
+    assert inputs.B == 3
+    assert inputs.L == 0
+    assert inputs.step_counts().tolist() == [0, 0, 0]
+
+
 def test_objective_column_dtype_promotes_to_float_when_any_step_is_float() -> None:
     tok = _tok()
     steps = [

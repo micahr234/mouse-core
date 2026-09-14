@@ -15,30 +15,46 @@ inside each class), all decoder layers run in that order, and the outputs
 are restored to the original order before returning. Causal attention over
 the packed segments is then exactly the predicate above.
 
-Three attention kernels run the same packed segments; ``train_kernel``
+Four attention kernels run the same packed segments; ``train_kernel``
 (``Backbone.train_kernel``, a required constructor argument, / the
 ``packed_forward`` argument) selects one so they can be compared on equal
-terms. Everything else — the regrouping, RoPE positions, decoder body,
+terms. The choice is strict: a kernel that cannot run on the current
+device/dtype raises instead of silently substituting another one.
+Everything else — the regrouping, RoPE positions, decoder body,
 compiled body, gradient checkpointing, the hidden-state contract — is shared.
 
-- ``"varlen"``. CUDA bf16 / fp16 (the frozen-base LoRA configuration):
-  :func:`torch.nn.attention.varlen.varlen_attn`, PyTorch's FlashAttention
-  varlen kernel — no mask tensor, grouped KV heads read directly, O(L)
-  memory. CPU, or CUDA fp32: the same decoder body with
-  :func:`torch.nn.functional.scaled_dot_product_attention` over a
-  block-causal boolean mask built once per forward — the fp32 reference
-  mode (O(L^2) memory), not a fallback.
+- ``"varlen"``. :func:`torch.nn.attention.varlen.varlen_attn`, PyTorch's
+  FlashAttention varlen kernel — no mask tensor, grouped KV heads read
+  directly, O(L) memory. Requires CUDA with bf16/fp16 q/k/v: a bf16/fp16
+  backbone (the frozen-base LoRA configuration) or fp32 weights with
+  ``train_autocast_dtype`` set. Anything else raises ``ValueError``.
 - ``"padded"``. Each packed segment is right-padded to ``max_seqlen`` and
   run as a dense causal SDPA call ``[n_seg, H, S, Dh]`` (Flash when the
   backend picks it). Pad keys are masked; attention is not truncated.
-  Cost tracks ``n_seg * S^2``, so a few long groups beat ``"varlen"``'s
-  packed-stream ``L^2`` fallback, and many short groups waste pad.
+  Cost tracks ``n_seg * S^2``, so a few long groups run tight, and many
+  short groups waste pad.
 - ``"flex"``. :func:`torch.nn.attention.flex_attention` with a block-sparse
   mask over the packed segments (128-token blocks; masked blocks are
   skipped). Compiled on CUDA in every dtype — inside the compiled decoder
   body when :func:`install_compiled_decoder` is active, otherwise as a
   compiled kernel of its own — and unfused (scores materialized) on CPU,
   where it is forward-only. The kernel of choice for full fp32 fine-tuning.
+- ``"reference"``. The same decoder body with
+  :func:`torch.nn.functional.scaled_dot_product_attention` over a
+  block-causal boolean mask built once per forward — O(L^2) memory, any
+  device and dtype. The ground-truth implementation the fused kernels are
+  tested against; the explicit choice for CPU training or debugging.
+
+Mixed precision is declared at construction, never inferred:
+``train_autocast_dtype=torch.bfloat16`` (or ``torch.float16``) on a fp32 backbone
+wraps the decoder stack in :func:`torch.autocast` — matmuls run in the
+autocast dtype while weights, norms, RoPE, and the residual stream stay
+fp32. ``decode_autocast_dtype`` is the separate declaration for cached decode
+(``FlexDecodeSession`` runs its layers under it and allocates the KV pool
+in that dtype), so bf16 train can pair with exact fp32 eval decode.
+``packed_forward`` raises if it is called inside an ambient
+``torch.autocast`` region, so the declared precision is always the actual
+precision.
 
 :func:`install_compiled_decoder` compiles the per-layer train decoder body
 once (``torch.compile(dynamic=True)``) and, on CUDA, the full cached-decode
@@ -50,7 +66,7 @@ recomputes each layer in backward instead of storing its activations.
 from __future__ import annotations
 
 import threading
-import warnings
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Callable, Literal, cast, get_args, overload
 
@@ -63,14 +79,16 @@ from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
 
 from mouse_core.models.backbone.flex_decode import (
     _BLOCK_SIZE,
+    _FLASH_DTYPES,
     _FlexKernel,
     _use_flex_compile,
+    check_autocast_dtype,
     flex_block_mask,
     install_compiled_decode_layer,
     module_device_dtype,
 )
 
-TrainKernel = Literal["varlen", "flex", "padded"]
+TrainKernel = Literal["varlen", "flex", "padded", "reference"]
 
 
 def check_train_kernel(kernel: object) -> TrainKernel:
@@ -80,11 +98,8 @@ def check_train_kernel(kernel: object) -> TrainKernel:
     return cast(TrainKernel, kernel)
 
 
-_FLASH_DTYPES = frozenset({torch.bfloat16, torch.float16})
-
 _compiled_layer: Any | None = None
 _flex_kernels: dict[tuple[str, int | None], _FlexKernel] = {}
-_warned_reference_cuda: set[str] = set()
 
 
 @dataclass(frozen=True)
@@ -243,7 +258,8 @@ def _decoder_layer(
 
     ``block_mask`` selects FlexAttention; ``padded`` selects rectangular
     causal SDPA; otherwise ``attn_mask is None`` selects flash varlen and a
-    mask selects packed-stream SDPA. Compiled by :func:`install_compiled_decoder`.
+    mask selects packed-stream SDPA (the ``"reference"`` kernel). Compiled by
+    :func:`install_compiled_decoder`.
     """
     L = h.shape[0]
     attn = layer.self_attn
@@ -260,6 +276,13 @@ def _decoder_layer(
     q, k = apply_rotary_pos_emb(
         q.transpose(0, 1).unsqueeze(0), k.transpose(0, 1).unsqueeze(0), cos, sin
     )
+    if q.dtype != v.dtype:
+        # autocast_dtype over fp32 weights: the projections emit the autocast
+        # dtype but the fp32 RoPE cos/sin promote q/k back to fp32. Every
+        # kernel wants one dtype and flash varlen requires bf16/fp16, so
+        # follow v (the projection output dtype). RoPE itself stays fp32.
+        q = q.to(v.dtype)
+        k = k.to(v.dtype)
     gqa = n_heads != n_kv_heads
     if block_mask is not None:
         assert flex_fn is not None
@@ -349,6 +372,7 @@ def packed_forward(
     sequence_ids: torch.Tensor,
     grouping_ids: torch.Tensor,
     train_kernel: TrainKernel,
+    autocast_dtype: torch.dtype | None = None,
     output_hidden_states: Literal[False] = False,
     checkpoint: bool = False,
 ) -> torch.Tensor: ...
@@ -362,6 +386,7 @@ def packed_forward(
     sequence_ids: torch.Tensor,
     grouping_ids: torch.Tensor,
     train_kernel: TrainKernel,
+    autocast_dtype: torch.dtype | None = None,
     output_hidden_states: Literal[True],
     checkpoint: bool = False,
 ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]: ...
@@ -375,6 +400,7 @@ def packed_forward(
     sequence_ids: torch.Tensor,
     grouping_ids: torch.Tensor,
     train_kernel: TrainKernel,
+    autocast_dtype: torch.dtype | None = None,
     output_hidden_states: bool,
     checkpoint: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, ...]]: ...
@@ -387,6 +413,7 @@ def packed_forward(
     sequence_ids: torch.Tensor,
     grouping_ids: torch.Tensor,
     train_kernel: TrainKernel,
+    autocast_dtype: torch.dtype | None = None,
     output_hidden_states: bool = False,
     checkpoint: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
@@ -399,12 +426,20 @@ def packed_forward(
             model's base dtype.
         sequence_ids: ``[L]`` sequence id per token.
         grouping_ids: ``[L]`` grouping id per token (any integer values).
-        train_kernel: ``"varlen"`` (flash varlen on CUDA bf16/fp16,
-            masked SDPA otherwise), ``"padded"`` (dense causal SDPA on
-            segments padded to ``max_seqlen``), or ``"flex"`` (FlexAttention
-            block mask, compiled on CUDA); see the module docstring.
-            Required so the kernel is always an explicit choice; ``Model``
-            passes ``Backbone.train_kernel``.
+        train_kernel: ``"varlen"`` (flash varlen; requires CUDA with bf16/fp16
+            q/k/v — a bf16/fp16 backbone or ``train_autocast_dtype`` — and raises
+            otherwise), ``"padded"`` (dense causal SDPA on segments padded to
+            ``max_seqlen``), ``"flex"`` (FlexAttention block mask, compiled on
+            CUDA), or ``"reference"`` (masked SDPA over the packed stream,
+            O(L^2) memory, any device/dtype); see the module docstring. There
+            are no fallbacks between kernels. Required so the kernel is always
+            an explicit choice; ``Model`` passes ``Backbone.train_kernel``.
+        autocast_dtype: ``None`` runs everything in the model's base dtype.
+            ``torch.bfloat16`` / ``torch.float16`` (fp32 base weights only)
+            wraps the decoder stack in ``torch.autocast``: matmuls run in this
+            dtype, weights / norms / RoPE / residuals stay fp32. ``Model``
+            passes ``Backbone.train_autocast_dtype``. Calling ``packed_forward``
+            inside an ambient ``torch.autocast`` region raises.
         output_hidden_states: Also return every layer's output (before the
             final norm) for layerwise heads.
         checkpoint: Recompute each layer in backward instead of storing its
@@ -427,6 +462,24 @@ def packed_forward(
     if getattr(hf.config, "use_sliding_window", False):
         raise ValueError("packed_forward does not support sliding-window attention.")
     device, dtype = module_device_dtype(hf)
+    check_autocast_dtype(autocast_dtype, dtype)
+    if torch.is_autocast_enabled(device.type):
+        raise RuntimeError(
+            "packed_forward was called inside an active torch.autocast region. "
+            "Mixed precision is declared at backbone construction "
+            "(train_autocast_dtype= / decode_autocast_dtype=), never inferred from "
+            "ambient state; remove the surrounding torch.autocast."
+        )
+    compute_dtype = dtype if autocast_dtype is None else autocast_dtype
+    if train_kernel == "varlen" and not (device.type == "cuda" and compute_dtype in _FLASH_DTYPES):
+        raise ValueError(
+            f'train_kernel="varlen" is the flash varlen kernel and requires CUDA with '
+            f"bf16/fp16 q/k/v; got device={device.type}, compute dtype={compute_dtype} "
+            f"(base dtype {dtype}, autocast_dtype={autocast_dtype}). There is no fallback: "
+            "use a bf16/fp16 base or train_autocast_dtype=, or pick train_kernel="
+            '"flex" (block-sparse, compiled on CUDA, any dtype), "padded" (dense causal '
+            'SDPA), or "reference" (masked SDPA, O(L^2) memory).'
+        )
     x = embeds.to(device=device, dtype=dtype)
     n_layers = len(hf.layers)
 
@@ -435,7 +488,6 @@ def packed_forward(
         return (out, (x,) * n_layers) if output_hidden_states else out
 
     plan = _packing_plan(sequence_ids.to(device), grouping_ids.to(device))
-    fused = device.type == "cuda" and dtype in _FLASH_DTYPES
     attn_mask: torch.Tensor | None = None
     block_mask: BlockMask | None = None
     flex_fn: Callable[..., torch.Tensor] | None = None
@@ -447,17 +499,8 @@ def packed_forward(
         lengths = plan.cu_seqlens[1:] - plan.cu_seqlens[:-1]
         if not bool((lengths == plan.max_seqlen).all()):
             attn_mask = _padded_causal_mask(plan.cu_seqlens, plan.max_seqlen)
-    elif train_kernel == "varlen" and not fused:
+    elif train_kernel == "reference":
         attn_mask = _block_causal_mask(plan)
-        if device.type == "cuda" and not _warned_reference_cuda:
-            warnings.warn(
-                f"packed_forward is running the fp32 reference attention (masked SDPA, O(L^2) "
-                f"memory) because the backbone dtype is {dtype} and train_kernel is "
-                '"varlen". For fp32 training prefer train_kernel="flex" (block-sparse, '
-                "compiled on CUDA); the flash varlen kernel needs a bf16/fp16 backbone.",
-                stacklevel=2,
-            )
-            _warned_reference_cuda.add(train_kernel)
 
     cfg = hf.config
     n_heads = int(cfg.num_attention_heads)
@@ -465,19 +508,25 @@ def packed_forward(
     head_dim = int(cfg.head_dim)
 
     h = x[plan.order]
+    # RoPE cos/sin are computed outside autocast and stay fp32 alongside the
+    # residual stream; ``_decoder_layer`` casts q/k to the compute dtype.
     cos, sin = hf.rotary_emb(h.unsqueeze(0), plan.position_ids.unsqueeze(0))
     body = _compiled_layer if _compiled_layer is not None else _decoder_layer
     recompute = checkpoint and torch.is_grad_enabled()
     layer_hiddens: list[torch.Tensor] = []
-    for layer in hf.layers:
-        args = (
-            layer, h, cos, sin, plan.cu_seqlens, plan.max_seqlen,
-            attn_mask, block_mask, flex_fn, padded, n_heads, n_kv_heads, head_dim,
-        )
-        h = _checkpoint(body, *args, use_reentrant=False) if recompute else body(*args)
-        if output_hidden_states:
-            layer_hiddens.append(h[plan.inverse])
-    out = hf.norm(h)[plan.inverse]
+    run_ctx = (
+        nullcontext() if autocast_dtype is None else torch.autocast(device.type, dtype=autocast_dtype)
+    )
+    with run_ctx:
+        for layer in hf.layers:
+            args = (
+                layer, h, cos, sin, plan.cu_seqlens, plan.max_seqlen,
+                attn_mask, block_mask, flex_fn, padded, n_heads, n_kv_heads, head_dim,
+            )
+            h = _checkpoint(body, *args, use_reentrant=False) if recompute else body(*args)
+            if output_hidden_states:
+                layer_hiddens.append(h[plan.inverse])
+        out = hf.norm(h)[plan.inverse]
     if output_hidden_states:
         return out, tuple(layer_hiddens)
     return out

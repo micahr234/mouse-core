@@ -37,7 +37,11 @@ from mouse_core.models.backbone.flex_decode import (
     check_decode_kernel,
     module_device_dtype,
 )
-from mouse_core.models.backbone.packed_train import TrainKernel, check_train_kernel
+from mouse_core.models.backbone.packed_train import (
+    TrainKernel,
+    check_autocast_dtype,
+    check_train_kernel,
+)
 from mouse_core.models.lora import LoRAConfig, apply_lora
 
 
@@ -76,14 +80,28 @@ class Backbone(nn.Module, ABC):
     transformer backbone, so the choices are always explicit:
 
     - ``train_kernel`` runs the uncached packed forward (training, and any
-      forward without a cache): ``"varlen"`` (flash varlen on CUDA
-      bf16/fp16, masked SDPA otherwise), ``"padded"`` (dense causal SDPA
-      on segments padded to ``max_seqlen``), or ``"flex"`` (FlexAttention
-      block mask, compiled on CUDA in every dtype). All three give the
-      same result.
+      forward without a cache): ``"varlen"`` (flash varlen; requires CUDA
+      with bf16/fp16 q/k/v — a bf16/fp16 backbone or ``train_autocast_dtype`` —
+      and raises otherwise), ``"padded"`` (dense causal SDPA on segments
+      padded to ``max_seqlen``), ``"flex"`` (FlexAttention block mask,
+      compiled on CUDA in every dtype), or ``"reference"`` (masked SDPA,
+      O(L^2) memory, any device/dtype). All four give the same result; a
+      kernel that cannot run on the current device/dtype raises instead of
+      falling back to another one.
     - ``decode_kernel`` runs cached decode (``use_cache=True``): ``"flex"``
       (paged FlexAttention), currently the only kernel that reads K/V
       through a page table.
+    - ``train_autocast_dtype`` / ``decode_autocast_dtype`` (default
+      ``None``) declare mixed precision per path for a fp32 backbone: the
+      packed training forward / cached decode run their matmuls in
+      bf16/fp16 under ``torch.autocast`` while weights, norms, RoPE, and
+      the residual stream stay fp32; decode also allocates its KV pool in
+      the autocast dtype (half the fp32 size). ``None`` runs that path in
+      the base dtype, so e.g. ``train_autocast_dtype=torch.bfloat16`` with
+      ``decode_autocast_dtype=None`` is mixed-precision training with
+      exact fp32 eval decode. Both forwards raise if called inside an
+      ambient ``torch.autocast`` region — precision is declared here,
+      never inferred.
 
     Like ``gradient_checkpointing`` they are execution choices for the
     current machine, not model properties: not saved with the model
@@ -95,10 +113,21 @@ class Backbone(nn.Module, ABC):
     gradient_checkpointing: bool = False
     train_kernel: TrainKernel
     decode_kernel: DecodeKernel
+    train_autocast_dtype: torch.dtype | None = None
+    decode_autocast_dtype: torch.dtype | None = None
 
     def _set_kernels(self, train_kernel: TrainKernel, decode_kernel: DecodeKernel) -> None:
         self.train_kernel = check_train_kernel(train_kernel)
         self.decode_kernel = check_decode_kernel(decode_kernel)
+
+    def _set_autocast(
+        self,
+        train_autocast_dtype: torch.dtype | None,
+        decode_autocast_dtype: torch.dtype | None,
+        dtype: torch.dtype,
+    ) -> None:
+        self.train_autocast_dtype = check_autocast_dtype(train_autocast_dtype, dtype)
+        self.decode_autocast_dtype = check_autocast_dtype(decode_autocast_dtype, dtype)
 
     def to(self, *args: Any, **kwargs: Any) -> Self:
         """Move the backbone; the base dtype is fixed at construction (``dtype=``)."""
@@ -167,7 +196,8 @@ class Backbone(nn.Module, ABC):
 
         ``Model.forward`` calls this on the first ``use_cache=True`` call and
         carries the session inside its ``DecodeCache``. The session runs
-        ``self.decode_kernel``; its paged KV pool sizes itself as rows grow.
+        ``self.decode_kernel`` under ``self.decode_autocast_dtype`` (KV pool
+        in the compute dtype); its paged KV pool sizes itself as rows grow.
         Requires the backbone to expose a ``transformers`` decoder stack as
         ``self.model``.
         """
@@ -177,7 +207,7 @@ class Backbone(nn.Module, ABC):
                 f"{type(self).__name__} does not support cached decoding."
             )
         check_decode_kernel(self.decode_kernel)  # "flex" is the only kernel; paged FlexAttention.
-        return FlexDecodeSession(model, batch_size=batch_size)
+        return FlexDecodeSession(model, batch_size=batch_size, autocast_dtype=self.decode_autocast_dtype)
 
 
 def _reject_dtype_cast(what: str, *args: Any, **kwargs: Any) -> None:

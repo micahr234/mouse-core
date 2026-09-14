@@ -35,7 +35,7 @@ _MODALITIES = [
 def _tiny_model(*, num_passes: int | None = 3, layerwise: bool = False) -> Model:
     encoder = NumericEmbedder(hidden_dim=_HIDDEN, modalities=_MODALITIES)
     backbone = LlamaBackbone(
-        train_kernel="varlen", decode_kernel="flex", dtype=torch.float32,
+        train_kernel="reference", decode_kernel="flex", dtype=torch.float32,
         hidden_dim=_HIDDEN,
         num_layers=2,
         num_heads=2,
@@ -103,7 +103,7 @@ def test_recurrence_validates_arguments() -> None:
     with pytest.raises(ValueError, match="cannot be combined"):
         Model(
             encoder=NumericEmbedder(hidden_dim=_HIDDEN, modalities=_MODALITIES),
-            backbone=LlamaBackbone(train_kernel="varlen", decode_kernel="flex", dtype=torch.float32, hidden_dim=_HIDDEN, num_layers=1, num_heads=2),
+            backbone=LlamaBackbone(train_kernel="reference", decode_kernel="flex", dtype=torch.float32, hidden_dim=_HIDDEN, num_layers=1, num_heads=2),
             heads=DiscreteActionValueHead(
                 in_features=_HIDDEN, out_features=_ACTIONS, hidden_dim=_HIDDEN, num_layers=1
             ),
@@ -114,7 +114,7 @@ def test_recurrence_validates_arguments() -> None:
     with pytest.raises(ValueError, match="hidden_dim mismatch"):
         Model(
             encoder=NumericEmbedder(hidden_dim=_HIDDEN, modalities=_MODALITIES),
-            backbone=LlamaBackbone(train_kernel="varlen", decode_kernel="flex", dtype=torch.float32, hidden_dim=_HIDDEN, num_layers=1, num_heads=2),
+            backbone=LlamaBackbone(train_kernel="reference", decode_kernel="flex", dtype=torch.float32, hidden_dim=_HIDDEN, num_layers=1, num_heads=2),
             heads=DiscreteActionValueHead(
                 in_features=_HIDDEN, out_features=_ACTIONS, hidden_dim=_HIDDEN, num_layers=1
             ),
@@ -337,7 +337,7 @@ def test_save_load_roundtrip_keeps_recurrence(tmp_path) -> None:
     save_model(model, tmp_path)
     config = json.loads((tmp_path / "config.json").read_text())
     assert config["recurrence"] == {"num_passes": 3}
-    loaded = load_model(str(tmp_path), train_kernel="varlen", decode_kernel="flex", dtype=torch.float32).eval()
+    loaded = load_model(str(tmp_path), train_kernel="reference", decode_kernel="flex", dtype=torch.float32).eval()
     assert loaded.recurrence is not None and loaded.recurrence.num_passes == 3
     batch = _token_batch(model, _BATCH)
     with torch.no_grad():

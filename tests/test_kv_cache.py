@@ -64,10 +64,10 @@ def _as_rect(preds: torch.Tensor) -> torch.Tensor:
         return preds.unsqueeze(0)
     return preds
 
-def _tiny_model(backbone_cls, tokens: int=1, dtype: torch.dtype = torch.float32, **backbone_kwargs) -> Model:
+def _tiny_model(backbone_cls, tokens: int=1, dtype: torch.dtype = torch.float32, train_kernel: str = "reference", **backbone_kwargs) -> Model:
     hidden_dim = 16
     encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}, {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3, "std": 0.02, "positions": 1}])
-    backbone = backbone_cls(train_kernel="varlen", decode_kernel="flex", dtype=dtype, hidden_dim=hidden_dim, num_layers=2, num_heads=2, **backbone_kwargs)
+    backbone = backbone_cls(train_kernel=train_kernel, decode_kernel="flex", dtype=dtype, hidden_dim=hidden_dim, num_layers=2, num_heads=2, **backbone_kwargs)
     head = DiscreteActionValueHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1)
     return Model(encoder=encoder, backbone=backbone, heads=head, action_head="action_value", reasoner=None, recurrence=None).eval()
 
@@ -216,6 +216,62 @@ def test_cuda_bf16_lora_compiled_train_matches_cached_decode() -> None:
         assert flex_decode_mod._compiled_decode_layer is not None
     finally:
         packed_train_mod._compiled_layer = was
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='varlen train / bf16 KV pool are CUDA-only')
+def test_cuda_fp32_autocast_train_matches_cached_decode() -> None:
+    """bf16 declared on both paths: flash varlen packed train == Flex cached decode on a bf16 KV pool."""
+    torch.manual_seed(6)
+    model = _tiny_model(
+        Qwen3Backbone, train_kernel="varlen",
+        train_autocast_dtype=torch.bfloat16, decode_autocast_dtype=torch.bfloat16,
+    ).to(torch.device('cuda'))
+    steps = _steps(8)
+    for step, task in zip(steps, (0, 0, 1, 1, 0, 0, 2, 0)):
+        step["task_index"] = task
+    with torch.no_grad():
+        full, _ = _fwd(model, [steps])
+        cache = None
+        last_step_preds = []
+        for step in steps:
+            preds, cache = _fwd(model, [[step]], cache=cache, use_cache=True)
+            last_step_preds.append(preds['action_value'][:, -1])
+        incremental = torch.stack(last_step_preds, dim=1)
+    assert cache is not None
+    session = cache.sessions[0]
+    assert session.autocast_dtype is torch.bfloat16
+    assert session.k_cache.dtype == torch.bfloat16 and session.v_cache.dtype == torch.bfloat16
+    full_q = _as_rect(full['action_value'])
+    assert full_q.dtype == torch.float32  # residual stream and head stay fp32
+    assert torch.allclose(incremental, full_q, atol=0.05), (incremental - full_q).abs().max().item()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='varlen train is CUDA-only')
+def test_cuda_split_autocast_bf16_train_fp32_decode() -> None:
+    """train_autocast_dtype=bf16 with decode_autocast_dtype=None: fp32 KV pool, decode matches bf16 train."""
+    torch.manual_seed(7)
+    model = _tiny_model(
+        Qwen3Backbone, train_kernel="varlen", train_autocast_dtype=torch.bfloat16,
+    ).to(torch.device('cuda'))
+    steps = _steps(6)
+    with torch.no_grad():
+        full, _ = _fwd(model, [steps])
+        preds_a, cache = _fwd(model, [steps[:4]], use_cache=True)
+        preds_b, cache = _fwd(model, [steps[4:]], cache=cache, use_cache=True)
+        incremental = torch.cat([preds_a['action_value'], preds_b['action_value']], dim=1)
+    session = cache.sessions[0]
+    assert session.autocast_dtype is None
+    assert session.k_cache.dtype == torch.float32 and session.v_cache.dtype == torch.float32
+    full_q = _as_rect(full['action_value'])
+    assert torch.allclose(incremental, full_q, atol=0.05), (incremental - full_q).abs().max().item()
+
+
+def test_decode_rejects_ambient_autocast() -> None:
+    """Precision is declared at construction; a decode inside torch.autocast raises."""
+    model = _tiny_model(Qwen3Backbone)
+    steps = _steps(2)
+    with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16), pytest.raises(RuntimeError, match="torch.autocast"):
+        _fwd(model, [steps], use_cache=True)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='decode CUDA graph is CUDA-only')
@@ -400,7 +456,7 @@ def test_concat_fusion_ragged_chunks_match_unbatched() -> None:
     torch.manual_seed(6)
     hidden_dim = 16
     encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}, {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3, "std": 0.02, "positions": 1}, {'type': 'learnable', 'tokens': 1, "std": 0.02, "positions": 1}])
-    backbone = Qwen3Backbone(train_kernel="varlen", decode_kernel="flex", dtype=torch.float32, hidden_dim=hidden_dim, num_layers=2, num_heads=2)
+    backbone = Qwen3Backbone(train_kernel="reference", decode_kernel="flex", dtype=torch.float32, hidden_dim=hidden_dim, num_layers=2, num_heads=2)
     head = DiscreteActionValueHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1)
     model = Model(encoder=encoder, backbone=backbone, heads=head, action_head="action_value", reasoner=None, recurrence=None).eval()
     assert model.encoder.tokens_per_step == 4

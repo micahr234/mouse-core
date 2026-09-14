@@ -8,6 +8,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- ``Tokenizer.pack_rows``: tokenize ragged per-sequence rows
+  (``list[list[dict]]``, empty entries keep their batch slot) and pack
+  them into a ``TokenBatch`` in one call — the decode-path helper the
+  online and inference notebooks previously each defined by hand.
+  ``prev_grouping_ids`` is a required argument (the last grouping id
+  already cached per sequence, or ``None``) so incremental decode with
+  ``group_prefix=`` cannot silently re-emit a cached segment's prefix.
+  ``examples/03``, ``07``, ``08``, and ``09`` now use it.
+- ``train_autocast_dtype`` and ``decode_autocast_dtype`` on transformer
+  backbones (``Qwen3Backbone``, ``LlamaBackbone``) and ``load_model``:
+  ``torch.bfloat16`` / ``torch.float16`` declares mixed precision per
+  path for a fp32 backbone — the packed training forward / cached
+  decode run their matmuls in the autocast dtype under
+  ``torch.autocast`` while weights, optimizer state, norms, RoPE, and
+  the residual stream stay fp32, and ``FlexDecodeSession`` allocates
+  its KV pool in the decode autocast dtype (half the fp32 size).
+  ``None`` (default) runs that path in the base dtype; the two are
+  independent, so bf16 training can pair with exact fp32 eval decode.
+  Requires fp32 base weights. Execution choices like the kernels: not
+  saved with the model.
+- ``train_kernel="reference"``: the masked-SDPA packed-stream kernel
+  (O(L^2) memory, any device/dtype) as an explicit choice — previously
+  only reachable as the silent ``"varlen"`` fallback. The ground-truth
+  implementation the fused kernels are tested against.
 - ``MaxNStepDqnObjective``: two heads ``selector`` (deployed
   policy) and ``max_return``. Same complete n-step returns as
   ``NStepDqnObjective`` (incomplete windows masked, not shortened).
@@ -282,6 +306,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``grouping_field: str | None = None`` (``None`` ⇒ no grouping filter).
 
 ### Changed
+- Train kernels are strict; there are no fallbacks between kernels.
+  ``train_kernel="varlen"`` always means the flash varlen kernel and
+  requires CUDA with bf16/fp16 q/k/v (a bf16/fp16 backbone or fp32
+  weights with ``train_autocast_dtype``); anything else raises ``ValueError``
+  instead of silently running the masked-SDPA reference (that fallback,
+  and its warning, are gone — ask for ``"reference"`` explicitly).
+- Mixed precision is declared at construction, never inferred:
+  ``packed_forward`` and ``FlexDecodeSession.forward`` raise
+  ``RuntimeError`` when called inside an ambient ``torch.autocast``
+  region. Under a declared autocast dtype the q/k projections are cast
+  back to it after the fp32 RoPE, so every kernel runs attention in the
+  declared compute dtype.
 - DQN discounts have no defaults. ``DqnObjective`` and
   ``LayerwiseDqnObjective`` require all five ``gamma_*`` values
   (layerwise also requires every ``gamma_*_start``).

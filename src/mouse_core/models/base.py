@@ -594,6 +594,8 @@ def load_model(
     train_kernel: TrainKernel,
     decode_kernel: DecodeKernel,
     dtype: torch.dtype,
+    train_autocast_dtype: torch.dtype | None = None,
+    decode_autocast_dtype: torch.dtype | None = None,
     force_download: bool = True,
     local_dir: str | Path | None = None,
     **kwargs: Any,
@@ -605,14 +607,23 @@ def load_model(
             repo id (e.g. ``"my-model"`` or ``"your-org/your-model"``).
             Unscoped Hub names are resolved under the authenticated user.
         train_kernel: Kernel for the uncached (packed) forward of a
-            transformer backbone, ``"varlen"``, ``"padded"``, or ``"flex"``.
+            transformer backbone: ``"varlen"``, ``"padded"``, ``"flex"``, or
+            ``"reference"``. Strict — a kernel that cannot run on the current
+            device/dtype raises instead of falling back.
         decode_kernel: Kernel for cached decode, ``"flex"``.
         dtype: Dtype of the transformer backbone's base weights
             (``preferred_dtype(device)`` for inference or a LoRA base,
             ``torch.float32`` to fine-tune them). The saved weights are cast
             into it.
+        train_autocast_dtype: ``torch.bfloat16`` / ``torch.float16``
+            declares bf16/fp16 mixed precision for the packed training
+            forward of a fp32 backbone; ``None`` (default) trains in the
+            base dtype.
+        decode_autocast_dtype: The same declaration for cached decode
+            (which also allocates its KV pool in the autocast dtype);
+            ``None`` (default) decodes in the base dtype.
 
-            All three are execution choices for the loading machine, not
+            All of these are execution choices for the loading machine, not
             model properties, so they are never stored in the checkpoint and
             must be given here (ignored by backbones without a transformer
             stack).
@@ -650,18 +661,36 @@ def load_model(
             "with save_model(...)."
         )
 
-    model = _build_model_from_config(config, train_kernel=train_kernel, decode_kernel=decode_kernel, dtype=dtype)
+    model = _build_model_from_config(
+        config,
+        train_kernel=train_kernel,
+        decode_kernel=decode_kernel,
+        dtype=dtype,
+        train_autocast_dtype=train_autocast_dtype,
+        decode_autocast_dtype=decode_autocast_dtype,
+    )
     state = torch.load(weights_path, map_location=map_location)
     model.load_state_dict(state)
     return model
 
 
 def _build_model_from_config(
-    config: dict[str, Any], *, train_kernel: TrainKernel, decode_kernel: DecodeKernel, dtype: torch.dtype
+    config: dict[str, Any],
+    *,
+    train_kernel: TrainKernel,
+    decode_kernel: DecodeKernel,
+    dtype: torch.dtype,
+    train_autocast_dtype: torch.dtype | None,
+    decode_autocast_dtype: torch.dtype | None,
 ) -> "Model":
     encoder = _build_encoder_from_config(config["encoder"])
     backbone = _build_backbone_from_config(
-        config["backbone"], train_kernel=train_kernel, decode_kernel=decode_kernel, dtype=dtype
+        config["backbone"],
+        train_kernel=train_kernel,
+        decode_kernel=decode_kernel,
+        dtype=dtype,
+        train_autocast_dtype=train_autocast_dtype,
+        decode_autocast_dtype=decode_autocast_dtype,
     )
     heads_cfg = config["heads"]
     heads = _build_heads_from_config(heads_cfg["heads"])
@@ -715,7 +744,13 @@ def _build_encoder_from_config(config: dict[str, Any]) -> Encoder:
 
 
 def _build_backbone_from_config(
-    config: dict[str, Any], *, train_kernel: TrainKernel, decode_kernel: DecodeKernel, dtype: torch.dtype
+    config: dict[str, Any],
+    *,
+    train_kernel: TrainKernel,
+    decode_kernel: DecodeKernel,
+    dtype: torch.dtype,
+    train_autocast_dtype: torch.dtype | None,
+    decode_autocast_dtype: torch.dtype | None,
 ) -> Backbone:
     backbone_type = config.get("type")
     if backbone_type == "identity":
@@ -724,7 +759,13 @@ def _build_backbone_from_config(
         return IdentityBackbone(hidden_dim=config.get("hidden_dim"))
     lora_cfg = config.get("lora")
     lora = LoRAConfig(**lora_cfg) if lora_cfg is not None else None
-    runtime: dict[str, Any] = dict(train_kernel=train_kernel, decode_kernel=decode_kernel, dtype=dtype)
+    runtime: dict[str, Any] = dict(
+        train_kernel=train_kernel,
+        decode_kernel=decode_kernel,
+        dtype=dtype,
+        train_autocast_dtype=train_autocast_dtype,
+        decode_autocast_dtype=decode_autocast_dtype,
+    )
     if backbone_type == "llama":
         from mouse_core.models.backbone import LlamaBackbone
 
@@ -1243,9 +1284,11 @@ class Model(nn.Module):
         """Uncached backbone pass over the flat packed stream.
 
         Transformer backbones run :func:`packed_forward` with the backbone's
-        ``train_kernel`` (``"varlen"``: flash varlen on CUDA bf16/fp16,
-        masked SDPA otherwise; ``"padded"``: dense causal SDPA on
-        segments padded to ``max_seqlen``; ``"flex"``: FlexAttention). Backbones
+        ``train_kernel`` (``"varlen"``: flash varlen, CUDA bf16/fp16 q/k/v
+        only — raises otherwise; ``"padded"``: dense causal SDPA on segments
+        padded to ``max_seqlen``; ``"flex"``: FlexAttention; ``"reference"``:
+        masked SDPA, O(L^2)) and ``train_autocast_dtype`` (bf16/fp16 mixed
+        precision over fp32 weights, ``None`` for the base dtype). Backbones
         without a decoder stack (``IdentityBackbone``, custom) take the
         rectangular route with a dense sequence/grouping mask. ``embeds``
         come from the fp32 encoder / adapters and are cast to the backbone's
@@ -1264,6 +1307,7 @@ class Model(nn.Module):
                 output_hidden_states=needs_layerwise,
                 checkpoint=backbone.gradient_checkpointing,
                 train_kernel=backbone.train_kernel,
+                autocast_dtype=backbone.train_autocast_dtype,
             )
         attention_mask = _flat_sequence_causal_mask(
             dtype=embeds.dtype,

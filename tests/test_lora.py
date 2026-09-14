@@ -42,7 +42,7 @@ _BATCH = [
 
 
 def _backbone(lora: LoRAConfig | None, *, cls=Qwen3Backbone, dtype: torch.dtype = torch.float32):
-    return cls(train_kernel="varlen", decode_kernel="flex", dtype=dtype, hidden_dim=_HIDDEN, num_layers=2, num_heads=2, max_position_embeddings=64, lora=lora)
+    return cls(train_kernel="reference", decode_kernel="flex", dtype=dtype, hidden_dim=_HIDDEN, num_layers=2, num_heads=2, max_position_embeddings=64, lora=lora)
 
 
 def _model(
@@ -358,7 +358,7 @@ def test_save_load_roundtrip_with_lora(tmp_path) -> None:
         "dropout": 0.0,
         "targets": ["q_proj", "v_proj"],
     }
-    loaded = load_model(tmp_path, train_kernel="varlen", decode_kernel="flex", dtype=torch.float32).eval()
+    loaded = load_model(tmp_path, train_kernel="reference", decode_kernel="flex", dtype=torch.float32).eval()
     assert loaded.backbone is not None
     assert loaded.backbone.lora == model.backbone.lora  # type: ignore[union-attr]
     assert set(loaded.state_dict()) == set(model.state_dict())
@@ -373,7 +373,7 @@ def test_save_load_roundtrip_without_lora_has_no_lora_key(tmp_path) -> None:
     with (tmp_path / "config.json").open() as fh:
         config = json.load(fh)
     assert "lora" not in config["backbone"]
-    assert load_model(tmp_path, train_kernel="varlen", decode_kernel="flex", dtype=torch.float32).backbone.lora is None  # type: ignore[union-attr]
+    assert load_model(tmp_path, train_kernel="reference", decode_kernel="flex", dtype=torch.float32).backbone.lora is None  # type: ignore[union-attr]
 
 
 # ---- delayed copy / Polyak ---------------------------------------------------

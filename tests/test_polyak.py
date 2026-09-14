@@ -51,7 +51,7 @@ def _llama_model(*, layerwise: bool = False) -> Model:
     hidden_dim = 16
     encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=_MODALITIES)
     backbone = LlamaBackbone(
-        train_kernel="varlen", decode_kernel="flex", dtype=torch.float32,
+        train_kernel="reference", decode_kernel="flex", dtype=torch.float32,
         hidden_dim=hidden_dim, num_layers=2, num_heads=2, max_position_embeddings=64
     )
     head: BaseHead

@@ -23,7 +23,7 @@ def test_composed_model_roundtrip(tmp_path) -> None:
     batch = [[{'action': 0, 'reward': 0.0, 'episode_done': 0, 'task_done': 0}, {'action': 1, 'reward': 1.0, 'episode_done': 0, 'task_done': 0}, {'action': 2, 'reward': 2.0, 'episode_done': 1, 'task_done': 0}]]
     expected = model(batch_to_token_batch(_tok(model.encoder), batch)).predictions
     save_model(model, tmp_path)
-    loaded = load_model(tmp_path, train_kernel="varlen", decode_kernel="flex", dtype=torch.float32).eval()
+    loaded = load_model(tmp_path, train_kernel="reference", decode_kernel="flex", dtype=torch.float32).eval()
     actual = loaded(batch_to_token_batch(_tok(loaded.encoder), batch)).predictions
     assert torch.allclose(actual['action_value'], expected['action_value'])
     assert loaded.hidden_dim == hidden_dim
@@ -54,7 +54,7 @@ def test_composed_model_roundtrip(tmp_path) -> None:
 def test_kernels_and_dtype_are_not_saved_and_come_from_the_loader(tmp_path) -> None:
     hidden_dim = 8
     encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}])
-    backbone = Qwen3Backbone(train_kernel="varlen", decode_kernel="flex", dtype=torch.float32, hidden_dim=hidden_dim, num_layers=1, num_heads=2)
+    backbone = Qwen3Backbone(train_kernel="reference", decode_kernel="flex", dtype=torch.float32, hidden_dim=hidden_dim, num_layers=1, num_heads=2)
     heads = DiscreteActionValueHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1)
     save_model(Model(encoder=encoder, backbone=backbone, heads=heads, action_head="action_value", reasoner=None, recurrence=None), tmp_path)
     with (tmp_path / 'config.json').open() as fh:
@@ -72,9 +72,9 @@ def test_transformer_backbone_requires_kernels_and_dtype() -> None:
     with pytest.raises(ValueError, match="train_kernel"):
         Qwen3Backbone(train_kernel=cast(Any, "sdpa"), decode_kernel="flex", dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2)
     with pytest.raises(ValueError, match="decode_kernel"):
-        Qwen3Backbone(train_kernel="varlen", decode_kernel=cast(Any, "sdpa"), dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2)
+        Qwen3Backbone(train_kernel="reference", decode_kernel=cast(Any, "sdpa"), dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2)
     with pytest.raises(TypeError, match="dtype"):
-        Qwen3Backbone(train_kernel="varlen", decode_kernel="flex", dtype=torch.int8, hidden_dim=8, num_layers=1, num_heads=2)
+        Qwen3Backbone(train_kernel="reference", decode_kernel="flex", dtype=torch.int8, hidden_dim=8, num_layers=1, num_heads=2)
 
 
 def test_roundtrip_multi_field_spec_before_learnable(tmp_path) -> None:
@@ -109,7 +109,7 @@ def test_roundtrip_multi_field_spec_before_learnable(tmp_path) -> None:
     batch = [[{'action': 0, 'prev_action': 1, 'reward': 0.5, 'task_index': 0}, {'action': 2, 'prev_action': 0, 'reward': 1.0, 'task_index': 0}]]
     expected = model(batch_to_token_batch(tokenizer, batch, grouping_field="task_index")).predictions
     save_model(model, tmp_path)
-    loaded = load_model(tmp_path, train_kernel="varlen", decode_kernel="flex", dtype=torch.float32).eval()
+    loaded = load_model(tmp_path, train_kernel="reference", decode_kernel="flex", dtype=torch.float32).eval()
     assert set(model.state_dict()) == set(loaded.state_dict())
     actual = loaded(batch_to_token_batch(tokenizer, batch, grouping_field="task_index")).predictions
     assert torch.allclose(actual['action_value'], expected['action_value'])
@@ -126,7 +126,7 @@ def test_composed_model_roundtrip_static_fourier(tmp_path) -> None:
     batch = [[{'action': 1, 'reward': 0.5}, {'action': 2, 'reward': -0.1}]]
     expected = model(batch_to_token_batch(_tok(model.encoder), batch)).predictions
     save_model(model, tmp_path)
-    loaded = load_model(tmp_path, train_kernel="varlen", decode_kernel="flex", dtype=torch.float32).eval()
+    loaded = load_model(tmp_path, train_kernel="reference", decode_kernel="flex", dtype=torch.float32).eval()
     actual = loaded(batch_to_token_batch(_tok(loaded.encoder), batch)).predictions
     assert torch.allclose(actual['action_value'], expected['action_value'])
     enc = cast(NumericEmbedder, model.encoder)
@@ -170,7 +170,7 @@ def test_model_card_includes_usage_and_architecture(tmp_path) -> None:
 def _lora_model(dtype: torch.dtype) -> Model:
     hidden_dim = 8
     encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}, {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3, "std": 0.02, "positions": 1}])
-    backbone = Qwen3Backbone(train_kernel="varlen", decode_kernel="flex", dtype=dtype, hidden_dim=hidden_dim, num_layers=1, num_heads=2, lora=LoRAConfig(rank=2))
+    backbone = Qwen3Backbone(train_kernel="reference", decode_kernel="flex", dtype=dtype, hidden_dim=hidden_dim, num_layers=1, num_heads=2, lora=LoRAConfig(rank=2))
     heads = DiscreteActionValueHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1)
     return Model(encoder=encoder, backbone=backbone, heads=heads, action_head="action_value", reasoner=None, recurrence=None).eval()
 
@@ -218,7 +218,7 @@ def test_model_and_backbone_refuse_dtype_casts(cast_fn) -> None:
 def test_load_model_casts_saved_weights_into_requested_dtype(tmp_path) -> None:
     model = _lora_model(torch.bfloat16)
     save_model(model, tmp_path)
-    loaded = load_model(tmp_path, train_kernel="varlen", decode_kernel="flex", dtype=torch.float32)
+    loaded = load_model(tmp_path, train_kernel="reference", decode_kernel="flex", dtype=torch.float32)
     assert loaded.backbone.dtype == torch.float32
     assert {p.dtype for p in loaded.backbone.parameters()} == {torch.float32}
     saved: dict[str, torch.Tensor] = {n: cast(torch.Tensor, p) for n, p in model.backbone.named_parameters()}

@@ -38,7 +38,7 @@ _TOKENS_PER_STEP = 5
 def _tiny_model(*, num_thoughts: int = 2, with_reasoner: bool = True) -> Model:
     encoder = NumericEmbedder(hidden_dim=_HIDDEN, modalities=_MODALITIES)
     backbone = LlamaBackbone(
-        train_kernel="varlen", decode_kernel="flex", dtype=torch.float32,
+        train_kernel="reference", decode_kernel="flex", dtype=torch.float32,
         hidden_dim=_HIDDEN,
         num_layers=2,
         num_heads=2,
@@ -271,7 +271,7 @@ def test_save_load_roundtrip_with_reasoner(tmp_path) -> None:
     torch.manual_seed(0)
     model = _tiny_model(num_thoughts=3).eval()
     save_model(model, tmp_path)
-    loaded = load_model(str(tmp_path), train_kernel="varlen", decode_kernel="flex", dtype=torch.float32, map_location="cpu").eval()
+    loaded = load_model(str(tmp_path), train_kernel="reference", decode_kernel="flex", dtype=torch.float32, map_location="cpu").eval()
     assert loaded.reasoner is not None
     assert loaded.reasoner.num_thoughts == 3
     batch = _token_batch(model, _BATCH)

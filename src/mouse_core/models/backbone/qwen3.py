@@ -115,11 +115,15 @@ class _Qwen3BackboneConfig:
 class Qwen3Backbone(Backbone):
     """Backbone adapter wrapping a ``transformers.Qwen3Model``.
 
-    ``train_kernel`` (``"varlen"`` / ``"padded"`` / ``"flex"``), ``decode_kernel``
-    (``"flex"``) and ``dtype`` are required: the uncached-forward kernel, the
-    cached-decode kernel, and the dtype of the base weights (``torch.float32``
-    to fine-tune them, ``preferred_dtype(device)`` for a frozen LoRA base or
-    inference). See ``Backbone``. ``Model.to(device)`` moves and never casts.
+    ``train_kernel`` (``"varlen"`` / ``"padded"`` / ``"flex"`` / ``"reference"``),
+    ``decode_kernel`` (``"flex"``) and ``dtype`` are required: the
+    uncached-forward kernel, the cached-decode kernel, and the dtype of the
+    base weights (``torch.float32`` to fine-tune them,
+    ``preferred_dtype(device)`` for a frozen LoRA base or inference).
+    ``train_autocast_dtype`` / ``decode_autocast_dtype`` (bf16/fp16, fp32
+    base only) declare mixed precision per path: the packed training
+    forward and cached decode (KV pool in the autocast dtype). See
+    ``Backbone``. ``Model.to(device)`` moves and never casts.
 
     Without ``lora`` the backbone is fully trainable (keep the model fp32).
     Pass ``lora=LoRAConfig(...)`` to freeze the base weights (bf16 on CUDA)
@@ -134,6 +138,8 @@ class Qwen3Backbone(Backbone):
         train_kernel: TrainKernel,
         decode_kernel: DecodeKernel,
         dtype: torch.dtype,
+        train_autocast_dtype: torch.dtype | None = None,
+        decode_autocast_dtype: torch.dtype | None = None,
         model: Qwen3Model | None = None,
         hidden_dim: int | None = None,
         pretrained: str | Path | None = None,
@@ -146,6 +152,7 @@ class Qwen3Backbone(Backbone):
         self._set_kernels(train_kernel, decode_kernel)
         if not isinstance(dtype, torch.dtype) or not dtype.is_floating_point:
             raise TypeError(f"dtype must be a floating point torch.dtype, got {dtype!r}.")
+        self._set_autocast(train_autocast_dtype, decode_autocast_dtype, dtype)
         if model is not None and pretrained is not None:
             raise TypeError("Qwen3Backbone accepts either model= or pretrained=, not both.")
 

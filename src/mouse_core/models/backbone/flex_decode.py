@@ -64,7 +64,8 @@ from __future__ import annotations
 import threading
 import warnings
 from collections.abc import Sequence
-from typing import Any, Callable, Literal, cast, get_args
+from contextlib import nullcontext
+from typing import Any, Callable, ContextManager, Literal, cast, get_args
 
 import torch
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask, flex_attention
@@ -85,6 +86,29 @@ def check_decode_kernel(kernel: object) -> DecodeKernel:
     if kernel not in get_args(DecodeKernel):
         raise ValueError(f"decode_kernel must be one of {get_args(DecodeKernel)}, got {kernel!r}.")
     return cast(DecodeKernel, kernel)
+
+
+_FLASH_DTYPES = frozenset({torch.bfloat16, torch.float16})
+
+
+def check_autocast_dtype(autocast_dtype: object, dtype: torch.dtype) -> torch.dtype | None:
+    """Validate a backbone autocast dtype (train or decode) against the base weight ``dtype``.
+
+    ``None`` means no autocast: every forward runs in the base dtype.
+    bf16/fp16 declare mixed precision and require fp32 base weights.
+    """
+    if autocast_dtype is None:
+        return None
+    if autocast_dtype not in _FLASH_DTYPES:
+        raise ValueError(
+            f"autocast_dtype must be torch.bfloat16, torch.float16, or None, got {autocast_dtype!r}."
+        )
+    if dtype is not torch.float32:
+        raise ValueError(
+            f"autocast_dtype={autocast_dtype} requires fp32 base weights, got dtype={dtype}; "
+            "a bf16/fp16 backbone already computes in its base dtype."
+        )
+    return cast(torch.dtype, autocast_dtype)
 
 
 _BLOCK_SIZE = 128  # compiled CUDA FlexAttention requires >= 128
@@ -113,8 +137,9 @@ def module_device_dtype(module: torch.nn.Module) -> tuple[torch.device, torch.dt
     """Device and dtype of a module's base weights.
 
     Skips fp32 LoRA adapters so a LoRA stack still reports the frozen
-    base dtype (the dtype the KV cache is allocated in). Raises if the
-    module has no parameters.
+    base dtype. Raises if the module has no parameters. (The KV cache is
+    allocated in the compute dtype: the base dtype, or the backbone's
+    ``decode_autocast_dtype`` when that is set.)
     """
     for name, param in module.named_parameters():
         if _is_lora_adapter(name):
@@ -315,6 +340,13 @@ def _decode_layer(
     k = k.transpose(1, 2)
     v = attn.v_proj(hn).view(B, S, n_kv_heads, head_dim).transpose(1, 2)
     q, k = apply_rotary_pos_emb(q, k, cos, sin)
+    if q.dtype != v.dtype:
+        # autocast_dtype over fp32 weights: the projections emit the autocast
+        # dtype but the fp32 RoPE cos/sin promote q/k back to fp32. The KV
+        # pool and FlexAttention run in the compute dtype, so follow v (the
+        # projection output dtype). RoPE itself stays fp32.
+        q = q.to(v.dtype)
+        k = k.to(v.dtype)
     k_cache[:, addr] = k[real_rows, :, real_cols].transpose(0, 1)
     v_cache[:, addr] = v[real_rows, :, real_cols].transpose(0, 1)
     # A compiled graph that includes this write and FlexAttention can read the
@@ -438,15 +470,26 @@ class FlexDecodeSession:
             with ``layers``, ``rotary_emb``, and ``norm`` attributes. Used in
             place; not modified.
         batch_size: Number of sequences decoded by this session.
+        autocast_dtype: ``None`` decodes in the model's base dtype.
+            ``torch.bfloat16`` / ``torch.float16`` (fp32 base weights only)
+            runs the decode layers under ``torch.autocast`` and allocates the
+            KV pool in that dtype. ``decode_session`` passes the backbone's
+            ``decode_autocast_dtype``, declared independently of the train
+            one, so bf16 train can pair with fp32 decode or vice versa.
+            Calling :meth:`forward` inside an ambient ``torch.autocast``
+            region raises.
 
     Attributes:
         lengths: Tokens cached per row, ``[B]`` (device tensor).
         n_pages: Physical pages in the pool.
         pages_in_use: Pages currently owned by rows (each row holds >= 1).
-        k_cache / v_cache: ``[layers, kv_heads, n_pages * 128, head_dim]``.
+        k_cache / v_cache: ``[layers, kv_heads, n_pages * 128, head_dim]``,
+            in the compute dtype (base dtype, or ``autocast_dtype`` if set).
     """
 
-    def __init__(self, model: torch.nn.Module, batch_size: int) -> None:
+    def __init__(
+        self, model: torch.nn.Module, batch_size: int, autocast_dtype: torch.dtype | None = None
+    ) -> None:
         # HF decoder stacks are ``nn.Module``; pyright treats children as Tensor|Module.
         hf = cast(Any, model)
         if getattr(hf.config, "use_sliding_window", False):
@@ -462,6 +505,11 @@ class FlexDecodeSession:
         self.head_dim = int(cfg.head_dim)
 
         self.device, self.dtype = module_device_dtype(hf)
+        self.autocast_dtype = check_autocast_dtype(autocast_dtype, self.dtype)
+        # KV pool and attention run in the compute dtype: with autocast_dtype
+        # set the pool is bf16/fp16 (half the fp32 size) and FlexAttention
+        # reads/writes it directly in that dtype.
+        self.compute_dtype = self.dtype if self.autocast_dtype is None else self.autocast_dtype
         self._flex = _FlexKernel(self.device)
         self._compile_masks = _use_flex_compile(self.device)
         self._use_compiled_layer = self.device.type == "cuda"
@@ -471,8 +519,8 @@ class FlexDecodeSession:
         n_layers = len(hf.layers)
         self.n_pages = self.B
         kv_shape = (n_layers, self.n_kv_heads, self.n_pages * self.page, self.head_dim)
-        self._k_store = ExpandableKvTensor(kv_shape, dtype=self.dtype, device=self.device)
-        self._v_store = ExpandableKvTensor(kv_shape, dtype=self.dtype, device=self.device)
+        self._k_store = ExpandableKvTensor(kv_shape, dtype=self.compute_dtype, device=self.device)
+        self._v_store = ExpandableKvTensor(kv_shape, dtype=self.compute_dtype, device=self.device)
         self.k_cache = self._k_store.tensor
         self.v_cache = self._v_store.tensor
 
@@ -674,6 +722,12 @@ class FlexDecodeSession:
         self._mask_holder["kv_mask"] = self.grouping_ids
         _bind_decode_mask_holder(self._mask_holder)
 
+    def _autocast(self) -> ContextManager[Any]:
+        """The declared-precision context for the decode layer stack."""
+        if self.autocast_dtype is None:
+            return nullcontext()
+        return torch.autocast(self.device.type, dtype=self.autocast_dtype)
+
     def _run_layers(
         self,
         h: torch.Tensor,
@@ -694,20 +748,22 @@ class FlexDecodeSession:
         layer_hiddens: list[torch.Tensor] = []
         h_in = h
         try:
-            for li in range(self.k_cache.shape[0]):
-                h = body(
-                    self.model.layers[li], h, cos, sin,
-                    self.k_cache[li], self.v_cache[li],
-                    addr, real_rows, real_cols, block_mask, flex_fn,
-                    self.n_heads, self.n_kv_heads, self.head_dim,
-                )
-                layer_hiddens.append(h)
+            with self._autocast():
+                for li in range(self.k_cache.shape[0]):
+                    h = body(
+                        self.model.layers[li], h, cos, sin,
+                        self.k_cache[li], self.v_cache[li],
+                        addr, real_rows, real_cols, block_mask, flex_fn,
+                        self.n_heads, self.n_kv_heads, self.head_dim,
+                    )
+                    layer_hiddens.append(h)
+                out = self.model.norm(h)
         except Exception as exc:
             if use_compiled and _inductor_rejected(exc):
                 self._use_compiled_layer = False
                 return self._run_layers(h_in, cos, sin, addr, real_rows, real_cols, block_mask)
             raise
-        return self.model.norm(h), layer_hiddens
+        return out, layer_hiddens
 
     def _graph_input_ready(
         self,
@@ -823,14 +879,17 @@ class FlexDecodeSession:
             assert self._g_addr is not None and self._g_rows is not None and self._g_cols is not None
             assert self._g_mask is not None
             # Eager stack (compiled Flex kernel, eager LoRA) so launches record.
-            # A compiled ``_decode_layer`` entry point does not.
-            return _decode_stack(
-                self.model.layers, self.model.norm,
-                self._g_h, self._g_cos, self._g_sin,
-                self.k_cache, self.v_cache,
-                self._g_addr, self._g_rows, self._g_cols, self._g_mask,
-                self._flex, self.n_heads, self.n_kv_heads, self.head_dim,
-            )
+            # A compiled ``_decode_layer`` entry point does not. The declared
+            # autocast context wraps warmup and capture alike, so the recorded
+            # kernels are the compute-dtype ones.
+            with self._autocast():
+                return _decode_stack(
+                    self.model.layers, self.model.norm,
+                    self._g_h, self._g_cos, self._g_sin,
+                    self.k_cache, self.v_cache,
+                    self._g_addr, self._g_rows, self._g_cols, self._g_mask,
+                    self._flex, self.n_heads, self.n_kv_heads, self.head_dim,
+                )
 
         import mouse_core.models.lora as lora_mod
 
@@ -941,6 +1000,14 @@ class FlexDecodeSession:
         """
         if self._closed:
             raise RuntimeError("FlexDecodeSession.close() has been called.")
+        if torch.is_autocast_enabled(self.device.type):
+            raise RuntimeError(
+                "FlexDecodeSession.forward was called inside an active torch.autocast "
+                "region. Mixed precision is declared at backbone construction "
+                "(decode_autocast_dtype=torch.bfloat16 / torch.float16), never inferred "
+                "from "
+                "ambient state; remove the surrounding torch.autocast."
+            )
         B, S, _ = embeds.shape
         if B != self.B:
             raise ValueError(f"Session was created for batch_size={self.B}, got {B}.")
