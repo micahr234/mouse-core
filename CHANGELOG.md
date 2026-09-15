@@ -10,13 +10,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - ``Polyak.update`` skips a section whose ``tau`` is ``0`` (no delayed-
   parameter writes). All-zero ``tau`` returns immediately.
+- Example notebooks: training is ``01``–``14``; inference is
+  ``15_inference.ipynb`` (was ``09``).
+
+### Removed
+- ``MaxNStepDqnObjective`` and
+  ``examples/15_train_offline_max_n_step_dqn.ipynb``.
 
 ### Added
 - ``Model.features``: encoder + backbone only (pooled last-layer
   states at head-output tokens). Does not run heads. Training path
   only (no cache, no ``reasoning=``). Pair with ``Model.head`` when
   the same features are scored more than once.
-- ``examples/16_train_offline_multi_head_update_dqn.ipynb``: same
+- ``examples/14_train_offline_multi_head_update_dqn.ipynb``: same
   offline loop as ``02``, but each composite update trains the Q-head
   ``HEAD_UPDATES`` times (``m=4`` here) for one encoder/backbone
   step. ``model.features`` computes last-layer features once (no unused
@@ -32,7 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and ``tokenizer_repo_id=`` (must differ from ``repo_id``) and returns
   ``(model_url, tokenizer_url)``. ``save_model`` writes only the model.
   Formats, skips, and the head-output field cannot be reconstructed from
-  the embedder. ``examples/09_inference.ipynb`` calls
+  the embedder. ``examples/15_inference.ipynb`` calls
   ``load_tokenizer(TOKENIZER_ID)``.
 - ``Tokenizer.pack_rows``: tokenize ragged per-sequence rows
   (``list[list[dict]]``, empty entries keep their batch slot) and pack
@@ -41,7 +47,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``prev_grouping_ids`` is a required argument (the last grouping id
   already cached per sequence, or ``None``) so incremental decode with
   ``group_prefix=`` cannot silently re-emit a cached segment's prefix.
-  ``examples/03``, ``07``, ``08``, and ``09`` now use it.
+  ``examples/03``, ``07``, ``08``, and ``15`` now use it.
 - ``train_autocast_dtype`` and ``decode_autocast_dtype`` on transformer
   backbones (``Qwen3Backbone``, ``LlamaBackbone``) and ``load_model``:
   ``torch.bfloat16`` / ``torch.float16`` declares mixed precision per
@@ -58,21 +64,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (O(L^2) memory, any device/dtype) as an explicit choice — previously
   only reachable as the silent ``"varlen"`` fallback. The ground-truth
   implementation the fused kernels are tested against.
-- ``MaxNStepDqnObjective``: two heads ``selector`` (deployed
-  policy) and ``max_return``. Same complete n-step returns as
-  ``NStepDqnObjective`` (incomplete windows masked, not shortened).
-  The extras are the max over required ``horizons`` (must include
-  ``1``) and the selector that picks the delayed ``max_return``
-  bootstrap action; the max-return head trains on that max and the
-  selector on the one-step candidate.
-  ``examples/15_train_offline_max_n_step_dqn.ipynb`` uses
-  ``horizons=(1, 3, 5, 10)`` and ``action_head="selector"``.
 - ``NStepDqnObjective``: DQN TD target is the n-step return
   (``n`` required, ``>= 1``). ``n=1`` is one-step TD; larger ``n``
   uses that many observed rewards then bootstraps delayed max-Q.
   Incomplete windows (fewer than ``n`` in-run steps ahead, and no
   ``γ == 0`` stop) are masked, not shortened. No ``td_lambda`` and
-  no Watkins cut. ``examples/14_train_offline_n_step_dqn.ipynb``
+  no Watkins cut. ``examples/13_train_offline_n_step_dqn.ipynb``
   uses ``n=3`` in the same offline loop as ``02``.
 - ``Tokenizer`` text fields with no ``input_field=`` are consts
   (no step I/O). ``output_field=`` names the field; ``format=`` is the
@@ -157,7 +154,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   env reward and does not bootstrap across episodes; the task head
   drops current-episode reward and λ-skips to
   ``Q_e(s', a*) + Q_t(s', a*)`` at the next episode start.
-  ``examples/13_train_offline_episode_task_dqn.ipynb`` uses
+  ``examples/12_train_offline_episode_task_dqn.ipynb`` uses
   ``action_head=("episode", "task")`` so ``get_action`` sums them.
 - ``Tokenizer(group_prefix=)`` is a format string over the raw step
   dict (placeholders need not be ``input_fields``). Those tokens are
@@ -231,7 +228,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Learnable modalities accept an explicit name: ``field=`` on the embedder
   spec and ``output_field=`` on the tokenizer spec (they must match).
   Unnamed learnables keep the ``__learnable_<i>`` auto-name.
-- ``examples/11_train_offline_reasoning_dqn.ipynb``: same offline DQN loop
+- ``examples/10_train_offline_reasoning_dqn.ipynb``: same offline DQN loop
   as ``02``, with a trailing ``learnable`` action-prompt token named
   ``value`` on every step (flagged ``head_output: True``; Q is read from it)
   and per-batch latent reasoning bursts via ``LatentReasoner`` +
@@ -255,7 +252,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ``DecodeCache``: the object carried between ``use_cache=True`` calls
   (``out.cache``), one ``FlexDecodeSession`` per backbone pass, with
   ``reset_rows(rows)`` applying to every pass.
-- ``examples/12_train_offline_recurrent_dqn.ipynb``: same offline DQN loop
+- ``examples/11_train_offline_recurrent_dqn.ipynb``: same offline DQN loop
   as ``02``, with a ``Recurrence`` section and the TD loss averaged over
   ``out.passes``.
 - ``AdamW.zero_grad`` accepts ``set_to_none`` (default ``True``), matching
@@ -289,7 +286,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (``SvObjective`` regresses ``action_value`` onto ``info_q_star``). The action
   permute spec sets ``input_vector_field`` / ``output_vector_field`` to
   ``info_q_star`` so the vector stays aligned with remapped action ids.
-- ``examples/10_train_offline_sp.ipynb``: offline supervised-policy training
+- ``examples/09_train_offline_sp.ipynb``: offline supervised-policy training
   (``SpObjective`` CE onto a random argmax of ``info_q_star`` with
   ``DiscreteActionHead``). Same action vector-field permute as SV.
 - ``StepTokens``: tokenizer output for one step (token arrays + scalar
@@ -328,7 +325,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``Tokenizer``. It names the step key used for attention isolation
   (typically ``task_index``). Int coercion happens when packing
   ``TokenBatch.grouping_ids``.
-- Objectives (DQN / n-step / max-n-step / layerwise / episode-task / PPO /
+- Objectives (DQN / n-step / layerwise / episode-task / PPO /
   GRPO) take required ``grouping_field: str | None``. Pass a column
   (typically ``task_index``) or ``None`` to skip grouping isolation.
   Omitting the argument raises — it does not silently train across
@@ -371,7 +368,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``task_gamma_*`` values. PPO discounts are unchanged.
 - Example notebooks train and infer in fp32: training builds
   ``Qwen3Backbone`` with ``dtype=torch.float32`` and no LoRA;
-  ``09_inference.ipynb`` loads with ``dtype=torch.float32``.
+  ``15_inference.ipynb`` loads with ``dtype=torch.float32``.
 - ``EpisodeTaskDqnObjective`` discounts are per-head: ``episode_gamma_*``
   for the episode head and ``task_gamma_*`` for the task head (each has
   the five ``DqnObjective`` roles). Shared ``gamma_step`` /
@@ -379,7 +376,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ``Model`` does not whitelist or special-case head names. Dict keys
   are caller-chosen; ``action_head`` is one name or a sequence of
   names whose scores ``get_action`` sums.
-  ``examples/13_train_offline_episode_task_dqn.ipynb`` uses
+  ``examples/12_train_offline_episode_task_dqn.ipynb`` uses
   ``episode`` / ``task`` with ``action_head=("episode", "task")``.
 - DQN example notebooks set ``POLYAK_TAU_HEADS = 0.0001``,
   ``POLYAK_TAU_ENCODER = 0.01``, and ``POLYAK_TAU_BACKBONE = 0.01``.
@@ -553,7 +550,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``Recurrence``.
 - Every training example ends a step with a trailing ``learnable`` token
   named ``value``, flagged ``head_output: True``. Q / action outputs are
-  read from that token. ``examples/09_inference.ipynb`` reconstructs the
+  read from that token. ``examples/15_inference.ipynb`` reconstructs the
   named learnable when building the eval tokenizer.
 - ``TextTokenizer`` accepts ``type: "learnable"`` (no ``input_field=``;
   optional ``output_field=`` / ``tokens=``). Learnable tokens are appended
@@ -615,7 +612,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``SwiGLUHead``.
 - Example notebooks are short usage docs, not full experiments. Training
   notebooks no longer build a held-out ``GroupEnv`` or call ``run_eval``;
-  score a saved checkpoint in ``examples/09_inference.ipynb``. Default
+  score a saved checkpoint in ``examples/15_inference.ipynb``. Default
   cycle / step / env budgets are documentation-scale. Full runs belong in
   [mouse-experiment](https://github.com/micahr234/mouse-experiment).
 - ``SpObjective`` hard ``"ce"`` (``sp_ce``) samples uniformly among tied
@@ -662,7 +659,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Triton still re-enables the GIL on import.
 - Numeric example notebooks use ``DataLoader`` prefetch workers (default
   ``num_workers=1``) instead of pinning ``0``. The text DQN example stays at
-  ``0``. ``10_train_offline_sp`` logs train/eval ``argmax(Q*)`` agreement
+  ``0``. ``09_train_offline_sp`` logs train/eval ``argmax(Q*)`` agreement
   each cycle.
 - Aligned with mouse-gym 1.0.0: step field ``done`` is replaced by
   ``episode_done`` and ``task_done`` (each ``0``/``1``/``2``). The last
@@ -1093,7 +1090,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (Flex has no backward on CPU).
 - ``mouse_core.models.kv_policy``: grow-then-rebuild helpers
   (``resolve_cache_bounds``, ``rebuild_starts``, ``cache_needs_rebuild``) for
-  cached inference. Examples ``03``, ``07``, and ``09`` use ``max_cache`` +
+  cached inference. Examples ``03``, ``07``, and ``15`` use ``max_cache`` +
   ``start_cache`` instead of a sliding ``deque(maxlen=...)`` paired with a
   never-rebased KV session.
 

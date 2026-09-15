@@ -160,7 +160,7 @@ def _pair_valid_to_rows(
 
 @dataclass(frozen=True)
 class _NStepBatch:
-    """Step tensors shared by n-step and max-over-n-step."""
+    """Step tensors for the n-step return."""
 
     action: torch.Tensor
     reward: torch.Tensor
@@ -192,7 +192,7 @@ def _n_step_batch(
     gamma_task_terminal: float,
     gamma_task_truncated: float,
 ) -> _NStepBatch:
-    """Read the transition columns both n-step objectives share."""
+    """Read the transition columns the n-step return uses."""
     action = objective_data[action_key]
     if action.dtype != torch.int64:
         raise TypeError(f"action must be int64, got {action.dtype}.")
@@ -301,9 +301,6 @@ class NStepDqnObjective(Objective):
     the one-step target ``r + γ V``. A ``γ == 0`` in the product zeros
     every later reward and the bootstrap; the window is still complete.
     Incomplete windows are masked, never shortened.
-    :class:`~mouse_core.objectives.max_n_step_dqn.MaxNStepDqnObjective`
-    uses this same return; it only adds the max-over-horizons head and
-    the selector that picks the bootstrap action.
     ``metrics["n_step_valid_frac"]`` is the in-run fraction of starts
     that have a complete n-step window. The return never
     crosses a run break, is not mixed with intermediate delayed Q (no

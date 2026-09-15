@@ -1087,7 +1087,7 @@ class Model(nn.Module):
     Recurrent-depth refinement is a
     :class:`~mouse_core.models.recurrence.Recurrence` section
     (``num_passes`` backbone passes per forward, saved with the model). See
-    ``examples/12_train_offline_recurrent_dqn.ipynb``.
+    ``examples/11_train_offline_recurrent_dqn.ipynb``.
     """
 
     @staticmethod
@@ -1756,7 +1756,7 @@ class Model(nn.Module):
         :class:`~mouse_core.models.recurrence.Recurrence` section still runs
         ``num_passes`` and this returns the final pass. Pair with
         :meth:`head` when the training loop should score the same features
-        more than once (see ``examples/16_train_offline_multi_head_update_dqn.ipynb``).
+        more than once (see ``examples/14_train_offline_multi_head_update_dqn.ipynb``).
         """
         from mouse_core.data.token_batch import TokenBatch as _TokenBatch
 

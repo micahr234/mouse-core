@@ -12,7 +12,7 @@
 ## News 📰
 
 - **2026-08-18 — mouse-gym 1.0.0.** The env step contract is now `episode_done` / `task_done` (each `0`/`1`/`2`) instead of a single 5-code `done` field. `EnvConfig.seed` advances once per task and is passed to `reset(seed=...)` only at task start. The `examples` extra installs `mouse-gym` from GitHub `main`.
-- **2026-06-26 — Offline training works.** [`examples/02_train_offline_dqn.ipynb`](examples/02_train_offline_dqn.ipynb) now trains a full `Qwen/Qwen3-0.6B` MOUSE model from Hub replay data and reaches strong FrozenLake performance. Push the checkpoint, then evaluate in [`examples/09_inference.ipynb`](examples/09_inference.ipynb).
+- **2026-06-26 — Offline training works.** [`examples/02_train_offline_dqn.ipynb`](examples/02_train_offline_dqn.ipynb) now trains a full `Qwen/Qwen3-0.6B` MOUSE model from Hub replay data and reaches strong FrozenLake performance. Push the checkpoint, then evaluate in [`examples/15_inference.ipynb`](examples/15_inference.ipynb).
 
 See [CHANGELOG.md](CHANGELOG.md) for the full release history.
 
@@ -52,7 +52,7 @@ mouse-core gives you three building blocks for in-context RL. Compose them in yo
 
 * **Data** (`mouse_core.data`) — stores sequential rows in `Datastore` and batches contiguous windows with `DataLoader`.
 * **Models** (`mouse_core.models`) — encoder + backbone (`LlamaBackbone`, `Qwen3Backbone`, or `IdentityBackbone`) + output heads (`DiscreteActionHead`, `DiscreteActionValueHead`, …).
-* **Objectives** (`mouse_core.objectives`) — training losses such as DQN, n-step DQN, max-over-n-step DQN, episode/task DQN, PPO, GRPO, SP, and SV.
+* **Objectives** (`mouse_core.objectives`) — training losses such as DQN, n-step DQN, episode/task DQN, PPO, GRPO, SP, and SV.
 
 Backbone loading has one public path: instantiate the backbone. For example, `LlamaBackbone(train_kernel="flex", decode_kernel="flex", dtype=preferred_dtype(device), pretrained="meta-llama/Llama-3.2-1B", num_layers=2)` reads the pretrained config, loads matching transformer weights, and exposes `backbone.hidden_dim` for the encoder and heads. Three arguments are required on every transformer backbone (and on `load_model`) because they describe how the model runs on your machine, not what it is, so they are never saved with it: `train_kernel` for the uncached forward, `decode_kernel` for cached decode (`"flex"`, paged FlexAttention, the only kernel that reads K/V through a page table), and `dtype` for the base weights. `model.to(device)` moves and never casts; every part other than the backbone base is float32.
 
@@ -65,7 +65,7 @@ The delayed DQN model is `model.delayed_copy()`: a frozen copy of the online mod
 
 ## Quick start 🚀
 
-The [example notebooks](examples/) are short usage docs, not full experiments. Work through them in order, then evaluate a saved checkpoint in `09`. Full training runs live in **[mouse-experiment](https://github.com/micahr234/mouse-experiment)**.
+The [example notebooks](examples/) are short usage docs, not full experiments. Work through them in order, then evaluate a saved checkpoint in `15`. Full training runs live in **[mouse-experiment](https://github.com/micahr234/mouse-experiment)**.
 
 | Notebook | What it covers |
 |----------|----------------|
@@ -77,14 +77,13 @@ The [example notebooks](examples/) are short usage docs, not full experiments. W
 | [06 — Text offline DQN](examples/06_train_offline_text_dqn.ipynb) | Same offline loop as `02`, with `Tokenizer` + `TextEmbedder`; each text field has its own `format=`, and a const `value` readout (`head_output: True`) |
 | [07 — Train online PPO](examples/07_train_online_ppo.ipynb) | Online on-policy PPO (`DiscreteActionHead` + value head, `PpoObjective` with GAE) |
 | [08 — Train online GRPO](examples/08_train_online_grpo.ipynb) | Branched GRPO: fork env+context at many `L`, group-relative advantages, `GrpoObjective` |
-| [09 — Inference](examples/09_inference.ipynb) | Evaluation: `load_model` on the model repo and `load_tokenizer` on a separate tokenizer repo, then batched FlexAttention cached inference (`max_cache` / `start_cache`) |
-| [10 — Train offline SP](examples/10_train_offline_sp.ipynb) | Same offline loop as `05`, but `SpObjective` CE onto a random argmax of `info_q_star` with `DiscreteActionHead` *(ranking check)* |
-| [11 — Offline reasoning DQN](examples/11_train_offline_reasoning_dqn.ipynb) | Same offline loop as `02` (including the trailing learnable `value` prompt), plus Coconut-style latent reasoning bursts (`LatentReasoner`, `sample_reasoning_splits`) trained through the DQN loss |
-| [12 — Offline recurrent DQN](examples/12_train_offline_recurrent_dqn.ipynb) | Same offline loop as `02`, with a `Recurrence` section: the backbone runs `num_passes` times per forward through a normalized input-injection adapter, `DqnObjective` runs on every pass in `out.passes` and the losses are averaged; cached inference keeps the same passes |
-| [13 — Offline episode/task DQN](examples/13_train_offline_episode_task_dqn.ipynb) | Same offline loop as `02`, with `episode` + `task` heads and `EpisodeTaskDqnObjective`: both heads share one delayed `a* = argmax(Q_e + Q_t)`; `action_head=("episode", "task")` makes `get_action` sum them |
-| [14 — Offline n-step DQN](examples/14_train_offline_n_step_dqn.ipynb) | Same offline loop as `02`, with `NStepDqnObjective`: the TD target is the n-step return (`n=3` here), bootstrapping delayed max-Q after `n` rewards; incomplete windows are masked |
-| [15 — Offline max-over-n-step DQN](examples/15_train_offline_max_n_step_dqn.ipynb) | Same complete n-step returns as `14`, then `MaxNStepDqnObjective` extras: `selector` + `max_return` heads, max over `horizons=(1, 3, 5, 10)`, bootstrap at the selector's action; `action_head="selector"` is the deployed policy |
-| [16 — Offline multi-head-update DQN](examples/16_train_offline_multi_head_update_dqn.ipynb) | Same offline loop as `02`, but each composite update trains the Q-head `HEAD_UPDATES` times (`m=4` here) on `model.features` (no unused head pass): first `m-1` steps detach those features and Polyak only the delayed head; the last step backprops through encoder and backbone and Polyak all three sections; `tau=0` skips that section |
+| [09 — Train offline SP](examples/09_train_offline_sp.ipynb) | Same offline loop as `05`, but `SpObjective` CE onto a random argmax of `info_q_star` with `DiscreteActionHead` *(ranking check)* |
+| [10 — Offline reasoning DQN](examples/10_train_offline_reasoning_dqn.ipynb) | Same offline loop as `02` (including the trailing learnable `value` prompt), plus Coconut-style latent reasoning bursts (`LatentReasoner`, `sample_reasoning_splits`) trained through the DQN loss |
+| [11 — Offline recurrent DQN](examples/11_train_offline_recurrent_dqn.ipynb) | Same offline loop as `02`, with a `Recurrence` section: the backbone runs `num_passes` times per forward through a normalized input-injection adapter, `DqnObjective` runs on every pass in `out.passes` and the losses are averaged; cached inference keeps the same passes |
+| [12 — Offline episode/task DQN](examples/12_train_offline_episode_task_dqn.ipynb) | Same offline loop as `02`, with `episode` + `task` heads and `EpisodeTaskDqnObjective`: both heads share one delayed `a* = argmax(Q_e + Q_t)`; `action_head=("episode", "task")` makes `get_action` sum them |
+| [13 — Offline n-step DQN](examples/13_train_offline_n_step_dqn.ipynb) | Same offline loop as `02`, with `NStepDqnObjective`: the TD target is the n-step return (`n=3` here), bootstrapping delayed max-Q after `n` rewards; incomplete windows are masked |
+| [14 — Offline multi-head-update DQN](examples/14_train_offline_multi_head_update_dqn.ipynb) | Same offline loop as `02`, but each composite update trains the Q-head `HEAD_UPDATES` times (`m=4` here) on `model.features` (no unused head pass): first `m-1` steps detach those features and Polyak only the delayed head; the last step backprops through encoder and backbone and Polyak all three sections; `tau=0` skips that section |
+| [15 — Inference](examples/15_inference.ipynb) | Evaluation: `load_model` on the model repo and `load_tokenizer` on a separate tokenizer repo, then batched FlexAttention cached inference (`max_cache` / `start_cache`) |
 
 ### Example dependencies
 

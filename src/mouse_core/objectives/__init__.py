@@ -2,7 +2,6 @@ from mouse_core.objectives.base import Objective
 from mouse_core.objectives.dqn import DqnObjective
 from mouse_core.objectives.episode_task_dqn import EpisodeTaskDqnObjective
 from mouse_core.objectives.grpo import GrpoObjective, group_relative_advantages
-from mouse_core.objectives.max_n_step_dqn import MaxNStepDqnObjective
 from mouse_core.objectives.n_step_dqn import NStepDqnObjective
 from mouse_core.objectives.layerwise_dqn import (
     LayerwiseDqnObjective,
@@ -19,7 +18,6 @@ __all__ = [
     "EpisodeTaskDqnObjective",
     "GrpoObjective",
     "group_relative_advantages",
-    "MaxNStepDqnObjective",
     "NStepDqnObjective",
     "LayerwiseDqnObjective",
     "effective_horizon",

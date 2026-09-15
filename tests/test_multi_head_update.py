@@ -1,4 +1,4 @@
-"""Tests for the multi-head-update loop in examples/16_train_offline_multi_head_update_dqn.ipynb."""
+"""Tests for the multi-head-update loop in examples/14_train_offline_multi_head_update_dqn.ipynb."""
 
 from __future__ import annotations
 
