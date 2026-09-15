@@ -1078,7 +1078,9 @@ class Model(nn.Module):
         )
 
     ``forward`` returns a :class:`ModelOutput` with ``predictions``,
-    ``last_hidden_state``, and per-pass ``passes``. The delayed DQN model
+    ``last_hidden_state``, and per-pass ``passes``. :meth:`features`
+    is the encoder + backbone only (pooled last-layer states, no heads).
+    The delayed DQN model
     comes from :meth:`delayed_copy` (a copy of every trainable parameter;
     frozen weights shared by reference), runs on the same ``TokenBatch``,
     and is interpolated per section with :class:`~mouse_core.polyak.Polyak`.
@@ -1745,6 +1747,47 @@ class Model(nn.Module):
             cache=new_cache,
             head_output_valid=head_output_valid,
         )
+
+    def features(self, batch: TokenBatch) -> torch.Tensor:
+        """Pooled last-layer features at head-output tokens. Does not run heads.
+
+        Training path only (no cache, no ``reasoning=``). A model with a
+        reasoner raises — latent insertion lives on :meth:`forward`. A
+        :class:`~mouse_core.models.recurrence.Recurrence` section still runs
+        ``num_passes`` and this returns the final pass. Pair with
+        :meth:`head` when the training loop should score the same features
+        more than once (see ``examples/16_train_offline_multi_head_update_dqn.ipynb``).
+        """
+        from mouse_core.data.token_batch import TokenBatch as _TokenBatch
+
+        if not isinstance(batch, _TokenBatch):
+            raise TypeError(
+                f"Model.features expects a TokenBatch, got {type(batch).__name__}. "
+                "Use pack_token_batch([transform(step)], ...) "
+                "or DataLoader(transform=...)."
+            )
+        if self.reasoner is not None:
+            raise ValueError(
+                "Model.features does not run a reasoner; use Model.forward(reasoning=...)."
+            )
+
+        embeds, resolved_indices = self.encoder(batch)
+        t = batch.to_tensors(embeds.device)
+        needs_layerwise = "action_value_layerwise" in self._heads
+        num_passes = self.recurrence.num_passes if self.recurrence is not None else 1
+        pass_input = embeds
+        session_out: torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, ...]] = embeds
+        for _ in range(num_passes):
+            session_out = self._train_backbone_forward(
+                self.backbone,
+                pass_input,
+                t["sequence_ids"],
+                t["grouping_ids"],
+                needs_layerwise,
+            )
+            if self.recurrence is not None:
+                pass_input = self.recurrence(embeds, _last_hidden(session_out))
+        return self._pool_backbone_out(session_out, resolved_indices, needs_layerwise)
 
     def head(
         self,

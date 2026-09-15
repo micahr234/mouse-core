@@ -203,20 +203,15 @@ def run_train(
     metrics: dict[str, float] = {}
     for _ in range(num_steps):
         inputs, objective_data = loader.next_batch()
-        out = model(inputs)
-        features = out.last_hidden_state[out.head_output_indices]
+        features = model.features(inputs)
         with torch.no_grad():
-            delayed_out = delayed_model(inputs)
-            delayed_features = delayed_out.last_hidden_state[
-                delayed_out.head_output_indices
-            ]
+            delayed_features = delayed_model.features(inputs)
+            delayed_preds = delayed_model.head(h=delayed_features)
         objective_data = objective_data.to(features.device)
         for i in range(head_updates):
             last = i == head_updates - 1
             h = features if last else features.detach()
             preds = model.head(h=h)
-            with torch.no_grad():
-                delayed_preds = delayed_model.head(h=delayed_features)
             loss, metrics = objective(objective_data, preds, delayed_preds)
             head_optimizer.zero_grad()
             if last:
@@ -225,11 +220,18 @@ def run_train(
             head_optimizer.step()
             if last:
                 feature_optimizer.step()
-            polyak.update(
-                tau_heads=tau_heads,
-                tau_encoder=tau_encoder if last else 0.0,
-                tau_backbone=tau_backbone if last else 0.0,
-            )
+            step_tau_heads = tau_heads
+            step_tau_encoder = tau_encoder if last else 0.0
+            step_tau_backbone = tau_backbone if last else 0.0
+            if step_tau_heads > 0.0 or step_tau_encoder > 0.0 or step_tau_backbone > 0.0:
+                polyak.update(
+                    tau_heads=step_tau_heads,
+                    tau_encoder=step_tau_encoder,
+                    tau_backbone=step_tau_backbone,
+                )
+            if step_tau_heads > 0.0:
+                with torch.no_grad():
+                    delayed_preds = delayed_model.head(h=delayed_features)
     assert loss is not None
     return (loss, metrics)
 
@@ -291,24 +293,18 @@ def test_composite_step_updates_head_then_features() -> None:
         dhead_before = _clone_params(delayed.heads)
         denc_before = _clone_params(delayed.encoder)
 
-        out = model(inputs)
-        features = out.last_hidden_state[out.head_output_indices]
+        features = model.features(inputs)
         assert features.ndim == 2
-        assert features.shape[0] == int(out.head_output_indices.shape[0])
         assert features.requires_grad
         with torch.no_grad():
-            delayed_out = delayed(inputs)
-            delayed_features = delayed_out.last_hidden_state[
-                delayed_out.head_output_indices
-            ]
+            delayed_features = delayed.features(inputs)
+            delayed_preds = delayed.head(h=delayed_features)
         objective_data = objective_data.to(features.device)
         head_updates = 4
         for i in range(head_updates):
             last = i == head_updates - 1
             h = features if last else features.detach()
             preds = model.head(h=h)
-            with torch.no_grad():
-                delayed_preds = delayed.head(h=delayed_features)
             loss, metrics = objective(objective_data, preds, delayed_preds)
             assert torch.isfinite(loss)
             head_opt.zero_grad()
@@ -322,11 +318,18 @@ def test_composite_step_updates_head_then_features() -> None:
             head_opt.step()
             if last:
                 feat_opt.step()
-            polyak.update(
-                tau_heads=0.5,
-                tau_encoder=0.5 if last else 0.0,
-                tau_backbone=0.5 if last else 0.0,
-            )
+            tau_heads = 0.5
+            tau_encoder = 0.5 if last else 0.0
+            tau_backbone = 0.5 if last else 0.0
+            if tau_heads > 0.0 or tau_encoder > 0.0 or tau_backbone > 0.0:
+                polyak.update(
+                    tau_heads=tau_heads,
+                    tau_encoder=tau_encoder,
+                    tau_backbone=tau_backbone,
+                )
+            if tau_heads > 0.0:
+                with torch.no_grad():
+                    delayed_preds = delayed.head(h=delayed_features)
             if i == 0:
                 assert _changed(head_before, model.heads)
                 assert not _changed(enc_before, model.encoder)
@@ -431,5 +434,59 @@ def test_llama_backbone_composite_step() -> None:
         assert torch.isfinite(loss)
         assert _changed(bb_before, model.backbone)
         assert _changed(dbb_before, delayed.backbone)
+    finally:
+        loader.close()
+
+
+def test_features_match_forward_pool_and_skip_heads() -> None:
+    torch.manual_seed(0)
+    model = _identity_model()
+    loader = _loader()
+    try:
+        inputs, _ = loader.next_batch()
+        out = model(inputs)
+        features = model.features(inputs)
+        pooled = out.last_hidden_state[out.head_output_indices]
+        assert torch.allclose(features, pooled)
+        preds = model.head(h=features)
+        assert torch.allclose(preds["action_value"], out.predictions["action_value"])
+        features.sum().backward()
+        assert all(p.grad is None for p in model.heads.parameters())
+        assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.encoder.parameters())
+    finally:
+        loader.close()
+
+
+def test_zero_tau_heads_scores_delayed_head_once() -> None:
+    torch.manual_seed(0)
+    model = _identity_model()
+    delayed = model.delayed_copy()
+    polyak = Polyak(model, delayed)
+    head_opt, feat_opt = _optimizers(model)
+    loader = _loader()
+    calls = {"n": 0}
+    original = delayed.head
+
+    def counted(*, h, batch_size=None):
+        calls["n"] += 1
+        return original(h=h, batch_size=batch_size)
+
+    delayed.head = counted  # type: ignore[method-assign]
+    try:
+        run_train(
+            model=model,
+            delayed_model=delayed,
+            polyak=polyak,
+            head_optimizer=head_opt,
+            feature_optimizer=feat_opt,
+            objective=_objective(),
+            loader=loader,
+            num_steps=1,
+            head_updates=4,
+            tau_heads=0.0,
+            tau_encoder=0.5,
+            tau_backbone=0.5,
+        )
+        assert calls["n"] == 1
     finally:
         loader.close()

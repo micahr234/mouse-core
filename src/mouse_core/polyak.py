@@ -158,14 +158,21 @@ class Polyak:
         """Move the delayed model toward the online model after an optimizer step.
 
         Each ``tau`` is this call's interpolation factor for that section,
-        in ``[0, 1]``: ``0`` leaves it unchanged (frozen), ``1`` copies the
-        online weights. ``tau_backbone`` also applies to the reasoner /
-        recurrence section. Pass new values each step to change them mid-run.
+        in ``[0, 1]``: ``0`` skips that section (no interpolation), ``1``
+        copies the online weights. ``tau_backbone`` also applies to the
+        reasoner / recurrence section. All-zero ``tau`` returns without
+        touching any delayed parameter. Pass new values each step to
+        change them mid-run.
         """
         tau_heads = _check_tau("tau_heads", tau_heads)
         tau_encoder = _check_tau("tau_encoder", tau_encoder)
         tau_backbone = _check_tau("tau_backbone", tau_backbone)
-        self._heads.update(tau_heads)
-        self._encoder.update(tau_encoder)
-        for state in self._backbone:
-            state.update(tau_backbone)
+        if tau_heads == 0.0 and tau_encoder == 0.0 and tau_backbone == 0.0:
+            return
+        if tau_heads > 0.0:
+            self._heads.update(tau_heads)
+        if tau_encoder > 0.0:
+            self._encoder.update(tau_encoder)
+        if tau_backbone > 0.0:
+            for state in self._backbone:
+                state.update(tau_backbone)

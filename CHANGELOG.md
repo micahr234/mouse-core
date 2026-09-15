@@ -7,14 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- ``Polyak.update`` skips a section whose ``tau`` is ``0`` (no delayed-
+  parameter writes). All-zero ``tau`` returns immediately.
+
 ### Added
+- ``Model.features``: encoder + backbone only (pooled last-layer
+  states at head-output tokens). Does not run heads. Training path
+  only (no cache, no ``reasoning=``). Pair with ``Model.head`` when
+  the same features are scored more than once.
 - ``examples/16_train_offline_multi_head_update_dqn.ipynb``: same
   offline loop as ``02``, but each composite update trains the Q-head
   ``HEAD_UPDATES`` times (``m=4`` here) for one encoder/backbone
-  step. Last-layer features are computed once; the first ``m-1`` head
-  steps detach them and Polyak only the delayed head; the last step
-  backprops through encoder and backbone and Polyak all three
-  sections. ``HEAD_UPDATES=1`` is the same as ``02``.
+  step. ``model.features`` computes last-layer features once (no unused
+  head pass); the first ``m-1`` head steps detach them and Polyak only
+  the delayed head; the last step backprops through encoder and
+  backbone and Polyak all three sections. ``tau=0`` skips that
+  section's interpolation and a delayed-head refresh. ``HEAD_UPDATES=1``
+  is the same as ``02``.
 - Tokenizer packing spec is a separate object and a separate Hub repo.
   ``save_tokenizer`` / ``load_tokenizer`` persist ``tokenizer.json``
   (fields, ``group_prefix``, ``head_output``, ``objective_fields``,

@@ -235,6 +235,15 @@ def test_layerwise_delayed_model_matches_online_before_update() -> None:
 # ---- Polyak ---------------------------------------------------------------
 
 
+def test_all_zero_tau_does_not_write_delayed_params() -> None:
+    model = _tiny_model()
+    delayed = model.delayed_copy()
+    polyak = Polyak(model, delayed)
+    versions = [param._version for param in delayed.parameters()]
+    polyak.update(tau_heads=0.0, tau_encoder=0.0, tau_backbone=0.0)
+    assert [param._version for param in delayed.parameters()] == versions
+
+
 def test_polyak_requires_a_tau_per_section() -> None:
     model = _tiny_model()
     polyak = Polyak(model, model.delayed_copy())
