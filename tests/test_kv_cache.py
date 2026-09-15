@@ -378,6 +378,41 @@ def test_batched_cached_rollout_matches_per_row_rollout() -> None:
         batched = torch.stack(batched_per_step, dim=1)
     assert torch.allclose(batched, reference, atol=1e-05)
 
+def test_eval_loop_get_action_model_output_matches_full_forward() -> None:
+    """09 ``run_eval``: lockstep incremental decode + ``get_action(ModelOutput)``.
+
+    Each call packs one new step per stream, carries the KV cache, and reads
+    the last valid head-output. The final greedy actions must match a full
+    uncached forward's last-step argmax.
+    """
+    torch.manual_seed(4)
+    model = _tiny_model(Qwen3Backbone)
+    rows = [_steps(5, start=b * 10) for b in range(3)]
+    with torch.no_grad():
+        expected = [
+            int(_fwd(model, [row])[0]["action_value"][-1].argmax().item())
+            for row in rows
+        ]
+        cache = None
+        actions = None
+        for s in range(5):
+            patched = [
+                [{**row[s], "task_index": row[s].get("task_index", 0)}]
+                for row in rows
+            ]
+            tb = batch_to_token_batch(
+                _tok(model.encoder, grouping_field="task_index"),
+                patched,
+                grouping_field="task_index",
+            )
+            out = model(tb, cache=cache, use_cache=True)
+            cache = out.cache
+            actions = model.get_action(out, temperature=0.0)
+        assert cache is not None
+        cache.close()
+        assert actions is not None
+        assert actions.tolist() == expected
+
 @pytest.mark.parametrize('backbone_cls', [Qwen3Backbone, LlamaBackbone])
 @pytest.mark.parametrize('tokens', [1, 2])
 def test_ragged_batched_chunks_match_unbatched(backbone_cls, tokens) -> None:

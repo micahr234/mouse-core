@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Tokenizer packing spec is a separate object and a separate Hub repo.
+  ``save_tokenizer`` / ``load_tokenizer`` persist ``tokenizer.json``
+  (fields, ``group_prefix``, ``head_output``, ``objective_fields``,
+  ``pretrained`` name). ``push_model_to_hub`` requires ``tokenizer=``
+  and ``tokenizer_repo_id=`` (must differ from ``repo_id``) and returns
+  ``(model_url, tokenizer_url)``. ``save_model`` writes only the model.
+  Formats, skips, and the head-output field cannot be reconstructed from
+  the embedder. ``examples/09_inference.ipynb`` calls
+  ``load_tokenizer(TOKENIZER_ID)``.
 - ``Tokenizer.pack_rows``: tokenize ragged per-sequence rows
   (``list[list[dict]]``, empty entries keep their batch slot) and pack
   them into a ``TokenBatch`` in one call — the decode-path helper the
@@ -302,10 +311,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``Tokenizer``. It names the step key used for attention isolation
   (typically ``task_index``). Int coercion happens when packing
   ``TokenBatch.grouping_ids``.
-- Objectives (DQN / Layerwise / PPO / GRPO) take
-  ``grouping_field: str | None = None`` (``None`` ⇒ no grouping filter).
+- Objectives (DQN / n-step / max-n-step / layerwise / episode-task / PPO /
+  GRPO) take required ``grouping_field: str | None``. Pass a column
+  (typically ``task_index``) or ``None`` to skip grouping isolation.
+  Omitting the argument raises — it does not silently train across
+  task boundaries.
 
 ### Changed
+- ``grouping_field`` is required on every TD / PPO / GRPO objective.
+  There is no default: pass a column or ``None``. Omitting it is a
+  ``TypeError``, not a silent cross-task pair leak.
+- ``get_action`` reads the value head at the last **valid** head-output
+  token of each decode row. Pass the ``ModelOutput`` from
+  ``forward(..., use_cache=True)``: ``head_output_valid`` marks real
+  last-head-output slots (not left-padded idle columns, not tokens
+  after the head-output field). A scores ``TensorDict`` still uses the
+  last step axis. Empty decode rows raise instead of acting on pad.
+- ``DiscreteActionHead`` always stores as ``action``. It no longer
+  inherits ``SwiGLUHead``'s rename-from-``action_head`` behavior (that
+  would store the policy logits under ``action_value`` when
+  ``action_head="action_value"``). Pass ``action_head="action"`` or the
+  dict form.
 - LoRA adapts every ``nn.Linear`` in the backbone (attention and MLP
   projections on Llama / Qwen3). ``LoRAConfig.targets`` is gone — there
   is no named subset.
@@ -717,6 +743,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Train is ``compose(augmenter, tokenizer)``; eval is the tokenizer.
 
 ### Fixed
+- ``examples/07`` and ``08`` pass ``grouping_field="task_index"`` on
+  ``PpoObjective`` / ``GrpoObjective``. Without it, a sampled window
+  that crosses a task on the same ``sequence_id`` trains the boundary
+  pair (wrong action/reward from the new task). ``task_done`` on the
+  last row of the old task discounts the incoming pair only.
 - ``left_align_content`` takes ``token_lengths`` so an idle decode row
   (zero new tokens) is not treated as length 1.
 - ``grouping_field`` set but missing from ``objective_data`` raises

@@ -119,7 +119,7 @@ class PpoObjective(Objective):
             ],
         )
         inputs, objective_data = loader.next_batch()
-        predictions, _ = model(inputs)
+        predictions = model(inputs).predictions
         loss, metrics = objective(objective_data.to(device), predictions)
 
     When ``old_log_prob`` is absent, the detached current log-probs are used
@@ -147,6 +147,10 @@ class PpoObjective(Objective):
         predictions_key: Key in ``predictions`` for policy logits.
         value_key: Key in ``predictions`` for scalar values.
         num_actions: If set, only the first ``num_actions`` logits participate.
+        grouping_field: Step column that isolates runs (typically
+            ``task_index``). Required. Pass ``None`` only when the batch
+            has no grouping isolation — omitting it is an error, not a
+            silent skip.
     """
 
     def __init__(
@@ -170,7 +174,7 @@ class PpoObjective(Objective):
         predictions_key: str = "action",
         value_key: str = "value",
         num_actions: int | None = None,
-        grouping_field: str | None = None,
+        grouping_field: str | None,
     ) -> None:
         self.gamma_step = gamma_step
         self.gamma_episode_terminal = gamma_episode_terminal

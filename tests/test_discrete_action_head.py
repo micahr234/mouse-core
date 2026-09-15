@@ -1,5 +1,6 @@
 from __future__ import annotations
 import json
+import pytest
 import torch
 from mouse_core.models import Model, load_model, save_model
 from mouse_core.models.backbone import IdentityBackbone
@@ -19,6 +20,28 @@ def test_discrete_action_head_forward_shape() -> None:
 def test_infer_head_name_is_action() -> None:
     head = DiscreteActionHead(in_features=8, out_features=4, hidden_dim=8, num_layers=1)
     assert ModelClass._infer_head_name(head) == 'action'
+    assert ModelClass._infer_head_name(head, preferred="action_value") == 'action'
+
+
+def test_discrete_action_head_rejects_action_value_name() -> None:
+    hidden_dim = 8
+    encoder = NumericEmbedder(
+        hidden_dim=hidden_dim,
+        modalities=[
+            {"type": "discrete", "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1},
+        ],
+    )
+    with pytest.raises(ValueError, match="action_head names"):
+        Model(
+            encoder=encoder,
+            backbone=IdentityBackbone(hidden_dim=hidden_dim),
+            heads=DiscreteActionHead(
+                in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1
+            ),
+            action_head="action_value",
+            reasoner=None,
+            recurrence=None,
+        )
 
 def test_discrete_action_head_save_load_roundtrip(tmp_path) -> None:
     torch.manual_seed(0)

@@ -9,11 +9,17 @@ I/O
 field is tagged by ``output_field`` (modality name). Pack ragged
 per-sequence rows with :meth:`Tokenizer.pack_rows`; pack already-tokenized
 steps with :func:`~mouse_core.data.token_batch.pack_token_batch`.
+:func:`save_tokenizer` writes the packing spec as ``tokenizer.json``;
+:func:`load_tokenizer` is the one recall path. Hub upload goes to its
+own repo via :func:`~mouse_core.models.base.push_model_to_hub`
+(``tokenizer_repo_id=``).
 """
 
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
+from dataclasses import asdict
 from pathlib import Path
 from string import Formatter
 from typing import Any
@@ -161,6 +167,7 @@ class Tokenizer:
             else:
                 raise ValueError(f"unsupported modality kind {m.kind!r}")
 
+        self.pretrained = None if pretrained is None else str(pretrained)
         self.group_prefix = group_prefix
         self.input_fields: tuple[TokenizerModalitySpec, ...] = tuple(specs)
         self._meta: tuple[TokenizerModalityMeta, ...] = tuple(meta)
@@ -487,3 +494,126 @@ def _render_group_prefix(group_prefix: str, row: dict[str, Any]) -> str:
             )
         mapping[name] = unwrap_scalar(row[name])
     return group_prefix.format_map(mapping)
+
+
+TOKENIZER_FORMAT = "mouse-core-tokenizer-v1"
+TOKENIZER_FILENAME = "tokenizer.json"
+
+
+def _jsonable(value: Any) -> Any:
+    """JSON-safe form of a tokenizer field value (``skip=`` especially)."""
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    return value
+
+
+def tokenizer_config(tokenizer: Tokenizer) -> dict[str, Any]:
+    """Public packing spec for :func:`save_tokenizer` / :func:`load_tokenizer`."""
+    input_fields: list[dict[str, Any]] = []
+    for spec in tokenizer.input_fields:
+        data = asdict(spec)
+        field: dict[str, Any] = {}
+        for key, value in data.items():
+            if value is None:
+                continue
+            if key == "head_output" and value is False:
+                continue
+            if key == "required" and value is True:
+                continue
+            field[key] = _jsonable(value)
+        input_fields.append(field)
+    objective_fields: list[dict[str, str]] = []
+    for in_name, out_name in tokenizer.objective_fields:
+        entry = {"input_field": in_name}
+        if out_name != in_name:
+            entry["output_field"] = out_name
+        objective_fields.append(entry)
+    return {
+        "format": TOKENIZER_FORMAT,
+        "grouping_field": tokenizer.grouping_field,
+        "group_prefix": tokenizer.group_prefix,
+        "pretrained": tokenizer.pretrained,
+        "input_fields": input_fields,
+        "objective_fields": objective_fields,
+    }
+
+
+def save_tokenizer(tokenizer: Tokenizer, path: str | Path) -> None:
+    """Write ``tokenizer.json`` into *path* (its own directory, not the model)."""
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    with (path / TOKENIZER_FILENAME).open("w") as fh:
+        json.dump(tokenizer_config(tokenizer), fh, indent=2, sort_keys=True)
+        fh.write("\n")
+
+
+def load_tokenizer(
+    repo_id_or_path: str,
+    *,
+    tokenizer=None,
+    image_tokenizer=None,
+    force_download: bool = True,
+    local_dir: str | Path | None = None,
+    **kwargs: Any,
+) -> Tokenizer:
+    """Load a tokenizer packing spec from a checkpoint directory or Hub repo.
+
+    The JSON is the packing contract (fields, ``group_prefix``,
+    ``objective_fields``, ``pretrained`` name). A live HF tokenizer or
+    image tokenizer is an execution choice: pass ``tokenizer=`` /
+    ``image_tokenizer=`` when the spec needs them; otherwise
+    ``pretrained`` in the file reloads the HF tokenizer.
+
+    Args:
+        repo_id_or_path: Local tokenizer directory or Hub repo id from
+            :func:`save_tokenizer` / ``push_model_to_hub(..., tokenizer_repo_id=)``.
+        tokenizer: Optional already-built HF tokenizer. Overrides
+            ``pretrained`` in the file.
+        image_tokenizer: Required when the spec has ``image`` fields.
+        force_download: Bypass the Hub cache (ignored for local paths).
+        local_dir: Where Hub files are saved (ignored for local paths).
+        **kwargs: Hub download kwargs (``revision``, ``token``, …).
+    """
+    local = Path(repo_id_or_path)
+    if local.exists():
+        config_path = local / TOKENIZER_FILENAME
+        if not config_path.is_file():
+            raise FileNotFoundError(
+                f"{config_path} is missing; save the tokenizer with "
+                "save_tokenizer or push_model_to_hub(..., tokenizer_repo_id=)."
+            )
+        with config_path.open() as fh:
+            config = json.load(fh)
+    else:
+        from huggingface_hub import hf_hub_download
+
+        from mouse_core.models.base import _hub_repo_id_for_user
+
+        hf_kwargs: dict[str, Any] = {"force_download": force_download, **kwargs}
+        if local_dir is not None:
+            hf_kwargs["local_dir"] = str(local_dir)
+        hub_repo_id = _hub_repo_id_for_user(repo_id_or_path, token=kwargs.get("token"))
+        config_path = Path(
+            hf_hub_download(
+                repo_id=hub_repo_id, filename=TOKENIZER_FILENAME, **hf_kwargs
+            )
+        )
+        with config_path.open() as fh:
+            config = json.load(fh)
+
+    if config.get("format") != TOKENIZER_FORMAT:
+        raise ValueError(
+            "Unsupported tokenizer config format. Expected a MOUSE tokenizer "
+            "saved with save_tokenizer or push_model_to_hub(..., tokenizer_repo_id=)."
+        )
+    return Tokenizer(
+        input_fields=config["input_fields"],
+        grouping_field=config["grouping_field"],
+        group_prefix=config.get("group_prefix"),
+        objective_fields=config.get("objective_fields") or (),
+        pretrained=config.get("pretrained"),
+        tokenizer=tokenizer,
+        image_tokenizer=image_tokenizer,
+    )

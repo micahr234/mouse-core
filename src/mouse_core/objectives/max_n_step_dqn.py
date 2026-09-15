@@ -115,8 +115,8 @@ class MaxNStepDqnObjective(Objective):
         q_shift: Offset added after ``q_scale``.
         episode_done_key: Key in ``objective_data`` for the episode-done code.
         task_done_key: Key in ``objective_data`` for the task-done code.
-        grouping_field: Step column that isolates runs. ``None`` skips the
-            grouping check. When set, the column must be present.
+        grouping_field: Step column that isolates runs. Required. Pass
+            ``None`` only when the batch has no grouping isolation.
     """
 
     def __init__(
@@ -137,7 +137,7 @@ class MaxNStepDqnObjective(Objective):
         q_shift: float = 0.0,
         episode_done_key: str = "episode_done",
         task_done_key: str = "task_done",
-        grouping_field: str | None = None,
+        grouping_field: str | None,
     ) -> None:
         self.horizons = _require_horizons(horizons)
         self.max_return_weight = float(max_return_weight)

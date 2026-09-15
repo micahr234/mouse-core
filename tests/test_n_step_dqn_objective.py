@@ -40,7 +40,7 @@ def _objective(
         gamma_task_truncated=gamma_task_truncated,
         reward_scale=reward_scale,
         reward_shift=reward_shift,
-    )
+        grouping_field=None)
 
 
 def _return_fixture() -> tuple[TensorDict, TensorDict, TensorDict]:
@@ -112,7 +112,7 @@ def test_n_step_one_matches_dqn_objective() -> None:
         gamma_episode_truncated=0.0,
         gamma_task_terminal=0.0,
         gamma_task_truncated=0.0,
-    )(step_stream, predictions, delayed)
+        grouping_field=None)(step_stream, predictions, delayed)
     assert abs(nstep.item() - dqn.item()) < 1e-05
 
 
@@ -341,7 +341,7 @@ def test_n_step_rejects_non_integer_n() -> None:
             gamma_episode_truncated=0.0,
             gamma_task_terminal=0.0,
             gamma_task_truncated=0.0,
-        )
+            grouping_field=None)
 
 
 def test_n_step_requires_delayed_predictions() -> None:

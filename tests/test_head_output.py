@@ -8,7 +8,7 @@ import torch
 from tensordict import TensorDict
 
 from mouse_core.data import Tokenizer, pack_token_batch
-from mouse_core.models import LatentReasoner, Model
+from mouse_core.models import LatentReasoner, Model, ModelOutput
 from mouse_core.models.backbone import LlamaBackbone
 from mouse_core.models.embedding import NumericEmbedder
 from mouse_core.models.heads import DiscreteActionValueHead
@@ -179,6 +179,117 @@ def test_decode_pools_last_head_output_token_per_step() -> None:
             row += 1
 
 
+def test_get_action_uses_last_valid_head_output_not_last_token() -> None:
+    """get_action reads Q above the last valid head-output token.
+
+    Each step ends with a trailing non-head-output token, so the last
+    sequence token is *not* a readout. Decode also left-pads a short row.
+    ``get_action(ModelOutput)`` must match the value head at the last
+    head-output index, not the last token and not a padded step column.
+    """
+    torch.manual_seed(0)
+    hidden = _HIDDEN
+    encoder = NumericEmbedder(
+        hidden_dim=hidden,
+        modalities=[
+            {"type": "discrete", "field": "action", "vocab_size": _ACTIONS, "std": 0.02, "positions": 1},
+            {"type": "discrete", "field": "observation", "vocab_size": 16, "std": 0.02, "positions": 1},
+            {"type": "learnable", "field": "value", "tokens": 2, "std": 0.02, "positions": 2},
+            {"type": "discrete", "field": "tail", "vocab_size": 8, "std": 0.5, "positions": 1},
+        ],
+    )
+    backbone = LlamaBackbone(
+        train_kernel="reference", decode_kernel="flex", dtype=torch.float32,
+        hidden_dim=hidden, num_layers=2, num_heads=2, max_position_embeddings=128,
+    )
+    model = Model(
+        encoder=encoder,
+        backbone=backbone,
+        heads=DiscreteActionValueHead(
+            in_features=hidden, out_features=_ACTIONS, hidden_dim=hidden, num_layers=1,
+        ),
+        action_head="action_value",
+        reasoner=None,
+        recurrence=None,
+    ).eval()
+    tok = Tokenizer(
+        input_fields=[
+            {"type": "discrete", "input_field": "action"},
+            {"type": "discrete", "input_field": "observation"},
+            {"type": "learnable", "output_field": "value", "tokens": 2, "head_output": True},
+            {"type": "discrete", "input_field": "tail"},
+        ],
+        grouping_field="grouping_id",
+        objective_fields=[{"input_field": "action"}, {"input_field": "observation"}, {"input_field": "tail"}],
+    )
+    rows = [
+        [{**step, "tail": (i + 3) % 8} for i, step in enumerate(_rows(3))],
+        [{**step, "tail": (i + 5) % 8} for i, step in enumerate(_rows(1, offset=2))],
+    ]
+    batch, _ = batch_to_packed(tok, rows)
+    with torch.no_grad():
+        out = model(batch, use_cache=True)
+        action = model.get_action(out, temperature=0.0)
+
+    assert out.head_output_valid is not None
+    assert out.head_output_valid.tolist() == [[True, True, True], [False, False, True]]
+    # Last sequence token is the trailing ``tail`` field, not a head-output.
+    last_head = out.head_output_indices[torch.arange(2), 2]
+    assert (last_head != out.last_hidden_state.shape[1] - 1).all()
+
+    with torch.no_grad():
+        h_head = out.last_hidden_state[torch.arange(2), last_head]
+        q_head = model.head(h=h_head, batch_size=(2,))["action_value"]
+        h_tok = out.last_hidden_state[:, -1]
+        q_tok = model.head(h=h_tok, batch_size=(2,))["action_value"]
+    assert not torch.allclose(q_head, q_tok, atol=1e-5)
+    assert action.tolist() == q_head.argmax(dim=-1).tolist()
+
+
+def test_get_action_model_output_uses_last_valid_step_column() -> None:
+    """A scores tensor's last column is ignored when a later slot is invalid."""
+    model = _tiny_model()
+    preds = TensorDict(
+        {
+            "action_value": torch.tensor(
+                [
+                    [[0.0, 9.0], [5.0, 0.0], [0.0, 3.0]],
+                    [[1.0, 0.0], [0.0, 1.0], [8.0, 0.0]],
+                ]
+            )
+        }
+    )
+    # Last valid columns are 1 and 0 — not the trailing pad column.
+    valid = torch.tensor([[True, True, False], [True, False, False]])
+    out = ModelOutput(
+        predictions=preds,
+        last_hidden_state=torch.zeros(2, 1, _HIDDEN),
+        passes=(),
+        head_output_indices=torch.zeros(2, 3, dtype=torch.long),
+        head_output_valid=valid,
+    )
+    action = model.get_action(out, temperature=0.0)
+    assert action.tolist() == [0, 0]
+    # TensorDict path still takes the last step axis.
+    assert model.get_action(preds, temperature=0.0).tolist() == [1, 0]
+
+
+def test_get_action_rejects_decode_row_with_no_valid_head_output() -> None:
+    model = _tiny_model()
+    preds = TensorDict(
+        {"action_value": torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])}
+    )
+    out = ModelOutput(
+        predictions=preds,
+        last_hidden_state=torch.zeros(1, 1, _HIDDEN),
+        passes=(),
+        head_output_indices=torch.zeros(1, 2, dtype=torch.long),
+        head_output_valid=torch.tensor([[False, False]]),
+    )
+    with pytest.raises(ValueError, match="valid head-output"):
+        model.get_action(out, temperature=0.0)
+
+
 # ---------------------------------------------------------------------------
 # DQN objective with several head-output rows per step
 # ---------------------------------------------------------------------------
@@ -204,7 +315,7 @@ def test_dqn_duplicated_rows_match_single_head_output() -> None:
     N, A = 5, _ACTIONS
     q = torch.randn(N, A)
     q_target = torch.randn(N, A)
-    objective = DqnObjective(gamma_step=0.9, gamma_episode_terminal=0.0, gamma_episode_truncated=0.0, gamma_task_terminal=0.0, gamma_task_truncated=0.0)
+    objective = DqnObjective(gamma_step=0.9, gamma_episode_terminal=0.0, gamma_episode_truncated=0.0, gamma_task_terminal=0.0, gamma_task_truncated=0.0, grouping_field=None)
 
     base_loss, base_metrics = objective(
         _objective_data(N),
@@ -230,7 +341,7 @@ def test_dqn_multi_head_output_shares_step_target() -> None:
     gamma = 0.9
     q = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
     q_target = torch.tensor([[10.0, 20.0], [30.0, 40.0], [50.0, 60.0]])
-    objective = DqnObjective(gamma_step=gamma, gamma_episode_terminal=0.0, gamma_episode_truncated=0.0, gamma_task_terminal=0.0, gamma_task_truncated=0.0)
+    objective = DqnObjective(gamma_step=gamma, gamma_episode_terminal=0.0, gamma_episode_truncated=0.0, gamma_task_terminal=0.0, gamma_task_truncated=0.0, grouping_field=None)
     data = _objective_data(2, counts=[2, 1], actions=[0, 1])
     data["reward"] = torch.tensor([0.0, 0.5])
     loss, _ = objective(
@@ -247,7 +358,7 @@ def test_dqn_misaligned_head_output_count_raises() -> None:
     N = 3
     q = torch.randn(2 * N, _ACTIONS)
     preds = TensorDict({"action_value": q}, batch_size=[2 * N])
-    objective = DqnObjective(gamma_step=1.0, gamma_episode_terminal=0.0, gamma_episode_truncated=0.0, gamma_task_terminal=0.0, gamma_task_truncated=0.0)
+    objective = DqnObjective(gamma_step=1.0, gamma_episode_terminal=0.0, gamma_episode_truncated=0.0, gamma_task_terminal=0.0, gamma_task_truncated=0.0, grouping_field=None)
     with pytest.raises(ValueError, match="misaligned"):
         objective(_objective_data(N, counts=[2, 2, 1]), preds, preds.clone())
     with pytest.raises(ValueError, match="head_output_count column"):

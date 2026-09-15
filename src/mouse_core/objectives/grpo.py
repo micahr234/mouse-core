@@ -81,7 +81,7 @@ class GrpoObjective(Objective):
             ],
         )
         inputs, objective_data = loader.next_batch()
-        predictions, _ = model(inputs)
+        predictions = model(inputs).predictions
         loss, metrics = objective(objective_data.to(device), predictions)
 
     ``old_log_prob`` and ``advantage`` are objective columns only — not
@@ -102,6 +102,10 @@ class GrpoObjective(Objective):
         advantage_key: Key in ``objective_data`` for group-relative advantages.
         predictions_key: Key in ``predictions`` for policy logits.
         num_actions: If set, only the first ``num_actions`` logits participate.
+        grouping_field: Step column that isolates runs (typically
+            ``task_index``). Required. Pass ``None`` only when the batch
+            has no grouping isolation — omitting it is an error, not a
+            silent skip.
     """
 
     def __init__(
@@ -114,7 +118,7 @@ class GrpoObjective(Objective):
         advantage_key: str = "advantage",
         predictions_key: str = "action",
         num_actions: int | None = None,
-        grouping_field: str | None = None,
+        grouping_field: str | None,
     ) -> None:
         self.clip_eps = clip_eps
         self.ent_coef = ent_coef

@@ -45,7 +45,7 @@ def _objective(
         gamma_episode_truncated=gamma_episode_truncated,
         gamma_task_terminal=gamma_task_terminal,
         gamma_task_truncated=gamma_task_truncated,
-    )
+        grouping_field=None)
 
 
 def test_pdf_numerical_example() -> None:

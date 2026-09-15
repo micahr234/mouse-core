@@ -3,11 +3,11 @@ from typing import Any, cast
 import json
 import pytest
 import torch
-from mouse_core.models import Model, load_model, save_model
+from mouse_core.models import Model, load_model, push_model_to_hub, save_model
 from mouse_core.models.base import _write_model_card
 from mouse_core.models.backbone import IdentityBackbone, LoRAConfig, Qwen3Backbone
 from mouse_core.models.embedding import NumericEmbedder
-from mouse_core.data import Tokenizer
+from mouse_core.data import Tokenizer, load_tokenizer, save_tokenizer
 from mouse_core.models.heads import DiscreteActionValueHead
 from tests._token_batch_helpers import batch_to_token_batch, tok_from_encoder
 
@@ -139,7 +139,7 @@ def test_composed_model_roundtrip_static_fourier(tmp_path) -> None:
 def test_model_card_includes_usage_and_architecture(tmp_path) -> None:
     model = Model(encoder=NumericEmbedder(hidden_dim=8, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}, {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3, "std": 0.02, "positions": 1}]), backbone=IdentityBackbone(hidden_dim=8), heads=DiscreteActionValueHead(in_features=8, out_features=4, hidden_dim=8, num_layers=1), action_head="action_value", reasoner=None, recurrence=None)
     path = tmp_path / 'README.md'
-    _write_model_card(repo_id='user/mouse-example-model', model=model, path=path)
+    _write_model_card(repo_id='user/mouse-example-model', tokenizer_repo_id='user/mouse-example-tokenizer', model=model, path=path)
     text = path.read_text()
     assert 'library_name: mouse-core' in text
     assert text.index('## Architecture') < text.index('### Encoder')
@@ -159,8 +159,9 @@ def test_model_card_includes_usage_and_architecture(tmp_path) -> None:
     assert 'pack_token_batch' in text
     assert 'DataLoader(transform=compose(augmenter, tokenizer))' in text
     assert 'eval_transform = tokenizer' in text
-    assert 'grouping_field="task_index"' in text
-    assert '{"input_field": "action"}' in text
+    assert 'load_tokenizer(' in text
+    assert 'user/mouse-example-tokenizer' in text
+    assert 'separate' in text.lower()
     assert 'token_batch.grouper' not in text
     assert 'boundary_values' not in text
     assert 'Backbone: `identity`' in text
@@ -239,4 +240,91 @@ def test_model_to_cuda_moves_without_casting() -> None:
     with torch.no_grad():
         preds = model(batch_to_token_batch(_tok(model.encoder), batch), use_cache=True).predictions
     assert preds['action_value'].dtype == torch.float32
+
+
+def test_save_model_does_not_write_tokenizer(tmp_path) -> None:
+    model = Model(
+        encoder=NumericEmbedder(
+            hidden_dim=8,
+            modalities=[{"type": "discrete", "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}],
+        ),
+        backbone=IdentityBackbone(hidden_dim=8),
+        heads=DiscreteActionValueHead(in_features=8, out_features=4, hidden_dim=8, num_layers=1),
+        action_head="action_value",
+        reasoner=None,
+        recurrence=None,
+    )
+    save_model(model, tmp_path)
+    assert not (tmp_path / "tokenizer.json").exists()
+
+
+def test_tokenizer_roundtrip(tmp_path) -> None:
+    """save_tokenizer writes tokenizer.json; load_tokenizer is the recall path."""
+    tokenizer = Tokenizer(
+        input_fields=[
+            {"type": "discrete", "input_field": "action"},
+            {"type": "fourier", "input_field": "reward", "required": False},
+            {"type": "discrete", "input_field": "episode_done", "head_output": True},
+        ],
+        grouping_field="task_index",
+        objective_fields=[
+            {"input_field": "action"},
+            {"input_field": "reward", "output_field": "r"},
+            {"input_field": "episode_done"},
+            {"input_field": "task_done"},
+        ],
+    )
+    save_tokenizer(tokenizer, tmp_path)
+    assert (tmp_path / "tokenizer.json").is_file()
+    loaded = load_tokenizer(str(tmp_path))
+    assert loaded.grouping_field == "task_index"
+    assert loaded.group_prefix is None
+    assert loaded.pretrained is None
+    assert loaded.objective_fields == (
+        ("action", "action"),
+        ("reward", "r"),
+        ("episode_done", "episode_done"),
+        ("task_done", "task_done"),
+    )
+    assert [s.input_field for s in loaded.input_fields] == ["action", "reward", "episode_done"]
+    assert loaded.input_fields[1].required is False
+    assert loaded.input_fields[2].head_output is True
+    assert sum(1 for s in loaded.input_fields if s.head_output) == 1
+
+
+def test_load_tokenizer_missing_file_raises(tmp_path) -> None:
+    with pytest.raises(FileNotFoundError, match="tokenizer.json"):
+        load_tokenizer(str(tmp_path))
+
+
+def test_push_model_to_hub_requires_distinct_tokenizer_repo() -> None:
+    model = Model(
+        encoder=NumericEmbedder(
+            hidden_dim=8,
+            modalities=[{"type": "discrete", "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}],
+        ),
+        backbone=IdentityBackbone(hidden_dim=8),
+        heads=DiscreteActionValueHead(in_features=8, out_features=4, hidden_dim=8, num_layers=1),
+        action_head="action_value",
+        reasoner=None,
+        recurrence=None,
+    )
+    tokenizer = Tokenizer(
+        input_fields=[{"type": "discrete", "input_field": "action", "head_output": True}],
+        grouping_field="task_index",
+        objective_fields=[],
+    )
+    with pytest.raises(ValueError, match="tokenizer_repo_id"):
+        push_model_to_hub(
+            model=model,
+            tokenizer=tokenizer,
+            repo_id="same-id",
+            tokenizer_repo_id="same-id",
+        )
+    with pytest.raises(TypeError, match="tokenizer_repo_id"):
+        push_model_to_hub(  # type: ignore[call-arg]
+            model=model,
+            tokenizer=tokenizer,
+            repo_id="my-model",
+        )
 

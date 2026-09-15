@@ -29,6 +29,7 @@ from mouse_core.models.recurrence import Recurrence
 
 if TYPE_CHECKING:
     from mouse_core.data.token_batch import TokenBatch
+    from mouse_core.data.tokenizer import Tokenizer
 
 def _backbone_num_layers(backbone: nn.Module) -> int | None:
     """Return transformer block count when the backbone exposes block layers."""
@@ -59,10 +60,11 @@ def _hub_repo_id_for_user(repo_id: str, token: str | bool | None = None) -> str:
 
 
 def save_model(model: "Model", path: str | Path) -> None:
-    """Save a MOUSE model to a local directory.
+    """Save a MOUSE model checkpoint to a directory.
 
-    Writes ``pytorch_model.bin`` and ``config.json`` into *path*. The saved
-    directory can be passed back to :func:`load_model`.
+    Writes ``pytorch_model.bin`` and ``config.json`` into *path*. The
+    packing spec is a separate object — :func:`~mouse_core.data.tokenizer.save_tokenizer`
+    / :func:`~mouse_core.data.tokenizer.load_tokenizer`.
 
     Args:
         model: The model instance to save.
@@ -71,10 +73,12 @@ def save_model(model: "Model", path: str | Path) -> None:
     Example::
 
         save_model(model, "./checkpoints/step-10000")
+        save_tokenizer(tokenizer, "./checkpoints/step-10000-tokenizer")
         model2 = load_model(
             "./checkpoints/step-10000",
             train_kernel="flex", decode_kernel="flex", dtype=torch.float32,
         )
+        tokenizer2 = load_tokenizer("./checkpoints/step-10000-tokenizer")
     """
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
@@ -84,38 +88,14 @@ def save_model(model: "Model", path: str | Path) -> None:
     torch.save(model.state_dict(), path / "pytorch_model.bin")
 
 
-def push_model_to_hub(
+def _create_hub_repo(
     *,
-    model: "Model",
     repo_id: str,
-    commit_message: str = "Upload MOUSE model",
-    private: bool = False,
-    clear: bool = False,
-    **kwargs: Any,
-) -> str:
-    """Push a MOUSE model to the Hugging Face Hub.
-
-    Creates the repository if needed, uploads the MOUSE checkpoint files plus a
-    model card, and returns the Hub URL.
-
-    Args:
-        model: The model instance to upload.
-        repo_id: Hub repository ID, e.g. ``"my-model"`` or ``"your-org/your-model"``.
-            Unscoped names are resolved under the authenticated user.
-        commit_message: Commit message written to the Hub.
-        private: Create a private repository if it does not already exist.
-        clear: Delete all existing files in the repository before uploading.
-            Useful to avoid stale files from a previous push.
-        **kwargs: Forwarded to ``huggingface_hub.HfApi.upload_folder``.
-
-    Returns:
-        The Hub URL string for the uploaded repository.
-
-    Example::
-
-        url = push_model_to_hub(model=model, repo_id="my-model", clear=True)
-        print(url)
-    """
+    private: bool,
+    clear: bool,
+    token: str | bool | None,
+) -> tuple[str, str]:
+    """Create or open a Hub repo, optionally clearing it. Returns ``(url, hub_repo_id)``."""
     from huggingface_hub import HfApi
 
     api = HfApi()
@@ -123,7 +103,7 @@ def push_model_to_hub(
         repo_id=repo_id,
         private=private,
         exist_ok=True,
-        token=kwargs.get("token"),
+        token=token,
     )
     hub_repo_id = repo_url.repo_id
     if clear:
@@ -137,16 +117,106 @@ def push_model_to_hub(
                 delete_patterns=existing,
                 commit_message="Clear repository before upload",
             )
-    with tempfile.TemporaryDirectory() as tmp:
-        save_model(model, tmp)
-        _write_model_card(repo_id=hub_repo_id, model=model, path=Path(tmp) / 'README.md')
+    return str(repo_url), hub_repo_id
+
+
+def push_model_to_hub(
+    *,
+    model: "Model",
+    tokenizer: "Tokenizer",
+    repo_id: str,
+    tokenizer_repo_id: str,
+    commit_message: str = "Upload MOUSE model",
+    tokenizer_commit_message: str = "Upload MOUSE tokenizer",
+    private: bool = False,
+    clear: bool = False,
+    **kwargs: Any,
+) -> tuple[str, str]:
+    """Push a MOUSE model and its tokenizer to two Hugging Face Hub repos.
+
+    The tokenizer is a separate object and a separate repository — it is
+    not written into the model checkpoint. :func:`load_model` reads
+    *repo_id*; :func:`~mouse_core.data.tokenizer.load_tokenizer` reads
+    *tokenizer_repo_id*.
+
+    Args:
+        model: The model instance to upload.
+        tokenizer: The :class:`~mouse_core.data.tokenizer.Tokenizer` used
+            to pack steps for this model. Required — a different object
+            from *model*, uploaded to *tokenizer_repo_id*.
+        repo_id: Hub repository ID for the model, e.g. ``"my-model"`` or
+            ``"your-org/your-model"``. Unscoped names are resolved under
+            the authenticated user.
+        tokenizer_repo_id: Hub repository ID for the packing spec. Must
+            differ from *repo_id*.
+        commit_message: Commit message for the model repo.
+        tokenizer_commit_message: Commit message for the tokenizer repo.
+        private: Create private repositories if they do not already exist.
+        clear: Delete all existing files in each repository before uploading.
+        **kwargs: Forwarded to ``huggingface_hub.HfApi.upload_folder``.
+
+    Returns:
+        ``(model_url, tokenizer_url)`` Hub URL strings.
+
+    Example::
+
+        model_url, tokenizer_url = push_model_to_hub(
+            model=model,
+            tokenizer=tokenizer,
+            repo_id="my-model",
+            tokenizer_repo_id="my-tokenizer",
+            clear=True,
+        )
+    """
+    from huggingface_hub import HfApi
+
+    from mouse_core.data.tokenizer import Tokenizer, save_tokenizer
+
+    if not isinstance(tokenizer, Tokenizer):
+        raise TypeError(
+            f"push_model_to_hub requires tokenizer= to be a Tokenizer, got {type(tokenizer).__name__}."
+        )
+    if repo_id == tokenizer_repo_id:
+        raise ValueError(
+            "tokenizer_repo_id must be a different Hub repo than repo_id; "
+            f"got {repo_id!r} for both."
+        )
+    token = kwargs.get("token")
+    model_url, hub_model_id = _create_hub_repo(
+        repo_id=repo_id, private=private, clear=clear, token=token
+    )
+    tokenizer_url, hub_tok_id = _create_hub_repo(
+        repo_id=tokenizer_repo_id, private=private, clear=clear, token=token
+    )
+    if hub_model_id == hub_tok_id:
+        raise ValueError(
+            "tokenizer_repo_id resolved to the same Hub repo as repo_id "
+            f"({hub_model_id!r}); pass a different tokenizer_repo_id."
+        )
+    api = HfApi()
+    with tempfile.TemporaryDirectory() as model_tmp, tempfile.TemporaryDirectory() as tok_tmp:
+        save_model(model, model_tmp)
+        _write_model_card(
+            repo_id=hub_model_id,
+            tokenizer_repo_id=hub_tok_id,
+            model=model,
+            path=Path(model_tmp) / "README.md",
+        )
+        save_tokenizer(tokenizer, tok_tmp)
+        _write_tokenizer_card(repo_id=hub_tok_id, path=Path(tok_tmp) / "README.md")
         api.upload_folder(
-            repo_id=hub_repo_id,
-            folder_path=tmp,
+            repo_id=hub_model_id,
+            folder_path=model_tmp,
             commit_message=commit_message,
             **kwargs,
         )
-    return str(repo_url)
+        api.upload_folder(
+            repo_id=hub_tok_id,
+            folder_path=tok_tmp,
+            commit_message=tokenizer_commit_message,
+            **kwargs,
+        )
+    return model_url, tokenizer_url
 
 
 def _write_model_card(
@@ -154,6 +224,7 @@ def _write_model_card(
     model: "Model",
     path: Path,
     repo_id: str,
+    tokenizer_repo_id: str,
 ) -> None:
     config = _model_config(model)
     heads = config["heads"]["heads"]
@@ -177,7 +248,7 @@ def _write_model_card(
             f"on every backbone `nn.Linear` (fp32 adapters over frozen base weights)"
         )
     encoder_section, tokenizer_snippet, objective_data_example = _model_card_encoder_bits(
-        config
+        config, tokenizer_repo_id=tokenizer_repo_id
     )
     text = f"""---
 library_name: mouse-core
@@ -188,7 +259,8 @@ tags:
 
 # {repo_id}
 
-This repository contains a MOUSE model checkpoint.
+This repository contains a MOUSE model checkpoint. The packing spec
+lives in a separate repo (`{tokenizer_repo_id}`).
 
 ## Architecture
 
@@ -233,8 +305,8 @@ model = (
 Training and inference both take a `TokenBatch`. Training typically uses
 `DataLoader(transform=compose(augmenter, tokenizer))`. Online / inference
 uses the tokenizer (no augmenter → `StepTokens`) and
-`pack_token_batch` when combining steps. The tokenizer is not part of the
-saved model.
+`pack_token_batch` when combining steps. The packing spec is a
+separate Hub repo — `load_tokenizer` on `{tokenizer_repo_id}`.
 
 ```python
 {tokenizer_snippet}
@@ -245,7 +317,7 @@ with torch.no_grad():
     steps = [eval_transform(step) for step in batch[0]]
     inputs, _ = pack_token_batch(steps, sequence_ids=[0] * len(steps))
     out = model(inputs, use_cache=True)
-    action = model.get_action(out.predictions, temperature=0.0)
+    action = model.get_action(out, temperature=0.0)
 ```
 
 `model()` returns a `ModelOutput` with `predictions` and
@@ -262,20 +334,42 @@ cache, so each row decodes exactly as it would alone.
     path.write_text(text, encoding="utf-8")
 
 
-def _model_card_encoder_bits(config: dict[str, Any]) -> tuple[str, str, str]:
+def _write_tokenizer_card(*, path: Path, repo_id: str) -> None:
+    path.write_text(
+        f"""---
+library_name: mouse-core
+tags:
+- mouse-core
+- tokenizer
+---
+
+# {repo_id}
+
+MOUSE tokenizer packing spec (`tokenizer.json`). Load with:
+
+```python
+from mouse_core.data import load_tokenizer
+
+tokenizer = load_tokenizer("{repo_id}")
+```
+""",
+        encoding="utf-8",
+    )
+
+
+def _model_card_encoder_bits(
+    config: dict[str, Any], *, tokenizer_repo_id: str
+) -> tuple[str, str, str]:
     """Return ``(encoder_section, tokenizer_snippet, step_example)`` for the card."""
     enc = config["encoder"]
     hidden = config["hidden_dim"]
-    objective_fields = """    objective_fields=[
-        {"input_field": "action"},
-        {"input_field": "reward"},
-        {"input_field": "episode_done"},
-        {"input_field": "task_done"},
-    ],
-    grouping_field="task_index",
-)"""
+    tokenizer_snippet = (
+        "from mouse_core.data import load_tokenizer, pack_token_batch\n"
+        "\n"
+        f'tokenizer = load_tokenizer("{tokenizer_repo_id}")\n'
+        "eval_transform = tokenizer"
+    )
     if enc.get("type") == "text":
-        pretrained = enc["kwargs"].get("pretrained") or "..."
         vocab = enc["kwargs"].get("vocab_size")
         vocab_note = f" (`vocab_size={vocab}`)" if vocab is not None else ""
         learnable = enc["kwargs"].get("learnable") or []
@@ -294,19 +388,9 @@ def _model_card_encoder_bits(config: dict[str, Any]) -> tuple[str, str, str]:
             f":class:`~mouse_core.data.token_batch.TokenBatch`, mapping them into "
             f"the shared `{hidden}`-dimensional token space before the backbone. "
             f"Step templates and field packing live on `Tokenizer` "
-            f"(not saved with the checkpoint).{learnable_note}"
+            f"(a separate Hub repo, `{tokenizer_repo_id}`).{learnable_note}"
         )
-        tokenizer_snippet = (
-            "from mouse_core.data import Tokenizer, pack_token_batch\n"
-            "\n"
-            "tokenizer = Tokenizer(\n"
-            "    input_fields=[...],  # type/input_field=; text fields require format=\"{field}\";\n"
-            "                         # flag exactly one field head_output=True (the Q readout tokens)\n"
-            f'    pretrained="{pretrained}",\n'
-            f"{objective_fields}\n"
-            "eval_transform = tokenizer"
-        )
-        step_example = """# Rebuild the same Tokenizer used at train time, then pack steps.
+        step_example = """# load_tokenizer(repo) is the same packing spec used at train time.
 batch = [[
     {
         "action": 0,
@@ -322,19 +406,11 @@ batch = [[
     modalities = enc.get("kwargs", {}).get("modalities", [])
     encoder_section = (
         f"`NumericEmbedder` maps a tokenized "
-        f":class:`~mouse_core.data.token_batch.TokenBatch`\n"
-        f"(discrete ids / continuous values) into the shared `{hidden}`-dimensional\n"
-        f"token space before the backbone.\n\n"
+        f":class:`~mouse_core.data.token_batch.TokenBatch` "
+        f"(discrete ids / continuous values) into the shared `{hidden}`-dimensional "
+        f"token space before the backbone. Step templates and field packing live on "
+        f"`Tokenizer` (a separate Hub repo, `{tokenizer_repo_id}`).\n\n"
         f"{_model_card_modality_table(modalities)}"
-    )
-    tokenizer_snippet = (
-        "from mouse_core.data import Tokenizer, pack_token_batch\n"
-        "\n"
-        "tokenizer = Tokenizer(\n"
-        "    input_fields=[...],  # input_field=; optional output_field= matches embedder field=;\n"
-        "                         # flag exactly one field head_output=True (the Q readout tokens)\n"
-        f"{objective_fields}\n"
-        "eval_transform = tokenizer"
     )
     return encoder_section, tokenizer_snippet, _model_card_step_stream_example(modalities)
 
@@ -945,8 +1021,11 @@ class ModelOutput:
 
     ``head_output_indices`` maps token states to the rows heads read. A
     reasoning forward extends the stream, so those indices and the states
-    describe the stream *with* latents inserted. Incremental decode carries
-    ``cache`` — pass ``out.cache`` back as ``cache=`` with ``use_cache=True``.
+    describe the stream *with* latents inserted. Cached decode also sets
+    ``head_output_valid`` (``[B, S]``): True where a step slot is a real
+    last-head-output readout, False on left-padded idle columns.
+    Incremental decode carries ``cache`` — pass ``out.cache`` back as
+    ``cache=`` with ``use_cache=True``.
     """
 
     predictions: TensorDict
@@ -955,6 +1034,7 @@ class ModelOutput:
     head_output_indices: torch.Tensor
     hidden_states: tuple[torch.Tensor, ...] | None = None
     cache: DecodeCache | None = None
+    head_output_valid: torch.Tensor | None = None
 
 
 class Model(nn.Module):
@@ -1077,11 +1157,17 @@ class Model(nn.Module):
 
     @staticmethod
     def _infer_head_name(head: BaseHead, preferred: str | None = None) -> str:
-        """Infer a default storage key from the head type when no dict key is given."""
+        """Infer a default storage key from the head type when no dict key is given.
+
+        ``DiscreteActionValueHead`` → ``action_value``, ``DiscreteActionHead``
+        → ``action``. ``SwiGLUHead`` uses *preferred* when set, else ``action``.
+        """
         if isinstance(head, LayerwiseDiscreteActionValueHead):
             return "action_value_layerwise"
         if isinstance(head, DiscreteActionValueHead):
             return "action_value"
+        if isinstance(head, DiscreteActionHead):
+            return "action"
         if isinstance(head, SwiGLUHead):
             if preferred is not None:
                 return preferred
@@ -1598,6 +1684,15 @@ class Model(nn.Module):
                     pass_input = self.recurrence(flex_embeds, _last_hidden(session_out))
             new_cache = DecodeCache(sessions=tuple(sessions))
             pred_batch_size: tuple[int, ...] = (B, S_max)
+            counts = torch.as_tensor(
+                step_counts_np.tolist(), device=embeds.device, dtype=torch.long
+            )
+            # Left-padded steps: trailing ``n`` columns of row ``b`` are real.
+            head_output_valid = (
+                torch.arange(S_max, device=embeds.device).unsqueeze(0)
+                >= (S_max - counts).clamp(min=0).unsqueeze(1)
+            )
+            head_output_valid = head_output_valid & counts.unsqueeze(1).gt(0)
         else:
             if plan is not None:
                 # Gradient-taped latent generation; swaps in the extended stream.
@@ -1627,6 +1722,7 @@ class Model(nn.Module):
                     pass_input = self.recurrence(embeds, _last_hidden(session_out))
             new_cache = None
             pred_batch_size = (token_batch.P,)
+            head_output_valid = None
 
         passes = tuple(
             PassOutput(
@@ -1647,6 +1743,7 @@ class Model(nn.Module):
             head_output_indices=resolved_indices,
             hidden_states=final.hidden_states,
             cache=new_cache,
+            head_output_valid=head_output_valid,
         )
 
     def head(
@@ -1665,31 +1762,45 @@ class Model(nn.Module):
 
     def get_action(
         self,
-        out: TensorDict,
+        out: TensorDict | ModelOutput,
         *,
         temperature: float,
         num_actions: int | None = None,
     ) -> torch.Tensor:
-        """Select an action at the last head-output token of each decode row.
+        """Select an action from the value head at the last valid head-output.
 
-        ``out`` must be cached-decode scores ``[B, S, A]`` (or layerwise
-        ``[B, S, L, A]``). Flat training outputs ``[N, A]`` are rejected
-        unless ``N == 1``.
+        Cached decode writes Q at each step's last head-output token
+        (left-padded ``[B, S, A]``, or layerwise ``[B, S, L, A]``). Pass the
+        :class:`ModelOutput` from ``forward(..., use_cache=True)`` so this
+        reads the last-layer residual stream at the last *valid* (non-pad)
+        head-output of each row — not a padded step column and not a token
+        after the head-output field. A scores ``TensorDict`` is treated as
+        already aligned: the last step axis is used.
+
+        Flat training outputs ``[N, A]`` are rejected unless ``N == 1``.
 
         Scores come from ``action_head``: one name, or the sum of each
         named head.
         """
+        if isinstance(out, ModelOutput):
+            preds = out.predictions
+            valid = out.head_output_valid
+        else:
+            preds = out
+            valid = None
         names = _action_head_names(self.action_head)
         scores = _last_action_scores(
-            cast(torch.Tensor, out[names[0]]),
+            cast(torch.Tensor, preds[names[0]]),
             name=names[0],
             head=self._heads[names[0]],
+            valid=valid,
         )
         for name in names[1:]:
             scores = scores + _last_action_scores(
-                cast(torch.Tensor, out[name]),
+                cast(torch.Tensor, preds[name]),
                 name=name,
                 head=self._heads[name],
+                valid=valid,
             )
         if num_actions is not None:
             scores = scores[:, :num_actions]
@@ -1718,17 +1829,49 @@ def _action_head_names(action_head: str | Sequence[str]) -> tuple[str, ...]:
     return names
 
 
-def _last_action_scores(
-    raw: torch.Tensor, *, name: str, head: BaseHead
-) -> torch.Tensor:
-    """Last-step action scores from a head tensor.
+def _last_valid_step(valid: torch.Tensor) -> torch.Tensor:
+    """Last True index along dim=-1. Every row must have a valid head-output."""
+    if valid.ndim != 2:
+        raise ValueError(
+            f"head_output_valid must have shape [B, S], got {tuple(valid.shape)}"
+        )
+    has = valid.any(dim=-1)
+    if not bool(has.all()):
+        empty = (~has).nonzero(as_tuple=True)[0]
+        raise ValueError(
+            "get_action needs a valid head-output token in every row; "
+            f"empty rows: {empty.tolist()}."
+        )
+    idx = valid.long() * torch.arange(valid.shape[1], device=valid.device)
+    return idx.max(dim=-1).values
 
-    Layerwise Q: ``[B, S, L, A]`` / ``[N, L, A]`` → last step, deepest
-    layer. Other Q / logit heads: ``[B, S, A]`` / ``[N, A]``.
+
+def _last_action_scores(
+    raw: torch.Tensor,
+    *,
+    name: str,
+    head: BaseHead,
+    valid: torch.Tensor | None,
+) -> torch.Tensor:
+    """Action scores at the last valid head-output of each row.
+
+    Layerwise Q: ``[B, S, L, A]`` / ``[N, L, A]`` → last valid step,
+    deepest layer. Other Q / logit heads: ``[B, S, A]`` / ``[N, A]``.
+    ``valid`` is the decode ``[B, S]`` mask; omitted, the last step
+    column is used (left-padded decode).
     """
+    if valid is not None and raw.ndim >= 3 and valid.shape != raw.shape[:2]:
+        raise ValueError(
+            f"{name} scores {tuple(raw.shape)} do not match "
+            f"head_output_valid {tuple(valid.shape)}"
+        )
+    step = None if valid is None else _last_valid_step(valid)
+    batch = None if step is None else torch.arange(raw.shape[0], device=raw.device)
     if isinstance(head, LayerwiseDiscreteActionValueHead):
         if raw.ndim == 4:
-            return raw[:, -1, -1, :]
+            if step is None:
+                return raw[:, -1, -1, :]
+            return raw[batch, step, -1, :]
         if raw.ndim == 3:
             if raw.shape[0] != 1:
                 raise ValueError(
@@ -1742,7 +1885,9 @@ def _last_action_scores(
             f"got {tuple(raw.shape)}"
         )
     if raw.ndim == 3:
-        return raw[:, -1]
+        if step is None:
+            return raw[:, -1]
+        return raw[batch, step]
     if raw.ndim == 2:
         if raw.shape[0] != 1:
             raise ValueError(

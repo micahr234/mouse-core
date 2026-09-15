@@ -115,7 +115,7 @@ def _pair_weight(
     N: int,
     device: torch.device | str | None,
     *,
-    grouping_field: str | None = None,
+    grouping_field: str | None,
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """``[N-1]`` weights: ``1.0`` when ``(i, i+1)`` share a run, else ``0.0``.
@@ -426,6 +426,10 @@ class DqnObjective(Objective):
             Q is ``q_scale * Q + q_shift``.
         episode_done_key: Key in ``objective_data`` for the episode-done code.
         task_done_key: Key in ``objective_data`` for the task-done code.
+        grouping_field: Step column that isolates runs (typically
+            ``task_index``). Required. Pass ``None`` only when the batch
+            has no grouping isolation — omitting it is an error, not a
+            silent skip.
         cql_weight: Alpha coefficient for the Conservative Q-Learning penalty.
             ``0.0`` disables CQL.
         cql_scale_q_eps: Additive floor used when scaling the CQL penalty.
@@ -450,7 +454,7 @@ class DqnObjective(Objective):
         q_shift: float = 0.0,
         episode_done_key: str = "episode_done",
         task_done_key: str = "task_done",
-        grouping_field: str | None = None,
+        grouping_field: str | None,
         cql_weight: float = 0.0,
         cql_scale_q_eps: float = 1.0,
         td_lambda: float = 0.0,

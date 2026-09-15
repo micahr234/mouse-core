@@ -182,7 +182,8 @@ def test_shared_astar_not_per_head_argmax() -> None:
         task_gamma_episode_terminal=1.0,
         task_gamma_episode_truncated=1.0,
         task_gamma_task_terminal=0.0,
-        task_gamma_task_truncated=0.0)(step_stream, preds, delayed)
+        task_gamma_task_truncated=0.0,
+        grouping_field=None)(step_stream, preds, delayed)
     # Episode: gathered Q=4, target = 0 + 1 * Q_e[a*]=4 → 0.
     # Task: gathered Q=3, target = 0 + 1 * Q_t[a*]=3 → 0.
     # Own-max episode target would be 5 and loss_e would be 1.
@@ -218,7 +219,8 @@ def test_episode_head_ignores_next_episode_reward() -> None:
         task_gamma_episode_terminal=1.0,
         task_gamma_episode_truncated=1.0,
         task_gamma_task_terminal=0.0,
-        task_gamma_task_truncated=0.0)(step_stream, preds, delayed)
+        task_gamma_task_truncated=0.0,
+        grouping_field=None)(step_stream, preds, delayed)
     # Both pairs have γ=0, so targets are rewards 1 and 5: (2-1)^2, (3-5)^2 → 2.5.
     # Bootstrapping the next-episode start into pair 0 would use Q_e[a*]=9.
     assert abs(metrics["episode"] - 2.5) < 1e-5
@@ -251,7 +253,8 @@ def test_task_head_bootstraps_sum_at_next_episode() -> None:
         episode_gamma_task_truncated=0.0,
         task_gamma_episode_truncated=1.0,
         task_gamma_task_terminal=0.0,
-        task_gamma_task_truncated=0.0)(step_stream, preds, delayed)
+        task_gamma_task_truncated=0.0,
+        grouping_field=None)(step_stream, preds, delayed)
     # Both in-run pairs target 4; online task Q gathered is 0 → MSE 16.
     assert abs(metrics["task"] - 16.0) < 1e-5
 
@@ -281,7 +284,8 @@ def test_task_head_zero_at_task_end() -> None:
         episode_gamma_task_terminal=0.0,
         task_gamma_step=1.0,
         task_gamma_episode_truncated=1.0,
-        task_gamma_task_terminal=0.0)(step_stream, preds, delayed)
+        task_gamma_task_terminal=0.0,
+        grouping_field=None)(step_stream, preds, delayed)
     assert abs(metrics["task"] - 0.0) < 1e-5
 
 
@@ -303,7 +307,7 @@ def test_episode_task_objective_metrics() -> None:
         torch.randn(n, a),
         torch.randn(n, a),
     )
-    loss, metrics = EpisodeTaskDqnObjective(episode_gamma_step=1.0, episode_gamma_episode_terminal=0.0, episode_gamma_episode_truncated=0.0, episode_gamma_task_terminal=0.0, episode_gamma_task_truncated=0.0, task_gamma_step=1.0, task_gamma_episode_terminal=1.0, task_gamma_episode_truncated=1.0, task_gamma_task_terminal=0.0, task_gamma_task_truncated=0.0)(step_stream, preds, delayed)
+    loss, metrics = EpisodeTaskDqnObjective(episode_gamma_step=1.0, episode_gamma_episode_terminal=0.0, episode_gamma_episode_truncated=0.0, episode_gamma_task_terminal=0.0, episode_gamma_task_truncated=0.0, task_gamma_step=1.0, task_gamma_episode_terminal=1.0, task_gamma_episode_truncated=1.0, task_gamma_task_terminal=0.0, task_gamma_task_truncated=0.0, grouping_field=None)(step_stream, preds, delayed)
     assert loss.ndim == 0
     assert metrics["episode"] >= 0.0
     assert metrics["task"] >= 0.0

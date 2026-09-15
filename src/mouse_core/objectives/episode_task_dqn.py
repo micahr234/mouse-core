@@ -117,6 +117,10 @@ class EpisodeTaskDqnObjective(Objective):
             is truncated. ``0`` zeros the bootstrap.
         watkins: Cut the task-head return where the taken action is not
             the online argmax of ``Q_e + Q_t``.
+        grouping_field: Step column that isolates runs (typically
+            ``task_index``). Required. Pass ``None`` only when the batch
+            has no grouping isolation — omitting it is an error, not a
+            silent skip.
     """
 
     def __init__(
@@ -140,7 +144,7 @@ class EpisodeTaskDqnObjective(Objective):
         q_shift: float = 0.0,
         episode_done_key: str = "episode_done",
         task_done_key: str = "task_done",
-        grouping_field: str | None = None,
+        grouping_field: str | None,
         watkins: bool = False,
     ) -> None:
         self.episode_gamma_step = episode_gamma_step

@@ -161,8 +161,9 @@ class LayerwiseDqnObjective(Objective):
             the one-step target; ``1.0`` is the full in-run n-step return.
         watkins: Cut the λ-trace at non-greedy actions (Watkins's Q(λ)).
         grouping_field: Step column that isolates runs (typically
-            ``task_index``). ``None`` skips the grouping check. When set, the
-            column must be present in ``objective_data``.
+            ``task_index``). Required. Pass ``None`` only when the batch
+            has no grouping isolation — omitting it is an error, not a
+            silent skip.
     """
 
     def __init__(
@@ -189,7 +190,7 @@ class LayerwiseDqnObjective(Objective):
         task_done_key: str = "task_done",
         cql_weight: float = 0.0,
         cql_scale_q_eps: float = 1.0,
-        grouping_field: str | None = None,
+        grouping_field: str | None,
         td_lambda: float = 0.0,
         watkins: bool = False,
     ) -> None:

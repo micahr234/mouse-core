@@ -738,13 +738,18 @@ def test_text_model_card_describes_tokenizer(tmp_path) -> None:
         recurrence=None,
     )
     path = tmp_path / "README.md"
-    _write_model_card(repo_id="user/mouse-text", model=model, path=path)
+    _write_model_card(
+        repo_id="user/mouse-text",
+        tokenizer_repo_id="user/mouse-text-tokenizer",
+        model=model,
+        path=path,
+    )
     text = path.read_text()
     assert "TextEmbedder" in text
     assert "Tokenizer" in text
-    assert "from mouse_core.data import Tokenizer" in text
-    assert 'pretrained="Qwen/Qwen3-0.6B"' in text
-    assert '{"input_field": "action"}' in text
+    assert "from mouse_core.data import load_tokenizer" in text
+    assert "load_tokenizer(" in text
+    assert "user/mouse-text-tokenizer" in text
 
 
 def test_load_embed_tokens_quiets_transformers() -> None:
