@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- ``examples/16_train_offline_multi_head_update_dqn.ipynb``: same
+  offline loop as ``02``, but each composite update trains the Q-head
+  ``HEAD_UPDATES`` times (``m=4`` here) for one encoder/backbone
+  step. Last-layer features are computed once; the first ``m-1`` head
+  steps detach them and Polyak only the delayed head; the last step
+  backprops through encoder and backbone and Polyak all three
+  sections. ``HEAD_UPDATES=1`` is the same as ``02``.
 - Tokenizer packing spec is a separate object and a separate Hub repo.
   ``save_tokenizer`` / ``load_tokenizer`` persist ``tokenizer.json``
   (fields, ``group_prefix``, ``head_output``, ``objective_fields``,

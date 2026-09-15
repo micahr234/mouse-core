@@ -84,6 +84,7 @@ The [example notebooks](examples/) are short usage docs, not full experiments. W
 | [13 — Offline episode/task DQN](examples/13_train_offline_episode_task_dqn.ipynb) | Same offline loop as `02`, with `episode` + `task` heads and `EpisodeTaskDqnObjective`: both heads share one delayed `a* = argmax(Q_e + Q_t)`; `action_head=("episode", "task")` makes `get_action` sum them |
 | [14 — Offline n-step DQN](examples/14_train_offline_n_step_dqn.ipynb) | Same offline loop as `02`, with `NStepDqnObjective`: the TD target is the n-step return (`n=3` here), bootstrapping delayed max-Q after `n` rewards; incomplete windows are masked |
 | [15 — Offline max-over-n-step DQN](examples/15_train_offline_max_n_step_dqn.ipynb) | Same complete n-step returns as `14`, then `MaxNStepDqnObjective` extras: `selector` + `max_return` heads, max over `horizons=(1, 3, 5, 10)`, bootstrap at the selector's action; `action_head="selector"` is the deployed policy |
+| [16 — Offline multi-head-update DQN](examples/16_train_offline_multi_head_update_dqn.ipynb) | Same offline loop as `02`, but each composite update trains the Q-head `HEAD_UPDATES` times (`m=4` here): first `m-1` steps detach last-layer features and Polyak only the delayed head; the last step backprops through encoder and backbone and Polyak all three sections |
 
 ### Example dependencies
 
