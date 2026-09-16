@@ -50,10 +50,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ``RetraceObjective``: Retrace(λ) off-policy return-based Q-learning
   (Munos et al., 2016). The TD target is the delayed expected one-step
   backup plus a trace of later TD errors scaled by truncated importance
-  ratios ``c = td_lambda * min(1, π/μ)``; ``π = softmax(Q / temperature)``
-  over the delayed head's raw Q (``temperature``, required, ``>= 0``,
-  same convention as ``get_action``), every target quantity reads the
-  delayed network, and the λ-return is a parallel scan.
+  ratios ``c = td_lambda * min(1, π/μ)``;
+  ``π = softmax(Q / temperature)`` over the delayed head's raw Q,
+  treated as logits (``temperature``, required, ``>= 0``, same
+  convention as ``get_action``). Every target quantity reads the delayed
+  network, and the λ-return is a parallel scan.
   ``μ`` is not stored with the data: the model carries a second
   ``DiscreteActionHead`` under ``predictions[behavior_key]``
   (``"behavior"``) whose outputs are logits; the objective fits it by NLL

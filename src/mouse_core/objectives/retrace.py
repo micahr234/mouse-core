@@ -47,9 +47,10 @@ def _require_head(predictions: TensorDict, *, key: str, shape: torch.Size, who: 
 def _softmax_policy(q: torch.Tensor, *, temperature: float) -> torch.Tensor:
     """Target policy over the last dim of ``q``, shape ``q.shape``.
 
-    ``softmax(q / temperature)`` — the same convention as
-    :meth:`~mouse_core.models.base.Model.get_action`. ``temperature = 0``
-    is the greedy policy with the argmax set sharing the mass evenly.
+    ``q`` is logits: ``softmax(q / temperature)``. Same convention as
+    :meth:`~mouse_core.models.base.Model.get_action`.
+    ``temperature = 0`` is the greedy policy with the argmax set sharing
+    the mass evenly.
     """
     if float(temperature) == 0.0:
         is_max = q == q.amax(dim=-1, keepdim=True)
@@ -129,8 +130,9 @@ class RetraceObjective(Objective):
     target of every transition is the delayed one-step expected backup plus
     a trace of later TD errors, each scaled by the product of truncated
     importance ratios ``c_s = λ min(1, π(a_s|s_s) / μ(a_s|s_s))``. ``π`` is
-    the target policy — ``softmax(Q / temperature)`` over the delayed Q,
-    the same convention as :meth:`~mouse_core.models.base.Model.get_action`
+    the target policy — ``softmax(Q / temperature)`` over the delayed
+    Q (Q as logits), the same convention as
+    :meth:`~mouse_core.models.base.Model.get_action`
     — and ``μ`` is the behavior policy that produced the data. Because the
     ratio is clipped at ``1``, near-on-policy transitions keep the full
     λ-return while strongly off-policy actions cut the trace, without
@@ -190,9 +192,10 @@ class RetraceObjective(Objective):
     paper's Atari runs use ``λ = 1`` with the exploration policy as ``π``;
     the clipped ratio does the trace cutting that ``Q*(λ)`` needs ``λ < 1``
     for. The λ-return is computed with a parallel scan on the device.
-    ``π`` is taken over the delayed head's raw Q (before ``q_scale`` /
-    ``q_shift``), so ``temperature`` is in the units the head outputs and
-    means the same thing here as in ``get_action(temperature=)``.
+    ``π`` is ``softmax(Q / temperature)`` over the delayed head's raw
+    Q (before ``q_scale`` / ``q_shift``), so ``temperature`` is in the
+    units the head outputs and means the same thing here as in
+    ``get_action(temperature=)``.
 
     Model construction pairs the two heads under caller-chosen keys, with
     ``get_action`` reading the Q head::
@@ -216,9 +219,10 @@ class RetraceObjective(Objective):
             one-step target; ``1.0`` cuts traces only through
             ``min(1, π/μ)``.
         temperature: Softmax temperature of the target policy
-            ``π = softmax(Q / temperature)``, ``>= 0``. ``0.0`` is greedy
-            (Watkins's cut; argmax ties share the mass); larger values
-            flatten ``π`` toward uniform and cut fewer traces.
+            ``π = softmax(Q / temperature)``, ``>= 0``. Q is logits.
+            ``0.0`` is greedy (Watkins's cut; argmax ties share the
+            mass); larger values flatten ``π`` toward uniform and cut
+            fewer traces.
         behavior_weight: Coefficient of the behavior head's NLL
             (``-log μ(a_t | s_t)``) in the returned loss. Must be ``>= 0``.
             ``0.0`` excludes the NLL from the returned loss; the head is
