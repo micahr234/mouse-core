@@ -12,6 +12,7 @@ from mouse_core.models.backbone import IdentityBackbone, LlamaBackbone
 from mouse_core.models.embedding import NumericEmbedder, NumericEmbedderModalitySpec
 from mouse_core.models.heads import (
     BaseHead,
+    DiscreteActionHead,
     DiscreteActionValueHead,
     LayerwiseDiscreteActionValueHead,
 )
@@ -99,7 +100,7 @@ def _count_calls(module: nn.Module, name: str = "forward"):
 
 def test_delayed_copy_is_a_frozen_full_copy() -> None:
     model = _llama_model()
-    delayed = model.delayed_copy()
+    delayed = model.delayed_copy(heads=("action_value",))
     assert delayed.encoder is not model.encoder
     assert delayed.backbone is not model.backbone
     assert delayed.reasoner is None and delayed.recurrence is None
@@ -119,7 +120,7 @@ def test_delayed_copy_shares_frozen_parameters_by_reference() -> None:
     for p in model.backbone.parameters():
         p.requires_grad_(False)
     model.encoder.requires_grad_(False)
-    delayed = model.delayed_copy()
+    delayed = model.delayed_copy(heads=("action_value",))
     online = dict(model.named_parameters())
     for name, p in delayed.named_parameters():
         if name.startswith("heads."):
@@ -130,12 +131,75 @@ def test_delayed_copy_shares_frozen_parameters_by_reference() -> None:
 
 def test_delayed_copy_rejects_a_model_with_nothing_trainable() -> None:
     model = _tiny_model()
-    delayed = model.delayed_copy()
+    delayed = model.delayed_copy(heads=("action_value",))
     with pytest.raises(ValueError, match="trainable online model"):
-        delayed.delayed_copy()
+        delayed.delayed_copy(heads=("action_value",))
     model.requires_grad_(False)
     with pytest.raises(ValueError, match="trainable online model"):
-        model.delayed_copy()
+        model.delayed_copy(heads=("action_value",))
+
+
+def _two_head_model(hidden_dim: int = 8) -> Model:
+    return Model(
+        encoder=NumericEmbedder(hidden_dim=hidden_dim, modalities=_MODALITIES),
+        backbone=IdentityBackbone(hidden_dim=hidden_dim),
+        heads={
+            "action_value": _head(hidden_dim),
+            "behavior": DiscreteActionHead(
+                in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, use_norm=True
+            ),
+        },
+        action_head="action_value",
+        reasoner=None,
+        recurrence=None,
+    )
+
+
+def test_delayed_copy_carries_only_the_named_heads() -> None:
+    model = _two_head_model()
+    delayed = model.delayed_copy(heads=("action_value",))
+    assert tuple(delayed.heads) == ("action_value",)
+    assert delayed.action_head == "action_value"
+    assert not any(name.startswith("heads.behavior") for name, _ in delayed.named_parameters())
+    # Leaving out the action head is allowed; the copy's action_head is the first name listed.
+    behavior_only = model.delayed_copy(heads=("behavior",))
+    assert tuple(behavior_only.heads) == ("behavior",)
+    assert behavior_only.action_head == "behavior"
+
+
+def test_delayed_copy_validates_heads() -> None:
+    model = _two_head_model()
+    with pytest.raises(TypeError, match="delayed_copy heads"):
+        model.delayed_copy(heads="action_value")  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        model.delayed_copy()  # type: ignore[call-arg]
+    with pytest.raises(ValueError, match="at least one head"):
+        model.delayed_copy(heads=())
+    with pytest.raises(ValueError, match="duplicate"):
+        model.delayed_copy(heads=("action_value", "action_value"))
+    with pytest.raises(ValueError, match=r"\['value'\] are not enabled"):
+        model.delayed_copy(heads=("action_value", "value"))
+
+
+def test_polyak_skips_online_heads_the_delayed_model_does_not_carry() -> None:
+    model = _two_head_model()
+    delayed = model.delayed_copy(heads=("action_value",))
+    polyak = Polyak(model, delayed)
+    _perturb(model.heads)
+    polyak.update(tau_heads=1.0, tau_encoder=0.0, tau_backbone=0.0)
+    online = dict(model.named_parameters())
+    for name, p in delayed.named_parameters():
+        if name.startswith("heads."):
+            assert torch.equal(p, online[name])
+    # The online behavior head trained on; nothing delayed mirrors it.
+    assert not any(name.startswith("heads.behavior") for name, _ in delayed.named_parameters())
+
+
+def test_polyak_rejects_delayed_heads_missing_online() -> None:
+    model = _two_head_model()
+    other = _tiny_model()
+    with pytest.raises(ValueError, match=r"delayed heads \['behavior'\] do not exist"):
+        Polyak(other, model.delayed_copy(heads=("action_value", "behavior")))
 
 
 def test_delayed_copy_carries_reasoner_and_recurrence() -> None:
@@ -148,7 +212,7 @@ def test_delayed_copy_carries_reasoner_and_recurrence() -> None:
         reasoner=None,
         recurrence=Recurrence(hidden_dim=hidden_dim, num_passes=2),
     )
-    d = recurrent.delayed_copy()
+    d = recurrent.delayed_copy(heads=("action_value",))
     assert d.recurrence is not None and d.recurrence is not recurrent.recurrence
     assert all(not p.requires_grad for p in d.recurrence.parameters())
 
@@ -160,7 +224,7 @@ def test_delayed_copy_carries_reasoner_and_recurrence() -> None:
         reasoner=LatentReasoner(hidden_dim=hidden_dim, num_thoughts=1),
         recurrence=None,
     )
-    dr = reasoning.delayed_copy()
+    dr = reasoning.delayed_copy(heads=("action_value",))
     assert dr.reasoner is not None and dr.reasoner is not reasoning.reasoner
 
 
@@ -170,7 +234,7 @@ def test_delayed_copy_carries_reasoner_and_recurrence() -> None:
 def test_delayed_model_matches_online_before_update_and_builds_no_graph() -> None:
     torch.manual_seed(0)
     model = _llama_model().eval()
-    delayed = model.delayed_copy().eval()
+    delayed = model.delayed_copy(heads=("action_value",)).eval()
     batch = _token_batch(model)
     out = model(batch)
     saved = {"n": 0}
@@ -190,7 +254,7 @@ def test_delayed_model_matches_online_before_update_and_builds_no_graph() -> Non
 def test_delayed_model_reruns_its_own_trunk() -> None:
     torch.manual_seed(0)
     model = _tiny_model().eval()
-    delayed = model.delayed_copy().eval()
+    delayed = model.delayed_copy(heads=("action_value",)).eval()
     batch = _token_batch(model)
     enc_calls = _count_calls(delayed.encoder)
     bb_calls = _count_calls(delayed.backbone)
@@ -202,7 +266,7 @@ def test_delayed_model_reruns_its_own_trunk() -> None:
 def test_delayed_model_ignores_online_changes_until_update() -> None:
     torch.manual_seed(0)
     model = _tiny_model().eval()
-    delayed = model.delayed_copy().eval()
+    delayed = model.delayed_copy(heads=("action_value",)).eval()
     polyak = Polyak(model, delayed)
     batch = _token_batch(model)
     with torch.no_grad():
@@ -223,7 +287,7 @@ def test_delayed_model_ignores_online_changes_until_update() -> None:
 def test_layerwise_delayed_model_matches_online_before_update() -> None:
     torch.manual_seed(0)
     model = _llama_model(layerwise=True).eval()
-    delayed = model.delayed_copy().eval()
+    delayed = model.delayed_copy(heads=("action_value_layerwise",)).eval()
     batch = _token_batch(model)
     with torch.no_grad():
         out = model(batch)
@@ -237,7 +301,7 @@ def test_layerwise_delayed_model_matches_online_before_update() -> None:
 
 def test_all_zero_tau_does_not_write_delayed_params() -> None:
     model = _tiny_model()
-    delayed = model.delayed_copy()
+    delayed = model.delayed_copy(heads=("action_value",))
     polyak = Polyak(model, delayed)
     versions = [param._version for param in delayed.parameters()]
     polyak.update(tau_heads=0.0, tau_encoder=0.0, tau_backbone=0.0)
@@ -246,7 +310,7 @@ def test_all_zero_tau_does_not_write_delayed_params() -> None:
 
 def test_polyak_requires_a_tau_per_section() -> None:
     model = _tiny_model()
-    polyak = Polyak(model, model.delayed_copy())
+    polyak = Polyak(model, model.delayed_copy(heads=("action_value",)))
     with pytest.raises(TypeError):
         polyak.update(tau_heads=0.1)  # type: ignore[call-arg]
     with pytest.raises(TypeError):
@@ -257,7 +321,7 @@ def test_polyak_requires_a_tau_per_section() -> None:
 def test_polyak_tau_is_convex_combination_and_can_change() -> None:
     torch.manual_seed(0)
     model = _tiny_model()
-    delayed = model.delayed_copy()
+    delayed = model.delayed_copy(heads=("action_value",))
     polyak = Polyak(model, delayed)
     online = next(model.heads.parameters())
     delayed_p = next(delayed.heads.parameters())
@@ -272,7 +336,7 @@ def test_polyak_tau_is_convex_combination_and_can_change() -> None:
 def test_each_tau_interpolates_only_its_section() -> None:
     torch.manual_seed(0)
     model = _llama_model()
-    delayed = model.delayed_copy()
+    delayed = model.delayed_copy(heads=("action_value",))
     polyak = Polyak(model, delayed)
     snapshot = {n: p.detach().clone() for n, p in delayed.named_parameters()}
     _perturb(model)
@@ -298,7 +362,7 @@ def test_tau_backbone_also_moves_recurrence_and_reasoner() -> None:
         reasoner=None,
         recurrence=Recurrence(hidden_dim=hidden_dim, num_passes=2),
     )
-    d = recurrent.delayed_copy()
+    d = recurrent.delayed_copy(heads=("action_value",))
     assert recurrent.recurrence is not None and d.recurrence is not None
     _perturb(recurrent.recurrence)
     Polyak(recurrent, d).update(tau_heads=0.0, tau_encoder=0.0, tau_backbone=1.0)
@@ -313,7 +377,7 @@ def test_tau_backbone_also_moves_recurrence_and_reasoner() -> None:
         reasoner=LatentReasoner(hidden_dim=hidden_dim, num_thoughts=1),
         recurrence=None,
     )
-    dr = reasoning.delayed_copy()
+    dr = reasoning.delayed_copy(heads=("action_value",))
     assert reasoning.reasoner is not None and dr.reasoner is not None
     _perturb(reasoning.reasoner)
     Polyak(reasoning, dr).update(tau_heads=0.0, tau_encoder=0.0, tau_backbone=1.0)
@@ -323,7 +387,7 @@ def test_tau_backbone_also_moves_recurrence_and_reasoner() -> None:
 
 def test_polyak_rejects_tau_out_of_range() -> None:
     model = _tiny_model()
-    polyak = Polyak(model, model.delayed_copy())
+    polyak = Polyak(model, model.delayed_copy(heads=("action_value",)))
     with pytest.raises(ValueError, match=r"tau_heads must be in \[0, 1\]"):
         polyak.update(tau_heads=1.5, tau_encoder=0.1, tau_backbone=0.1)
     with pytest.raises(ValueError, match=r"tau_encoder must be in \[0, 1\]"):
@@ -376,13 +440,13 @@ def test_polyak_skips_shared_frozen_params_and_rejects_shared_trainable() -> Non
 
 def test_polyak_rejects_wrong_models() -> None:
     model = _tiny_model()
-    delayed = model.delayed_copy()
+    delayed = model.delayed_copy(heads=("action_value",))
     with pytest.raises(TypeError):
         Polyak(model, nn.Linear(2, 2))  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="delayed_copy"):
         Polyak(model, model)
     with pytest.raises(ValueError, match="trainable model"):
-        Polyak(delayed, model.delayed_copy())
+        Polyak(delayed, model.delayed_copy(heads=("action_value",)))
     other = _tiny_model()
     with pytest.raises(ValueError, match="delayed_copy"):
         Polyak(model, other)  # trainable sections that are not copies
@@ -439,7 +503,7 @@ def _assert_no_autograd_graph(fn: Callable[[], Any]) -> Any:
 def test_delayed_forward_under_no_grad_builds_no_graph_in_train_mode() -> None:
     torch.manual_seed(0)
     model = _tiny_model().train()
-    delayed = model.delayed_copy()
+    delayed = model.delayed_copy(heads=("action_value",))
     batch = _token_batch(model)
 
     def run():

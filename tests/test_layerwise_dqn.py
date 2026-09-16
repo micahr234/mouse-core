@@ -36,7 +36,7 @@ def test_model_layerwise_forward_and_objective() -> None:
         ),
         batch,
     )
-    delayed = model.delayed_copy()
+    delayed = model.delayed_copy(heads=("action_value_layerwise",))
     out = model(token_batch)
     predictions = out.predictions
     with torch.no_grad():

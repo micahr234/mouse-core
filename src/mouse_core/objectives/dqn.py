@@ -320,7 +320,8 @@ class DqnObjective(Objective):
     ``(objective_data, predictions, delayed_predictions)``. Online Q is
     ``predictions["action_value"]``; bootstrap Q is
     ``delayed_predictions["action_value"]`` from the delayed
-    :class:`~mouse_core.models.base.Model` (``model.delayed_copy()``) run on
+    :class:`~mouse_core.models.base.Model`
+    (``model.delayed_copy(heads=("action_value",))``) run on
     the same ``TokenBatch``. The delayed tensor is detached before
     the Bellman target, so the TD error does not backprop through it.
 

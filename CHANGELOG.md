@@ -8,11 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- ``Model.delayed_copy(heads=...)``: ``heads`` is required and names the
+  heads the delayed model carries — only those the objective reads from
+  ``delayed_predictions`` (``("action_value",)`` for ``DqnObjective`` /
+  ``RetraceObjective``, ``("action_value_layerwise",)`` for
+  ``LayerwiseDqnObjective``). Heads left out are neither copied, run, nor
+  Polyak-interpolated; the copy's ``action_head`` is the online one when
+  listed, else the first name. ``Polyak`` pairs each delayed head with
+  the online head of the same name and rejects a delayed head that does
+  not exist online. Every DQN notebook passes ``heads=``.
 - ``LlamaBackbone``, ``Qwen3Backbone``, ``SwiGLUHead``, and the action
   heads require ``use_norm``.
 - ``Polyak.update`` skips a section whose ``tau`` is ``0`` (no delayed-
   parameter writes). All-zero ``tau`` returns immediately.
-- Example notebooks: training is ``01``–``14``; inference is
+- Example notebooks: training is ``01``–``12``; inference is
   ``15_inference.ipynb`` (was ``09``).
 
 ### Removed
@@ -26,25 +35,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   disable only after a repeated hard failure.
 
 ### Added
+- ``RetraceObjective``: Retrace(λ) off-policy return-based Q-learning
+  (Munos et al., 2016). The TD target is the delayed expected one-step
+  backup plus a trace of later TD errors scaled by truncated importance
+  ratios ``c = td_lambda * min(1, π/μ)``; ``π`` is ε-greedy
+  (``epsilon``, required) on the delayed Q, every target quantity reads
+  the delayed network, and the λ-return is a parallel scan.
+  ``μ`` is not stored with the data: the model carries a second
+  ``DiscreteActionHead`` under ``predictions[behavior_key]``
+  (``"behavior"``), the objective trains it by behavior cloning on the
+  taken actions (``behavior_weight``, required, ``> 0``) and reads its
+  detached softmax as ``μ``. Loss is ``td_loss + behavior_weight *
+  behavior_loss``; metrics add ``td_loss``, ``behavior_loss``,
+  ``behavior_prob_mean``, and ``retrace_ratio_mean``. ``epsilon=0`` is
+  Watkins's Q(λ) with the greedy check on the delayed network.
+  ``examples/12_train_offline_retrace.ipynb`` is the same offline loop
+  as ``02`` with ``heads={"action_value": ..., "behavior": ...}``,
+  ``td_lambda=1.0``, ``epsilon=0.1``, and
+  ``delayed_copy(heads=("action_value",))`` so the behavior head is
+  never run or Polyak-interpolated on the delayed side.
 - ``use_norm`` (required, saved with the model) on transformer
   backbones and on ``SwiGLUHead`` / action heads. On
   ``LlamaBackbone`` / ``Qwen3Backbone``, ``True`` keeps the final
   RMSNorm and ``False`` replaces it with ``Identity`` (per-layer
   norms stay). On a head, ``True`` prepends an input RMSNorm and
   ``False`` skips it.
-- ``Model.features``: encoder + backbone only (pooled last-layer
-  states at head-output tokens). Does not run heads. Training path
-  only (no cache, no ``reasoning=``). Pair with ``Model.head`` when
-  the same features are scored more than once.
-- ``examples/14_train_offline_multi_head_update_dqn.ipynb``: same
-  offline loop as ``02``, but each composite update trains the Q-head
-  ``HEAD_UPDATES`` times (``m=4`` here) for one encoder/backbone
-  step. ``model.features`` computes last-layer features once (no unused
-  head pass); the first ``m-1`` head steps detach them and Polyak only
-  the delayed head; the last step backprops through encoder and
-  backbone and Polyak all three sections. ``tau=0`` skips that
-  section's interpolation and a delayed-head refresh. ``HEAD_UPDATES=1``
-  is the same as ``02``.
 - Tokenizer packing spec is a separate object and a separate Hub repo.
   ``save_tokenizer`` / ``load_tokenizer`` persist ``tokenizer.json``
   (fields, ``group_prefix``, ``head_output``, ``objective_fields``,
@@ -78,13 +93,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (O(L^2) memory, any device/dtype) as an explicit choice — previously
   only reachable as the silent ``"varlen"`` fallback. The ground-truth
   implementation the fused kernels are tested against.
-- ``NStepDqnObjective``: DQN TD target is the n-step return
-  (``n`` required, ``>= 1``). ``n=1`` is one-step TD; larger ``n``
-  uses that many observed rewards then bootstraps delayed max-Q.
-  Incomplete windows (fewer than ``n`` in-run steps ahead, and no
-  ``γ == 0`` stop) are masked, not shortened. No ``td_lambda`` and
-  no Watkins cut. ``examples/13_train_offline_n_step_dqn.ipynb``
-  uses ``n=3`` in the same offline loop as ``02``.
 - ``Tokenizer`` text fields with no ``input_field=`` are consts
   (no step I/O). ``output_field=`` names the field; ``format=`` is the
   literal string to tokenize (no placeholders; ``{{`` / ``}}`` for a
@@ -161,15 +169,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rebuilt by ``load_model``; the model card lists it. Training notebooks
   fine-tune the whole backbone in fp32
   (``dtype=torch.float32``, no ``lora=``).
-- Dual action-value heads ``episode`` and ``task`` (both
-  ``DiscreteActionValueHead``). ``EpisodeTaskDqnObjective`` reads
-  those keys and trains both heads from one delayed
-  ``a* = argmax_a (Q_e + Q_t)``: the episode head is stepwise TD on
-  env reward and does not bootstrap across episodes; the task head
-  drops current-episode reward and λ-skips to
-  ``Q_e(s', a*) + Q_t(s', a*)`` at the next episode start.
-  ``examples/12_train_offline_episode_task_dqn.ipynb`` uses
-  ``action_head=("episode", "task")`` so ``get_action`` sums them.
 - ``Tokenizer(group_prefix=)`` is a format string over the raw step
   dict (placeholders need not be ``input_fields``). Those tokens are
   ``__text__`` and ``pack_token_batch`` inserts them at the start of each
@@ -377,21 +376,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   declared compute dtype.
 - DQN discounts have no defaults. ``DqnObjective`` and
   ``LayerwiseDqnObjective`` require all five ``gamma_*`` values
-  (layerwise also requires every ``gamma_*_start``).
-  ``EpisodeTaskDqnObjective`` requires all ten ``episode_gamma_*`` /
-  ``task_gamma_*`` values. PPO discounts are unchanged.
+  (layerwise also requires every ``gamma_*_start``). PPO discounts
+  are unchanged.
 - Example notebooks train and infer in fp32: training builds
   ``Qwen3Backbone`` with ``dtype=torch.float32`` and no LoRA;
   ``15_inference.ipynb`` loads with ``dtype=torch.float32``.
-- ``EpisodeTaskDqnObjective`` discounts are per-head: ``episode_gamma_*``
-  for the episode head and ``task_gamma_*`` for the task head (each has
-  the five ``DqnObjective`` roles). Shared ``gamma_step`` /
-  ``gamma_episode_*`` / ``gamma_task_*`` names are gone.
 - ``Model`` does not whitelist or special-case head names. Dict keys
-  are caller-chosen; ``action_head`` is one name or a sequence of
-  names whose scores ``get_action`` sums.
-  ``examples/12_train_offline_episode_task_dqn.ipynb`` uses
-  ``episode`` / ``task`` with ``action_head=("episode", "task")``.
+  are caller-chosen; ``action_head`` names the head ``get_action``
+  reads.
 - DQN example notebooks set ``POLYAK_TAU_HEADS = 0.0001``,
   ``POLYAK_TAU_ENCODER = 0.01``, and ``POLYAK_TAU_BACKBONE = 0.01``.
 - Step-backed ``Tokenizer`` text ``format=`` interpolates ``{field}``

@@ -228,7 +228,7 @@ def test_delayed_model_parity_with_reasoning() -> None:
     delayed reasoning forward on the same bursts matches the online one."""
     torch.manual_seed(0)
     model = _tiny_model().eval()
-    delayed = model.delayed_copy().eval()
+    delayed = model.delayed_copy(heads=("action_value",)).eval()
     assert delayed.reasoner is not None and delayed.reasoner is not model.reasoner
     batch = _token_batch(model, _BATCH)
     out = model(batch, reasoning=[1, 0])
@@ -244,7 +244,7 @@ def test_delayed_model_parity_with_reasoning() -> None:
 def test_delayed_reasoning_builds_no_autograd_graph() -> None:
     torch.manual_seed(0)
     model = _tiny_model().train()
-    delayed = model.delayed_copy()
+    delayed = model.delayed_copy(heads=("action_value",))
     batch = _token_batch(model, _BATCH)
     saved = {"n": 0}
 

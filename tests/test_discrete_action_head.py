@@ -31,7 +31,7 @@ def test_discrete_action_head_rejects_action_value_name() -> None:
             {"type": "discrete", "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1},
         ],
     )
-    with pytest.raises(ValueError, match="action_head names"):
+    with pytest.raises(ValueError, match="is not enabled"):
         Model(
             encoder=encoder,
             backbone=IdentityBackbone(hidden_dim=hidden_dim),

@@ -1,0 +1,318 @@
+"""Tests for the Retrace(λ) objective on synthetic tensors."""
+from __future__ import annotations
+
+import math
+
+import pytest
+import torch
+from tensordict import TensorDict
+
+from mouse_core.objectives import DqnObjective, RetraceObjective
+from mouse_core.objectives.retrace import _epsilon_greedy
+
+
+_GAMMAS = dict(
+    gamma_step=1.0,
+    gamma_episode_terminal=0.0,
+    gamma_episode_truncated=0.0,
+    gamma_task_terminal=0.0,
+    gamma_task_truncated=0.0,
+)
+
+
+def _preds(
+    online: torch.Tensor, delayed: torch.Tensor, behavior: torch.Tensor
+) -> tuple[TensorDict, TensorDict]:
+    n = online.shape[0]
+    return (
+        TensorDict({"action_value": online, "behavior": behavior}, batch_size=[n]),
+        TensorDict({"action_value": delayed}, batch_size=[n]),
+    )
+
+
+def _retrace(**overrides: object) -> RetraceObjective:
+    kwargs: dict[str, object] = dict(
+        td_lambda=1.0, epsilon=0.5, behavior_weight=1.0, grouping_field=None, **_GAMMAS
+    )
+    kwargs.update(overrides)
+    return RetraceObjective(**kwargs)  # type: ignore[arg-type]
+
+
+def _fixture(mu_1: float) -> tuple[TensorDict, TensorDict, TensorDict]:
+    """Three in-run steps; ``mu_1`` is the behavior head's ``μ(a_1 = 1 | s_1)``.
+
+    Action from s0 is 0; from s1 is 1. Delayed Q is ``[0, 0]`` at s0,
+    ``[3, 0]`` at s1 and ``[0, 100]`` at s2. Rewards out of s0 / s1 are 1
+    and 10. Online ``Q(s0, 0) = 5`` and ``Q(s1, 1) = 0``. Behavior logits
+    are uniform at s0 (``μ(a_0 | s_0) = 0.5``) and ``log [1 - mu_1, mu_1]``
+    at s1.
+
+    With ``epsilon=0.5`` over two actions ``π(s1) = [0.75, 0.25]`` and
+    ``π(s2) = [0.25, 0.75]``, so ``E_π Q(s1) = 2.25`` and
+    ``E_π Q(s2) = 75``. The last pair has no continuation:
+    ``G_1 = 10 + 75 = 85``. At s0 the trace through ``a_1`` is
+    ``c = λ min(1, 0.25 / mu_1)`` and
+    ``G_0 = 1 + 2.25 + c * (85 - Q(s1, 1) = 0)``.
+    """
+    step_stream = TensorDict(
+        {
+            "action": torch.tensor([0, 0, 1]),
+            "reward": torch.tensor([0.0, 1.0, 10.0]),
+            "episode_done": torch.zeros(3, dtype=torch.int64),
+            "task_done": torch.zeros(3, dtype=torch.int64),
+            "sequence_id": torch.zeros(3, dtype=torch.int64),
+        },
+        batch_size=[3],
+    )
+    online = torch.tensor([[5.0, 0.0], [0.0, 0.0], [0.0, 0.0]])
+    delayed = torch.tensor([[0.0, 0.0], [3.0, 0.0], [0.0, 100.0]])
+    behavior = torch.tensor([[0.0, 0.0], [math.log(1.0 - mu_1), math.log(mu_1)], [0.0, 0.0]])
+    return step_stream, *_preds(online, delayed, behavior)
+
+
+# G_1 = 85 → (0 - 85)^2 = 7225 for the s1 row in every ε=0.5 case.
+_S1_SQ = 7225.0
+
+
+def _bc_loss(mu_1: float) -> float:
+    """Behavior-cloning CE over the two in-run rows: -log 0.5 at s0, -log mu_1 at s1."""
+    return (math.log(2.0) - math.log(mu_1)) / 2
+
+
+def test_retrace_requires_lambda_epsilon_weight_and_grouping_field() -> None:
+    with pytest.raises(TypeError, match="td_lambda"):
+        RetraceObjective(epsilon=0.1, behavior_weight=1.0, grouping_field=None, **_GAMMAS)  # type: ignore[call-arg]
+    with pytest.raises(TypeError, match="epsilon"):
+        RetraceObjective(td_lambda=1.0, behavior_weight=1.0, grouping_field=None, **_GAMMAS)  # type: ignore[call-arg]
+    with pytest.raises(TypeError, match="behavior_weight"):
+        RetraceObjective(td_lambda=1.0, epsilon=0.1, grouping_field=None, **_GAMMAS)  # type: ignore[call-arg]
+    with pytest.raises(TypeError, match="grouping_field"):
+        RetraceObjective(td_lambda=1.0, epsilon=0.1, behavior_weight=1.0, **_GAMMAS)  # type: ignore[call-arg]
+
+
+def test_retrace_rejects_out_of_range_hyperparameters() -> None:
+    with pytest.raises(ValueError, match=r"td_lambda must be in \[0, 1\]"):
+        _retrace(td_lambda=1.5)
+    with pytest.raises(ValueError, match=r"epsilon must be in \[0, 1\]"):
+        _retrace(epsilon=-0.1)
+    with pytest.raises(ValueError, match="behavior_weight must be > 0"):
+        _retrace(behavior_weight=0.0)
+
+
+def test_retrace_objective_runs() -> None:
+    n, a = 8, 3
+    step_stream = TensorDict(
+        {
+            "action": torch.randint(0, a, (n,)),
+            "reward": torch.randn(n),
+            "episode_done": torch.zeros(n, dtype=torch.long),
+            "task_done": torch.zeros(n, dtype=torch.long),
+            "sequence_id": torch.tensor([0, 0, 0, 0, 1, 1, 1, 1]),
+        },
+        batch_size=[n],
+    )
+    predictions, delayed = _preds(torch.randn(n, a), torch.randn(n, a), torch.randn(n, a))
+    loss, metrics = _retrace(epsilon=0.1)(step_stream, predictions, delayed)
+    assert loss.ndim == 0
+    assert metrics["td_loss"] >= 0.0
+    assert metrics["behavior_loss"] >= 0.0
+    assert abs(metrics["retrace"] - (metrics["td_loss"] + metrics["behavior_loss"])) < 1e-5
+    assert 0.0 <= metrics["retrace_ratio_mean"] <= 1.0
+    assert 0.0 <= metrics["behavior_prob_mean"] <= 1.0
+    assert "cql_penalty" not in metrics
+
+
+def test_epsilon_greedy_splits_ties_and_mixes_uniform() -> None:
+    q = torch.tensor([[1.0, 3.0, 3.0, 0.0]])
+    pi = _epsilon_greedy(q, epsilon=0.2)
+    assert torch.allclose(pi, torch.tensor([[0.05, 0.45, 0.45, 0.05]]))
+    assert torch.allclose(
+        _epsilon_greedy(q, epsilon=0.0), torch.tensor([[0.0, 0.5, 0.5, 0.0]])
+    )
+    assert torch.allclose(_epsilon_greedy(q, epsilon=1.0), torch.full((1, 4), 0.25))
+
+
+def test_retrace_lambda_zero_is_the_expected_one_step_target() -> None:
+    step_stream, predictions, delayed = _fixture(mu_1=0.25)
+    # G_0 = 1 + 2.25 = 3.25 → (5 - 3.25)^2 = 3.0625.
+    _, metrics = _retrace(td_lambda=0.0)(step_stream, predictions, delayed)
+    assert abs(metrics["td_loss"] - (3.0625 + _S1_SQ) / 2) < 1e-3
+
+
+def test_retrace_on_policy_action_keeps_the_full_trace() -> None:
+    """π(a_1|s_1) = 0.25 ≥ μ = 0.25 → ratio 1: G_0 = 3.25 + 85 = 88.25."""
+    step_stream, predictions, delayed = _fixture(mu_1=0.25)
+    _, metrics = _retrace()(step_stream, predictions, delayed)
+    assert abs(metrics["td_loss"] - ((5.0 - 88.25) ** 2 + _S1_SQ) / 2) < 1e-3
+    # Pair 0: π(s0) is a tie → 0.5 / μ 0.5 = 1. Pair 1: 0.25 / 0.25 = 1.
+    assert abs(metrics["retrace_ratio_mean"] - 1.0) < 1e-6
+    assert abs(metrics["behavior_prob_mean"] - (0.5 + 0.25) / 2) < 1e-6
+
+
+def test_retrace_off_policy_action_truncates_the_trace() -> None:
+    """π(a_1|s_1) = 0.25 < μ = 0.5 → ratio 0.5: G_0 = 3.25 + 0.5 * 85 = 45.75."""
+    step_stream, predictions, delayed = _fixture(mu_1=0.5)
+    _, metrics = _retrace()(step_stream, predictions, delayed)
+    assert abs(metrics["td_loss"] - ((5.0 - 45.75) ** 2 + _S1_SQ) / 2) < 1e-3
+    assert abs(metrics["retrace_ratio_mean"] - 0.75) < 1e-6
+
+
+def test_retrace_lambda_scales_the_ratio() -> None:
+    """λ = 0.5 with ratio 1 is the same trace as λ = 1 with ratio 0.5."""
+    step_stream, predictions, delayed = _fixture(mu_1=0.25)
+    _, metrics = _retrace(td_lambda=0.5)(step_stream, predictions, delayed)
+    assert abs(metrics["td_loss"] - ((5.0 - 45.75) ** 2 + _S1_SQ) / 2) < 1e-3
+
+
+def test_retrace_greedy_target_cuts_non_greedy_actions() -> None:
+    """ε = 0: delayed argmax at s1 is 0, taken a_1 = 1 → the trace is cut."""
+    step_stream, predictions, delayed = _fixture(mu_1=0.25)
+    _, metrics = _retrace(epsilon=0.0)(step_stream, predictions, delayed)
+    one_step, _ = DqnObjective(
+        gamma_step=1.0,
+        gamma_episode_terminal=0.0,
+        gamma_episode_truncated=0.0,
+        gamma_task_terminal=0.0,
+        gamma_task_truncated=0.0,
+        grouping_field=None,
+    )(step_stream, predictions, delayed)
+    assert abs(metrics["td_loss"] - one_step.item()) < 1e-4
+    # a_0 = 0 is a greedy tie at s0 (π = 0.5 ≥ μ = 0.5); a_1 is not greedy.
+    assert abs(metrics["retrace_ratio_mean"] - 0.5) < 1e-6
+
+
+def test_retrace_greedy_target_on_greedy_data_is_the_full_return() -> None:
+    """ε = 0 with a greedy a_1 is Watkins's Q(λ): G_0 = 1 + 10 + 100 = 111."""
+    step_stream, predictions, delayed = _fixture(mu_1=0.25)
+    delayed = delayed.clone()
+    q = delayed["action_value"].clone()
+    q[1] = torch.tensor([0.0, 3.0])  # greedy at s1 is the taken action
+    delayed["action_value"] = q
+    _, metrics = _retrace(epsilon=0.0)(step_stream, predictions, delayed)
+    # (5 - 111)^2 = 11236; s1: (0 - 110)^2 = 12100.
+    assert abs(metrics["td_loss"] - (11236.0 + 12100.0) / 2) < 1e-3
+
+
+def test_retrace_total_loss_adds_weighted_behavior_cloning() -> None:
+    step_stream, predictions, delayed = _fixture(mu_1=0.25)
+    loss, metrics = _retrace(behavior_weight=2.0)(step_stream, predictions, delayed)
+    assert abs(metrics["behavior_loss"] - _bc_loss(0.25)) < 1e-5
+    assert abs(loss.item() - (metrics["td_loss"] + 2.0 * _bc_loss(0.25))) < 1e-2
+
+
+def test_retrace_behavior_head_is_trained_and_gives_no_td_gradient() -> None:
+    """The BC loss reaches the behavior logits; the trace (μ) is detached."""
+    step_stream, _, _ = _fixture(mu_1=0.25)
+    torch.manual_seed(0)
+    online = torch.randn(3, 2, requires_grad=True)
+    delayed = torch.randn(3, 2, requires_grad=True)
+    behavior = torch.randn(3, 2, requires_grad=True)
+    predictions, delayed_td = _preds(online, delayed, behavior)
+    loss, _ = _retrace(behavior_weight=3.0)(step_stream, predictions, delayed_td)
+    loss.backward()
+    assert online.grad is not None
+    assert delayed.grad is None
+    assert behavior.grad is not None
+    # Behavior's gradient is exactly that of 3 * mean CE over the two in-run
+    # rows (rows 0 / 1 predict a_0 = 0 / a_1 = 1; row 2 has weight 0).
+    ref = behavior.detach().clone().requires_grad_(True)
+    ce = torch.nn.functional.cross_entropy(ref[:2], torch.tensor([0, 1]), reduction="sum") / 2
+    (3.0 * ce).backward()
+    assert ref.grad is not None
+    assert torch.allclose(behavior.grad, ref.grad, atol=1e-6)
+
+
+def test_retrace_does_not_cross_sequence_boundary() -> None:
+    step_stream, predictions, delayed = _fixture(mu_1=0.25)
+    step_stream = step_stream.clone()
+    step_stream["sequence_id"] = torch.tensor([0, 0, 1])
+    _, metrics = _retrace()(step_stream, predictions, delayed)
+    # Only pair 0 is in-run and it cannot continue: G_0 = 3.25.
+    assert abs(metrics["td_loss"] - 3.0625) < 1e-4
+    assert abs(metrics["behavior_loss"] - math.log(2.0)) < 1e-5
+
+
+def test_retrace_terminal_gamma_zero_ends_the_trace() -> None:
+    step_stream, predictions, delayed = _fixture(mu_1=0.25)
+    step_stream = step_stream.clone()
+    step_stream["episode_done"] = torch.tensor([0, 0, 1])
+    _, metrics = _retrace()(step_stream, predictions, delayed)
+    # γ_1 = 0 → G_1 = 10; G_0 = 3.25 + 1 * (10 - 0) = 13.25.
+    assert abs(metrics["td_loss"] - ((5.0 - 13.25) ** 2 + 100.0) / 2) < 1e-3
+
+
+def test_retrace_truncation_gamma_carries_the_trace_discounted() -> None:
+    step_stream, predictions, delayed = _fixture(mu_1=0.25)
+    step_stream = step_stream.clone()
+    step_stream["episode_done"] = torch.tensor([0, 0, 2])
+    _, metrics = _retrace(gamma_episode_truncated=0.5)(step_stream, predictions, delayed)
+    # γ_1 = 0.5 → G_1 = 10 + 0.5 * 75 = 47.5; G_0 = 3.25 + 47.5 = 50.75.
+    assert abs(metrics["td_loss"] - ((5.0 - 50.75) ** 2 + 47.5**2) / 2) < 1e-3
+
+
+def test_retrace_with_multiple_head_output_rows_per_step() -> None:
+    """Every row of a step trains toward its target; per-step reads use the last row."""
+    step_stream, _, _ = _fixture(mu_1=0.25)
+    step_stream = step_stream.clone()
+    step_stream["head_output_count"] = torch.tensor([2, 1, 2])
+    online = torch.tensor([[5.0, 0.0], [7.0, 0.0], [0.0, 0.0], [0.0, -9.0], [0.0, 0.0]])
+    delayed_q = torch.tensor([[0.0, 0.0], [0.0, 0.0], [3.0, 0.0], [-9.0, -9.0], [0.0, 100.0]])
+    # First s0 row would give μ = 0.9 for a_0; the last row (uniform) is the one read.
+    behavior = torch.tensor(
+        [[math.log(0.9), math.log(0.1)], [0.0, 0.0], [math.log(0.75), math.log(0.25)], [0.0, 0.0], [0.0, 0.0]]
+    )
+    predictions, delayed = _preds(online, delayed_q, behavior)
+    _, metrics = _retrace()(step_stream, predictions, delayed)
+    expected = ((5.0 - 88.25) ** 2 + (7.0 - 88.25) ** 2 + _S1_SQ) / 3
+    assert abs(metrics["td_loss"] - expected) < 1e-2
+    assert abs(metrics["behavior_prob_mean"] - (0.5 + 0.25) / 2) < 1e-6
+    # BC over the three in-run rows: -log 0.9, -log 0.5, -log 0.25.
+    bc = (-math.log(0.9) + math.log(2.0) + math.log(4.0)) / 3
+    assert abs(metrics["behavior_loss"] - bc) < 1e-5
+
+
+def test_retrace_q_affine_applies_to_online_and_delayed() -> None:
+    """``q_scale`` doubles online and delayed Q; π and μ are unchanged."""
+    step_stream, predictions, delayed = _fixture(mu_1=0.25)
+    _, metrics = _retrace(q_scale=2.0)(step_stream, predictions, delayed)
+    # G_1 = 10 + 150 = 160; G_0 = 1 + 4.5 + (160 - 0) = 165.5; online 10 and 0.
+    assert abs(metrics["td_loss"] - ((10.0 - 165.5) ** 2 + 160.0**2) / 2) < 1e-3
+
+
+def test_retrace_requires_behavior_head() -> None:
+    step_stream, predictions, delayed = _fixture(mu_1=0.25)
+    predictions = predictions.exclude("behavior")
+    with pytest.raises(KeyError, match="behavior"):
+        _retrace()(step_stream, predictions, delayed)
+
+
+def test_retrace_reads_behavior_head_under_custom_key() -> None:
+    step_stream, predictions, delayed = _fixture(mu_1=0.25)
+    predictions = predictions.rename_key_("behavior", "mu")
+    _, metrics = _retrace(behavior_key="mu")(step_stream, predictions, delayed)
+    assert abs(metrics["retrace_ratio_mean"] - 1.0) < 1e-6
+
+
+def test_retrace_rejects_misaligned_behavior_head() -> None:
+    step_stream, predictions, delayed = _fixture(mu_1=0.25)
+    predictions = predictions.clone()
+    predictions["behavior"] = torch.zeros(3, 3)
+    with pytest.raises(ValueError, match="behavior shape"):
+        _retrace()(step_stream, predictions, delayed)
+    predictions["behavior"] = torch.zeros(3, 2, dtype=torch.float64)
+    with pytest.raises(TypeError, match="float32"):
+        _retrace()(step_stream, predictions, delayed)
+
+
+def test_retrace_requires_delayed_predictions() -> None:
+    step_stream, predictions, _ = _fixture(mu_1=0.25)
+    with pytest.raises(ValueError, match="delayed_predictions"):
+        _retrace()(step_stream, predictions, None)
+
+
+def test_retrace_cql_penalty_metric() -> None:
+    step_stream, predictions, delayed = _fixture(mu_1=0.25)
+    _, plain = _retrace()(step_stream, predictions, delayed)
+    _, with_cql = _retrace(cql_weight=1.0)(step_stream, predictions, delayed)
+    assert "cql_penalty" in with_cql
+    assert with_cql["td_loss"] > plain["td_loss"]

@@ -605,10 +605,7 @@ def _heads_config(model: "Model") -> dict[str, Any]:
         spec = _head_config(name, head)
         if spec is not None:
             heads.append(spec)
-    action_head = model.action_head
-    if isinstance(action_head, tuple):
-        action_head = list(action_head)
-    return {"action_head": action_head, "heads": heads}
+    return {"action_head": model.action_head, "heads": heads}
 
 
 def _head_config(name: str, head: BaseHead) -> dict[str, Any] | None:
@@ -1057,10 +1054,9 @@ class Model(nn.Module):
       When a plain head (SwiGLUHead) is passed without a name it defaults to ``"action"``;
       use the dict form to pick the key.
 
-    ``action_head`` names which head(s) ``get_action`` consults. Required.
-    A string selects one head; a sequence of names sums those heads'
-    scores. ``reasoner`` and ``recurrence`` are required
-    (pass ``None`` when unused) and cannot be combined.
+    ``action_head`` names the head ``get_action`` consults. Required.
+    ``reasoner`` and ``recurrence`` are required (pass ``None`` when unused)
+    and cannot be combined.
 
     Full construction::
 
@@ -1078,8 +1074,7 @@ class Model(nn.Module):
         )
 
     ``forward`` returns a :class:`ModelOutput` with ``predictions``,
-    ``last_hidden_state``, and per-pass ``passes``. :meth:`features`
-    is the encoder + backbone only (pooled last-layer states, no heads).
+    ``last_hidden_state``, and per-pass ``passes``.
     The delayed DQN model
     comes from :meth:`delayed_copy` (a copy of every trainable parameter;
     frozen weights shared by reference), runs on the same ``TokenBatch``,
@@ -1093,17 +1088,17 @@ class Model(nn.Module):
     @staticmethod
     def _normalize_heads(
         heads: BaseHead | list[BaseHead] | Mapping[str, BaseHead | None] | None,
-        action_head: str | Sequence[str] | None,
+        action_head: str | None,
     ) -> dict[str, BaseHead]:
         """Convert the flexible ``heads=`` argument into the internal ``name -> head`` dict.
 
         Supported inputs:
           - dict (caller-chosen names to head or None): passed through.
           - single BaseHead instance: becomes the only head; name is inferred
-            from type (SwiGLUHead defaults to "action"; pass a string
+            from type (SwiGLUHead defaults to "action"; pass
             ``action_head`` to store it under that key).
           - list/tuple of BaseHead: each gets an inferred name; you *must* provide
-            action_head= to declare which heads get_action() uses.
+            action_head= to declare which head get_action() uses.
         """
         if heads is None:
             return {}
@@ -1124,8 +1119,7 @@ class Model(nn.Module):
 
         # Single head instance gives an implicit single-head model.
         if isinstance(heads, BaseHead):
-            preferred = action_head if isinstance(action_head, str) else None
-            name = Model._infer_head_name(heads, preferred=preferred)
+            name = Model._infer_head_name(heads, preferred=action_head)
             return {name: heads}
 
         # List of heads → explicit action_head required
@@ -1148,7 +1142,7 @@ class Model(nn.Module):
             if action_head is None:
                 raise TypeError(
                     "When passing heads as a list you must also specify action_head= "
-                    "to select the head(s) used by get_action()."
+                    "to select the head used by get_action()."
                 )
             return result
 
@@ -1185,7 +1179,7 @@ class Model(nn.Module):
         encoder: Encoder,
         backbone: Backbone,
         heads: BaseHead | list[BaseHead] | Mapping[str, BaseHead | None],
-        action_head: str | Sequence[str],
+        action_head: str,
         reasoner: LatentReasoner | None,
         recurrence: Recurrence | None,
     ):
@@ -1255,16 +1249,16 @@ class Model(nn.Module):
         self.heads = nn.ModuleDict(filtered)  # for parameters/state
         self._heads: dict[str, BaseHead] = filtered  # typed view for calling
 
-        action_names = _action_head_names(action_head)
-        missing = [name for name in action_names if name not in self.heads]
-        if missing:
+        if not isinstance(action_head, str) or not action_head:
             raise ValueError(
-                f"action_head names {missing} are not enabled; "
+                f"action_head must be a non-empty string, got {action_head!r}."
+            )
+        if action_head not in self.heads:
+            raise ValueError(
+                f"action_head {action_head!r} is not enabled; "
                 f"heads are {tuple(self.heads)}."
             )
-        self.action_head: str | tuple[str, ...] = (
-            action_names[0] if len(action_names) == 1 else action_names
-        )
+        self.action_head = action_head
 
         bb_layers: int | None = None
         for name, head in self._heads.items():
@@ -1292,8 +1286,18 @@ class Model(nn.Module):
                 self.max_num_actions = out
                 break
 
-    def delayed_copy(self) -> "Model":
+    def delayed_copy(self, *, heads: Sequence[str]) -> "Model":
         """Build the delayed model for TD targets: a frozen copy of this model.
+
+        ``heads`` names the heads the delayed model carries — only those
+        the objective reads from ``delayed_predictions`` (the Q head for
+        ``DqnObjective`` / ``RetraceObjective``, ``action_value_layerwise``
+        for ``LayerwiseDqnObjective``). Heads left out (a policy or behavior
+        head whose delayed values nothing uses) are neither copied, run,
+        nor Polyak-interpolated. Every name must be an enabled head and
+        the list must not be empty. The copy's ``action_head`` is this
+        model's when it is among ``heads``, else the first name listed
+        (the delayed model does not pick actions).
 
         Every trainable parameter gets its own copy; every frozen parameter
         (``requires_grad=False`` — the base weights of a LoRA backbone) is
@@ -1305,7 +1309,8 @@ class Model(nn.Module):
         Run it as ``delayed(inputs)`` with the same ``TokenBatch`` (and
         ``reasoning=``) as the online forward, under ``torch.no_grad()``.
         Interpolate it with :class:`~mouse_core.polyak.Polyak`, which takes
-        one ``tau`` per section (heads, encoder, backbone) on every update.
+        one ``tau`` per section (heads, encoder, backbone) on every update
+        and pairs only the heads the delayed model has.
 
         Construct after ``model.to(...)``. Do not call ``requires_grad_`` /
         ``to`` on the delayed model: shared frozen parameters belong to the
@@ -1314,6 +1319,20 @@ class Model(nn.Module):
         if not any(p.requires_grad for p in self.parameters()):
             raise ValueError(
                 "delayed_copy needs a trainable online model (no parameter requires grad)."
+            )
+        if isinstance(heads, str) or not isinstance(heads, Sequence):
+            raise TypeError(
+                f"delayed_copy heads must be a sequence of head names, got {heads!r}."
+            )
+        names = tuple(heads)
+        if not names:
+            raise ValueError("delayed_copy heads must name at least one head.")
+        if len(set(names)) != len(names):
+            raise ValueError(f"delayed_copy heads has duplicate names: {names}.")
+        missing = [name for name in names if name not in self._heads]
+        if missing:
+            raise ValueError(
+                f"delayed_copy heads {missing} are not enabled; heads are {tuple(self._heads)}."
             )
 
         def _copy(module: nn.Module) -> nn.Module:
@@ -1326,8 +1345,8 @@ class Model(nn.Module):
         return Model(
             encoder=cast(Encoder, _copy(self.encoder)),
             backbone=cast(Backbone, _copy(self.backbone)),
-            heads={name: cast(BaseHead, _copy(head)) for name, head in self._heads.items()},
-            action_head=self.action_head,
+            heads={name: cast(BaseHead, _copy(self._heads[name])) for name in names},
+            action_head=self.action_head if self.action_head in names else names[0],
             reasoner=None if self.reasoner is None else cast(LatentReasoner, _copy(self.reasoner)),
             recurrence=(
                 None if self.recurrence is None else cast(Recurrence, _copy(self.recurrence))
@@ -1542,7 +1561,7 @@ class Model(nn.Module):
 
         Training: ``inputs, objective_data = loader.next_batch()`` then
         ``out = model(inputs)``. Delayed DQN: ``delayed_model =
-        model.delayed_copy()`` then ``delayed_model(inputs)`` under
+        model.delayed_copy(heads=("action_value",))`` then ``delayed_model(inputs)`` under
         ``torch.no_grad()`` (same ``TokenBatch`` and ``reasoning=`` as the
         online forward); interpolate with ``Polyak(model, delayed_model)``
         and ``polyak.update(tau_heads=..., tau_encoder=..., tau_backbone=...)``.
@@ -1748,47 +1767,6 @@ class Model(nn.Module):
             head_output_valid=head_output_valid,
         )
 
-    def features(self, batch: TokenBatch) -> torch.Tensor:
-        """Pooled last-layer features at head-output tokens. Does not run heads.
-
-        Training path only (no cache, no ``reasoning=``). A model with a
-        reasoner raises — latent insertion lives on :meth:`forward`. A
-        :class:`~mouse_core.models.recurrence.Recurrence` section still runs
-        ``num_passes`` and this returns the final pass. Pair with
-        :meth:`head` when the training loop should score the same features
-        more than once (see ``examples/14_train_offline_multi_head_update_dqn.ipynb``).
-        """
-        from mouse_core.data.token_batch import TokenBatch as _TokenBatch
-
-        if not isinstance(batch, _TokenBatch):
-            raise TypeError(
-                f"Model.features expects a TokenBatch, got {type(batch).__name__}. "
-                "Use pack_token_batch([transform(step)], ...) "
-                "or DataLoader(transform=...)."
-            )
-        if self.reasoner is not None:
-            raise ValueError(
-                "Model.features does not run a reasoner; use Model.forward(reasoning=...)."
-            )
-
-        embeds, resolved_indices = self.encoder(batch)
-        t = batch.to_tensors(embeds.device)
-        needs_layerwise = "action_value_layerwise" in self._heads
-        num_passes = self.recurrence.num_passes if self.recurrence is not None else 1
-        pass_input = embeds
-        session_out: torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, ...]] = embeds
-        for _ in range(num_passes):
-            session_out = self._train_backbone_forward(
-                self.backbone,
-                pass_input,
-                t["sequence_ids"],
-                t["grouping_ids"],
-                needs_layerwise,
-            )
-            if self.recurrence is not None:
-                pass_input = self.recurrence(embeds, _last_hidden(session_out))
-        return self._pool_backbone_out(session_out, resolved_indices, needs_layerwise)
-
     def head(
         self,
         *,
@@ -1822,8 +1800,7 @@ class Model(nn.Module):
 
         Flat training outputs ``[N, A]`` are rejected unless ``N == 1``.
 
-        Scores come from ``action_head``: one name, or the sum of each
-        named head.
+        Scores come from the head named by ``action_head``.
         """
         if isinstance(out, ModelOutput):
             preds = out.predictions
@@ -1831,20 +1808,12 @@ class Model(nn.Module):
         else:
             preds = out
             valid = None
-        names = _action_head_names(self.action_head)
         scores = _last_action_scores(
-            cast(torch.Tensor, preds[names[0]]),
-            name=names[0],
-            head=self._heads[names[0]],
+            cast(torch.Tensor, preds[self.action_head]),
+            name=self.action_head,
+            head=self._heads[self.action_head],
             valid=valid,
         )
-        for name in names[1:]:
-            scores = scores + _last_action_scores(
-                cast(torch.Tensor, preds[name]),
-                name=name,
-                head=self._heads[name],
-                valid=valid,
-            )
         if num_actions is not None:
             scores = scores[:, :num_actions]
         if temperature == 0.0:
@@ -1852,24 +1821,6 @@ class Model(nn.Module):
         scores = scores - scores.max(dim=-1, keepdim=True).values
         probs = F.softmax(scores / temperature, dim=-1)
         return torch.multinomial(probs, num_samples=1).squeeze(-1)
-
-
-def _action_head_names(action_head: str | Sequence[str]) -> tuple[str, ...]:
-    """Normalize ``action_head`` to one or more non-empty names."""
-    if isinstance(action_head, str):
-        names = (action_head,)
-    else:
-        names = tuple(action_head)
-    if not names:
-        raise ValueError("action_head must name at least one head.")
-    for name in names:
-        if not isinstance(name, str) or not name:
-            raise ValueError(
-                f"action_head names must be non-empty strings, got {name!r}."
-            )
-    if len(set(names)) != len(names):
-        raise ValueError(f"action_head has duplicate names: {names}.")
-    return names
 
 
 def _last_valid_step(valid: torch.Tensor) -> torch.Tensor:

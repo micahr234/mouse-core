@@ -91,7 +91,8 @@ class LayerwiseDqnObjective(Objective):
     rows to steps). Every head-output row of step ``i`` trains toward the same
     per-layer target; the bootstrap reads step ``i+1``'s last head-output row.
     Delayed Q comes from the delayed :class:`~mouse_core.models.base.Model`
-    (``model.delayed_copy()``) run on the same ``TokenBatch`` and is detached
+    (``model.delayed_copy(heads=("action_value_layerwise",))``) run on the
+    same ``TokenBatch`` and is detached
     before the Bellman target, so the TD error does not backprop through it.
     Each layer and each episode/task done-code uses its own discount, built at construction
     from explicit shallow/deep endpoint pairs. A run is the same

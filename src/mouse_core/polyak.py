@@ -3,12 +3,12 @@
 The delayed model comes from :meth:`~mouse_core.models.base.Model.delayed_copy`:
 a copy of the online model in which every trainable parameter has its own
 copy and every frozen parameter (the bf16 base weights of a LoRA backbone)
-is shared by reference. After each ``optimizer.step()`` call
-:meth:`Polyak.update` with this step's ``tau`` for each section — heads,
-encoder, and backbone (the reasoner / recurrence section follows the
-backbone)::
+is shared by reference, carrying only the heads named in ``heads=``. After
+each ``optimizer.step()`` call :meth:`Polyak.update` with this step's
+``tau`` for each section — heads, encoder, and backbone (the reasoner /
+recurrence section follows the backbone)::
 
-    delayed_model = model.delayed_copy()
+    delayed_model = model.delayed_copy(heads=("action_value",))
     polyak = Polyak(model, delayed_model)
     out = model(inputs)
     with torch.no_grad():
@@ -17,7 +17,10 @@ backbone)::
     polyak.update(tau_heads=0.0001, tau_encoder=0.01, tau_backbone=0.01)
 
 Per section, ``θ_delayed ← τ·θ_online + (1−τ)·θ_delayed``. ``τ = 0`` keeps
-that section frozen; ``τ = 1`` copies the online weights (no delay).
+that section frozen; ``τ = 1`` copies the online weights (no delay). The
+heads section pairs each delayed head with the online head of the same
+name; online heads the delayed model does not carry (a behavior or policy
+head whose delayed values nothing reads) are not interpolated.
 
 Every trainable parameter is fp32 (heads, encoder, reasoner / recurrence,
 and either the whole fp32 backbone or the LoRA adapters of a frozen bf16
@@ -55,7 +58,7 @@ class _PolyakState:
         if delayed is online:
             raise ValueError(
                 f"the delayed {section} is the online {section} itself; "
-                "build the delayed model with Model.delayed_copy()."
+                "build the delayed model with Model.delayed_copy(heads=...)."
             )
         online_params = dict(online.named_parameters())
         delayed_params = dict(delayed.named_parameters())
@@ -114,11 +117,13 @@ class Polyak:
     Does not run a forward. Pair with the model from
     :meth:`~mouse_core.models.base.Model.delayed_copy`. The sections are
     heads, encoder, and backbone; the reasoner / recurrence section follows
-    the backbone.
+    the backbone. The heads section covers the heads the delayed model
+    carries (each paired with the online head of the same name); every
+    delayed head must exist online.
 
     Args:
         online: Source model (encoder, backbone, heads).
-        delayed: Model from ``online.delayed_copy()``.
+        delayed: Model from ``online.delayed_copy(heads=...)``.
     """
 
     def __init__(self, online: Model, delayed: Model) -> None:
@@ -127,22 +132,32 @@ class Polyak:
         if not isinstance(online, _Model) or not isinstance(delayed, _Model):
             raise TypeError("Polyak interpolates a delayed Model toward an online Model.")
         if delayed is online:
-            raise ValueError("delayed must come from Model.delayed_copy(), not be the online model.")
+            raise ValueError("delayed must come from Model.delayed_copy(heads=...), not be the online model.")
         if not any(p.requires_grad for p in online.parameters()):
             raise ValueError("online must be the trainable model, not a delayed copy.")
         if any(p.requires_grad for p in delayed.parameters()):
             raise ValueError(
-                "delayed has trainable parameters; build it with Model.delayed_copy()."
+                "delayed has trainable parameters; build it with Model.delayed_copy(heads=...)."
             )
         if (online.reasoner is None) != (delayed.reasoner is None) or (
             online.recurrence is None
         ) != (delayed.recurrence is None):
             raise ValueError(
                 "online and delayed models must have the same sections; "
-                "build the delayed model with Model.delayed_copy()."
+                "build the delayed model with Model.delayed_copy(heads=...)."
             )
 
-        self._heads = _PolyakState(online.heads, delayed.heads, section="heads")
+        extra = [name for name in delayed.heads if name not in online.heads]
+        if extra:
+            raise ValueError(
+                f"delayed heads {extra} do not exist on the online model "
+                f"(online heads are {tuple(online.heads)}); build the delayed "
+                "model with Model.delayed_copy(heads=...)."
+            )
+        self._heads = [
+            _PolyakState(online.heads[name], delayed.heads[name], section=f"heads.{name}")
+            for name in delayed.heads
+        ]
         self._encoder = _PolyakState(online.encoder, delayed.encoder, section="encoder")
         self._backbone = [_PolyakState(online.backbone, delayed.backbone, section="backbone")]
         if online.reasoner is not None and delayed.reasoner is not None:
@@ -170,7 +185,8 @@ class Polyak:
         if tau_heads == 0.0 and tau_encoder == 0.0 and tau_backbone == 0.0:
             return
         if tau_heads > 0.0:
-            self._heads.update(tau_heads)
+            for state in self._heads:
+                state.update(tau_heads)
         if tau_encoder > 0.0:
             self._encoder.update(tau_encoder)
         if tau_backbone > 0.0:

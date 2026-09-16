@@ -274,6 +274,15 @@ def test_get_action_model_output_uses_last_valid_step_column() -> None:
     assert model.get_action(preds, temperature=0.0).tolist() == [1, 0]
 
 
+def test_get_action_rejects_flat_multi_step_train_outputs() -> None:
+    model = _tiny_model()
+    preds = TensorDict(
+        {"action_value": torch.tensor([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]])}
+    )
+    with pytest.raises(ValueError, match="N=1"):
+        model.get_action(preds, temperature=0.0)
+
+
 def test_get_action_rejects_decode_row_with_no_valid_head_output() -> None:
     model = _tiny_model()
     preds = TensorDict(
@@ -387,7 +396,7 @@ def test_reasoning_forward_and_delayed_parity_multi_head_output() -> None:
     torch.manual_seed(0)
     model = _tiny_model(with_reasoner=True).eval()
     batch, _ = _packed(model)
-    delayed = model.delayed_copy().eval()
+    delayed = model.delayed_copy(heads=("action_value",)).eval()
     with torch.no_grad():
         out = model(batch, reasoning=[1, 0])
         delayed_out = delayed(batch, reasoning=[1, 0])
