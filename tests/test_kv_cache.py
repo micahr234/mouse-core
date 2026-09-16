@@ -323,6 +323,85 @@ def test_cuda_step_cudagraph_matches_eager_decode(S: int) -> None:
         )
 
 
+def _cuda_graph_session(batch_size: int = 2) -> tuple[Any, torch.device, int]:
+    from mouse_core.models.backbone.flex_decode import FlexDecodeSession
+
+    device = torch.device("cuda")
+    backbone = Qwen3Backbone(
+        train_kernel="varlen", decode_kernel="flex", dtype=torch.bfloat16,
+        hidden_dim=64, num_layers=2, num_heads=4, lora=LoRAConfig(rank=4, alpha=8.0),
+    ).to(device).eval()
+    inner = cast(nn.Module, cast(Any, backbone).model)
+    return FlexDecodeSession(inner, batch_size=batch_size), device, 64
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='decode CUDA graph is CUDA-only')
+def test_cuda_identical_incremental_steps_capture() -> None:
+    """Two identical incremental steps after prefill capture a CUDA graph."""
+    session, device, D = _cuda_graph_session()
+    B, S = 2, 1
+    pre = torch.randn(B, 8, D, device=device, dtype=torch.bfloat16)
+    preg = torch.zeros(B, 8, dtype=torch.long, device=device)
+    step = torch.randn(B, S, D, device=device, dtype=torch.bfloat16)
+    stepg = torch.zeros(B, S, dtype=torch.long, device=device)
+    with torch.no_grad():
+        session.forward(embeds=pre, lengths=[8, 8], grouping_ids=preg)
+        session.forward(embeds=step, lengths=[S, S], grouping_ids=stepg)
+        assert session._graph is None
+        assert not session._graph_disabled
+        session.forward(embeds=step, lengths=[S, S], grouping_ids=stepg)
+    assert session._graph is not None
+    assert not session._graph_disabled
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='decode CUDA graph is CUDA-only')
+def test_cuda_page_grow_skips_capture_then_recaptures() -> None:
+    """A VMM grow step does not capture; the next stable step still can."""
+    session, device, D = _cuda_graph_session()
+    B, S = 2, 1
+    page = session.page
+    pre_len = page - 2
+    pre = torch.randn(B, pre_len, D, device=device, dtype=torch.bfloat16)
+    preg = torch.zeros(B, pre_len, dtype=torch.long, device=device)
+    step = torch.randn(B, S, D, device=device, dtype=torch.bfloat16)
+    stepg = torch.zeros(B, S, dtype=torch.long, device=device)
+    with torch.no_grad():
+        session.forward(embeds=pre, lengths=[pre_len, pre_len], grouping_ids=preg)
+        session.forward(embeds=step, lengths=[S, S], grouping_ids=stepg)
+        session.forward(embeds=step, lengths=[S, S], grouping_ids=stepg)
+        assert session._graph is not None
+        assert not session._graph_disabled
+        n_pages = session.n_pages
+        session.forward(embeds=step, lengths=[S, S], grouping_ids=stepg)
+        assert session.n_pages > n_pages
+        assert session._graph is None
+        assert not session._graph_disabled
+        session.forward(embeds=step, lengths=[S, S], grouping_ids=stepg)
+        assert session._graph is not None
+        assert not session._graph_disabled
+        session.forward(embeds=step, lengths=[S, S], grouping_ids=stepg)
+    assert session._graph is not None
+    assert not session._graph_disabled
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='decode CUDA graph is CUDA-only')
+def test_cuda_eager_flex_skips_capture_without_disabling() -> None:
+    """Eager FlexAttention is not capturable and must not fail-close graphs."""
+    session, device, D = _cuda_graph_session()
+    session._flex._active = session._flex._eager
+    B, S = 2, 1
+    pre = torch.randn(B, 8, D, device=device, dtype=torch.bfloat16)
+    preg = torch.zeros(B, 8, dtype=torch.long, device=device)
+    step = torch.randn(B, S, D, device=device, dtype=torch.bfloat16)
+    stepg = torch.zeros(B, S, dtype=torch.long, device=device)
+    with torch.no_grad():
+        session.forward(embeds=pre, lengths=[8, 8], grouping_ids=preg)
+        for _ in range(4):
+            session.forward(embeds=step, lengths=[S, S], grouping_ids=stepg)
+    assert session._graph is None
+    assert not session._graph_disabled
+
+
 def test_packed_rope_positions_count_same_group_tokens() -> None:
     from mouse_core.models.backbone.flex_decode import packed_rope_positions
 

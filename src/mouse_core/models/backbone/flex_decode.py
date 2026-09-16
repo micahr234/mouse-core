@@ -47,10 +47,13 @@ How it works:
   MLP) is compiled on CUDA like train's ``_decoder_layer``. A graph break
   after the KV scatter keeps FlexAttention from reading the pre-write
   cache. Page-table growth, mask build, and address setup stay eager.
-* After a call's ``[B, S]`` and real-token count repeat, the eager full
-  stack is CUDA-graphed so that steady incremental shape is one replay.
-  ``S`` is whatever the caller keeps sending; only one-off shapes (prefills,
-  rebuilds) stay compiled-but-not-graphed.
+* After a call's ``[B, S]`` repeats with a stable page count and ``addr``
+  shape, the eager full stack is CUDA-graphed so that steady incremental
+  shape is one replay. ``S`` is whatever the caller keeps sending; one-off
+  shapes (prefills, rebuilds) and VMM grow steps stay compiled-but-not-graphed.
+  A capture miss skips that step and retries once the shape is stable; graphs
+  disable only after a repeated hard failure (logged). Eager FlexAttention
+  is not capturable and is skipped, not treated as a disable.
 
 The session wraps the backbone's ``transformers`` model in place (shared
 weights, decoder loop reimplemented) and supports both ``Qwen3Model`` and
@@ -561,12 +564,19 @@ class FlexDecodeSession:
         _bind_decode_mask_holder(self._mask_holder)
 
         # Incremental-step CUDA graph: captured the second time a shape
-        # repeats; rebuilt when the pool grows or BlockMask tables change.
+        # repeats on a stable pool; rebuilt when the pool grows or BlockMask
+        # tables change. One miss skips; a second hard miss on the same key
+        # disables graphs for the session.
         self._closed = False
         self._graph: torch.cuda.CUDAGraph | None = None
         self._graph_disabled = False
-        self._g_key: tuple[int, int, int, int] | None = None
-        self._pending_graph_key: tuple[int, int, int, int] | None = None
+        self._g_key: tuple[int, int, int] | None = None
+        self._pending_graph_key: tuple[int, int, int] | None = None
+        self._graph_last_n_pages: int | None = None
+        self._graph_last_addr_shape: tuple[int, ...] | None = None
+        self._graph_miss_key: tuple[int, int, int] | None = None
+        self._graph_miss_count = 0
+        self._graph_capture_logged = False
         self._g_h: torch.Tensor | None = None
         self._g_cos: torch.Tensor | None = None
         self._g_sin: torch.Tensor | None = None
@@ -628,6 +638,7 @@ class FlexDecodeSession:
         new_table[:, : self.page_table.shape[1]] = self.page_table
         self.page_table = new_table
         self.logical_cap = new_cap
+        self._invalidate_graph()
 
     def _grow_pool(self, min_pages: int) -> None:
         new_n = min_pages
@@ -700,8 +711,28 @@ class FlexDecodeSession:
         self._g_mask = None
         self._g_cache_id = None
 
-    def _step_graph_key(self, h: torch.Tensor, addr: torch.Tensor) -> tuple[int, int, int, int]:
-        return (h.shape[0], h.shape[1], addr.numel(), id(self.k_cache))
+    def _step_graph_key(self, h: torch.Tensor) -> tuple[int, int, int]:
+        return (h.shape[0], h.shape[1], id(self.k_cache))
+
+    def _flex_is_eager(self) -> bool:
+        return self._flex._active is self._flex._eager
+
+    def _note_graph_miss(self, key: tuple[int, int, int], reason: str) -> None:
+        """Log a hard capture miss. Disable only after the same key misses twice."""
+        warnings.warn(reason, stacklevel=3)
+        self._invalidate_graph()
+        self._pending_graph_key = None
+        if self._graph_miss_key == key:
+            self._graph_miss_count += 1
+        else:
+            self._graph_miss_key = key
+            self._graph_miss_count = 1
+        if self._graph_miss_count >= 2:
+            self._graph_disabled = True
+            warnings.warn(
+                f"FlexDecodeSession CUDA graph disabled after repeated capture misses key={key}",
+                stacklevel=3,
+            )
 
     def _update_mask_tables(self, t: torch.Tensor, q_mask: torch.Tensor) -> None:
         """Write query tables; copy in-place when the CUDA graph closed over them."""
@@ -826,7 +857,16 @@ class FlexDecodeSession:
             or addr.numel() == 0
         ):
             return None
-        key = self._step_graph_key(h, addr)
+        pages_changed = (
+            self._graph_last_n_pages is None or self._graph_last_n_pages != self.n_pages
+        )
+        addr_changed = (
+            self._graph_last_addr_shape is None
+            or self._graph_last_addr_shape != tuple(addr.shape)
+        )
+        self._graph_last_n_pages = self.n_pages
+        self._graph_last_addr_shape = tuple(addr.shape)
+        key = self._step_graph_key(h)
         if (
             self._graph is not None
             and self._g_key == key
@@ -836,6 +876,14 @@ class FlexDecodeSession:
             assert self._graph is not None and self._g_out is not None and self._g_hiddens is not None
             self._graph.replay()
             return self._g_out, self._g_hiddens
+        # Eager Flex copies host tensors and cannot record. Skip; do not disable.
+        if self._flex_is_eager():
+            return None
+        # VMM grow / addr reshape this call: capture is illegal or would recapture
+        # a transitioning shape. Compiled path this step; retry when stable.
+        if pages_changed or addr_changed:
+            self._pending_graph_key = key
+            return None
         # One-off shapes (prefills) stay compiled. Capture the shape that
         # just repeated — S is part of the key, not chosen here.
         if self._pending_graph_key != key:
@@ -853,6 +901,7 @@ class FlexDecodeSession:
         real_cols: torch.Tensor,
         block_mask: BlockMask,
     ) -> tuple[torch.Tensor, list[torch.Tensor]] | None:
+        key = self._step_graph_key(h)
         self._g_h = h.clone()
         self._g_cos = cos.clone()
         self._g_sin = sin.clone()
@@ -862,6 +911,7 @@ class FlexDecodeSession:
         self._g_mask = block_mask
         if not self._copy_graph_inputs(h, cos, sin, addr, real_rows, real_cols, block_mask):
             self._invalidate_graph()
+            self._pending_graph_key = None
             return self._run_layers(h, cos, sin, addr, real_rows, real_cols, block_mask)
 
         def _restore_static() -> None:
@@ -898,7 +948,7 @@ class FlexDecodeSession:
         out: torch.Tensor | None = None
         hiddens: list[torch.Tensor] | None = None
         graph: torch.cuda.CUDAGraph | None = None
-        empty = False
+        fail_reason: str | None = None
         try:
             side = torch.cuda.Stream()
             side.wait_stream(torch.cuda.current_stream())
@@ -907,15 +957,34 @@ class FlexDecodeSession:
                     _restore_static()
                     out, hiddens = _run_static()
             torch.cuda.current_stream().wait_stream(side)
+            # Compiled Flex is the capturable path. If warmup fell back to
+            # eager, do not enter ``torch.cuda.graph`` (it will throw).
+            if self._flex_is_eager():
+                warnings.warn(
+                    "FlexDecodeSession CUDA graph skipped: FlexAttention fell "
+                    "back to eager during warmup.",
+                    stacklevel=2,
+                )
+                self._invalidate_graph()
+                self._pending_graph_key = None
+                if out is None or hiddens is None:
+                    out, hiddens = self._run_layers(
+                        h, cos, sin, addr, real_rows, real_cols, block_mask,
+                    )
+                return out, hiddens
             _restore_static()
             graph = torch.cuda.CUDAGraph()
             with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always")
                 with torch.cuda.graph(graph):
                     self._g_out, self._g_hiddens = _run_static()
-            empty = any("CUDA Graph is empty" in str(w.message) for w in caught)
-        except Exception:
-            empty = True
+            empty_msgs = [
+                str(w.message) for w in caught if "CUDA Graph is empty" in str(w.message)
+            ]
+            if empty_msgs:
+                fail_reason = empty_msgs[0]
+        except Exception as exc:
+            fail_reason = f"FlexDecodeSession CUDA graph capture failed: {exc}"
             out, hiddens = self._run_layers(h, cos, sin, addr, real_rows, real_cols, block_mask)
         finally:
             lora_mod._force_eager_lora = was_eager_lora
@@ -923,20 +992,29 @@ class FlexDecodeSession:
         # until replay. Replay, then check against warmup.
         if out is None or hiddens is None:
             out, hiddens = self._run_layers(h, cos, sin, addr, real_rows, real_cols, block_mask)
-        if empty or self._g_out is None or self._g_hiddens is None:
-            self._graph_disabled = True
-            self._invalidate_graph()
+        if fail_reason is not None or self._g_out is None or self._g_hiddens is None:
+            if fail_reason is None:
+                fail_reason = "FlexDecodeSession CUDA graph capture produced no outputs."
+            self._note_graph_miss(key, fail_reason)
             return out, hiddens
         _restore_static()
         assert graph is not None
         graph.replay()
         if not torch.allclose(self._g_out.float(), out.float(), atol=5e-2, rtol=5e-2):
-            self._graph_disabled = True
-            self._invalidate_graph()
+            diff = (self._g_out.float() - out.float()).abs().max().item()
+            self._note_graph_miss(
+                key,
+                f"FlexDecodeSession CUDA graph replay mismatch max_abs={diff}",
+            )
             return out, hiddens
         self._graph = graph
-        self._g_key = self._step_graph_key(h, addr)
+        self._g_key = key
         self._g_cache_id = id(self.k_cache)
+        self._graph_miss_key = None
+        self._graph_miss_count = 0
+        if not self._graph_capture_logged:
+            self._graph_capture_logged = True
+            warnings.warn(f"cuda graph captured key={key}", stacklevel=2)
         return self._g_out, self._g_hiddens
 
     def reset_rows(self, rows: Sequence[int] | None = None) -> None:

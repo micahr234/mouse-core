@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ``MaxNStepDqnObjective`` and
   ``examples/15_train_offline_max_n_step_dqn.ipynb``.
 
+### Fixed
+- Incremental Flex decode CUDA-graph capture no longer disables the
+  session after one silent miss. Grow steps and eager FlexAttention skip
+  capture; a miss is logged and retried once the shape is stable; graphs
+  disable only after a repeated hard failure.
+
 ### Added
 - ``Model.features``: encoder + backbone only (pooled last-layer
   states at head-output tokens). Does not run heads. Training path
