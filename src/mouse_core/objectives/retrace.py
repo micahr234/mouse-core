@@ -141,10 +141,12 @@ class RetraceObjective(Objective):
 
     The dataset does not store ``μ``. It is **learned**: the model carries a
     second head, a :class:`~mouse_core.models.heads.DiscreteActionHead`
-    under ``predictions[behavior_key]`` (``[P, A]`` logits), trained here by
-    behavior cloning — cross-entropy onto the action actually taken from
-    each step, over every head-output row of that step. Its softmax at the
-    step's last head-output row is ``μ(· | s_t)``, read from the *online*
+    under ``predictions[behavior_key]`` whose outputs are treated as
+    **logits**: ``log_softmax`` of the row is ``log μ(· | s)``. The head is fit
+    by negative log-likelihood of the action actually taken from each step,
+    ``-log μ(a_t | s_t)``, over every head-output row of that step. The same
+    distribution at the step's last head-output row is the ``μ(· | s_t)``
+    the trace uses, read from the *online*
     predictions and detached, so the trace coefficients are the current best
     estimate of the data policy and receive no TD gradient. The returned
     loss is ``td_loss + behavior_weight * behavior_loss``; in-context, the
@@ -217,8 +219,8 @@ class RetraceObjective(Objective):
             ``π = softmax(Q / temperature)``, ``>= 0``. ``0.0`` is greedy
             (Watkins's cut; argmax ties share the mass); larger values
             flatten ``π`` toward uniform and cut fewer traces.
-        behavior_weight: Coefficient of the behavior-cloning cross-entropy
-            in the returned loss. Must be ``> 0`` — the trace needs a
+        behavior_weight: Coefficient of the behavior head's NLL
+            (``-log μ(a_t | s_t)``) in the returned loss. Must be ``> 0`` — the trace needs a
             trained ``μ``.
         gamma_step: Discount factor for running (non-terminal) transitions
             (``episode_done == 0``).
@@ -255,7 +257,7 @@ class RetraceObjective(Objective):
         cql_scale_q_eps: Additive floor used when scaling the CQL penalty.
 
     Metrics: ``retrace`` (the returned loss), ``td_loss`` (Q-head MSE
-    including CQL), ``behavior_loss`` (behavior-cloning cross-entropy),
+    including CQL), ``behavior_loss`` (behavior-head NLL, ``-log μ(a_t | s_t)``),
     ``behavior_prob_mean`` (in-run mean of ``μ(a_t | s_t)`` for the taken
     action — how well the behavior head predicts the data), ``q_values_*``
     (online max-Q over in-run rows), ``retrace_ratio_mean`` (in-run mean of
@@ -407,10 +409,13 @@ class RetraceObjective(Objective):
             device=device,
         )
 
-        # Behavior cloning: every row of step i predicts a_i. Its softmax is μ.
-        behavior_nll = F.cross_entropy(behavior_logits, next_actions, reduction="none")  # [P]
+        # Behavior head outputs logits; log_softmax is log μ(· | s). Every row of
+        # step i is fit to the taken action a_i by NLL, and the same
+        # (detached) distribution at the step's last row is the μ the trace uses.
+        log_mu = F.log_softmax(behavior_logits, dim=-1)  # [P, A]
+        behavior_nll = F.nll_loss(log_mu, next_actions, reduction="none")  # [P]  -log μ(a_i | s_i)
         behavior_loss = _weighted_mean(behavior_nll, row_weight)
-        mu_step = F.softmax(behavior_logits.detach(), dim=-1)[last_rows]  # [N, A]  μ(· | s_i)
+        mu_step = log_mu.detach().exp()[last_rows]  # [N, A]  μ(· | s_i)
 
         q_values = q.gather(dim=-1, index=next_actions.unsqueeze(-1)).squeeze(-1)  # [P]
         q_step = q_target[last_rows]  # [N, A]  delayed Q(s_i, ·)

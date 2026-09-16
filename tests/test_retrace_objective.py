@@ -77,8 +77,8 @@ def _fixture(mu_1: float) -> tuple[TensorDict, TensorDict, TensorDict]:
 _S1_SQ = 12100.0
 
 
-def _bc_loss(mu_1: float) -> float:
-    """Behavior-cloning CE over the two in-run rows: -log 0.5 at s0, -log mu_1 at s1."""
+def _nll_loss(mu_1: float) -> float:
+    """Behavior-head NLL over the two in-run rows: -log 0.5 at s0, -log mu_1 at s1."""
     return (math.log(2.0) - math.log(mu_1)) / 2
 
 
@@ -196,15 +196,15 @@ def test_retrace_greedy_target_on_greedy_data_is_the_full_return() -> None:
     assert abs(metrics["td_loss"] - (11236.0 + 12100.0) / 2) < 1e-3
 
 
-def test_retrace_total_loss_adds_weighted_behavior_cloning() -> None:
+def test_retrace_total_loss_adds_weighted_behavior_nll() -> None:
     step_stream, predictions, delayed = _fixture(mu_1=0.25)
     loss, metrics = _retrace(behavior_weight=2.0)(step_stream, predictions, delayed)
-    assert abs(metrics["behavior_loss"] - _bc_loss(0.25)) < 1e-5
-    assert abs(loss.item() - (metrics["td_loss"] + 2.0 * _bc_loss(0.25))) < 1e-2
+    assert abs(metrics["behavior_loss"] - _nll_loss(0.25)) < 1e-5
+    assert abs(loss.item() - (metrics["td_loss"] + 2.0 * _nll_loss(0.25))) < 1e-2
 
 
 def test_retrace_behavior_head_is_trained_and_gives_no_td_gradient() -> None:
-    """The BC loss reaches the behavior logits; the trace (μ) is detached."""
+    """The NLL reaches the behavior logits; the trace (μ) is detached."""
     step_stream, _, _ = _fixture(mu_1=0.25)
     torch.manual_seed(0)
     online = torch.randn(3, 2, requires_grad=True)
@@ -216,11 +216,13 @@ def test_retrace_behavior_head_is_trained_and_gives_no_td_gradient() -> None:
     assert online.grad is not None
     assert delayed.grad is None
     assert behavior.grad is not None
-    # Behavior's gradient is exactly that of 3 * mean CE over the two in-run
-    # rows (rows 0 / 1 predict a_0 = 0 / a_1 = 1; row 2 has weight 0).
+    # Behavior's gradient is exactly that of 3 * mean NLL of log_softmax(logits)
+    # over the two in-run rows (rows 0 / 1 predict a_0 = 0 / a_1 = 1; row 2 has
+    # weight 0).
     ref = behavior.detach().clone().requires_grad_(True)
-    ce = torch.nn.functional.cross_entropy(ref[:2], torch.tensor([0, 1]), reduction="sum") / 2
-    (3.0 * ce).backward()
+    log_mu = torch.nn.functional.log_softmax(ref[:2], dim=-1)
+    nll = torch.nn.functional.nll_loss(log_mu, torch.tensor([0, 1]), reduction="sum") / 2
+    (3.0 * nll).backward()
     assert ref.grad is not None
     assert torch.allclose(behavior.grad, ref.grad, atol=1e-6)
 

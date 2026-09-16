@@ -44,9 +44,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   delayed network, and the λ-return is a parallel scan.
   ``μ`` is not stored with the data: the model carries a second
   ``DiscreteActionHead`` under ``predictions[behavior_key]``
-  (``"behavior"``), the objective trains it by behavior cloning on the
-  taken actions (``behavior_weight``, required, ``> 0``) and reads its
-  detached softmax as ``μ``. Loss is ``td_loss + behavior_weight *
+  (``"behavior"``) whose outputs are logits; the objective fits it by NLL
+  of the taken actions, ``-log softmax(logits)[a]`` (``behavior_weight``,
+  required, ``> 0``), and reads the same distribution, detached, as ``μ``.
+  Loss is ``td_loss + behavior_weight *
   behavior_loss``; metrics add ``td_loss``, ``behavior_loss``,
   ``behavior_prob_mean``, and ``retrace_ratio_mean``. ``temperature=0``
   is the greedy target policy, i.e. Watkins's Q(λ) with the greedy check
