@@ -7,16 +7,17 @@ output ``e``. Pass ``k`` reads ``e + proj(RMSNorm(h_{k-1}))`` where
 runs the heads, so a training loop can supervise each pass and average the
 losses; ``get_action`` reads the final pass.
 
-Why the adapter: the backbone output passes through the pretrained final
-RMSNorm, whose learned per-dim gain leaves it on a very different scale
-from the encoder embeddings (on Qwen3-0.6B the gain carries outlier dims,
-versus encoder embeddings of RMS ~0.03). Feeding it straight back as the
-next input lets those outliers compound pass over pass and in bf16 rounds
-the later passes' layer contributions away. The adapter re-normalizes the
-recycled state without a gain, re-injects the original encodings so no
-pass loses the input, and starts with a zero projection so at construction
-every pass equals pass 1 — the recurrence is an exact no-op until the
-optimizer turns it on.
+Why the adapter: when the backbone keeps its final RMSNorm
+(``use_norm=True``), the learned per-dim gain leaves the output on a
+very different scale from the encoder embeddings (on Qwen3-0.6B the
+gain carries outlier dims, versus encoder embeddings of RMS ~0.03).
+Feeding it straight back as the next input lets those outliers compound
+pass over pass and in bf16 rounds the later passes' layer contributions
+away. The adapter re-normalizes the recycled state without a gain,
+re-injects the original encodings so no pass loses the input, and
+starts with a zero projection so at construction every pass equals
+pass 1 — the recurrence is an exact no-op until the optimizer turns
+it on.
 
 Cached decode keeps one KV session per pass (pass ``k`` of a new token
 attends to pass ``k`` states of earlier tokens), so a recurrent model

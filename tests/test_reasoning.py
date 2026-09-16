@@ -38,7 +38,7 @@ _TOKENS_PER_STEP = 5
 def _tiny_model(*, num_thoughts: int = 2, with_reasoner: bool = True) -> Model:
     encoder = NumericEmbedder(hidden_dim=_HIDDEN, modalities=_MODALITIES)
     backbone = LlamaBackbone(
-        train_kernel="reference", decode_kernel="flex", dtype=torch.float32,
+        train_kernel="reference", decode_kernel="flex", dtype=torch.float32, use_norm=True,
         hidden_dim=_HIDDEN,
         num_layers=2,
         num_heads=2,
@@ -49,7 +49,7 @@ def _tiny_model(*, num_thoughts: int = 2, with_reasoner: bool = True) -> Model:
         in_features=_HIDDEN,
         out_features=_ACTIONS,
         hidden_dim=_HIDDEN,
-        num_layers=1,
+        num_layers=1, use_norm=True,
     )
     reasoner = (
         LatentReasoner(hidden_dim=_HIDDEN, num_thoughts=num_thoughts)

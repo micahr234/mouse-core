@@ -17,6 +17,7 @@ from mouse_core.models.backbone.base import (
     Backbone,
     DecodeKernel,
     TrainKernel,
+    _apply_final_norm,
     _disable_cudnn_sdp,
     _load_transformer_weights,
     _rope_parameters_from_config,
@@ -30,7 +31,8 @@ class _Qwen3BackboneConfig:
 
     Builds a HuggingFace ``Qwen3Model`` with SDPA attention and no token
     embedding (``vocab_size=1``; the MOUSE encoder supplies ``inputs_embeds``).
-    The final RMSNorm is kept, so the backbone output is normalized.
+    The final RMSNorm is applied in :class:`Qwen3Backbone` when
+    ``use_norm=True``.
 
     Args:
         num_layers: Number of transformer decoder layers.
@@ -79,7 +81,8 @@ class _Qwen3BackboneConfig:
                 must be divisible by ``num_heads``.
 
         Returns:
-            ``Qwen3Model`` (token embedding unused, final norm kept).
+            ``Qwen3Model`` (token embedding unused; the caller applies
+            ``use_norm``).
         """
         _disable_cudnn_sdp()
         if self.head_dim is None:
@@ -116,10 +119,13 @@ class Qwen3Backbone(Backbone):
     """Backbone adapter wrapping a ``transformers.Qwen3Model``.
 
     ``train_kernel`` (``"varlen"`` / ``"padded"`` / ``"flex"`` / ``"reference"``),
-    ``decode_kernel`` (``"flex"``) and ``dtype`` are required: the
-    uncached-forward kernel, the cached-decode kernel, and the dtype of the
+    ``decode_kernel`` (``"flex"``), ``dtype``, and ``use_norm`` are required:
+    the uncached-forward kernel, the cached-decode kernel, the dtype of the
     base weights (``torch.float32`` to fine-tune them,
-    ``preferred_dtype(device)`` for a frozen LoRA base or inference).
+    ``preferred_dtype(device)`` for a frozen LoRA base or inference), and
+    whether to keep the transformer's final RMSNorm (``False`` replaces it
+    with ``Identity``; per-layer norms stay). ``use_norm`` is saved with
+    the model.
     ``train_autocast_dtype`` / ``decode_autocast_dtype`` (bf16/fp16, fp32
     base only) declare mixed precision per path: the packed training
     forward and cached decode (KV pool in the autocast dtype). See
@@ -138,6 +144,7 @@ class Qwen3Backbone(Backbone):
         train_kernel: TrainKernel,
         decode_kernel: DecodeKernel,
         dtype: torch.dtype,
+        use_norm: bool,
         train_autocast_dtype: torch.dtype | None = None,
         decode_autocast_dtype: torch.dtype | None = None,
         model: Qwen3Model | None = None,
@@ -156,6 +163,7 @@ class Qwen3Backbone(Backbone):
         if model is not None and pretrained is not None:
             raise TypeError("Qwen3Backbone accepts either model= or pretrained=, not both.")
 
+        load_from: tuple[str | Path, dict[str, Any]] | None = None
         if model is not None:
             if not isinstance(model, Qwen3Model):
                 raise TypeError(
@@ -179,19 +187,21 @@ class Qwen3Backbone(Backbone):
             self.model = _Qwen3BackboneConfig(**extracted_kwargs).build(extracted_hidden_dim)
             self._config_kwargs = dict(extracted_kwargs)
             if load_weights:
-                self._load_pretrained_weights(
-                    repo_id_or_path=pretrained, hub_kwargs=hf_kwargs
-                )
+                load_from = (pretrained, hf_kwargs)
         else:
             if hidden_dim is None:
                 raise TypeError(
                     "Qwen3Backbone requires either a pre-built model, "
                     "pretrained=, or hidden_dim plus backbone config arguments "
-                    "(e.g. Qwen3Backbone(hidden_dim=128, num_layers=2, num_heads=4))."
+                    "(e.g. Qwen3Backbone(hidden_dim=128, num_layers=2, num_heads=4, use_norm=True))."
                 )
             self.model = _Qwen3BackboneConfig(**config_kwargs).build(hidden_dim)
             self._config_kwargs = self._config_kwargs_from_model(self.model)
 
+        _apply_final_norm(self.model, use_norm)
+        self._config_kwargs["use_norm"] = use_norm
+        if load_from is not None:
+            self._load_pretrained_weights(repo_id_or_path=load_from[0], hub_kwargs=load_from[1])
         cast(torch.nn.Module, self.model).to(dtype)  # base weights; LoRA adapters below are always fp32
         self._attach_lora(self.model, lora)
 

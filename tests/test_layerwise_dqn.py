@@ -18,15 +18,15 @@ def _tiny_batch() -> list[list[dict]]:
     return [[{'action': 0, 'observation': 1, 'reward': 0.0, 'episode_done': 0, 'task_done': 0}, {'action': 1, 'observation': 2, 'reward': 1.0, 'episode_done': 0, 'task_done': 0}, {'action': 0, 'observation': 3, 'reward': 0.5, 'episode_done': 0, 'task_done': 0}]]
 
 def test_layerwise_head_forward_shape() -> None:
-    head = LayerwiseDiscreteActionValueHead(num_backbone_layers=2, in_features=8, out_features=4, hidden_dim=8, num_layers=1, scale=0.1)
+    head = LayerwiseDiscreteActionValueHead(num_backbone_layers=2, in_features=8, out_features=4, hidden_dim=8, num_layers=1, use_norm=True, scale=0.1)
     h = torch.randn(1, 2, 3, 8)
     q = head.forward(h)
     assert q.shape == (1, 3, 2, 4)
 
 def test_model_layerwise_forward_and_objective() -> None:
-    backbone = Qwen3Backbone(train_kernel="reference", decode_kernel="flex", dtype=torch.float32, hidden_dim=16, num_layers=2, num_heads=2)
+    backbone = Qwen3Backbone(train_kernel="reference", decode_kernel="flex", dtype=torch.float32, use_norm=True, hidden_dim=16, num_layers=2, num_heads=2)
     encoder = NumericEmbedder(hidden_dim=backbone.hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}, {"type": 'discrete', "field": "observation", "vocab_size": 8, "std": 0.02, "positions": 1}, {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3, "std": 0.02, "positions": 1}])
-    head = LayerwiseDiscreteActionValueHead(num_backbone_layers=2, in_features=backbone.hidden_dim, out_features=4, hidden_dim=backbone.hidden_dim, num_layers=1, scale=0.1)
+    head = LayerwiseDiscreteActionValueHead(num_backbone_layers=2, in_features=backbone.hidden_dim, out_features=4, hidden_dim=backbone.hidden_dim, num_layers=1, use_norm=True, scale=0.1)
     model = Model(encoder=encoder, backbone=backbone, heads=head, action_head="action_value_layerwise", reasoner=None, recurrence=None)
     batch = _tiny_batch()
     token_batch, objective_data = batch_to_packed(
@@ -137,7 +137,7 @@ def test_cached_decode_matches_full_forward_with_layerwise() -> None:
     backbone = Qwen3Backbone(
         train_kernel="reference",
         decode_kernel="flex",
-        dtype=torch.float32,
+        dtype=torch.float32, use_norm=True,
         hidden_dim=16,
         num_layers=2,
         num_heads=2,
@@ -156,7 +156,7 @@ def test_cached_decode_matches_full_forward_with_layerwise() -> None:
         in_features=backbone.hidden_dim,
         out_features=4,
         hidden_dim=backbone.hidden_dim,
-        num_layers=1,
+        num_layers=1, use_norm=True,
         scale=0.1,
     )
     model = Model(

@@ -13,12 +13,12 @@ from tests._token_batch_helpers import batch_to_token_batch, tok_from_encoder
 _tok = tok_from_encoder
 
 def test_discrete_action_head_forward_shape() -> None:
-    head = DiscreteActionHead(in_features=8, out_features=4, hidden_dim=8, num_layers=1)
+    head = DiscreteActionHead(in_features=8, out_features=4, hidden_dim=8, num_layers=1, use_norm=True)
     out = head(torch.randn(2, 5, 8))
     assert out.shape == (2, 5, 4)
 
 def test_infer_head_name_is_action() -> None:
-    head = DiscreteActionHead(in_features=8, out_features=4, hidden_dim=8, num_layers=1)
+    head = DiscreteActionHead(in_features=8, out_features=4, hidden_dim=8, num_layers=1, use_norm=True)
     assert ModelClass._infer_head_name(head) == 'action'
     assert ModelClass._infer_head_name(head, preferred="action_value") == 'action'
 
@@ -36,7 +36,7 @@ def test_discrete_action_head_rejects_action_value_name() -> None:
             encoder=encoder,
             backbone=IdentityBackbone(hidden_dim=hidden_dim),
             heads=DiscreteActionHead(
-                in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1
+                in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, use_norm=True
             ),
             action_head="action_value",
             reasoner=None,
@@ -47,7 +47,7 @@ def test_discrete_action_head_save_load_roundtrip(tmp_path) -> None:
     torch.manual_seed(0)
     hidden_dim = 8
     encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}, {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0}])
-    model = Model(encoder=encoder, backbone=IdentityBackbone(hidden_dim=hidden_dim), heads=DiscreteActionHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1), action_head="action", reasoner=None, recurrence=None).eval()
+    model = Model(encoder=encoder, backbone=IdentityBackbone(hidden_dim=hidden_dim), heads=DiscreteActionHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, use_norm=True), action_head="action", reasoner=None, recurrence=None).eval()
     batch = [[{'action': 0, 'reward': 0.0}, {'action': 1, 'reward': 1.0}]]
     expected = model(batch_to_token_batch(_tok(model.encoder), batch)).predictions
     save_model(model, tmp_path)

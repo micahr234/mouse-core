@@ -624,7 +624,7 @@ def test_text_embedder_save_load(tmp_path) -> None:
         encoder=enc,
         backbone=IdentityBackbone(hidden_dim=D),
         heads=DiscreteActionValueHead(
-            in_features=D, out_features=4, hidden_dim=D, num_layers=1
+            in_features=D, out_features=4, hidden_dim=D, num_layers=1, use_norm=True
         ),
         action_head="action_value",
         reasoner=None,
@@ -685,7 +685,7 @@ def test_text_embedder_learnable_save_load(tmp_path) -> None:
         encoder=enc,
         backbone=IdentityBackbone(hidden_dim=D),
         heads=DiscreteActionValueHead(
-            in_features=D, out_features=4, hidden_dim=D, num_layers=1
+            in_features=D, out_features=4, hidden_dim=D, num_layers=1, use_norm=True
         ),
         action_head="action_value",
         reasoner=None,
@@ -731,7 +731,7 @@ def test_text_model_card_describes_tokenizer(tmp_path) -> None:
         encoder=enc,
         backbone=IdentityBackbone(hidden_dim=8),
         heads=DiscreteActionValueHead(
-            in_features=8, out_features=4, hidden_dim=8, num_layers=1
+            in_features=8, out_features=4, hidden_dim=8, num_layers=1, use_norm=True
         ),
         action_head="action_value",
         reasoner=None,

@@ -35,7 +35,7 @@ _MODALITIES = [
 def _tiny_model(*, num_passes: int | None = 3, layerwise: bool = False) -> Model:
     encoder = NumericEmbedder(hidden_dim=_HIDDEN, modalities=_MODALITIES)
     backbone = LlamaBackbone(
-        train_kernel="reference", decode_kernel="flex", dtype=torch.float32,
+        train_kernel="reference", decode_kernel="flex", dtype=torch.float32, use_norm=True,
         hidden_dim=_HIDDEN,
         num_layers=2,
         num_heads=2,
@@ -48,14 +48,14 @@ def _tiny_model(*, num_passes: int | None = 3, layerwise: bool = False) -> Model
             in_features=_HIDDEN,
             out_features=_ACTIONS,
             hidden_dim=_HIDDEN,
-            num_layers=1,
+            num_layers=1, use_norm=True,
         )
     else:
         heads = DiscreteActionValueHead(
             in_features=_HIDDEN,
             out_features=_ACTIONS,
             hidden_dim=_HIDDEN,
-            num_layers=1,
+            num_layers=1, use_norm=True,
         )
     recurrence = (
         Recurrence(hidden_dim=_HIDDEN, num_passes=num_passes)
@@ -103,9 +103,9 @@ def test_recurrence_validates_arguments() -> None:
     with pytest.raises(ValueError, match="cannot be combined"):
         Model(
             encoder=NumericEmbedder(hidden_dim=_HIDDEN, modalities=_MODALITIES),
-            backbone=LlamaBackbone(train_kernel="reference", decode_kernel="flex", dtype=torch.float32, hidden_dim=_HIDDEN, num_layers=1, num_heads=2),
+            backbone=LlamaBackbone(train_kernel="reference", decode_kernel="flex", dtype=torch.float32, use_norm=True, hidden_dim=_HIDDEN, num_layers=1, num_heads=2),
             heads=DiscreteActionValueHead(
-                in_features=_HIDDEN, out_features=_ACTIONS, hidden_dim=_HIDDEN, num_layers=1
+                in_features=_HIDDEN, out_features=_ACTIONS, hidden_dim=_HIDDEN, num_layers=1, use_norm=True
             ),
             action_head="action_value",
             reasoner=LatentReasoner(hidden_dim=_HIDDEN, num_thoughts=2),
@@ -114,9 +114,9 @@ def test_recurrence_validates_arguments() -> None:
     with pytest.raises(ValueError, match="hidden_dim mismatch"):
         Model(
             encoder=NumericEmbedder(hidden_dim=_HIDDEN, modalities=_MODALITIES),
-            backbone=LlamaBackbone(train_kernel="reference", decode_kernel="flex", dtype=torch.float32, hidden_dim=_HIDDEN, num_layers=1, num_heads=2),
+            backbone=LlamaBackbone(train_kernel="reference", decode_kernel="flex", dtype=torch.float32, use_norm=True, hidden_dim=_HIDDEN, num_layers=1, num_heads=2),
             heads=DiscreteActionValueHead(
-                in_features=_HIDDEN, out_features=_ACTIONS, hidden_dim=_HIDDEN, num_layers=1
+                in_features=_HIDDEN, out_features=_ACTIONS, hidden_dim=_HIDDEN, num_layers=1, use_norm=True
             ),
             action_head="action_value",
             reasoner=None,

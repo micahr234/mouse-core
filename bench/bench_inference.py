@@ -148,7 +148,7 @@ def main() -> None:
     backbone = Qwen3Backbone(
         train_kernel="varlen",
         decode_kernel="flex",
-        dtype=dtype,
+        dtype=dtype, use_norm=True,
         hidden_dim=args.hidden,
         num_layers=args.layers,
         num_heads=args.heads,

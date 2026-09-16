@@ -116,7 +116,7 @@ def _head(hidden_dim: int) -> DiscreteActionValueHead:
         in_features=hidden_dim,
         out_features=_MAX_ACTIONS,
         hidden_dim=hidden_dim,
-        num_layers=1,
+        num_layers=1, use_norm=True,
         scale=0.1,
     )
 
@@ -138,7 +138,7 @@ def _llama_model(hidden_dim: int = _HIDDEN) -> Model:
         backbone=LlamaBackbone(
             train_kernel="reference",
             decode_kernel="flex",
-            dtype=torch.float32,
+            dtype=torch.float32, use_norm=True,
             hidden_dim=hidden_dim,
             num_layers=2,
             num_heads=2,

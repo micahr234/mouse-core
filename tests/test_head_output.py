@@ -33,7 +33,7 @@ _TOKENS_PER_STEP = 6
 def _tiny_model(*, with_reasoner: bool = False) -> Model:
     encoder = NumericEmbedder(hidden_dim=_HIDDEN, modalities=_MODALITIES)
     backbone = LlamaBackbone(
-        train_kernel="reference", decode_kernel="flex", dtype=torch.float32,
+        train_kernel="reference", decode_kernel="flex", dtype=torch.float32, use_norm=True,
         hidden_dim=_HIDDEN,
         num_layers=2,
         num_heads=2,
@@ -43,7 +43,7 @@ def _tiny_model(*, with_reasoner: bool = False) -> Model:
         in_features=_HIDDEN,
         out_features=_ACTIONS,
         hidden_dim=_HIDDEN,
-        num_layers=1,
+        num_layers=1, use_norm=True,
     )
     reasoner = (
         LatentReasoner(hidden_dim=_HIDDEN, num_thoughts=2) if with_reasoner else None
@@ -199,14 +199,14 @@ def test_get_action_uses_last_valid_head_output_not_last_token() -> None:
         ],
     )
     backbone = LlamaBackbone(
-        train_kernel="reference", decode_kernel="flex", dtype=torch.float32,
+        train_kernel="reference", decode_kernel="flex", dtype=torch.float32, use_norm=True,
         hidden_dim=hidden, num_layers=2, num_heads=2, max_position_embeddings=128,
     )
     model = Model(
         encoder=encoder,
         backbone=backbone,
         heads=DiscreteActionValueHead(
-            in_features=hidden, out_features=_ACTIONS, hidden_dim=hidden, num_layers=1,
+            in_features=hidden, out_features=_ACTIONS, hidden_dim=hidden, num_layers=1, use_norm=True,
         ),
         action_head="action_value",
         reasoner=None,

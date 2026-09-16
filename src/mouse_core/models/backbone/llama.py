@@ -17,6 +17,7 @@ from mouse_core.models.backbone.base import (
     Backbone,
     DecodeKernel,
     TrainKernel,
+    _apply_final_norm,
     _disable_cudnn_sdp,
     _load_transformer_weights,
     _rope_parameters_from_config,
@@ -30,7 +31,8 @@ class _LlamaBackboneConfig:
 
     Builds a HuggingFace ``LlamaModel`` with SDPA attention and no token
     embedding (``vocab_size=1``; the MOUSE encoder supplies ``inputs_embeds``).
-    The final RMSNorm is kept, so the backbone output is normalized.
+    The final RMSNorm is applied in :class:`LlamaBackbone` when
+    ``use_norm=True``.
 
     Args:
         num_layers: Number of transformer decoder layers.
@@ -74,7 +76,8 @@ class _LlamaBackboneConfig:
             hidden_dim: Model hidden dimension ``D``; must be divisible by ``num_heads``.
 
         Returns:
-            ``LlamaModel`` (token embedding unused, final norm kept).
+            ``LlamaModel`` (token embedding unused; the caller applies
+            ``use_norm``).
         """
         _disable_cudnn_sdp()
         if hidden_dim % self.num_heads != 0:
@@ -110,6 +113,7 @@ class LlamaBackbone(Backbone):
                train_kernel="flex",
                decode_kernel="flex",
                dtype=torch.float32,
+               use_norm=True,
                hidden_dim=128,
                num_layers=4,
                num_heads=4,
@@ -122,6 +126,7 @@ class LlamaBackbone(Backbone):
                train_kernel="flex",
                decode_kernel="flex",
                dtype=preferred_dtype(device),
+               use_norm=True,
                pretrained="meta-llama/Llama-3.2-1B",
                num_layers=2,
            )
@@ -130,10 +135,13 @@ class LlamaBackbone(Backbone):
     convention. Cached decoding goes through ``decode_session()``.
 
     ``train_kernel`` (``"varlen"`` / ``"padded"`` / ``"flex"`` / ``"reference"``),
-    ``decode_kernel`` (``"flex"``) and ``dtype`` are required: the
-    uncached-forward kernel, the cached-decode kernel, and the dtype of the
+    ``decode_kernel`` (``"flex"``), ``dtype``, and ``use_norm`` are required:
+    the uncached-forward kernel, the cached-decode kernel, the dtype of the
     base weights (``torch.float32`` to fine-tune them,
-    ``preferred_dtype(device)`` for a frozen LoRA base or inference).
+    ``preferred_dtype(device)`` for a frozen LoRA base or inference), and
+    whether to keep the transformer's final RMSNorm (``False`` replaces it
+    with ``Identity``; per-layer norms stay). ``use_norm`` is saved with
+    the model.
     ``train_autocast_dtype`` / ``decode_autocast_dtype`` (bf16/fp16, fp32
     base only) declare mixed precision per path: the packed training
     forward and cached decode (KV pool in the autocast dtype). See
@@ -152,6 +160,7 @@ class LlamaBackbone(Backbone):
         train_kernel: TrainKernel,
         decode_kernel: DecodeKernel,
         dtype: torch.dtype,
+        use_norm: bool,
         train_autocast_dtype: torch.dtype | None = None,
         decode_autocast_dtype: torch.dtype | None = None,
         model: LlamaModel | None = None,
@@ -171,6 +180,7 @@ class LlamaBackbone(Backbone):
         if model is not None and pretrained is not None:
             raise TypeError("LlamaBackbone accepts either model= or pretrained=, not both.")
 
+        load_from: tuple[str | Path, dict[str, Any]] | None = None
         if model is not None:
             if not isinstance(model, LlamaModel):
                 raise TypeError(
@@ -194,20 +204,22 @@ class LlamaBackbone(Backbone):
             self.model = _LlamaBackboneConfig(**extracted_kwargs).build(extracted_hidden_dim)
             self._config_kwargs = dict(extracted_kwargs)
             if load_weights:
-                self._load_pretrained_weights(
-                    repo_id_or_path=pretrained, hub_kwargs=hf_kwargs
-                )
+                load_from = (pretrained, hf_kwargs)
         else:
             if hidden_dim is None:
                 raise TypeError(
                     "LlamaBackbone requires either a pre-built model, "
                     "pretrained=, or hidden_dim plus backbone config arguments "
-                    "(e.g. LlamaBackbone(hidden_dim=128, num_layers=2, num_heads=4))."
+                    "(e.g. LlamaBackbone(hidden_dim=128, num_layers=2, num_heads=4, use_norm=True))."
                 )
             cfg = _LlamaBackboneConfig(**config_kwargs)
             self.model = cfg.build(hidden_dim)
             self._config_kwargs = self._config_kwargs_from_model(self.model)
 
+        _apply_final_norm(self.model, use_norm)
+        self._config_kwargs["use_norm"] = use_norm
+        if load_from is not None:
+            self._load_pretrained_weights(repo_id_or_path=load_from[0], hub_kwargs=load_from[1])
         cast(torch.nn.Module, self.model).to(dtype)  # base weights; LoRA adapters below are always fp32
         self._attach_lora(self.model, lora)
 

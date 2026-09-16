@@ -52,6 +52,24 @@ def _disable_cudnn_sdp() -> None:
         enable_cudnn_sdp(enabled=False)
 
 
+def _apply_final_norm(model: nn.Module, use_norm: bool) -> None:
+    """Keep or drop the transformer's final RMSNorm.
+
+    Per-layer norms (input, post-attention, Qwen3 q/k) are unchanged.
+    ``use_norm=False`` replaces ``model.norm`` with ``nn.Identity``.
+    """
+    if type(use_norm) is not bool:
+        raise TypeError(f"use_norm must be a bool, got {use_norm!r}.")
+    if use_norm:
+        if isinstance(model.norm, nn.Identity):
+            raise TypeError(
+                "use_norm=True requires the transformer final RMSNorm; "
+                f"got {type(model.norm).__name__}."
+            )
+        return
+    model.norm = nn.Identity()
+
+
 class Backbone(nn.Module, ABC):
     """Abstract base for backbones.
 
@@ -257,7 +275,10 @@ def _load_transformer_weights(
     MOUSE backbones replace token embeddings with a MOUSE encoder
     (:class:`~mouse_core.models.embedding.NumericEmbedder` or
     :class:`~mouse_core.models.embedding.TextEmbedder`), so the
-    ``embed_tokens`` keys are skipped. The final norm is kept and loaded.
+    ``embed_tokens`` keys are skipped. The final norm is loaded when the
+    target still has ``norm.weight`` (``use_norm=True``); ``use_norm=False``
+    replaces that module with ``Identity``, so the checkpoint's
+    ``norm.weight`` is skipped.
 
     Warns in both directions: backbone tensors that did not receive pretrained
     weights (missing from the checkpoint or shape-mismatched, so they keep
@@ -271,7 +292,7 @@ def _load_transformer_weights(
         pretrained = AutoModel.from_pretrained(repo_id_or_path, **hub_kwargs)
     target_state = model.state_dict()
     pretrained_state = pretrained.state_dict()
-    skipped_prefixes = ("embed_tokens",)
+    skipped_prefixes = ("embed_tokens",) if "norm.weight" in target_state else ("embed_tokens", "norm")
     loadable = {
         key: value
         for key, value in pretrained_state.items()

@@ -67,8 +67,8 @@ def _as_rect(preds: torch.Tensor) -> torch.Tensor:
 def _tiny_model(backbone_cls, tokens: int=1, dtype: torch.dtype = torch.float32, train_kernel: str = "reference", **backbone_kwargs) -> Model:
     hidden_dim = 16
     encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}, {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3, "std": 0.02, "positions": 1}])
-    backbone = backbone_cls(train_kernel=train_kernel, decode_kernel="flex", dtype=dtype, hidden_dim=hidden_dim, num_layers=2, num_heads=2, **backbone_kwargs)
-    head = DiscreteActionValueHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1)
+    backbone = backbone_cls(train_kernel=train_kernel, decode_kernel="flex", dtype=dtype, use_norm=True, hidden_dim=hidden_dim, num_layers=2, num_heads=2, **backbone_kwargs)
+    head = DiscreteActionValueHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, use_norm=True)
     return Model(encoder=encoder, backbone=backbone, heads=head, action_head="action_value", reasoner=None, recurrence=None).eval()
 
 def _steps(n: int, start: int=0) -> list[dict]:
@@ -183,14 +183,14 @@ def test_cuda_bf16_lora_compiled_train_matches_cached_decode() -> None:
         ],
     )
     backbone = Qwen3Backbone(
-        train_kernel="varlen", decode_kernel="flex", dtype=torch.bfloat16,
+        train_kernel="varlen", decode_kernel="flex", dtype=torch.bfloat16, use_norm=True,
         hidden_dim=hidden_dim,
         num_layers=2,
         num_heads=4,
         lora=LoRAConfig(rank=4, alpha=8.0),
     )
     head = DiscreteActionValueHead(
-        in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1
+        in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, use_norm=True
     )
     model = Model(encoder=encoder, backbone=backbone, heads=head, action_head="action_value", reasoner=None, recurrence=None).eval().to(torch.device('cuda'))
     steps = _steps(8)
@@ -283,7 +283,7 @@ def test_cuda_step_cudagraph_matches_eager_decode(S: int) -> None:
     torch.manual_seed(0)
     device = torch.device('cuda')
     backbone = Qwen3Backbone(
-        train_kernel="varlen", decode_kernel="flex", dtype=torch.bfloat16,
+        train_kernel="varlen", decode_kernel="flex", dtype=torch.bfloat16, use_norm=True,
         hidden_dim=64, num_layers=2, num_heads=4, lora=LoRAConfig(rank=4, alpha=8.0),
     ).to(device).eval()
     for n, p in backbone.named_parameters():
@@ -328,7 +328,7 @@ def _cuda_graph_session(batch_size: int = 2) -> tuple[Any, torch.device, int]:
 
     device = torch.device("cuda")
     backbone = Qwen3Backbone(
-        train_kernel="varlen", decode_kernel="flex", dtype=torch.bfloat16,
+        train_kernel="varlen", decode_kernel="flex", dtype=torch.bfloat16, use_norm=True,
         hidden_dim=64, num_layers=2, num_heads=4, lora=LoRAConfig(rank=4, alpha=8.0),
     ).to(device).eval()
     inner = cast(nn.Module, cast(Any, backbone).model)
@@ -570,8 +570,8 @@ def test_concat_fusion_ragged_chunks_match_unbatched() -> None:
     torch.manual_seed(6)
     hidden_dim = 16
     encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}, {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0}, {"type": 'discrete', "field": "episode_done", "vocab_size": 3, "std": 0.02, "positions": 1}, {'type': 'learnable', 'tokens': 1, "std": 0.02, "positions": 1}])
-    backbone = Qwen3Backbone(train_kernel="reference", decode_kernel="flex", dtype=torch.float32, hidden_dim=hidden_dim, num_layers=2, num_heads=2)
-    head = DiscreteActionValueHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1)
+    backbone = Qwen3Backbone(train_kernel="reference", decode_kernel="flex", dtype=torch.float32, use_norm=True, hidden_dim=hidden_dim, num_layers=2, num_heads=2)
+    head = DiscreteActionValueHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, use_norm=True)
     model = Model(encoder=encoder, backbone=backbone, heads=head, action_head="action_value", reasoner=None, recurrence=None).eval()
     assert model.encoder.tokens_per_step == 4
     chunk_lengths = [[1, 4, 2], [3, 0, 1], [2, 2, 3]]

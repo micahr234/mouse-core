@@ -38,7 +38,7 @@ def _head(hidden_dim: int = 8, out_features: int = 3) -> DiscreteActionValueHead
         in_features=hidden_dim,
         out_features=out_features,
         hidden_dim=hidden_dim,
-        num_layers=1,
+        num_layers=1, use_norm=True,
     )
 
 

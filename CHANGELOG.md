@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- ``LlamaBackbone``, ``Qwen3Backbone``, ``SwiGLUHead``, and the action
+  heads require ``use_norm``.
 - ``Polyak.update`` skips a section whose ``tau`` is ``0`` (no delayed-
   parameter writes). All-zero ``tau`` returns immediately.
 - Example notebooks: training is ``01``–``14``; inference is
@@ -24,6 +26,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   disable only after a repeated hard failure.
 
 ### Added
+- ``use_norm`` (required, saved with the model) on transformer
+  backbones and on ``SwiGLUHead`` / action heads. On
+  ``LlamaBackbone`` / ``Qwen3Backbone``, ``True`` keeps the final
+  RMSNorm and ``False`` replaces it with ``Identity`` (per-layer
+  norms stay). On a head, ``True`` prepends an input RMSNorm and
+  ``False`` skips it.
 - ``Model.features``: encoder + backbone only (pooled last-layer
   states at head-output tokens). Does not run heads. Training path
   only (no cache, no ``reasoning=``). Pair with ``Model.head`` when

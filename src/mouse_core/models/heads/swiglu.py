@@ -29,17 +29,18 @@ class SwiGLUHead(BaseHead):
 
         [RMSNorm →] SwiGLU(D→hidden) × (num_layers−1) → ScaledLinear(hidden→out)
 
-    The optional ``RMSNorm`` (``use_norm=True``) is applied to the input before
-    the first SwiGLU block. ``scale`` controls the output weight initialisation
-    magnitude — set small (e.g. ``0.01``) for a near-zero initial output.
+    ``use_norm`` (required) prepends an ``RMSNorm`` on the input before
+    the first SwiGLU block — independent of the backbone's final RMSNorm.
+    ``scale`` controls the output weight initialisation magnitude — set
+    small (e.g. ``0.01``) for a near-zero initial output.
 
     Args:
         in_features: Input dimension ``D``.
         out_features: Output dimension (number of actions ``A``, or ``A * vec_dim``).
         hidden_dim: Width of the SwiGLU hidden layers.
         num_layers: Total depth including the final linear; must be ``>= 1``.
-        scale: ``ScaledLinear`` weight init multiplier for the output projection.
         use_norm: Whether to prepend an ``RMSNorm`` layer.
+        scale: ``ScaledLinear`` weight init multiplier for the output projection.
     """
 
     def __init__(
@@ -48,16 +49,18 @@ class SwiGLUHead(BaseHead):
         out_features: int,
         hidden_dim: int,
         num_layers: int,
+        use_norm: bool,
         scale: float = 1.0,
-        use_norm: bool = True,
     ):
         super().__init__()
+        if type(use_norm) is not bool:
+            raise TypeError(f"use_norm must be a bool, got {use_norm!r}.")
         self.in_features = int(in_features)
         self.out_features = int(out_features)
         self.hidden_dim = int(hidden_dim)
         self.num_layers = int(num_layers)
         self.scale = float(scale)
-        self.use_norm = bool(use_norm)
+        self.use_norm = use_norm
         if use_norm:
             self.norm = nn.RMSNorm(in_features, elementwise_affine=True, eps=1e-5)
         else:

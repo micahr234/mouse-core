@@ -42,7 +42,7 @@ _BATCH = [
 
 
 def _backbone(lora: LoRAConfig | None, *, cls=Qwen3Backbone, dtype: torch.dtype = torch.float32):
-    return cls(train_kernel="reference", decode_kernel="flex", dtype=dtype, hidden_dim=_HIDDEN, num_layers=2, num_heads=2, max_position_embeddings=64, lora=lora)
+    return cls(train_kernel="reference", decode_kernel="flex", dtype=dtype, use_norm=True, hidden_dim=_HIDDEN, num_layers=2, num_heads=2, max_position_embeddings=64, lora=lora)
 
 
 def _model(
@@ -56,7 +56,7 @@ def _model(
         encoder=NumericEmbedder(hidden_dim=_HIDDEN, modalities=_MODALITIES),
         backbone=_backbone(lora, dtype=dtype),
         heads=DiscreteActionValueHead(
-            in_features=_HIDDEN, out_features=_ACTIONS, hidden_dim=_HIDDEN, num_layers=1
+            in_features=_HIDDEN, out_features=_ACTIONS, hidden_dim=_HIDDEN, num_layers=1, use_norm=True
         ),
         action_head="action_value",
         reasoner=LatentReasoner(hidden_dim=_HIDDEN, num_thoughts=1) if reasoner else None,

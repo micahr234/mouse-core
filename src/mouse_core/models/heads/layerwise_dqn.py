@@ -27,21 +27,23 @@ class LayerwiseDiscreteActionValueHead(BaseHead):
         out_features: int,
         hidden_dim: int,
         num_layers: int,
+        use_norm: bool,
         scale: float = 1.0,
-        use_norm: bool = True,
     ) -> None:
         super().__init__()
         if num_backbone_layers < 1:
             raise ValueError(
                 f"num_backbone_layers must be >= 1, got {num_backbone_layers}."
             )
+        if type(use_norm) is not bool:
+            raise TypeError(f"use_norm must be a bool, got {use_norm!r}.")
         self.num_backbone_layers = int(num_backbone_layers)
         self.in_features = int(in_features)
         self.out_features = int(out_features)
         self.hidden_dim = int(hidden_dim)
         self.num_layers = int(num_layers)
         self.scale = float(scale)
-        self.use_norm = bool(use_norm)
+        self.use_norm = use_norm
         self.layer_heads = nn.ModuleList(
             [
                 DiscreteActionValueHead(

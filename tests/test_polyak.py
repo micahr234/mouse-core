@@ -36,7 +36,7 @@ _BATCH = [
 
 def _head(hidden_dim: int) -> DiscreteActionValueHead:
     return DiscreteActionValueHead(
-        in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1
+        in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, use_norm=True
     )
 
 
@@ -51,7 +51,7 @@ def _llama_model(*, layerwise: bool = False) -> Model:
     hidden_dim = 16
     encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=_MODALITIES)
     backbone = LlamaBackbone(
-        train_kernel="reference", decode_kernel="flex", dtype=torch.float32,
+        train_kernel="reference", decode_kernel="flex", dtype=torch.float32, use_norm=True,
         hidden_dim=hidden_dim, num_layers=2, num_heads=2, max_position_embeddings=64
     )
     head: BaseHead
@@ -61,7 +61,7 @@ def _llama_model(*, layerwise: bool = False) -> Model:
             in_features=hidden_dim,
             out_features=4,
             hidden_dim=hidden_dim,
-            num_layers=1,
+            num_layers=1, use_norm=True,
         )
     else:
         head = _head(hidden_dim)
@@ -389,7 +389,7 @@ def test_polyak_rejects_wrong_models() -> None:
     mismatched = Model(
         encoder=NumericEmbedder(hidden_dim=8, modalities=_MODALITIES),
         backbone=IdentityBackbone(hidden_dim=8),
-        heads=DiscreteActionValueHead(in_features=8, out_features=4, hidden_dim=8, num_layers=2),
+        heads=DiscreteActionValueHead(in_features=8, out_features=4, hidden_dim=8, num_layers=2, use_norm=True),
         action_head="action_value",
         reasoner=None,
         recurrence=None,

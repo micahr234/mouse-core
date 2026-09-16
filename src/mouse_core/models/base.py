@@ -866,7 +866,7 @@ def _build_heads_from_config(heads: list[dict[str, Any]]) -> dict[str, BaseHead]
                 hidden_dim=spec["hidden_dim"],
                 num_layers=spec["num_layers"],
                 scale=spec.get("scale", 1.0),
-                use_norm=spec.get("use_norm", True),
+                use_norm=spec["use_norm"],
             )
         elif head_type == "action_value":
             built[name] = DiscreteActionValueHead(
@@ -875,7 +875,7 @@ def _build_heads_from_config(heads: list[dict[str, Any]]) -> dict[str, BaseHead]
                 hidden_dim=spec["hidden_dim"],
                 num_layers=spec["num_layers"],
                 scale=spec.get("scale", 1.0),
-                use_norm=spec.get("use_norm", True),
+                use_norm=spec["use_norm"],
             )
         elif head_type == "discrete_action":
             built[name] = DiscreteActionHead(
@@ -884,7 +884,7 @@ def _build_heads_from_config(heads: list[dict[str, Any]]) -> dict[str, BaseHead]
                 hidden_dim=spec["hidden_dim"],
                 num_layers=spec["num_layers"],
                 scale=spec.get("scale", 1.0),
-                use_norm=spec.get("use_norm", True),
+                use_norm=spec["use_norm"],
             )
         elif head_type == "swiglu":
             built[name] = SwiGLUHead(
@@ -893,7 +893,7 @@ def _build_heads_from_config(heads: list[dict[str, Any]]) -> dict[str, BaseHead]
                 hidden_dim=spec["hidden_dim"],
                 num_layers=spec["num_layers"],
                 scale=spec.get("scale", 1.0),
-                use_norm=spec.get("use_norm", True),
+                use_norm=spec["use_norm"],
             )
         else:
             raise ValueError(f"Unsupported head type {head_type!r}.")
