@@ -44,18 +44,19 @@ def _require_head(predictions: TensorDict, *, key: str, shape: torch.Size, who: 
     return values
 
 
-def _epsilon_greedy(q: torch.Tensor, *, epsilon: float) -> torch.Tensor:
-    """ε-greedy distribution over the last dim of ``q``, shape ``q.shape``.
+def _softmax_policy(q: torch.Tensor, *, temperature: float) -> torch.Tensor:
+    """Target policy over the last dim of ``q``, shape ``q.shape``.
 
-    ``ε / A`` on every action plus ``(1 - ε)`` split evenly across the
-    argmax set (ties share the greedy mass; ``ε = 0`` is exactly greedy).
+    ``softmax(q / temperature)`` — the same convention as
+    :meth:`~mouse_core.models.base.Model.get_action`. ``temperature = 0``
+    is the greedy policy with the argmax set sharing the mass evenly.
     """
-    n_actions = int(q.shape[-1])
-    is_max = q == q.amax(dim=-1, keepdim=True)
-    greedy = is_max.to(dtype=q.dtype) / is_max.sum(dim=-1, keepdim=True).to(
-        dtype=q.dtype
-    )
-    return float(epsilon) / n_actions + (1.0 - float(epsilon)) * greedy
+    if float(temperature) == 0.0:
+        is_max = q == q.amax(dim=-1, keepdim=True)
+        return is_max.to(dtype=q.dtype) / is_max.sum(dim=-1, keepdim=True).to(
+            dtype=q.dtype
+        )
+    return F.softmax(q / float(temperature), dim=-1)
 
 
 @torch.no_grad()
@@ -73,7 +74,7 @@ def _retrace_targets(
     """Retrace(λ) target for every pair ``(t, t+1)`` and its trace ratio.
 
     ``q_step`` / ``pi_step`` / ``mu_step`` are ``[N, A]`` per-step reads at
-    the last head-output row: delayed Q, the ε-greedy target policy over it,
+    the last head-output row: delayed Q, the softmax target policy over it,
     and the learned behavior distribution. Returns ``(G [N-1], ratio [N-1])``::
 
         G_t = r_t + γ_t * ( E_π Q(s_{t+1}, ·)
@@ -128,12 +129,15 @@ class RetraceObjective(Objective):
     target of every transition is the delayed one-step expected backup plus
     a trace of later TD errors, each scaled by the product of truncated
     importance ratios ``c_s = λ min(1, π(a_s|s_s) / μ(a_s|s_s))``. ``π`` is
-    the target policy — ε-greedy with respect to the delayed Q — and ``μ``
-    is the behavior policy that produced the data. Because the ratio is
-    clipped at ``1``, near-on-policy transitions keep the full λ-return
-    while strongly off-policy actions cut the trace, without
-    importance-weight variance. ``epsilon=0`` makes ``π`` greedy, which is
-    Watkins's Q(λ) with the greedy check on the delayed network.
+    the target policy — ``softmax(Q / temperature)`` over the delayed Q,
+    the same convention as :meth:`~mouse_core.models.base.Model.get_action`
+    — and ``μ`` is the behavior policy that produced the data. Because the
+    ratio is clipped at ``1``, near-on-policy transitions keep the full
+    λ-return while strongly off-policy actions cut the trace, without
+    importance-weight variance. A lower temperature is a greedier ``π``
+    (the paper's increasingly-greedy sequence); ``temperature=0`` is the
+    greedy policy, which is Watkins's Q(λ) with the greedy check on the
+    delayed network.
 
     The dataset does not store ``μ``. It is **learned**: the model carries a
     second head, a :class:`~mouse_core.models.heads.DiscreteActionHead`
@@ -184,6 +188,9 @@ class RetraceObjective(Objective):
     paper's Atari runs use ``λ = 1`` with the exploration policy as ``π``;
     the clipped ratio does the trace cutting that ``Q*(λ)`` needs ``λ < 1``
     for. The λ-return is computed with a parallel scan on the device.
+    ``π`` is taken over the delayed head's raw Q (before ``q_scale`` /
+    ``q_shift``), so ``temperature`` is in the units the head outputs and
+    means the same thing here as in ``get_action(temperature=)``.
 
     Model construction pairs the two heads under caller-chosen keys, with
     ``get_action`` reading the Q head::
@@ -206,9 +213,10 @@ class RetraceObjective(Objective):
         td_lambda: λ of the trace in ``[0, 1]``. ``0.0`` is the expected
             one-step target; ``1.0`` cuts traces only through
             ``min(1, π/μ)``.
-        epsilon: Exploration of the ε-greedy target policy ``π`` in
-            ``[0, 1]``. ``0.0`` is greedy (Watkins's cut); ``1.0`` is
-            uniform. Ties share the greedy mass.
+        temperature: Softmax temperature of the target policy
+            ``π = softmax(Q / temperature)``, ``>= 0``. ``0.0`` is greedy
+            (Watkins's cut; argmax ties share the mass); larger values
+            flatten ``π`` toward uniform and cut fewer traces.
         behavior_weight: Coefficient of the behavior-cloning cross-entropy
             in the returned loss. Must be ``> 0`` — the trace needs a
             trained ``μ``.
@@ -235,7 +243,7 @@ class RetraceObjective(Objective):
         reward_shift: Offset added after ``reward_scale`` (default ``0.0``).
         q_scale: Multiplier applied to online and delayed ``action_value``
             before the TD error (default ``1.0``). Same affine on both
-            networks; ``π`` is unchanged by it.
+            networks; ``π`` is taken over the raw Q and is unchanged by it.
         q_shift: Offset added after ``q_scale`` (default ``0.0``).
         episode_done_key: Key in ``objective_data`` for the episode-done code.
         task_done_key: Key in ``objective_data`` for the task-done code.
@@ -260,7 +268,7 @@ class RetraceObjective(Objective):
         self,
         *,
         td_lambda: float,
-        epsilon: float,
+        temperature: float,
         behavior_weight: float,
         gamma_step: float,
         gamma_episode_terminal: float,
@@ -282,14 +290,14 @@ class RetraceObjective(Objective):
     ) -> None:
         if not 0.0 <= float(td_lambda) <= 1.0:
             raise ValueError(f"td_lambda must be in [0, 1], got {td_lambda}.")
-        if not 0.0 <= float(epsilon) <= 1.0:
-            raise ValueError(f"epsilon must be in [0, 1], got {epsilon}.")
+        if not float(temperature) >= 0.0:
+            raise ValueError(f"temperature must be >= 0, got {temperature}.")
         if not float(behavior_weight) > 0.0:
             raise ValueError(
                 f"behavior_weight must be > 0 (the trace needs a trained μ), got {behavior_weight}."
             )
         self.td_lambda = float(td_lambda)
-        self.epsilon = float(epsilon)
+        self.temperature = float(temperature)
         self.behavior_weight = float(behavior_weight)
         self.gamma_step = gamma_step
         self.gamma_episode_terminal = gamma_episode_terminal
@@ -337,6 +345,7 @@ class RetraceObjective(Objective):
         behavior_logits = _require_head(
             predictions, key=self.behavior_key, shape=q.shape, who="Retrace"
         )
+        q_target_raw = q_target  # π is taken over the head's own Q (get_action units)
         q = _affine(q, scale=self.q_scale, shift=self.q_shift)
         q_target = _affine(q_target, scale=self.q_scale, shift=self.q_shift)
         P, A = q.shape
@@ -405,7 +414,9 @@ class RetraceObjective(Objective):
 
         q_values = q.gather(dim=-1, index=next_actions.unsqueeze(-1)).squeeze(-1)  # [P]
         q_step = q_target[last_rows]  # [N, A]  delayed Q(s_i, ·)
-        pi_step = _epsilon_greedy(q_step, epsilon=self.epsilon)  # [N, A]  π(· | s_i)
+        pi_step = _softmax_policy(
+            q_target_raw[last_rows], temperature=self.temperature
+        )  # [N, A]  π(· | s_i)
         pair_target, ratio = _retrace_targets(
             reward=reward,
             discount_all=discount_all,
