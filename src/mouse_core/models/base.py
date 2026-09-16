@@ -1291,8 +1291,9 @@ class Model(nn.Module):
 
         ``heads`` names the heads the delayed model carries — only those
         the objective reads from ``delayed_predictions`` (the Q head for
-        ``DqnObjective`` / ``RetraceObjective``, ``action_value_layerwise``
-        for ``LayerwiseDqnObjective``). Heads left out (a policy or behavior
+        ``DqnObjective`` / ``RetraceObjective``, each ``prediction_key``
+        for ``NStepDqnObjective``, ``action_value_layerwise`` for
+        ``LayerwiseDqnObjective``). Heads left out (a policy or behavior
         head whose delayed values nothing uses) are neither copied, run,
         nor Polyak-interpolated. Every name must be an enabled head and
         the list must not be empty. The copy's ``action_head`` is this

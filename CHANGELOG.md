@@ -11,7 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ``Model.delayed_copy(heads=...)``: ``heads`` is required and names the
   heads the delayed model carries — only those the objective reads from
   ``delayed_predictions`` (``("action_value",)`` for ``DqnObjective`` /
-  ``RetraceObjective``, ``("action_value_layerwise",)`` for
+  ``RetraceObjective``, each ``prediction_key`` for
+  ``NStepDqnObjective``, ``("action_value_layerwise",)`` for
   ``LayerwiseDqnObjective``). Heads left out are neither copied, run, nor
   Polyak-interpolated; the copy's ``action_head`` is the online one when
   listed, else the first name. ``Polyak`` pairs each delayed head with
@@ -21,7 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   heads require ``use_norm``.
 - ``Polyak.update`` skips a section whose ``tau`` is ``0`` (no delayed-
   parameter writes). All-zero ``tau`` returns immediately.
-- Example notebooks: training is ``01``–``12``; inference is
+- Example notebooks: training is ``01``–``13``; inference is
   ``15_inference.ipynb`` (was ``09``).
 
 ### Removed
@@ -32,9 +33,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Incremental Flex decode CUDA-graph capture no longer disables the
   session after one silent miss. Grow steps and eager FlexAttention skip
   capture; a miss is logged and retried once the shape is stable; graphs
-  disable only after a repeated hard failure.
+  disable only after a repeated hard failure. A successful capture is
+  silent (eval builds several sessions and shapes).
 
 ### Added
+- ``NStepDqnObjective``: fixed-horizon n-step DQN. Required ``n``
+  (``int >= 1``) and ``prediction_key`` select the backup length and
+  which Q head to train; ``n=1`` is the one-step target ``r + γ V``.
+  A window that hits a run break or the end of the batch truncates and
+  bootstraps at the last in-run next state. One objective trains one
+  head — call it once per head and add the losses to train several
+  horizons. ``examples/13_train_offline_n_step_dqn.ipynb`` is the same
+  offline loop as ``02`` with three ``DiscreteActionValueHead``s
+  (``n=1, 3, 5``), ``delayed_copy`` of every Q head, and the three
+  n-step losses summed.
 - ``RetraceObjective``: Retrace(λ) off-policy return-based Q-learning
   (Munos et al., 2016). The TD target is the delayed expected one-step
   backup plus a trace of later TD errors scaled by truncated importance

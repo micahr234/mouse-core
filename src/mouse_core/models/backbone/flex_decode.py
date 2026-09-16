@@ -576,7 +576,6 @@ class FlexDecodeSession:
         self._graph_last_addr_shape: tuple[int, ...] | None = None
         self._graph_miss_key: tuple[int, int, int] | None = None
         self._graph_miss_count = 0
-        self._graph_capture_logged = False
         self._g_h: torch.Tensor | None = None
         self._g_cos: torch.Tensor | None = None
         self._g_sin: torch.Tensor | None = None
@@ -1012,9 +1011,6 @@ class FlexDecodeSession:
         self._g_cache_id = id(self.k_cache)
         self._graph_miss_key = None
         self._graph_miss_count = 0
-        if not self._graph_capture_logged:
-            self._graph_capture_logged = True
-            warnings.warn(f"cuda graph captured key={key}", stacklevel=2)
         return self._g_out, self._g_hiddens
 
     def reset_rows(self, rows: Sequence[int] | None = None) -> None:

@@ -6,6 +6,7 @@ from mouse_core.objectives.layerwise_dqn import (
     effective_horizon,
     gamma_from_horizon,
 )
+from mouse_core.objectives.nstep import NStepDqnObjective
 from mouse_core.objectives.ppo import PpoObjective, sample_discrete_action
 from mouse_core.objectives.retrace import RetraceObjective
 from mouse_core.objectives.sp import SpObjective
@@ -19,6 +20,7 @@ __all__ = [
     "LayerwiseDqnObjective",
     "effective_horizon",
     "gamma_from_horizon",
+    "NStepDqnObjective",
     "PpoObjective",
     "sample_discrete_action",
     "RetraceObjective",
