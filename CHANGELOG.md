@@ -38,20 +38,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ``RetraceObjective``: Retrace(λ) off-policy return-based Q-learning
   (Munos et al., 2016). The TD target is the delayed expected one-step
   backup plus a trace of later TD errors scaled by truncated importance
-  ratios ``c = td_lambda * min(1, π/μ)``; ``π`` is ε-greedy
-  (``epsilon``, required) on the delayed Q, every target quantity reads
-  the delayed network, and the λ-return is a parallel scan.
+  ratios ``c = td_lambda * min(1, π/μ)``; ``π = softmax(Q / temperature)``
+  over the delayed head's raw Q (``temperature``, required, ``>= 0``,
+  same convention as ``get_action``), every target quantity reads the
+  delayed network, and the λ-return is a parallel scan.
   ``μ`` is not stored with the data: the model carries a second
   ``DiscreteActionHead`` under ``predictions[behavior_key]``
   (``"behavior"``), the objective trains it by behavior cloning on the
   taken actions (``behavior_weight``, required, ``> 0``) and reads its
   detached softmax as ``μ``. Loss is ``td_loss + behavior_weight *
   behavior_loss``; metrics add ``td_loss``, ``behavior_loss``,
-  ``behavior_prob_mean``, and ``retrace_ratio_mean``. ``epsilon=0`` is
-  Watkins's Q(λ) with the greedy check on the delayed network.
+  ``behavior_prob_mean``, and ``retrace_ratio_mean``. ``temperature=0``
+  is the greedy target policy, i.e. Watkins's Q(λ) with the greedy check
+  on the delayed network.
   ``examples/12_train_offline_retrace.ipynb`` is the same offline loop
   as ``02`` with ``heads={"action_value": ..., "behavior": ...}``,
-  ``td_lambda=1.0``, ``epsilon=0.1``, and
+  ``td_lambda=1.0``, ``temperature=0.1``, and
   ``delayed_copy(heads=("action_value",))`` so the behavior head is
   never run or Polyak-interpolated on the delayed side.
 - ``use_norm`` (required, saved with the model) on transformer
