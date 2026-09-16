@@ -220,8 +220,10 @@ class RetraceObjective(Objective):
             (Watkins's cut; argmax ties share the mass); larger values
             flatten ``π`` toward uniform and cut fewer traces.
         behavior_weight: Coefficient of the behavior head's NLL
-            (``-log μ(a_t | s_t)``) in the returned loss. Must be ``> 0`` — the trace needs a
-            trained ``μ``.
+            (``-log μ(a_t | s_t)``) in the returned loss. Must be ``>= 0``.
+            ``0.0`` excludes the NLL from the returned loss; the head is
+            still required and its detached softmax is still ``μ`` for
+            the trace.
         gamma_step: Discount factor for running (non-terminal) transitions
             (``episode_done == 0``).
         gamma_episode_terminal: Discount applied when the episode terminates
@@ -294,9 +296,9 @@ class RetraceObjective(Objective):
             raise ValueError(f"td_lambda must be in [0, 1], got {td_lambda}.")
         if not float(temperature) >= 0.0:
             raise ValueError(f"temperature must be >= 0, got {temperature}.")
-        if not float(behavior_weight) > 0.0:
+        if not float(behavior_weight) >= 0.0:
             raise ValueError(
-                f"behavior_weight must be > 0 (the trace needs a trained μ), got {behavior_weight}."
+                f"behavior_weight must be >= 0, got {behavior_weight}."
             )
         self.td_lambda = float(td_lambda)
         self.temperature = float(temperature)

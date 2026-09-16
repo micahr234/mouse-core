@@ -98,8 +98,8 @@ def test_retrace_rejects_out_of_range_hyperparameters() -> None:
         _retrace(td_lambda=1.5)
     with pytest.raises(ValueError, match="temperature must be >= 0"):
         _retrace(temperature=-0.1)
-    with pytest.raises(ValueError, match="behavior_weight must be > 0"):
-        _retrace(behavior_weight=0.0)
+    with pytest.raises(ValueError, match="behavior_weight must be >= 0"):
+        _retrace(behavior_weight=-0.1)
 
 
 def test_retrace_objective_runs() -> None:
@@ -201,6 +201,13 @@ def test_retrace_total_loss_adds_weighted_behavior_nll() -> None:
     loss, metrics = _retrace(behavior_weight=2.0)(step_stream, predictions, delayed)
     assert abs(metrics["behavior_loss"] - _nll_loss(0.25)) < 1e-5
     assert abs(loss.item() - (metrics["td_loss"] + 2.0 * _nll_loss(0.25))) < 1e-2
+
+
+def test_retrace_zero_behavior_weight_is_td_loss_only() -> None:
+    step_stream, predictions, delayed = _fixture(mu_1=0.25)
+    loss, metrics = _retrace(behavior_weight=0.0)(step_stream, predictions, delayed)
+    assert abs(metrics["behavior_loss"] - _nll_loss(0.25)) < 1e-5
+    assert abs(loss.item() - metrics["td_loss"]) < 1e-5
 
 
 def test_retrace_behavior_head_is_trained_and_gives_no_td_gradient() -> None:

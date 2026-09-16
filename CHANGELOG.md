@@ -46,7 +46,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``DiscreteActionHead`` under ``predictions[behavior_key]``
   (``"behavior"``) whose outputs are logits; the objective fits it by NLL
   of the taken actions, ``-log softmax(logits)[a]`` (``behavior_weight``,
-  required, ``> 0``), and reads the same distribution, detached, as ``μ``.
+  required, ``>= 0``; ``0`` drops the NLL from the loss), and reads the
+  same distribution, detached, as ``μ``.
   Loss is ``td_loss + behavior_weight *
   behavior_loss``; metrics add ``td_loss``, ``behavior_loss``,
   ``behavior_prob_mean``, and ``retrace_ratio_mean``. ``temperature=0``
