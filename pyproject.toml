@@ -23,7 +23,7 @@ dependencies = [
     "tokenizers>=0.23.2",
     "tensordict>=0.14.2",
     "datasets>=5.0.1",
-    "huggingface_hub>=1.31.0",
+    "huggingface_hub>=1.32.0",
 ]
 
 [project.urls]

@@ -130,10 +130,12 @@ class PpoObjective(Objective):
         gamma_episode_terminal: Discount when an episode ends (``episode_done == 1``).
         gamma_episode_truncated: Discount when an episode is truncated
             (``episode_done == 2``).
-        gamma_task_terminal: Extra discount when a task ends (``task_done == 1``);
+        gamma_task_terminal: Extra discount when the task terminates
+            (``task_done == 1``; ``EnvConfig.terminate_task``);
             multiplies the episode discount. ``task_done == 0`` uses ``1.0``.
-        gamma_task_truncated: Extra discount when a task is truncated
-            (``task_done == 2``); multiplies the episode discount.
+        gamma_task_truncated: Extra discount when the task is truncated
+            (``task_done == 2``; last episode of ``max_task_episodes``);
+            multiplies the episode discount.
         gae_lambda: GAE λ (``1.0`` = Monte Carlo returns within the discount).
         clip_eps: PPO ratio clip ε.
         vf_coef: Weight on the value-function MSE term.

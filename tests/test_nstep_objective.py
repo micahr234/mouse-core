@@ -33,7 +33,7 @@ def _q(
 
 def _nstep(**overrides: object) -> NStepDqnObjective:
     kwargs: dict[str, object] = dict(
-        n=1, prediction_key="action_value", grouping_field=None, **_GAMMAS
+        n=1, prediction_key="action_value", grouping_field=None, temperature=0.0, **_GAMMAS
     )
     kwargs.update(overrides)
     return NStepDqnObjective(**kwargs)  # type: ignore[arg-type]
@@ -69,12 +69,14 @@ _TWO_STEP = 11668.0
 def test_nstep_requires_n_prediction_key_and_grouping_field() -> None:
     with pytest.raises(TypeError, match="n"):
         NStepDqnObjective(  # type: ignore[call-arg]
-            prediction_key="action_value", grouping_field=None, **_GAMMAS
+            prediction_key="action_value", grouping_field=None, temperature=0.0, **_GAMMAS
         )
     with pytest.raises(TypeError, match="prediction_key"):
-        NStepDqnObjective(n=1, grouping_field=None, **_GAMMAS)  # type: ignore[call-arg]
+        NStepDqnObjective(n=1, grouping_field=None, temperature=0.0, **_GAMMAS)  # type: ignore[call-arg]
     with pytest.raises(TypeError, match="grouping_field"):
-        NStepDqnObjective(n=1, prediction_key="action_value", **_GAMMAS)  # type: ignore[call-arg]
+        NStepDqnObjective(n=1, prediction_key="action_value", temperature=0.0, **_GAMMAS)  # type: ignore[call-arg]
+    with pytest.raises(TypeError, match="temperature"):
+        NStepDqnObjective(n=1, prediction_key="action_value", grouping_field=None, **_GAMMAS)  # type: ignore[call-arg]
 
 
 def test_nstep_rejects_non_positive_n() -> None:
@@ -111,7 +113,7 @@ def test_nstep_requires_prediction_key_on_both_sides() -> None:
 def test_nstep_one_matches_dqn() -> None:
     step_stream, predictions, delayed = _lambda_fixture()
     nstep, metrics = _nstep(n=1)(step_stream, predictions, delayed)
-    dqn, _ = DqnObjective(grouping_field=None, **_GAMMAS)(
+    dqn, _ = DqnObjective(grouping_field=None, temperature=0.0, **_GAMMAS)(
         step_stream, predictions, delayed
     )
     assert abs(nstep.item() - dqn.item()) < 1e-05
@@ -287,3 +289,34 @@ def test_nstep_rejects_non_fp32_q() -> None:
     predictions["action_value"] = predictions["action_value"].to(torch.bfloat16)
     with pytest.raises(TypeError, match="float32"):
         _nstep()(step_stream, predictions, delayed)
+
+
+def test_nstep_temperature_matches_dqn_one_step() -> None:
+    """n=1 with the same α is DqnObjective's soft backup."""
+    step_stream = TensorDict(
+        {
+            "action": torch.tensor([0, 0]),
+            "reward": torch.tensor([0.0, 0.0]),
+            "episode_done": torch.zeros(2, dtype=torch.int64),
+            "task_done": torch.zeros(2, dtype=torch.int64),
+        },
+        batch_size=[2],
+    )
+    predictions, delayed = _q(torch.zeros(2, 2), torch.zeros(2, 2))
+    nstep_loss, nstep_m = _nstep(temperature=1.0)(step_stream, predictions, delayed)
+    dqn_loss, dqn_m = DqnObjective(temperature=1.0, grouping_field=None, **_GAMMAS)(
+        step_stream, predictions, delayed
+    )
+    assert abs(nstep_loss.item() - dqn_loss.item()) < 1e-06
+    assert abs(nstep_m["entropy"] - dqn_m["entropy"]) < 1e-06
+
+
+def test_nstep_temperature_zero_omits_metric() -> None:
+    step_stream, predictions, delayed = _lambda_fixture()
+    _, metrics = _nstep()(step_stream, predictions, delayed)
+    assert "entropy" not in metrics
+
+
+def test_nstep_temperature_rejects_negative() -> None:
+    with pytest.raises(ValueError, match="temperature"):
+        _nstep(temperature=-0.1)

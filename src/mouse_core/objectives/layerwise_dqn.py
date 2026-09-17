@@ -10,6 +10,7 @@ from tensordict import TensorDict
 from mouse_core.objectives.base import Objective
 from mouse_core.objectives.dqn import (
     _affine,
+    _boltzmann_entropy,
     _boundary_discounts,
     _greedy_from_online_q,
     _in_run_stats,
@@ -18,6 +19,8 @@ from mouse_core.objectives.dqn import (
     _head_output_layout,
     _require_action_ids,
     _require_done_codes,
+    _require_temperature,
+    _soft_state_value,
     _td_lambda_targets,
     _weighted_mean,
 )
@@ -131,7 +134,11 @@ class LayerwiseDqnObjective(Objective):
     one-step target) built with that layer's discounts; with ``watkins=True``
     the trace is also cut wherever the taken action is not that layer's online
     argmax, and ``metrics["watkins_greedy_frac"]`` reports the deepest layer's
-    in-run greedy fraction.
+    in-run greedy fraction.     ``temperature`` is the same SAC / soft-Q ``α``
+    as :class:`~mouse_core.objectives.dqn.DqnObjective`: ``0`` is hard
+    max-Q per layer; ``> 0`` bootstraps from ``α logsumexp(Q / α)``.
+    ``metrics["entropy"]`` is the deepest layer's in-run mean of
+    ``H[softmax(Q / α)]`` on online Q when ``α > 0``.
 
     Args:
         num_backbone_layers: Number of transformer blocks (and Q heads).
@@ -142,9 +149,11 @@ class LayerwiseDqnObjective(Objective):
         gamma_episode_truncated_start: Episode-truncated discount at layer 0.
         gamma_episode_truncated: Episode-truncated discount at the deepest layer.
         gamma_task_terminal_start: Task-terminal extra discount at layer 0
-            (multiplies the episode discount; ``task_done == 0`` uses ``1.0``).
+            (``task_done == 1``; ``EnvConfig.terminate_task``; multiplies
+            the episode discount; ``task_done == 0`` uses ``1.0``).
         gamma_task_terminal: Task-terminal extra discount at the deepest layer.
-        gamma_task_truncated_start: Task-truncated extra discount at layer 0.
+        gamma_task_truncated_start: Task-truncated extra discount at layer 0
+            (``task_done == 2``; last episode of ``max_task_episodes``).
         gamma_task_truncated: Task-truncated extra discount at the deepest layer.
         action_key: Key in ``objective_data`` for the integer action.
         reward_key: Key in ``objective_data`` for per-step reward.
@@ -165,6 +174,11 @@ class LayerwiseDqnObjective(Objective):
             ``task_index``). Required. Pass ``None`` only when the batch
             has no grouping isolation — omitting it is an error, not a
             silent skip.
+        temperature: SAC / soft Q-learning ``α`` (``>= 0``). Required.
+            ``0`` is hard max-Q. ``> 0`` bootstraps each layer from
+            ``α logsumexp(Q / α)`` on delayed Q (after ``q_scale`` /
+            ``q_shift``) and logs ``metrics["entropy"]``. Same units and
+            meaning as ``get_action(temperature=)``.
     """
 
     def __init__(
@@ -181,6 +195,7 @@ class LayerwiseDqnObjective(Objective):
         gamma_task_terminal: float,
         gamma_task_truncated_start: float,
         gamma_task_truncated: float,
+        temperature: float,
         action_key: str = "action",
         reward_key: str = "reward",
         reward_scale: float = 1.0,
@@ -197,6 +212,7 @@ class LayerwiseDqnObjective(Objective):
     ) -> None:
         if not 0.0 <= float(td_lambda) <= 1.0:
             raise ValueError(f"td_lambda must be in [0, 1], got {td_lambda}.")
+        self.temperature = _require_temperature(temperature)
         self.num_backbone_layers = int(num_backbone_layers)
         self.gamma_step_start = float(gamma_step_start)
         self.gamma_step = float(gamma_step)
@@ -337,7 +353,9 @@ class LayerwiseDqnObjective(Objective):
 
         step_next = (step_of + 1).clamp(max=N - 1)      # [P]
         next_actions = action[step_next]                # [P]
-        v_step_all = q_target[last_rows].amax(dim=-1)   # [N, L]  V_l(s_i)
+        v_step_all = _soft_state_value(
+            q_target[last_rows], temperature=self.temperature
+        )  # [N, L]  V_l(s_i): max_a Q, or α logsumexp
 
         layer_losses: list[torch.Tensor] = []
         layer_curr_max_means: list[torch.Tensor] = []
@@ -421,6 +439,13 @@ class LayerwiseDqnObjective(Objective):
             named["cql_penalty"] = torch.stack(cql_penalties).mean()
         if deepest_greedy_from is not None:
             named["watkins_greedy_frac"] = _weighted_mean(deepest_greedy_from, pair_weight)
+        if self.temperature > 0.0:
+            named["entropy"] = _weighted_mean(
+                _boltzmann_entropy(
+                    q[:, -1, :].detach(), temperature=self.temperature
+                ),
+                row_weight,
+            )
 
         metrics: dict[str, float] = {
             key: (value.item() if value.numel() == 1 else float(value))

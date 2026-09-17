@@ -14,13 +14,16 @@ from mouse_core.objectives.base import Objective
 from mouse_core.objectives.dqn import (
     _affine,
     _affine_scan_backward,
+    _boltzmann_entropy,
     _boundary_discounts,
     _head_output_layout,
     _in_run_stats,
     _pair_values_to_rows,
     _pair_weight,
+    _policy_entropy,
     _require_action_ids,
     _require_done_codes,
+    _require_temperature,
     _shift_next,
     _weighted_mean,
 )
@@ -71,6 +74,7 @@ def _retrace_targets(
     action: torch.Tensor,
     pair_weight: torch.Tensor,
     td_lambda: float,
+    temperature: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Retrace(λ) target for every pair ``(t, t+1)`` and its trace ratio.
 
@@ -78,8 +82,9 @@ def _retrace_targets(
     the last head-output row: delayed Q, the softmax target policy over it,
     and the learned behavior distribution. Returns ``(G [N-1], ratio [N-1])``::
 
-        G_t = r_t + γ_t * ( E_π Q(s_{t+1}, ·)
+        G_t = r_t + γ_t * ( V_π(s_{t+1})
                             + c_{t+1} * (G_{t+1} - Q(s_{t+1}, a_{t+1})) )
+        V_π = E_π Q + α H[π]
         c_{t+1} = λ * min(1, π(a_{t+1} | s_{t+1}) / μ(a_{t+1} | s_{t+1}))
 
     which is the paper's ``Q(x_t, a_t) + Σ_s γ^{s-t} (Π c_i) δ_s`` written
@@ -89,7 +94,9 @@ def _retrace_targets(
     exist or is out-of-run, so the trace never crosses a run break.
     Episode / task boundaries are handled by ``γ_t`` itself: a ``0`` gamma
     ends the trace and a non-zero truncation gamma carries it, discounted.
-    ``λ = 0`` is the expected one-step target ``r + γ E_π Q``.
+    ``λ = 0`` is the expected one-step target ``r + γ V_π``.
+    ``temperature`` is the SAC ``α`` on that same ``π``; ``0`` is
+    greedy ``π`` and ``V_π = E_π Q``.
     Out-of-run pairs return ``0`` (their rows carry weight ``0``).
     """
     dtype = q_step.dtype
@@ -107,7 +114,9 @@ def _retrace_targets(
     )
 
     v_pi = (pi_step * q_step).sum(dim=-1)  # [N]  E_π Q(s_i, ·)
-    v_next = v_pi[1:]  # [N-1]  E_π Q(s_{t+1}, ·)
+    if float(temperature) > 0.0:
+        v_pi = v_pi + float(temperature) * _policy_entropy(pi_step)
+    v_next = v_pi[1:]  # [N-1]  V_π(s_{t+1})
 
     in_run = pair_weight > 0
     cont = _shift_next(in_run.to(dtype=dtype))  # pair t+1 exists and is in-run
@@ -157,9 +166,10 @@ class RetraceObjective(Objective):
 
     Instantiate with hyperparameters, then call with
     ``(objective_data, predictions, delayed_predictions)``. Online Q is
-    ``predictions["action_value"]``; every target quantity — the expected
-    bootstrap ``E_π Q(s', ·)``, the corrected ``Q(s', a')``, and ``π``
-    itself — is read from ``delayed_predictions["action_value"]`` of the
+    ``predictions["action_value"]``; every target quantity — the soft
+    bootstrap ``V_π(s') = E_π Q + temperature H[π]``, the corrected
+    ``Q(s', a')``, and ``π`` itself — is read from
+    ``delayed_predictions["action_value"]`` of the
     delayed :class:`~mouse_core.models.base.Model`
     (``model.delayed_copy(heads=("action_value",))``) run on the same
     ``TokenBatch``. The delayed tensor is detached, so the TD error does not
@@ -184,10 +194,13 @@ class RetraceObjective(Objective):
 
     The target along a run is::
 
-        G_i = r_i + γ_i * ( E_π Q(s_{i+1}, ·)
+        G_i = r_i + γ_i * ( V_π(s_{i+1})
                             + c_{i+1} * (G_{i+1} - Q(s_{i+1}, a_{i+1})) )
 
-    so ``td_lambda=0`` is the expected one-step target and ``td_lambda=1``
+    with ``V_π = E_π Q + temperature H[π]``. ``temperature=0`` is the
+    paper's greedy expected backup; a positive value is the SAC soft
+    value on ``π = softmax(Q / temperature)``. So ``td_lambda=0`` is
+    the expected one-step target and ``td_lambda=1``
     with an on-policy action (``π ≥ μ``) is the full in-run return. The
     paper's Atari runs use ``λ = 1`` with the exploration policy as ``π``;
     the clipped ratio does the trace cutting that ``Q*(λ)`` needs ``λ < 1``
@@ -219,10 +232,12 @@ class RetraceObjective(Objective):
             one-step target; ``1.0`` cuts traces only through
             ``min(1, π/μ)``.
         temperature: Softmax temperature of the target policy
-            ``π = softmax(Q / temperature)``, ``>= 0``. Q is logits.
+            ``π = softmax(Q / temperature)`` and the SAC ``α`` on the
+            backup ``V_π = E_π Q + α H[π]``, ``>= 0``. Q is logits.
             ``0.0`` is greedy (Watkins's cut; argmax ties share the
-            mass); larger values flatten ``π`` toward uniform and cut
-            fewer traces.
+            mass; ``V_π = E_π Q``); larger values flatten ``π`` toward
+            uniform, cut fewer traces, and raise the soft value. Same
+            units and meaning as ``get_action(temperature=)``.
         behavior_weight: Coefficient of the behavior head's NLL
             (``-log μ(a_t | s_t)``) in the returned loss. Must be ``>= 0``.
             ``0.0`` excludes the NLL from the returned loss; the head is
@@ -237,10 +252,10 @@ class RetraceObjective(Objective):
             (``episode_done == 2``). ``1.0`` bootstraps across episode
             boundaries.
         gamma_task_terminal: Extra discount when the task terminates
-            (``task_done == 1``; reserved, unused by mouse-gym today).
+            (``task_done == 1``; ``EnvConfig.terminate_task``).
             Multiplies the episode discount. ``task_done == 0`` uses ``1.0``.
         gamma_task_truncated: Extra discount when the task is truncated
-            (``task_done == 2``; last episode of ``episodes_per_task``).
+            (``task_done == 2``; last episode of ``max_task_episodes``).
             Multiplies the episode discount. ``0.0`` zeros the bootstrap.
         behavior_key: Key in ``predictions`` of the behavior head's
             ``[P, A]`` logits (default ``"behavior"``).
@@ -268,8 +283,8 @@ class RetraceObjective(Objective):
     action — how well the behavior head predicts the data), ``q_values_*``
     (online max-Q over in-run rows), ``retrace_ratio_mean`` (in-run mean of
     ``min(1, π/μ)`` for the taken action — ``1`` is on-policy, near ``0``
-    means the traces are cut everywhere), and ``cql_penalty`` when CQL is
-    on.
+    means the traces are cut everywhere), ``entropy`` when
+    ``temperature > 0``, and ``cql_penalty`` when CQL is on.
     """
 
     def __init__(
@@ -298,14 +313,12 @@ class RetraceObjective(Objective):
     ) -> None:
         if not 0.0 <= float(td_lambda) <= 1.0:
             raise ValueError(f"td_lambda must be in [0, 1], got {td_lambda}.")
-        if not float(temperature) >= 0.0:
-            raise ValueError(f"temperature must be >= 0, got {temperature}.")
         if not float(behavior_weight) >= 0.0:
             raise ValueError(
                 f"behavior_weight must be >= 0, got {behavior_weight}."
             )
         self.td_lambda = float(td_lambda)
-        self.temperature = float(temperature)
+        self.temperature = _require_temperature(temperature)
         self.behavior_weight = float(behavior_weight)
         self.gamma_step = gamma_step
         self.gamma_episode_terminal = gamma_episode_terminal
@@ -437,6 +450,7 @@ class RetraceObjective(Objective):
             action=action,
             pair_weight=pair_weight,
             td_lambda=self.td_lambda,
+            temperature=self.temperature,
         )
         td_target = _pair_values_to_rows(pair_target, step_of)  # [P]
 
@@ -470,6 +484,11 @@ class RetraceObjective(Objective):
         }
         if cql_penalty_mean is not None:
             named["cql_penalty"] = cql_penalty_mean
+        if self.temperature > 0.0:
+            named["entropy"] = _weighted_mean(
+                _boltzmann_entropy(q.detach(), temperature=self.temperature),
+                row_weight,
+            )
 
         metrics: dict[str, float] = dict(
             zip(named, torch.stack(list(named.values())).tolist())

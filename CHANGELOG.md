@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Aligned with mouse-gym 1.1.0: ``EnvConfig.episodes_per_task`` is
+  ``max_task_episodes`` (task-length timeout, ``task_done=2``).
+  ``task_done=1`` is ``terminate_task`` (no longer reserved).
+  ``DqnObjective`` / ``NStepDqnObjective`` / ``LayerwiseDqnObjective`` /
+  ``RetraceObjective`` / ``PpoObjective`` ``gamma_task_terminal`` /
+  ``gamma_task_truncated`` docs match. Live-env notebooks pass
+  ``max_task_episodes=``.
+- Depend on ``huggingface_hub>=1.32.0``.
 - ``Model.delayed_copy(heads=...)``: ``heads`` is required and names the
   heads the delayed model carries — only those the objective reads from
   ``delayed_predictions`` (``("action_value",)`` for ``DqnObjective`` /
@@ -30,6 +38,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``examples/15_train_offline_max_n_step_dqn.ipynb``.
 
 ### Fixed
+- ``huggingface_hub`` 1.32.0 dropped ``CommitOperationAdd`` from
+  ``huggingface_hub.hf_api``. Hub helpers import it from
+  ``huggingface_hub`` so ``import mouse_core`` works.
 - Incremental Flex decode CUDA-graph capture no longer disables the
   session after one silent miss. Grow steps and eager FlexAttention skip
   capture; a miss is logged and retried once the shape is stable; graphs
@@ -37,6 +48,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   silent (eval builds several sessions and shapes).
 
 ### Added
+- ``temperature`` (SAC / soft Q-learning ``α``, required, ``>= 0``)
+  on ``DqnObjective``, ``NStepDqnObjective``, and
+  ``LayerwiseDqnObjective``. ``0`` is hard max-Q; ``> 0`` bootstraps
+  from ``α logsumexp(Q / α)``. Same units and meaning as
+  ``get_action(temperature=)``. ``RetraceObjective`` already required
+  ``temperature`` for ``π = softmax(Q / α)``; that same ``α`` is now
+  also the backup, ``V_π = E_π[Q] + α H[π]``.
+  ``metrics["entropy"]`` is the in-run mean of ``H[softmax(Q / α)]``
+  on online Q when ``α > 0``. Watkins still cuts on the hard argmax.
 - ``NStepDqnObjective``: fixed-horizon n-step DQN. Required ``n``
   (``int >= 1``) and ``prediction_key`` select the backup length and
   which Q head to train; ``n=1`` is the one-step target ``r + γ V``.
@@ -48,8 +68,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (``n=1, 3, 5``), ``delayed_copy`` of every Q head, and the three
   n-step losses summed.
 - ``RetraceObjective``: Retrace(λ) off-policy return-based Q-learning
-  (Munos et al., 2016). The TD target is the delayed expected one-step
-  backup plus a trace of later TD errors scaled by truncated importance
+  (Munos et al., 2016).   The TD target is the delayed soft one-step backup
+  ``V_π = E_π Q + temperature H[π]`` plus a trace of later TD errors
+  scaled by truncated importance
   ratios ``c = td_lambda * min(1, π/μ)``;
   ``π = softmax(Q / temperature)`` over the delayed head's raw Q,
   treated as logits (``temperature``, required, ``>= 0``, same

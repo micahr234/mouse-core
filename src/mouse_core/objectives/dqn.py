@@ -207,6 +207,46 @@ def _in_run_stats(
     return selected.mean(), std, selected.min(), selected.max()
 
 
+def _require_temperature(temperature: float) -> float:
+    """``temperature >= 0``. ``0`` is hard max / greedy."""
+    if float(temperature) < 0.0:
+        raise ValueError(f"temperature must be >= 0, got {temperature}.")
+    return float(temperature)
+
+
+def _policy_entropy(pi: torch.Tensor) -> torch.Tensor:
+    """Per-row entropy of a categorical ``pi`` on the last dim."""
+    log_pi = torch.log(pi.clamp_min(torch.finfo(pi.dtype).tiny))
+    return -(pi * log_pi).sum(dim=-1)
+
+
+def _soft_state_value(q: torch.Tensor, *, temperature: float) -> torch.Tensor:
+    """State value of ``q`` ``[..., A]``: hard max, or SAC / soft-Q ``α logsumexp``.
+
+    ``temperature == 0`` is ``max_a Q``. Otherwise
+    ``V = α log Σ_a exp(Q_a / α)``, equal to ``E_π[Q] + α H[π]`` for
+    ``π = softmax(Q / α)``. Same ``α`` as
+    :meth:`~mouse_core.models.base.Model.get_action`.
+    """
+    alpha = float(temperature)
+    if alpha == 0.0:
+        return q.amax(dim=-1)
+    return alpha * torch.logsumexp(q / alpha, dim=-1)
+
+
+def _boltzmann_entropy(q: torch.Tensor, *, temperature: float) -> torch.Tensor:
+    """Per-row entropy of ``softmax(Q / α)``. ``α == 0`` is the greedy policy."""
+    alpha = float(temperature)
+    if alpha == 0.0:
+        is_max = q == q.amax(dim=-1, keepdim=True)
+        pi = is_max.to(dtype=q.dtype) / is_max.sum(dim=-1, keepdim=True).to(
+            dtype=q.dtype
+        )
+        return _policy_entropy(pi)
+    log_pi = F.log_softmax(q / alpha, dim=-1)
+    return _policy_entropy(log_pi.exp())
+
+
 def _greedy_from_online_q(
     *,
     q: torch.Tensor,
@@ -265,7 +305,7 @@ def _td_lambda_targets(
     """TD(λ) target for every pair ``(t, t+1)``, shape ``[N-1]``.
 
     ``G_t = r_{t+1} + γ_{t+1} * ((1 - λ c_t) * V_{t+1} + λ c_t * G_{t+1})``
-    where ``V`` is the delayed max-Q and ``c_t`` says whether the trace
+    where ``V`` is the delayed state value and ``c_t`` says whether the trace
     continues through ``s_{t+1}``: pair ``t+1`` must exist and be in-run, and
     with Watkins the action taken from ``s_{t+1}`` must be online-greedy
     (``greedy_from``). Episode / task boundaries are handled by ``γ_{t+1}``
@@ -351,20 +391,30 @@ class DqnObjective(Objective):
 
     The target is the TD(λ) return along the run,
     ``G_i = r + γ * ((1 - λ) * V(s_{i+1}) + λ * G_{i+1})`` with ``V`` the
-    delayed max-Q, so ``td_lambda=0`` (default) is the plain one-step target
-    ``r + γ V`` and ``td_lambda=1`` is the full n-step return to the end of
-    the run. The trace never crosses a run break. At an episode / task
-    boundary ``γ`` is the corresponding done-code gamma and multiplies both
-    the bootstrap and the continued return, so ``gamma_*_terminal = 0`` ends
-    the trace there while a non-zero truncation gamma carries it (discounted)
-    into the reset frame's return. Off-policy behavior is not
+    delayed state value, so ``td_lambda=0`` (default) is the plain one-step
+    target ``r + γ V`` and ``td_lambda=1`` is the full n-step return to the
+    end of the run. ``V`` is delayed max-Q when ``temperature=0``. A
+    positive ``temperature`` (SAC / soft Q-learning ``α``) replaces that
+    with the soft value ``α log Σ_a exp(Q / α)``, equal to
+    ``E_π[Q] + α H[π]`` for the Boltzmann policy
+    ``π = softmax(Q / α)`` over the same (affine) delayed Q the TD error
+    uses. ``α → 0`` recovers hard max. Pair a non-zero ``α`` with
+    ``get_action(temperature=)`` so rollout samples that same policy.
+    The trace never crosses a run break. At an episode /
+    task boundary ``γ`` is the corresponding done-code gamma and multiplies
+    both the bootstrap and the continued return, so ``gamma_*_terminal = 0``
+    ends the trace there while a non-zero truncation gamma carries it
+    (discounted) into the reset frame's return. Off-policy behavior is not
     corrected unless ``watkins=True`` (Watkins's Q(λ)), which also cuts the
     trace wherever the taken action is not the online argmax of
     ``predictions["action_value"]`` (ties included; never compared against
-    oracle columns such as ``info_q_star``). ``metrics["watkins_greedy_frac"]``
+    oracle columns such as ``info_q_star``). Watkins still uses the hard
+    argmax; it does not read ``π``. ``metrics["watkins_greedy_frac"]``
     then reports the in-run fraction of taken actions that were greedy —
     near ``0`` means the traces are cut everywhere and the target is one-step.
-    The λ-return is computed with a parallel scan on the device (no host syncs).
+    ``metrics["entropy"]`` is the in-run mean of ``H[softmax(Q / α)]`` on
+    online Q when ``temperature > 0``. The λ-return is computed with a
+    parallel scan on the device (no host syncs).
 
     Those columns arrive in ``objective_data`` only if they are listed in the
     tokenizer ``objective_fields`` keep-list (input fields are not auto-copied).
@@ -394,7 +444,7 @@ class DqnObjective(Objective):
     +--------------+-----------+----------------------------------+-----------------------------------------------+
     | 2            | 2         | Last episode truncated           | ``gamma_episode_truncated * gamma_task_truncated`` |
     +--------------+-----------+----------------------------------+-----------------------------------------------+
-    | 1 or 2       | 1         | Task terminated (reserved)       | episode gamma ``* gamma_task_terminal``       |
+    | 1 or 2       | 1         | Task terminated (``terminate_task``) | episode gamma ``* gamma_task_terminal``       |
     +--------------+-----------+----------------------------------+-----------------------------------------------+
 
     Args:
@@ -407,10 +457,10 @@ class DqnObjective(Objective):
             (``episode_done == 2``). ``1.0`` bootstraps across episode
             boundaries.
         gamma_task_terminal: Extra discount when the task terminates
-            (``task_done == 1``; reserved, unused by mouse-gym today).
+            (``task_done == 1``; ``EnvConfig.terminate_task``).
             Multiplies the episode discount. ``task_done == 0`` uses ``1.0``.
         gamma_task_truncated: Extra discount when the task is truncated
-            (``task_done == 2``; last episode of ``episodes_per_task``).
+            (``task_done == 2``; last episode of ``max_task_episodes``).
             Multiplies the episode discount. ``0.0`` zeros the bootstrap.
         action_key: Key in ``objective_data`` that holds the integer action.
         reward_key: Key in ``objective_data`` that holds the per-step reward.
@@ -437,6 +487,11 @@ class DqnObjective(Objective):
         td_lambda: λ of the TD(λ) target in ``[0, 1]``. ``0.0`` (default) is
             the one-step target; ``1.0`` is the full in-run n-step return.
         watkins: Cut the λ-trace at non-greedy actions (Watkins's Q(λ)).
+        temperature: SAC / soft Q-learning ``α`` (``>= 0``). Required.
+            ``0`` is hard max-Q. ``> 0`` bootstraps from
+            ``α logsumexp(Q / α)`` on delayed Q (after ``q_scale`` /
+            ``q_shift``) and logs ``metrics["entropy"]``. Same units and
+            meaning as ``get_action(temperature=)``.
     """
 
     def __init__(
@@ -447,6 +502,7 @@ class DqnObjective(Objective):
         gamma_episode_truncated: float,
         gamma_task_terminal: float,
         gamma_task_truncated: float,
+        temperature: float,
         action_key: str = "action",
         reward_key: str = "reward",
         reward_scale: float = 1.0,
@@ -463,6 +519,7 @@ class DqnObjective(Objective):
     ) -> None:
         if not 0.0 <= float(td_lambda) <= 1.0:
             raise ValueError(f"td_lambda must be in [0, 1], got {td_lambda}.")
+        self.temperature = _require_temperature(temperature)
         self.gamma_step = gamma_step
         self.gamma_episode_terminal = gamma_episode_terminal
         self.gamma_episode_truncated = gamma_episode_truncated
@@ -589,7 +646,9 @@ class DqnObjective(Objective):
         pair_target = _td_lambda_targets(
             reward=reward,
             discount_all=discount_all,
-            v_step=q_target[last_rows].amax(dim=-1),  # [N]  V(s_i) = max_a Q_target
+            v_step=_soft_state_value(
+                q_target[last_rows], temperature=self.temperature
+            ),  # [N]  V(s_i): max_a Q, or α logsumexp
             pair_weight=pair_weight,
             td_lambda=self.td_lambda,
             greedy_from=greedy_from,
@@ -620,6 +679,11 @@ class DqnObjective(Objective):
             named["cql_penalty"] = cql_penalty_mean
         if greedy_from is not None:
             named["watkins_greedy_frac"] = _weighted_mean(greedy_from, pair_weight)
+        if self.temperature > 0.0:
+            named["entropy"] = _weighted_mean(
+                _boltzmann_entropy(q.detach(), temperature=self.temperature),
+                row_weight,
+            )
 
         metrics: dict[str, float] = dict(zip(named, torch.stack(list(named.values())).tolist()))
         return loss, metrics

@@ -8,6 +8,7 @@ from tensordict import TensorDict
 from mouse_core.objectives.base import Objective
 from mouse_core.objectives.dqn import (
     _affine,
+    _boltzmann_entropy,
     _boundary_discounts,
     _head_output_layout,
     _in_run_stats,
@@ -15,6 +16,8 @@ from mouse_core.objectives.dqn import (
     _pair_weight,
     _require_action_ids,
     _require_done_codes,
+    _require_temperature,
+    _soft_state_value,
     _weighted_mean,
 )
 
@@ -93,7 +96,11 @@ class NStepDqnObjective(Objective):
     one :class:`NStepDqnObjective` per head (each with its own ``n`` and
     ``prediction_key``) and add the returned losses. ``n=1`` is the
     one-step target ``r + γ V``; larger ``n`` sums that many discounted
-    rewards and bootstraps from the delayed max-Q at ``s_{t+n}``. A window
+    rewards and bootstraps from the delayed state value at ``s_{t+n}``.
+    ``V`` is delayed max-Q when ``temperature=0``; a positive
+    ``temperature`` (SAC / soft Q-learning ``α``) is
+    ``α logsumexp(Q / α)``, the same bootstrap as
+    :class:`~mouse_core.objectives.dqn.DqnObjective`. A window
     that hits a run break or the end of the batch truncates and bootstraps
     at the last in-run next state.
 
@@ -150,7 +157,7 @@ class NStepDqnObjective(Objective):
     +--------------+-----------+----------------------------------+-----------------------------------------------+
     | 2            | 2         | Last episode truncated           | ``gamma_episode_truncated * gamma_task_truncated`` |
     +--------------+-----------+----------------------------------+-----------------------------------------------+
-    | 1 or 2       | 1         | Task terminated (reserved)       | episode gamma ``* gamma_task_terminal``       |
+    | 1 or 2       | 1         | Task terminated (``terminate_task``) | episode gamma ``* gamma_task_terminal``       |
     +--------------+-----------+----------------------------------+-----------------------------------------------+
 
     Args:
@@ -166,10 +173,10 @@ class NStepDqnObjective(Objective):
             truncated (``episode_done == 2``). ``1.0`` bootstraps across
             episode boundaries.
         gamma_task_terminal: Extra discount when the task terminates
-            (``task_done == 1``; reserved, unused by mouse-gym today).
+            (``task_done == 1``; ``EnvConfig.terminate_task``).
             Multiplies the episode discount. ``task_done == 0`` uses ``1.0``.
         gamma_task_truncated: Extra discount when the task is truncated
-            (``task_done == 2``; last episode of ``episodes_per_task``).
+            (``task_done == 2``; last episode of ``max_task_episodes``).
             Multiplies the episode discount. ``0.0`` zeros the bootstrap.
         action_key: Key in ``objective_data`` that holds the integer action.
         reward_key: Key in ``objective_data`` that holds the per-step reward.
@@ -192,6 +199,11 @@ class NStepDqnObjective(Objective):
         cql_weight: Alpha coefficient for the Conservative Q-Learning
             penalty. ``0.0`` disables CQL.
         cql_scale_q_eps: Additive floor used when scaling the CQL penalty.
+        temperature: SAC / soft Q-learning ``α`` (``>= 0``). Required.
+            ``0`` is hard max-Q. ``> 0`` bootstraps from
+            ``α logsumexp(Q / α)`` on delayed Q (after ``q_scale`` /
+            ``q_shift``) and logs ``metrics["entropy"]``. Same units and
+            meaning as ``get_action(temperature=)``.
     """
 
     def __init__(
@@ -204,6 +216,7 @@ class NStepDqnObjective(Objective):
         gamma_episode_truncated: float,
         gamma_task_terminal: float,
         gamma_task_truncated: float,
+        temperature: float,
         action_key: str = "action",
         reward_key: str = "reward",
         reward_scale: float = 1.0,
@@ -240,6 +253,7 @@ class NStepDqnObjective(Objective):
         self.grouping_field = grouping_field
         self.cql_weight = cql_weight
         self.cql_scale_q_eps = cql_scale_q_eps
+        self.temperature = _require_temperature(temperature)
 
     def __call__(
         self,
@@ -348,7 +362,9 @@ class NStepDqnObjective(Objective):
         pair_target = _n_step_targets(
             reward=reward,
             discount_all=discount_all,
-            v_step=q_target[last_rows].amax(dim=-1),
+            v_step=_soft_state_value(
+                q_target[last_rows], temperature=self.temperature
+            ),
             pair_weight=pair_weight,
             n=self.n,
         )
@@ -376,6 +392,11 @@ class NStepDqnObjective(Objective):
         }
         if cql_penalty_mean is not None:
             named["cql_penalty"] = cql_penalty_mean
+        if self.temperature > 0.0:
+            named["entropy"] = _weighted_mean(
+                _boltzmann_entropy(q.detach(), temperature=self.temperature),
+                row_weight,
+            )
 
         metrics: dict[str, float] = dict(
             zip(named, torch.stack(list(named.values())).tolist())

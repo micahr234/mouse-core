@@ -35,9 +35,8 @@ from typing import TYPE_CHECKING, Any, NoReturn
 import numpy as np
 from datasets import Dataset, DatasetDict, Features, Value, load_dataset
 from datasets import config as datasets_config
-from huggingface_hub import HfApi, snapshot_download
+from huggingface_hub import CommitOperationAdd, HfApi, snapshot_download
 from huggingface_hub.errors import HfHubHTTPError
-from huggingface_hub.hf_api import CommitOperationAdd
 
 if TYPE_CHECKING:
     from mouse_core.data.datastore import Datastore
