@@ -1,0 +1,21 @@
+---
+description: Public functions take arguments by name, not position
+alwaysApply: true
+---
+
+# Keyword-Only Public API
+
+Call every public function by name, not by position. Signatures enforce this.
+
+- After `self` (or at the start of a module-level function), put `*`.
+- Call sites, examples, and docs pass every argument as `name=value`.
+- Do not add a positional parameter because one value is usual.
+
+## Exceptions
+
+These stay positional because they are protocols, not our API:
+
+- `nn.Module.forward` — `model(batch)`, `head(h)`, `backbone(embeds)`
+- Collection dunders — `__len__`, `__getitem__`, `__iter__`, `__repr__`
+- Single-value apply callables — `tokenizer(step)`, `augmenter(step)`,
+  `compose(...)(step)`, `schedule(x)`

@@ -6,11 +6,8 @@ import torch
 
 from mouse_core.models.backbone import IdentityBackbone
 from mouse_core.models.base import Model, _flat_sequence_causal_mask, _flat_sequence_position_ids
-from mouse_core.models.embedding import NumericEmbedder
-from mouse_core.models.heads.dqn import DiscreteActionValueHead
-from tests._token_batch_helpers import batch_to_packed, batch_to_token_batch, tok_from_encoder
-
-_tok = tok_from_encoder
+from mouse_core.models.heads import RegressionHead
+from tests._token_batch_helpers import batch_to_packed, token_tokenizer
 
 
 def test_flat_sequence_position_ids_reset_per_sequence() -> None:
@@ -59,22 +56,17 @@ def test_flat_sequence_causal_mask_blocks_cross_grouping_id() -> None:
 
 
 def test_model_forward_injects_sequence_id_and_runs_flat() -> None:
-    encoder = NumericEmbedder(
-        hidden_dim=8, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}]
-    )
-    backbone = IdentityBackbone(hidden_dim=8)
+    backbone = IdentityBackbone(hidden_dim=8, vocab_size=32)
     model = Model(
-        encoder=encoder,
         backbone=backbone,
-        heads=DiscreteActionValueHead(
+        heads=(head := RegressionHead(
             in_features=8, out_features=4, hidden_dim=8, num_layers=1, use_norm=True
-        ),
-        action_head="action_value",
+        )),
+        action_source=head,
         reasoner=None,
-        recurrence=None,
     )
     batch = [[{"action": i % 4} for i in range(3)], [{"action": 1}, {"action": 2}]]
-    tb, objective_data = batch_to_packed(_tok(model.encoder), batch)
+    tb, objective_data = batch_to_packed(token_tokenizer("action"), batch)
     predictions = model(tb).predictions
     assert "sequence_id" in objective_data.keys()
     assert objective_data["sequence_id"].tolist() == [0, 0, 0, 1, 1]
@@ -88,13 +80,6 @@ def test_model_forward_injects_sequence_id_and_runs_flat() -> None:
 
 
 def test_prepare_derives_grouping_ids_from_field() -> None:
-    encoder = NumericEmbedder(
-        hidden_dim=8,
-        modalities=[
-            {"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1},
-            {"type": 'discrete', "field": "episode_done", "vocab_size": 3, "std": 0.02, "positions": 1},
-        ],
-    )
     batch = [
         [
             {"action": 0, "episode_done": 0, "task_done": 0, "task_index": 0},
@@ -106,7 +91,7 @@ def test_prepare_derives_grouping_ids_from_field() -> None:
         ]
     ]
     tb, objective_data = batch_to_packed(
-        _tok(encoder, grouping_field="task_index"),
+        token_tokenizer("action", "episode_done", grouping_field="task_index"),
         batch,
         grouping_field="task_index",
     )
@@ -115,14 +100,7 @@ def test_prepare_derives_grouping_ids_from_field() -> None:
 
 
 def test_missing_grouping_field_stamps_zero() -> None:
-    encoder = NumericEmbedder(
-        hidden_dim=8,
-        modalities=[
-            {"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1},
-            {"type": 'discrete', "field": "episode_done", "vocab_size": 3, "std": 0.02, "positions": 1},
-        ],
-    )
     batch = [[{"action": 0, "episode_done": 1, "task_done": 2}, {"action": 1, "episode_done": 0, "task_done": 0}]]
-    tb, objective_data = batch_to_packed(_tok(encoder), batch)
+    tb, objective_data = batch_to_packed(token_tokenizer("action", "episode_done"), batch)
     assert objective_data["grouping_id"].tolist() == [0, 0]
     assert list(tb.grouping_ids) == [0] * tb.L

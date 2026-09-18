@@ -25,7 +25,7 @@ def _io(*pairs: tuple[str, str]) -> list[dict[str, str]]:
 
 
 def _tok_in(
-    *names: str, type: str = "discrete", head_output: str | None = None
+    *names: str, type: str = "token", head_output: str | None = None
 ) -> list[dict[str, Any]]:
     return [
         {
@@ -65,7 +65,7 @@ def test_tokenizer_output_defaults_to_input() -> None:
         grouping_field="task_index",
     )
     tokens = tokenizer({"action": 2, "reward": 0.5, "task_index": 0})
-    assert tokens.modality_names == ("action",)
+    assert tokens.modality_names == ("__text__",)
     assert tokens.objective_fields["reward"] == pytest.approx(0.5)
 
 
@@ -73,7 +73,7 @@ def test_tokenizer_renames_input_and_objective_fields() -> None:
     tokenizer = Tokenizer(
         input_fields=[
             {
-                "type": "discrete",
+                "type": "token",
                 "input_field": "act",
                 "output_field": "action",
                 "head_output": True,
@@ -83,7 +83,7 @@ def test_tokenizer_renames_input_and_objective_fields() -> None:
         grouping_field="task_index",
     )
     tokens = tokenizer({"act": 3, "q": 1.5, "task_index": 0})
-    assert tokens.modality_names == ("action",)
+    assert tokens.modality_names == ("__text__",)
     assert tokens.objective_fields["info_q_star"] == pytest.approx(1.5)
 
 
@@ -91,9 +91,7 @@ def test_tokenizer_full_matches_per_step_concat() -> None:
     """Full-window pack == head/tail step lists packed together."""
     tokenizer = Tokenizer(
         input_fields=[
-            *_tok_in("action", "observation"),
-            *_tok_in("reward", type="fourier"),
-            *_tok_in("episode_done", head_output="episode_done"),
+            *_tok_in("action", "observation", head_output="observation"),
         ],
         objective_fields=_io(
             ("action", "action"),
@@ -105,10 +103,10 @@ def test_tokenizer_full_matches_per_step_concat() -> None:
         grouping_field="task_index",
     )
     rows = _rows()
-    full, full_obj = pack_token_batch([tokenizer(step) for step in rows])
+    full, full_obj = pack_token_batch(steps=[tokenizer(step) for step in rows])
     head = [tokenizer(s) for s in rows[:3]]
     tail = [tokenizer(s) for s in rows[3:]]
-    cat, cat_obj = pack_token_batch(head + tail)
+    cat, cat_obj = pack_token_batch(steps=head + tail)
     assert np.array_equal(full.modality_ids, cat.modality_ids)
     assert np.array_equal(full.ids, cat.ids)
     assert np.allclose(full.values, cat.values)

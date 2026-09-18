@@ -11,9 +11,7 @@ from mouse_core.data import (
     pack_token_batch,
     empty_token_batch,
 )
-from mouse_core.models import (
-    NumericEmbedderModalitySpec,
-)
+from mouse_core.models import Model, IdentityBackbone
 
 
 def test_public_data_exports() -> None:
@@ -28,4 +26,5 @@ def test_public_data_exports() -> None:
     assert compose is not None
     assert pack_token_batch is not None
     assert empty_token_batch is not None
-    assert NumericEmbedderModalitySpec is not None
+    assert Model is not None
+    assert IdentityBackbone is not None

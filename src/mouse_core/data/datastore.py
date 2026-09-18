@@ -78,7 +78,7 @@ class Datastore:
     ``(inputs, objective_data)``.
     """
 
-    def __init__(self, name: str | None = None) -> None:
+    def __init__(self, *, name: str | None = None) -> None:
         self.name = name
 
         # Source segment — HF Dataset stored by reference, never mutated.
@@ -162,7 +162,7 @@ class Datastore:
     # Append  (rollout / test path)
     # ------------------------------------------------------------------
 
-    def append(self, data: dict[str, Any] | Datastore | list[Datastore]) -> None:
+    def append(self, *, data: dict[str, Any] | Datastore | list[Datastore]) -> None:
         """Append a row, another store, or a list of stores.
 
         Row append is the fast path for collection loops. The row can contain
@@ -172,13 +172,13 @@ class Datastore:
         rows, preserving order.
         """
         if isinstance(data, Datastore):
-            self.from_dataset(data.to_dataset())
+            self.from_dataset(ds=data.to_dataset())
             return
         if isinstance(data, list):
             if not all(isinstance(store, Datastore) for store in data):
                 raise TypeError("append expects a row dict, Datastore, or list of Datastore objects.")
             for store in data:
-                self.append(store)
+                self.append(data=store)
             return
         if not isinstance(data, dict):
             raise TypeError("append expects a row dict, Datastore, or list of Datastore objects.")
@@ -190,7 +190,7 @@ class Datastore:
     # HuggingFace Dataset I/O
     # ------------------------------------------------------------------
 
-    def from_dataset(self, ds: "Dataset | datasets.DatasetDict") -> None:
+    def from_dataset(self, *, ds: "Dataset | datasets.DatasetDict") -> None:
         """Ingest an already-loaded Hugging Face ``Dataset`` into the store.
 
         All selection (which config/subset, which split, globs, etc.) is done
@@ -210,7 +210,7 @@ class Datastore:
             from datasets import load_dataset
 
             store = Datastore(name="cartpole")
-            store.from_dataset(load_dataset("your-org/your-dataset", "cartpole", split="train"))
+            store.from_dataset(ds=load_dataset("your-org/your-dataset", "cartpole", split="train"))
 
             # Or, for stores written by ``push_stores_to_hub``:
             stores = load_stores_from_hub(repo_id="your-org/your-dataset", split="train")

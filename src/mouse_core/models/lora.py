@@ -19,7 +19,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class LoRAConfig:
     """LoRA hyperparameters for a backbone.
 
@@ -150,7 +150,7 @@ def lora_modules(module: nn.Module) -> Iterator[LoRALinear]:
             yield child
 
 
-def apply_lora(model: nn.Module, config: LoRAConfig) -> int:
+def apply_lora(*, model: nn.Module, config: LoRAConfig) -> int:
     """Freeze ``model`` and wrap every ``nn.Linear`` in :class:`LoRALinear`.
 
     Every existing parameter is frozen; the LoRA factors are the only

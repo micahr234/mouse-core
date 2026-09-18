@@ -1,9 +1,10 @@
 """AdamW over fp32 trainable parameters.
 
-Every trainable parameter in a MOUSE model is fp32: heads, encoder,
-reasoner / recurrence, and either the whole fp32 backbone (full
-fine-tuning) or the fp32 LoRA adapters of a frozen bf16 backbone. AdamW
-therefore steps the parameters directly and needs no fp32 master copies.
+Every trainable parameter in a MOUSE model is fp32: heads,
+reasoner, and either the whole fp32 backbone (full
+fine-tuning) or the fp32 LoRA adapters
+of a frozen bf16 backbone. AdamW therefore steps the parameters
+directly and needs no fp32 master copies.
 """
 
 from __future__ import annotations
@@ -73,8 +74,8 @@ class AdamW:
 
     def __init__(
         self,
-        params: Iterable[nn.Parameter],
         *,
+        params: Iterable[nn.Parameter],
         lr: float,
         weight_decay: float = 0.0,
         betas: tuple[float, float] = (0.9, 0.95),

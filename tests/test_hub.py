@@ -73,7 +73,7 @@ class _FakeHfApi:
 def _store(*actions: int, name: str | None=None) -> Datastore:
     store = Datastore(name=name)
     for i, action in enumerate(actions):
-        store.append({'observation': {'discrete': i}, 'action': {'discrete': action}, 'reward': float(i), 'episode_done': 0, 'task_done': 0, 'step_index': i})
+        store.append(data={'observation': {'discrete': i}, 'action': {'discrete': action}, 'reward': float(i), 'episode_done': 0, 'task_done': 0, 'step_index': i})
     return store
 
 def _loaded_store_datasets() -> dict[str, Dataset]:

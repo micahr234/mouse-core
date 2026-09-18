@@ -5,7 +5,8 @@ from __future__ import annotations
 import torch
 from tensordict import TensorDict
 
-from mouse_core.objectives.base import Objective
+from mouse_core.models.heads.base import BaseHead, prediction_key
+from mouse_core.objectives.base import Objective, predictions_for, require_head
 from mouse_core.objectives.dqn import (
     _affine,
     _boltzmann_entropy,
@@ -84,17 +85,17 @@ class NStepDqnObjective(Objective):
     """Bellman n-step objective with a delayed target network.
 
     Instantiate with hyperparameters, then call with
-    ``(objective_data, predictions, delayed_predictions)``. Online Q is
-    ``predictions[prediction_key]``; bootstrap Q is
-    ``delayed_predictions[prediction_key]`` from the delayed
+    ``objective_data=``, ``predictions=``, and ``delayed_predictions=``. Online Q is
+    the tensor for ``head``; bootstrap Q is the same key on
+    ``delayed_predictions`` from the delayed
     :class:`~mouse_core.models.base.Model`
-    (``model.delayed_copy(heads=(prediction_key,))``) run on the same
+    (``model.delayed_copy(heads=(head,))``) run on the same
     ``TokenBatch``. The delayed tensor is detached before the Bellman
     target, so the TD error does not backprop through it.
 
     One objective trains one Q head. To train several horizons, build
     one :class:`NStepDqnObjective` per head (each with its own ``n`` and
-    ``prediction_key``) and add the returned losses. ``n=1`` is the
+    ``head``) and add the returned losses. ``n=1`` is the
     one-step target ``r + γ V``; larger ``n`` sums that many discounted
     rewards and bootstraps from the delayed state value at ``s_{t+n}``.
     ``V`` is delayed max-Q when ``temperature=0``; a positive
@@ -131,7 +132,7 @@ class NStepDqnObjective(Objective):
     Those columns arrive in ``objective_data`` only if they are listed in
     the tokenizer ``objective_fields`` keep-list (input fields are not
     auto-copied). ``task_done`` is an objective column only — do not add
-    it as a tokenizer input field or embedder modality, or it will be fed
+    it as a tokenizer input field, or it will be fed
     to the transformer::
 
         tokenizer = Tokenizer(
@@ -162,8 +163,8 @@ class NStepDqnObjective(Objective):
 
     Args:
         n: Backup horizon. ``1`` is one-step DQN; must be an ``int >= 1``.
-        prediction_key: Key in ``predictions`` / ``delayed_predictions`` of
-            the Q head this objective trains (``[P, A]`` float32).
+        head: Q head this objective trains. Must be the same instance
+            passed to ``Model(heads=)``.
         gamma_step: Discount factor for running (non-terminal) transitions
             (``episode_done == 0``).
         gamma_episode_terminal: Discount applied when the episode terminates
@@ -210,7 +211,7 @@ class NStepDqnObjective(Objective):
         self,
         *,
         n: int,
-        prediction_key: str,
+        head: BaseHead,
         gamma_step: float,
         gamma_episode_terminal: float,
         gamma_episode_truncated: float,
@@ -231,12 +232,9 @@ class NStepDqnObjective(Objective):
     ) -> None:
         if not isinstance(n, int) or isinstance(n, bool) or n < 1:
             raise ValueError(f"n must be an int >= 1, got {n!r}.")
-        if not isinstance(prediction_key, str) or not prediction_key:
-            raise ValueError(
-                f"prediction_key must be a non-empty string, got {prediction_key!r}."
-            )
         self.n = n
-        self.prediction_key = prediction_key
+        self.head = require_head(head=head, what="head")
+        self.prediction_key = prediction_key(head=self.head)
         self.gamma_step = gamma_step
         self.gamma_episode_terminal = gamma_episode_terminal
         self.gamma_episode_truncated = gamma_episode_truncated
@@ -257,24 +255,17 @@ class NStepDqnObjective(Objective):
 
     def __call__(
         self,
+        *,
         objective_data: TensorDict,
         predictions: TensorDict,
         delayed_predictions: TensorDict | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         if delayed_predictions is None:
             raise ValueError("NStepDqnObjective requires delayed_predictions.")
-        if self.prediction_key not in predictions.keys():
-            raise KeyError(
-                f"NStepDqnObjective expects predictions[{self.prediction_key!r}]; "
-                "add a DiscreteActionValueHead under that key."
-            )
-        if self.prediction_key not in delayed_predictions.keys():
-            raise KeyError(
-                f"NStepDqnObjective expects delayed_predictions[{self.prediction_key!r}]; "
-                f"include it in delayed_copy(heads=(..., {self.prediction_key!r}, ...))."
-            )
-        q: torch.Tensor = predictions[self.prediction_key]
-        q_target: torch.Tensor = delayed_predictions[self.prediction_key].detach()
+        q: torch.Tensor = predictions_for(head=self.head, predictions=predictions, who="n-step DQN")
+        q_target: torch.Tensor = predictions_for(
+            head=self.head, predictions=delayed_predictions, who="n-step DQN delayed"
+        ).detach()
 
         if q.ndim != 2:
             raise ValueError(

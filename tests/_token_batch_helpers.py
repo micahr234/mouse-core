@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import asdict, is_dataclass
 from typing import Any, cast
 
 from tensordict import TensorDict
@@ -12,62 +11,33 @@ from mouse_core.data import Tokenizer, compose, pack_token_batch
 from mouse_core.data.token_batch import StepTokens, TokenBatch
 
 DEFAULT_GROUPING_FIELD = "grouping_id"
+DEFAULT_TOKEN_VOCAB = 32
 
 
-def _tokenizer_input_fields_from_encoder(encoder) -> list[dict[str, Any]]:
-    """Map embedder modality specs to tokenizer packing specs (by name).
-
-    The last modality is flagged ``head_output=True`` (tokenizers require
-    exactly one head-output field; tests list the readout modality last).
-    """
-    out: list[dict[str, Any]] = []
-    for m in encoder.modalities:
-        data = asdict(cast(Any, m)) if is_dataclass(m) else dict(m)
-        kind = str(data["type"]).lower()
-        if kind == "learnable":
-            entry = {"type": "learnable", "tokens": data.get("tokens")}
-            name = data.get("field")
-            if isinstance(name, str) and not name.startswith("__learnable_"):
-                entry["output_field"] = name
-            out.append(entry)
-            continue
-        name = data.get("field")
-        entry: dict = {
-            "type": kind,
-            "input_field": name,
-        }
-        if kind == "continuous" and data.get("dim") is not None:
-            entry["dim"] = data["dim"]
-        out.append(entry)
-    if out:
-        out[-1]["head_output"] = True
-    return out
-
-
-def tok_from_encoder(
-    encoder,
-    *,
+def token_tokenizer(
+    *fields: str,
     grouping_field: str = DEFAULT_GROUPING_FIELD,
     objective_fields: list[dict[str, Any]] | list[str] | None = None,
-    **kwargs,
+    **kwargs: Any,
 ) -> Tokenizer:
-    # Default keep-list: non-learnable modality names (common for tests/objectives).
-    resolved: list[dict[str, Any]]
+    """Pack integer step fields as ``type="token"`` (shared ``__text__`` stream).
+
+    The last listed field is ``head_output=True``. Reward floats stay on
+    ``objective_fields`` only.
+    """
+    input_fields: list[dict[str, Any]] = [
+        {"type": "token", "input_field": name} for name in fields
+    ]
+    if input_fields:
+        input_fields[-1]["head_output"] = True
     if objective_fields is None:
-        resolved = []
-        for m in encoder.modalities:
-            data = asdict(cast(Any, m)) if is_dataclass(m) else dict(m)
-            if str(data["type"]).lower() == "learnable":
-                continue
-            name = data.get("field")
-            if isinstance(name, str):
-                resolved.append({"input_field": name})
+        resolved = [{"input_field": name} for name in fields]
     elif objective_fields and isinstance(objective_fields[0], str):
         resolved = [{"input_field": name} for name in cast(list[str], objective_fields)]
     else:
         resolved = cast(list[dict[str, Any]], objective_fields)
     return Tokenizer(
-        input_fields=_tokenizer_input_fields_from_encoder(encoder),
+        input_fields=input_fields,
         objective_fields=resolved,
         grouping_field=grouping_field,
         **kwargs,
@@ -91,8 +61,7 @@ def batch_to_packed(
 ) -> tuple[TokenBatch, TensorDict]:
     """Tokenize a ragged ``list[list[dict]]`` into ``(inputs, objective_data)``."""
     transform = compose(
-        lambda step: _ensure_grouping_field(step, grouping_field),
-        tokenizer,
+        stages=(lambda step: _ensure_grouping_field(step, grouping_field), tokenizer),
     )
     steps: list[StepTokens] = []
     sids: list[int] = []
@@ -101,7 +70,7 @@ def batch_to_packed(
             steps.append(transform(step))
             sids.append(b)
     return pack_token_batch(
-        steps,
+        steps=steps,
         sequence_ids=sids if steps else None,
         batch_size=len(batch),
         grouping_field=grouping_field,

@@ -1,9 +1,9 @@
-"""Tokenizer modality specs and packing helpers (not used by embedders)."""
+"""Tokenizer modality specs and packing helpers."""
 
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from string import Formatter
 from typing import Any, ClassVar
 
@@ -20,9 +20,6 @@ TEXT_FORMAT_KEY = "field"
 
 KIND_TEXT = "text"
 KIND_TOKEN = "token"
-KIND_DISCRETE = "discrete"
-KIND_FOURIER = "fourier"
-KIND_LEARNABLE = "learnable"
 KIND_IMAGE = "image"
 
 
@@ -33,18 +30,11 @@ class TokenizerModalitySpec:
     Types:
       * ``text`` — format string → HF tokenize → ``__text__``
       * ``token`` — integer id → one ``__text__`` token (pretrained vocab)
-      * ``discrete`` — integer id → one discrete token (named modality)
-      * ``fourier`` — scalar → one continuous token
-      * ``continuous`` — vector → one continuous token per component
       * ``image`` — image tokenizer → discrete visual token ids
-      * ``learnable`` — ``tokens`` scratch rows (no step I/O)
 
-    ``text`` and ``token`` share the ``__text__`` stream (embedder alignment
-    is that name). Every other type uses ``output_field`` as the modality
-    name (embedder alignment). Omitted ``output_field`` defaults to
-    ``input_field``. Learnable fields have no ``input_field``; set
-    ``output_field`` to name them (e.g. ``"value"``), else they are
-    auto-named ``__learnable_<i>``.
+    ``text`` and ``token`` share the ``__text__`` stream. ``image`` uses
+    ``output_field`` as the modality name. Omitted ``output_field``
+    defaults to ``input_field``.
 
     A ``text`` field requires ``format=``. ``input_field=`` reads the
     step value into exactly one placeholder ``{field}``; a format spec
@@ -55,32 +45,27 @@ class TokenizerModalitySpec:
     ``skip``, ``format_skipped=`` is tokenized instead (a literal,
     including ``""`` for no tokens). ``format=`` / ``format_skipped=``
     / const ``format=`` are all ``str.format`` strings: write ``{{`` /
-    ``}}`` for a literal brace in any of them. ``token`` / ``discrete``
-    / ``fourier`` / ``continuous`` / ``image`` / ``learnable`` do not
-    accept ``format=`` / ``format_skipped=``.
+    ``}}`` for a literal brace in any of them. ``token`` / ``image``
+    do not accept ``format=`` / ``format_skipped=``.
 
     ``required`` (default ``True``) means the step must carry
     ``input_field``; a missing / ``None`` value raises. With
     ``required=False`` a missing value emits nothing for that field —
     ``format_skipped=`` is not used (it only applies to a present value
-    equal to ``skip``). Fields with no ``input_field`` (const text,
-    ``learnable``) always emit and reject ``required=False`` and
-    ``skip=``.
+    equal to ``skip``). Const text fields have no ``input_field``; they
+    always emit and reject ``required=False`` and ``skip=``.
 
     Exactly one input field must set ``head_output=True``: its tokens are
     the step's **head-output tokens** — the positions the model reads Q /
-    action outputs from. A step may emit several (e.g. ``learnable`` with
-    ``tokens > 1``); every step must emit at least one, so the
-    head-output field must not be skippable on any step.
+    action outputs from. A step may emit several (e.g. a ``text`` run
+    with more than one id); every step must emit at least one, so the
+    head-output field must not be skippable on every step.
 
     Optional ``max_tokens=`` raises if that field emits more ids than
     the limit. Only the variable-length types accept it (``text`` /
-    ``image``); ``token``, ``discrete``, ``fourier``, ``continuous``, and
-    ``learnable`` emit a fixed count and reject it. ``tokens`` (default
-    ``1``) is the number of scratch rows for ``learnable``. ``dim`` is
-    required on ``continuous``. Every ``output_field`` (including
-    ``text`` / ``token`` names) must be unique. Fields emit in
-    ``input_fields`` order.
+    ``image``); ``token`` emits one id and rejects it. Every
+    ``output_field`` (including ``text`` / ``token`` names) must be
+    unique. Fields emit in ``input_fields`` order.
     """
 
     type: str
@@ -89,21 +74,12 @@ class TokenizerModalitySpec:
     format: str | None = None
     format_skipped: str | None = None
     max_tokens: int | None = None
-    tokens: int | None = None
-    dim: int | None = None
     skip: Any = None
     required: bool = True
     head_output: bool = False
 
-    _VALID_TYPES: ClassVar[tuple[str, ...]] = (
-        "text",
-        "token",
-        "discrete",
-        "fourier",
-        "continuous",
-        "image",
-        "learnable",
-    )
+    _VALID_TYPES: ClassVar[tuple[str, ...]] = ("text", "token", "image")
+
     def __post_init__(self) -> None:
         k = (self.type or "").lower()
         if k not in self._VALID_TYPES:
@@ -112,33 +88,9 @@ class TokenizerModalitySpec:
                 f"expected one of {self._VALID_TYPES}"
             )
         object.__setattr__(self, "type", k)
-        if k == "learnable":
-            self._init_learnable()
-            return
-        if self.tokens is not None:
-            raise TypeError(
-                f"tokenizer modality type={k!r} does not accept tokens= "
-                "(learnable only)"
-            )
         if k == "text":
             self._init_text()
             return
-        if k == "continuous":
-            self._init_named_input()
-            self._reject_text_format(k)
-            self._reject_max_tokens(k)
-            dim = int(self.dim or 0)
-            if dim <= 0:
-                raise ValueError(
-                    f"continuous modality {self.output_field!r} requires dim="
-                )
-            object.__setattr__(self, "dim", dim)
-            return
-        if self.dim is not None:
-            raise TypeError(
-                f"tokenizer modality type={k!r} does not accept dim= "
-                "(continuous only)"
-            )
         self._init_named_input()
         self._reject_text_format(k)
         if k == "image":
@@ -146,22 +98,7 @@ class TokenizerModalitySpec:
         else:
             self._reject_max_tokens(k)
 
-    def _init_learnable(self) -> None:
-        self._reject_no_input_knobs("learnable")
-        self._reject_text_format("learnable")
-        self._reject_max_tokens("learnable")
-        if self.dim is not None:
-            raise TypeError(
-                "learnable tokenizer modalities do not accept dim="
-            )
-        n = int(self.tokens or 1)
-        if n <= 0:
-            raise ValueError("learnable tokens must be >= 1")
-        object.__setattr__(self, "tokens", n)
-
     def _init_text(self) -> None:
-        if self.dim is not None:
-            raise TypeError("text tokenizer modalities do not accept dim=")
         if self.input_field is None:
             self._reject_no_input_knobs("text const")
             if self.format_skipped is not None:
@@ -368,15 +305,7 @@ def copy_keep_fields(
     return out
 
 
-def expand_tokenizer_spec(
-    spec: TokenizerModalitySpec, *, learnable_index: int
-) -> list[TokenizerModalitySpec]:
-    """``learnable_index`` names anonymous learnables (ordinal among learnable
-    specs, matching the embedder); an explicit ``output_field`` is kept."""
-    if spec.type == "learnable":
-        if spec.output_field:
-            return [spec]
-        return [replace(spec, output_field=f"__learnable_{learnable_index}")]
+def expand_tokenizer_spec(spec: TokenizerModalitySpec) -> list[TokenizerModalitySpec]:
     if spec.type == "text" and spec.input_field is None:
         if not spec.output_field:
             raise ValueError("text const field requires output_field=")
@@ -395,8 +324,6 @@ class TokenizerModalityMeta:
     spec: TokenizerModalitySpec
     name: str
     kind: str
-    dim: int = 0
-    n_learnable: int = 0
 
 
 def resolve_tokenizer_modalities(
@@ -404,20 +331,17 @@ def resolve_tokenizer_modalities(
 ) -> tuple[list[TokenizerModalitySpec], list[TokenizerModalityMeta]]:
     """Expand tokenizer input-field specs.
 
-    ``text`` / ``token`` meta ``name`` is :data:`NAME_TEXT`. Every other
-    type is keyed by ``output_field``.
+    ``text`` / ``token`` meta ``name`` is :data:`NAME_TEXT`. ``image``
+    is keyed by ``output_field``.
     """
     raw = input_fields or []
     specs: list[TokenizerModalitySpec] = []
-    n_learnable = 0
     for m in raw:
         if isinstance(m, TokenizerModalitySpec):
             spec = m
         else:
             spec = TokenizerModalitySpec(**dict(m))
-        specs.extend(expand_tokenizer_spec(spec, learnable_index=n_learnable))
-        if spec.type == "learnable":
-            n_learnable += 1
+        specs.extend(expand_tokenizer_spec(spec))
 
     meta: list[TokenizerModalityMeta] = []
     seen: set[str] = set()
@@ -438,37 +362,6 @@ def resolve_tokenizer_modalities(
                     spec=spec,
                     name=NAME_TEXT,
                     kind=KIND_TEXT if k == "text" else KIND_TOKEN,
-                )
-            )
-            continue
-        if k == "discrete":
-            meta.append(
-                TokenizerModalityMeta(spec=spec, name=name, kind=KIND_DISCRETE)
-            )
-        elif k in ("fourier", "continuous"):
-            dim = 1 if k == "fourier" else int(spec.dim or 0)
-            if dim <= 0:
-                raise ValueError(
-                    f"continuous modality {spec.output_field!r} requires dim="
-                )
-            meta.append(
-                TokenizerModalityMeta(
-                    spec=spec,
-                    name=name,
-                    kind=KIND_FOURIER,
-                    dim=dim,
-                )
-            )
-        elif k == "learnable":
-            n = int(spec.tokens or 1)
-            if n <= 0:
-                raise ValueError("learnable tokens must be >= 1")
-            meta.append(
-                TokenizerModalityMeta(
-                    spec=spec,
-                    name=name,
-                    kind=KIND_LEARNABLE,
-                    n_learnable=n,
                 )
             )
         elif k == "image":

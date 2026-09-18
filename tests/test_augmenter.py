@@ -323,7 +323,7 @@ def test_eval_compose_omits_augmenter() -> None:
             {"type": "discrete", "input_field": "action", "output_field": "action", "vocab_size": 10, "permute": True}
         ],
     )
-    train_transform = compose(augment)
+    train_transform = compose(stages=(augment,))
     step = {"action": 0, "task_index": 7}
     assert train_transform(step) == augment(step)
     # eval is the raw step — no augmenter in the compose.
@@ -337,7 +337,7 @@ def test_compose_reseed_forwards_to_augmenter() -> None:
             {"type": "discrete", "input_field": "action", "output_field": "action", "vocab_size": 10, "permute": True}
         ],
     )
-    transform = compose(augment)
+    transform = compose(stages=(augment,))
     assert augment._generation == 0
     transform.reseed()
     assert augment._generation == 1

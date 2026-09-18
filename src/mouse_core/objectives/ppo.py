@@ -8,7 +8,8 @@ import torch
 import torch.nn.functional as F
 from tensordict import TensorDict
 
-from mouse_core.objectives.base import Objective
+from mouse_core.models.heads.base import BaseHead
+from mouse_core.objectives.base import Objective, predictions_for, require_head
 from mouse_core.objectives.dqn import (
     _boundary_discounts,
     _pair_weight,
@@ -85,12 +86,12 @@ class PpoObjective(Objective):
     """Clipped PPO policy+value objective with GAE.
 
     Instantiate with hyperparameters, then call with
-    ``(objective_data, predictions)`` to compute the loss.
+    ``objective_data=`` and ``predictions=`` to compute the loss.
 
     Requires dual heads on the model:
 
-    * ``predictions["action"]`` — ``[N, A]`` discrete policy logits
-    * ``predictions["value"]`` — ``[N, 1]`` or ``[N]`` scalar state values
+    * ``head`` — ``[N, A]`` discrete policy logits
+    * ``value_head`` — ``[N, 1]`` or ``[N]`` scalar state values
 
     A run is the same ``sequence_id`` and, when ``grouping_field=`` is set,
     the same grouping column. Neighbor reads must stay in-run: out-of-run
@@ -104,7 +105,7 @@ class PpoObjective(Objective):
     gamma, then by the task gamma (``1.0`` when ``task_done==0``).
 
     ``task_done`` and ``old_log_prob`` are objective columns only — not
-    tokenizer or embedder input. Stamp behavior log-probs on rollout rows
+    tokenizer input. Stamp behavior log-probs on rollout rows
     (same step as ``action``) and include them in the tokenizer ``objective_fields``
     keep-list so they land in ``objective_data``::
 
@@ -120,7 +121,7 @@ class PpoObjective(Objective):
         )
         inputs, objective_data = loader.next_batch()
         predictions = model(inputs).predictions
-        loss, metrics = objective(objective_data.to(device), predictions)
+        loss, metrics = objective(objective_data=objective_data.to(device), predictions=predictions)
 
     When ``old_log_prob`` is absent, the detached current log-probs are used
     (ratio = 1) — suitable for a single pass over a freshly collected batch.
@@ -146,8 +147,10 @@ class PpoObjective(Objective):
         episode_done_key: Key in ``objective_data`` for episode-done codes.
         task_done_key: Key in ``objective_data`` for task-done codes.
         old_log_prob_key: Key in ``objective_data`` for behavior log-probs.
-        predictions_key: Key in ``predictions`` for policy logits.
-        value_key: Key in ``predictions`` for scalar values.
+        head: Policy head this objective trains. Must be the same
+            instance passed to ``Model(heads=)``.
+        value_head: Value head this objective trains. Must be the same
+            instance passed to ``Model(heads=)``.
         num_actions: If set, only the first ``num_actions`` logits participate.
         grouping_field: Step column that isolates runs (typically
             ``task_index``). Required. Pass ``None`` only when the batch
@@ -173,8 +176,8 @@ class PpoObjective(Objective):
         episode_done_key: str = "episode_done",
         task_done_key: str = "task_done",
         old_log_prob_key: str = "old_log_prob",
-        predictions_key: str = "action",
-        value_key: str = "value",
+        head: BaseHead,
+        value_head: BaseHead,
         num_actions: int | None = None,
         grouping_field: str | None,
     ) -> None:
@@ -193,23 +196,24 @@ class PpoObjective(Objective):
         self.episode_done_key = episode_done_key
         self.task_done_key = task_done_key
         self.old_log_prob_key = old_log_prob_key
-        self.predictions_key = predictions_key
-        self.value_key = value_key
+        self.head = require_head(head=head, what="head")
+        self.value_head = require_head(head=value_head, what="value_head")
         self.num_actions = num_actions
         self.grouping_field = grouping_field
 
     def __call__(
         self,
+        *,
         objective_data: TensorDict,
         predictions: TensorDict,
         delayed_predictions: TensorDict | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        logits: torch.Tensor = predictions[self.predictions_key]
-        values_raw: torch.Tensor = predictions[self.value_key]
+        logits: torch.Tensor = predictions_for(head=self.head, predictions=predictions, who="PPO")
+        values_raw: torch.Tensor = predictions_for(head=self.value_head, predictions=predictions, who="PPO")
 
         if logits.ndim != 2:
             raise ValueError(
-                f"PPO expects {self.predictions_key!r} logits shape [N, A], "
+                f"PPO expects policy logits shape [N, A], "
                 f"got {tuple(logits.shape)}."
             )
         N, A = logits.shape
@@ -226,7 +230,7 @@ class PpoObjective(Objective):
 
         if values_raw.shape[0] != N:
             raise ValueError(
-                f"PPO expects {self.value_key!r} leading size [{N}], "
+                f"PPO expects value leading size [{N}], "
                 f"got {tuple(values_raw.shape)}."
             )
         if values_raw.ndim == 2 and values_raw.shape[-1] == 1:
@@ -235,7 +239,7 @@ class PpoObjective(Objective):
             values = values_raw
         else:
             raise ValueError(
-                f"PPO expects {self.value_key!r} shape [{N}] or [{N}, 1], "
+                f"PPO expects value shape [{N}] or [{N}, 1], "
                 f"got {tuple(values_raw.shape)}."
             )
         values = values.to(dtype=dtype)

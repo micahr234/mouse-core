@@ -13,7 +13,7 @@ Two ways to train a backbone, both with every trainable parameter in fp32:
 - full fine-tuning — no ``lora``; build it with ``dtype=torch.float32`` and
   the base weights train directly;
 - fp32 LoRA on a frozen base — ``lora=LoRAConfig(...)``; the base weights
-  are frozen and may be built in bf16 (``dtype=preferred_dtype(device)``),
+  are frozen and may be built in bf16 (``dtype=preferred_dtype(device=device)``),
   the LoRA adapters are the only trainable backbone parameters.
 
 The base dtype is a constructor argument of the transformer backbones; the
@@ -52,22 +52,34 @@ def _disable_cudnn_sdp() -> None:
         enable_cudnn_sdp(enabled=False)
 
 
+def _final_norm_attr(model: nn.Module) -> str:
+    """Name of the stack's final norm (``norm``, ``final_layernorm``, or ``ln_f``)."""
+    for name in ("norm", "final_layernorm", "ln_f"):
+        if hasattr(model, name):
+            return name
+    raise TypeError(
+        f"{type(model).__name__} has no final norm (norm / final_layernorm / ln_f)."
+    )
+
+
 def _apply_final_norm(model: nn.Module, use_norm: bool) -> None:
-    """Keep or drop the transformer's final RMSNorm.
+    """Keep or drop the transformer's final RMSNorm / LayerNorm.
 
     Per-layer norms (input, post-attention, Qwen3 q/k) are unchanged.
-    ``use_norm=False`` replaces ``model.norm`` with ``nn.Identity``.
+    ``use_norm=False`` replaces that module with ``nn.Identity``.
     """
     if type(use_norm) is not bool:
         raise TypeError(f"use_norm must be a bool, got {use_norm!r}.")
+    name = _final_norm_attr(model)
+    current = getattr(model, name)
     if use_norm:
-        if isinstance(model.norm, nn.Identity):
+        if isinstance(current, nn.Identity):
             raise TypeError(
                 "use_norm=True requires the transformer final RMSNorm; "
-                f"got {type(model.norm).__name__}."
+                f"got {type(current).__name__}."
             )
         return
-    model.norm = nn.Identity()
+    setattr(model, name, nn.Identity())
 
 
 class Backbone(nn.Module, ABC):
@@ -77,7 +89,7 @@ class Backbone(nn.Module, ABC):
     processed hidden states of shape ``[B, T, D]``.
 
     Implementations may be:
-    - a full transformer (Llama, Qwen3, …)
+    - a full transformer (:class:`~mouse_core.models.backbone.transformer.TransformerBackbone`)
     - a state-space model
     - an identity (no-op) for ablations
     - any custom sequence processor
@@ -129,6 +141,7 @@ class Backbone(nn.Module, ABC):
 
     lora: LoRAConfig | None = None
     gradient_checkpointing: bool = False
+    uses_packed: bool = False
     train_kernel: TrainKernel
     decode_kernel: DecodeKernel
     train_autocast_dtype: torch.dtype | None = None
@@ -173,18 +186,22 @@ class Backbone(nn.Module, ABC):
         """
         self.lora = lora
         if lora is not None:
-            apply_lora(model, lora)
+            apply_lora(model=model, config=lora)
 
     @property
     def dtype(self) -> torch.dtype:
-        """Dtype of the base weights; ``Model`` casts backbone inputs to it.
+        """Dtype of the decoder base weights; ``Model`` casts embeds to it.
 
-        LoRA adapters are fp32 and skipped. A parameterless backbone
+        Reads ``self.model`` when present so Identity ``embed_tokens``
+        (fp32) do not hide a bf16 LoRA base. LoRA adapters are skipped.
+        A parameterless / table-only backbone
         (:class:`~mouse_core.models.backbone.none.IdentityBackbone`) reports
         ``float32``.
         """
+        stack = getattr(self, "model", None)
+        target = stack if isinstance(stack, nn.Module) else self
         try:
-            return module_device_dtype(self)[1]
+            return module_device_dtype(target)[1]
         except ValueError:
             return torch.float32
 
@@ -206,6 +223,16 @@ class Backbone(nn.Module, ABC):
         Returns:
             Hidden states ``[B, T, D]``, or ``(hidden_states, layer_hiddens)``
             when ``output_hidden_states=True``.
+        """
+        ...
+
+    @abstractmethod
+    def embed(self, token_batch: Any) -> tuple[torch.Tensor, torch.Tensor]:
+        """Embed a :class:`~mouse_core.data.token_batch.TokenBatch`.
+
+        Returns ``(embeds [L, D], head_output_indices [P])``.
+        ``TransformerBackbone`` and ``IdentityBackbone`` look up
+        ``embed_tokens``.
         """
         ...
 
@@ -234,7 +261,7 @@ def _reject_dtype_cast(what: str, *args: Any, **kwargs: Any) -> None:
     if dtype is not None:
         raise TypeError(
             f"{what}.to() does not cast dtypes. The backbone dtype is fixed when it is built "
-            f"(e.g. Qwen3Backbone(dtype=preferred_dtype(device), ...)); use .to(device) to move."
+            f"(e.g. TransformerBackbone(dtype=preferred_dtype(device=device), ...)); use .to(device) to move."
         )
 
 
@@ -272,10 +299,7 @@ def _load_transformer_weights(
 ) -> None:
     """Load matching transformer weights into a MOUSE backbone internals.
 
-    MOUSE backbones replace token embeddings with a MOUSE encoder
-    (:class:`~mouse_core.models.embedding.NumericEmbedder` or
-    :class:`~mouse_core.models.embedding.TextEmbedder`), so the
-    ``embed_tokens`` keys are skipped. The final norm is loaded when the
+    Always loads ``embed_tokens``. The final norm is loaded when the
     target still has ``norm.weight`` (``use_norm=True``); ``use_norm=False``
     replaces that module with ``Identity``, so the checkpoint's
     ``norm.weight`` is skipped.
@@ -292,7 +316,10 @@ def _load_transformer_weights(
         pretrained = AutoModel.from_pretrained(repo_id_or_path, **hub_kwargs)
     target_state = model.state_dict()
     pretrained_state = pretrained.state_dict()
-    skipped_prefixes = ("embed_tokens",) if "norm.weight" in target_state else ("embed_tokens", "norm")
+    skipped: list[str] = []
+    if "norm.weight" not in target_state:
+        skipped.append("norm")
+    skipped_prefixes = tuple(skipped)
     loadable = {
         key: value
         for key, value in pretrained_state.items()

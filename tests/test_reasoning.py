@@ -13,39 +13,27 @@ from mouse_core.models import (
     sample_reasoning_splits,
     save_model,
 )
-from mouse_core.models.backbone import LlamaBackbone, LoRAConfig
-from mouse_core.models.embedding import NumericEmbedder
-from mouse_core.models.heads import DiscreteActionValueHead
+from mouse_core.models.backbone import TransformerBackbone, LoRAConfig
+from mouse_core.models.heads import RegressionHead
 from mouse_core.models.reasoner import _plan_insertions
-from tests._token_batch_helpers import batch_to_token_batch, tok_from_encoder
+from tests._token_batch_helpers import batch_to_token_batch, token_tokenizer
 
 _HIDDEN = 32
 _ACTIONS = 4
-
-# Every step ends with a learnable "value" token (the action prompt):
-# the tokenizer emits modalities in list order, so it is each step's
-# head-output token and Q is read from it.
-_MODALITIES = [
-    {"type": "discrete", "field": "action", "vocab_size": _ACTIONS, "std": 0.02, "positions": 1},
-    {"type": "discrete", "field": "observation", "vocab_size": 16, "std": 0.02, "positions": 1},
-    {"type": "fourier", "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0},
-    {"type": "discrete", "field": "episode_done", "vocab_size": 3, "std": 0.02, "positions": 1},
-    {"type": "learnable", "field": "value", "tokens": 1, "std": 0.02, "positions": 1},
-]
-_TOKENS_PER_STEP = 5
+_TOK = token_tokenizer("action", "observation", "episode_done")
+_TOKENS_PER_STEP = 3
 
 
 def _tiny_model(*, num_thoughts: int = 2, with_reasoner: bool = True) -> Model:
-    encoder = NumericEmbedder(hidden_dim=_HIDDEN, modalities=_MODALITIES)
-    backbone = LlamaBackbone(
+    backbone = TransformerBackbone(architecture="llama", 
         train_kernel="reference", decode_kernel="flex", dtype=torch.float32, use_norm=True,
         hidden_dim=_HIDDEN,
         num_layers=2,
         num_heads=2,
         max_position_embeddings=128,
-        lora=LoRAConfig(rank=4),
-    )
-    heads = DiscreteActionValueHead(
+        vocab_size=32,
+        lora=LoRAConfig(rank=4))
+    heads = RegressionHead(
         in_features=_HIDDEN,
         out_features=_ACTIONS,
         hidden_dim=_HIDDEN,
@@ -56,7 +44,7 @@ def _tiny_model(*, num_thoughts: int = 2, with_reasoner: bool = True) -> Model:
         if with_reasoner
         else None
     )
-    return Model(encoder=encoder, backbone=backbone, heads=heads, action_head="action_value", reasoner=reasoner, recurrence=None)
+    return Model(backbone=backbone, heads=heads, action_source=heads, reasoner=reasoner)
 
 
 def _rows(n: int, offset: int = 0, groups: list[int] | None = None) -> list[dict]:
@@ -73,21 +61,17 @@ def _rows(n: int, offset: int = 0, groups: list[int] | None = None) -> list[dict
 
 
 def _token_batch(model: Model, batch: list[list[dict]]):
-    return batch_to_token_batch(tok_from_encoder(model.encoder), batch)
+    return batch_to_token_batch(_TOK, batch)
 
 
 _BATCH = [_rows(4), _rows(3, offset=1)]
 
 
-def test_value_modality_is_named() -> None:
+def test_head_output_is_text_stream() -> None:
     model = _tiny_model()
     batch = _token_batch(model, _BATCH)
-    assert "value" in batch.modality_names
-    assert "value" in dict(model.encoder._tables)  # type: ignore[union-attr]
-    # The prompt is each step's last token, so it is the head-output token.
-    assert batch.modality_ids[batch.head_output_indices].tolist() == (
-        [batch.modality_names.index("value")] * batch.N
-    )
+    assert batch.modality_names == ("__text__",)
+    assert batch.modality_ids[batch.head_output_indices].tolist() == [0] * batch.N
 
 
 def test_reasoning_none_matches_plain_forward() -> None:
@@ -114,19 +98,19 @@ def test_all_skip_splits_match_plain_forward() -> None:
 def test_plan_insertions_bookkeeping() -> None:
     model = _tiny_model()
     batch = _token_batch(model, _BATCH)
-    # Seq 0: tokens 0..19, prompts [4, 9, 14, 19]; seq 1: tokens 20..34,
-    # prompts [24, 29, 34]. Burst at seq 0 step 1 (anchor 9), R = 2.
+    # Seq 0: 4 steps × 3 tokens, head-outputs [2, 5, 8, 11]; seq 1: 3 steps
+    # × 3 tokens. Burst at seq 0 step 1 (first head-output token 5), R = 2.
     plan = _plan_insertions(batch, np.array([1, -1]), num_thoughts=2)
     assert plan is not None
     assert plan.ext_length == batch.L + 2
-    assert plan.anchors.tolist() == [9]
+    assert plan.anchors.tolist() == [5]
     assert plan.prefix_starts.tolist() == [0]
-    assert plan.latent_positions.tolist() == [9, 10]
-    expected_tokens = [i if i < 9 else i + 2 for i in range(batch.L)]
+    assert plan.latent_positions.tolist() == [5, 6]
+    expected_tokens = [i if i < 5 else i + 2 for i in range(batch.L)]
     assert plan.token_positions.tolist() == expected_tokens
-    assert plan.ext_head_output_indices.tolist() == [4, 11, 16, 21, 26, 31, 36]
-    assert plan.ext_sequence_ids[9:11].tolist() == [0, 0]
-    assert plan.ext_grouping_ids[9:11].tolist() == [0, 0]
+    assert plan.ext_head_output_indices.tolist() == [2, 7, 10, 13, 16, 19, 22]
+    assert plan.ext_sequence_ids[5:7].tolist() == [0, 0]
+    assert plan.ext_grouping_ids[5:7].tolist() == [0, 0]
     # Original ids land at their shifted positions.
     assert plan.ext_sequence_ids[plan.token_positions].tolist() == (
         batch.sequence_ids.tolist()
@@ -201,7 +185,7 @@ def test_sample_reasoning_splits_eligibility() -> None:
     rng = np.random.default_rng(0)
     seen: set[int] = set()
     for _ in range(50):
-        splits = sample_reasoning_splits(batch, rng)
+        splits = sample_reasoning_splits(batch=batch, generator=rng)
         assert splits.shape == (2,)
         assert splits[1] == -1
         assert int(splits[0]) in (0, 2)
@@ -228,7 +212,7 @@ def test_delayed_model_parity_with_reasoning() -> None:
     delayed reasoning forward on the same bursts matches the online one."""
     torch.manual_seed(0)
     model = _tiny_model().eval()
-    delayed = model.delayed_copy(heads=("action_value",)).eval()
+    delayed = model.delayed_copy(heads=(model._heads["action_value"],)).eval()
     assert delayed.reasoner is not None and delayed.reasoner is not model.reasoner
     batch = _token_batch(model, _BATCH)
     out = model(batch, reasoning=[1, 0])
@@ -244,7 +228,7 @@ def test_delayed_model_parity_with_reasoning() -> None:
 def test_delayed_reasoning_builds_no_autograd_graph() -> None:
     torch.manual_seed(0)
     model = _tiny_model().train()
-    delayed = model.delayed_copy(heads=("action_value",))
+    delayed = model.delayed_copy(heads=(model._heads["action_value"],))
     batch = _token_batch(model, _BATCH)
     saved = {"n": 0}
 
@@ -270,8 +254,8 @@ def test_reasoning_states_stay_on_the_tape() -> None:
 def test_save_load_roundtrip_with_reasoner(tmp_path) -> None:
     torch.manual_seed(0)
     model = _tiny_model(num_thoughts=3).eval()
-    save_model(model, tmp_path)
-    loaded = load_model(str(tmp_path), train_kernel="reference", decode_kernel="flex", dtype=torch.float32, map_location="cpu").eval()
+    save_model(model=model, path=tmp_path)
+    loaded = load_model(repo_id_or_path=str(tmp_path), train_kernel="reference", decode_kernel="flex", dtype=torch.float32, map_location="cpu").eval()
     assert loaded.reasoner is not None
     assert loaded.reasoner.num_thoughts == 3
     batch = _token_batch(model, _BATCH)

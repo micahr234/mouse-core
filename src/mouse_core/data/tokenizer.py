@@ -1,4 +1,4 @@
-"""Tokenizer — one step dict → StepTokens (text / discrete / continuous).
+"""Tokenizer — one step dict → StepTokens (text / token / image).
 
 I/O
 ---
@@ -29,10 +29,7 @@ import torch
 
 from mouse_core.data.io_fields import coerce_io_fields
 from mouse_core.data.modality import (
-    KIND_DISCRETE,
-    KIND_FOURIER,
     KIND_IMAGE,
-    KIND_LEARNABLE,
     KIND_TEXT,
     KIND_TOKEN,
     NAME_TEXT,
@@ -55,16 +52,15 @@ from mouse_core.data.token_batch import (
 class Tokenizer:
     """CPU packer: one step dict → :class:`StepTokens`.
 
-    Construct independently of the embedder. Alignment is by modality
-    **name**: ``__text__`` for ``text`` / ``token`` fields (and
-    ``group_prefix=``), ``output_field`` for every other type.
-    ``input_fields=`` are the tokens fed to the transformer, emitted in
-    list order. Each field is its own tokenize/emit run (no BPE merge
-    across ``text`` fields). Exactly one input field must set
+    Alignment is by modality **name**: ``__text__`` for ``text`` /
+    ``token`` fields (and ``group_prefix=``), ``output_field`` for
+    ``image``. ``input_fields=`` are the tokens fed to the transformer,
+    emitted in list order. Each field is its own tokenize/emit run (no
+    BPE merge across ``text`` fields). Exactly one input field must set
     ``head_output=True``: its tokens are the step's head-output tokens —
     the positions the model reads Q / action outputs from. Every step
     must emit at least one (never skip that field); a step may emit
-    several (e.g. ``learnable`` with ``tokens > 1``), and the DQN
+    several (e.g. a ``text`` run with more than one id), and the DQN
     objectives then train each of them toward the same per-step target.
 
     A ``text`` field requires ``format=``. ``input_field=`` reads the
@@ -76,8 +72,7 @@ class Tokenizer:
     when the step value matches ``skip``. A ``required=False`` field
     whose value is missing / ``None`` emits nothing (``format_skipped=``
     does not apply). ``max_tokens=`` (``text`` / ``image``) raises if
-    that run is longer. ``learnable`` fields have no step I/O and emit
-    in list order. ``group_prefix=`` is a format string over the raw
+    that run is longer. ``group_prefix=`` is a format string over the raw
     step dict (placeholders need not be ``input_fields``); it is
     tokenized as ``__text__`` and :func:`~mouse_core.data.token_batch.pack_token_batch`
     inserts those tokens at the start of each grouping-field segment.
@@ -156,14 +151,8 @@ class Tokenizer:
             if m.name in mmap:
                 raise ValueError(f"duplicate tokenizer modality name {m.name!r}")
             names.append(m.name)
-            if m.kind == KIND_FOURIER:
-                mmap[m.name] = ModalityInfo(type="fourier", dim=m.dim)
-            elif m.kind == KIND_DISCRETE:
-                mmap[m.name] = ModalityInfo(type="discrete")
-            elif m.kind == KIND_IMAGE:
+            if m.kind == KIND_IMAGE:
                 mmap[m.name] = ModalityInfo(type="image")
-            elif m.kind == KIND_LEARNABLE:
-                mmap[m.name] = ModalityInfo(type="learnable")
             else:
                 raise ValueError(f"unsupported modality kind {m.kind!r}")
 
@@ -203,8 +192,8 @@ class Tokenizer:
 
     def pack_rows(
         self,
-        rows: Sequence[Sequence[dict]],
         *,
+        rows: Sequence[Sequence[dict]],
         prev_grouping_ids: Sequence[int | None] | None,
     ) -> TokenBatch:
         """Tokenize ragged per-sequence rows into packed model inputs.
@@ -232,7 +221,7 @@ class Tokenizer:
                 steps.append(self(step))
                 sids.append(i)
         inputs, _ = pack_token_batch(
-            steps,
+            steps=steps,
             sequence_ids=sids if steps else None,
             batch_size=len(rows),
             grouping_field=self.grouping_field,
@@ -363,16 +352,6 @@ def _tokenize_step(
 
     for m in meta:
         spec = m.spec
-        if m.kind == KIND_LEARNABLE:
-            n = int(m.n_learnable)
-            _emit(
-                list(range(n)),
-                spec=spec,
-                name=m.name,
-                head_output=spec.head_output,
-            )
-            continue
-
         if m.kind == KIND_TEXT:
             rendered = _field_text_value(spec, row)
             if rendered is None:
@@ -403,31 +382,6 @@ def _tokenize_step(
                 [int(unwrap_scalar(value))],
                 spec=spec,
                 name=NAME_TEXT,
-                head_output=spec.head_output,
-            )
-        elif m.kind == KIND_DISCRETE:
-            _emit(
-                [int(unwrap_scalar(value))],
-                spec=spec,
-                name=m.name,
-                head_output=spec.head_output,
-            )
-        elif m.kind == KIND_FOURIER:
-            if m.dim == 1:
-                vals = [float(unwrap_scalar(value))]
-            else:
-                arr = np.asarray(value, dtype=np.float32).ravel()
-                if arr.size != m.dim:
-                    raise ValueError(
-                        f"continuous field {in_name!r} declared dim={m.dim} but the "
-                        f"step value has {arr.size} elements"
-                    )
-                vals = [float(v) for v in arr]
-            _emit(
-                list(range(len(vals))),
-                spec=spec,
-                name=m.name,
-                token_values=vals,
                 head_output=spec.head_output,
             )
         elif m.kind == KIND_IMAGE:
@@ -509,7 +463,7 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
-def tokenizer_config(tokenizer: Tokenizer) -> dict[str, Any]:
+def tokenizer_config(*, tokenizer: Tokenizer) -> dict[str, Any]:
     """Public packing spec for :func:`save_tokenizer` / :func:`load_tokenizer`."""
     input_fields: list[dict[str, Any]] = []
     for spec in tokenizer.input_fields:
@@ -540,18 +494,18 @@ def tokenizer_config(tokenizer: Tokenizer) -> dict[str, Any]:
     }
 
 
-def save_tokenizer(tokenizer: Tokenizer, path: str | Path) -> None:
+def save_tokenizer(*, tokenizer: Tokenizer, path: str | Path) -> None:
     """Write ``tokenizer.json`` into *path* (its own directory, not the model)."""
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
     with (path / TOKENIZER_FILENAME).open("w") as fh:
-        json.dump(tokenizer_config(tokenizer), fh, indent=2, sort_keys=True)
+        json.dump(tokenizer_config(tokenizer=tokenizer), fh, indent=2, sort_keys=True)
         fh.write("\n")
 
 
 def load_tokenizer(
-    repo_id_or_path: str,
     *,
+    repo_id_or_path: str,
     tokenizer=None,
     image_tokenizer=None,
     force_download: bool = True,

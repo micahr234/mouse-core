@@ -1,4 +1,4 @@
-"""SwiGLU activation and SwiGLUHead MLP building block."""
+"""SwiGLU activation and shared MLP body for public heads."""
 
 from __future__ import annotations
 
@@ -22,8 +22,8 @@ class SwiGLU(nn.Module):
         return F.silu(a) * b
 
 
-class SwiGLUHead(BaseHead):
-    """MLP head built from stacked ``SwiGLU`` blocks with a scaled output projection.
+class _MlpHead(BaseHead):
+    """Stacked SwiGLU blocks with a scaled output projection.
 
     Architecture::
 
@@ -33,18 +33,11 @@ class SwiGLUHead(BaseHead):
     the first SwiGLU block — independent of the backbone's final RMSNorm.
     ``scale`` controls the output weight initialisation magnitude — set
     small (e.g. ``0.01``) for a near-zero initial output.
-
-    Args:
-        in_features: Input dimension ``D``.
-        out_features: Output dimension (number of actions ``A``, or ``A * vec_dim``).
-        hidden_dim: Width of the SwiGLU hidden layers.
-        num_layers: Total depth including the final linear; must be ``>= 1``.
-        use_norm: Whether to prepend an ``RMSNorm`` layer.
-        scale: ``ScaledLinear`` weight init multiplier for the output projection.
     """
 
     def __init__(
         self,
+        *,
         in_features: int,
         out_features: int,
         hidden_dim: int,
@@ -67,7 +60,7 @@ class SwiGLUHead(BaseHead):
             self.norm = None
         dims = [in_features] + [hidden_dim] * (num_layers - 1) + [out_features]
         self.layers = nn.Sequential(
-            *[SwiGLU(in_features=dims[i], hidden_dim=dims[i+1]) for i in range(num_layers - 1)],
+            *[SwiGLU(in_features=dims[i], hidden_dim=dims[i + 1]) for i in range(num_layers - 1)],
             ScaledLinear(in_features=dims[-2], out_features=dims[-1], scale=scale),
         )
 

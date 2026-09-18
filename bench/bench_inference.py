@@ -32,7 +32,7 @@ from typing import Any
 
 import torch
 
-from mouse_core.models.backbone import Qwen3Backbone
+from mouse_core.models.backbone import TransformerBackbone
 from mouse_core.models.lora import LoRAConfig
 
 _BENCH_DIR = Path(__file__).resolve().parent
@@ -145,7 +145,7 @@ def main() -> None:
     torch.manual_seed(0)
     lora = None if args.no_lora else LoRAConfig(rank=16, alpha=32.0)
     dtype = torch.float32 if lora is None else torch.bfloat16
-    backbone = Qwen3Backbone(
+    backbone = TransformerBackbone(
         train_kernel="varlen",
         decode_kernel="flex",
         dtype=dtype, use_norm=True,

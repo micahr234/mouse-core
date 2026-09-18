@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- ``TransformerBackbone``: one public transformer backbone. ``pretrained=``
+  inspects the Hub config. Packed Flex / varlen / padded kernels run when
+  every layer is a Llama/Qwen3-shaped softmax block (including other
+  packed-compatible stacks such as Qwen2). Other maskable softmax
+  decoders use HuggingFace ``forward`` with the grouping mask and
+  require ``train_kernel="reference"``. Hybrid / linear / sliding-window
+  stacks raise — grouping would be silently wrong. From-scratch stacks
+  pass ``architecture="qwen3"`` or ``architecture="llama"``.
+
 ### Changed
 - Aligned with mouse-gym 1.1.0: ``EnvConfig.episodes_per_task`` is
   ``max_task_episodes`` (task-length timeout, ``task_done=2``).
@@ -16,28 +26,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``gamma_task_truncated`` docs match. Live-env notebooks pass
   ``max_task_episodes=``.
 - Depend on ``huggingface_hub>=1.32.0``.
-- ``Model.delayed_copy(heads=...)``: ``heads`` is required and names the
-  heads the delayed model carries — only those the objective reads from
-  ``delayed_predictions`` (``("action_value",)`` for ``DqnObjective`` /
-  ``RetraceObjective``, each ``prediction_key`` for
-  ``NStepDqnObjective``, ``("action_value_layerwise",)`` for
-  ``LayerwiseDqnObjective``). Heads left out are neither copied, run, nor
-  Polyak-interpolated; the copy's ``action_head`` is the online one when
-  listed, else the first name. ``Polyak`` pairs each delayed head with
-  the online head of the same name and rejects a delayed head that does
-  not exist online. Every DQN notebook passes ``heads=``.
-- ``LlamaBackbone``, ``Qwen3Backbone``, ``SwiGLUHead``, and the action
-  heads require ``use_norm``.
+- ``Model.delayed_copy(heads=...)``: ``heads`` is required and is the
+  head instances the delayed model carries — only those the objective
+  reads from ``delayed_predictions`` (the Q head for ``DqnObjective`` /
+  ``RetraceObjective``, each n-step Q head, the layerwise Q head). Heads
+  left out are neither copied, run, nor Polyak-interpolated; the copy's
+  ``action_source`` is the online one when listed, else the first head.
+  ``Polyak`` pairs each delayed head with the online head of the same
+  name and rejects a delayed head that does not exist online. Every DQN
+  notebook passes ``heads=``.
+- Objectives take the head instance they train (``head=``, plus
+  ``value_head=`` / ``behavior_head=`` where needed) instead of a
+  prediction-key string. ``Model`` stamps the storage key on each head.
+  ``DqnObjective``, ``NStepDqnObjective``, ``LayerwiseDqnObjective``,
+  ``RetraceObjective``, ``PpoObjective``, ``GrpoObjective``,
+  ``SpObjective``, and ``SvObjective`` all require the head.
+- ``TransformerBackbone``, ``RegressionHead``, ``ClassificationHead``, and
+  ``LayerwiseRegressionHead`` require ``use_norm``. ``save_model`` writes
+  backbone type ``transformer`` with an ``architecture`` field
+  (``llama`` / ``qwen3`` / ``hf``). Packed train dispatch is
+  ``backbone.uses_packed``, not ``hasattr(model, "layers")``.
+- Head classes: ``DiscreteActionValueHead`` is ``RegressionHead``,
+  ``DiscreteActionHead`` is ``ClassificationHead``,
+  ``LayerwiseDiscreteActionValueHead`` is ``LayerwiseRegressionHead``.
+  Prediction keys are unchanged (``action_value``, ``action``,
+  ``action_value_layerwise``). ``save_model`` writes head types
+  ``regression``, ``classification``, and ``regression_layerwise``.
+- ``Model(..., action_source=)`` is the head instance ``get_action``
+  uses, not a string name. It must be one of the objects in ``heads``.
+  The stored prediction key is still inferred from type (or the dict
+  key). ``save_model`` writes that key as ``action_source``.
+- Public constructors and helpers are keyword-only. Call them by name
+  (``Polyak(online=model, delayed=delayed_model)``,
+  ``save_model(model=model, path=path)``,
+  ``objective(objective_data=..., predictions=..., delayed_predictions=...)``).
+  ``nn.Module.forward`` and single-value apply callables
+  (``tokenizer(step)``, ``schedule(x)``) stay positional.
 - ``Polyak.update`` skips a section whose ``tau`` is ``0`` (no delayed-
   parameter writes). All-zero ``tau`` returns immediately.
 - Example notebooks: training is ``01``–``13``; inference is
   ``15_inference.ipynb`` (was ``09``).
+- Example notebooks pack with ``Tokenizer`` ``text`` / ``token`` /
+  ``image`` fields and look up ids through the backbone ``embed_tokens``
+  table. ``examples/02_train_offline_dqn.ipynb`` is the text baseline
+  (reward ``{field:g}`` drops a trailing ``.0``).
+- Token embeddings live on the backbone. ``TransformerBackbone(pretrained=...)``
+  loads native ``embed_tokens``; from-scratch stacks take ``vocab_size=``.
+  ``IdentityBackbone`` requires ``hidden_dim=`` and ``vocab_size=``.
+  ``Model`` takes ``backbone=`` and ``heads=`` (no ``encoder=`` /
+  ``embedder=``). ``Polyak.update`` is ``tau_heads=`` + ``tau_backbone=``;
+  embeddings interpolate with the backbone.
 
 ### Removed
+- ``Recurrence`` and ``Model(recurrence=)``. ``Model.forward`` runs the
+  backbone once. ``ModelOutput.passes`` and ``PassOutput`` are gone;
+  ``DecodeCache`` holds one ``FlexDecodeSession``.
+- ``examples/11_train_offline_recurrent_dqn.ipynb``.
+- ``NumericEmbedder``, ``TextEmbedder``, the ``Encoder`` ABC, and
+  ``embedder=`` on ``TransformerBackbone`` / ``IdentityBackbone``.
+  Both backbones look up a single ``embed_tokens`` table.
+- Tokenizer modality types ``discrete``, ``fourier``, ``continuous``,
+  and ``learnable``. There is no custom / scratch token table.
+- ``examples/06_train_offline_numeric_dqn.ipynb``.
+- ``Model(encoder=)`` and ``Polyak.update(tau_encoder=)``. Embeddings
+  are a backbone concern; ``tau_backbone`` interpolates them.
+- ``examples/06_train_offline_text_dqn.ipynb``. Text packing is the
+  default in ``02``.
+- ``LlamaBackbone`` and ``Qwen3Backbone``. Use ``TransformerBackbone``.
 - ``MaxNStepDqnObjective`` and
   ``examples/15_train_offline_max_n_step_dqn.ipynb``.
+- ``DiscreteActionValueHead``, ``DiscreteActionHead``,
+  ``LayerwiseDiscreteActionValueHead``, and ``SwiGLUHead``. Use
+  ``RegressionHead``, ``ClassificationHead``, or
+  ``LayerwiseRegressionHead``.
+- ``prediction_key``, ``predictions_key``, ``value_key``, and
+  ``behavior_key`` on objectives. Pass the head instance
+  (``head=``, plus ``value_head=`` / ``behavior_head=``).
+  ``delayed_copy(heads=)`` takes those instances, not name strings.
 
 ### Fixed
+- Latent reasoner thoughts are cast to the backbone embed dtype so a
+  bf16 ``embed_tokens`` table can host them.
 - ``huggingface_hub`` 1.32.0 dropped ``CommitOperationAdd`` from
   ``huggingface_hub.hf_api``. Hub helpers import it from
   ``huggingface_hub`` so ``import mouse_core`` works.
@@ -64,7 +133,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bootstraps at the last in-run next state. One objective trains one
   head — call it once per head and add the losses to train several
   horizons. ``examples/13_train_offline_n_step_dqn.ipynb`` is the same
-  offline loop as ``02`` with three ``DiscreteActionValueHead``s
+  offline loop as ``02`` with three ``RegressionHead``s
   (``n=1, 3, 5``), ``delayed_copy`` of every Q head, and the three
   n-step losses summed.
 - ``RetraceObjective``: Retrace(λ) off-policy return-based Q-learning
@@ -77,7 +146,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   convention as ``get_action``). Every target quantity reads the delayed
   network, and the λ-return is a parallel scan.
   ``μ`` is not stored with the data: the model carries a second
-  ``DiscreteActionHead`` under ``predictions[behavior_key]``
+  ``ClassificationHead`` under ``predictions[behavior_key]``
   (``"behavior"``) whose outputs are logits; the objective fits it by NLL
   of the taken actions, ``-log softmax(logits)[a]`` (``behavior_weight``,
   required, ``>= 0``; ``0`` drops the NLL from the loss), and reads the
@@ -93,7 +162,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``delayed_copy(heads=("action_value",))`` so the behavior head is
   never run or Polyak-interpolated on the delayed side.
 - ``use_norm`` (required, saved with the model) on transformer
-  backbones and on ``SwiGLUHead`` / action heads. On
+  backbones and on ``RegressionHead`` / ``ClassificationHead``. On
   ``LlamaBackbone`` / ``Qwen3Backbone``, ``True`` keeps the final
   RMSNorm and ``False`` replaces it with ``Identity`` (per-layer
   norms stay). On a head, ``True`` prepends an input RMSNorm and
@@ -134,9 +203,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ``Tokenizer`` text fields with no ``input_field=`` are consts
   (no step I/O). ``output_field=`` names the field; ``format=`` is the
   literal string to tokenize (no placeholders; ``{{`` / ``}}`` for a
-  literal brace, like every ``format=``). Consts and ``learnable``
-  fields always emit and reject ``skip=`` / ``required=False``.
-  ``examples/06_train_offline_text_dqn.ipynb`` uses
+  literal brace, like every ``format=``). Consts always emit and
+  reject ``skip=`` / ``required=False``.
+  ``examples/02_train_offline_dqn.ipynb`` uses
   ``output_field="value"`` / ``format="\n"`` as the ``head_output``
   readout.
 - ``Tokenizer`` text ``skip=`` requires ``format_skipped=`` (a
@@ -147,9 +216,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to ``True``.
 - ``Tokenizer`` ``text`` / ``image`` fields accept optional
   ``max_tokens=``. If the field emits more ids than that, the tokenizer
-  raises. Fixed-count types (``token`` / ``discrete`` / ``fourier`` /
-  ``continuous`` / ``learnable``) reject it.
-  ``examples/06_train_offline_text_dqn.ipynb`` sets
+  raises. Fixed-count types (``token``) reject it.
+  ``examples/02_train_offline_dqn.ipynb`` sets
   ``max_tokens=1`` on the const ``value`` readout.
 - ``Tokenizer`` rejects duplicate field names across every type
   (``text`` / ``token`` ``output_field`` included), not only named
@@ -234,8 +302,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   text) must set ``head_output: True``; the tokens it emits are the step's
   **head-output tokens** — the positions the heads read Q / action outputs
   from. Every step must emit at least one (the head-output field must never
-  be skipped), and a step may emit several (e.g. ``learnable`` with
-  ``tokens > 1``, or a multi-token text field). ``StepTokens`` carries a
+  be skipped), and a step may emit several (e.g. a multi-token text
+  field). ``StepTokens`` carries a
   per-token ``head_output_mask``; ``TokenBatch.head_output_indices`` lists all
   ``P >= N`` head-output tokens with a parallel ``head_output_steps`` row→step
   map, and ``pack_token_batch`` stamps a ``head_output_count`` column into

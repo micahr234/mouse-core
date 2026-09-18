@@ -1,53 +1,21 @@
-"""Llama transformer backbone.
-
-Provides :class:`LlamaBackbone`, a thin Backbone adapter around
-``transformers.LlamaModel`` for use with the generic :class:`~mouse_core.models.base.Model`.
-"""
+"""Llama decoder stack builder used by :class:`TransformerBackbone`."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
-import torch
 from transformers import LlamaConfig, LlamaModel
 
-from mouse_core.models.backbone.base import (
-    Backbone,
-    DecodeKernel,
-    TrainKernel,
-    _apply_final_norm,
-    _disable_cudnn_sdp,
-    _load_transformer_weights,
-    _rope_parameters_from_config,
-)
-from mouse_core.models.lora import LoRAConfig
+from mouse_core.models.backbone.base import _disable_cudnn_sdp
 
 
 @dataclass
 class _LlamaBackboneConfig:
-    """Configuration for a Llama transformer backbone.
+    """Configuration for a Llama transformer stack.
 
-    Builds a HuggingFace ``LlamaModel`` with SDPA attention and no token
-    embedding (``vocab_size=1``; the MOUSE encoder supplies ``inputs_embeds``).
-    The final RMSNorm is applied in :class:`LlamaBackbone` when
-    ``use_norm=True``.
-
-    Args:
-        num_layers: Number of transformer decoder layers.
-        num_heads: Number of query attention heads.
-        num_key_value_heads: Key/value heads for GQA; defaults to ``num_heads``.
-        max_position_embeddings: Maximum sequence length for RoPE; should be at
-            least ``sequence_length * tokens_per_step``.
-        expand: FFN intermediate size multiplier: ``intermediate_size = hidden_dim * expand``.
-        intermediate_size: Exact FFN size; overrides ``expand * hidden_dim`` when set.
-            Use this when loading from a pretrained model whose FFN size is not
-            an integer multiple of the hidden dim.
-        rope_parameters: Optional dict forwarded to ``LlamaConfig.rope_parameters``
-            for custom RoPE variants (e.g. ``{"rope_type": "llama3"}``).
-        rms_norm_eps: Epsilon for RMSNorm layers.
-        attention_bias: Whether to add bias to QKV and output projections.
+    Builds a HuggingFace ``LlamaModel`` with SDPA attention. ``vocab_size=``
+    is the pretrained vocab, or a stub of 1 when the table is unused.
     """
 
     num_layers: int
@@ -69,16 +37,7 @@ class _LlamaBackboneConfig:
         else:
             self.num_key_value_heads = int(self.num_key_value_heads)
 
-    def build(self, hidden_dim: int) -> LlamaModel:
-        """Instantiate a ``LlamaModel`` with this config.
-
-        Args:
-            hidden_dim: Model hidden dimension ``D``; must be divisible by ``num_heads``.
-
-        Returns:
-            ``LlamaModel`` (token embedding unused; the caller applies
-            ``use_norm``).
-        """
+    def build(self, hidden_dim: int, *, vocab_size: int) -> LlamaModel:
         _disable_cudnn_sdp()
         if hidden_dim % self.num_heads != 0:
             raise ValueError(
@@ -86,7 +45,7 @@ class _LlamaBackboneConfig:
             )
         ffn_size = self.intermediate_size if self.intermediate_size is not None else hidden_dim * self.expand
         config_kwargs: dict = dict(
-            vocab_size=1,
+            vocab_size=int(vocab_size),
             hidden_size=hidden_dim,
             num_attention_heads=self.num_heads,
             num_key_value_heads=self.num_key_value_heads,
@@ -104,200 +63,19 @@ class _LlamaBackboneConfig:
         return LlamaModel(config)
 
 
-class LlamaBackbone(Backbone):
-    """Backbone adapter wrapping a ``transformers.LlamaModel``.
-
-    Construct directly from config args::
-
-           backbone = LlamaBackbone(
-               train_kernel="flex",
-               decode_kernel="flex",
-               dtype=torch.float32,
-               use_norm=True,
-               hidden_dim=128,
-               num_layers=4,
-               num_heads=4,
-               max_position_embeddings=256,
-           )
-
-    Or load architecture and transformer weights from a pretrained Llama repo::
-
-           backbone = LlamaBackbone(
-               train_kernel="flex",
-               decode_kernel="flex",
-               dtype=preferred_dtype(device),
-               use_norm=True,
-               pretrained="meta-llama/Llama-3.2-1B",
-               num_layers=2,
-           )
-
-    The adapter translates the generic MOUSE call into the HF calling
-    convention. Cached decoding goes through ``decode_session()``.
-
-    ``train_kernel`` (``"varlen"`` / ``"padded"`` / ``"flex"`` / ``"reference"``),
-    ``decode_kernel`` (``"flex"``), ``dtype``, and ``use_norm`` are required:
-    the uncached-forward kernel, the cached-decode kernel, the dtype of the
-    base weights (``torch.float32`` to fine-tune them,
-    ``preferred_dtype(device)`` for a frozen LoRA base or inference), and
-    whether to keep the transformer's final RMSNorm (``False`` replaces it
-    with ``Identity``; per-layer norms stay). ``use_norm`` is saved with
-    the model.
-    ``train_autocast_dtype`` / ``decode_autocast_dtype`` (bf16/fp16, fp32
-    base only) declare mixed precision per path: the packed training
-    forward and cached decode (KV pool in the autocast dtype). See
-    ``Backbone``. ``Model.to(device)`` moves and never casts.
-
-    Without ``lora`` the backbone is fully trainable (keep the model fp32).
-    Pass ``lora=LoRAConfig(...)`` to freeze the base weights (bf16 on CUDA)
-    and train fp32 LoRA adapters on every ``nn.Linear`` instead.
-    """
-
-    model: LlamaModel
-
-    def __init__(
-        self,
-        *,
-        train_kernel: TrainKernel,
-        decode_kernel: DecodeKernel,
-        dtype: torch.dtype,
-        use_norm: bool,
-        train_autocast_dtype: torch.dtype | None = None,
-        decode_autocast_dtype: torch.dtype | None = None,
-        model: LlamaModel | None = None,
-        hidden_dim: int | None = None,
-        pretrained: str | Path | None = None,
-        load_weights: bool = True,
-        hub_kwargs: dict[str, Any] | None = None,
-        lora: LoRAConfig | None = None,
-        **config_kwargs: Any,
-    ) -> None:
-        super().__init__()
-        self._set_kernels(train_kernel, decode_kernel)
-        if not isinstance(dtype, torch.dtype) or not dtype.is_floating_point:
-            raise TypeError(f"dtype must be a floating point torch.dtype, got {dtype!r}.")
-        self._set_autocast(train_autocast_dtype, decode_autocast_dtype, dtype)
-
-        if model is not None and pretrained is not None:
-            raise TypeError("LlamaBackbone accepts either model= or pretrained=, not both.")
-
-        load_from: tuple[str | Path, dict[str, Any]] | None = None
-        if model is not None:
-            if not isinstance(model, LlamaModel):
-                raise TypeError(
-                    "When passing a model to LlamaBackbone, it must be a "
-                    "transformers.LlamaModel (with vocab_size=1)."
-                )
-            self.model = model
-            self._config_kwargs = self._config_kwargs_from_model(model)
-        elif pretrained is not None:
-            hf_kwargs = hub_kwargs or {}
-            extracted_kwargs, extracted_hidden_dim = self._config_from_pretrained(
-                repo_id_or_path=pretrained,
-                hub_kwargs=hf_kwargs,
-                overrides=config_kwargs,
-            )
-            if hidden_dim is not None and int(hidden_dim) != extracted_hidden_dim:
-                raise ValueError(
-                    f"hidden_dim={hidden_dim} does not match pretrained hidden size "
-                    f"{extracted_hidden_dim} from {pretrained!r}."
-                )
-            self.model = _LlamaBackboneConfig(**extracted_kwargs).build(extracted_hidden_dim)
-            self._config_kwargs = dict(extracted_kwargs)
-            if load_weights:
-                load_from = (pretrained, hf_kwargs)
-        else:
-            if hidden_dim is None:
-                raise TypeError(
-                    "LlamaBackbone requires either a pre-built model, "
-                    "pretrained=, or hidden_dim plus backbone config arguments "
-                    "(e.g. LlamaBackbone(hidden_dim=128, num_layers=2, num_heads=4, use_norm=True))."
-                )
-            cfg = _LlamaBackboneConfig(**config_kwargs)
-            self.model = cfg.build(hidden_dim)
-            self._config_kwargs = self._config_kwargs_from_model(self.model)
-
-        _apply_final_norm(self.model, use_norm)
-        self._config_kwargs["use_norm"] = use_norm
-        if load_from is not None:
-            self._load_pretrained_weights(repo_id_or_path=load_from[0], hub_kwargs=load_from[1])
-        cast(torch.nn.Module, self.model).to(dtype)  # base weights; LoRA adapters below are always fp32
-        self._attach_lora(self.model, lora)
-
-    @staticmethod
-    def _config_from_pretrained(
-        *,
-        repo_id_or_path: str | Path,
-        hub_kwargs: dict[str, Any],
-        overrides: dict[str, Any],
-    ) -> tuple[dict[str, Any], int]:
-        from transformers import AutoConfig
-
-        hf_cfg = AutoConfig.from_pretrained(repo_id_or_path, **hub_kwargs)
-        model_type = getattr(hf_cfg, "model_type", "").lower()
-        if "llama" not in model_type:
-            raise ValueError(
-                f"LlamaBackbone can only load Llama configs, got model_type={model_type!r} "
-                f"from {repo_id_or_path!r}."
-            )
-
-        backbone_kwargs: dict[str, Any] = dict(
-            num_layers=hf_cfg.num_hidden_layers,
-            num_heads=hf_cfg.num_attention_heads,
-            num_key_value_heads=getattr(hf_cfg, "num_key_value_heads", hf_cfg.num_attention_heads),
-            max_position_embeddings=hf_cfg.max_position_embeddings,
-            intermediate_size=hf_cfg.intermediate_size,
-            rms_norm_eps=getattr(hf_cfg, "rms_norm_eps", 1e-5),
-            attention_bias=getattr(hf_cfg, "attention_bias", False),
-        )
-        rope_parameters = _rope_parameters_from_config(hf_cfg)
-        if rope_parameters is not None:
-            backbone_kwargs["rope_parameters"] = rope_parameters
-        backbone_kwargs.update(overrides)
-        return backbone_kwargs, int(hf_cfg.hidden_size)
-
-    @staticmethod
-    def _config_kwargs_from_model(model: LlamaModel) -> dict[str, Any]:
-        cfg = model.config
-        kwargs: dict[str, Any] = dict(
-            num_layers=len(model.layers),
-            num_heads=cfg.num_attention_heads,
-            num_key_value_heads=getattr(cfg, "num_key_value_heads", cfg.num_attention_heads),
-            max_position_embeddings=cfg.max_position_embeddings,
-            intermediate_size=cfg.intermediate_size,
-            rms_norm_eps=getattr(cfg, "rms_norm_eps", 1e-5),
-            attention_bias=getattr(cfg, "attention_bias", False),
-        )
-        rope_parameters = getattr(cfg, "rope_parameters", None)
-        if rope_parameters is not None:
-            kwargs["rope_parameters"] = rope_parameters
-        return kwargs
-
-    def _load_pretrained_weights(
-        self,
-        *,
-        repo_id_or_path: str | Path,
-        hub_kwargs: dict[str, Any],
-    ) -> None:
-        _load_transformer_weights(hub_kwargs=hub_kwargs, model=self.model, repo_id_or_path=repo_id_or_path)
-
-    @property
-    def hidden_dim(self) -> int:
-        return int(self.model.config.hidden_size)
-
-    def forward(
-        self,
-        embeds: torch.Tensor,
-        output_hidden_states: bool = False,
-        **kwargs: Any,
-    ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
-        out = self.model(
-            inputs_embeds=embeds,
-            output_hidden_states=output_hidden_states,
-            **kwargs,
-        )
-        if output_hidden_states:
-            if out.hidden_states is None:
-                raise RuntimeError("LlamaBackbone expected hidden_states but the model returned None.")
-            return out.last_hidden_state, out.hidden_states[1:]
-        return out.last_hidden_state
-
+def llama_config_kwargs(model: Any) -> dict[str, Any]:
+    cfg = model.config
+    kwargs: dict[str, Any] = dict(
+        num_layers=len(model.layers),
+        num_heads=cfg.num_attention_heads,
+        num_key_value_heads=getattr(cfg, "num_key_value_heads", cfg.num_attention_heads),
+        max_position_embeddings=cfg.max_position_embeddings,
+        intermediate_size=cfg.intermediate_size,
+        rms_norm_eps=getattr(cfg, "rms_norm_eps", 1e-5),
+        attention_bias=getattr(cfg, "attention_bias", False),
+        vocab_size=int(cfg.vocab_size),
+    )
+    rope_parameters = getattr(cfg, "rope_parameters", None)
+    if rope_parameters is not None:
+        kwargs["rope_parameters"] = rope_parameters
+    return kwargs

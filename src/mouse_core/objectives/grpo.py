@@ -8,7 +8,8 @@ import torch
 import torch.nn.functional as F
 from tensordict import TensorDict
 
-from mouse_core.objectives.base import Objective
+from mouse_core.models.heads.base import BaseHead
+from mouse_core.objectives.base import Objective, predictions_for, require_head
 from mouse_core.objectives.dqn import (
     _pair_weight,
     _require_action_ids,
@@ -55,11 +56,11 @@ class GrpoObjective(Objective):
     """Clipped GRPO policy objective (no value / critic head).
 
     Instantiate with hyperparameters, then call with
-    ``(objective_data, predictions)``.
+    ``objective_data=`` and ``predictions=``.
 
     Requires a policy head only:
 
-    * ``predictions["action"]`` — ``[N, A]`` discrete policy logits
+    * ``head`` — ``[N, A]`` discrete policy logits
 
     Advantages are **not** estimated from a learned baseline. The caller
     computes them with :func:`group_relative_advantages` over a group of
@@ -82,10 +83,10 @@ class GrpoObjective(Objective):
         )
         inputs, objective_data = loader.next_batch()
         predictions = model(inputs).predictions
-        loss, metrics = objective(objective_data.to(device), predictions)
+        loss, metrics = objective(objective_data=objective_data.to(device), predictions=predictions)
 
     ``old_log_prob`` and ``advantage`` are objective columns only — not
-    tokenizer input fields or embedder modalities.
+    tokenizer input fields.
 
     Timing matches :class:`~mouse_core.objectives.dqn.DqnObjective`: token
     ``i`` is state ``s_i``; action / behavior log-prob / advantage at ``i+1``
@@ -100,7 +101,8 @@ class GrpoObjective(Objective):
         action_key: Key in ``objective_data`` for integer actions.
         old_log_prob_key: Key in ``objective_data`` for behavior log-probs.
         advantage_key: Key in ``objective_data`` for group-relative advantages.
-        predictions_key: Key in ``predictions`` for policy logits.
+        head: Policy head this objective trains. Must be the same
+            instance passed to ``Model(heads=)``.
         num_actions: If set, only the first ``num_actions`` logits participate.
         grouping_field: Step column that isolates runs (typically
             ``task_index``). Required. Pass ``None`` only when the batch
@@ -116,7 +118,7 @@ class GrpoObjective(Objective):
         action_key: str = "action",
         old_log_prob_key: str = "old_log_prob",
         advantage_key: str = "advantage",
-        predictions_key: str = "action",
+        head: BaseHead,
         num_actions: int | None = None,
         grouping_field: str | None,
     ) -> None:
@@ -125,21 +127,22 @@ class GrpoObjective(Objective):
         self.action_key = action_key
         self.old_log_prob_key = old_log_prob_key
         self.advantage_key = advantage_key
-        self.predictions_key = predictions_key
+        self.head = require_head(head=head, what="head")
         self.num_actions = num_actions
         self.grouping_field = grouping_field
 
     def __call__(
         self,
+        *,
         objective_data: TensorDict,
         predictions: TensorDict,
         delayed_predictions: TensorDict | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        logits: torch.Tensor = predictions[self.predictions_key]
+        logits: torch.Tensor = predictions_for(head=self.head, predictions=predictions, who="GRPO")
 
         if logits.ndim != 2:
             raise ValueError(
-                f"GRPO expects {self.predictions_key!r} logits shape [N, A], "
+                f"GRPO expects policy logits shape [N, A], "
                 f"got {tuple(logits.shape)}."
             )
         N, A = logits.shape

@@ -18,7 +18,7 @@ from typing import Literal, Sequence
 Interpolation = Literal["linear", "geometric", "constant"]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class ExponentialDecay:
     """``x -> value * decay**x``: the value is multiplied by ``decay`` each step.
 
@@ -59,8 +59,8 @@ class Piecewise:
 
     def __init__(
         self,
-        knots: Sequence[tuple[float, float]],
         *,
+        knots: Sequence[tuple[float, float]],
         interpolation: Interpolation = "linear",
     ) -> None:
         if interpolation not in ("linear", "geometric", "constant"):

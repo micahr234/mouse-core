@@ -10,7 +10,8 @@ import torch
 import torch.nn.functional as F
 from tensordict import TensorDict
 
-from mouse_core.objectives.base import Objective
+from mouse_core.models.heads.base import BaseHead
+from mouse_core.objectives.base import Objective, predictions_for, require_head
 from mouse_core.objectives.dqn import (
     _affine,
     _affine_scan_backward,
@@ -29,20 +30,17 @@ from mouse_core.objectives.dqn import (
 )
 
 
-def _require_head(predictions: TensorDict, *, key: str, shape: torch.Size, who: str) -> torch.Tensor:
-    """Validate a float32 ``[P, A]`` head output that must align with ``action_value``."""
-    if key not in predictions.keys():
-        raise KeyError(
-            f"{who} expects predictions[{key!r}]; add a DiscreteActionHead under "
-            f"that key (heads={{'action_value': ..., {key!r}: ...}})."
-        )
-    values: torch.Tensor = predictions[key]
+def _require_aligned(
+    predictions: TensorDict, *, head: BaseHead, shape: torch.Size, who: str
+) -> torch.Tensor:
+    """Validate a float32 ``[P, A]`` head output that must align with Q."""
+    values = predictions_for(head=head, predictions=predictions, who=who)
     if values.dtype != torch.float32:
-        raise TypeError(f"{who} expects float32 {key}, got {values.dtype}.")
+        raise TypeError(f"{who} expects float32 head outputs, got {values.dtype}.")
     if values.shape != shape:
         raise ValueError(
-            f"{who} expects {key} shape {tuple(shape)} (same rows and actions as "
-            f"action_value), got {tuple(values.shape)}."
+            f"{who} expects head shape {tuple(shape)} (same rows and actions as "
+            f"the Q head), got {tuple(values.shape)}."
         )
     return values
 
@@ -151,8 +149,8 @@ class RetraceObjective(Objective):
     delayed network.
 
     The dataset does not store ``μ``. It is **learned**: the model carries a
-    second head, a :class:`~mouse_core.models.heads.DiscreteActionHead`
-    under ``predictions[behavior_key]`` whose outputs are treated as
+    second head, a :class:`~mouse_core.models.heads.ClassificationHead`
+    (``behavior_head``) whose outputs are treated as
     **logits**: ``log_softmax`` of the row is ``log μ(· | s)``. The head is fit
     by negative log-likelihood of the action actually taken from each step,
     ``-log μ(a_t | s_t)``, over every head-output row of that step. The same
@@ -165,13 +163,13 @@ class RetraceObjective(Objective):
     behavior policy that changes along the run.
 
     Instantiate with hyperparameters, then call with
-    ``(objective_data, predictions, delayed_predictions)``. Online Q is
-    ``predictions["action_value"]``; every target quantity — the soft
+    ``objective_data=``, ``predictions=``, and ``delayed_predictions=``. Online Q is
+    the tensor for ``head``; every target quantity — the soft
     bootstrap ``V_π(s') = E_π Q + temperature H[π]``, the corrected
     ``Q(s', a')``, and ``π`` itself — is read from
-    ``delayed_predictions["action_value"]`` of the
+    the delayed tensor for ``head`` of the
     delayed :class:`~mouse_core.models.base.Model`
-    (``model.delayed_copy(heads=("action_value",))``) run on the same
+    (``model.delayed_copy(heads=(head,))``) run on the same
     ``TokenBatch``. The delayed tensor is detached, so the TD error does not
     backprop through it. The behavior head is not part of the delayed model:
     nothing reads its delayed values, so it is neither run there nor
@@ -216,9 +214,9 @@ class RetraceObjective(Objective):
         model = Model(
             ...,
             heads={"action_value": q_head, "behavior": behavior_head},
-            action_head="action_value",
+            action_source=q_head,
         )
-        delayed_model = model.delayed_copy(heads=("action_value",))
+        delayed_model = model.delayed_copy(heads=(q_head,))
 
     Discounts follow the ``DqnObjective`` done-code table: the bootstrap and
     the continued trace are multiplied by the episode gamma
@@ -257,8 +255,10 @@ class RetraceObjective(Objective):
         gamma_task_truncated: Extra discount when the task is truncated
             (``task_done == 2``; last episode of ``max_task_episodes``).
             Multiplies the episode discount. ``0.0`` zeros the bootstrap.
-        behavior_key: Key in ``predictions`` of the behavior head's
-            ``[P, A]`` logits (default ``"behavior"``).
+        head: Q head this objective trains. Must be the same instance
+            passed to ``Model(heads=)``.
+        behavior_head: Behavior-policy head whose logits are ``μ``.
+            Must be the same instance passed to ``Model(heads=)``.
         action_key: Key in ``objective_data`` that holds the integer action.
         reward_key: Key in ``objective_data`` that holds the per-step reward.
         reward_scale: Multiplier applied to ``reward`` before the target
@@ -298,7 +298,8 @@ class RetraceObjective(Objective):
         gamma_episode_truncated: float,
         gamma_task_terminal: float,
         gamma_task_truncated: float,
-        behavior_key: str = "behavior",
+        head: BaseHead,
+        behavior_head: BaseHead,
         action_key: str = "action",
         reward_key: str = "reward",
         reward_scale: float = 1.0,
@@ -325,7 +326,8 @@ class RetraceObjective(Objective):
         self.gamma_episode_truncated = gamma_episode_truncated
         self.gamma_task_terminal = gamma_task_terminal
         self.gamma_task_truncated = gamma_task_truncated
-        self.behavior_key = behavior_key
+        self.head = require_head(head=head, what="head")
+        self.behavior_head = require_head(head=behavior_head, what="behavior_head")
         self.action_key = action_key
         self.reward_key = reward_key
         self.reward_scale = float(reward_scale)
@@ -340,14 +342,17 @@ class RetraceObjective(Objective):
 
     def __call__(
         self,
+        *,
         objective_data: TensorDict,
         predictions: TensorDict,
         delayed_predictions: TensorDict | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         if delayed_predictions is None:
             raise ValueError("RetraceObjective requires delayed_predictions.")
-        q: torch.Tensor = predictions["action_value"]
-        q_target: torch.Tensor = delayed_predictions["action_value"].detach()
+        q: torch.Tensor = predictions_for(head=self.head, predictions=predictions, who="Retrace")
+        q_target: torch.Tensor = predictions_for(
+            head=self.head, predictions=delayed_predictions, who="Retrace delayed"
+        ).detach()
 
         if q.ndim != 2:
             raise ValueError(
@@ -363,8 +368,8 @@ class RetraceObjective(Objective):
                 f"Retrace delayed action_value shape {tuple(q_target.shape)} must "
                 f"match online shape {tuple(q.shape)}."
             )
-        behavior_logits = _require_head(
-            predictions, key=self.behavior_key, shape=q.shape, who="Retrace"
+        behavior_logits = _require_aligned(
+            predictions, head=self.behavior_head, shape=q.shape, who="Retrace"
         )
         q_target_raw = q_target  # π is taken over the head's own Q (get_action units)
         q = _affine(q, scale=self.q_scale, shift=self.q_shift)

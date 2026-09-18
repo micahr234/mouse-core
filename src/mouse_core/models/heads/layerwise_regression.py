@@ -1,4 +1,4 @@
-"""Layerwise discrete action-value heads — one Q head per backbone layer."""
+"""Layerwise regression heads — one RegressionHead per backbone layer."""
 
 from __future__ import annotations
 
@@ -8,20 +8,21 @@ import torch
 import torch.nn as nn
 
 from mouse_core.models.heads.base import BaseHead
-from mouse_core.models.heads.dqn import DiscreteActionValueHead
+from mouse_core.models.heads.regression import RegressionHead
 
 
-class LayerwiseDiscreteActionValueHead(BaseHead):
-    """One :class:`DiscreteActionValueHead` per backbone layer.
+class LayerwiseRegressionHead(BaseHead):
+    """One :class:`RegressionHead` per backbone layer.
 
     Expects pooled step representations stacked over layers as:
 
-    * train (flat): ``[N, L, D]`` → Q-values ``[N, L, A]``
-    * decode (rect): ``[B, L, S, D]`` → Q-values ``[B, S, L, A]``
+    * train (flat): ``[N, L, D]`` → values ``[N, L, A]``
+    * decode (rect): ``[B, L, S, D]`` → values ``[B, S, L, A]``
     """
 
     def __init__(
         self,
+        *,
         num_backbone_layers: int,
         in_features: int,
         out_features: int,
@@ -46,7 +47,7 @@ class LayerwiseDiscreteActionValueHead(BaseHead):
         self.use_norm = use_norm
         self.layer_heads = nn.ModuleList(
             [
-                DiscreteActionValueHead(
+                RegressionHead(
                     in_features=in_features,
                     out_features=out_features,
                     hidden_dim=hidden_dim,
@@ -58,13 +59,12 @@ class LayerwiseDiscreteActionValueHead(BaseHead):
             ]
         )
 
-    def _heads(self) -> list[DiscreteActionValueHead]:
-        return [cast(DiscreteActionValueHead, head) for head in self.layer_heads]
+    def _heads(self) -> list[RegressionHead]:
+        return [cast(RegressionHead, head) for head in self.layer_heads]
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
-        """Returns per-action values ``[N, L, A]`` or ``[B, S, L, A]``."""
+        """Returns per-output values ``[N, L, A]`` or ``[B, S, L, A]``."""
         if h.ndim == 3:
-            # [N, L, D]
             if h.shape[1] != self.num_backbone_layers:
                 raise ValueError(
                     f"Expected {self.num_backbone_layers} backbone layers in h, got {h.shape[1]}."
@@ -75,7 +75,7 @@ class LayerwiseDiscreteActionValueHead(BaseHead):
             return torch.stack(outputs, dim=1)
         if h.ndim != 4:
             raise ValueError(
-                f"LayerwiseDiscreteActionValueHead expects h shape [N, L, D] or "
+                f"LayerwiseRegressionHead expects h shape [N, L, D] or "
                 f"[B, L, S, D], got {tuple(h.shape)}."
             )
         if h.shape[1] != self.num_backbone_layers:

@@ -24,7 +24,7 @@ import torch
 import torch.nn as nn
 
 
-@dataclass
+@dataclass(kw_only=True)
 class HeadSpec:
     """Specification for a head to attach to a MOUSE model.
 
@@ -38,7 +38,7 @@ class HeadSpec:
     num_layers: int | None = None
     scale: float | None = None
     use_norm: bool | None = None
-    # Layerwise action value specific
+    # Layerwise regression specific
     num_backbone_layers: int | None = None
 
     def __post_init__(self) -> None:
@@ -49,6 +49,31 @@ class HeadSpec:
             )
         if self.num_backbone_layers is not None and int(self.num_backbone_layers) <= 0:
             raise ValueError(f"num_backbone_layers must be positive, got {self.num_backbone_layers!r}")
+
+
+def prediction_key(*, head: BaseHead) -> str:
+    """Storage key ``Model`` uses for this head's outputs in ``predictions``.
+
+    Bound when the head is passed to ``Model(heads=)``. Objectives look up
+    tensors with this key so the caller passes the head instance, not a
+    string name.
+    """
+    if not isinstance(head, BaseHead):
+        raise TypeError(f"head must be a BaseHead instance, got {type(head).__name__}.")
+    key = getattr(head, "_prediction_key", None)
+    if not isinstance(key, str) or not key:
+        raise ValueError(
+            "head is not attached to a Model; pass the same instance given to Model(heads=)."
+        )
+    return key
+
+
+def _bind_prediction_key(head: BaseHead, name: str) -> BaseHead:
+    """Stamp ``name`` on ``head`` as its ``predictions`` storage key."""
+    if not isinstance(name, str) or not name:
+        raise ValueError(f"head name must be a non-empty string, got {name!r}.")
+    head._prediction_key = name
+    return head
 
 
 class BaseHead(nn.Module, ABC):

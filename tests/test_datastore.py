@@ -14,21 +14,21 @@ def test_named_store_repr() -> None:
 
 def test_name_is_not_saved_as_a_dataset_column() -> None:
     store = Datastore(name='cartpole')
-    store.append({'action': 1, 'reward': 0.5, 'episode_done': 0, 'task_done': 0})
+    store.append(data={'action': 1, 'reward': 0.5, 'episode_done': 0, 'task_done': 0})
     assert 'name' not in store.to_dataset().column_names
 
 def test_append_and_len() -> None:
     store = Datastore()
-    store.append({'action': 1, 'reward': 0.5, 'episode_done': 0, 'task_done': 0})
-    store.append({'action': 2, 'reward': 1.0, 'episode_done': 0, 'task_done': 0})
+    store.append(data={'action': 1, 'reward': 0.5, 'episode_done': 0, 'task_done': 0})
+    store.append(data={'action': 2, 'reward': 1.0, 'episode_done': 0, 'task_done': 0})
     assert len(store) == 2
 
 def test_append_store() -> None:
     left = Datastore(name='left')
-    left.append({'action': 1, 'reward': 0.0, 'episode_done': 0, 'task_done': 0})
+    left.append(data={'action': 1, 'reward': 0.0, 'episode_done': 0, 'task_done': 0})
     right = Datastore(name='right')
-    right.append({'action': 2, 'reward': 1.0, 'episode_done': 0, 'task_done': 0})
-    left.append(right)
+    right.append(data={'action': 2, 'reward': 1.0, 'episode_done': 0, 'task_done': 0})
+    left.append(data=right)
     assert len(left) == 2
     rows = left.__getitem__([0, 1])
     assert [r['action'] for r in rows] == [1, 2]
@@ -38,16 +38,16 @@ def test_append_store_list() -> None:
     stores = []
     for action in (1, 2):
         store = Datastore()
-        store.append({'action': action, 'reward': float(action), 'episode_done': 0, 'task_done': 0})
+        store.append(data={'action': action, 'reward': float(action), 'episode_done': 0, 'task_done': 0})
         stores.append(store)
-    target.append(stores)
+    target.append(data=stores)
     assert len(target) == 2
     rows = target.__getitem__([0, 1])
     assert [r['action'] for r in rows] == [1, 2]
 
 def test_getitem_returns_list_of_dicts() -> None:
     store = Datastore()
-    store.append({'action': 3, 'reward': -1.0, 'episode_done': 1, 'task_done': 0, 'step_index': 4})
+    store.append(data={'action': 3, 'reward': -1.0, 'episode_done': 1, 'task_done': 0, 'step_index': 4})
     rows = store.__getitem__(0)
     assert isinstance(rows, list)
     assert len(rows) == 1
@@ -60,7 +60,7 @@ def test_getitem_returns_list_of_dicts() -> None:
 def test_getitem_slice_preserves_order() -> None:
     store = Datastore()
     for i in range(5):
-        store.append({'action': i, 'reward': float(i), 'episode_done': 0, 'task_done': 0})
+        store.append(data={'action': i, 'reward': float(i), 'episode_done': 0, 'task_done': 0})
     rows = store.__getitem__([2, 4, 0])
     assert [r['action'] for r in rows] == [2, 4, 0]
 
@@ -68,11 +68,11 @@ def test_dataset_roundtrip() -> None:
     """Append rows, export to a HuggingFace Dataset, reload, and re-retrieve."""
     store = Datastore()
     for t in range(3):
-        store.append({'action': t % 2, 'reward': float(t), 'episode_done': 0, 'task_done': 0, 'step_index': t, 'group_id': 'CartPole-v1#0'})
+        store.append(data={'action': t % 2, 'reward': float(t), 'episode_done': 0, 'task_done': 0, 'step_index': t, 'group_id': 'CartPole-v1#0'})
     ds = store.to_dataset()
     assert len(ds) == 3
     reloaded = Datastore()
-    reloaded.from_dataset(ds)
+    reloaded.from_dataset(ds=ds)
     rows = reloaded.__getitem__([0, 1, 2])
     assert [r['action'] for r in rows] == [0, 1, 0]
     assert rows[2]['reward'] == 2.0
@@ -82,7 +82,7 @@ def test_getitem_out_of_range_raises_index_error() -> None:
 
     store = Datastore()
     for i in range(3):
-        store.append({'action': i})
+        store.append(data={'action': i})
     with pytest.raises(IndexError):
         store[3]
     with pytest.raises(IndexError):
@@ -97,7 +97,7 @@ def test_getitem_out_of_range_raises_index_error() -> None:
 def test_getitem_slice_and_copies() -> None:
     store = Datastore()
     for i in range(5):
-        store.append({'action': i})
+        store.append(data={'action': i})
     assert [r['action'] for r in store[1:4]] == [1, 2, 3]
     assert [r['action'] for r in store[::2]] == [0, 2, 4]
     rows = store[[0]]
@@ -108,12 +108,12 @@ def test_getitem_slice_and_copies() -> None:
 def test_getitem_mixed_source_and_buffer() -> None:
     """Rows from the HF source and from the append buffer interleave correctly."""
     store = Datastore()
-    store.append({'action': 10, 'reward': 0.0, 'episode_done': 0, 'task_done': 0})
-    store.append({'action': 20, 'reward': 0.0, 'episode_done': 0, 'task_done': 0})
+    store.append(data={'action': 10, 'reward': 0.0, 'episode_done': 0, 'task_done': 0})
+    store.append(data={'action': 20, 'reward': 0.0, 'episode_done': 0, 'task_done': 0})
     ds = store.to_dataset()
     store2 = Datastore()
-    store2.from_dataset(ds)
-    store2.append({'action': 30, 'reward': 0.0, 'episode_done': 0, 'task_done': 0})
+    store2.from_dataset(ds=ds)
+    store2.append(data={'action': 30, 'reward': 0.0, 'episode_done': 0, 'task_done': 0})
     rows = store2.__getitem__([0, 1, 2])
     assert [r['action'] for r in rows] == [10, 20, 30]
 
@@ -124,7 +124,7 @@ def test_from_dataset_unwraps_zero_dim_arrays() -> None:
 
     store = Datastore()
     store.from_dataset(
-        Dataset.from_list([{"action": np.array(3), "reward": np.array(0.5)}])
+        ds=Dataset.from_list([{"action": np.array(3), "reward": np.array(0.5)}])
     )
     row = store[0][0]
     assert row["action"] == 3

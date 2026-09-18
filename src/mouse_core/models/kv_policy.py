@@ -11,7 +11,7 @@ from __future__ import annotations
 import numpy as np
 
 
-def resolve_cache_bounds(max_cache: int, start_cache: int | None = None) -> tuple[int, int]:
+def resolve_cache_bounds(*, max_cache: int, start_cache: int | None = None) -> tuple[int, int]:
     """Return ``(max_cache, start_cache)`` with grow room when possible.
 
     ``start_cache`` defaults to ``max_cache // 2`` (at least 1). When

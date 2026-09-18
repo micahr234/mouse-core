@@ -4,12 +4,12 @@ import numpy as np
 from mouse_core.models.kv_policy import cache_needs_rebuild, rebuild_starts, resolve_cache_bounds
 
 def test_resolve_cache_bounds_defaults() -> None:
-    max_c, start_c = resolve_cache_bounds(512, None)
+    max_c, start_c = resolve_cache_bounds(max_cache=512, start_cache=None)
     assert max_c == 512
     assert start_c == 256
 
 def test_resolve_cache_bounds_clamps_start() -> None:
-    max_c, start_c = resolve_cache_bounds(512, 512)
+    max_c, start_c = resolve_cache_bounds(max_cache=512, start_cache=512)
     assert max_c == 512
     assert start_c == 511
 

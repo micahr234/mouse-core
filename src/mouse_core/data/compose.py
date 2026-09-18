@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 
@@ -19,7 +19,7 @@ class _Compose:
             value = stage(value)
         return value
 
-    def reseed(self, generation: int | None = None) -> None:
+    def reseed(self, *, generation: int | None = None) -> None:
         """Call ``reseed(generation=...)`` on every stage that defines it."""
         for stage in self._stages:
             fn = getattr(stage, "reseed", None)
@@ -27,7 +27,7 @@ class _Compose:
                 fn(generation=generation)
 
 
-def compose(*stages: Callable[[Any], Any]) -> _Compose:
+def compose(*, stages: Sequence[Callable[[Any], Any]]) -> _Compose:
     """Return ``fn`` such that ``fn(x) == stages[-1](...stages[0](x)...)``.
 
     The result is callable and exposes ``reseed(generation=None)``, which
@@ -38,7 +38,7 @@ def compose(*stages: Callable[[Any], Any]) -> _Compose:
     Train includes the augmenter; eval leaves it out so the model sees raw
     values::
 
-        train_transform = compose(augmenter, tokenizer)
+        train_transform = compose(stages=(augmenter, tokenizer))
         eval_transform = tokenizer
         step_tokens = train_transform(step)
         train_transform.reseed()
@@ -46,4 +46,4 @@ def compose(*stages: Callable[[Any], Any]) -> _Compose:
     """
     if not stages:
         raise ValueError("compose requires at least one stage")
-    return _Compose(stages)
+    return _Compose(tuple(stages))

@@ -3,18 +3,19 @@
 The delayed model comes from :meth:`~mouse_core.models.base.Model.delayed_copy`:
 a copy of the online model in which every trainable parameter has its own
 copy and every frozen parameter (the bf16 base weights of a LoRA backbone)
-is shared by reference, carrying only the heads named in ``heads=``. After
+is shared by reference, carrying only the head instances in ``heads=``. After
 each ``optimizer.step()`` call :meth:`Polyak.update` with this step's
-``tau`` for each section — heads, encoder, and backbone (the reasoner /
-recurrence section follows the backbone)::
+``tau`` for each section — heads and backbone (the reasoner
+section follows the backbone; token embeddings ride with the
+backbone)::
 
-    delayed_model = model.delayed_copy(heads=("action_value",))
-    polyak = Polyak(model, delayed_model)
+    delayed_model = model.delayed_copy(heads=(q_head,))
+    polyak = Polyak(online=model, delayed=delayed_model)
     out = model(inputs)
     with torch.no_grad():
         delayed_out = delayed_model(inputs)
     ...
-    polyak.update(tau_heads=0.0001, tau_encoder=0.01, tau_backbone=0.01)
+    polyak.update(tau_heads=0.0001, tau_backbone=0.01)
 
 Per section, ``θ_delayed ← τ·θ_online + (1−τ)·θ_delayed``. ``τ = 0`` keeps
 that section frozen; ``τ = 1`` copies the online weights (no delay). The
@@ -22,11 +23,12 @@ heads section pairs each delayed head with the online head of the same
 name; online heads the delayed model does not carry (a behavior or policy
 head whose delayed values nothing reads) are not interpolated.
 
-Every trainable parameter is fp32 (heads, encoder, reasoner / recurrence,
-and either the whole fp32 backbone or the LoRA adapters of a frozen bf16
-one), so interpolation runs in place in fp32 and a small ``tau`` never
-rounds away. Shared frozen parameters are not interpolated. ``Polyak``
-rejects a non-fp32 parameter it would have to interpolate.
+Every trainable parameter is fp32 (heads, reasoner, and
+either the whole fp32 backbone — including Identity ``embed_tokens``
+— or the LoRA adapters of a frozen bf16 one), so interpolation runs
+in place in fp32 and a small ``tau`` never rounds away. Shared frozen
+parameters are not interpolated. ``Polyak`` rejects a non-fp32
+parameter it would have to interpolate.
 """
 
 from __future__ import annotations
@@ -116,17 +118,18 @@ class Polyak:
 
     Does not run a forward. Pair with the model from
     :meth:`~mouse_core.models.base.Model.delayed_copy`. The sections are
-    heads, encoder, and backbone; the reasoner / recurrence section follows
-    the backbone. The heads section covers the heads the delayed model
-    carries (each paired with the online head of the same name); every
-    delayed head must exist online.
+    heads and backbone; the reasoner section follows
+    the backbone. Token embeddings ride with the backbone. The heads
+    section covers the heads the delayed model carries (each paired
+    with the online head of the same name); every delayed head must
+    exist online.
 
     Args:
-        online: Source model (encoder, backbone, heads).
+        online: Source model (backbone, heads).
         delayed: Model from ``online.delayed_copy(heads=...)``.
     """
 
-    def __init__(self, online: Model, delayed: Model) -> None:
+    def __init__(self, *, online: Model, delayed: Model) -> None:
         from mouse_core.models.base import Model as _Model
 
         if not isinstance(online, _Model) or not isinstance(delayed, _Model):
@@ -139,9 +142,7 @@ class Polyak:
             raise ValueError(
                 "delayed has trainable parameters; build it with Model.delayed_copy(heads=...)."
             )
-        if (online.reasoner is None) != (delayed.reasoner is None) or (
-            online.recurrence is None
-        ) != (delayed.recurrence is None):
+        if (online.reasoner is None) != (delayed.reasoner is None):
             raise ValueError(
                 "online and delayed models must have the same sections; "
                 "build the delayed model with Model.delayed_copy(heads=...)."
@@ -158,37 +159,29 @@ class Polyak:
             _PolyakState(online.heads[name], delayed.heads[name], section=f"heads.{name}")
             for name in delayed.heads
         ]
-        self._encoder = _PolyakState(online.encoder, delayed.encoder, section="encoder")
         self._backbone = [_PolyakState(online.backbone, delayed.backbone, section="backbone")]
         if online.reasoner is not None and delayed.reasoner is not None:
             self._backbone.append(
                 _PolyakState(online.reasoner, delayed.reasoner, section="reasoner")
             )
-        if online.recurrence is not None and delayed.recurrence is not None:
-            self._backbone.append(
-                _PolyakState(online.recurrence, delayed.recurrence, section="recurrence")
-            )
 
-    def update(self, *, tau_heads: float, tau_encoder: float, tau_backbone: float) -> None:
+    def update(self, *, tau_heads: float, tau_backbone: float) -> None:
         """Move the delayed model toward the online model after an optimizer step.
 
         Each ``tau`` is this call's interpolation factor for that section,
         in ``[0, 1]``: ``0`` skips that section (no interpolation), ``1``
         copies the online weights. ``tau_backbone`` also applies to the
-        reasoner / recurrence section. All-zero ``tau`` returns without
-        touching any delayed parameter. Pass new values each step to
-        change them mid-run.
+        reasoner section and to token embeddings on the
+        backbone. All-zero ``tau`` returns without touching any delayed
+        parameter. Pass new values each step to change them mid-run.
         """
         tau_heads = _check_tau("tau_heads", tau_heads)
-        tau_encoder = _check_tau("tau_encoder", tau_encoder)
         tau_backbone = _check_tau("tau_backbone", tau_backbone)
-        if tau_heads == 0.0 and tau_encoder == 0.0 and tau_backbone == 0.0:
+        if tau_heads == 0.0 and tau_backbone == 0.0:
             return
         if tau_heads > 0.0:
             for state in self._heads:
                 state.update(tau_heads)
-        if tau_encoder > 0.0:
-            self._encoder.update(tau_encoder)
         if tau_backbone > 0.0:
             for state in self._backbone:
                 state.update(tau_backbone)

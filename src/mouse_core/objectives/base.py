@@ -1,7 +1,7 @@
 """Base type for MOUSE objective objects.
 
 All objectives are plain Python objects: instantiate with hyperparameters,
-then call with ``(objective_data, predictions)`` to get a loss and metrics.
+then call with ``objective_data=`` and ``predictions=`` to get a loss and metrics.
 
 Example — custom objective::
 
@@ -10,11 +10,12 @@ Example — custom objective::
     import torch
 
     class MyObjective(Objective):
-        def __init__(self, temperature: float = 1.0):
+        def __init__(self, *, temperature: float):
             self.temperature = temperature
 
         def __call__(
             self,
+            *,
             objective_data: TensorDict,
             predictions: TensorDict,
             delayed_predictions: TensorDict | None = None,
@@ -30,17 +31,21 @@ from abc import ABC, abstractmethod
 import torch
 from tensordict import TensorDict
 
+from mouse_core.models.heads.base import BaseHead, prediction_key
+
 
 class Objective(ABC):
     """Abstract base for all MOUSE objective objects.
 
     Subclass this and implement :meth:`__call__` to create a custom objective.
-    Instantiate with hyperparameters; call with ``(objective_data, predictions)``.
+    Instantiate with hyperparameters; call with ``objective_data=`` and
+    ``predictions=``.
     """
 
     @abstractmethod
     def __call__(
         self,
+        *,
         objective_data: TensorDict,
         predictions: TensorDict,
         delayed_predictions: TensorDict | None = None,
@@ -61,3 +66,19 @@ class Objective(ABC):
             ready for logging.
         """
         ...
+
+
+def require_head(*, head: object, what: str) -> BaseHead:
+    """Require ``head`` to be a :class:`BaseHead` already attached to a Model."""
+    if not isinstance(head, BaseHead):
+        raise TypeError(f"{what} must be a BaseHead instance, got {type(head).__name__}.")
+    prediction_key(head=head)
+    return head
+
+
+def predictions_for(*, head: BaseHead, predictions: TensorDict, who: str) -> torch.Tensor:
+    """Return ``predictions`` for ``head``'s bound storage key."""
+    key = prediction_key(head=head)
+    if key not in predictions.keys():
+        raise KeyError(f"{who} expects predictions[{key!r}] for the given head.")
+    return predictions[key]

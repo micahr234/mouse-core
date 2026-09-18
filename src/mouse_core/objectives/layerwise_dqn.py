@@ -7,7 +7,8 @@ import math
 import torch
 from tensordict import TensorDict
 
-from mouse_core.objectives.base import Objective
+from mouse_core.models.heads.base import BaseHead
+from mouse_core.objectives.base import Objective, predictions_for, require_head
 from mouse_core.objectives.dqn import (
     _affine,
     _boltzmann_entropy,
@@ -26,7 +27,7 @@ from mouse_core.objectives.dqn import (
 )
 
 
-def effective_horizon(gamma: float) -> float:
+def effective_horizon(*, gamma: float) -> float:
     """Effective planning horizon ``1 / (1 - gamma)`` for ``gamma < 1``."""
     if gamma >= 1.0:
         return float("inf")
@@ -35,7 +36,7 @@ def effective_horizon(gamma: float) -> float:
     return 1.0 / (1.0 - gamma)
 
 
-def gamma_from_horizon(horizon: float) -> float:
+def gamma_from_horizon(*, horizon: float) -> float:
     """Discount factor with effective horizon ``horizon >= 1``."""
     if not math.isfinite(horizon) or horizon <= 1.0:
         return 0.0
@@ -71,8 +72,8 @@ def _build_layer_gamma_schedule(
     if gamma_start == gamma_deep:
         return [gamma_deep] * num_layers
 
-    h_start = effective_horizon(gamma_start)
-    h_deep = effective_horizon(gamma_deep)
+    h_start = effective_horizon(gamma=gamma_start)
+    h_deep = effective_horizon(gamma=gamma_deep)
 
     if math.isinf(h_start) or math.isinf(h_deep):
         raise ValueError(
@@ -80,7 +81,7 @@ def _build_layer_gamma_schedule(
         )
 
     return [
-        gamma_from_horizon(h_start + (h_deep - h_start) * (layer_idx / (num_layers - 1)))
+        gamma_from_horizon(horizon=h_start + (h_deep - h_start) * (layer_idx / (num_layers - 1)))
         for layer_idx in range(num_layers)
     ]
 
@@ -88,13 +89,13 @@ def _build_layer_gamma_schedule(
 class LayerwiseDqnObjective(Objective):
     """Bellman TD(λ) objective on every backbone layer.
 
-    Reads ``predictions["action_value_layerwise"]`` and
-    ``delayed_predictions["action_value_layerwise"]`` with shape ``[P, L, A]``
+    Reads the tensor for ``head`` on ``predictions`` and
+    ``delayed_predictions`` with shape ``[P, L, A]``
     (one row per head-output token; ``objective_data["head_output_count"]`` maps
     rows to steps). Every head-output row of step ``i`` trains toward the same
     per-layer target; the bootstrap reads step ``i+1``'s last head-output row.
     Delayed Q comes from the delayed :class:`~mouse_core.models.base.Model`
-    (``model.delayed_copy(heads=("action_value_layerwise",))``) run on the
+    (``model.delayed_copy(heads=(head,))``) run on the
     same ``TokenBatch`` and is detached
     before the Bellman target, so the TD error does not backprop through it.
     Each layer and each episode/task done-code uses its own discount, built at construction
@@ -141,6 +142,8 @@ class LayerwiseDqnObjective(Objective):
     ``H[softmax(Q / α)]`` on online Q when ``α > 0``.
 
     Args:
+        head: Layerwise Q head this objective trains. Must be the same
+            instance passed to ``Model(heads=)``.
         num_backbone_layers: Number of transformer blocks (and Q heads).
         gamma_step_start: Step discount at layer 0 (``episode_done == 0``).
         gamma_step: Step discount at the deepest layer.
@@ -184,6 +187,7 @@ class LayerwiseDqnObjective(Objective):
     def __init__(
         self,
         *,
+        head: BaseHead,
         num_backbone_layers: int,
         gamma_step_start: float,
         gamma_step: float,
@@ -212,6 +216,7 @@ class LayerwiseDqnObjective(Objective):
     ) -> None:
         if not 0.0 <= float(td_lambda) <= 1.0:
             raise ValueError(f"td_lambda must be in [0, 1], got {td_lambda}.")
+        self.head = require_head(head=head, what="head")
         self.temperature = _require_temperature(temperature)
         self.num_backbone_layers = int(num_backbone_layers)
         self.gamma_step_start = float(gamma_step_start)
@@ -266,14 +271,17 @@ class LayerwiseDqnObjective(Objective):
 
     def __call__(
         self,
+        *,
         objective_data: TensorDict,
         predictions: TensorDict,
         delayed_predictions: TensorDict | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         if delayed_predictions is None:
             raise ValueError("LayerwiseDqnObjective requires delayed_predictions.")
-        q: torch.Tensor = predictions["action_value_layerwise"]
-        q_target: torch.Tensor = delayed_predictions["action_value_layerwise"].detach()
+        q: torch.Tensor = predictions_for(head=self.head, predictions=predictions, who="Layerwise DQN")
+        q_target: torch.Tensor = predictions_for(
+            head=self.head, predictions=delayed_predictions, who="Layerwise DQN delayed"
+        ).detach()
 
         if q.ndim != 3:
             raise ValueError(

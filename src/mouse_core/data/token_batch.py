@@ -23,6 +23,7 @@ class ModalityInfo:
 
 
 def step_counts_from_sequence_id(
+    *,
     sequence_id: np.ndarray | None,
     B: int,
 ) -> np.ndarray:
@@ -70,9 +71,7 @@ class StepTokens:
     ``modality_map[modality_names[modality_ids[t]]]``.
 
     ``positions[t]`` is the token's 0-based index among the tokens of the
-    same modality in this step (coordinate of a continuous vector, learnable
-    slot, image patch, text run offset). Embedders use it to give each token
-    of a multi-token modality its own type vector.
+    same modality in this step (image patch, text run offset).
 
     ``head_output_mask[t]`` marks the step's head-output tokens (the positions
     the model reads Q / action outputs from). Tokenizers set it from the
@@ -202,15 +201,14 @@ class TokenBatch:
 
     Token type/kind is looked up via ``modality_map[modality_names[modality_ids[i]]]``:
 
-    * discrete / learnable / image — ``ids[i]`` is a table/vocab row; ``values[i]`` is 0
-    * fourier — ``values[i]`` is the scalar; ``ids[i]`` is the Fourier freq-bank index
+    * text / token / image — ``ids[i]`` is a vocab row; ``values[i]`` is 0
 
     Attributes:
         modality_ids: ``[L]`` int64 — index into ``modality_names``.
         modality_names: interned modality names for this batch.
         modality_map: name → :class:`ModalityInfo` (type/kind lookup).
-        ids: ``[L]`` int64 — discrete row id, or continuous freq-bank index.
-        values: ``[L]`` float32 — continuous scalar (0 when discrete).
+        ids: ``[L]`` int64 — vocab / table row id.
+        values: ``[L]`` float32 — unused (0).
         positions: ``[L]`` int64 — index of the token among its modality's
             tokens within its step (see :class:`StepTokens`).
         sequence_ids: ``[L]`` int64 — which of the ``B`` sequences each token belongs to.
@@ -342,10 +340,10 @@ class TokenBatch:
         first = np.ones(self.P, dtype=bool)
         first[1:] = self.head_output_steps[1:] != self.head_output_steps[:-1]
         return step_counts_from_sequence_id(
-            np.asarray(self.sequence_ids, dtype=np.int64)[
+            sequence_id=np.asarray(self.sequence_ids, dtype=np.int64)[
                 self.head_output_indices[first]
             ],
-            self.B,
+            B=self.B,
         )
 
     def to_tensors(self, device: torch.device | str | None = None) -> dict[str, Any]:
@@ -375,8 +373,8 @@ class TokenBatch:
 
 
 def empty_token_batch(
-    B: int = 0,
     *,
+    B: int = 0,
     grouping_field: str,
     modality_names: Sequence[str] = (),
     modality_map: Mapping[str, ModalityInfo] | None = None,
@@ -490,8 +488,8 @@ def _fields_to_tensordict(fields: dict[str, np.ndarray], n: int) -> TensorDict:
 
 
 def pack_token_batch(
-    steps: Sequence[StepTokens],
     *,
+    steps: Sequence[StepTokens],
     sequence_ids: Sequence[int] | None = None,
     batch_size: int | None = None,
     grouping_field: str | None = None,
@@ -517,8 +515,8 @@ def pack_token_batch(
                 "pack_token_batch of empty steps requires grouping_field="
             )
         if batch_size is None:
-            return empty_token_batch(0, grouping_field=grouping_field), empty_objective
-        return empty_token_batch(batch_size, grouping_field=grouping_field), empty_objective
+            return empty_token_batch(B=0, grouping_field=grouping_field), empty_objective
+        return empty_token_batch(B=batch_size, grouping_field=grouping_field), empty_objective
 
     gf = steps[0].grouping_field
     names = steps[0].modality_names

@@ -254,7 +254,7 @@ def _decoder_layer(
     n_kv_heads: int,
     head_dim: int,
 ) -> torch.Tensor:
-    """One Llama / Qwen3 decoder layer over a packed stream ``h [L, D]``.
+    """One packed-compatible decoder layer over a packed stream ``h [L, D]``.
 
     ``block_mask`` selects FlexAttention; ``padded`` selects rectangular
     causal SDPA; otherwise ``attn_mask is None`` selects flash varlen and a
@@ -504,8 +504,9 @@ def packed_forward(
 
     cfg = hf.config
     n_heads = int(cfg.num_attention_heads)
-    n_kv_heads = int(cfg.num_key_value_heads)
-    head_dim = int(cfg.head_dim)
+    n_kv_heads = int(getattr(cfg, "num_key_value_heads", n_heads))
+    head_dim = getattr(cfg, "head_dim", None)
+    head_dim = int(head_dim) if head_dim is not None else int(cfg.hidden_size) // n_heads
 
     h = x[plan.order]
     # RoPE cos/sin are computed outside autocast and stay fp32 alongside the

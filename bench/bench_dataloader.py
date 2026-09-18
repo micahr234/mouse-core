@@ -91,7 +91,7 @@ def _stores(*, n_stores: int, steps: int) -> list[Datastore]:
     stores: list[Datastore] = []
     for i in range(n_stores):
         store = Datastore(name=f"synth_{i}")
-        store.from_dataset(Dataset.from_list(_synthetic_rows(steps, seed=i)))
+        store.from_dataset(ds=Dataset.from_list(_synthetic_rows(steps, seed=i)))
         stores.append(store)
     return stores
 
@@ -118,11 +118,29 @@ def _train_transform() -> Any:
     )
     tokenizer = Tokenizer(
         input_fields=[
-            {"type": "discrete", "input_field": "action"},
-            {"type": "discrete", "input_field": "observation"},
-            {"type": "fourier", "input_field": "reward"},
-            {"type": "discrete", "input_field": "episode_done"},
-            {"type": "learnable", "output_field": "value", "tokens": 1, "head_output": True},
+            {"type": "text", "input_field": "action", "format": "{field},"},
+            {"type": "text", "input_field": "observation", "format": "{field},"},
+            {
+                "type": "text",
+                "input_field": "reward",
+                "format": "r={field:g},",
+                "skip": 0.0,
+                "format_skipped": "",
+            },
+            {
+                "type": "text",
+                "input_field": "episode_done",
+                "format": "d={field},",
+                "skip": 0,
+                "format_skipped": "",
+            },
+            {
+                "type": "text",
+                "output_field": "value",
+                "format": "\n",
+                "max_tokens": 1,
+                "head_output": True,
+            },
         ],
         objective_fields=[
             {"input_field": "action"},
@@ -131,8 +149,10 @@ def _train_transform() -> Any:
             {"input_field": "task_done"},
         ],
         grouping_field="task_index",
+        group_prefix="action,observation,r=reward,d=done\n",
+        pretrained="Qwen/Qwen3-0.6B",
     )
-    return compose(augmenter, tokenizer)
+    return compose(stages=(augmenter, tokenizer))
 
 
 def _timed(fn: Callable[[], Any], iters: int) -> tuple[float, float, float]:

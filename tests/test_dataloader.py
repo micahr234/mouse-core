@@ -22,15 +22,14 @@ from mouse_core.data import (
 from tensordict import TensorDict
 
 from mouse_core.data.token_batch import StepTokens, TokenBatch
-from mouse_core.models.embedding import NumericEmbedder
-from tests._token_batch_helpers import tok_from_encoder
+from tests._token_batch_helpers import token_tokenizer
 
 
 def _store_with_actions() -> Datastore:
     store = Datastore()
     for action in range(8):
         store.append(
-            {
+            data={
                 "action": action + 1,
                 "reward": float(action),
                 "episode_done": 0,
@@ -52,8 +51,7 @@ def _tokenizer(*, objective_fields: list[dict[str, str]] | None = None) -> Token
     )
     return Tokenizer(
         input_fields=[
-            {"type": "discrete", "input_field": "action"},
-            {"type": "fourier", "input_field": "reward", "head_output": True},
+            {"type": "token", "input_field": "action", "head_output": True},
         ],
         objective_fields=keep,
         grouping_field="grouping_id",
@@ -67,7 +65,7 @@ def _stamp_grouping(step: dict) -> dict:
 
 
 def _transform(**kwargs):
-    return compose(_stamp_grouping, _tokenizer(**kwargs))
+    return compose(stages=(_stamp_grouping, _tokenizer(**kwargs)))
 
 
 def _loader(**kwargs) -> DataLoader:
@@ -128,7 +126,7 @@ def test_dataloader_applies_augmenter_before_returning_batch() -> None:
         sequence_length=3,
         batch_size=2,
         num_workers=0,
-        transform=compose(_stamp_task, augmenter, _stamp_grouping, _tokenizer()),
+        transform=compose(stages=(_stamp_task, augmenter, _stamp_grouping, _tokenizer())),
     )
     tb, obj = loader.next_batch()
     assert isinstance(tb, TokenBatch)
@@ -160,7 +158,7 @@ def test_dataloader_reseeds_transform_each_batch() -> None:
         batch_size=1,
         num_workers=0,
         seed=0,
-        transform=compose(_stamp_task, augmenter, _stamp_grouping, _tokenizer()),
+        transform=compose(stages=(_stamp_task, augmenter, _stamp_grouping, _tokenizer())),
     )
     loader.next_batch()
     assert augmenter._generation_for_call() == 0  # batch k=0 pinned on this thread
@@ -262,14 +260,14 @@ def test_dataloader_num_workers_requires_free_threading() -> None:
 def test_dataloader_snapshots_loaded_source_and_appended_rows() -> None:
     store = Datastore()
     store.from_dataset(
-        Dataset.from_list(
+        ds=Dataset.from_list(
             [
                 {"action": 1, "reward": 0.0, "episode_done": 0, "task_done": 0},
                 {"action": 2, "reward": 0.0, "episode_done": 0, "task_done": 0},
             ]
         )
     )
-    store.append({"action": 3, "reward": 0.0, "episode_done": 0, "task_done": 0})
+    store.append(data={"action": 3, "reward": 0.0, "episode_done": 0, "task_done": 0})
     loader = _loader(sequence_length=3, batch_size=1, num_workers=0, seed=0, stores=store)
     tb, obj = loader.next_batch()
     actions = [int(a) for a in obj["action"]]
@@ -329,7 +327,7 @@ def _augmented_transform() -> Any:
             }
         ],
     )
-    return compose(_stamp, augment, _tokenizer(objective_fields=_obj("action")))
+    return compose(stages=(_stamp, augment, _tokenizer(objective_fields=_obj("action"))))
 
 
 def _signatures(loader: DataLoader, n: int) -> list[tuple]:
@@ -410,10 +408,10 @@ def test_dataloader_index_field_stamps_store_offset() -> None:
 def test_dataloader_refresh_picks_up_appended_rows() -> None:
     store = Datastore()
     for action in (1, 2, 3):
-        store.append({"action": action, "reward": 0.0, "episode_done": 0, "task_done": 0})
+        store.append(data={"action": action, "reward": 0.0, "episode_done": 0, "task_done": 0})
     loader = _loader(sequence_length=3, batch_size=1, num_workers=0, stores=store)
     loader.next_batch()
-    store.append({"action": 4, "reward": 0.0, "episode_done": 0, "task_done": 0})
+    store.append(data={"action": 4, "reward": 0.0, "episode_done": 0, "task_done": 0})
     _, obj_before = loader.next_batch()
     assert all(int(a) != 4 for a in obj_before["action"])
     loader.refresh()
@@ -428,12 +426,12 @@ def test_dataloader_refresh_picks_up_appended_rows() -> None:
 def test_dataloader_refresh_drains_prefetch_queue_and_updates_store_sizes() -> None:
     store = Datastore()
     for action in range(3):
-        store.append({"action": action, "reward": 0.0, "episode_done": 0, "task_done": 0})
+        store.append(data={"action": action, "reward": 0.0, "episode_done": 0, "task_done": 0})
     loader = _loader(sequence_length=2, batch_size=1, num_workers=1, prefetch=2, stores=store)
     try:
         loader.next_batch()
         assert loader._ns == [3]
-        store.append({"action": 99, "reward": 0.0, "episode_done": 0, "task_done": 0})
+        store.append(data={"action": 99, "reward": 0.0, "episode_done": 0, "task_done": 0})
         loader.refresh()
         assert loader._ns == [4]
     finally:
@@ -443,7 +441,7 @@ def test_dataloader_refresh_drains_prefetch_queue_and_updates_store_sizes() -> N
 def test_dataloader_ragged_windows_up_to_max_length() -> None:
     store = Datastore()
     for action in (1, 2, 3):
-        store.append({"action": action, "reward": 0.0, "episode_done": 0, "task_done": 0})
+        store.append(data={"action": action, "reward": 0.0, "episode_done": 0, "task_done": 0})
     loader = _loader(sequence_length=8, batch_size=1, num_workers=0, seed=0, stores=store)
     tb, obj = loader.next_batch()
     n = int(tb.step_counts()[0])
@@ -454,7 +452,7 @@ def test_dataloader_ragged_windows_up_to_max_length() -> None:
 
 def test_dataloader_allows_short_stores() -> None:
     store = Datastore()
-    store.append({"action": 7, "reward": 1.0, "episode_done": 0, "task_done": 0})
+    store.append(data={"action": 7, "reward": 1.0, "episode_done": 0, "task_done": 0})
     loader = _loader(sequence_length=4, batch_size=1, num_workers=0, stores=store)
     tb, obj = loader.next_batch()
     assert int(tb.step_counts()[0]) == 1
@@ -467,7 +465,7 @@ def test_dataloader_allows_empty_stores_until_sampling() -> None:
     try:
         with pytest.raises(ValueError, match="all stores are empty"):
             loader.next_batch()
-        store.append({"action": 1, "reward": 0.0, "episode_done": 0, "task_done": 0})
+        store.append(data={"action": 1, "reward": 0.0, "episode_done": 0, "task_done": 0})
         loader.refresh()
         tb, _ = loader.next_batch()
         assert int(tb.step_counts()[0]) == 1
@@ -476,18 +474,14 @@ def test_dataloader_allows_empty_stores_until_sampling() -> None:
 
 
 def test_dataloader_transform_returns_token_batch() -> None:
-    encoder = NumericEmbedder(
-        hidden_dim=8,
-        modalities=[
-            {"type": 'discrete', "field": "action", "vocab_size": 16, "std": 0.02, "positions": 1},
-            {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0},
-        ],
-    )
+    from mouse_core.models.backbone import IdentityBackbone
+
+    backbone = IdentityBackbone(hidden_dim=8, vocab_size=32)
     loader = DataLoader(
         sequence_length=3,
         batch_size=2,
         num_workers=0,
-        transform=compose(_stamp_grouping, tok_from_encoder(encoder)),
+        transform=compose(stages=(_stamp_grouping, token_tokenizer("action"))),
         stores=_store_with_actions(),
     )
     try:
@@ -496,7 +490,7 @@ def test_dataloader_transform_returns_token_batch() -> None:
         assert int(tb.step_counts().sum()) == tb.N
         assert tb.N >= 2
         assert all(1 <= int(n) <= 3 for n in tb.step_counts())
-        embeds, head_output_indices = encoder(tb)
+        embeds, head_output_indices = backbone.embed(tb)
         assert embeds.shape == (tb.L, 8)
         assert head_output_indices.shape == (tb.N,)
         assert "sequence_id" in obj.keys()

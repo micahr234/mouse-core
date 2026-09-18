@@ -8,7 +8,7 @@ I/O
 Field keep/rename is the tokenizer's ``input_field`` / ``output_field``,
 not this class. Compose in pipeline order::
 
-    train_transform = compose(augmenter, tokenizer)
+    train_transform = compose(stages=(augmenter, tokenizer))
     eval_transform = tokenizer
 
 Permute/scale/shift draws are keyed by ``seed_field`` so steps sharing that
@@ -330,7 +330,7 @@ class Augmenter:
                 row[out_f] = self._apply_value_permutation(spec, draw, row[in_f])
         return row
 
-    def reseed(self, generation: int | None = None) -> None:
+    def reseed(self, *, generation: int | None = None) -> None:
         """Move the calling thread to a new draw set for every ``seed_field`` key.
 
         Within one generation, steps that share the seed-field value share

@@ -51,7 +51,7 @@ from typing import Any, cast
 
 import torch
 
-from mouse_core.models.backbone import TrainKernel, Qwen3Backbone, install_compiled_decoder, packed_forward
+from mouse_core.models.backbone import TrainKernel, TransformerBackbone, install_compiled_decoder, packed_forward
 from mouse_core.models.lora import LoRAConfig
 from mouse_core.optim import AdamW
 
@@ -141,7 +141,7 @@ def main() -> None:
     lora = None if args.no_lora else LoRAConfig(rank=16, alpha=32.0)
     kernels = cast(list[TrainKernel], args.train_kernel)
     dtype = torch.float32 if lora is None else torch.bfloat16
-    backbone = Qwen3Backbone(
+    backbone = TransformerBackbone(
         train_kernel=kernels[0],
         decode_kernel="flex",
         dtype=dtype, use_norm=True,
@@ -160,7 +160,7 @@ def main() -> None:
             if ".lora_B." in name:
                 torch.nn.init.normal_(p, std=0.02)  # nonzero B so A receives gradients
     trainable = [p for p in backbone.parameters() if p.requires_grad]
-    optimizer = AdamW(trainable, lr=1e-4)
+    optimizer = AdamW(params=trainable, lr=1e-4)
     props = torch.cuda.get_device_properties(device)
     print(
         f"{props.name} | torch {torch.__version__} | layers={args.layers} base dtype={dtype} "

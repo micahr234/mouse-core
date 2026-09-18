@@ -12,10 +12,6 @@ into the backbone.
 
 Use :func:`sample_reasoning_splits` to pick one burst step per sequence and
 pass the result to ``Model.forward(batch, reasoning=...)``.
-
-The recurrent-depth alternative — re-running the backbone on its own
-hidden states — is the :class:`~mouse_core.models.recurrence.Recurrence`
-section. A model has one or the other, not both.
 """
 
 from __future__ import annotations
@@ -60,6 +56,7 @@ class LatentReasoner(nn.Module):
 
 
 def sample_reasoning_splits(
+    *,
     batch: TokenBatch,
     generator: np.random.Generator | None = None,
 ) -> np.ndarray:

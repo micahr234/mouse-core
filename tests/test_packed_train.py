@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 import torch
 
-from mouse_core.models.backbone import LlamaBackbone, Qwen3Backbone
+from mouse_core.models.backbone import TransformerBackbone
 from mouse_core.models.backbone import packed_train as packed_train_mod
 from mouse_core.models.backbone.flex_decode import packed_rope_positions
 from mouse_core.models.backbone.packed_train import (
@@ -20,12 +20,9 @@ from mouse_core.models.backbone.packed_train import (
     packed_forward,
 )
 from mouse_core.models.base import Model, _flat_sequence_causal_mask, _flat_sequence_position_ids
-from mouse_core.models.embedding import NumericEmbedder
-from mouse_core.models.heads.dqn import DiscreteActionValueHead
+from mouse_core.models.heads import RegressionHead
 from mouse_core.models.lora import LoRAConfig
-from tests._token_batch_helpers import batch_to_packed, batch_to_token_batch, tok_from_encoder
-
-_tok = tok_from_encoder
+from tests._token_batch_helpers import batch_to_packed, batch_to_token_batch, token_tokenizer
 _cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 _DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
 _KERNELS: list[TrainKernel] = ["varlen", "flex", "padded", "reference"]
@@ -44,11 +41,11 @@ def no_compiled_decoder() -> Iterator[None]:
         packed_train_mod._compiled_layer = was
 
 
-def _backbone(cls, *, hidden: int = 64, layers: int = 2, heads: int = 4, kv_heads: int = 4, head_dim: int | None = None, lora: LoRAConfig | None = None, kernel: TrainKernel = "varlen", dtype: torch.dtype = torch.float32, autocast_dtype: torch.dtype | None = None):
-    kwargs: dict[str, Any] = dict(train_kernel=kernel, decode_kernel="flex", dtype=dtype, use_norm=True, train_autocast_dtype=autocast_dtype, hidden_dim=hidden, num_layers=layers, num_heads=heads, num_key_value_heads=kv_heads, lora=lora)
+def _backbone(architecture: str = "qwen3", *, hidden: int = 64, layers: int = 2, heads: int = 4, kv_heads: int = 4, head_dim: int | None = None, lora: LoRAConfig | None = None, kernel: TrainKernel = "varlen", dtype: torch.dtype = torch.float32, autocast_dtype: torch.dtype | None = None):
+    kwargs: dict[str, Any] = dict(architecture=architecture, train_kernel=kernel, decode_kernel="flex", dtype=dtype, use_norm=True, train_autocast_dtype=autocast_dtype, hidden_dim=hidden, num_layers=layers, num_heads=heads, num_key_value_heads=kv_heads, lora=lora)
     if head_dim is not None:
         kwargs["head_dim"] = head_dim
-    return cls(**kwargs)
+    return TransformerBackbone(**kwargs)
 
 
 def _scale_up(backbone: torch.nn.Module, factor: float = 4.0) -> None:
@@ -179,7 +176,7 @@ def test_packed_rope_positions_match_brute_force_with_recurring_ids(device: str)
 
 @pytest.mark.parametrize(
     "cls,kv_heads,head_dim",
-    [(Qwen3Backbone, 4, None), (Qwen3Backbone, 2, 24), (LlamaBackbone, 4, None), (LlamaBackbone, 2, None)],
+    [("qwen3", 4, None), ("qwen3", 2, 24), ("llama", 4, None), ("llama", 2, None)],
     ids=["qwen3-mha", "qwen3-gqa-hd24", "llama-mha", "llama-gqa"],
 )
 @pytest.mark.parametrize("L", [1, 3, 7, 61, 300])
@@ -209,7 +206,7 @@ def test_cpu_fp32_forward_matches_dense_reference(no_compiled_decoder: None, cls
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
 @pytest.mark.parametrize(
     "cls,kv_heads,head_dim",
-    [(Qwen3Backbone, 4, None), (Qwen3Backbone, 2, 32), (LlamaBackbone, 2, None)],
+    [("qwen3", 4, None), ("qwen3", 2, 32), ("llama", 2, None)],
     ids=["qwen3-mha", "qwen3-gqa-hd32", "llama-gqa"],
 )
 @pytest.mark.parametrize("L", [12, 300], ids=["L<block", "L>block"])
@@ -246,7 +243,7 @@ def test_cuda_fp32_matches_dense_reference(no_compiled_decoder: None, kernel: Tr
     """fp32 on CUDA: reference is packed-stream SDPA, padded is rectangular SDPA, flex is compiled block-sparse."""
     torch.manual_seed(0)
     device = torch.device("cuda")
-    bb = cast(Any, _backbone(Qwen3Backbone, kv_heads=2).to(device))
+    bb = cast(Any, _backbone("qwen3", kv_heads=2).to(device))
     _scale_up(bb)
     seq, grp = _stream(L, n_seq=2, n_grp=3, seed=9, device="cuda")
     embeds = torch.randn(L, 64, device=device)
@@ -267,9 +264,9 @@ def test_cuda_fp32_autocast_fused_matches_fp32_reference(
     stays within the half-precision floor of the fp32 dense reference."""
     torch.manual_seed(0)
     device = torch.device("cuda")
-    bb32 = _backbone(Qwen3Backbone, kv_heads=2).to(device)
+    bb32 = _backbone("qwen3", kv_heads=2).to(device)
     _scale_up(bb32)
-    bb16 = _backbone(Qwen3Backbone, kv_heads=2, dtype=dtype).to(device)
+    bb16 = _backbone("qwen3", kv_heads=2, dtype=dtype).to(device)
     bb16.load_state_dict(bb32.state_dict())
     seq, grp = _stream(L, n_seq=3, n_grp=3, seed=L, device="cuda")
     embeds = torch.randn(L, 64, device=device)
@@ -295,7 +292,7 @@ def test_cuda_fp32_autocast_gradients_flow(no_compiled_decoder: None, kernel: Tr
     """fp32 base params get finite fp32 grads through every kernel with autocast_dtype=bf16."""
     torch.manual_seed(4)
     device = torch.device("cuda")
-    bb = cast(Any, _backbone(Qwen3Backbone, kv_heads=2).to(device))
+    bb = cast(Any, _backbone("qwen3", kv_heads=2).to(device))
     L = 40
     seq, grp = _stream(L, n_seq=2, n_grp=2, seed=7, device="cuda")
     embeds = torch.randn(L, 64, device=device, requires_grad=True)
@@ -316,7 +313,7 @@ def test_cuda_fp32_autocast_gradients_flow(no_compiled_decoder: None, kernel: Tr
 
 def test_varlen_is_strict_no_fallback(no_compiled_decoder: None) -> None:
     """fp32 without autocast_dtype never silently runs another kernel."""
-    bb = _backbone(Qwen3Backbone)
+    bb = _backbone("qwen3")
     ids = torch.zeros(4, dtype=torch.long)
     embeds = torch.randn(4, 64)
     with pytest.raises(ValueError, match="no fallback"):
@@ -329,7 +326,7 @@ def test_varlen_is_strict_no_fallback(no_compiled_decoder: None) -> None:
 
 def test_varlen_rejects_bf16_base_on_cpu(no_compiled_decoder: None) -> None:
     """The flash kernel needs CUDA, not just a flash dtype."""
-    bb = _backbone(Qwen3Backbone, dtype=torch.bfloat16)
+    bb = _backbone("qwen3", dtype=torch.bfloat16)
     ids = torch.zeros(4, dtype=torch.long)
     with pytest.raises(ValueError, match="no fallback"):
         packed_forward(model=bb.model, embeds=torch.zeros(4, 64), sequence_ids=ids, grouping_ids=ids, train_kernel="varlen")
@@ -337,7 +334,7 @@ def test_varlen_rejects_bf16_base_on_cpu(no_compiled_decoder: None) -> None:
 
 def test_ambient_autocast_is_rejected(no_compiled_decoder: None) -> None:
     """Precision is declared at construction; packed_forward inside torch.autocast raises."""
-    bb = _backbone(Qwen3Backbone)
+    bb = _backbone("qwen3")
     ids = torch.zeros(4, dtype=torch.long)
     embeds = torch.randn(4, 64)
     with torch.autocast("cpu", dtype=torch.bfloat16), pytest.raises(RuntimeError, match="torch.autocast"):
@@ -354,15 +351,15 @@ def test_ambient_autocast_is_rejected(no_compiled_decoder: None) -> None:
 def test_autocast_dtype_is_validated(no_compiled_decoder: None) -> None:
     """bf16/fp16 over fp32 base only — both declarations, at construction and at packed_forward."""
     with pytest.raises(ValueError, match="fp32 base"):
-        _backbone(Qwen3Backbone, dtype=torch.bfloat16, autocast_dtype=torch.bfloat16)
+        _backbone("qwen3", dtype=torch.bfloat16, autocast_dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="autocast_dtype must be"):
-        _backbone(Qwen3Backbone, autocast_dtype=torch.float32)
+        _backbone("qwen3", autocast_dtype=torch.float32)
     with pytest.raises(ValueError, match="fp32 base"):
-        Qwen3Backbone(
+        TransformerBackbone(architecture="qwen3", 
             train_kernel="reference", decode_kernel="flex", dtype=torch.bfloat16, use_norm=True,
             decode_autocast_dtype=torch.bfloat16, hidden_dim=64, num_layers=1, num_heads=4,
         )
-    bb = _backbone(Qwen3Backbone)
+    bb = _backbone("qwen3")
     ids = torch.zeros(4, dtype=torch.long)
     with pytest.raises(ValueError, match="autocast_dtype must be"):
         packed_forward(
@@ -381,7 +378,7 @@ def test_isolation_and_recurring_group_causality(no_compiled_decoder: None, devi
         pytest.skip("varlen is strict: CUDA with bf16/fp16 q/k/v only")
     torch.manual_seed(1)
     dtype = torch.bfloat16 if device == "cuda" else torch.float32
-    bb = cast(Any, _backbone(Qwen3Backbone, kv_heads=2, dtype=dtype).to(device))
+    bb = cast(Any, _backbone("qwen3", kv_heads=2, dtype=dtype).to(device))
     _scale_up(bb)
     # seq 0: groups 0 0 1 1 0 0 ; seq 1: group 0 0 0
     seq = torch.tensor([0, 0, 0, 0, 0, 0, 1, 1, 1], device=device)
@@ -422,7 +419,7 @@ def test_isolation_and_recurring_group_causality(no_compiled_decoder: None, devi
 @pytest.mark.parametrize("kernel", ["reference", "padded"])
 def test_cpu_fp32_gradients_match_dense_reference(no_compiled_decoder: None, kernel: TrainKernel) -> None:
     torch.manual_seed(2)
-    bb = _backbone(LlamaBackbone, kv_heads=2)
+    bb = _backbone("llama", kv_heads=2)
     _scale_up(bb)
     L = 23
     seq, grp = _stream(L, n_seq=2, n_grp=3, seed=5)
@@ -451,7 +448,7 @@ def test_cpu_fp32_gradients_match_dense_reference(no_compiled_decoder: None, ker
 @pytest.mark.parametrize("kernel", ["reference", "padded"])
 def test_gradient_checkpointing_matches_plain_backward(no_compiled_decoder: None, kernel: TrainKernel) -> None:
     torch.manual_seed(3)
-    bb = _backbone(Qwen3Backbone, layers=3, kv_heads=2)
+    bb = _backbone("qwen3", layers=3, kv_heads=2)
     L = 31
     seq, grp = _stream(L, n_seq=2, n_grp=2, seed=8)
     embeds = torch.randn(L, 64, requires_grad=True)
@@ -478,7 +475,7 @@ def test_cuda_bf16_lora_gradients_on_frozen_base(no_compiled_decoder: None, kern
     """fp32 LoRA and input-embedding grads flow through the fused kernel; frozen base gets none."""
     torch.manual_seed(4)
     device = torch.device("cuda")
-    bb = cast(Any, _backbone(Qwen3Backbone, kv_heads=2, lora=LoRAConfig(rank=4, alpha=8.0), dtype=torch.bfloat16).to(device))
+    bb = cast(Any, _backbone("qwen3", kv_heads=2, lora=LoRAConfig(rank=4, alpha=8.0), dtype=torch.bfloat16).to(device))
     for n, p in bb.named_parameters():
         if ".lora_" in n:
             p.data = p.data.float()
@@ -526,7 +523,7 @@ def test_install_compiled_decoder_idempotent(no_compiled_decoder: None) -> None:
     assert packed_train_mod._compiled_layer is compiled
 
 
-@pytest.mark.parametrize("cls", [Qwen3Backbone, LlamaBackbone])
+@pytest.mark.parametrize("cls", ["qwen3", "llama"])
 @pytest.mark.parametrize("kernel", _CPU_KERNELS)
 def test_cpu_compiled_body_matches_eager_across_layouts(no_compiled_decoder: None, cls, kernel: TrainKernel) -> None:
     torch.manual_seed(5)
@@ -557,11 +554,10 @@ def test_cpu_compiled_body_matches_eager_across_layouts(no_compiled_decoder: Non
 def test_cuda_bf16_lora_compiled_body_matches_eager_and_trains(no_compiled_decoder: None, L: int, kernel: TrainKernel) -> None:
     torch.manual_seed(6)
     device = torch.device("cuda")
-    encoder = NumericEmbedder(hidden_dim=64, modalities=[{"type": "discrete", "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}])
-    backbone = _backbone(Qwen3Backbone, kv_heads=2, lora=LoRAConfig(rank=4, alpha=8.0), dtype=torch.bfloat16)
-    head = DiscreteActionValueHead(in_features=64, out_features=4, hidden_dim=64, num_layers=1, use_norm=True)
-    model = Model(encoder=encoder, backbone=backbone, heads=head, action_head="action_value", reasoner=None, recurrence=None).to(device)
-    bb = cast(Qwen3Backbone, model.backbone)
+    backbone = _backbone("qwen3", kv_heads=2, lora=LoRAConfig(rank=4, alpha=8.0), dtype=torch.bfloat16)
+    head = RegressionHead(in_features=64, out_features=4, hidden_dim=64, num_layers=1, use_norm=True)
+    model = Model(backbone=backbone, heads=head, action_source=head, reasoner=None).to(device)
+    bb = cast(TransformerBackbone, model.backbone)
     for n, p in bb.named_parameters():
         if ".lora_B." in n:
             torch.nn.init.normal_(p, std=0.05)
@@ -595,7 +591,7 @@ def test_cuda_fp32_autocast_compiled_body_matches_eager(no_compiled_decoder: Non
     """The q/k autocast dtype cast compiles: eager and compiled agree with autocast_dtype=bf16."""
     torch.manual_seed(7)
     device = torch.device("cuda")
-    bb = cast(Any, _backbone(Qwen3Backbone, kv_heads=2).to(device))
+    bb = cast(Any, _backbone("qwen3", kv_heads=2).to(device))
     _scale_up(bb)
     L = 200
     seq, grp = _stream(L, n_seq=3, n_grp=2, seed=L, device="cuda")
@@ -626,7 +622,7 @@ def test_cuda_fp32_autocast_compiled_body_matches_eager(no_compiled_decoder: Non
 
 
 def test_empty_stream(no_compiled_decoder: None) -> None:
-    bb = _backbone(Qwen3Backbone)
+    bb = _backbone("qwen3")
     empty = torch.zeros(0, dtype=torch.long)
     out, layers = packed_forward(model=bb.model, embeds=torch.zeros(0, 64), sequence_ids=empty, grouping_ids=empty, train_kernel="reference", output_hidden_states=True)
     assert out.shape == (0, 64)
@@ -634,7 +630,7 @@ def test_empty_stream(no_compiled_decoder: None) -> None:
 
 
 def test_shape_validation(no_compiled_decoder: None) -> None:
-    bb = _backbone(Qwen3Backbone)
+    bb = _backbone("qwen3")
     ids = torch.zeros(4, dtype=torch.long)
     with pytest.raises(ValueError, match=r"\[L, D\]"):
         packed_forward(model=bb.model, embeds=torch.zeros(1, 4, 64), sequence_ids=ids, grouping_ids=ids, train_kernel="reference")
@@ -643,14 +639,14 @@ def test_shape_validation(no_compiled_decoder: None) -> None:
 
 
 def test_sliding_window_config_is_rejected(no_compiled_decoder: None) -> None:
-    bb = Qwen3Backbone(train_kernel="reference", decode_kernel="flex", dtype=torch.float32, use_norm=True, hidden_dim=64, num_layers=1, num_heads=4, use_sliding_window=True)
+    bb = TransformerBackbone(architecture="qwen3", train_kernel="reference", decode_kernel="flex", dtype=torch.float32, use_norm=True, hidden_dim=64, num_layers=1, num_heads=4, use_sliding_window=True)
     ids = torch.zeros(4, dtype=torch.long)
     with pytest.raises(ValueError, match="sliding-window"):
         packed_forward(model=bb.model, embeds=torch.zeros(4, 64), sequence_ids=ids, grouping_ids=ids, train_kernel="reference")
 
 
 def test_unknown_train_kernel_is_rejected(no_compiled_decoder: None) -> None:
-    bb = _backbone(Qwen3Backbone)
+    bb = _backbone("qwen3")
     ids = torch.zeros(4, dtype=torch.long)
     with pytest.raises(ValueError, match="train_kernel"):
         packed_forward(model=bb.model, embeds=torch.zeros(4, 64), sequence_ids=ids, grouping_ids=ids, train_kernel=cast(Any, "sdpa"))
@@ -658,7 +654,7 @@ def test_unknown_train_kernel_is_rejected(no_compiled_decoder: None) -> None:
 
 def test_flex_kernel_is_forward_only_on_cpu(no_compiled_decoder: None) -> None:
     """FlexAttention has no CPU backward (torch limitation); the CPU kernel comparison is forward-only."""
-    bb = _backbone(Qwen3Backbone)
+    bb = _backbone("qwen3")
     ids = torch.zeros(4, dtype=torch.long)
     embeds = torch.randn(4, 64, requires_grad=True)
     with pytest.raises(NotImplementedError, match="CPU"):
@@ -672,9 +668,8 @@ def test_flex_kernel_is_forward_only_on_cpu(no_compiled_decoder: None) -> None:
 
 
 def test_prepare_sequence_id_col_matches_step_counts() -> None:
-    encoder = NumericEmbedder(hidden_dim=8, modalities=[{"type": "discrete", "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}, {"type": "fourier", "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0}, {"type": "learnable", "tokens": 1, "std": 0.02, "positions": 1}])
     batch = [[{"action": s % 4, "reward": float(s)} for s in range(5)], [{"action": 1, "reward": 0.0}, {"action": 2, "reward": 1.0}, {"action": 3, "reward": 2.0}]]
-    tb, objective_data = batch_to_packed(_tok(encoder), batch)
+    tb, objective_data = batch_to_packed(token_tokenizer("action"), batch)
     assert list(tb.step_counts()) == [5, 3]
     assert objective_data["sequence_id"].tolist() == [0, 0, 0, 0, 0, 1, 1, 1]
     assert objective_data["grouping_id"].tolist() == [0] * 8
@@ -687,16 +682,15 @@ def test_prepare_sequence_id_col_matches_step_counts() -> None:
 @pytest.mark.parametrize("kernel", _CPU_KERNELS)  # fp32 backbone on both devices; strict varlen would raise
 def test_model_forward_isolates_sequences(no_compiled_decoder: None, device: str, kernel: TrainKernel) -> None:
     torch.manual_seed(2)
-    backbone = Qwen3Backbone(train_kernel=kernel, decode_kernel="flex", dtype=torch.float32, use_norm=True, hidden_dim=64, num_layers=2, num_heads=4, num_key_value_heads=4)
-    encoder = NumericEmbedder(hidden_dim=backbone.hidden_dim, modalities=[{"type": "discrete", "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}, {"type": "learnable", "tokens": 1, "std": 0.02, "positions": 1}])
-    head = DiscreteActionValueHead(in_features=backbone.hidden_dim, out_features=4, hidden_dim=backbone.hidden_dim, num_layers=1, use_norm=True)
-    model = Model(encoder=encoder, backbone=backbone, heads=head, action_head="action_value", reasoner=None, recurrence=None).to(device).eval()
+    backbone = TransformerBackbone(architecture="qwen3", train_kernel=kernel, decode_kernel="flex", dtype=torch.float32, use_norm=True, hidden_dim=64, num_layers=2, num_heads=4, num_key_value_heads=4, vocab_size=32)
+    head = RegressionHead(in_features=backbone.hidden_dim, out_features=4, hidden_dim=backbone.hidden_dim, num_layers=1, use_norm=True)
+    model = Model(backbone=backbone, heads=head, action_source=head, reasoner=None).to(device).eval()
     batch = [[{"action": i % 4} for i in range(3)], [{"action": i % 4} for i in range(3)]]
-    tb = batch_to_token_batch(_tok(encoder), batch)
+    tb = batch_to_token_batch(token_tokenizer("action"), batch)
     with torch.no_grad():
         preds0 = model(tb).predictions
         batch_corrupt = [[{"action": 3} for _ in range(3)], [{"action": i % 4} for i in range(3)]]
-        tb_c = batch_to_token_batch(_tok(encoder), batch_corrupt)
+        tb_c = batch_to_token_batch(token_tokenizer("action"), batch_corrupt)
         preds1 = model(tb_c).predictions
     q0 = preds0["action_value"]
     q1 = preds1["action_value"]
@@ -709,17 +703,9 @@ def test_model_forward_isolates_sequences(no_compiled_decoder: None, device: str
 def test_model_train_isolates_tasks_within_sequence(no_compiled_decoder: None) -> None:
     """Packed train forward on a two-task window matches a single-task suffix forward."""
     torch.manual_seed(11)
-    backbone = Qwen3Backbone(train_kernel="reference", decode_kernel="flex", dtype=torch.float32, use_norm=True, hidden_dim=32, num_layers=2, num_heads=4, num_key_value_heads=4)
-    encoder = NumericEmbedder(
-        hidden_dim=backbone.hidden_dim,
-        modalities=[
-            {"type": "discrete", "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1},
-            {"type": "discrete", "field": "episode_done", "vocab_size": 3, "std": 0.02, "positions": 1},
-            {"type": "learnable", "tokens": 1, "std": 0.02, "positions": 1},
-        ],
-    )
-    head = DiscreteActionValueHead(in_features=backbone.hidden_dim, out_features=4, hidden_dim=backbone.hidden_dim, num_layers=1, use_norm=True)
-    model = Model(encoder=encoder, backbone=backbone, heads=head, action_head="action_value", reasoner=None, recurrence=None).eval()
+    backbone = TransformerBackbone(architecture="qwen3", train_kernel="reference", decode_kernel="flex", dtype=torch.float32, use_norm=True, hidden_dim=32, num_layers=2, num_heads=4, num_key_value_heads=4, vocab_size=32)
+    head = RegressionHead(in_features=backbone.hidden_dim, out_features=4, hidden_dim=backbone.hidden_dim, num_layers=1, use_norm=True)
+    model = Model(backbone=backbone, heads=head, action_source=head, reasoner=None).eval()
     task0 = [
         {"action": 0, "episode_done": 0, "task_done": 0, "task_index": 0},
         {"action": 1, "episode_done": 0, "task_done": 0, "task_index": 0},
@@ -730,8 +716,9 @@ def test_model_train_isolates_tasks_within_sequence(no_compiled_decoder: None) -
         {"action": 1, "episode_done": 0, "task_done": 0, "task_index": 1},
     ]
     with torch.no_grad():
-        tb_both, od = batch_to_packed(_tok(encoder, grouping_field="task_index"), [task0 + task1], grouping_field="task_index")
-        tb_t1 = batch_to_token_batch(_tok(encoder, grouping_field="task_index"), [task1], grouping_field="task_index")
+        tok = token_tokenizer("action", "episode_done", grouping_field="task_index")
+        tb_both, od = batch_to_packed(tok, [task0 + task1], grouping_field="task_index")
+        tb_t1 = batch_to_token_batch(tok, [task1], grouping_field="task_index")
         preds_both = model(tb_both).predictions
         preds_t1 = model(tb_t1).predictions
     assert od["task_index"].tolist() == [0, 0, 0, 1, 1]
@@ -740,11 +727,10 @@ def test_model_train_isolates_tasks_within_sequence(no_compiled_decoder: None) -
 
 def test_model_gradient_checkpointing_flag_reaches_backward(no_compiled_decoder: None) -> None:
     torch.manual_seed(12)
-    backbone = Qwen3Backbone(train_kernel="reference", decode_kernel="flex", dtype=torch.float32, use_norm=True, hidden_dim=32, num_layers=2, num_heads=4)
-    encoder = NumericEmbedder(hidden_dim=32, modalities=[{"type": "discrete", "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}])
-    head = DiscreteActionValueHead(in_features=32, out_features=4, hidden_dim=32, num_layers=1, use_norm=True)
-    model = Model(encoder=encoder, backbone=backbone, heads=head, action_head="action_value", reasoner=None, recurrence=None)
-    tb = batch_to_token_batch(_tok(encoder), [[{"action": i % 4} for i in range(5)], [{"action": 1}]])
+    backbone = TransformerBackbone(architecture="qwen3", train_kernel="reference", decode_kernel="flex", dtype=torch.float32, use_norm=True, hidden_dim=32, num_layers=2, num_heads=4, vocab_size=32)
+    head = RegressionHead(in_features=32, out_features=4, hidden_dim=32, num_layers=1, use_norm=True)
+    model = Model(backbone=backbone, heads=head, action_source=head, reasoner=None)
+    tb = batch_to_token_batch(token_tokenizer("action"), [[{"action": i % 4} for i in range(5)], [{"action": 1}]])
 
     def step() -> list[torch.Tensor]:
         model(tb).predictions["action_value"].square().sum().backward()
@@ -764,16 +750,14 @@ def test_model_gradient_checkpointing_flag_reaches_backward(no_compiled_decoder:
 def test_model_forwards_autocast_dtype_to_packed_forward(no_compiled_decoder: None) -> None:
     """A fp32 Model built with train_autocast_dtype=bf16 trains through the varlen kernel."""
     torch.manual_seed(13)
-    backbone = Qwen3Backbone(
+    backbone = TransformerBackbone(architecture="qwen3", 
         train_kernel="varlen", decode_kernel="flex", dtype=torch.float32, use_norm=True,
         train_autocast_dtype=torch.bfloat16,
-        hidden_dim=32, num_layers=2, num_heads=4,
-    )
+        hidden_dim=32, num_layers=2, num_heads=4, vocab_size=32)
     assert backbone.train_autocast_dtype is torch.bfloat16 and backbone.decode_autocast_dtype is None
-    encoder = NumericEmbedder(hidden_dim=32, modalities=[{"type": "discrete", "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}])
-    head = DiscreteActionValueHead(in_features=32, out_features=4, hidden_dim=32, num_layers=1, use_norm=True)
-    model = Model(encoder=encoder, backbone=backbone, heads=head, action_head="action_value", reasoner=None, recurrence=None).to("cuda")
-    tb = batch_to_token_batch(_tok(encoder), [[{"action": i % 4} for i in range(5)], [{"action": 1}]])
+    head = RegressionHead(in_features=32, out_features=4, hidden_dim=32, num_layers=1, use_norm=True)
+    model = Model(backbone=backbone, heads=head, action_source=head, reasoner=None).to("cuda")
+    tb = batch_to_token_batch(token_tokenizer("action"), [[{"action": i % 4} for i in range(5)], [{"action": 1}]])
     model(tb).predictions["action_value"].square().sum().backward()
     grads = [cast(torch.Tensor, p.grad) for p in model.parameters() if p.grad is not None]
     assert grads and all(g.dtype is torch.float32 and torch.isfinite(g).all() for g in grads)

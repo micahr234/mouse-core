@@ -32,7 +32,7 @@ Usage
 -----
 ::
 
-    train_transform = compose(augmenter, tokenizer)
+    train_transform = compose(stages=(augmenter, tokenizer))
     loader = DataLoader(
         stores=store,
         sequence_length=64,
@@ -152,7 +152,7 @@ def _fetch_one_batch(
             steps.append(packed)
             sequence_ids.append(b)
     return pack_token_batch(
-        steps,
+        steps=steps,
         sequence_ids=sequence_ids,
         batch_size=cfg.batch_size,
         grouping_field=grouping_field,

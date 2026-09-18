@@ -161,7 +161,7 @@ def _build_split_datasets(splits: dict[str, list[Datastore]]) -> dict[str, Datas
     resolved: dict[str, Dataset] = {}
     for split_name, stores in splits.items():
         merged = _DS()
-        merged.append(stores)
+        merged.append(data=stores)
         combined = merged.to_dataset()
         if len(combined) > 0:
             resolved[split_name] = combined
@@ -464,7 +464,7 @@ def load_stores_from_hub(
     stores: list[Datastore] = []
     for store_name in store_names:
         store = _DS(name=store_name)
-        store.from_dataset(loaded[store_name])
+        store.from_dataset(ds=loaded[store_name])
         stores.append(store)
     return stores
 

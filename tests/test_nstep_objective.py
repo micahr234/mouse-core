@@ -6,6 +6,7 @@ import torch
 from tensordict import TensorDict
 
 from mouse_core.objectives import DqnObjective, NStepDqnObjective
+from tests._bound_head import BoundHead
 from mouse_core.objectives.nstep import _n_step_targets
 
 
@@ -33,7 +34,7 @@ def _q(
 
 def _nstep(**overrides: object) -> NStepDqnObjective:
     kwargs: dict[str, object] = dict(
-        n=1, prediction_key="action_value", grouping_field=None, temperature=0.0, **_GAMMAS
+        n=1, head=BoundHead("action_value"), grouping_field=None, temperature=0.0, **_GAMMAS
     )
     kwargs.update(overrides)
     return NStepDqnObjective(**kwargs)  # type: ignore[arg-type]
@@ -66,17 +67,17 @@ _ONE_STEP = 6050.5
 _TWO_STEP = 11668.0
 
 
-def test_nstep_requires_n_prediction_key_and_grouping_field() -> None:
+def test_nstep_requires_n_head_and_grouping_field() -> None:
     with pytest.raises(TypeError, match="n"):
         NStepDqnObjective(  # type: ignore[call-arg]
-            prediction_key="action_value", grouping_field=None, temperature=0.0, **_GAMMAS
+            head=BoundHead("action_value"), grouping_field=None, temperature=0.0, **_GAMMAS
         )
-    with pytest.raises(TypeError, match="prediction_key"):
+    with pytest.raises(TypeError, match="head"):
         NStepDqnObjective(n=1, grouping_field=None, temperature=0.0, **_GAMMAS)  # type: ignore[call-arg]
     with pytest.raises(TypeError, match="grouping_field"):
-        NStepDqnObjective(n=1, prediction_key="action_value", temperature=0.0, **_GAMMAS)  # type: ignore[call-arg]
+        NStepDqnObjective(n=1, head=BoundHead("action_value"), temperature=0.0, **_GAMMAS)  # type: ignore[call-arg]
     with pytest.raises(TypeError, match="temperature"):
-        NStepDqnObjective(n=1, prediction_key="action_value", grouping_field=None, **_GAMMAS)  # type: ignore[call-arg]
+        NStepDqnObjective(n=1, head=BoundHead("action_value"), grouping_field=None, **_GAMMAS)  # type: ignore[call-arg]
 
 
 def test_nstep_rejects_non_positive_n() -> None:
@@ -88,33 +89,37 @@ def test_nstep_rejects_non_positive_n() -> None:
         _nstep(n=True)
 
 
-def test_nstep_rejects_empty_prediction_key() -> None:
-    with pytest.raises(ValueError, match="non-empty"):
-        _nstep(prediction_key="")
+def test_nstep_rejects_unattached_head() -> None:
+    class _Unbound(BoundHead):
+        def __init__(self) -> None:
+            super(BoundHead, self).__init__()
+
+    with pytest.raises(ValueError, match="not attached"):
+        _nstep(head=_Unbound())
 
 
 def test_nstep_requires_delayed_predictions() -> None:
     step_stream, predictions, _ = _lambda_fixture()
     with pytest.raises(ValueError, match="delayed_predictions"):
-        _nstep()(step_stream, predictions)
+        _nstep()(objective_data=step_stream, predictions=predictions)
 
 
 def test_nstep_requires_prediction_key_on_both_sides() -> None:
     step_stream, predictions, delayed = _lambda_fixture()
     with pytest.raises(KeyError, match="action_value_3"):
-        _nstep(prediction_key="action_value_3")(step_stream, predictions, delayed)
+        _nstep(head=BoundHead("action_value_3"))(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
     delayed_only = TensorDict(
         {"action_value_3": delayed["action_value"]}, batch_size=delayed.batch_size
     )
-    with pytest.raises(KeyError, match="delayed_predictions"):
-        _nstep()(step_stream, predictions, delayed_only)
+    with pytest.raises(KeyError, match="n-step DQN delayed"):
+        _nstep()(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed_only)
 
 
 def test_nstep_one_matches_dqn() -> None:
     step_stream, predictions, delayed = _lambda_fixture()
-    nstep, metrics = _nstep(n=1)(step_stream, predictions, delayed)
-    dqn, _ = DqnObjective(grouping_field=None, temperature=0.0, **_GAMMAS)(
-        step_stream, predictions, delayed
+    nstep, metrics = _nstep(n=1)(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
+    dqn, _ = DqnObjective(head=BoundHead("action_value"), grouping_field=None, temperature=0.0, **_GAMMAS)(
+        objective_data=step_stream, predictions=predictions, delayed_predictions=delayed
     )
     assert abs(nstep.item() - dqn.item()) < 1e-05
     assert abs(nstep.item() - _ONE_STEP) < 1e-03
@@ -124,15 +129,15 @@ def test_nstep_one_matches_dqn() -> None:
 
 def test_nstep_two_is_the_two_step_return() -> None:
     step_stream, predictions, delayed = _lambda_fixture()
-    loss, _ = _nstep(n=2)(step_stream, predictions, delayed)
+    loss, _ = _nstep(n=2)(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
     assert abs(loss.item() - _TWO_STEP) < 1e-03
 
 
 def test_nstep_past_batch_end_truncates_to_available_steps() -> None:
     """n larger than the remaining run is the same as the longest available."""
     step_stream, predictions, delayed = _lambda_fixture()
-    two, _ = _nstep(n=2)(step_stream, predictions, delayed)
-    ten, _ = _nstep(n=10)(step_stream, predictions, delayed)
+    two, _ = _nstep(n=2)(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
+    ten, _ = _nstep(n=10)(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
     assert abs(two.item() - ten.item()) < 1e-05
 
 
@@ -152,7 +157,7 @@ def test_nstep_terminal_gamma_zero_ends_the_sum() -> None:
     step_stream, predictions, delayed = _lambda_fixture()
     step_stream = step_stream.clone()
     step_stream["episode_done"] = torch.tensor([0, 1, 0])
-    loss, _ = _nstep(n=2)(step_stream, predictions, delayed)
+    loss, _ = _nstep(n=2)(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
     # s0: (5 - 1)^2 = 16 — neither V(s1) nor the next episode's return; s1: 12100.
     assert abs(loss.item() - (16.0 + 12100.0) / 2) < 1e-03
 
@@ -163,7 +168,7 @@ def test_nstep_truncation_gamma_carries_the_sum_discounted() -> None:
     step_stream["episode_done"] = torch.tensor([0, 2, 0])
     loss, _ = _nstep(
         n=2, gamma_episode_truncated=0.5, gamma_episode_terminal=0.0
-    )(step_stream, predictions, delayed)
+    )(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
     # s0: 1 + 0.5 * 10 + 0.5 * 100 = 56 → (5 - 56)^2 = 2601; s1: 12100.
     assert abs(loss.item() - (2601.0 + 12100.0) / 2) < 1e-03
 
@@ -172,8 +177,8 @@ def test_nstep_does_not_cross_sequence_boundary() -> None:
     step_stream, predictions, delayed = _lambda_fixture()
     step_stream = step_stream.clone()
     step_stream["sequence_id"] = torch.tensor([0, 0, 1])
-    two, _ = _nstep(n=2)(step_stream, predictions, delayed)
-    one, _ = _nstep(n=1)(step_stream, predictions, delayed)
+    two, _ = _nstep(n=2)(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
+    one, _ = _nstep(n=1)(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
     assert abs(two.item() - one.item()) < 1e-04
 
 
@@ -189,7 +194,7 @@ def test_nstep_all_out_of_run_pairs_yield_zero_loss() -> None:
         batch_size=[3],
     )
     predictions, delayed = _q(torch.ones(3, 2), torch.ones(3, 2))
-    loss, metrics = _nstep(n=2)(step_stream, predictions, delayed)
+    loss, metrics = _nstep(n=2)(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
     assert abs(loss.item()) < 1e-05
     assert abs(metrics["q_values_mean"]) < 1e-05
 
@@ -207,11 +212,11 @@ def test_nstep_trains_multiple_heads_independently() -> None:
         {"action_value_1": delayed_q, "action_value_3": delayed_q},
         batch_size=[3],
     )
-    loss_1, m1 = _nstep(n=1, prediction_key="action_value_1")(
-        step_stream, predictions, delayed
+    loss_1, m1 = _nstep(n=1, head=BoundHead("action_value_1"))(
+        objective_data=step_stream, predictions=predictions, delayed_predictions=delayed
     )
-    loss_3, m3 = _nstep(n=3, prediction_key="action_value_3")(
-        step_stream, predictions, delayed
+    loss_3, m3 = _nstep(n=3, head=BoundHead("action_value_3"))(
+        objective_data=step_stream, predictions=predictions, delayed_predictions=delayed
     )
     assert abs(loss_1.item() - _ONE_STEP) < 1e-03
     assert abs(loss_3.item() - _TWO_STEP) < 1e-03
@@ -238,7 +243,7 @@ def test_nstep_does_not_backprop_through_delayed_q() -> None:
     online = torch.randn(n, a, requires_grad=True)
     delayed_q = torch.randn(n, a, requires_grad=True)
     predictions, delayed = _q(online, delayed_q)
-    loss, _ = _nstep(n=2)(step_stream, predictions, delayed)
+    loss, _ = _nstep(n=2)(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
     loss.backward()
     assert online.grad is not None
     assert delayed_q.grad is None
@@ -256,14 +261,14 @@ def test_nstep_with_multiple_head_output_rows_per_step() -> None:
         [[0.0, 0.0], [0.0, 0.0], [3.0, 0.0], [-9.0, -9.0], [0.0, 100.0]]
     )
     predictions, delayed = _q(online, delayed_q)
-    loss, _ = _nstep(n=2)(step_stream, predictions, delayed)
+    loss, _ = _nstep(n=2)(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
     # s0 rows: (5-111)^2 = 11236, (7-111)^2 = 10816; s1 row: (0-110)^2 = 12100.
     assert abs(loss.item() - (11236.0 + 10816.0 + 12100.0) / 3) < 1e-02
 
 
 def test_nstep_q_affine_applies_to_online_and_delayed() -> None:
     step_stream, predictions, delayed = _lambda_fixture()
-    loss, _ = _nstep(n=1, q_scale=2.0)(step_stream, predictions, delayed)
+    loss, _ = _nstep(n=1, q_scale=2.0)(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
     expected = (9.0 + 44100.0) / 2
     assert abs(loss.item() - expected) < 1e-03
 
@@ -280,7 +285,7 @@ def test_nstep_requires_min_sequence() -> None:
     )
     predictions, delayed = _q(torch.zeros(1, 2), torch.zeros(1, 2))
     with pytest.raises(ValueError, match="Not enough"):
-        _nstep()(step_stream, predictions, delayed)
+        _nstep()(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
 
 
 def test_nstep_rejects_non_fp32_q() -> None:
@@ -288,7 +293,7 @@ def test_nstep_rejects_non_fp32_q() -> None:
     predictions = predictions.clone()
     predictions["action_value"] = predictions["action_value"].to(torch.bfloat16)
     with pytest.raises(TypeError, match="float32"):
-        _nstep()(step_stream, predictions, delayed)
+        _nstep()(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
 
 
 def test_nstep_temperature_matches_dqn_one_step() -> None:
@@ -303,9 +308,9 @@ def test_nstep_temperature_matches_dqn_one_step() -> None:
         batch_size=[2],
     )
     predictions, delayed = _q(torch.zeros(2, 2), torch.zeros(2, 2))
-    nstep_loss, nstep_m = _nstep(temperature=1.0)(step_stream, predictions, delayed)
-    dqn_loss, dqn_m = DqnObjective(temperature=1.0, grouping_field=None, **_GAMMAS)(
-        step_stream, predictions, delayed
+    nstep_loss, nstep_m = _nstep(temperature=1.0)(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
+    dqn_loss, dqn_m = DqnObjective(head=BoundHead("action_value"), temperature=1.0, grouping_field=None, **_GAMMAS)(
+        objective_data=step_stream, predictions=predictions, delayed_predictions=delayed
     )
     assert abs(nstep_loss.item() - dqn_loss.item()) < 1e-06
     assert abs(nstep_m["entropy"] - dqn_m["entropy"]) < 1e-06
@@ -313,7 +318,7 @@ def test_nstep_temperature_matches_dqn_one_step() -> None:
 
 def test_nstep_temperature_zero_omits_metric() -> None:
     step_stream, predictions, delayed = _lambda_fixture()
-    _, metrics = _nstep()(step_stream, predictions, delayed)
+    _, metrics = _nstep()(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
     assert "entropy" not in metrics
 
 

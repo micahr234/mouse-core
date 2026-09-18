@@ -5,58 +5,53 @@ import torch
 from mouse_core.models import Model, load_model, save_model
 from mouse_core.models.backbone import IdentityBackbone
 from mouse_core.models.base import Model as ModelClass
-from mouse_core.models.embedding import NumericEmbedder
 from mouse_core.data import Tokenizer
-from mouse_core.models.heads import DiscreteActionHead
-from tests._token_batch_helpers import batch_to_token_batch, tok_from_encoder
+from mouse_core.models.heads import ClassificationHead, RegressionHead
+from tests._token_batch_helpers import batch_to_token_batch, token_tokenizer
 
-_tok = tok_from_encoder
+_TOK = token_tokenizer("action")
 
-def test_discrete_action_head_forward_shape() -> None:
-    head = DiscreteActionHead(in_features=8, out_features=4, hidden_dim=8, num_layers=1, use_norm=True)
+def test_classification_head_forward_shape() -> None:
+    head = ClassificationHead(in_features=8, out_features=4, hidden_dim=8, num_layers=1, use_norm=True)
     out = head(torch.randn(2, 5, 8))
     assert out.shape == (2, 5, 4)
 
 def test_infer_head_name_is_action() -> None:
-    head = DiscreteActionHead(in_features=8, out_features=4, hidden_dim=8, num_layers=1, use_norm=True)
+    head = ClassificationHead(in_features=8, out_features=4, hidden_dim=8, num_layers=1, use_norm=True)
     assert ModelClass._infer_head_name(head) == 'action'
-    assert ModelClass._infer_head_name(head, preferred="action_value") == 'action'
 
 
-def test_discrete_action_head_rejects_action_value_name() -> None:
+def test_action_source_must_be_an_enabled_instance() -> None:
     hidden_dim = 8
-    encoder = NumericEmbedder(
-        hidden_dim=hidden_dim,
-        modalities=[
-            {"type": "discrete", "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1},
-        ],
+    enabled = ClassificationHead(
+        in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, use_norm=True
     )
-    with pytest.raises(ValueError, match="is not enabled"):
+    other = RegressionHead(
+        in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, use_norm=True
+    )
+    with pytest.raises(ValueError, match="not one of the heads"):
         Model(
-            encoder=encoder,
-            backbone=IdentityBackbone(hidden_dim=hidden_dim),
-            heads=DiscreteActionHead(
-                in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, use_norm=True
-            ),
-            action_head="action_value",
+            backbone=IdentityBackbone(hidden_dim=hidden_dim, vocab_size=32),
+            heads=enabled,
+            action_source=other,
             reasoner=None,
-            recurrence=None,
         )
 
-def test_discrete_action_head_save_load_roundtrip(tmp_path) -> None:
+def test_classification_head_save_load_roundtrip(tmp_path) -> None:
     torch.manual_seed(0)
     hidden_dim = 8
-    encoder = NumericEmbedder(hidden_dim=hidden_dim, modalities=[{"type": 'discrete', "field": "action", "vocab_size": 4, "std": 0.02, "positions": 1}, {"type": 'fourier', "field": "reward", "std": 0.02, "positions": 1, "fourier_min": 0.01, "fourier_max": 10.0}])
-    model = Model(encoder=encoder, backbone=IdentityBackbone(hidden_dim=hidden_dim), heads=DiscreteActionHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, use_norm=True), action_head="action", reasoner=None, recurrence=None).eval()
+    head = ClassificationHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, use_norm=True)
+    model = Model(backbone=IdentityBackbone(hidden_dim=hidden_dim, vocab_size=32), heads=head, action_source=head, reasoner=None).eval()
     batch = [[{'action': 0, 'reward': 0.0}, {'action': 1, 'reward': 1.0}]]
-    expected = model(batch_to_token_batch(_tok(model.encoder), batch)).predictions
-    save_model(model, tmp_path)
-    loaded = load_model(tmp_path, train_kernel="reference", decode_kernel="flex", dtype=torch.float32).eval()
-    actual = loaded(batch_to_token_batch(_tok(loaded.encoder), batch)).predictions
+    expected = model(batch_to_token_batch(_TOK, batch)).predictions
+    save_model(model=model, path=tmp_path)
+    loaded = load_model(repo_id_or_path=tmp_path, train_kernel="reference", decode_kernel="flex", dtype=torch.float32).eval()
+    actual = loaded(batch_to_token_batch(_TOK, batch)).predictions
     assert torch.allclose(actual['action'], expected['action'])
-    assert loaded.action_head == 'action'
+    assert loaded.action_source == 'action'
     with (tmp_path / 'config.json').open() as fh:
         config = json.load(fh)
+    assert config['heads']['action_source'] == 'action'
     head_specs = config['heads']['heads']
     assert len(head_specs) == 1
-    assert head_specs[0]['type'] == 'discrete_action'
+    assert head_specs[0]['type'] == 'classification'

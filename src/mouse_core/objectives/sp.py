@@ -9,7 +9,8 @@ import torch
 import torch.nn.functional as F
 from tensordict import TensorDict
 
-from mouse_core.objectives.base import Objective
+from mouse_core.models.heads.base import BaseHead
+from mouse_core.objectives.base import Objective, predictions_for, require_head
 
 
 def _argmax_random_tie(q_targets: torch.Tensor) -> torch.Tensor:
@@ -196,7 +197,7 @@ def _skip_mask(mask: torch.Tensor, n_rows: int) -> torch.Tensor:
 class SpObjective(Objective):
     """Supervised policy objective distilling per-action Q targets into action logits.
 
-    Reads ``predictions[predictions_key]`` (shape ``[B, S, A]``) and compares against
+    Reads the tensor for ``head`` (shape ``[B, S, A]``) and compares against
     ``objective_data[targets_key]`` (same shape).
 
     ``info_q_star`` is Q of taking an action *from the current observation* (the
@@ -213,7 +214,8 @@ class SpObjective(Objective):
         label_smoothing: Mixes uniform mass into the teacher. On hard ``"ce"``
             this is ``F.cross_entropy`` smoothing; on soft losses it is applied
             to the teacher distribution only.
-        predictions_key: Key in ``predictions`` that holds the ``[B, S, A]`` action logits.
+        head: Policy head this objective trains. Must be the same
+            instance passed to ``Model(heads=)``.
         targets_key: Key in ``objective_data`` that holds ``[B, S, A]`` Q targets
             (default ``"info_q_star"`` from env expert Q; use e.g. ``"action_value"``
             for teacher-model distillation).
@@ -228,24 +230,25 @@ class SpObjective(Objective):
         loss_type: Literal["ce", "ce-soft-fwd", "ce-soft-bwd", "js", "kl-fwd", "kl-bwd"] = "ce",
         temperature: float = 1.0,
         label_smoothing: float = 0.0,
-        predictions_key: str = "action",
+        head: BaseHead,
         targets_key: str = "info_q_star",
         mask_key: str | None = "episode_done",
     ) -> None:
         self.loss_type = loss_type
         self.temperature = temperature
         self.label_smoothing = label_smoothing
-        self.predictions_key = predictions_key
+        self.head = require_head(head=head, what="head")
         self.targets_key = targets_key
         self.mask_key = mask_key
 
     def __call__(
         self,
+        *,
         objective_data: TensorDict,
         predictions: TensorDict,
         delayed_predictions: TensorDict | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        logits: torch.Tensor = predictions[self.predictions_key]
+        logits: torch.Tensor = predictions_for(head=self.head, predictions=predictions, who="SpObjective")
         temp = float(self.temperature)
 
         A = logits.shape[-1]

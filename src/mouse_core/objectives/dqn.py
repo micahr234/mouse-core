@@ -6,7 +6,8 @@ import torch
 import torch.nn.functional as F
 from tensordict import TensorDict
 
-from mouse_core.objectives.base import Objective
+from mouse_core.models.heads.base import BaseHead
+from mouse_core.objectives.base import Objective, predictions_for, require_head
 
 
 def _require_done_codes(
@@ -357,11 +358,11 @@ class DqnObjective(Objective):
     """Bellman TD(λ) objective with a delayed target network.
 
     Instantiate with hyperparameters, then call with
-    ``(objective_data, predictions, delayed_predictions)``. Online Q is
-    ``predictions["action_value"]``; bootstrap Q is
-    ``delayed_predictions["action_value"]`` from the delayed
+    ``objective_data=``, ``predictions=``, and ``delayed_predictions=``. Online Q is
+    the tensor for ``head``; bootstrap Q is the same key on
+    ``delayed_predictions`` from the delayed
     :class:`~mouse_core.models.base.Model`
-    (``model.delayed_copy(heads=("action_value",))``) run on
+    (``model.delayed_copy(heads=(head,))``) run on
     the same ``TokenBatch``. The delayed tensor is detached before
     the Bellman target, so the TD error does not backprop through it.
 
@@ -407,7 +408,7 @@ class DqnObjective(Objective):
     (discounted) into the reset frame's return. Off-policy behavior is not
     corrected unless ``watkins=True`` (Watkins's Q(λ)), which also cuts the
     trace wherever the taken action is not the online argmax of
-    ``predictions["action_value"]`` (ties included; never compared against
+    the online ``head`` (ties included; never compared against
     oracle columns such as ``info_q_star``). Watkins still uses the hard
     argmax; it does not read ``π``. ``metrics["watkins_greedy_frac"]``
     then reports the in-run fraction of taken actions that were greedy —
@@ -419,7 +420,7 @@ class DqnObjective(Objective):
     Those columns arrive in ``objective_data`` only if they are listed in the
     tokenizer ``objective_fields`` keep-list (input fields are not auto-copied).
     ``task_done`` is an objective column only — do not add it as a tokenizer
-    input field or embedder modality, or it will be fed to the transformer::
+    input field, or it will be fed to the transformer::
 
         tokenizer = Tokenizer(
             ...,
@@ -448,6 +449,8 @@ class DqnObjective(Objective):
     +--------------+-----------+----------------------------------+-----------------------------------------------+
 
     Args:
+        head: Q head this objective trains. Must be the same instance
+            passed to ``Model(heads=)``.
         gamma_step: Discount factor for running (non-terminal) transitions
             (``episode_done == 0``).
         gamma_episode_terminal: Discount applied when the episode terminates
@@ -497,6 +500,7 @@ class DqnObjective(Objective):
     def __init__(
         self,
         *,
+        head: BaseHead,
         gamma_step: float,
         gamma_episode_terminal: float,
         gamma_episode_truncated: float,
@@ -519,6 +523,7 @@ class DqnObjective(Objective):
     ) -> None:
         if not 0.0 <= float(td_lambda) <= 1.0:
             raise ValueError(f"td_lambda must be in [0, 1], got {td_lambda}.")
+        self.head = require_head(head=head, what="head")
         self.temperature = _require_temperature(temperature)
         self.gamma_step = gamma_step
         self.gamma_episode_terminal = gamma_episode_terminal
@@ -541,14 +546,17 @@ class DqnObjective(Objective):
 
     def __call__(
         self,
+        *,
         objective_data: TensorDict,
         predictions: TensorDict,
         delayed_predictions: TensorDict | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         if delayed_predictions is None:
             raise ValueError("DqnObjective requires delayed_predictions.")
-        q: torch.Tensor = predictions["action_value"]
-        q_target: torch.Tensor = delayed_predictions["action_value"].detach()
+        q: torch.Tensor = predictions_for(head=self.head, predictions=predictions, who="DQN")
+        q_target: torch.Tensor = predictions_for(
+            head=self.head, predictions=delayed_predictions, who="DQN delayed"
+        ).detach()
 
         if q.ndim != 2:
             raise ValueError(

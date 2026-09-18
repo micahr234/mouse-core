@@ -4,6 +4,7 @@ import torch
 from tensordict import TensorDict
 
 from mouse_core.objectives import SpObjective
+from tests._bound_head import BoundHead
 from mouse_core.objectives.sp import _argmax_random_tie, sp_ce, sp_js
 
 
@@ -20,7 +21,7 @@ def test_sp_objective_allows_negative_infinity_action_padding() -> None:
         batch_size=(1, 1),
     )
     predictions = TensorDict({"action": torch.tensor([[[0.0, 1.0, 100.0]]])}, batch_size=(1, 1))
-    loss, metrics = SpObjective(loss_type="ce")(objective_data, predictions)
+    loss, metrics = SpObjective(head=BoundHead("action"), loss_type="ce")(objective_data=objective_data, predictions=predictions)
     assert loss.ndim == 0
     assert metrics["action"] >= 0.0
 
@@ -36,7 +37,7 @@ def test_sp_objective_skips_rows_with_no_finite_action_targets() -> None:
     predictions = TensorDict(
         {"action": torch.tensor([[[100.0, 0.0], [0.0, 100.0]]])}, batch_size=(1, 2)
     )
-    loss, _ = SpObjective(loss_type="ce")(objective_data, predictions)
+    loss, _ = SpObjective(head=BoundHead("action"), loss_type="ce")(objective_data=objective_data, predictions=predictions)
     assert loss.item() < 0.0001
 
 
@@ -49,16 +50,16 @@ def test_sp_objective_skips_nonzero_mask_rows() -> None:
         batch_size=(1, 3),
     )
     predictions = TensorDict({"action": logits}, batch_size=(1, 3))
-    loss, _ = SpObjective(loss_type="ce")(objective_data, predictions)
+    loss, _ = SpObjective(head=BoundHead("action"), loss_type="ce")(objective_data=objective_data, predictions=predictions)
     assert loss.item() < 1e-4
 
 
 def test_sp_objective_mask_key_none_keeps_terminals() -> None:
-    q = torch.tensor([[[0.0, 0.0]]])
+    q = torch.tensor([[[1.0, 0.0]]])
     logits = torch.tensor([[[0.0, 100.0]]])
     objective_data = TensorDict({"info_q_star": q}, batch_size=(1, 1))
     predictions = TensorDict({"action": logits}, batch_size=(1, 1))
-    loss, _ = SpObjective(loss_type="ce", mask_key=None)(objective_data, predictions)
+    loss, _ = SpObjective(head=BoundHead("action"), loss_type="ce", mask_key=None)(objective_data=objective_data, predictions=predictions)
     assert loss.item() > 1.0
 
 
@@ -74,8 +75,8 @@ def test_sp_objective_soft_losses_finite_with_padded_actions() -> None:
     for loss_type in ("kl-fwd", "kl-bwd", "ce-soft-fwd", "ce-soft-bwd", "js"):
         logits = torch.randn(2, 3, 4, requires_grad=True)
         predictions = TensorDict({"action": logits}, batch_size=(2, 3))
-        loss, _ = SpObjective(loss_type=loss_type, label_smoothing=0.1)(
-            objective_data, predictions
+        loss, _ = SpObjective(head=BoundHead("action"), loss_type=loss_type, label_smoothing=0.1)(
+            objective_data=objective_data, predictions=predictions
         )
         loss.backward()
         assert torch.isfinite(loss), loss_type
@@ -94,7 +95,7 @@ def test_sp_objective_soft_losses_ignore_padded_student_logits() -> None:
         {"action": torch.tensor([[[1.0, 2.0, 3.0, 100.0]]])}, batch_size=(1, 1)
     )
     for direction in ("kl-fwd", "kl-bwd"):
-        loss, _ = SpObjective(loss_type=direction)(objective_data, matching)
+        loss, _ = SpObjective(head=BoundHead("action"), loss_type=direction)(objective_data=objective_data, predictions=matching)
         assert loss.item() < 1e-06, direction
 
 
@@ -134,8 +135,8 @@ def test_sp_objective_custom_targets_key() -> None:
         batch_size=(1, 1),
     )
     predictions = TensorDict({"action": torch.tensor([[[0.0, 1.0]]])}, batch_size=(1, 1))
-    loss, _ = SpObjective(loss_type="ce", targets_key="action_value")(
-        objective_data, predictions
+    loss, _ = SpObjective(head=BoundHead("action"), loss_type="ce", targets_key="action_value")(
+        objective_data=objective_data, predictions=predictions
     )
     assert loss.item() > 0.0
 

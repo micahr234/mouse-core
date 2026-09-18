@@ -1,14 +1,13 @@
-from mouse_core.models.heads.base import BaseHead, HeadSpec
-from mouse_core.models.heads.swiglu import SwiGLUHead
-from mouse_core.models.heads.layerwise_dqn import LayerwiseDiscreteActionValueHead
-from mouse_core.models.heads.discrete_action import DiscreteActionHead
-from mouse_core.models.heads.dqn import DiscreteActionValueHead
+from mouse_core.models.heads.base import BaseHead, HeadSpec, prediction_key
+from mouse_core.models.heads.classification import ClassificationHead
+from mouse_core.models.heads.layerwise_regression import LayerwiseRegressionHead
+from mouse_core.models.heads.regression import RegressionHead
 
 __all__ = [
     "BaseHead",
     "HeadSpec",
-    "SwiGLUHead",
-    "DiscreteActionHead",
-    "DiscreteActionValueHead",
-    "LayerwiseDiscreteActionValueHead",
+    "prediction_key",
+    "ClassificationHead",
+    "LayerwiseRegressionHead",
+    "RegressionHead",
 ]
