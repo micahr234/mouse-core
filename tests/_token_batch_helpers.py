@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any, cast
 
-from tensordict import TensorDict
+import torch
 
 from mouse_core.data import Tokenizer, compose, pack_token_batch
 from mouse_core.data.token_batch import StepTokens, TokenBatch
@@ -58,7 +58,7 @@ def batch_to_packed(
     batch: list[list[dict]],
     *,
     grouping_field: str = DEFAULT_GROUPING_FIELD,
-) -> tuple[TokenBatch, TensorDict]:
+) -> tuple[TokenBatch, dict[str, torch.Tensor]]:
     """Tokenize a ragged ``list[list[dict]]`` into ``(inputs, objective_data)``."""
     transform = compose(
         stages=(lambda step: _ensure_grouping_field(step, grouping_field), tokenizer),

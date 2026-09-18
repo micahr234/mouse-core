@@ -2,7 +2,6 @@ from __future__ import annotations
 
 """Tests for LayerwiseRegressionHead and Model integration."""
 import torch
-from tensordict import TensorDict
 from mouse_core.models.backbone import TransformerBackbone
 from mouse_core.data import Tokenizer
 from mouse_core.models.heads import LayerwiseRegressionHead
@@ -50,38 +49,31 @@ def test_model_layerwise_forward_and_objective() -> None:
 
 def test_layerwise_objective_q_metrics_use_curr_max_q() -> None:
     """q_values_mean and layer_q_mean report max online Q at the current state."""
-    step_stream = TensorDict({'action': torch.tensor([0, 1, 0]), 'reward': torch.tensor([0.0, 1.0, 5.0]), 'episode_done': torch.tensor([0, 0, 0]), 'task_done': torch.tensor([0, 0, 0])}, batch_size=[3])
-    predictions = TensorDict({'action_value_layerwise': torch.tensor([[[0.0, 2.0], [3.0, 0.0]], [[0.0, 0.0], [0.0, 0.0]], [[0.0, 0.0], [0.0, 0.0]]])}, batch_size=[3])
-    delayed = TensorDict({'action_value_layerwise': torch.zeros(3, 2, 2)}, batch_size=[3])
+    step_stream = {'action': torch.tensor([0, 1, 0]), 'reward': torch.tensor([0.0, 1.0, 5.0]), 'episode_done': torch.tensor([0, 0, 0]), 'task_done': torch.tensor([0, 0, 0])}
+    predictions = {'action_value_layerwise': torch.tensor([[[0.0, 2.0], [3.0, 0.0]], [[0.0, 0.0], [0.0, 0.0]], [[0.0, 0.0], [0.0, 0.0]]])}
+    delayed = {'action_value_layerwise': torch.zeros(3, 2, 2)}
     _, metrics = LayerwiseDqnObjective(head=BoundHead("action_value_layerwise"), num_backbone_layers=2, gamma_step_start=0.0, gamma_step=0.0, gamma_episode_terminal_start=0.0, gamma_episode_terminal=0.0, gamma_episode_truncated_start=0.0, gamma_episode_truncated=0.0, gamma_task_terminal_start=0.0, gamma_task_terminal=0.0, gamma_task_truncated_start=0.0, gamma_task_truncated=0.0, grouping_field=None, temperature=0.0)(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
     assert abs(metrics['q_values_mean'] - 1.5) < 1e-05
     assert abs(metrics['layer_0_q_mean'] - 1.0) < 1e-05
     assert abs(metrics['layer_1_q_mean'] - 1.5) < 1e-05
 
 
-def _layerwise_lambda_fixture() -> tuple[TensorDict, TensorDict, TensorDict]:
+def _layerwise_lambda_fixture() -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     """The DQN λ fixture on two layers (layer 0 gamma 0.5, layer 1 gamma 0.9).
 
     Action from s0 is 0, from s1 is 1; rewards out of s0 / s1 are 1 and 10;
     delayed max-Q is 3 at s1 and 100 at s2; online Q(s0, 0) = 5, Q(s1, 1) = 0.
     """
-    step_stream = TensorDict(
-        {
+    step_stream = {
             "action": torch.tensor([0, 0, 1]),
             "reward": torch.tensor([0.0, 1.0, 10.0]),
             "episode_done": torch.zeros(3, dtype=torch.int64),
             "task_done": torch.zeros(3, dtype=torch.int64),
-        },
-        batch_size=[3],
-    )
+        }
     online = torch.tensor([[5.0, 0.0], [0.0, 0.0], [0.0, 0.0]])
     delayed = torch.tensor([[0.0, 0.0], [3.0, 0.0], [0.0, 100.0]])
-    predictions = TensorDict(
-        {"action_value_layerwise": torch.stack([online, online], dim=1)}, batch_size=[3]
-    )
-    delayed_td = TensorDict(
-        {"action_value_layerwise": torch.stack([delayed, delayed], dim=1)}, batch_size=[3]
-    )
+    predictions = {"action_value_layerwise": torch.stack([online, online], dim=1)}
+    delayed_td = {"action_value_layerwise": torch.stack([delayed, delayed], dim=1)}
     return step_stream, predictions, delayed_td
 
 

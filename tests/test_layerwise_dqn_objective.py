@@ -2,7 +2,6 @@
 from __future__ import annotations
 import pytest
 import torch
-from tensordict import TensorDict
 from mouse_core.objectives import LayerwiseDqnObjective, effective_horizon
 from tests._bound_head import BoundHead
 
@@ -28,9 +27,9 @@ def test_layerwise_dqn_objective_linear_horizon() -> None:
 
 def test_layerwise_dqn_objective_runs() -> None:
     n, layers, a = (8, 3, 3)
-    step_stream = TensorDict({'action': torch.randint(0, a, (n,)), 'reward': torch.randn(n), 'episode_done': torch.zeros(n, dtype=torch.long), 'task_done': torch.zeros(n, dtype=torch.long), 'sequence_id': torch.tensor([0, 0, 0, 0, 1, 1, 1, 1])}, batch_size=[n])
-    predictions = TensorDict({'action_value_layerwise': torch.randn(n, layers, a)}, batch_size=[n])
-    delayed = TensorDict({'action_value_layerwise': torch.randn(n, layers, a)}, batch_size=[n])
+    step_stream = {'action': torch.randint(0, a, (n,)), 'reward': torch.randn(n), 'episode_done': torch.zeros(n, dtype=torch.long), 'task_done': torch.zeros(n, dtype=torch.long), 'sequence_id': torch.tensor([0, 0, 0, 0, 1, 1, 1, 1])}
+    predictions = {'action_value_layerwise': torch.randn(n, layers, a)}
+    delayed = {'action_value_layerwise': torch.randn(n, layers, a)}
     objective = LayerwiseDqnObjective(head=_LW, num_backbone_layers=layers, gamma_step_start=0.0, gamma_step=0.99, gamma_episode_terminal_start=0.0, gamma_episode_terminal=0.0, gamma_episode_truncated_start=0.0, gamma_episode_truncated=0.0, gamma_task_terminal_start=0.0, gamma_task_terminal=0.0, gamma_task_truncated_start=0.0, gamma_task_truncated=0.0, grouping_field=None, temperature=0.0)
     loss, metrics = objective(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
     assert loss.ndim == 0
@@ -44,29 +43,26 @@ def test_layerwise_dqn_objective_skips_transitions_across_sequences() -> None:
     """Corrupting data at a sequence-boundary pair must leave the loss unchanged."""
     n, layers, a = (5, 2, 3)
     torch.manual_seed(0)
-    step_stream = TensorDict({'action': torch.randint(0, a, (n,)), 'reward': torch.randn(n), 'episode_done': torch.zeros(n, dtype=torch.long), 'task_done': torch.zeros(n, dtype=torch.long), 'sequence_id': torch.tensor([0, 0, 1, 1, 1])}, batch_size=[n])
-    predictions = TensorDict({'action_value_layerwise': torch.randn(n, layers, a)}, batch_size=[n])
-    delayed = TensorDict({'action_value_layerwise': torch.randn(n, layers, a)}, batch_size=[n])
+    step_stream = {'action': torch.randint(0, a, (n,)), 'reward': torch.randn(n), 'episode_done': torch.zeros(n, dtype=torch.long), 'task_done': torch.zeros(n, dtype=torch.long), 'sequence_id': torch.tensor([0, 0, 1, 1, 1])}
+    predictions = {'action_value_layerwise': torch.randn(n, layers, a)}
+    delayed = {'action_value_layerwise': torch.randn(n, layers, a)}
     objective = LayerwiseDqnObjective(head=_LW, num_backbone_layers=layers, gamma_step_start=0.0, gamma_step=0.99, gamma_episode_terminal_start=0.0, gamma_episode_terminal=0.0, gamma_episode_truncated_start=0.0, gamma_episode_truncated=0.0, gamma_task_terminal_start=0.0, gamma_task_terminal=0.0, gamma_task_truncated_start=0.0, gamma_task_truncated=0.0, grouping_field=None, temperature=0.0)
     loss_before, _ = objective(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
-    corrupted = step_stream.clone()
+    corrupted = {key: value.clone() for key, value in step_stream.items()}
     corrupted['reward'][2] = 1000000.0
     loss_after, _ = objective(objective_data=corrupted, predictions=predictions, delayed_predictions=delayed)
     assert torch.allclose(loss_before, loss_after)
 
 def test_layerwise_dqn_all_out_of_run_pairs_yield_zero_loss() -> None:
-    step_stream = TensorDict(
-        {
+    step_stream = {
             'action': torch.zeros(3, dtype=torch.long),
             'reward': torch.zeros(3),
             'episode_done': torch.zeros(3, dtype=torch.long),
             'task_done': torch.zeros(3, dtype=torch.long),
             'sequence_id': torch.tensor([0, 1, 2]),
-        },
-        batch_size=[3],
-    )
-    predictions = TensorDict({'action_value_layerwise': torch.randn(3, 2, 2)}, batch_size=[3])
-    delayed = TensorDict({'action_value_layerwise': torch.randn(3, 2, 2)}, batch_size=[3])
+        }
+    predictions = {'action_value_layerwise': torch.randn(3, 2, 2)}
+    delayed = {'action_value_layerwise': torch.randn(3, 2, 2)}
     loss, metrics = LayerwiseDqnObjective(head=_LW, 
         num_backbone_layers=2, gamma_step_start=0.0, gamma_step=0.99,
         gamma_episode_terminal_start=0.0,
@@ -83,9 +79,9 @@ def test_layerwise_dqn_all_out_of_run_pairs_yield_zero_loss() -> None:
 
 
 def test_layerwise_dqn_objective_rejects_layer_mismatch() -> None:
-    step_stream = TensorDict({'action': torch.zeros(3, dtype=torch.long), 'reward': torch.zeros(3), 'episode_done': torch.zeros(3, dtype=torch.long), 'task_done': torch.zeros(3, dtype=torch.long)}, batch_size=[3])
-    predictions = TensorDict({'action_value_layerwise': torch.zeros(3, 2, 2)}, batch_size=[3])
-    delayed = TensorDict({'action_value_layerwise': torch.zeros(3, 2, 2)}, batch_size=[3])
+    step_stream = {'action': torch.zeros(3, dtype=torch.long), 'reward': torch.zeros(3), 'episode_done': torch.zeros(3, dtype=torch.long), 'task_done': torch.zeros(3, dtype=torch.long)}
+    predictions = {'action_value_layerwise': torch.zeros(3, 2, 2)}
+    delayed = {'action_value_layerwise': torch.zeros(3, 2, 2)}
     objective = LayerwiseDqnObjective(head=_LW, num_backbone_layers=3, gamma_step_start=0.0, gamma_step=0.99, gamma_episode_terminal_start=0.0, gamma_episode_terminal=0.0, gamma_episode_truncated_start=0.0, gamma_episode_truncated=0.0, gamma_task_terminal_start=0.0, gamma_task_terminal=0.0, gamma_task_truncated_start=0.0, gamma_task_truncated=0.0, grouping_field=None, temperature=0.0)
     try:
         objective(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
@@ -98,19 +94,16 @@ def test_layerwise_dqn_objective_rejects_layer_mismatch() -> None:
 def test_layerwise_dqn_objective_does_not_backprop_through_delayed_q() -> None:
     """Bootstrap Q is a constant: delayed Q must not receive a gradient."""
     n, layers, a = 4, 2, 2
-    step_stream = TensorDict(
-        {
+    step_stream = {
             "action": torch.zeros(n, dtype=torch.long),
             "reward": torch.ones(n),
             "episode_done": torch.zeros(n, dtype=torch.long),
             "task_done": torch.zeros(n, dtype=torch.long),
-        },
-        batch_size=[n],
-    )
+        }
     online = torch.randn(n, layers, a, requires_grad=True)
     delayed = torch.randn(n, layers, a, requires_grad=True)
-    predictions = TensorDict({"action_value_layerwise": online}, batch_size=[n])
-    delayed_td = TensorDict({"action_value_layerwise": delayed}, batch_size=[n])
+    predictions = {"action_value_layerwise": online}
+    delayed_td = {"action_value_layerwise": delayed}
     loss, _ = LayerwiseDqnObjective(head=_LW, 
         num_backbone_layers=layers, gamma_step_start=1.0, gamma_step=1.0,
         gamma_episode_terminal_start=0.0,
@@ -182,25 +175,18 @@ def test_layerwise_temperature_matches_dqn_one_layer() -> None:
     """One layer with the same α is DqnObjective's soft backup."""
     from mouse_core.objectives import DqnObjective
 
-    step_stream = TensorDict(
-        {
+    step_stream = {
             "action": torch.tensor([0, 0]),
             "reward": torch.tensor([0.0, 0.0]),
             "episode_done": torch.zeros(2, dtype=torch.int64),
             "task_done": torch.zeros(2, dtype=torch.int64),
-        },
-        batch_size=[2],
-    )
+        }
     online = torch.zeros(2, 2)
     delayed = torch.zeros(2, 2)
-    layerwise_pred = TensorDict(
-        {"action_value_layerwise": online.unsqueeze(1)}, batch_size=[2]
-    )
-    layerwise_del = TensorDict(
-        {"action_value_layerwise": delayed.unsqueeze(1)}, batch_size=[2]
-    )
-    dqn_pred = TensorDict({"action_value": online}, batch_size=[2])
-    dqn_del = TensorDict({"action_value": delayed}, batch_size=[2])
+    layerwise_pred = {"action_value_layerwise": online.unsqueeze(1)}
+    layerwise_del = {"action_value_layerwise": delayed.unsqueeze(1)}
+    dqn_pred = {"action_value": online}
+    dqn_del = {"action_value": delayed}
     lw_loss, lw_m = _layerwise(temperature=1.0)(
         objective_data=step_stream, predictions=layerwise_pred, delayed_predictions=layerwise_del
     )

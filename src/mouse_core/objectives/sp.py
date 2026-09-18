@@ -7,7 +7,6 @@ from typing import Literal
 
 import torch
 import torch.nn.functional as F
-from tensordict import TensorDict
 
 from mouse_core.models.heads.base import BaseHead
 from mouse_core.objectives.base import Objective, predictions_for, require_head
@@ -244,9 +243,9 @@ class SpObjective(Objective):
     def __call__(
         self,
         *,
-        objective_data: TensorDict,
-        predictions: TensorDict,
-        delayed_predictions: TensorDict | None = None,
+        objective_data: dict[str, torch.Tensor],
+        predictions: dict[str, torch.Tensor],
+        delayed_predictions: dict[str, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         logits: torch.Tensor = predictions_for(head=self.head, predictions=predictions, who="SpObjective")
         temp = float(self.temperature)

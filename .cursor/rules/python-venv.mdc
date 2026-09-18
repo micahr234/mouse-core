@@ -18,12 +18,12 @@ This project uses `uv` with a `.venv` at the repo root.
 
 ```bash
 # ❌ BAD
-pip install tensordict
+pip install numpy
 python -c "import mouse_core"
 jupyter lab examples/
 
 # ✅ GOOD
-uv pip install tensordict --python .venv/bin/python
+uv pip install numpy --python .venv/bin/python
 .venv/bin/python -c "import mouse_core"
 .venv/bin/jupyter lab examples/
 ```

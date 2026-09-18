@@ -5,7 +5,6 @@ from __future__ import annotations
 import numpy as np
 import pytest
 import torch
-from tensordict import TensorDict
 
 from mouse_core.data import Tokenizer, pack_token_batch
 from mouse_core.models import LatentReasoner, Model, ModelOutput
@@ -243,9 +242,9 @@ def test_get_action_uses_last_valid_head_output_not_last_token() -> None:
 
     with torch.no_grad():
         h_head = out.last_hidden_state[torch.arange(2), last_head]
-        q_head = model.head(h=h_head, batch_size=(2,))["action_value"]
+        q_head = model.head(h=h_head)["action_value"]
         h_tok = out.last_hidden_state[:, -1]
-        q_tok = model.head(h=h_tok, batch_size=(2,))["action_value"]
+        q_tok = model.head(h=h_tok)["action_value"]
     assert not torch.allclose(q_head, q_tok, atol=1e-5)
     assert action.tolist() == q_head.argmax(dim=-1).tolist()
 
@@ -253,8 +252,7 @@ def test_get_action_uses_last_valid_head_output_not_last_token() -> None:
 def test_get_action_model_output_uses_last_valid_step_column() -> None:
     """A scores tensor's last column is ignored when a later slot is invalid."""
     model = _tiny_model()
-    preds = TensorDict(
-        {
+    preds = {
             "action_value": torch.tensor(
                 [
                     [[0.0, 9.0], [5.0, 0.0], [0.0, 3.0]],
@@ -262,7 +260,6 @@ def test_get_action_model_output_uses_last_valid_step_column() -> None:
                 ]
             )
         }
-    )
     # Last valid columns are 1 and 0 — not the trailing pad column.
     valid = torch.tensor([[True, True, False], [True, False, False]])
     out = ModelOutput(
@@ -273,24 +270,20 @@ def test_get_action_model_output_uses_last_valid_step_column() -> None:
     )
     action = model.get_action(out=out, temperature=0.0)
     assert action.tolist() == [0, 0]
-    # TensorDict path still takes the last step axis.
+    # scores-dict path still takes the last step axis.
     assert model.get_action(out=preds, temperature=0.0).tolist() == [1, 0]
 
 
 def test_get_action_rejects_flat_multi_step_train_outputs() -> None:
     model = _tiny_model()
-    preds = TensorDict(
-        {"action_value": torch.tensor([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]])}
-    )
+    preds = {"action_value": torch.tensor([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]])}
     with pytest.raises(ValueError, match="N=1"):
         model.get_action(out=preds, temperature=0.0)
 
 
 def test_get_action_rejects_decode_row_with_no_valid_head_output() -> None:
     model = _tiny_model()
-    preds = TensorDict(
-        {"action_value": torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])}
-    )
+    preds = {"action_value": torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])}
     out = ModelOutput(
         predictions=preds,
         last_hidden_state=torch.zeros(1, 1, _HIDDEN),
@@ -308,7 +301,7 @@ def test_get_action_rejects_decode_row_with_no_valid_head_output() -> None:
 
 def _objective_data(
     N: int, *, counts: list[int] | None = None, actions: list[int] | None = None
-) -> TensorDict:
+) -> dict[str, torch.Tensor]:
     data = {
         "action": torch.tensor(actions or list(range(N)), dtype=torch.int64) % _ACTIONS,
         "reward": torch.arange(N, dtype=torch.float32) / 2,
@@ -318,7 +311,7 @@ def _objective_data(
     }
     if counts is not None:
         data["head_output_count"] = torch.tensor(counts, dtype=torch.int64)
-    return TensorDict(data, batch_size=[N])
+    return data
 
 
 def test_dqn_duplicated_rows_match_single_head_output() -> None:
@@ -329,13 +322,13 @@ def test_dqn_duplicated_rows_match_single_head_output() -> None:
     objective = DqnObjective(head=BoundHead("action_value"), gamma_step=0.9, gamma_episode_terminal=0.0, gamma_episode_truncated=0.0, gamma_task_terminal=0.0, gamma_task_truncated=0.0, grouping_field=None, temperature=0.0)
 
     base_loss, base_metrics = objective(
-        objective_data=_objective_data(N), predictions=TensorDict({"action_value": q}, batch_size=[N]), delayed_predictions=TensorDict({"action_value": q_target}, batch_size=[N]),
+        objective_data=_objective_data(N), predictions={"action_value": q}, delayed_predictions={"action_value": q_target},
     )
     # Duplicate every step's head-output row: same targets, same loss.
     q2 = q.repeat_interleave(2, dim=0)
     q2_target = q_target.repeat_interleave(2, dim=0)
     dup_loss, dup_metrics = objective(
-        objective_data=_objective_data(N, counts=[2] * N), predictions=TensorDict({"action_value": q2}, batch_size=[2 * N]), delayed_predictions=TensorDict({"action_value": q2_target}, batch_size=[2 * N]),
+        objective_data=_objective_data(N, counts=[2] * N), predictions={"action_value": q2}, delayed_predictions={"action_value": q2_target},
     )
     assert torch.allclose(base_loss, dup_loss, atol=1e-6)
     for key in ("q_values_mean", "q_values_min", "q_values_max"):
@@ -352,7 +345,7 @@ def test_dqn_multi_head_output_shares_step_target() -> None:
     data = _objective_data(2, counts=[2, 1], actions=[0, 1])
     data["reward"] = torch.tensor([0.0, 0.5])
     loss, _ = objective(
-        objective_data=data, predictions=TensorDict({"action_value": q}, batch_size=[3]), delayed_predictions=TensorDict({"action_value": q_target}, batch_size=[3]),
+        objective_data=data, predictions={"action_value": q}, delayed_predictions={"action_value": q_target},
     )
     target = 0.5 + gamma * 60.0  # r_1 + gamma * max_a Q_target(s_1) (row 2)
     expected = ((2.0 - target) ** 2 + (4.0 - target) ** 2) / 2  # a_1 = 1
@@ -362,12 +355,12 @@ def test_dqn_multi_head_output_shares_step_target() -> None:
 def test_dqn_misaligned_head_output_count_raises() -> None:
     N = 3
     q = torch.randn(2 * N, _ACTIONS)
-    preds = TensorDict({"action_value": q}, batch_size=[2 * N])
+    preds = {"action_value": q}
     objective = DqnObjective(head=BoundHead("action_value"), gamma_step=1.0, gamma_episode_terminal=0.0, gamma_episode_truncated=0.0, gamma_task_terminal=0.0, gamma_task_truncated=0.0, grouping_field=None, temperature=0.0)
     with pytest.raises(ValueError, match="misaligned"):
-        objective(objective_data=_objective_data(N, counts=[2, 2, 1]), predictions=preds, delayed_predictions=preds.clone())
+        objective(objective_data=_objective_data(N, counts=[2, 2, 1]), predictions=preds, delayed_predictions={key: value.clone() for key, value in preds.items()})
     with pytest.raises(ValueError, match="head_output_count column"):
-        objective(objective_data=_objective_data(N), predictions=preds, delayed_predictions=preds.clone())
+        objective(objective_data=_objective_data(N), predictions=preds, delayed_predictions={key: value.clone() for key, value in preds.items()})
 
 
 # ---------------------------------------------------------------------------

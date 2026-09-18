@@ -8,7 +8,6 @@ from typing import Any
 
 import numpy as np
 import torch
-from tensordict import TensorDict
 
 
 @dataclass(frozen=True)
@@ -475,8 +474,17 @@ def _stack_objective_fields(
     return out
 
 
-def _fields_to_tensordict(fields: dict[str, np.ndarray], n: int) -> TensorDict:
-    """CPU ``TensorDict[N]`` from stacked numpy objective columns."""
+def to_device(
+    *,
+    data: Mapping[str, torch.Tensor],
+    device: torch.device | str,
+) -> dict[str, torch.Tensor]:
+    """Move every tensor in ``data`` to ``device``."""
+    return {key: value.to(device) for key, value in data.items()}
+
+
+def _fields_to_tensors(fields: dict[str, np.ndarray]) -> dict[str, torch.Tensor]:
+    """CPU tensors from stacked numpy objective columns."""
     tensors: dict[str, torch.Tensor] = {}
     for k, v in fields.items():
         arr = np.asarray(v)
@@ -484,7 +492,7 @@ def _fields_to_tensordict(fields: dict[str, np.ndarray], n: int) -> TensorDict:
             tensors[k] = torch.from_numpy(arr.astype(np.float32, copy=False))
         else:
             tensors[k] = torch.from_numpy(arr.astype(np.int64, copy=False))
-    return TensorDict(tensors, batch_size=[n])
+    return tensors
 
 
 def pack_token_batch(
@@ -494,11 +502,12 @@ def pack_token_batch(
     batch_size: int | None = None,
     grouping_field: str | None = None,
     prev_grouping_ids: Sequence[int | None] | None = None,
-) -> tuple[TokenBatch, TensorDict]:
+) -> tuple[TokenBatch, dict[str, torch.Tensor]]:
     """Pack per-step :class:`StepTokens` into model and objective inputs.
 
     All steps must share the same ``modality_names``, ``modality_map``, and
-    ``grouping_field``. Returns ``(inputs, objective_data)``.
+    ``grouping_field``. Returns ``(inputs, objective_data)``. Move
+    ``objective_data`` with :func:`to_device`.
 
     When a step carries ``group_prefix_*`` tokens (from
     :class:`~mouse_core.data.tokenizer.Tokenizer` ``group_prefix=``),
@@ -508,7 +517,7 @@ def pack_token_batch(
     (optional ``None`` entries); pass the last grouping already in a cached
     sequence so incremental decode does not emit the group prefix again.
     """
-    empty_objective = TensorDict({}, batch_size=[0])
+    empty_objective: dict[str, torch.Tensor] = {}
     if not steps:
         if grouping_field is None:
             raise ValueError(
@@ -635,4 +644,4 @@ def pack_token_batch(
         grouping_field=gf,
         B=B,
     )
-    return inputs, _fields_to_tensordict(fields, inputs.N)
+    return inputs, _fields_to_tensors(fields)

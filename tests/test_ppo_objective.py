@@ -2,7 +2,6 @@
 from __future__ import annotations
 import pytest
 import torch
-from tensordict import TensorDict
 from mouse_core.objectives import PpoObjective, sample_discrete_action
 from tests._bound_head import BoundHead
 
@@ -10,7 +9,7 @@ _POLICY = BoundHead("action")
 _VALUE = BoundHead("value")
 
 
-def _ppo_batch(*, n: int=8, a: int=3, with_old_log_prob: bool=True, sequence_id: list[int] | None=None) -> tuple[TensorDict, TensorDict]:
+def _ppo_batch(*, n: int=8, a: int=3, with_old_log_prob: bool=True, sequence_id: list[int] | None=None) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     action = torch.randint(0, a, (n,))
     reward = torch.randn(n)
     episode_done = torch.zeros(n, dtype=torch.long)
@@ -18,8 +17,8 @@ def _ppo_batch(*, n: int=8, a: int=3, with_old_log_prob: bool=True, sequence_id:
     data: dict[str, torch.Tensor] = {'action': action, 'reward': reward, 'episode_done': episode_done, 'task_done': task_done, 'sequence_id': torch.tensor(sequence_id if sequence_id is not None else [0] * (n // 2) + [1] * (n - n // 2))}
     if with_old_log_prob:
         data['old_log_prob'] = torch.randn(n)
-    objective_data = TensorDict(data, batch_size=[n])
-    predictions = TensorDict({'action': torch.randn(n, a), 'value': torch.randn(n, 1)}, batch_size=[n])
+    objective_data = data
+    predictions = {'action': torch.randn(n, a), 'value': torch.randn(n, 1)}
     return (objective_data, predictions)
 
 def test_ppo_objective_runs() -> None:
@@ -50,14 +49,14 @@ def test_ppo_objective_rejects_wrong_action_shape() -> None:
         PpoObjective(head=_POLICY, value_head=_VALUE, grouping_field=None)(objective_data=objective_data, predictions=predictions)
 
 def test_ppo_objective_requires_min_sequence() -> None:
-    objective_data = TensorDict({'action': torch.zeros(1, dtype=torch.long), 'reward': torch.zeros(1), 'episode_done': torch.zeros(1, dtype=torch.long), 'task_done': torch.zeros(1, dtype=torch.long)}, batch_size=[1])
-    predictions = TensorDict({'action': torch.zeros(1, 2), 'value': torch.zeros(1, 1)}, batch_size=[1])
+    objective_data = {'action': torch.zeros(1, dtype=torch.long), 'reward': torch.zeros(1), 'episode_done': torch.zeros(1, dtype=torch.long), 'task_done': torch.zeros(1, dtype=torch.long)}
+    predictions = {'action': torch.zeros(1, 2), 'value': torch.zeros(1, 1)}
     with pytest.raises(ValueError, match="N >= 2"):
         PpoObjective(head=_POLICY, value_head=_VALUE, grouping_field=None)(objective_data=objective_data, predictions=predictions)
 
 def test_ppo_objective_closed_form_single_transition() -> None:
-    objective_data = TensorDict({'action': torch.tensor([0, 0]), 'reward': torch.tensor([0.0, 4.0]), 'episode_done': torch.tensor([0, 0]), 'task_done': torch.tensor([0, 0]), 'old_log_prob': torch.tensor([0.0, 0.0])}, batch_size=[2])
-    predictions = TensorDict({'action': torch.tensor([[20.0, -20.0], [20.0, -20.0]]), 'value': torch.tensor([[1.0], [0.0]])}, batch_size=[2])
+    objective_data = {'action': torch.tensor([0, 0]), 'reward': torch.tensor([0.0, 4.0]), 'episode_done': torch.tensor([0, 0]), 'task_done': torch.tensor([0, 0]), 'old_log_prob': torch.tensor([0.0, 0.0])}
+    predictions = {'action': torch.tensor([[20.0, -20.0], [20.0, -20.0]]), 'value': torch.tensor([[1.0], [0.0]])}
     objective = PpoObjective(head=_POLICY, value_head=_VALUE, gamma_step=0.0, gae_lambda=1.0, clip_eps=0.2, vf_coef=1.0, ent_coef=0.0, normalize_advantage=False, grouping_field=None)
     loss, metrics = objective(objective_data=objective_data, predictions=predictions)
     assert abs(loss.item() - 6.0) < 0.001
@@ -72,8 +71,7 @@ def test_ppo_masks_cross_task_pairs_only_when_grouping_field_set() -> None:
     (wrong action/reward from the new task). Omitting the argument is an
     error — it must not silently default to no isolation.
     """
-    objective_data = TensorDict(
-        {
+    objective_data = {
             "action": torch.tensor([0, 0, 0]),
             "reward": torch.tensor([0.0, 1.0, 5.0]),
             "episode_done": torch.tensor([0, 0, 0]),
@@ -81,16 +79,11 @@ def test_ppo_masks_cross_task_pairs_only_when_grouping_field_set() -> None:
             "old_log_prob": torch.tensor([0.0, 0.0, 0.0]),
             "sequence_id": torch.tensor([0, 0, 0]),
             "task_index": torch.tensor([0, 1, 1]),
-        },
-        batch_size=[3],
-    )
-    predictions = TensorDict(
-        {
+        }
+    predictions = {
             "action": torch.tensor([[20.0, -20.0], [20.0, -20.0], [20.0, -20.0]]),
             "value": torch.tensor([[0.0], [2.0], [0.0]]),
-        },
-        batch_size=[3],
-    )
+        }
     kwargs = dict(
         gamma_step=0.0, gae_lambda=1.0, vf_coef=1.0, ent_coef=0.0, normalize_advantage=False
     )
@@ -103,14 +96,14 @@ def test_ppo_masks_cross_task_pairs_only_when_grouping_field_set() -> None:
 
 
 def test_ppo_objective_skips_transitions_across_sequences() -> None:
-    objective_data = TensorDict({'action': torch.tensor([0, 0, 0]), 'reward': torch.tensor([0.0, 1.0, 5.0]), 'episode_done': torch.tensor([0, 0, 0]), 'task_done': torch.tensor([0, 0, 0]), 'old_log_prob': torch.tensor([0.0, 0.0, 0.0]), 'sequence_id': torch.tensor([0, 1, 1])}, batch_size=[3])
-    predictions = TensorDict({'action': torch.tensor([[20.0, -20.0], [20.0, -20.0], [20.0, -20.0]]), 'value': torch.tensor([[0.0], [2.0], [0.0]])}, batch_size=[3])
+    objective_data = {'action': torch.tensor([0, 0, 0]), 'reward': torch.tensor([0.0, 1.0, 5.0]), 'episode_done': torch.tensor([0, 0, 0]), 'task_done': torch.tensor([0, 0, 0]), 'old_log_prob': torch.tensor([0.0, 0.0, 0.0]), 'sequence_id': torch.tensor([0, 1, 1])}
+    predictions = {'action': torch.tensor([[20.0, -20.0], [20.0, -20.0], [20.0, -20.0]]), 'value': torch.tensor([[0.0], [2.0], [0.0]])}
     loss, _ = PpoObjective(head=_POLICY, value_head=_VALUE, gamma_step=0.0, gae_lambda=1.0, vf_coef=1.0, ent_coef=0.0, normalize_advantage=False, grouping_field=None)(objective_data=objective_data, predictions=predictions)
     assert abs(loss.item() - 6.0) < 0.001
 
 def test_ppo_objective_all_out_of_run_pairs_yield_zero_loss() -> None:
-    objective_data = TensorDict({'action': torch.tensor([0, 1, 0]), 'reward': torch.tensor([0.0, 1.0, 5.0]), 'episode_done': torch.tensor([0, 0, 0]), 'task_done': torch.tensor([0, 0, 0]), 'sequence_id': torch.tensor([0, 1, 2])}, batch_size=[3])
-    predictions = TensorDict({'action': torch.zeros(3, 2), 'value': torch.zeros(3, 1)}, batch_size=[3])
+    objective_data = {'action': torch.tensor([0, 1, 0]), 'reward': torch.tensor([0.0, 1.0, 5.0]), 'episode_done': torch.tensor([0, 0, 0]), 'task_done': torch.tensor([0, 0, 0]), 'sequence_id': torch.tensor([0, 1, 2])}
+    predictions = {'action': torch.zeros(3, 2), 'value': torch.zeros(3, 1)}
     loss, metrics = PpoObjective(head=_POLICY, value_head=_VALUE, grouping_field=None)(objective_data=objective_data, predictions=predictions)
     assert abs(loss.item()) < 1e-05
     assert abs(metrics['advantage_mean']) < 1e-05

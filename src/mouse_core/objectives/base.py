@@ -6,7 +6,6 @@ then call with ``objective_data=`` and ``predictions=`` to get a loss and metric
 Example — custom objective::
 
     from mouse_core.objectives.base import Objective
-    from tensordict import TensorDict
     import torch
 
     class MyObjective(Objective):
@@ -16,9 +15,9 @@ Example — custom objective::
         def __call__(
             self,
             *,
-            objective_data: TensorDict,
-            predictions: TensorDict,
-            delayed_predictions: TensorDict | None = None,
+            objective_data: dict[str, torch.Tensor],
+            predictions: dict[str, torch.Tensor],
+            delayed_predictions: dict[str, torch.Tensor] | None = None,
         ) -> tuple[torch.Tensor, dict[str, float]]:
             ...
             return loss, {"my_objective": loss.item()}
@@ -29,7 +28,6 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 
 import torch
-from tensordict import TensorDict
 
 from mouse_core.models.heads.base import BaseHead, prediction_key
 
@@ -46,17 +44,17 @@ class Objective(ABC):
     def __call__(
         self,
         *,
-        objective_data: TensorDict,
-        predictions: TensorDict,
-        delayed_predictions: TensorDict | None = None,
+        objective_data: dict[str, torch.Tensor],
+        predictions: dict[str, torch.Tensor],
+        delayed_predictions: dict[str, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         """Compute a scalar loss and return diagnostic metrics.
 
         Args:
-            objective_data: ``TensorDict[N]`` of tokenizer ``objective_fields``
+            objective_data: ``dict[str, Tensor]`` of tokenizer ``objective_fields``
                 (``action``, ``reward``, ``episode_done``, ``task_done``, …),
                 keyed by flat step index with ``sequence_id``.
-            predictions: ``TensorDict[N]`` of model head outputs from
+            predictions: ``dict[str, Tensor]`` of model head outputs from
                 :meth:`~mouse_core.models.base.Model.forward`.
             delayed_predictions: Delayed-model head outputs. Required by DQN
                 family objectives; ignored by PPO, GRPO, SP, and SV.
@@ -76,7 +74,7 @@ def require_head(*, head: object, what: str) -> BaseHead:
     return head
 
 
-def predictions_for(*, head: BaseHead, predictions: TensorDict, who: str) -> torch.Tensor:
+def predictions_for(*, head: BaseHead, predictions: dict[str, torch.Tensor], who: str) -> torch.Tensor:
     """Return ``predictions`` for ``head``'s bound storage key."""
     key = prediction_key(head=head)
     if key not in predictions.keys():

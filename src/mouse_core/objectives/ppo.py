@@ -6,7 +6,6 @@ from typing import cast
 
 import torch
 import torch.nn.functional as F
-from tensordict import TensorDict
 
 from mouse_core.models.heads.base import BaseHead
 from mouse_core.objectives.base import Objective, predictions_for, require_head
@@ -119,9 +118,13 @@ class PpoObjective(Objective):
                 {"input_field": "old_log_prob"},
             ],
         )
+        from mouse_core.data import to_device
         inputs, objective_data = loader.next_batch()
         predictions = model(inputs).predictions
-        loss, metrics = objective(objective_data=objective_data.to(device), predictions=predictions)
+        loss, metrics = objective(
+            objective_data=to_device(data=objective_data, device=device),
+            predictions=predictions,
+        )
 
     When ``old_log_prob`` is absent, the detached current log-probs are used
     (ratio = 1) — suitable for a single pass over a freshly collected batch.
@@ -204,9 +207,9 @@ class PpoObjective(Objective):
     def __call__(
         self,
         *,
-        objective_data: TensorDict,
-        predictions: TensorDict,
-        delayed_predictions: TensorDict | None = None,
+        objective_data: dict[str, torch.Tensor],
+        predictions: dict[str, torch.Tensor],
+        delayed_predictions: dict[str, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         logits: torch.Tensor = predictions_for(head=self.head, predictions=predictions, who="PPO")
         values_raw: torch.Tensor = predictions_for(head=self.value_head, predictions=predictions, who="PPO")

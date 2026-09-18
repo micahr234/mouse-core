@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 import torch
 
-from mouse_core.data import Tokenizer, pack_token_batch
+from mouse_core.data import Tokenizer, pack_token_batch, to_device
 
 
 def _tok(**kwargs) -> Tokenizer:
@@ -64,6 +64,16 @@ def test_objective_column_dtype_promotes_to_float_when_any_step_is_float() -> No
     assert objective["reward"].dtype == torch.float32
     assert objective["reward"].tolist() == [1.0, 0.75, 0.0]
     assert objective["action"].dtype == torch.int64
+
+
+def test_to_device_moves_every_tensor() -> None:
+    data = {
+        "reward": torch.zeros(2, dtype=torch.float32),
+        "action": torch.zeros(2, dtype=torch.int64),
+    }
+    moved = to_device(data=data, device="cpu")
+    assert set(moved) == {"reward", "action"}
+    assert all(value.device.type == "cpu" for value in moved.values())
 
 
 def test_objective_column_stays_int_when_all_steps_are_int() -> None:

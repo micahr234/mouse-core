@@ -18,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pass ``architecture="qwen3"`` or ``architecture="llama"``.
 
 ### Changed
+- ``objective_data`` and ``predictions`` are ``dict[str, Tensor]``. Move a
+  dict with ``to_device(data=, device=)``. ``Model.head`` no longer takes
+  ``batch_size``.
 - Aligned with mouse-gym 1.1.0: ``EnvConfig.episodes_per_task`` is
   ``max_task_episodes`` (task-length timeout, ``task_done=2``).
   ``task_done=1`` is ``terminate_task`` (no longer reserved).
@@ -78,6 +81,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   embeddings interpolate with the backbone.
 
 ### Removed
+- Dependency on ``tensordict``.
 - ``Recurrence`` and ``Model(recurrence=)``. ``Model.forward`` runs the
   backbone once. ``ModelOutput.passes`` and ``PassOutput`` are gone;
   ``DecodeCache`` holds one ``FlexDecodeSession``.

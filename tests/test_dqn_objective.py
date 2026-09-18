@@ -1,7 +1,6 @@
 """Tests for DQN objective on synthetic tensors."""
 from __future__ import annotations
 import torch
-from tensordict import TensorDict
 from mouse_core.objectives import DqnObjective
 from tests._bound_head import BoundHead
 import pytest
@@ -39,17 +38,17 @@ def test_dqn_requires_grouping_field_argument() -> None:
         )
 
 
-def _q(online: torch.Tensor, delayed: torch.Tensor) -> tuple[TensorDict, TensorDict]:
+def _q(online: torch.Tensor, delayed: torch.Tensor) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     n = online.shape[0]
     return (
-        TensorDict({"action_value": online}, batch_size=[n]),
-        TensorDict({"action_value": delayed}, batch_size=[n]),
+        {"action_value": online},
+        {"action_value": delayed},
     )
 
 
 def test_dqn_objective_runs() -> None:
     n, a = (8, 3)
-    step_stream = TensorDict({'action': torch.randint(0, a, (n,)), 'reward': torch.randn(n), 'episode_done': torch.zeros(n, dtype=torch.long), 'task_done': torch.zeros(n, dtype=torch.long), 'sequence_id': torch.tensor([0, 0, 0, 0, 1, 1, 1, 1])}, batch_size=[n])
+    step_stream = {'action': torch.randint(0, a, (n,)), 'reward': torch.randn(n), 'episode_done': torch.zeros(n, dtype=torch.long), 'task_done': torch.zeros(n, dtype=torch.long), 'sequence_id': torch.tensor([0, 0, 0, 0, 1, 1, 1, 1])}
     predictions, delayed = _q(torch.randn(n, a), torch.randn(n, a))
     objective = DqnObjective(head=_Q, gamma_step=0.99, gamma_episode_terminal=0.0, gamma_episode_truncated=0.0, gamma_task_terminal=0.0, gamma_task_truncated=0.0, grouping_field=None, temperature=0.0)
     loss, metrics = objective(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
@@ -61,35 +60,32 @@ def test_dqn_objective_runs() -> None:
 
 def test_dqn_objective_rejects_wrong_action_shape() -> None:
     n, a = (4, 3)
-    step_stream = TensorDict({'action': torch.randint(0, a, (n, 1)), 'reward': torch.randn(n), 'episode_done': torch.zeros(n, dtype=torch.long), 'task_done': torch.zeros(n, dtype=torch.long)}, batch_size=[n])
+    step_stream = {'action': torch.randint(0, a, (n, 1)), 'reward': torch.randn(n), 'episode_done': torch.zeros(n, dtype=torch.long), 'task_done': torch.zeros(n, dtype=torch.long)}
     predictions, delayed = _q(torch.randn(n, a), torch.randn(n, a))
     with pytest.raises(ValueError, match="action shape"):
         DqnObjective(head=_Q, gamma_step=0.99, gamma_episode_terminal=0.0, gamma_episode_truncated=0.0, gamma_task_terminal=0.0, gamma_task_truncated=0.0, grouping_field=None, temperature=0.0)(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
 
 def test_dqn_objective_requires_min_sequence() -> None:
-    step_stream = TensorDict({'action': torch.zeros(1, dtype=torch.long), 'reward': torch.zeros(1), 'episode_done': torch.zeros(1, dtype=torch.long), 'task_done': torch.zeros(1, dtype=torch.long)}, batch_size=[1])
+    step_stream = {'action': torch.zeros(1, dtype=torch.long), 'reward': torch.zeros(1), 'episode_done': torch.zeros(1, dtype=torch.long), 'task_done': torch.zeros(1, dtype=torch.long)}
     predictions, delayed = _q(torch.zeros(1, 2), torch.zeros(1, 2))
     with pytest.raises(ValueError, match="Not enough"):
         DqnObjective(head=_Q, gamma_step=1.0, gamma_episode_terminal=0.0, gamma_episode_truncated=0.0, gamma_task_terminal=0.0, gamma_task_truncated=0.0, grouping_field=None, temperature=0.0)(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
 
 def test_dqn_objective_trains_on_terminal_transitions() -> None:
     """Transitions *from* terminal states must contribute to the loss."""
-    step_stream = TensorDict({'action': torch.tensor([0, 1, 0]), 'reward': torch.tensor([0.0, 1.0, 5.0]), 'episode_done': torch.tensor([0, 1, 0]), 'task_done': torch.tensor([0, 0, 0])}, batch_size=[3])
+    step_stream = {'action': torch.tensor([0, 1, 0]), 'reward': torch.tensor([0.0, 1.0, 5.0]), 'episode_done': torch.tensor([0, 1, 0]), 'task_done': torch.tensor([0, 0, 0])}
     predictions, delayed = _q(torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]]), torch.zeros(3, 2))
     loss, _ = DqnObjective(head=_Q, gamma_step=0.0, gamma_episode_terminal=0.0, gamma_episode_truncated=0.0, gamma_task_terminal=0.0, gamma_task_truncated=0.0, grouping_field=None, temperature=0.0)(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
     assert abs(loss.item() - 2.5) < 1e-05
 
 
 def test_dqn_objective_reward_affine_is_identity_by_default() -> None:
-    step_stream = TensorDict(
-        {
+    step_stream = {
             "action": torch.tensor([0, 1, 0]),
             "reward": torch.tensor([0.0, 1.0, 5.0]),
             "episode_done": torch.tensor([0, 1, 0]),
             "task_done": torch.tensor([0, 0, 0]),
-        },
-        batch_size=[3],
-    )
+        }
     predictions, delayed = _q(torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]]), torch.zeros(3, 2))
     plain, _ = DqnObjective(head=_Q, gamma_step=0.0, gamma_episode_terminal=0.0, gamma_episode_truncated=0.0, gamma_task_terminal=0.0, gamma_task_truncated=0.0, grouping_field=None, temperature=0.0)(
         objective_data=step_stream, predictions=predictions, delayed_predictions=delayed
@@ -104,15 +100,12 @@ def test_dqn_objective_reward_affine_is_identity_by_default() -> None:
 
 def test_dqn_objective_reward_scale_and_shift() -> None:
     """gamma=0 so targets are the affine rewards stored at i+1."""
-    step_stream = TensorDict(
-        {
+    step_stream = {
             "action": torch.tensor([0, 1, 0]),
             "reward": torch.tensor([0.0, 1.0, 5.0]),
             "episode_done": torch.tensor([0, 1, 0]),
             "task_done": torch.tensor([0, 0, 0]),
-        },
-        batch_size=[3],
-    )
+        }
     predictions, delayed = _q(torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]]), torch.zeros(3, 2))
     # Unscaled targets 1 and 5 → MSE 2.5. Scale 2: targets 2 and 10 → (2-2)^2, (3-10)^2.
     scaled, _ = DqnObjective(head=_Q, gamma_step=0.0, gamma_episode_terminal=0.0, reward_scale=2.0,
@@ -133,15 +126,12 @@ def test_dqn_objective_reward_scale_and_shift() -> None:
 
 
 def test_dqn_objective_q_affine_is_identity_by_default() -> None:
-    step_stream = TensorDict(
-        {
+    step_stream = {
             "action": torch.tensor([0, 1, 0]),
             "reward": torch.tensor([0.0, 1.0, 5.0]),
             "episode_done": torch.tensor([0, 1, 0]),
             "task_done": torch.tensor([0, 0, 0]),
-        },
-        batch_size=[3],
-    )
+        }
     predictions, delayed = _q(torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]]), torch.zeros(3, 2))
     plain, _ = DqnObjective(head=_Q, gamma_step=0.0, gamma_episode_terminal=0.0, gamma_episode_truncated=0.0, gamma_task_terminal=0.0, gamma_task_truncated=0.0, grouping_field=None, temperature=0.0)(
         objective_data=step_stream, predictions=predictions, delayed_predictions=delayed
@@ -156,15 +146,12 @@ def test_dqn_objective_q_affine_is_identity_by_default() -> None:
 
 def test_dqn_objective_q_scale_and_shift() -> None:
     """gamma=0 so bootstrap is unused; affine applies to online Q only."""
-    step_stream = TensorDict(
-        {
+    step_stream = {
             "action": torch.tensor([0, 1, 0]),
             "reward": torch.tensor([0.0, 1.0, 5.0]),
             "episode_done": torch.tensor([0, 1, 0]),
             "task_done": torch.tensor([0, 0, 0]),
-        },
-        batch_size=[3],
-    )
+        }
     online = torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]])
     predictions, delayed = _q(online, torch.zeros(3, 2))
     # Taken Q 2 and 3, targets 1 and 5. Scale 2: 4 and 6 → (4-1)^2, (6-5)^2.
@@ -184,8 +171,8 @@ def test_dqn_objective_q_scale_and_shift() -> None:
     assert torch.equal(predictions["action_value"], online)
 
 
-def _sequence_fixture(sequence_id: list[int]) -> tuple[TensorDict, TensorDict, TensorDict]:
-    step_stream = TensorDict({'action': torch.tensor([0, 1, 0]), 'reward': torch.tensor([0.0, 1.0, 5.0]), 'episode_done': torch.tensor([0, 0, 0]), 'task_done': torch.tensor([0, 0, 0]), 'sequence_id': torch.tensor(sequence_id)}, batch_size=[3])
+def _sequence_fixture(sequence_id: list[int]) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    step_stream = {'action': torch.tensor([0, 1, 0]), 'reward': torch.tensor([0.0, 1.0, 5.0]), 'episode_done': torch.tensor([0, 0, 0]), 'task_done': torch.tensor([0, 0, 0]), 'sequence_id': torch.tensor(sequence_id)}
     predictions, delayed = _q(torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]]), torch.zeros(3, 2))
     return (step_stream, predictions, delayed)
 
@@ -209,17 +196,14 @@ def test_dqn_objective_all_out_of_run_pairs_yield_zero_loss() -> None:
 
 def test_dqn_objective_skips_transitions_across_tasks() -> None:
     """A pair whose steps belong to different tasks is not a transition."""
-    step_stream = TensorDict(
-        {
+    step_stream = {
             'action': torch.tensor([0, 1, 0]),
             'reward': torch.tensor([0.0, 1.0, 5.0]),
             'episode_done': torch.tensor([0, 1, 0]),
             'task_done': torch.tensor([0, 2, 0]),
             'sequence_id': torch.tensor([0, 0, 0]),
             'grouping_id': torch.tensor([0, 0, 1]),
-        },
-        batch_size=[3],
-    )
+        }
     predictions, delayed = _q(torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]]), torch.zeros(3, 2))
     # Only pair (0,1) is valid (same task); pair (1,2) crosses grouping_id.
     loss, metrics = DqnObjective(head=_Q, gamma_step=0.0, grouping_field="grouping_id", temperature=0.0, gamma_episode_terminal=0.0, gamma_episode_truncated=0.0, gamma_task_terminal=0.0, gamma_task_truncated=0.0)(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
@@ -229,38 +213,29 @@ def test_dqn_objective_skips_transitions_across_tasks() -> None:
 
 def test_pair_weight_zeros_window_cut_and_task_change() -> None:
     """Last output of a window or grouping run has weight 0; in-run reset stays 1."""
-    window = TensorDict(
-        {
+    window = {
             'sequence_id': torch.tensor([0, 0, 1, 1]),
             'task_index': torch.tensor([0, 0, 0, 0]),
-        },
-        batch_size=[4],
-    )
+        }
     assert torch.equal(
         _pair_weight(window, 4, 'cpu', grouping_field='task_index'),
         torch.tensor([1.0, 0.0, 1.0]),
     )
 
-    task_change = TensorDict(
-        {
+    task_change = {
             'sequence_id': torch.tensor([0, 0, 0]),
             'task_index': torch.tensor([0, 0, 1]),
-        },
-        batch_size=[3],
-    )
+        }
     assert torch.equal(
         _pair_weight(task_change, 3, 'cpu', grouping_field='task_index'),
         torch.tensor([1.0, 0.0]),
     )
 
-    reset = TensorDict(
-        {
+    reset = {
             'sequence_id': torch.tensor([0, 0, 0]),
             'task_index': torch.tensor([0, 0, 0]),
             'episode_done': torch.tensor([0, 1, 0]),
-        },
-        batch_size=[3],
-    )
+        }
     assert torch.equal(
         _pair_weight(reset, 3, 'cpu', grouping_field='task_index'),
         torch.tensor([1.0, 1.0]),
@@ -268,21 +243,18 @@ def test_pair_weight_zeros_window_cut_and_task_change() -> None:
 
 
 def test_pair_weight_missing_grouping_field_raises() -> None:
-    data = TensorDict({'sequence_id': torch.tensor([0, 0])}, batch_size=[2])
+    data = {'sequence_id': torch.tensor([0, 0])}
     with pytest.raises(KeyError, match="grouping_field"):
         _pair_weight(data, 2, 'cpu', grouping_field='task_index')
 
 
 def test_dqn_objective_rejects_out_of_range_action() -> None:
-    step_stream = TensorDict(
-        {
+    step_stream = {
             'action': torch.tensor([0, 9]),
             'reward': torch.tensor([0.0, 1.0]),
             'episode_done': torch.zeros(2, dtype=torch.long),
             'task_done': torch.zeros(2, dtype=torch.long),
-        },
-        batch_size=[2],
-    )
+        }
     predictions, delayed = _q(torch.zeros(2, 3), torch.zeros(2, 3))
     with pytest.raises(ValueError, match="action ids must be in"):
         DqnObjective(head=_Q, gamma_step=1.0, gamma_episode_terminal=0.0, gamma_episode_truncated=0.0, gamma_task_terminal=0.0, gamma_task_truncated=0.0, grouping_field=None, temperature=0.0)(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
@@ -294,17 +266,14 @@ def test_weighted_mean_all_zero_is_zero() -> None:
 
 def test_dqn_same_run_episode_reset_trains_both_pairs() -> None:
     """live→terminal→reset with the same sequence_id and task_index still trains."""
-    step_stream = TensorDict(
-        {
+    step_stream = {
             'action': torch.tensor([0, 1, 0]),
             'reward': torch.tensor([0.0, 1.0, 5.0]),
             'episode_done': torch.tensor([0, 1, 0]),
             'task_done': torch.tensor([0, 0, 0]),
             'sequence_id': torch.tensor([0, 0, 0]),
             'task_index': torch.tensor([0, 0, 0]),
-        },
-        batch_size=[3],
-    )
+        }
     predictions, delayed = _q(torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]]), torch.zeros(3, 2))
     loss, _ = DqnObjective(head=_Q, gamma_step=0.0, gamma_episode_terminal=0.0, grouping_field='task_index', temperature=0.0,
         gamma_episode_truncated=0.0,
@@ -315,15 +284,12 @@ def test_dqn_same_run_episode_reset_trains_both_pairs() -> None:
 
 def test_dqn_objective_multiplies_episode_and_task_gammas() -> None:
     """Last episode of a task applies episode gamma, then task gamma."""
-    step_stream = TensorDict(
-        {
+    step_stream = {
             'action': torch.tensor([0, 1]),
             'reward': torch.tensor([0.0, 1.0]),
             'episode_done': torch.tensor([0, 1]),
             'task_done': torch.tensor([0, 2]),
-        },
-        batch_size=[2],
-    )
+        }
     predictions, delayed = _q(
         torch.tensor([[0.0, 2.0], [4.0, 0.0]]),
         torch.tensor([[0.0, 0.0], [10.0, 0.0]]),
@@ -343,15 +309,12 @@ def test_dqn_objective_multiplies_episode_and_task_gammas() -> None:
 def test_dqn_objective_does_not_backprop_through_delayed_q() -> None:
     """Bootstrap Q is a constant: delayed Q must not receive a gradient."""
     n, a = 4, 2
-    step_stream = TensorDict(
-        {
+    step_stream = {
             "action": torch.zeros(n, dtype=torch.long),
             "reward": torch.ones(n),
             "episode_done": torch.zeros(n, dtype=torch.long),
             "task_done": torch.zeros(n, dtype=torch.long),
-        },
-        batch_size=[n],
-    )
+        }
     online = torch.randn(n, a, requires_grad=True)
     delayed = torch.randn(n, a, requires_grad=True)
     predictions, delayed_td = _q(online, delayed)
@@ -361,15 +324,14 @@ def test_dqn_objective_does_not_backprop_through_delayed_q() -> None:
     assert delayed.grad is None
 
 
-def _lambda_fixture() -> tuple[TensorDict, TensorDict, TensorDict]:
+def _lambda_fixture() -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     """Three in-run steps so λ can mix a two-step backup from s0.
 
     Action from s0 is 0; from s1 is 1. Delayed max-Q is 3 at s1 and 100 at s2.
     Rewards out of s0 / s1 are 1 and 10. One-step target at s0 is 4; the
     λ=1 (full n-step) target at s0 is 111.
     """
-    step_stream = TensorDict(
-        {
+    step_stream = {
             "action": torch.tensor([0, 0, 1]),
             "reward": torch.tensor([0.0, 1.0, 10.0]),
             "episode_done": torch.zeros(3, dtype=torch.int64),
@@ -378,9 +340,7 @@ def _lambda_fixture() -> tuple[TensorDict, TensorDict, TensorDict]:
             "info_q_star": torch.tensor(
                 [[10.0, 0.0], [0.0, 10.0], [0.0, 10.0]]
             ),
-        },
-        batch_size=[3],
-    )
+        }
     # Online Q(s0, a=0) = 5; Q(s1, a=1) = 0.
     online = torch.tensor([[5.0, 0.0], [0.0, 0.0], [0.0, 0.0]])
     delayed = torch.tensor([[0.0, 0.0], [3.0, 0.0], [0.0, 100.0]])
@@ -433,7 +393,7 @@ def test_td_lambda_rejects_out_of_range() -> None:
 def test_td_lambda_terminal_gamma_zero_ends_the_trace() -> None:
     """s0 → s1 terminates the episode (code stored at s1): G_0 = r only."""
     step_stream, predictions, delayed = _lambda_fixture()
-    step_stream = step_stream.clone()
+    step_stream = {key: value.clone() for key, value in step_stream.items()}
     step_stream["episode_done"] = torch.tensor([0, 1, 0])
     loss, _ = DqnObjective(head=_Q, gamma_step=1.0, gamma_episode_terminal=0.0, td_lambda=1.0,
         gamma_episode_truncated=0.0,
@@ -447,7 +407,7 @@ def test_td_lambda_terminal_gamma_zero_ends_the_trace() -> None:
 def test_td_lambda_truncation_gamma_carries_the_trace_discounted() -> None:
     """A non-zero truncation gamma bootstraps through the reset, so the trace does too."""
     step_stream, predictions, delayed = _lambda_fixture()
-    step_stream = step_stream.clone()
+    step_stream = {key: value.clone() for key, value in step_stream.items()}
     step_stream["episode_done"] = torch.tensor([0, 2, 0])
     loss, _ = DqnObjective(head=_Q, gamma_step=1.0, gamma_episode_truncated=0.5, td_lambda=1.0,
         gamma_episode_terminal=0.0,
@@ -460,7 +420,7 @@ def test_td_lambda_truncation_gamma_carries_the_trace_discounted() -> None:
 
 def test_td_lambda_task_gamma_scales_the_trace() -> None:
     step_stream, predictions, delayed = _lambda_fixture()
-    step_stream = step_stream.clone()
+    step_stream = {key: value.clone() for key, value in step_stream.items()}
     step_stream["task_done"] = torch.tensor([0, 2, 0])
     full, _ = DqnObjective(head=_Q, gamma_step=1.0, gamma_task_truncated=1.0, td_lambda=1.0,
         gamma_episode_terminal=0.0,
@@ -479,7 +439,7 @@ def test_td_lambda_task_gamma_scales_the_trace() -> None:
 def test_watkins_cuts_when_taken_action_is_not_online_greedy() -> None:
     """Online Q at s1 prefers 0; taken action is 1 → cut. Oracle would continue."""
     step_stream, predictions, delayed = _lambda_fixture()
-    predictions = predictions.clone()
+    predictions = {key: value.clone() for key, value in predictions.items()}
     q = predictions["action_value"].clone()
     q[1] = torch.tensor([10.0, 0.0])
     predictions["action_value"] = q
@@ -496,7 +456,7 @@ def test_watkins_cuts_when_taken_action_is_not_online_greedy() -> None:
 
 def test_watkins_continues_when_taken_action_matches_online_q() -> None:
     step_stream, predictions, delayed = _lambda_fixture()
-    predictions = predictions.clone()
+    predictions = {key: value.clone() for key, value in predictions.items()}
     q = predictions["action_value"].clone()
     q[1] = torch.tensor([-1.0, 0.0])  # greedy at s1 is the taken action; Q(s1,a=1) stays 0
     predictions["action_value"] = q
@@ -509,7 +469,7 @@ def test_watkins_continues_when_taken_action_matches_online_q() -> None:
 
 def test_lambda_returns_do_not_cross_sequence_boundary() -> None:
     step_stream, predictions, delayed = _lambda_fixture()
-    step_stream = step_stream.clone()
+    step_stream = {key: value.clone() for key, value in step_stream.items()}
     step_stream["sequence_id"] = torch.tensor([0, 0, 1])
     loss, _ = DqnObjective(head=_Q, gamma_step=1.0, td_lambda=1.0, gamma_episode_terminal=0.0, gamma_episode_truncated=0.0, gamma_task_terminal=0.0, gamma_task_truncated=0.0, grouping_field=None, temperature=0.0)(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
     one_step, _ = DqnObjective(head=_Q, gamma_step=1.0, gamma_episode_terminal=0.0, gamma_episode_truncated=0.0, gamma_task_terminal=0.0, gamma_task_truncated=0.0, grouping_field=None, temperature=0.0)(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
@@ -519,7 +479,7 @@ def test_lambda_returns_do_not_cross_sequence_boundary() -> None:
 def test_td_lambda_with_multiple_head_output_rows_per_step() -> None:
     """Every row of a step trains toward that step's λ-return; bootstrap reads the last row."""
     step_stream, predictions, delayed = _lambda_fixture()
-    step_stream = step_stream.clone()
+    step_stream = {key: value.clone() for key, value in step_stream.items()}
     step_stream["head_output_count"] = torch.tensor([2, 1, 2])
     online = torch.tensor([[5.0, 0.0], [7.0, 0.0], [0.0, 0.0], [0.0, -9.0], [0.0, 0.0]])
     delayed_q = torch.tensor([[0.0, 0.0], [0.0, 0.0], [3.0, 0.0], [-9.0, -9.0], [0.0, 100.0]])
@@ -545,7 +505,7 @@ def test_affine_scan_matches_sequential_recursion() -> None:
 
 def test_dqn_objective_rejects_non_fp32_q() -> None:
     step_stream, predictions, delayed = _lambda_fixture()
-    predictions = predictions.clone()
+    predictions = {key: value.clone() for key, value in predictions.items()}
     predictions["action_value"] = predictions["action_value"].to(torch.bfloat16)
     with pytest.raises(TypeError, match="float32"):
         DqnObjective(head=_Q, gamma_step=1.0, gamma_episode_terminal=0.0, gamma_episode_truncated=0.0, gamma_task_terminal=0.0, gamma_task_truncated=0.0, grouping_field=None, temperature=0.0)(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
@@ -576,15 +536,12 @@ def test_temperature_zero_matches_hard_max() -> None:
 
 def test_temperature_soft_value_is_logsumexp() -> None:
     """Two equal delayed Qs: V = α log 2 instead of max = 0."""
-    step_stream = TensorDict(
-        {
+    step_stream = {
             "action": torch.tensor([0, 0]),
             "reward": torch.tensor([0.0, 0.0]),
             "episode_done": torch.zeros(2, dtype=torch.int64),
             "task_done": torch.zeros(2, dtype=torch.int64),
-        },
-        batch_size=[2],
-    )
+        }
     online = torch.tensor([[0.0, 0.0], [0.0, 0.0]])
     delayed = torch.tensor([[0.0, 0.0], [0.0, 0.0]])
     predictions, delayed_td = _q(online, delayed)
@@ -616,15 +573,12 @@ def test_temperature_rejects_negative() -> None:
 
 def test_temperature_does_not_change_gamma_zero_target() -> None:
     """γ=0 so V is unused; soft and hard losses match."""
-    step_stream = TensorDict(
-        {
+    step_stream = {
             "action": torch.tensor([0, 1, 0]),
             "reward": torch.tensor([0.0, 1.0, 5.0]),
             "episode_done": torch.tensor([0, 1, 0]),
             "task_done": torch.tensor([0, 0, 0]),
-        },
-        batch_size=[3],
-    )
+        }
     predictions, delayed = _q(
         torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]]), torch.zeros(3, 2)
     )

@@ -21,7 +21,6 @@ dependencies = [
     "numpy>=2.5.3",
     "transformers>=5.17.0",
     "tokenizers>=0.23.2",
-    "tensordict>=0.14.2",
     "datasets>=5.0.1",
     "huggingface_hub>=1.32.0",
 ]

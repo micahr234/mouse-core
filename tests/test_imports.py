@@ -10,6 +10,7 @@ from mouse_core.data import (
     compose,
     pack_token_batch,
     empty_token_batch,
+    to_device,
 )
 from mouse_core.models import Model, IdentityBackbone
 
@@ -26,5 +27,6 @@ def test_public_data_exports() -> None:
     assert compose is not None
     assert pack_token_batch is not None
     assert empty_token_batch is not None
+    assert to_device is not None
     assert Model is not None
     assert IdentityBackbone is not None

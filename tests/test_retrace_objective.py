@@ -5,7 +5,6 @@ import math
 
 import pytest
 import torch
-from tensordict import TensorDict
 
 from mouse_core.objectives import DqnObjective, RetraceObjective
 from tests._bound_head import BoundHead
@@ -31,11 +30,11 @@ _MU = BoundHead("behavior")
 
 def _preds(
     online: torch.Tensor, delayed: torch.Tensor, behavior: torch.Tensor
-) -> tuple[TensorDict, TensorDict]:
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     n = online.shape[0]
     return (
-        TensorDict({"action_value": online, "behavior": behavior}, batch_size=[n]),
-        TensorDict({"action_value": delayed}, batch_size=[n]),
+        {"action_value": online, "behavior": behavior},
+        {"action_value": delayed},
     )
 
 
@@ -47,7 +46,7 @@ def _retrace(**overrides: object) -> RetraceObjective:
     return RetraceObjective(**kwargs)  # type: ignore[arg-type]
 
 
-def _fixture(mu_1: float) -> tuple[TensorDict, TensorDict, TensorDict]:
+def _fixture(mu_1: float) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     """Three in-run steps; ``mu_1`` is the behavior head's ``μ(a_1 = 1 | s_1)``.
 
     Action from s0 is 0; from s1 is 1. Delayed Q is ``[0, 0]`` at s0,
@@ -63,16 +62,13 @@ def _fixture(mu_1: float) -> tuple[TensorDict, TensorDict, TensorDict]:
     ``c = λ min(1, 0.25 / mu_1)`` and
     ``G_0 = 1 + V_π(s1) + c * (G_1 - Q(s1, 1) = 0)``.
     """
-    step_stream = TensorDict(
-        {
+    step_stream = {
             "action": torch.tensor([0, 0, 1]),
             "reward": torch.tensor([0.0, 1.0, 10.0]),
             "episode_done": torch.zeros(3, dtype=torch.int64),
             "task_done": torch.zeros(3, dtype=torch.int64),
             "sequence_id": torch.zeros(3, dtype=torch.int64),
-        },
-        batch_size=[3],
-    )
+        }
     online = torch.tensor([[5.0, 0.0], [0.0, 0.0], [0.0, 0.0]])
     delayed = torch.tensor([[0.0, 0.0], [3.0, 0.0], [0.0, 100.0]])
     behavior = torch.tensor([[0.0, 0.0], [math.log(1.0 - mu_1), math.log(mu_1)], [0.0, 0.0]])
@@ -122,16 +118,13 @@ def test_retrace_rejects_out_of_range_hyperparameters() -> None:
 
 def test_retrace_objective_runs() -> None:
     n, a = 8, 3
-    step_stream = TensorDict(
-        {
+    step_stream = {
             "action": torch.randint(0, a, (n,)),
             "reward": torch.randn(n),
             "episode_done": torch.zeros(n, dtype=torch.long),
             "task_done": torch.zeros(n, dtype=torch.long),
             "sequence_id": torch.tensor([0, 0, 0, 0, 1, 1, 1, 1]),
-        },
-        batch_size=[n],
-    )
+        }
     predictions, delayed = _preds(torch.randn(n, a), torch.randn(n, a), torch.randn(n, a))
     loss, metrics = _retrace(temperature=1.0)(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
     assert loss.ndim == 0
@@ -206,7 +199,7 @@ def test_retrace_greedy_target_cuts_non_greedy_actions() -> None:
 def test_retrace_greedy_target_on_greedy_data_is_the_full_return() -> None:
     """temperature = 0 with a greedy a_1 is Watkins's Q(λ): G_0 = 1 + 10 + 100 = 111."""
     step_stream, predictions, delayed = _fixture(mu_1=0.25)
-    delayed = delayed.clone()
+    delayed = {key: value.clone() for key, value in delayed.items()}
     q = delayed["action_value"].clone()
     q[1] = torch.tensor([0.0, 3.0])  # greedy at s1 is the taken action
     delayed["action_value"] = q
@@ -255,7 +248,7 @@ def test_retrace_behavior_head_is_trained_and_gives_no_td_gradient() -> None:
 
 def test_retrace_does_not_cross_sequence_boundary() -> None:
     step_stream, predictions, delayed = _fixture(mu_1=0.25)
-    step_stream = step_stream.clone()
+    step_stream = {key: value.clone() for key, value in step_stream.items()}
     step_stream["sequence_id"] = torch.tensor([0, 0, 1])
     _, metrics = _retrace()(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
     # Only pair 0 is in-run and it cannot continue: G_0 = one-step V.
@@ -265,7 +258,7 @@ def test_retrace_does_not_cross_sequence_boundary() -> None:
 
 def test_retrace_terminal_gamma_zero_ends_the_trace() -> None:
     step_stream, predictions, delayed = _fixture(mu_1=0.25)
-    step_stream = step_stream.clone()
+    step_stream = {key: value.clone() for key, value in step_stream.items()}
     step_stream["episode_done"] = torch.tensor([0, 0, 1])
     _, metrics = _retrace()(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
     # γ_1 = 0 → G_1 = 10; G_0 = one-step + 10.
@@ -275,7 +268,7 @@ def test_retrace_terminal_gamma_zero_ends_the_trace() -> None:
 
 def test_retrace_truncation_gamma_carries_the_trace_discounted() -> None:
     step_stream, predictions, delayed = _fixture(mu_1=0.25)
-    step_stream = step_stream.clone()
+    step_stream = {key: value.clone() for key, value in step_stream.items()}
     step_stream["episode_done"] = torch.tensor([0, 0, 2])
     _, metrics = _retrace(gamma_episode_truncated=0.5)(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
     # γ_1 = 0.5 → G_1 = 10 + 0.5 V_π(s2); G_0 = one-step + G_1.
@@ -287,7 +280,7 @@ def test_retrace_truncation_gamma_carries_the_trace_discounted() -> None:
 def test_retrace_with_multiple_head_output_rows_per_step() -> None:
     """Every row of a step trains toward its target; per-step reads use the last row."""
     step_stream, _, _ = _fixture(mu_1=0.25)
-    step_stream = step_stream.clone()
+    step_stream = {key: value.clone() for key, value in step_stream.items()}
     step_stream["head_output_count"] = torch.tensor([2, 1, 2])
     online = torch.tensor([[5.0, 0.0], [7.0, 0.0], [0.0, 0.0], [0.0, -9.0], [0.0, 0.0]])
     delayed_q = torch.tensor([[0.0, 0.0], [0.0, 0.0], [3.0, 0.0], [-9.0, -9.0], [0.0, 100.0]])
@@ -319,21 +312,21 @@ def test_retrace_q_affine_applies_to_online_and_delayed() -> None:
 
 def test_retrace_requires_behavior_head() -> None:
     step_stream, predictions, delayed = _fixture(mu_1=0.25)
-    predictions = predictions.exclude("behavior")
+    predictions = {key: value for key, value in predictions.items() if key != "behavior"}
     with pytest.raises(KeyError, match="behavior"):
         _retrace()(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
 
 
 def test_retrace_reads_behavior_head_under_custom_key() -> None:
     step_stream, predictions, delayed = _fixture(mu_1=0.25)
-    predictions = predictions.rename_key_("behavior", "mu")
+    predictions = {("mu" if key == "behavior" else key): value for key, value in predictions.items()}
     _, metrics = _retrace(behavior_head=BoundHead("mu"))(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
     assert abs(metrics["retrace_ratio_mean"] - 1.0) < 1e-6
 
 
 def test_retrace_rejects_misaligned_behavior_head() -> None:
     step_stream, predictions, delayed = _fixture(mu_1=0.25)
-    predictions = predictions.clone()
+    predictions = {key: value.clone() for key, value in predictions.items()}
     predictions["behavior"] = torch.zeros(3, 3)
     with pytest.raises(ValueError, match="head shape"):
         _retrace()(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)

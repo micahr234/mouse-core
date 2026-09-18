@@ -12,7 +12,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from tensordict import TensorDict
 
 from mouse_core.models.backbone.base import Backbone, _reject_dtype_cast
 from mouse_core.models.backbone.flex_decode import DecodeKernel, FlexDecodeSession, packed_rope_positions
@@ -711,24 +710,10 @@ def _layer_hiddens(
 def _run_heads(
     heads: dict[str, BaseHead],
     h: torch.Tensor,
-    batch_size: tuple[int, ...] | None,
-) -> TensorDict:
+) -> dict[str, torch.Tensor]:
     """Run ``heads`` on pooled ``h``. Layerwise ``h`` is ``[N, L, D]`` or ``[B, L, S, D]``."""
-    if batch_size is None:
-        if any(isinstance(head, LayerwiseRegressionHead) for head in heads.values()):
-            if h.ndim == 3:
-                batch_size = (int(h.shape[0]),)
-            elif h.ndim == 4:
-                batch_size = (int(h.shape[0]), int(h.shape[2]))
-            else:
-                batch_size = tuple(h.shape[:-1])
-        else:
-            batch_size = tuple(h.shape[:-1])
     h = h.float()
-    tensors: dict[str, torch.Tensor] = {}
-    for name, head_fn in heads.items():
-        tensors[name] = head_fn.forward(h)
-    return TensorDict(tensors, batch_size=batch_size)
+    return {name: head_fn.forward(h) for name, head_fn in heads.items()}
 
 
 @dataclass
@@ -772,7 +757,7 @@ class ModelOutput:
     ``cache=`` with ``use_cache=True``.
     """
 
-    predictions: TensorDict
+    predictions: dict[str, torch.Tensor]
     last_hidden_state: torch.Tensor
     head_output_indices: torch.Tensor
     hidden_states: tuple[torch.Tensor, ...] | None = None
@@ -1403,7 +1388,6 @@ class Model(nn.Module):
                 grouping_ids=flex_grouping_ids,
             )
             new_cache = DecodeCache(session=session)
-            pred_batch_size: tuple[int, ...] = (B, S_max)
             counts = torch.as_tensor(
                 step_counts_np.tolist(), device=embeds.device, dtype=torch.long
             )
@@ -1436,13 +1420,11 @@ class Model(nn.Module):
                 needs_layerwise,
             )
             new_cache = None
-            pred_batch_size = (token_batch.P,)
             head_output_valid = None
 
         return ModelOutput(
             predictions=self.head(
                 h=self._pool_backbone_out(session_out, resolved_indices, needs_layerwise),
-                batch_size=pred_batch_size,
             ),
             last_hidden_state=_last_hidden(session_out),
             head_output_indices=resolved_indices,
@@ -1455,20 +1437,18 @@ class Model(nn.Module):
         self,
         *,
         h: torch.Tensor,
-        batch_size: tuple[int, ...] | None = None,
-    ) -> TensorDict:
+    ) -> dict[str, torch.Tensor]:
         """Run enabled heads on pooled ``h``.
 
         Regular heads take last-layer ``[N, D]`` or ``[B, S, D]``. A layerwise
         Q head takes stacked layers ``[N, L, D]`` or ``[B, L, S, D]``.
-        ``batch_size`` defaults from ``h`` (step axis only for layerwise).
         """
-        return _run_heads(self._heads, h, batch_size)
+        return _run_heads(self._heads, h)
 
     def get_action(
         self,
         *,
-        out: TensorDict | ModelOutput,
+        out: dict[str, torch.Tensor] | ModelOutput,
         temperature: float,
         num_actions: int | None = None,
     ) -> torch.Tensor:
@@ -1479,7 +1459,7 @@ class Model(nn.Module):
         :class:`ModelOutput` from ``forward(..., use_cache=True)`` so this
         reads the last-layer residual stream at the last *valid* (non-pad)
         head-output of each row — not a padded step column and not a token
-        after the head-output field. A scores ``TensorDict`` is treated as
+        after the head-output field. A scores dict is treated as
         already aligned: the last step axis is used.
 
         Flat training outputs ``[N, A]`` are rejected unless ``N == 1``.

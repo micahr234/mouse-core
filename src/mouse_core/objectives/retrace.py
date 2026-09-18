@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
-from tensordict import TensorDict
 
 from mouse_core.models.heads.base import BaseHead
 from mouse_core.objectives.base import Objective, predictions_for, require_head
@@ -31,7 +30,7 @@ from mouse_core.objectives.dqn import (
 
 
 def _require_aligned(
-    predictions: TensorDict, *, head: BaseHead, shape: torch.Size, who: str
+    predictions: dict[str, torch.Tensor], *, head: BaseHead, shape: torch.Size, who: str
 ) -> torch.Tensor:
     """Validate a float32 ``[P, A]`` head output that must align with Q."""
     values = predictions_for(head=head, predictions=predictions, who=who)
@@ -343,9 +342,9 @@ class RetraceObjective(Objective):
     def __call__(
         self,
         *,
-        objective_data: TensorDict,
-        predictions: TensorDict,
-        delayed_predictions: TensorDict | None = None,
+        objective_data: dict[str, torch.Tensor],
+        predictions: dict[str, torch.Tensor],
+        delayed_predictions: dict[str, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         if delayed_predictions is None:
             raise ValueError("RetraceObjective requires delayed_predictions.")

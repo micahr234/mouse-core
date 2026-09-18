@@ -15,6 +15,7 @@ from mouse_core.data.token_batch import (
     empty_token_batch,
     pack_token_batch,
     step_counts_from_sequence_id,
+    to_device,
 )
 
 __all__ = [
@@ -33,6 +34,7 @@ __all__ = [
     "pack_token_batch",
     "empty_token_batch",
     "step_counts_from_sequence_id",
+    "to_device",
     "load_stores_from_hub",
     "push_stores_to_hub",
     "push_to_hub",

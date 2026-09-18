@@ -14,7 +14,6 @@ from typing import Any, cast
 import pytest
 import torch
 import torch.nn as nn
-from tensordict import TensorDict
 from mouse_core.models import Model
 from mouse_core.models.backbone import TransformerBackbone
 from mouse_core.models.backbone import packed_train as packed_train_mod
@@ -497,7 +496,7 @@ def test_ragged_batched_chunks_match_unbatched(backbone_cls, tokens) -> None:
     rows = [_steps(totals[b], start=b * 10) for b in range(3)]
     with torch.no_grad():
         reference = [_fwd(model, [row])[0]['action_value'] for row in rows]
-        preds: TensorDict | None = None
+        preds: dict[str, torch.Tensor] | None = None
         cache = None
         consumed = [0] * len(rows)
         collected: list[list[torch.Tensor]] = [[] for _ in rows]

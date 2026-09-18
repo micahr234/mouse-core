@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import torch
-from tensordict import TensorDict
 
 from mouse_core.models.heads.base import BaseHead, prediction_key
 from mouse_core.objectives.base import Objective, predictions_for, require_head
@@ -256,9 +255,9 @@ class NStepDqnObjective(Objective):
     def __call__(
         self,
         *,
-        objective_data: TensorDict,
-        predictions: TensorDict,
-        delayed_predictions: TensorDict | None = None,
+        objective_data: dict[str, torch.Tensor],
+        predictions: dict[str, torch.Tensor],
+        delayed_predictions: dict[str, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         if delayed_predictions is None:
             raise ValueError("NStepDqnObjective requires delayed_predictions.")

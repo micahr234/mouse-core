@@ -5,7 +5,7 @@ A ``Datastore`` is a flat sequence of arbitrary rows. The loader samples
 (a max), runs ``transform(step)`` on every step, and packs the resulting
 :class:`~mouse_core.data.token_batch.StepTokens` into a
 :class:`~mouse_core.data.token_batch.TokenBatch` plus a CPU
-:class:`~tensordict.TensorDict` of step-level objective columns.
+``dict[str, Tensor]`` of step-level objective columns.
 
 The loader is stage-agnostic: compose augmenter / tokenizer
 (or any ``dict → StepTokens`` callable) outside and pass the result as
@@ -55,12 +55,12 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from tensordict import TensorDict
-
 from mouse_core.data.datastore import _normalize_value
 from mouse_core.data.token_batch import StepTokens, TokenBatch, pack_token_batch
 
 if TYPE_CHECKING:
+    import torch
+
     from mouse_core.data.datastore import Datastore
 
 
@@ -134,7 +134,7 @@ def _fetch_one_batch(
     entropy: int,
     k: int,
     transform: StepTransform,
-) -> tuple[TokenBatch, TensorDict]:
+) -> tuple[TokenBatch, dict[str, torch.Tensor]]:
     """Build batch ``k``: reseed the transform to generation ``k``, sample, pack."""
     reseed = getattr(transform, "reseed", None)
     if callable(reseed):
@@ -272,7 +272,7 @@ class DataLoader:
         # out-of-order worker arrivals in _reorder. Workers claim indices from
         # a counter created per _start_workers call, starting at _next_k.
         self._next_k = 0
-        self._reorder: dict[int, tuple[TokenBatch, TensorDict]] = {}
+        self._reorder: dict[int, tuple[TokenBatch, dict[str, torch.Tensor]]] = {}
 
         if isinstance(stores, _DS):
             stores = [stores]
@@ -347,12 +347,12 @@ class DataLoader:
         if self._num_workers > 0:
             self._start_workers()
 
-    def next_batch(self) -> tuple[TokenBatch, TensorDict]:
+    def next_batch(self) -> tuple[TokenBatch, dict[str, torch.Tensor]]:
         """Return ``(inputs, objective_data)`` for the next batch index.
 
         ``inputs`` is the packed :class:`TokenBatch`. ``objective_data``
-        is a CPU :class:`~tensordict.TensorDict` of tokenizer
-        ``objective_fields`` (plus ``sequence_id`` and the grouping column).
+        is a CPU ``dict[str, Tensor]`` of tokenizer ``objective_fields``
+        (plus ``sequence_id`` and the grouping column).
         """
         k = self._next_k
         if self._num_workers == 0:

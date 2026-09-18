@@ -19,7 +19,6 @@ from mouse_core.data import (
     Tokenizer,
     compose,
 )
-from tensordict import TensorDict
 
 from mouse_core.data.token_batch import StepTokens, TokenBatch
 from tests._token_batch_helpers import token_tokenizer
@@ -276,7 +275,7 @@ def test_dataloader_snapshots_loaded_source_and_appended_rows() -> None:
     assert set(actions) <= {1, 2, 3}
 
 
-def _tb_signature(packed: tuple[TokenBatch, TensorDict]) -> tuple:
+def _tb_signature(packed: tuple[TokenBatch, dict[str, torch.Tensor]]) -> tuple:
     tb, obj = packed
     return (
         tb.B,

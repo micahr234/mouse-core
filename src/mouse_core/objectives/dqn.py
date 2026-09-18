@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
-from tensordict import TensorDict
 
 from mouse_core.models.heads.base import BaseHead
 from mouse_core.objectives.base import Objective, predictions_for, require_head
 
 
 def _require_done_codes(
-    objective_data: TensorDict,
+    objective_data: dict[str, torch.Tensor],
     *,
     episode_done_key: str,
     task_done_key: str,
@@ -67,7 +66,7 @@ def _boundary_discounts(
 
 
 def _head_output_layout(
-    objective_data: TensorDict,
+    objective_data: dict[str, torch.Tensor],
     *,
     N: int,
     P: int,
@@ -112,7 +111,7 @@ def _head_output_layout(
 
 
 def _pair_weight(
-    objective_data: TensorDict,
+    objective_data: dict[str, torch.Tensor],
     N: int,
     device: torch.device | str | None,
     *,
@@ -163,7 +162,7 @@ def _require_action_ids(action: torch.Tensor, A: int) -> None:
 
 
 def _require_step_aligned_predictions(
-    objective_data: TensorDict,
+    objective_data: dict[str, torch.Tensor],
     *,
     n_pred: int,
     n_steps: int,
@@ -547,9 +546,9 @@ class DqnObjective(Objective):
     def __call__(
         self,
         *,
-        objective_data: TensorDict,
-        predictions: TensorDict,
-        delayed_predictions: TensorDict | None = None,
+        objective_data: dict[str, torch.Tensor],
+        predictions: dict[str, torch.Tensor],
+        delayed_predictions: dict[str, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         if delayed_predictions is None:
             raise ValueError("DqnObjective requires delayed_predictions.")
