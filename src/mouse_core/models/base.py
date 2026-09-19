@@ -806,7 +806,7 @@ class Model(nn.Module):
     ``forward`` returns a :class:`ModelOutput` with ``predictions`` and
     ``last_hidden_state``.
     The delayed DQN model
-    comes from :meth:`delayed_copy` (a copy of every trainable parameter;
+    comes from :meth:`copy` (a copy of every trainable parameter;
     frozen weights shared by reference), runs on the same ``TokenBatch``,
     and is interpolated per section with :class:`~mouse_core.polyak.Polyak`.
     """
@@ -985,55 +985,59 @@ class Model(nn.Module):
                 self.max_num_actions = out
                 break
 
-    def delayed_copy(self, *, heads: Sequence[BaseHead]) -> "Model":
-        """Build the delayed model for TD targets: a frozen copy of this model.
+    def copy(self, *, heads: Sequence[BaseHead]) -> "Model":
+        """Return a frozen copy of this model: backbone, reasoner, and ``heads``.
 
-        ``heads`` is the head instances the delayed model carries — only
-        those the objective reads from ``delayed_predictions`` (the Q
-        head for ``DqnObjective`` / ``RetraceObjective``, each n-step Q
-        head, the layerwise Q head). Heads left out (a policy or
-        behavior head whose delayed values nothing uses) are neither
-        copied, run, nor Polyak-interpolated. Every instance must be one
-        of this model's heads and the list must not be empty. The copy's
-        ``action_source`` is this model's when it is among ``heads``,
-        else the first head listed (the delayed model does not pick
+        The backbone is always copied (token embeddings included). A
+        reasoner, if this model has one, is copied too. ``heads``
+        selects which heads the copy carries — only those the
+        objective reads from ``delayed_predictions`` (the Q head for
+        ``DqnObjective`` / ``RetraceObjective``, each n-step Q head,
+        the layerwise Q head). Heads left out (a policy or behavior
+        head whose values nothing uses on the copy) are neither
+        copied, run, nor Polyak-interpolated. Every instance must be
+        one of this model's heads and the list must not be empty. The
+        copy's ``action_source`` is this model's when it is among
+        ``heads``, else the first head listed (the copy does not pick
         actions).
 
-        Every trainable parameter gets its own copy; every frozen parameter
-        (``requires_grad=False`` — the base weights of a LoRA backbone) is
-        shared by reference with the online model, so a delayed LoRA
-        backbone costs one extra copy of the adapters, not of the base. A
-        fully trainable fp32 backbone is copied whole. The copy has every
-        parameter frozen and is left in ``train()`` mode.
+        Every trainable parameter gets its own copy; every frozen
+        parameter (``requires_grad=False`` — the base weights of a LoRA
+        backbone) is shared by reference with this model, so a LoRA
+        backbone costs one extra copy of the adapters, not of the
+        base. A fully trainable fp32 backbone is copied whole. The
+        copy has every parameter frozen and is left in ``train()``
+        mode.
 
-        Run it as ``delayed(inputs)`` with the same ``TokenBatch`` (and
-        ``reasoning=``) as the online forward, under ``torch.no_grad()``.
-        Interpolate it with :class:`~mouse_core.polyak.Polyak`, which takes
-        one ``tau`` per section (heads, backbone) on every update
-        and pairs only the heads the delayed model has. Token embeddings
-        ride with the backbone ``embed_tokens``.
+        Typical TD use: run the copy as ``copied(inputs)`` with the
+        same ``TokenBatch`` (and ``reasoning=``) as the online
+        forward, under ``torch.no_grad()``.
+        :class:`~mouse_core.polyak.Polyak` interpolates the copy
+        toward this model — that averaging is what delays the
+        weights. Token embeddings ride with the backbone
+        ``embed_tokens``.
 
-        Construct after ``model.to(...)``. Do not call ``requires_grad_`` /
-        ``to`` on the delayed model: shared frozen parameters belong to the
-        online model too.
+        Construct after ``model.to(...)``. Do not call
+        ``requires_grad_`` / ``to`` on the copy: shared frozen
+        parameters belong to this model too.
         """
         if not any(p.requires_grad for p in self.parameters()):
             raise ValueError(
-                "delayed_copy needs a trainable online model (no parameter requires grad)."
+                "copy needs a trainable online model (no parameter requires grad)."
             )
         if isinstance(heads, (str, BaseHead)) or not isinstance(heads, Sequence):
             raise TypeError(
-                f"delayed_copy heads must be a sequence of head instances, got {type(heads).__name__}."
+                f"copy heads must be a sequence of head instances, got {type(heads).__name__}."
             )
         head_list = tuple(heads)
         if not head_list:
-            raise ValueError("delayed_copy heads must include at least one head.")
+            raise ValueError("copy heads must include at least one head.")
         names = tuple(
-            Model._head_name(self._heads, head, what="delayed_copy heads")
+            Model._head_name(self._heads, head, what="copy heads")
             for head in head_list
         )
         if len(set(names)) != len(names):
-            raise ValueError(f"delayed_copy heads has duplicate heads: {names}.")
+            raise ValueError(f"copy heads has duplicate heads: {names}.")
 
         def _copy(module: nn.Module) -> nn.Module:
             shared = {id(p): p for p in module.parameters() if not p.requires_grad}
@@ -1262,7 +1266,7 @@ class Model(nn.Module):
 
         Training: ``inputs, objective_data = loader.next_batch()`` then
         ``out = model(inputs)``. Delayed DQN: ``delayed_model =
-        model.delayed_copy(heads=(head,))`` then ``delayed_model(inputs)`` under
+        model.copy(heads=(head,))`` then ``delayed_model(inputs)`` under
         ``torch.no_grad()`` (same ``TokenBatch`` and ``reasoning=`` as the
         online forward); interpolate with ``Polyak(online=model, delayed=delayed_model)``
         and ``polyak.update(tau_heads=..., tau_backbone=...)``.

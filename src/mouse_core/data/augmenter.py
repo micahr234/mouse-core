@@ -17,11 +17,13 @@ id share draws within one :meth:`Augmenter.reseed` generation. Mask decisions
 Discrete permute specs remap ``input_field`` ids; optional
 ``input_vector_field`` / ``output_vector_field`` vectors share that
 permutation (inverse-permuted along the last axis).
-``DataLoader`` calls ``train_transform.reseed(generation=k)`` with the batch
-index before building batch ``k``, so every draw is a pure function of
-``(seed, k, seed_field value)`` no matter which worker thread builds the
-batch. The generation and its draw cache are per thread. Eval / decode uses
-a second compose that omits the augmenter so raw values reach the model.
+``DataLoader`` calls ``train_transform.reseed(generation=k * B + b)`` before
+each sampled sequence ``b`` of batch ``k``, so every draw is a pure function
+of ``(seed, sequence generation, seed_field value)`` no matter which worker
+thread builds the batch. Two windows that share a ``seed_field`` value still
+get independent starting seeds; steps inside one window that share the value
+share draws. The generation and its draw cache are per thread. Eval / decode
+uses a second compose that omits the augmenter so raw values reach the model.
 """
 
 from __future__ import annotations
@@ -280,10 +282,12 @@ class Augmenter:
 
     ``seed_field`` is required: permute/scale/shift draws are keyed by that
     field's value so steps that share an id (e.g. the same task) share draws
-    within one :meth:`reseed` generation. Call :meth:`reseed` to advance to a
-    new draw set for every key. Mask decisions (``mask_prob``) are drawn
-    independently per step (one draw per field spec per call), from a stream
-    seeded by the base seed and generation.
+    within one :meth:`reseed` generation. ``DataLoader`` gives each sampled
+    sequence its own generation, so the same index on two rollouts starts
+    from two seeds. Call :meth:`reseed` to advance to a new draw set for
+    every key. Mask decisions (``mask_prob``) are drawn independently per
+    step (one draw per field spec per call), from a stream seeded by the
+    base seed and generation.
     Discrete ``permute=True`` specs remap ``input_field`` ids; set
     ``input_vector_field`` / ``output_vector_field`` for id-indexed vectors
     that must stay aligned with those ids (they share the same sampled
@@ -340,9 +344,10 @@ class Augmenter:
         ``generation=None`` advances a shared counter and pins the new value
         on this thread (a thread on an older pin is not disturbed).
         ``generation=k`` pins ``k`` on this thread without touching the
-        counter — ``DataLoader`` passes the batch index so batch ``k`` gets
-        the same augmentation whichever worker builds it. Either way the
-        calling thread's draw cache is dropped.
+        counter — ``DataLoader`` passes a unique generation per sampled
+        sequence (``batch_index * batch_size + sequence_index``) so two
+        windows that share a ``seed_field`` value get different starting
+        seeds. Either way the calling thread's draw cache is dropped.
         """
         if generation is None:
             with self._lock:

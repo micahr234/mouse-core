@@ -9,17 +9,21 @@ A ``Datastore`` is a flat sequence of arbitrary rows. The loader samples
 
 The loader is stage-agnostic: compose augmenter / tokenizer
 (or any ``dict → StepTokens`` callable) outside and pass the result as
-``transform=``. At the start of each batch fetch, if ``transform`` defines
-``reseed()``, it is called as ``reseed(generation=k)`` with the batch index
-(so an :class:`~mouse_core.data.augmenter.Augmenter` in the compose pipeline
-draws the augmentation set that belongs to batch ``k``).
+``transform=``. Before each sampled sequence ``b`` of batch ``k``, if
+``transform`` defines ``reseed()``, it is called as
+``reseed(generation=k * batch_size + b)`` so an
+:class:`~mouse_core.data.augmenter.Augmenter` in the compose pipeline
+draws a starting seed unique to that window. Steps that share a
+``seed_field`` value inside one window still share permute/scale/shift
+draws; the same index on two windows does not.
 
 Determinism
 -----------
 Batches are numbered ``k = 0, 1, 2, ...`` in the order :meth:`DataLoader.next_batch`
 returns them. Batch ``k`` samples its windows from
-``SeedSequence(seed, spawn_key=(k,))`` and reseeds the transform with
-``generation=k``, so it is a pure function of ``(seed, k, store snapshot)``:
+``SeedSequence(seed, spawn_key=(k,))`` and reseeds the transform once per
+sequence with ``generation=k * batch_size + b``, so it is a pure function
+of ``(seed, k, store snapshot)``:
 ``num_workers`` changes only throughput, never the stream. Workers claim
 indices from a shared counter and the consumer hands batches out in index
 order (a small reorder buffer absorbs the interleaving). :meth:`DataLoader.refresh`
@@ -129,22 +133,33 @@ def _batch_rng(entropy: int, k: int) -> np.random.Generator:
     return np.random.default_rng(np.random.SeedSequence(entropy, spawn_key=(k,)))
 
 
+def _sequence_generation(*, batch_index: int, sequence_index: int, batch_size: int) -> int:
+    """Unique augmenter generation for sequence ``b`` of batch ``k``."""
+    return batch_index * batch_size + sequence_index
+
+
 def _fetch_one_batch(
     cfg: _SnapshotConfig,
     entropy: int,
     k: int,
     transform: StepTransform,
 ) -> tuple[TokenBatch, dict[str, torch.Tensor]]:
-    """Build batch ``k``: reseed the transform to generation ``k``, sample, pack."""
-    reseed = getattr(transform, "reseed", None)
-    if callable(reseed):
-        reseed(generation=k)
+    """Build batch ``k``: sample windows, reseed each sequence, pack."""
     rng = _batch_rng(entropy, k)
     sequences = [_fetch_sequence(cfg, rng) for _ in range(cfg.batch_size)]
+    reseed = getattr(transform, "reseed", None)
     steps: list[StepTokens] = []
     sequence_ids: list[int] = []
     grouping_field: str | None = None
     for b, seq in enumerate(sequences):
+        if callable(reseed):
+            reseed(
+                generation=_sequence_generation(
+                    batch_index=k,
+                    sequence_index=b,
+                    batch_size=cfg.batch_size,
+                )
+            )
         for step in seq:
             packed = transform(step)
             if grouping_field is None:

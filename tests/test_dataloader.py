@@ -19,7 +19,8 @@ from mouse_core.data import (
     Tokenizer,
     compose,
 )
-
+from mouse_core.data.augmenter import _stable_hash
+from mouse_core.data.dataloader import _sequence_generation
 from mouse_core.data.token_batch import StepTokens, TokenBatch
 from tests._token_batch_helpers import token_tokenizer
 
@@ -160,10 +161,70 @@ def test_dataloader_reseeds_transform_each_batch() -> None:
         transform=compose(stages=(_stamp_task, augmenter, _stamp_grouping, _tokenizer())),
     )
     loader.next_batch()
-    assert augmenter._generation_for_call() == 0  # batch k=0 pinned on this thread
+    assert augmenter._generation_for_call() == 0  # batch k=0, sequence 0
     loader.next_batch()
-    assert augmenter._generation_for_call() == 1
+    assert augmenter._generation_for_call() == 1  # batch k=1, sequence 0 (B=1)
     assert augmenter._generation == 0  # the shared counter is untouched
+
+
+def test_dataloader_same_seed_field_on_two_sequences_uses_two_seeds() -> None:
+    """Same index on two rollouts in one batch must start from different seeds."""
+    store = Datastore()
+    for _ in range(8):
+        store.append(
+            data={
+                "action": 0,
+                "reward": 0.0,
+                "episode_done": 0,
+                "task_done": 0,
+                "task_index": 7,
+            }
+        )
+
+    augmenter = Augmenter(
+        seed=0,
+        seed_field="task_index",
+        fields=[
+            {
+                "type": "discrete",
+                "input_field": "action",
+                "output_field": "action",
+                "vocab_size": 10,
+                "permute": True,
+            }
+        ],
+    )
+    loader = DataLoader(
+        stores=store,
+        sequence_length=3,
+        batch_size=2,
+        num_workers=0,
+        seed=0,
+        transform=compose(stages=(augmenter, _stamp_grouping, _tokenizer(objective_fields=_obj("action")))),
+    )
+    _, obj = loader.next_batch()
+    sequence_id = obj["sequence_id"]
+    actions = obj["action"]
+
+    def _expected(*, sequence_index: int) -> int:
+        generation = _sequence_generation(
+            batch_index=0,
+            sequence_index=sequence_index,
+            batch_size=2,
+        )
+        rng = np.random.default_rng(
+            np.random.SeedSequence([0, generation, _stable_hash("task_index", 7)])
+        )
+        return int(rng.permutation(10)[0])
+
+    seq0 = [int(actions[i]) for i in range(len(actions)) if int(sequence_id[i]) == 0]
+    seq1 = [int(actions[i]) for i in range(len(actions)) if int(sequence_id[i]) == 1]
+    assert seq0
+    assert seq1
+    assert all(a == _expected(sequence_index=0) for a in seq0)
+    assert all(a == _expected(sequence_index=1) for a in seq1)
+    assert _expected(sequence_index=0) != _expected(sequence_index=1)
+    assert augmenter._generation_for_call() == 1
 
 
 class _ThreadMarkerTransform:

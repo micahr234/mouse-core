@@ -33,7 +33,8 @@ def compose(*, stages: Sequence[Callable[[Any], Any]]) -> _Compose:
     The result is callable and exposes ``reseed(generation=None)``, which
     forwards to any stage that defines ``reseed`` (e.g.
     :class:`~mouse_core.data.augmenter.Augmenter`). ``DataLoader`` calls it
-    with the batch index.
+    once per sampled sequence with
+    ``generation=batch_index * batch_size + sequence_index``.
 
     Train includes the augmenter; eval leaves it out so the model sees raw
     values::

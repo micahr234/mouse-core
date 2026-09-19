@@ -174,7 +174,7 @@ class RetraceObjective(Objective):
     ``Q(s', a')``, and ``π`` itself — is read from
     the delayed tensor for ``head`` of the
     delayed :class:`~mouse_core.models.base.Model`
-    (``model.delayed_copy(heads=(head,))``) run on the same
+    (``model.copy(heads=(head,))``) run on the same
     ``TokenBatch``. The delayed tensor is detached, so the TD error does not
     backprop through it. The behavior head is not part of the delayed model:
     nothing reads its delayed values, so it is neither run there nor
@@ -221,7 +221,7 @@ class RetraceObjective(Objective):
             heads={"action_value": q_head, "behavior": behavior_head},
             action_source=q_head,
         )
-        delayed_model = model.delayed_copy(heads=(q_head,))
+        delayed_model = model.copy(heads=(q_head,))
 
     Discounts follow ``DqnObjective``: ``discount(**objective_data)``
     supplies the per-step γ. The objective

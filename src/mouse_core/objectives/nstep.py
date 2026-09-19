@@ -94,7 +94,7 @@ class NStepDqnObjective(Objective):
     the tensor for ``head``; bootstrap Q is the same key on
     ``delayed_predictions`` from the delayed
     :class:`~mouse_core.models.base.Model`
-    (``model.delayed_copy(heads=(head,))``) run on the same
+    (``model.copy(heads=(head,))``) run on the same
     ``TokenBatch``. The delayed tensor is detached before the Bellman
     target, so the TD error does not backprop through it.
 

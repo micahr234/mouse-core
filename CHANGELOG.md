@@ -41,6 +41,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pass ``architecture="qwen3"`` or ``architecture="llama"``.
 
 ### Changed
+- ``Model.copy`` replaces ``Model.delayed_copy``. The method copies
+  the model; Polyak averaging is what delays the weights.
+- ``DataLoader`` reseeds the transform once per sampled sequence, not
+  once per batch. Generation is ``k * batch_size + sequence_index``, so
+  two windows that share a ``seed_field`` value (the same task index on
+  two rollouts) get independent starting seeds. Steps inside one window
+  that share the key still share permute/scale/shift draws.
 - DQN-family and PPO objectives take ``discount`` — a callable
   ``discount(**objective_data) -> [N]`` — instead of five
   ``gamma_*`` scalars. Columns are unpacked as keyword arguments.
@@ -71,7 +78,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``gamma_task_truncated`` docs match. Live-env notebooks pass
   ``max_task_episodes=``.
 - Depend on ``huggingface_hub>=1.32.0``.
-- ``Model.delayed_copy(heads=...)``: ``heads`` is required and is the
+- ``Model.copy(heads=...)``: ``heads`` is required and is the
   head instances the delayed model carries — only those the objective
   reads from ``delayed_predictions`` (the Q head for ``DqnObjective`` /
   ``RetraceObjective``, each n-step Q head, the layerwise Q head). Heads
@@ -148,7 +155,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ``prediction_key``, ``predictions_key``, ``value_key``, and
   ``behavior_key`` on objectives. Pass the head instance
   (``head=``, plus ``value_head=`` / ``behavior_head=``).
-  ``delayed_copy(heads=)`` takes those instances, not name strings.
+  ``copy(heads=)`` takes those instances, not name strings.
 
 ### Fixed
 - Latent reasoner thoughts are cast to the backbone embed dtype so a
@@ -180,7 +187,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   head — call it once per head and add the losses to train several
   horizons. ``examples/13_train_offline_n_step_dqn.ipynb`` is the same
   offline loop as ``02`` with three ``RegressionHead``s
-  (``n=1, 3, 5``), ``delayed_copy`` of every Q head, and the three
+  (``n=1, 3, 5``), ``copy`` of every Q head, and the three
   n-step losses summed.
 - ``RetraceObjective``: Retrace(λ) off-policy return-based Q-learning
   (Munos et al., 2016).   The TD target is the delayed soft one-step backup
@@ -205,7 +212,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``examples/12_train_offline_retrace.ipynb`` is the same offline loop
   as ``02`` with ``heads={"action_value": ..., "behavior": ...}``,
   ``td_lambda=1.0``, ``temperature=0.1``, and
-  ``delayed_copy(heads=("action_value",))`` so the behavior head is
+  ``copy(heads=("action_value",))`` so the behavior head is
   never run or Polyak-interpolated on the delayed side.
 - ``use_norm`` (required, saved with the model) on transformer
   backbones and on ``RegressionHead`` / ``ClassificationHead``. On
@@ -428,7 +435,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recurrence, LoRA adapters), so it steps them in place; it raises on a
   trainable non-fp32 parameter, whose sub-ULP updates would round away.
   Exposes ``state_dict()`` / ``load_state_dict()``.
-- Delayed DQN is a ``Model`` from ``Model.delayed_copy()``, interpolated
+- Delayed DQN is a ``Model`` from ``Model.copy()``, interpolated
   with ``Polyak(online, delayed)``. The delayed model is a frozen copy of
   the online model: every trainable parameter gets its own copy and every
   frozen parameter (the bf16 base weights of a LoRA backbone) is shared by
@@ -901,7 +908,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path now, sharing everything but the attention call with ``"varlen"``;
   ``FlexDecodeSession`` still handles cached decoding.
 - ``examples/11_train_offline_dqn_model_delay.ipynb``. Delayed Q is
-  ``model.delayed_copy()`` in every DQN example.
+  ``model.copy()`` in every DQN example.
 - ``AdamWFp32`` and ``Polyak(fp32_shadow=)``. Every trainable parameter is
   fp32 — the whole model under full fine-tuning, or the LoRA adapters plus
   encoder / heads over a frozen bf16 base — so there is nothing for fp32
