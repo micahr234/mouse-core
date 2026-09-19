@@ -9,9 +9,7 @@ import torch
 from mouse_core.models.heads.base import BaseHead
 from mouse_core.objectives.base import Objective, predictions_for, require_head
 from mouse_core.objectives.dqn import (
-    _affine,
     _boltzmann_entropy,
-    _boundary_discounts,
     _greedy_from_online_q,
     _in_run_stats,
     _pair_values_to_rows,
@@ -23,6 +21,14 @@ from mouse_core.objectives.dqn import (
     _soft_state_value,
     _td_lambda_targets,
     _weighted_mean,
+)
+from mouse_core.objectives.transforms import (
+    Discount,
+    Reward,
+    Value,
+    _apply_transform,
+    _apply_value,
+    _require_transform,
 )
 
 
@@ -85,6 +91,78 @@ def _build_layer_gamma_schedule(
     ]
 
 
+def _done_code_grid() -> tuple[torch.Tensor, torch.Tensor]:
+    """All ``(episode_done, task_done)`` pairs in ``{0,1,2}²``."""
+    episode_done = torch.tensor([0, 0, 0, 1, 1, 1, 2, 2, 2], dtype=torch.int64)
+    task_done = torch.tensor([0, 1, 2, 0, 1, 2, 0, 1, 2], dtype=torch.int64)
+    return episode_done, task_done
+
+
+def _probe_discount(
+    *,
+    discount: Discount,
+    episode_done: int,
+    task_done: int,
+) -> float:
+    """Evaluate ``discount`` on a single done-code pair."""
+    values = discount(
+        episode_done=torch.tensor([episode_done], dtype=torch.int64),
+        task_done=torch.tensor([task_done], dtype=torch.int64),
+    )
+    if not isinstance(values, torch.Tensor) or values.numel() != 1:
+        raise ValueError(
+            "discount must return a single value for a one-step done-code pair."
+        )
+    return float(values.reshape(-1)[0])
+
+
+def _horizon_lerp(
+    *,
+    gamma_start: torch.Tensor,
+    gamma_deep: torch.Tensor,
+    t: float,
+) -> torch.Tensor:
+    """Horizon-linear interpolation of per-step discounts.
+
+    ``t=0`` is ``gamma_start``; ``t=1`` is ``gamma_deep``. Equal values stay
+    put (including ``γ >= 1``). Mixing a finite horizon with an infinite
+    one raises, matching :func:`_build_layer_gamma_schedule`.
+    """
+    if t == 0.0:
+        return gamma_start
+    if t == 1.0:
+        return gamma_deep
+    same = gamma_start == gamma_deep
+    infinite = (gamma_start >= 1.0) | (gamma_deep >= 1.0)
+    if bool((infinite & ~same).any()):
+        raise ValueError(
+            "gamma_start and gamma_deep must be below 1.0 for a finite "
+            "horizon schedule."
+        )
+    h_start = torch.where(
+        gamma_start <= 0.0,
+        torch.ones_like(gamma_start),
+        torch.where(
+            gamma_start >= 1.0,
+            gamma_start.new_full(gamma_start.shape, float("inf")),
+            1.0 / (1.0 - gamma_start),
+        ),
+    )
+    h_deep = torch.where(
+        gamma_deep <= 0.0,
+        torch.ones_like(gamma_deep),
+        torch.where(
+            gamma_deep >= 1.0,
+            gamma_deep.new_full(gamma_deep.shape, float("inf")),
+            1.0 / (1.0 - gamma_deep),
+        ),
+    )
+    horizon = h_start + (h_deep - h_start) * t
+    finite = torch.isfinite(horizon) & (horizon > 1.0)
+    lerped = torch.where(finite, 1.0 - 1.0 / horizon, torch.zeros_like(horizon))
+    return torch.where(same, gamma_start, lerped)
+
+
 class LayerwiseDqnObjective(Objective):
     """Bellman TD(λ) objective on every backbone layer.
 
@@ -97,8 +175,9 @@ class LayerwiseDqnObjective(Objective):
     (``model.delayed_copy(heads=(head,))``) run on the
     same ``TokenBatch`` and is detached
     before the Bellman target, so the TD error does not backprop through it.
-    Each layer and each episode/task done-code uses its own discount, built at construction
-    from explicit shallow/deep endpoint pairs. A run is the same
+    Each layer uses its own discount. Layer ``0`` evaluates
+    ``discount_start``; the deepest layer evaluates ``discount``. Intermediate
+    layers horizon-lerp those two per-step outputs. A run is the same
     ``sequence_id`` and, when ``grouping_field`` is set and present, the same
     grouping column. Neighbor reads must stay in-run: out-of-run pairs are
     multiplied by ``0`` on every layer (all-zero weights → loss ``0``).
@@ -106,20 +185,19 @@ class LayerwiseDqnObjective(Objective):
     ``reward``, ``episode_done``, and ``task_done`` must be in the tokenizer
     ``objective_fields`` keep-list.
 
-    Effective planning horizon is ``H(gamma) = 1 / (1 - gamma)``. Layer ``0`` uses
-    each ``gamma_*_start``; the deepest layer uses the deep value
-    (``gamma_step``, ``gamma_episode_terminal``, …). Intermediate layers get
-    **linearly increasing horizon** (linearly harder targets):
+    Effective planning horizon is ``H(gamma) = 1 / (1 - gamma)``. Intermediate
+    layers get **linearly increasing horizon** (linearly harder targets):
 
     ``H_l = H_start + (H_deep - H_start) * (l / (L - 1))``
 
     ``gamma_l = 1 - 1 / H_l``
 
-    Example with ``num_backbone_layers=20``, ``gamma_episode_terminal_start=0.0``,
-    ``gamma_episode_terminal=0.99`` (``H_start=1``, ``H_deep=100``):
+    Example with ``num_backbone_layers=20``, ``discount_start`` returning
+    ``0.0`` and ``discount`` returning ``0.99`` at a given done-code pair
+    (``H_start=1``, ``H_deep=100``):
 
     +--------+---------------------------+----------+
-    | Layer  | gamma_episode_terminal    | Horizon  |
+    | Layer  | interpolated γ            | Horizon  |
     +========+===========================+==========+
     | 0      | 0.0                       | 1        |
     | 5      | ~0.963                    | ~27      |
@@ -144,27 +222,26 @@ class LayerwiseDqnObjective(Objective):
         head: Layerwise Q head this objective trains. Must be the same
             instance passed to ``Model(heads=)``.
         num_backbone_layers: Number of transformer blocks (and Q heads).
-        gamma_step_start: Step discount at layer 0 (``episode_done == 0``).
-        gamma_step: Step discount at the deepest layer.
-        gamma_episode_terminal_start: Episode-terminal discount at layer 0.
-        gamma_episode_terminal: Episode-terminal discount at the deepest layer.
-        gamma_episode_truncated_start: Episode-truncated discount at layer 0.
-        gamma_episode_truncated: Episode-truncated discount at the deepest layer.
-        gamma_task_terminal_start: Task-terminal extra discount at layer 0
-            (``task_done == 1``; ``EnvConfig.terminate_task``; multiplies
-            the episode discount; ``task_done == 0`` uses ``1.0``).
-        gamma_task_terminal: Task-terminal extra discount at the deepest layer.
-        gamma_task_truncated_start: Task-truncated extra discount at layer 0
-            (``task_done == 2``; last episode of ``max_task_episodes``).
-        gamma_task_truncated: Task-truncated extra discount at the deepest layer.
+        discount: Per-step γ at the deepest layer, from unpacked
+            ``objective_data`` columns. ``boundary_discount`` is the
+            standard ``gamma_step`` × extra lookup (factory args are
+            required; ``None`` is identity).
+        discount_start: Per-step γ at layer 0. Intermediate layers
+            horizon-lerp ``discount_start`` and ``discount``. With one
+            layer both callables must agree on every done-code pair.
+        reward: Per-step reward from unpacked ``objective_data`` columns.
+            ``affine_reward`` is the column affine; ``boundary_reward``
+            applies episode / task scale and shift extras
+            (factory args are required; ``None`` is identity);
+            any ``reward(**objective_data) -> [N]`` is accepted.
+        value: Per-step affine on online and delayed Q from unpacked
+            ``objective_data`` columns plus ``value=``. ``affine_value``
+            is the prediction affine; ``boundary_value`` applies episode
+            / task scale and shift extras
+            (factory args are required; ``None`` is identity);
+            any ``value(value=..., **objective_data)`` returning the same
+            shape is accepted. Same callable on both networks.
         action_key: Key in ``objective_data`` for the integer action.
-        reward_key: Key in ``objective_data`` for per-step reward.
-        reward_scale: Multiplier applied to ``reward`` before the TD target
-            (default ``1.0``). Does not change ``objective_data``.
-        reward_shift: Offset added after ``reward_scale`` (default ``0.0``).
-        q_scale: Multiplier applied to online and delayed Q before the TD
-            error (default ``1.0``). Same affine on both networks.
-        q_shift: Offset added after ``q_scale`` (default ``0.0``).
         episode_done_key: Key in ``objective_data`` for the episode-done code.
         task_done_key: Key in ``objective_data`` for the task-done code.
         cql_weight: CQL penalty coefficient; ``0.0`` disables CQL.
@@ -178,9 +255,9 @@ class LayerwiseDqnObjective(Objective):
             silent skip.
         temperature: SAC / soft Q-learning ``α`` (``>= 0``). Required.
             ``0`` is hard max-Q. ``> 0`` bootstraps each layer from
-            ``α logsumexp(Q / α)`` on delayed Q (after ``q_scale`` /
-            ``q_shift``) and logs ``metrics["entropy"]``. Same units and
-            meaning as ``get_action(temperature=)``.
+            ``α logsumexp(Q / α)`` on delayed Q (after ``value``) and
+            logs ``metrics["entropy"]``. Same units and meaning as
+            ``get_action(temperature=)``.
     """
 
     def __init__(
@@ -188,23 +265,12 @@ class LayerwiseDqnObjective(Objective):
         *,
         head: BaseHead,
         num_backbone_layers: int,
-        gamma_step_start: float,
-        gamma_step: float,
-        gamma_episode_terminal_start: float,
-        gamma_episode_terminal: float,
-        gamma_episode_truncated_start: float,
-        gamma_episode_truncated: float,
-        gamma_task_terminal_start: float,
-        gamma_task_terminal: float,
-        gamma_task_truncated_start: float,
-        gamma_task_truncated: float,
+        discount: Discount,
+        discount_start: Discount,
+        reward: Reward,
+        value: Value,
         temperature: float,
         action_key: str = "action",
-        reward_key: str = "reward",
-        reward_scale: float = 1.0,
-        reward_shift: float = 0.0,
-        q_scale: float = 1.0,
-        q_shift: float = 0.0,
         episode_done_key: str = "episode_done",
         task_done_key: str = "task_done",
         cql_weight: float = 0.0,
@@ -218,22 +284,11 @@ class LayerwiseDqnObjective(Objective):
         self.head = require_head(head=head, what="head")
         self.temperature = _require_temperature(temperature)
         self.num_backbone_layers = int(num_backbone_layers)
-        self.gamma_step_start = float(gamma_step_start)
-        self.gamma_step = float(gamma_step)
-        self.gamma_episode_terminal_start = float(gamma_episode_terminal_start)
-        self.gamma_episode_terminal = float(gamma_episode_terminal)
-        self.gamma_episode_truncated_start = float(gamma_episode_truncated_start)
-        self.gamma_episode_truncated = float(gamma_episode_truncated)
-        self.gamma_task_terminal_start = float(gamma_task_terminal_start)
-        self.gamma_task_terminal = float(gamma_task_terminal)
-        self.gamma_task_truncated_start = float(gamma_task_truncated_start)
-        self.gamma_task_truncated = float(gamma_task_truncated)
+        self.discount = _require_transform(discount, name="discount")
+        self.discount_start = _require_transform(discount_start, name="discount_start")
+        self.reward = _require_transform(reward, name="reward")
+        self.value = _require_transform(value, name="value")
         self.action_key = action_key
-        self.reward_key = reward_key
-        self.reward_scale = float(reward_scale)
-        self.reward_shift = float(reward_shift)
-        self.q_scale = float(q_scale)
-        self.q_shift = float(q_shift)
         self.episode_done_key = episode_done_key
         self.task_done_key = task_done_key
         self.cql_weight = cql_weight
@@ -242,30 +297,40 @@ class LayerwiseDqnObjective(Objective):
         self.td_lambda = float(td_lambda)
         self.watkins = bool(watkins)
 
-        build = _build_layer_gamma_schedule
         n = self.num_backbone_layers
+        grid_episode, grid_task = _done_code_grid()
+        start_grid = self.discount_start(
+            episode_done=grid_episode, task_done=grid_task
+        )
+        deep_grid = self.discount(episode_done=grid_episode, task_done=grid_task)
+        if n == 1:
+            if not torch.equal(start_grid, deep_grid):
+                raise ValueError(
+                    f"num_backbone_layers=1 cannot interpolate between "
+                    f"discount_start and discount; pass callables that "
+                    f"agree on every episode_done / task_done pair."
+                )
+        else:
+            _horizon_lerp(gamma_start=start_grid, gamma_deep=deep_grid, t=0.5)
+
+        build = _build_layer_gamma_schedule
         self.layer_gamma_step = build(
-            num_layers=n, gamma_start=self.gamma_step_start, gamma_deep=self.gamma_step
+            num_layers=n,
+            gamma_start=_probe_discount(
+                discount=self.discount_start, episode_done=0, task_done=0
+            ),
+            gamma_deep=_probe_discount(
+                discount=self.discount, episode_done=0, task_done=0
+            ),
         )
         self.layer_gamma_episode_terminal = build(
             num_layers=n,
-            gamma_start=self.gamma_episode_terminal_start,
-            gamma_deep=self.gamma_episode_terminal,
-        )
-        self.layer_gamma_episode_truncated = build(
-            num_layers=n,
-            gamma_start=self.gamma_episode_truncated_start,
-            gamma_deep=self.gamma_episode_truncated,
-        )
-        self.layer_gamma_task_terminal = build(
-            num_layers=n,
-            gamma_start=self.gamma_task_terminal_start,
-            gamma_deep=self.gamma_task_terminal,
-        )
-        self.layer_gamma_task_truncated = build(
-            num_layers=n,
-            gamma_start=self.gamma_task_truncated_start,
-            gamma_deep=self.gamma_task_truncated,
+            gamma_start=_probe_discount(
+                discount=self.discount_start, episode_done=1, task_done=0
+            ),
+            gamma_deep=_probe_discount(
+                discount=self.discount, episode_done=1, task_done=0
+            ),
         )
 
     def __call__(
@@ -297,8 +362,6 @@ class LayerwiseDqnObjective(Objective):
                 f"Layerwise DQN delayed shape {tuple(q_target.shape)} must "
                 f"match online shape {tuple(q.shape)}."
             )
-        q = _affine(q, scale=self.q_scale, shift=self.q_shift)
-        q_target = _affine(q_target, scale=self.q_scale, shift=self.q_shift)
         P, L, A = q.shape
         device = q.device
         value_dtype = q.dtype
@@ -322,18 +385,16 @@ class LayerwiseDqnObjective(Objective):
         if N < 2:
             raise ValueError("Not enough valid q values in data.")
 
-        reward = objective_data[self.reward_key]
-        if reward.dtype != torch.float32:
-            raise TypeError(f"reward must be float32, got {reward.dtype}.")
-        if reward.shape != torch.Size([N]):
-            raise ValueError(
-                f"Layerwise DQN objective expects reward shape [{N}], got {tuple(reward.shape)}."
-            )
-        reward = _affine(
-            reward, scale=self.reward_scale, shift=self.reward_shift
+        reward = _apply_transform(
+            transform=self.reward,
+            name="reward",
+            objective_data=objective_data,
+            N=N,
+            dtype=value_dtype,
+            device=device,
         )
 
-        episode_done, task_done = _require_done_codes(
+        _require_done_codes(
             objective_data,
             episode_done_key=self.episode_done_key,
             task_done_key=self.task_done_key,
@@ -345,6 +406,22 @@ class LayerwiseDqnObjective(Objective):
         # last head-output row.
         step_of, last_rows = _head_output_layout(
             objective_data, N=N, P=P, device=device
+        )
+        q = _apply_value(
+            transform=self.value,
+            name="value",
+            value=q,
+            objective_data=objective_data,
+            step_of=step_of,
+            N=N,
+        )
+        q_target = _apply_value(
+            transform=self.value,
+            name="value",
+            value=q_target,
+            objective_data=objective_data,
+            step_of=step_of,
+            N=N,
         )
 
         pair_weight = _pair_weight(
@@ -364,6 +441,23 @@ class LayerwiseDqnObjective(Objective):
             q_target[last_rows], temperature=self.temperature
         )  # [N, L]  V_l(s_i): max_a Q, or α logsumexp
 
+        gamma_start = _apply_transform(
+            transform=self.discount_start,
+            name="discount_start",
+            objective_data=objective_data,
+            N=N,
+            dtype=value_dtype,
+            device=device,
+        )
+        gamma_deep = _apply_transform(
+            transform=self.discount,
+            name="discount",
+            objective_data=objective_data,
+            N=N,
+            dtype=value_dtype,
+            device=device,
+        )
+
         layer_losses: list[torch.Tensor] = []
         layer_curr_max_means: list[torch.Tensor] = []
         cql_penalties: list[torch.Tensor] = []
@@ -371,16 +465,9 @@ class LayerwiseDqnObjective(Objective):
         deepest_greedy_from: torch.Tensor | None = None
 
         for layer_idx in range(L):
-            discount_all = _boundary_discounts(
-                episode_done=episode_done,
-                task_done=task_done,
-                gamma_step=self.layer_gamma_step[layer_idx],
-                gamma_episode_terminal=self.layer_gamma_episode_terminal[layer_idx],
-                gamma_episode_truncated=self.layer_gamma_episode_truncated[layer_idx],
-                gamma_task_terminal=self.layer_gamma_task_terminal[layer_idx],
-                gamma_task_truncated=self.layer_gamma_task_truncated[layer_idx],
-                dtype=value_dtype,
-                device=device,
+            t = 0.0 if L == 1 else layer_idx / (L - 1)
+            discount_all = _horizon_lerp(
+                gamma_start=gamma_start, gamma_deep=gamma_deep, t=t
             )
 
             curr_q_layer = q[:, layer_idx, :]  # [P, A]

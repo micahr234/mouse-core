@@ -2,10 +2,34 @@
 from __future__ import annotations
 import pytest
 import torch
-from mouse_core.objectives import LayerwiseDqnObjective, effective_horizon
+from mouse_core.objectives import LayerwiseDqnObjective, affine_reward, affine_value, boundary_discount, effective_horizon
 from tests._bound_head import BoundHead
 
 _LW = BoundHead("action_value_layerwise")
+
+
+def _disc(**overrides: float | None):
+    kwargs: dict[str, float | None] = dict(
+        gamma_step=None,
+        gamma_episode_terminal=0.0,
+        gamma_episode_truncated=0.0,
+        gamma_task_terminal=0.0,
+        gamma_task_truncated=0.0,
+    )
+    kwargs.update(overrides)
+    return boundary_discount(**kwargs)
+
+
+def _rew(**overrides: object):
+    kwargs: dict[str, object] = dict(scale=None, shift=None)
+    kwargs.update(overrides)
+    return affine_reward(**kwargs)  # type: ignore[arg-type]
+
+
+def _val(**overrides: object):
+    kwargs: dict[str, object] = dict(scale=None, shift=None)
+    kwargs.update(overrides)
+    return affine_value(**kwargs)  # type: ignore[arg-type]
 
 
 def test_effective_horizon() -> None:
@@ -13,24 +37,57 @@ def test_effective_horizon() -> None:
     assert effective_horizon(gamma=0.99) == pytest.approx(100.0)
 
 def test_layerwise_dqn_objective_anchors_endpoints() -> None:
-    objective = LayerwiseDqnObjective(head=_LW, num_backbone_layers=4, gamma_step_start=1.0, gamma_step=1.0, gamma_episode_terminal_start=0.0, gamma_episode_terminal=0.99, gamma_episode_truncated_start=0.0, gamma_episode_truncated=0.0, gamma_task_terminal_start=0.0, gamma_task_terminal=0.0, gamma_task_truncated_start=0.0, gamma_task_truncated=0.0, grouping_field=None, temperature=0.0)
+    objective = LayerwiseDqnObjective(
+        head=_LW,
+        num_backbone_layers=4,
+        discount_start=_disc(gamma_episode_terminal=0.0),
+        discount=_disc(gamma_episode_terminal=0.99),
+        grouping_field=None,
+        temperature=0.0,
+        reward=_rew(),
+        value=_val(),
+    )
     assert objective.layer_gamma_step == [1.0, 1.0, 1.0, 1.0]
     assert objective.layer_gamma_episode_terminal[0] == 0.0
-    assert objective.layer_gamma_episode_terminal[-1] == 0.99
+    assert objective.layer_gamma_episode_terminal[-1] == pytest.approx(0.99)
 
 def test_layerwise_dqn_objective_linear_horizon() -> None:
-    objective = LayerwiseDqnObjective(head=_LW, num_backbone_layers=4, gamma_step_start=0.0, gamma_step=0.99, gamma_episode_terminal_start=0.0, gamma_episode_terminal=0.0, gamma_episode_truncated_start=0.0, gamma_episode_truncated=0.0, gamma_task_terminal_start=0.0, gamma_task_terminal=0.0, gamma_task_truncated_start=0.0, gamma_task_truncated=0.0, grouping_field=None, temperature=0.0)
+    objective = LayerwiseDqnObjective(
+        head=_LW,
+        num_backbone_layers=4,
+        discount_start=_disc(gamma_step=0.0),
+        discount=_disc(gamma_step=0.99),
+        grouping_field=None,
+        temperature=0.0,
+        reward=_rew(),
+        value=_val(),
+    )
     horizons = [effective_horizon(gamma=g) for g in objective.layer_gamma_step]
     assert horizons == pytest.approx([1.0, 34.0, 67.0, 100.0])
     assert objective.layer_gamma_step[0] == 0.0
-    assert objective.layer_gamma_step[-1] == 0.99
+    assert objective.layer_gamma_step[-1] == pytest.approx(0.99)
+
+def _lw(*, num_backbone_layers: int, **overrides: object) -> LayerwiseDqnObjective:
+    kwargs: dict[str, object] = dict(
+        head=_LW,
+        num_backbone_layers=num_backbone_layers,
+        discount_start=_disc(gamma_step=0.0),
+        discount=_disc(gamma_step=0.99),
+        grouping_field=None,
+        temperature=0.0,
+        reward=_rew(),
+        value=_val(),
+    )
+    kwargs.update(overrides)
+    return LayerwiseDqnObjective(**kwargs)  # type: ignore[arg-type]
+
 
 def test_layerwise_dqn_objective_runs() -> None:
     n, layers, a = (8, 3, 3)
     step_stream = {'action': torch.randint(0, a, (n,)), 'reward': torch.randn(n), 'episode_done': torch.zeros(n, dtype=torch.long), 'task_done': torch.zeros(n, dtype=torch.long), 'sequence_id': torch.tensor([0, 0, 0, 0, 1, 1, 1, 1])}
     predictions = {'action_value_layerwise': torch.randn(n, layers, a)}
     delayed = {'action_value_layerwise': torch.randn(n, layers, a)}
-    objective = LayerwiseDqnObjective(head=_LW, num_backbone_layers=layers, gamma_step_start=0.0, gamma_step=0.99, gamma_episode_terminal_start=0.0, gamma_episode_terminal=0.0, gamma_episode_truncated_start=0.0, gamma_episode_truncated=0.0, gamma_task_terminal_start=0.0, gamma_task_terminal=0.0, gamma_task_truncated_start=0.0, gamma_task_truncated=0.0, grouping_field=None, temperature=0.0)
+    objective = _lw(num_backbone_layers=layers)
     loss, metrics = objective(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
     assert loss.ndim == 0
     assert 'action_value_layerwise' in metrics
@@ -46,7 +103,7 @@ def test_layerwise_dqn_objective_skips_transitions_across_sequences() -> None:
     step_stream = {'action': torch.randint(0, a, (n,)), 'reward': torch.randn(n), 'episode_done': torch.zeros(n, dtype=torch.long), 'task_done': torch.zeros(n, dtype=torch.long), 'sequence_id': torch.tensor([0, 0, 1, 1, 1])}
     predictions = {'action_value_layerwise': torch.randn(n, layers, a)}
     delayed = {'action_value_layerwise': torch.randn(n, layers, a)}
-    objective = LayerwiseDqnObjective(head=_LW, num_backbone_layers=layers, gamma_step_start=0.0, gamma_step=0.99, gamma_episode_terminal_start=0.0, gamma_episode_terminal=0.0, gamma_episode_truncated_start=0.0, gamma_episode_truncated=0.0, gamma_task_terminal_start=0.0, gamma_task_terminal=0.0, gamma_task_truncated_start=0.0, gamma_task_truncated=0.0, grouping_field=None, temperature=0.0)
+    objective = _lw(num_backbone_layers=layers)
     loss_before, _ = objective(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
     corrupted = {key: value.clone() for key, value in step_stream.items()}
     corrupted['reward'][2] = 1000000.0
@@ -63,17 +120,7 @@ def test_layerwise_dqn_all_out_of_run_pairs_yield_zero_loss() -> None:
         }
     predictions = {'action_value_layerwise': torch.randn(3, 2, 2)}
     delayed = {'action_value_layerwise': torch.randn(3, 2, 2)}
-    loss, metrics = LayerwiseDqnObjective(head=_LW, 
-        num_backbone_layers=2, gamma_step_start=0.0, gamma_step=0.99,
-        gamma_episode_terminal_start=0.0,
-        gamma_episode_terminal=0.0,
-        gamma_episode_truncated_start=0.0,
-        gamma_episode_truncated=0.0,
-        gamma_task_terminal_start=0.0,
-        gamma_task_terminal=0.0,
-        gamma_task_truncated_start=0.0,
-        gamma_task_truncated=0.0,
-        grouping_field=None, temperature=0.0)(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
+    loss, metrics = _lw(num_backbone_layers=2)(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
     assert abs(loss.item()) < 1e-05
     assert abs(metrics['q_values_mean']) < 1e-05
 
@@ -82,7 +129,7 @@ def test_layerwise_dqn_objective_rejects_layer_mismatch() -> None:
     step_stream = {'action': torch.zeros(3, dtype=torch.long), 'reward': torch.zeros(3), 'episode_done': torch.zeros(3, dtype=torch.long), 'task_done': torch.zeros(3, dtype=torch.long)}
     predictions = {'action_value_layerwise': torch.zeros(3, 2, 2)}
     delayed = {'action_value_layerwise': torch.zeros(3, 2, 2)}
-    objective = LayerwiseDqnObjective(head=_LW, num_backbone_layers=3, gamma_step_start=0.0, gamma_step=0.99, gamma_episode_terminal_start=0.0, gamma_episode_terminal=0.0, gamma_episode_truncated_start=0.0, gamma_episode_truncated=0.0, gamma_task_terminal_start=0.0, gamma_task_terminal=0.0, gamma_task_truncated_start=0.0, gamma_task_truncated=0.0, grouping_field=None, temperature=0.0)
+    objective = _lw(num_backbone_layers=3)
     try:
         objective(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
     except ValueError as exc:
@@ -104,17 +151,10 @@ def test_layerwise_dqn_objective_does_not_backprop_through_delayed_q() -> None:
     delayed = torch.randn(n, layers, a, requires_grad=True)
     predictions = {"action_value_layerwise": online}
     delayed_td = {"action_value_layerwise": delayed}
-    loss, _ = LayerwiseDqnObjective(head=_LW, 
-        num_backbone_layers=layers, gamma_step_start=1.0, gamma_step=1.0,
-        gamma_episode_terminal_start=0.0,
-        gamma_episode_terminal=0.0,
-        gamma_episode_truncated_start=0.0,
-        gamma_episode_truncated=0.0,
-        gamma_task_terminal_start=0.0,
-        gamma_task_terminal=0.0,
-        gamma_task_truncated_start=0.0,
-        gamma_task_truncated=0.0,
-        grouping_field=None, temperature=0.0)(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed_td)
+    same = _disc()
+    loss, _ = _lw(
+        num_backbone_layers=layers, discount_start=same, discount=same
+    )(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed_td)
     loss.backward()
     assert online.grad is not None
     assert delayed.grad is None
@@ -122,50 +162,23 @@ def test_layerwise_dqn_objective_does_not_backprop_through_delayed_q() -> None:
 
 def test_single_layer_rejects_mismatched_start_and_deep_gamma() -> None:
     with pytest.raises(ValueError, match="num_backbone_layers=1"):
-        LayerwiseDqnObjective(head=_LW, 
-            num_backbone_layers=1,
-            gamma_step_start=0.0,
-            gamma_step=0.99,
-            gamma_episode_terminal_start=0.0,
-            gamma_episode_terminal=0.0,
-            gamma_episode_truncated_start=0.0,
-            gamma_episode_truncated=0.0,
-            gamma_task_terminal_start=0.0,
-            gamma_task_terminal=0.0,
-            gamma_task_truncated_start=0.0,
-            gamma_task_truncated=0.0,
-            grouping_field=None, temperature=0.0)
-    objective = LayerwiseDqnObjective(head=_LW, 
-        num_backbone_layers=1,
-        gamma_step_start=0.5,
-        gamma_step=0.5,
-        gamma_episode_terminal_start=0.0,
-        gamma_episode_terminal=0.0,
-        gamma_episode_truncated_start=0.0,
-        gamma_episode_truncated=0.0,
-        gamma_task_terminal_start=0.0,
-        gamma_task_terminal=0.0,
-        gamma_task_truncated_start=0.0,
-        gamma_task_truncated=0.0,
-        grouping_field=None, temperature=0.0)
+        _lw(num_backbone_layers=1)
+    same = _disc(gamma_step=0.5)
+    objective = _lw(num_backbone_layers=1, discount_start=same, discount=same)
     assert objective.layer_gamma_step == [0.5]
 
 
 def _layerwise(**overrides: object) -> LayerwiseDqnObjective:
+    same = _disc()
     kwargs: dict[str, object] = dict(
         head=_LW,
         num_backbone_layers=1,
-        gamma_step_start=1.0,
-        gamma_step=1.0,
-        gamma_episode_terminal_start=0.0,
-        gamma_episode_terminal=0.0,
-        gamma_episode_truncated_start=0.0,
-        gamma_episode_truncated=0.0,
-        gamma_task_terminal_start=0.0,
-        gamma_task_terminal=0.0,
-        gamma_task_truncated_start=0.0,
-        gamma_task_truncated=0.0,
-        grouping_field=None, temperature=0.0,
+        discount_start=same,
+        discount=same,
+        grouping_field=None,
+        temperature=0.0,
+        reward=_rew(),
+        value=_val(),
     )
     kwargs.update(overrides)
     return LayerwiseDqnObjective(**kwargs)  # type: ignore[arg-type]
@@ -191,11 +204,9 @@ def test_layerwise_temperature_matches_dqn_one_layer() -> None:
         objective_data=step_stream, predictions=layerwise_pred, delayed_predictions=layerwise_del
     )
     dqn_loss, dqn_m = DqnObjective(head=BoundHead("action_value"), 
-        gamma_step=1.0,
-        gamma_episode_terminal=0.0,
-        gamma_episode_truncated=0.0,
-        gamma_task_terminal=0.0,
-        gamma_task_truncated=0.0,
+        discount=_disc(),
+        reward=_rew(),
+        value=_val(),
         grouping_field=None,
         temperature=1.0,
     )(objective_data=step_stream, predictions=dqn_pred, delayed_predictions=dqn_del)

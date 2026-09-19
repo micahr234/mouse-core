@@ -7,9 +7,7 @@ import torch
 from mouse_core.models.heads.base import BaseHead, prediction_key
 from mouse_core.objectives.base import Objective, predictions_for, require_head
 from mouse_core.objectives.dqn import (
-    _affine,
     _boltzmann_entropy,
-    _boundary_discounts,
     _head_output_layout,
     _in_run_stats,
     _pair_values_to_rows,
@@ -19,6 +17,14 @@ from mouse_core.objectives.dqn import (
     _require_temperature,
     _soft_state_value,
     _weighted_mean,
+)
+from mouse_core.objectives.transforms import (
+    Discount,
+    Reward,
+    Value,
+    _apply_transform,
+    _apply_value,
+    _require_transform,
 )
 
 
@@ -121,12 +127,19 @@ class NStepDqnObjective(Objective):
     discount from the done codes at each lookahead step inside a same-run
     pair — it is not a run mask.
 
-    The ``episode_done`` / ``task_done`` codes stored at each lookahead
-    step determine the discount applied to later rewards and the
-    bootstrap. Both factors always multiply: ``V ← episode_gamma *
-    task_gamma * V``. ``task_done == 0`` uses task factor ``1.0``. A
-    ``0`` gamma ends the remaining sum; a non-zero truncation gamma
-    carries it (discounted) into the reset frame.
+    ``reward(**objective_data)`` supplies the per-step reward used at
+    each lookahead. ``affine_reward`` is the column affine;
+    ``boundary_reward`` applies episode / task scale and shift extras.
+    ``value(value=..., **objective_data)`` supplies the per-step affine
+    on online and delayed Q. ``affine_value`` is the prediction affine;
+    ``boundary_value`` applies episode / task scale and shift extras.
+    ``discount(**objective_data)``
+    supplies the per-step γ that multiplies later rewards and the
+    bootstrap.
+    ``boundary_discount`` is the standard ``gamma_step`` × episode-extra
+    × task-extra lookup. A ``0`` gamma
+    ends the remaining sum; a non-zero truncation gamma carries it
+    (discounted) into the reset frame.
 
     Those columns arrive in ``objective_data`` only if they are listed in
     the tokenizer ``objective_fields`` keep-list (input fields are not
@@ -144,52 +157,27 @@ class NStepDqnObjective(Objective):
             ],
         )
 
-    +--------------+-----------+----------------------------------+-----------------------------------------------+
-    | episode_done | task_done | Meaning                          | Discount                                      |
-    +==============+===========+==================================+===============================================+
-    | 0            | 0         | Running                          | ``gamma_step``                                |
-    +--------------+-----------+----------------------------------+-----------------------------------------------+
-    | 1            | 0         | Episode terminated (mid-task)    | ``gamma_episode_terminal``                    |
-    +--------------+-----------+----------------------------------+-----------------------------------------------+
-    | 2            | 0         | Episode truncated (mid-task)     | ``gamma_episode_truncated``                   |
-    +--------------+-----------+----------------------------------+-----------------------------------------------+
-    | 1            | 2         | Last episode terminated          | ``gamma_episode_terminal * gamma_task_truncated`` |
-    +--------------+-----------+----------------------------------+-----------------------------------------------+
-    | 2            | 2         | Last episode truncated           | ``gamma_episode_truncated * gamma_task_truncated`` |
-    +--------------+-----------+----------------------------------+-----------------------------------------------+
-    | 1 or 2       | 1         | Task terminated (``terminate_task``) | episode gamma ``* gamma_task_terminal``       |
-    +--------------+-----------+----------------------------------+-----------------------------------------------+
-
     Args:
         n: Backup horizon. ``1`` is one-step DQN; must be an ``int >= 1``.
         head: Q head this objective trains. Must be the same instance
             passed to ``Model(heads=)``.
-        gamma_step: Discount factor for running (non-terminal) transitions
-            (``episode_done == 0``).
-        gamma_episode_terminal: Discount applied when the episode terminates
-            naturally (``episode_done == 1``). ``1.0`` bootstraps across
-            episode boundaries (usual for multi-episode MOUSE tasks).
-        gamma_episode_truncated: Discount applied when the episode is
-            truncated (``episode_done == 2``). ``1.0`` bootstraps across
-            episode boundaries.
-        gamma_task_terminal: Extra discount when the task terminates
-            (``task_done == 1``; ``EnvConfig.terminate_task``).
-            Multiplies the episode discount. ``task_done == 0`` uses ``1.0``.
-        gamma_task_truncated: Extra discount when the task is truncated
-            (``task_done == 2``; last episode of ``max_task_episodes``).
-            Multiplies the episode discount. ``0.0`` zeros the bootstrap.
+        discount: Per-step γ from unpacked ``objective_data`` columns.
+            ``boundary_discount`` is the standard ``gamma_step`` × extra
+            lookup (factory args are required; ``None`` is identity);
+            any ``discount(**objective_data) -> [N]`` is accepted.
+        reward: Per-step reward from unpacked ``objective_data`` columns.
+            ``affine_reward`` is the column affine; ``boundary_reward``
+            applies episode / task scale and shift extras
+            (factory args are required; ``None`` is identity);
+            any ``reward(**objective_data) -> [N]`` is accepted.
+        value: Per-step affine on online and delayed Q from unpacked
+            ``objective_data`` columns plus ``value=``. ``affine_value``
+            is the prediction affine; ``boundary_value`` applies episode
+            / task scale and shift extras
+            (factory args are required; ``None`` is identity);
+            any ``value(value=..., **objective_data)`` returning the same
+            shape is accepted. Same callable on both networks.
         action_key: Key in ``objective_data`` that holds the integer action.
-        reward_key: Key in ``objective_data`` that holds the per-step reward.
-        reward_scale: Multiplier applied to ``reward`` before the TD target
-            (default ``1.0``). Does not change ``objective_data`` or the
-            tokenizer.
-        reward_shift: Offset added after ``reward_scale`` (default ``0.0``).
-            The TD reward is ``reward_scale * r + reward_shift``.
-        q_scale: Multiplier applied to online and delayed Q before the TD
-            error (default ``1.0``). Same affine on both networks. Does
-            not change the prediction tensors or eval ``argmax``.
-        q_shift: Offset added after ``q_scale`` (default ``0.0``). The TD
-            Q is ``q_scale * Q + q_shift``.
         episode_done_key: Key in ``objective_data`` for the episode-done code.
         task_done_key: Key in ``objective_data`` for the task-done code.
         grouping_field: Step column that isolates runs (typically
@@ -201,9 +189,9 @@ class NStepDqnObjective(Objective):
         cql_scale_q_eps: Additive floor used when scaling the CQL penalty.
         temperature: SAC / soft Q-learning ``α`` (``>= 0``). Required.
             ``0`` is hard max-Q. ``> 0`` bootstraps from
-            ``α logsumexp(Q / α)`` on delayed Q (after ``q_scale`` /
-            ``q_shift``) and logs ``metrics["entropy"]``. Same units and
-            meaning as ``get_action(temperature=)``.
+            ``α logsumexp(Q / α)`` on delayed Q (after ``value``) and
+            logs ``metrics["entropy"]``. Same units and meaning as
+            ``get_action(temperature=)``.
     """
 
     def __init__(
@@ -211,18 +199,11 @@ class NStepDqnObjective(Objective):
         *,
         n: int,
         head: BaseHead,
-        gamma_step: float,
-        gamma_episode_terminal: float,
-        gamma_episode_truncated: float,
-        gamma_task_terminal: float,
-        gamma_task_truncated: float,
+        discount: Discount,
+        reward: Reward,
+        value: Value,
         temperature: float,
         action_key: str = "action",
-        reward_key: str = "reward",
-        reward_scale: float = 1.0,
-        reward_shift: float = 0.0,
-        q_scale: float = 1.0,
-        q_shift: float = 0.0,
         episode_done_key: str = "episode_done",
         task_done_key: str = "task_done",
         grouping_field: str | None,
@@ -234,17 +215,10 @@ class NStepDqnObjective(Objective):
         self.n = n
         self.head = require_head(head=head, what="head")
         self.prediction_key = prediction_key(head=self.head)
-        self.gamma_step = gamma_step
-        self.gamma_episode_terminal = gamma_episode_terminal
-        self.gamma_episode_truncated = gamma_episode_truncated
-        self.gamma_task_terminal = gamma_task_terminal
-        self.gamma_task_truncated = gamma_task_truncated
+        self.discount = _require_transform(discount, name="discount")
+        self.reward = _require_transform(reward, name="reward")
+        self.value = _require_transform(value, name="value")
         self.action_key = action_key
-        self.reward_key = reward_key
-        self.reward_scale = float(reward_scale)
-        self.reward_shift = float(reward_shift)
-        self.q_scale = float(q_scale)
-        self.q_shift = float(q_shift)
         self.episode_done_key = episode_done_key
         self.task_done_key = task_done_key
         self.grouping_field = grouping_field
@@ -281,8 +255,6 @@ class NStepDqnObjective(Objective):
                 f"n-step DQN delayed {self.prediction_key} shape "
                 f"{tuple(q_target.shape)} must match online shape {tuple(q.shape)}."
             )
-        q = _affine(q, scale=self.q_scale, shift=self.q_shift)
-        q_target = _affine(q_target, scale=self.q_scale, shift=self.q_shift)
         P, A = q.shape
         device = q.device
         value_dtype = q.dtype
@@ -301,19 +273,16 @@ class NStepDqnObjective(Objective):
         if N < 2:
             raise ValueError("Not enough valid q values in data.")
 
-        reward = objective_data[self.reward_key]
-        if reward.dtype != torch.float32:
-            raise TypeError(f"reward must be float32, got {reward.dtype}.")
-        if reward.shape != torch.Size([N]):
-            raise ValueError(
-                f"n-step DQN objective expects reward shape [{N}], "
-                f"got {tuple(reward.shape)}."
-            )
-        reward = _affine(
-            reward, scale=self.reward_scale, shift=self.reward_shift
+        reward = _apply_transform(
+            transform=self.reward,
+            name="reward",
+            objective_data=objective_data,
+            N=N,
+            dtype=value_dtype,
+            device=device,
         )
 
-        episode_done, task_done = _require_done_codes(
+        _require_done_codes(
             objective_data,
             episode_done_key=self.episode_done_key,
             task_done_key=self.task_done_key,
@@ -322,6 +291,22 @@ class NStepDqnObjective(Objective):
 
         step_of, last_rows = _head_output_layout(
             objective_data, N=N, P=P, device=device
+        )
+        q = _apply_value(
+            transform=self.value,
+            name="value",
+            value=q,
+            objective_data=objective_data,
+            step_of=step_of,
+            N=N,
+        )
+        q_target = _apply_value(
+            transform=self.value,
+            name="value",
+            value=q_target,
+            objective_data=objective_data,
+            step_of=step_of,
+            N=N,
         )
 
         pair_weight = _pair_weight(
@@ -336,14 +321,11 @@ class NStepDqnObjective(Objective):
         step_next = (step_of + 1).clamp(max=N - 1)
         next_actions = action[step_next]
 
-        discount_all = _boundary_discounts(
-            episode_done=episode_done,
-            task_done=task_done,
-            gamma_step=self.gamma_step,
-            gamma_episode_terminal=self.gamma_episode_terminal,
-            gamma_episode_truncated=self.gamma_episode_truncated,
-            gamma_task_terminal=self.gamma_task_terminal,
-            gamma_task_truncated=self.gamma_task_truncated,
+        discount_all = _apply_transform(
+            transform=self.discount,
+            name="discount",
+            objective_data=objective_data,
+            N=N,
             dtype=value_dtype,
             device=device,
         )

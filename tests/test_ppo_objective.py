@@ -2,11 +2,49 @@
 from __future__ import annotations
 import pytest
 import torch
-from mouse_core.objectives import PpoObjective, sample_discrete_action
+from mouse_core.objectives import PpoObjective, affine_reward, affine_value, boundary_discount, sample_discrete_action
 from tests._bound_head import BoundHead
+
+
+def _disc(**overrides: float | None):
+    kwargs: dict[str, float | None] = dict(
+        gamma_step=None,
+        gamma_episode_terminal=0.0,
+        gamma_episode_truncated=0.0,
+        gamma_task_terminal=0.0,
+        gamma_task_truncated=0.0,
+    )
+    kwargs.update(overrides)
+    return boundary_discount(**kwargs)
+
+
+def _rew(**overrides: object):
+    kwargs: dict[str, object] = dict(scale=None, shift=None)
+    kwargs.update(overrides)
+    return affine_reward(**kwargs)  # type: ignore[arg-type]
+
+
+def _val(**overrides: object):
+    kwargs: dict[str, object] = dict(scale=None, shift=None)
+    kwargs.update(overrides)
+    return affine_value(**kwargs)  # type: ignore[arg-type]
+
 
 _POLICY = BoundHead("action")
 _VALUE = BoundHead("value")
+
+
+def _ppo(**overrides: object) -> PpoObjective:
+    kwargs: dict[str, object] = dict(
+        head=_POLICY,
+        value_head=_VALUE,
+        discount=_disc(gamma_step=0.99),
+        reward=_rew(),
+        value=_val(),
+        grouping_field=None,
+    )
+    kwargs.update(overrides)
+    return PpoObjective(**kwargs)  # type: ignore[arg-type]
 
 
 def _ppo_batch(*, n: int=8, a: int=3, with_old_log_prob: bool=True, sequence_id: list[int] | None=None) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
@@ -23,7 +61,7 @@ def _ppo_batch(*, n: int=8, a: int=3, with_old_log_prob: bool=True, sequence_id:
 
 def test_ppo_objective_runs() -> None:
     objective_data, predictions = _ppo_batch()
-    loss, metrics = PpoObjective(head=_POLICY, value_head=_VALUE, gamma_step=0.99, grouping_field=None)(objective_data=objective_data, predictions=predictions)
+    loss, metrics = _ppo()(objective_data=objective_data, predictions=predictions)
     assert loss.ndim == 0
     assert 'ppo' in metrics
     assert 'policy_loss' in metrics
@@ -32,32 +70,32 @@ def test_ppo_objective_runs() -> None:
 
 def test_ppo_objective_runs_without_old_log_prob() -> None:
     objective_data, predictions = _ppo_batch(with_old_log_prob=False)
-    loss, metrics = PpoObjective(head=_POLICY, value_head=_VALUE, grouping_field=None)(objective_data=objective_data, predictions=predictions)
+    loss, metrics = _ppo()(objective_data=objective_data, predictions=predictions)
     assert loss.ndim == 0
     assert metrics['clipfrac'] == 0.0
 
 def test_ppo_objective_accepts_squeezed_value() -> None:
     objective_data, predictions = _ppo_batch()
     predictions['value'] = predictions['value'].squeeze(-1)
-    loss, _ = PpoObjective(head=_POLICY, value_head=_VALUE, grouping_field=None)(objective_data=objective_data, predictions=predictions)
+    loss, _ = _ppo()(objective_data=objective_data, predictions=predictions)
     assert loss.ndim == 0
 
 def test_ppo_objective_rejects_wrong_action_shape() -> None:
     objective_data, predictions = _ppo_batch()
     objective_data['action'] = torch.randint(0, 3, (8, 1))
     with pytest.raises(ValueError, match="action shape"):
-        PpoObjective(head=_POLICY, value_head=_VALUE, grouping_field=None)(objective_data=objective_data, predictions=predictions)
+        _ppo()(objective_data=objective_data, predictions=predictions)
 
 def test_ppo_objective_requires_min_sequence() -> None:
     objective_data = {'action': torch.zeros(1, dtype=torch.long), 'reward': torch.zeros(1), 'episode_done': torch.zeros(1, dtype=torch.long), 'task_done': torch.zeros(1, dtype=torch.long)}
     predictions = {'action': torch.zeros(1, 2), 'value': torch.zeros(1, 1)}
     with pytest.raises(ValueError, match="N >= 2"):
-        PpoObjective(head=_POLICY, value_head=_VALUE, grouping_field=None)(objective_data=objective_data, predictions=predictions)
+        _ppo()(objective_data=objective_data, predictions=predictions)
 
 def test_ppo_objective_closed_form_single_transition() -> None:
     objective_data = {'action': torch.tensor([0, 0]), 'reward': torch.tensor([0.0, 4.0]), 'episode_done': torch.tensor([0, 0]), 'task_done': torch.tensor([0, 0]), 'old_log_prob': torch.tensor([0.0, 0.0])}
     predictions = {'action': torch.tensor([[20.0, -20.0], [20.0, -20.0]]), 'value': torch.tensor([[1.0], [0.0]])}
-    objective = PpoObjective(head=_POLICY, value_head=_VALUE, gamma_step=0.0, gae_lambda=1.0, clip_eps=0.2, vf_coef=1.0, ent_coef=0.0, normalize_advantage=False, grouping_field=None)
+    objective = _ppo(discount=_disc(gamma_step=0.0), gae_lambda=1.0, clip_eps=0.2, vf_coef=1.0, ent_coef=0.0, normalize_advantage=False)
     loss, metrics = objective(objective_data=objective_data, predictions=predictions)
     assert abs(loss.item() - 6.0) < 0.001
     assert abs(metrics['policy_loss'] - -3.0) < 0.001
@@ -85,26 +123,26 @@ def test_ppo_masks_cross_task_pairs_only_when_grouping_field_set() -> None:
             "value": torch.tensor([[0.0], [2.0], [0.0]]),
         }
     kwargs = dict(
-        gamma_step=0.0, gae_lambda=1.0, vf_coef=1.0, ent_coef=0.0, normalize_advantage=False
+        discount=_disc(gamma_step=0.0), gae_lambda=1.0, vf_coef=1.0, ent_coef=0.0, normalize_advantage=False
     )
-    loss_cut, _ = PpoObjective(head=_POLICY, value_head=_VALUE, grouping_field="task_index", **kwargs)(
+    loss_cut, _ = _ppo(grouping_field="task_index", **kwargs)(
         objective_data=objective_data, predictions=predictions
     )
     assert abs(loss_cut.item() - 6.0) < 0.001
-    loss_leak, _ = PpoObjective(head=_POLICY, value_head=_VALUE, grouping_field=None, **kwargs)(objective_data=objective_data, predictions=predictions)
+    loss_leak, _ = _ppo(grouping_field=None, **kwargs)(objective_data=objective_data, predictions=predictions)
     assert abs(loss_leak.item() - 6.0) > 0.1
 
 
 def test_ppo_objective_skips_transitions_across_sequences() -> None:
     objective_data = {'action': torch.tensor([0, 0, 0]), 'reward': torch.tensor([0.0, 1.0, 5.0]), 'episode_done': torch.tensor([0, 0, 0]), 'task_done': torch.tensor([0, 0, 0]), 'old_log_prob': torch.tensor([0.0, 0.0, 0.0]), 'sequence_id': torch.tensor([0, 1, 1])}
     predictions = {'action': torch.tensor([[20.0, -20.0], [20.0, -20.0], [20.0, -20.0]]), 'value': torch.tensor([[0.0], [2.0], [0.0]])}
-    loss, _ = PpoObjective(head=_POLICY, value_head=_VALUE, gamma_step=0.0, gae_lambda=1.0, vf_coef=1.0, ent_coef=0.0, normalize_advantage=False, grouping_field=None)(objective_data=objective_data, predictions=predictions)
+    loss, _ = _ppo(discount=_disc(gamma_step=0.0), gae_lambda=1.0, vf_coef=1.0, ent_coef=0.0, normalize_advantage=False)(objective_data=objective_data, predictions=predictions)
     assert abs(loss.item() - 6.0) < 0.001
 
 def test_ppo_objective_all_out_of_run_pairs_yield_zero_loss() -> None:
     objective_data = {'action': torch.tensor([0, 1, 0]), 'reward': torch.tensor([0.0, 1.0, 5.0]), 'episode_done': torch.tensor([0, 0, 0]), 'task_done': torch.tensor([0, 0, 0]), 'sequence_id': torch.tensor([0, 1, 2])}
     predictions = {'action': torch.zeros(3, 2), 'value': torch.zeros(3, 1)}
-    loss, metrics = PpoObjective(head=_POLICY, value_head=_VALUE, grouping_field=None)(objective_data=objective_data, predictions=predictions)
+    loss, metrics = _ppo()(objective_data=objective_data, predictions=predictions)
     assert abs(loss.item()) < 1e-05
     assert abs(metrics['advantage_mean']) < 1e-05
 
@@ -113,7 +151,7 @@ def test_ppo_policy_loss_does_not_backprop_into_values() -> None:
     objective_data, predictions = _ppo_batch(n=6, a=3)
     predictions['action'] = predictions['action'].clone().requires_grad_(True)
     predictions['value'] = predictions['value'].clone().requires_grad_(True)
-    objective = PpoObjective(head=_POLICY, value_head=_VALUE, vf_coef=0.0, ent_coef=0.0, normalize_advantage=True, grouping_field=None)
+    objective = _ppo(vf_coef=0.0, ent_coef=0.0, normalize_advantage=True)
     loss, _ = objective(objective_data=objective_data, predictions=predictions)
     loss.backward()
     assert predictions['action'].grad is not None
@@ -130,11 +168,11 @@ def test_sample_discrete_action_shapes() -> None:
 
 def test_ppo_requires_grouping_field_argument() -> None:
     with pytest.raises(TypeError, match="grouping_field"):
-        PpoObjective(head=_POLICY, value_head=_VALUE, )  # type: ignore[call-arg]
+        PpoObjective(head=_POLICY, value_head=_VALUE, discount=_disc(), reward=_rew(), value=_val())  # type: ignore[call-arg]
 
 
 def test_ppo_rejects_multi_head_output_rows() -> None:
     objective_data, predictions = _ppo_batch(n=4)
     objective_data["head_output_count"] = torch.tensor([2, 2, 1, 1])
     with pytest.raises(ValueError, match="one prediction row per step"):
-        PpoObjective(head=_POLICY, value_head=_VALUE, grouping_field=None)(objective_data=objective_data, predictions=predictions)
+        _ppo()(objective_data=objective_data, predictions=predictions)

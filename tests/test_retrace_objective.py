@@ -6,7 +6,7 @@ import math
 import pytest
 import torch
 
-from mouse_core.objectives import DqnObjective, RetraceObjective
+from mouse_core.objectives import DqnObjective, RetraceObjective, affine_reward, affine_value, boundary_discount
 from tests._bound_head import BoundHead
 from mouse_core.objectives.dqn import _policy_entropy
 from mouse_core.objectives.retrace import _softmax_policy
@@ -15,13 +15,29 @@ from mouse_core.objectives.retrace import _softmax_policy
 # softmax([3, 0] / _T) = [0.75, 0.25]; softmax([0, 100] / _T) rounds to [0, 1] in fp32.
 _T = 3.0 / math.log(3.0)
 
-_GAMMAS = dict(
-    gamma_step=1.0,
-    gamma_episode_terminal=0.0,
-    gamma_episode_truncated=0.0,
-    gamma_task_terminal=0.0,
-    gamma_task_truncated=0.0,
-)
+
+def _disc(**overrides: float | None):
+    kwargs: dict[str, float | None] = dict(
+        gamma_step=None,
+        gamma_episode_terminal=0.0,
+        gamma_episode_truncated=0.0,
+        gamma_task_terminal=0.0,
+        gamma_task_truncated=0.0,
+    )
+    kwargs.update(overrides)
+    return boundary_discount(**kwargs)
+
+
+def _rew(**overrides: object):
+    kwargs: dict[str, object] = dict(scale=None, shift=None)
+    kwargs.update(overrides)
+    return affine_reward(**kwargs)  # type: ignore[arg-type]
+
+
+def _val(**overrides: object):
+    kwargs: dict[str, object] = dict(scale=None, shift=None)
+    kwargs.update(overrides)
+    return affine_value(**kwargs)  # type: ignore[arg-type]
 
 
 _Q = BoundHead("action_value")
@@ -40,7 +56,7 @@ def _preds(
 
 def _retrace(**overrides: object) -> RetraceObjective:
     kwargs: dict[str, object] = dict(
-        head=_Q, behavior_head=_MU, td_lambda=1.0, temperature=_T, behavior_weight=1.0, grouping_field=None, **_GAMMAS
+        head=_Q, behavior_head=_MU, td_lambda=1.0, temperature=_T, behavior_weight=1.0, grouping_field=None, discount=_disc(), reward=_rew(), value=_val()
     )
     kwargs.update(overrides)
     return RetraceObjective(**kwargs)  # type: ignore[arg-type]
@@ -98,13 +114,13 @@ def _nll_loss(mu_1: float) -> float:
 
 def test_retrace_requires_lambda_temperature_weight_and_grouping_field() -> None:
     with pytest.raises(TypeError, match="td_lambda"):
-        RetraceObjective(head=_Q, behavior_head=_MU, temperature=1.0, behavior_weight=1.0, grouping_field=None, **_GAMMAS)  # type: ignore[call-arg]
+        RetraceObjective(head=_Q, behavior_head=_MU, temperature=1.0, behavior_weight=1.0, grouping_field=None, discount=_disc(), reward=_rew(), value=_val())  # type: ignore[call-arg]
     with pytest.raises(TypeError, match="temperature"):
-        RetraceObjective(head=_Q, behavior_head=_MU, td_lambda=1.0, behavior_weight=1.0, grouping_field=None, **_GAMMAS)  # type: ignore[call-arg]
+        RetraceObjective(head=_Q, behavior_head=_MU, td_lambda=1.0, behavior_weight=1.0, grouping_field=None, discount=_disc(), reward=_rew(), value=_val())  # type: ignore[call-arg]
     with pytest.raises(TypeError, match="behavior_weight"):
-        RetraceObjective(head=_Q, behavior_head=_MU, td_lambda=1.0, temperature=1.0, grouping_field=None, **_GAMMAS)  # type: ignore[call-arg]
+        RetraceObjective(head=_Q, behavior_head=_MU, td_lambda=1.0, temperature=1.0, grouping_field=None, discount=_disc(), reward=_rew(), value=_val())  # type: ignore[call-arg]
     with pytest.raises(TypeError, match="grouping_field"):
-        RetraceObjective(head=_Q, behavior_head=_MU, td_lambda=1.0, temperature=1.0, behavior_weight=1.0, **_GAMMAS)  # type: ignore[call-arg]
+        RetraceObjective(head=_Q, behavior_head=_MU, td_lambda=1.0, temperature=1.0, behavior_weight=1.0, discount=_disc(), reward=_rew(), value=_val())  # type: ignore[call-arg]
 
 
 def test_retrace_rejects_out_of_range_hyperparameters() -> None:
@@ -183,11 +199,7 @@ def test_retrace_greedy_target_cuts_non_greedy_actions() -> None:
     """temperature = 0: delayed argmax at s1 is 0, taken a_1 = 1 → the trace is cut."""
     step_stream, predictions, delayed = _fixture(mu_1=0.25)
     _, metrics = _retrace(temperature=0.0)(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
-    one_step, _ = DqnObjective(head=_Q, gamma_step=1.0,
-        gamma_episode_terminal=0.0,
-        gamma_episode_truncated=0.0,
-        gamma_task_terminal=0.0,
-        gamma_task_truncated=0.0,
+    one_step, _ = DqnObjective(head=_Q, reward=_rew(), value=_val(), discount=_disc(),
         grouping_field=None,
         temperature=0.0,
     )(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
@@ -270,7 +282,7 @@ def test_retrace_truncation_gamma_carries_the_trace_discounted() -> None:
     step_stream, predictions, delayed = _fixture(mu_1=0.25)
     step_stream = {key: value.clone() for key, value in step_stream.items()}
     step_stream["episode_done"] = torch.tensor([0, 0, 2])
-    _, metrics = _retrace(gamma_episode_truncated=0.5)(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
+    _, metrics = _retrace(discount=_disc(gamma_episode_truncated=0.5))(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
     # γ_1 = 0.5 → G_1 = 10 + 0.5 V_π(s2); G_0 = one-step + G_1.
     g1 = 10.0 + 0.5 * _V_S2
     g0 = _ONE_STEP_G0 + g1
@@ -299,9 +311,9 @@ def test_retrace_with_multiple_head_output_rows_per_step() -> None:
 
 
 def test_retrace_q_affine_applies_to_online_and_delayed() -> None:
-    """``q_scale`` doubles online and delayed Q; π (raw Q) and μ are unchanged."""
+    """``value`` doubles online and delayed Q; π (raw Q) and μ are unchanged."""
     step_stream, predictions, delayed = _fixture(mu_1=0.25)
-    _, metrics = _retrace(q_scale=2.0)(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
+    _, metrics = _retrace(value=_val(scale=2.0))(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
     # π from raw Q; affine Q is doubled, so V = 2 E_π Q + T H[π].
     v1 = _v_pi(torch.tensor([3.0, 0.0])) - 2.25 + 4.5
     v2 = _v_pi(torch.tensor([0.0, 100.0])) - 100.0 + 200.0

@@ -10,12 +10,19 @@ import torch.nn.functional as F
 from mouse_core.models.heads.base import BaseHead
 from mouse_core.objectives.base import Objective, predictions_for, require_head
 from mouse_core.objectives.dqn import (
-    _boundary_discounts,
     _pair_weight,
     _require_action_ids,
     _require_done_codes,
     _require_step_aligned_predictions,
     _weighted_mean,
+)
+from mouse_core.objectives.transforms import (
+    Discount,
+    Reward,
+    Value,
+    _apply_transform,
+    _apply_value,
+    _require_transform,
 )
 
 
@@ -100,8 +107,14 @@ class PpoObjective(Objective):
     task-done / behavior log-prob stored at ``i+1`` describe the transition
     out of ``s_i``.
 
-    Discounts match the DQN table: the bootstrap is multiplied by the episode
-    gamma, then by the task gamma (``1.0`` when ``task_done==0``).
+    ``reward(**objective_data)`` supplies the per-step reward; the value
+    stored at ``i+1`` is ``r_t``. ``affine_reward`` is the column
+    affine; ``boundary_reward`` applies episode / task scale and shift extras.
+    ``value(value=..., **objective_data)`` supplies the per-step affine
+    on the value-head output. ``affine_value`` is the prediction affine;
+    ``boundary_value`` applies episode / task scale and shift extras.
+    Discounts match ``DqnObjective``:
+    ``discount(**objective_data)``.
 
     ``task_done`` and ``old_log_prob`` are objective columns only — not
     tokenizer input. Stamp behavior log-probs on rollout rows
@@ -130,23 +143,28 @@ class PpoObjective(Objective):
     (ratio = 1) — suitable for a single pass over a freshly collected batch.
 
     Args:
-        gamma_step: Discount for running transitions (``episode_done == 0``).
-        gamma_episode_terminal: Discount when an episode ends (``episode_done == 1``).
-        gamma_episode_truncated: Discount when an episode is truncated
-            (``episode_done == 2``).
-        gamma_task_terminal: Extra discount when the task terminates
-            (``task_done == 1``; ``EnvConfig.terminate_task``);
-            multiplies the episode discount. ``task_done == 0`` uses ``1.0``.
-        gamma_task_truncated: Extra discount when the task is truncated
-            (``task_done == 2``; last episode of ``max_task_episodes``);
-            multiplies the episode discount.
+        discount: Per-step γ from unpacked ``objective_data`` columns.
+            ``boundary_discount`` is the standard ``gamma_step`` × extra
+            lookup (factory args are required; ``None`` is identity);
+            any ``discount(**objective_data) -> [N]`` is accepted.
+        reward: Per-step reward from unpacked ``objective_data`` columns.
+            ``affine_reward`` is the column affine; ``boundary_reward``
+            applies episode / task scale and shift extras
+            (factory args are required; ``None`` is identity);
+            any ``reward(**objective_data) -> [N]`` is accepted.
+        value: Per-step affine on the value-head output from unpacked
+            ``objective_data`` columns plus ``value=``. ``affine_value``
+            is the prediction affine; ``boundary_value`` applies episode
+            / task scale and shift extras
+            (factory args are required; ``None`` is identity);
+            any ``value(value=..., **objective_data)`` returning the same
+            shape is accepted.
         gae_lambda: GAE λ (``1.0`` = Monte Carlo returns within the discount).
         clip_eps: PPO ratio clip ε.
         vf_coef: Weight on the value-function MSE term.
         ent_coef: Weight on the policy entropy bonus (subtracted from the loss).
         normalize_advantage: If True, standardize advantages over valid pairs.
         action_key: Key in ``objective_data`` for integer actions.
-        reward_key: Key in ``objective_data`` for rewards.
         episode_done_key: Key in ``objective_data`` for episode-done codes.
         task_done_key: Key in ``objective_data`` for task-done codes.
         old_log_prob_key: Key in ``objective_data`` for behavior log-probs.
@@ -164,18 +182,15 @@ class PpoObjective(Objective):
     def __init__(
         self,
         *,
-        gamma_step: float = 0.99,
-        gamma_episode_terminal: float = 0.0,
-        gamma_episode_truncated: float = 0.0,
-        gamma_task_terminal: float = 0.0,
-        gamma_task_truncated: float = 0.0,
+        discount: Discount,
+        reward: Reward,
+        value: Value,
         gae_lambda: float = 0.95,
         clip_eps: float = 0.2,
         vf_coef: float = 0.5,
         ent_coef: float = 0.01,
         normalize_advantage: bool = True,
         action_key: str = "action",
-        reward_key: str = "reward",
         episode_done_key: str = "episode_done",
         task_done_key: str = "task_done",
         old_log_prob_key: str = "old_log_prob",
@@ -184,18 +199,15 @@ class PpoObjective(Objective):
         num_actions: int | None = None,
         grouping_field: str | None,
     ) -> None:
-        self.gamma_step = gamma_step
-        self.gamma_episode_terminal = gamma_episode_terminal
-        self.gamma_episode_truncated = gamma_episode_truncated
-        self.gamma_task_terminal = gamma_task_terminal
-        self.gamma_task_truncated = gamma_task_truncated
+        self.discount = _require_transform(discount, name="discount")
+        self.reward = _require_transform(reward, name="reward")
+        self.value = _require_transform(value, name="value")
         self.gae_lambda = gae_lambda
         self.clip_eps = clip_eps
         self.vf_coef = vf_coef
         self.ent_coef = ent_coef
         self.normalize_advantage = normalize_advantage
         self.action_key = action_key
-        self.reward_key = reward_key
         self.episode_done_key = episode_done_key
         self.task_done_key = task_done_key
         self.old_log_prob_key = old_log_prob_key
@@ -266,18 +278,27 @@ class PpoObjective(Objective):
             )
         _require_action_ids(action, A)
 
-        reward = objective_data[self.reward_key]
-        if reward.dtype != torch.float32:
-            raise TypeError(f"reward must be float32, got {reward.dtype}.")
-        if reward.shape != torch.Size([N]):
-            raise ValueError(
-                f"PPO objective expects reward shape [{N}], got {tuple(reward.shape)}."
-            )
+        reward = _apply_transform(
+            transform=self.reward,
+            name="reward",
+            objective_data=objective_data,
+            N=N,
+            dtype=dtype,
+            device=device,
+        )
 
-        episode_done, task_done = _require_done_codes(
+        _require_done_codes(
             objective_data,
             episode_done_key=self.episode_done_key,
             task_done_key=self.task_done_key,
+            N=N,
+        )
+        values = _apply_value(
+            transform=self.value,
+            name="value",
+            value=values,
+            objective_data=objective_data,
+            step_of=torch.arange(N, device=device, dtype=torch.int64),
             N=N,
         )
 
@@ -295,17 +316,15 @@ class PpoObjective(Objective):
         curr_logits = logits[:-1, :]
         curr_values = values[:-1]
 
-        discounts = _boundary_discounts(
-            episode_done=episode_done[1:],
-            task_done=task_done[1:],
-            gamma_step=self.gamma_step,
-            gamma_episode_terminal=self.gamma_episode_terminal,
-            gamma_episode_truncated=self.gamma_episode_truncated,
-            gamma_task_terminal=self.gamma_task_terminal,
-            gamma_task_truncated=self.gamma_task_truncated,
+        discount_all = _apply_transform(
+            transform=self.discount,
+            name="discount",
+            objective_data=objective_data,
+            N=N,
             dtype=dtype,
             device=device,
         )
+        discounts = discount_all[1:]
 
         advantages, returns = _gae_advantages(
             rewards=next_rewards,

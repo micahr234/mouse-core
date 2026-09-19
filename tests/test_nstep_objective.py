@@ -4,18 +4,33 @@ from __future__ import annotations
 import pytest
 import torch
 
-from mouse_core.objectives import DqnObjective, NStepDqnObjective
+from mouse_core.objectives import DqnObjective, NStepDqnObjective, affine_reward, affine_value, boundary_discount
 from tests._bound_head import BoundHead
 from mouse_core.objectives.nstep import _n_step_targets
 
 
-_GAMMAS = dict(
-    gamma_step=1.0,
-    gamma_episode_terminal=0.0,
-    gamma_episode_truncated=0.0,
-    gamma_task_terminal=0.0,
-    gamma_task_truncated=0.0,
-)
+def _disc(**overrides: float | None):
+    kwargs: dict[str, float | None] = dict(
+        gamma_step=None,
+        gamma_episode_terminal=0.0,
+        gamma_episode_truncated=0.0,
+        gamma_task_terminal=0.0,
+        gamma_task_truncated=0.0,
+    )
+    kwargs.update(overrides)
+    return boundary_discount(**kwargs)
+
+
+def _rew(**overrides: object):
+    kwargs: dict[str, object] = dict(scale=None, shift=None)
+    kwargs.update(overrides)
+    return affine_reward(**kwargs)  # type: ignore[arg-type]
+
+
+def _val(**overrides: object):
+    kwargs: dict[str, object] = dict(scale=None, shift=None)
+    kwargs.update(overrides)
+    return affine_value(**kwargs)  # type: ignore[arg-type]
 
 
 def _q(
@@ -33,7 +48,7 @@ def _q(
 
 def _nstep(**overrides: object) -> NStepDqnObjective:
     kwargs: dict[str, object] = dict(
-        n=1, head=BoundHead("action_value"), grouping_field=None, temperature=0.0, **_GAMMAS
+        n=1, head=BoundHead("action_value"), grouping_field=None, temperature=0.0, discount=_disc(), reward=_rew(), value=_val()
     )
     kwargs.update(overrides)
     return NStepDqnObjective(**kwargs)  # type: ignore[arg-type]
@@ -66,14 +81,14 @@ _TWO_STEP = 11668.0
 def test_nstep_requires_n_head_and_grouping_field() -> None:
     with pytest.raises(TypeError, match="n"):
         NStepDqnObjective(  # type: ignore[call-arg]
-            head=BoundHead("action_value"), grouping_field=None, temperature=0.0, **_GAMMAS
+            head=BoundHead("action_value"), grouping_field=None, temperature=0.0, discount=_disc(), reward=_rew(), value=_val()
         )
     with pytest.raises(TypeError, match="head"):
-        NStepDqnObjective(n=1, grouping_field=None, temperature=0.0, **_GAMMAS)  # type: ignore[call-arg]
+        NStepDqnObjective(n=1, grouping_field=None, temperature=0.0, discount=_disc(), reward=_rew(), value=_val())  # type: ignore[call-arg]
     with pytest.raises(TypeError, match="grouping_field"):
-        NStepDqnObjective(n=1, head=BoundHead("action_value"), temperature=0.0, **_GAMMAS)  # type: ignore[call-arg]
+        NStepDqnObjective(n=1, head=BoundHead("action_value"), temperature=0.0, discount=_disc(), reward=_rew(), value=_val())  # type: ignore[call-arg]
     with pytest.raises(TypeError, match="temperature"):
-        NStepDqnObjective(n=1, head=BoundHead("action_value"), grouping_field=None, **_GAMMAS)  # type: ignore[call-arg]
+        NStepDqnObjective(n=1, head=BoundHead("action_value"), grouping_field=None, discount=_disc(), reward=_rew(), value=_val())  # type: ignore[call-arg]
 
 
 def test_nstep_rejects_non_positive_n() -> None:
@@ -112,7 +127,7 @@ def test_nstep_requires_prediction_key_on_both_sides() -> None:
 def test_nstep_one_matches_dqn() -> None:
     step_stream, predictions, delayed = _lambda_fixture()
     nstep, metrics = _nstep(n=1)(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
-    dqn, _ = DqnObjective(head=BoundHead("action_value"), grouping_field=None, temperature=0.0, **_GAMMAS)(
+    dqn, _ = DqnObjective(head=BoundHead("action_value"), grouping_field=None, temperature=0.0, discount=_disc(), reward=_rew(), value=_val())(
         objective_data=step_stream, predictions=predictions, delayed_predictions=delayed
     )
     assert abs(nstep.item() - dqn.item()) < 1e-05
@@ -161,7 +176,7 @@ def test_nstep_truncation_gamma_carries_the_sum_discounted() -> None:
     step_stream = {key: value.clone() for key, value in step_stream.items()}
     step_stream["episode_done"] = torch.tensor([0, 2, 0])
     loss, _ = _nstep(
-        n=2, gamma_episode_truncated=0.5, gamma_episode_terminal=0.0
+        n=2, discount=_disc(gamma_episode_truncated=0.5)
     )(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
     # s0: 1 + 0.5 * 10 + 0.5 * 100 = 56 → (5 - 56)^2 = 2601; s1: 12100.
     assert abs(loss.item() - (2601.0 + 12100.0) / 2) < 1e-03
@@ -251,7 +266,7 @@ def test_nstep_with_multiple_head_output_rows_per_step() -> None:
 
 def test_nstep_q_affine_applies_to_online_and_delayed() -> None:
     step_stream, predictions, delayed = _lambda_fixture()
-    loss, _ = _nstep(n=1, q_scale=2.0)(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
+    loss, _ = _nstep(n=1, value=_val(scale=2.0))(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
     expected = (9.0 + 44100.0) / 2
     assert abs(loss.item() - expected) < 1e-03
 
@@ -286,7 +301,7 @@ def test_nstep_temperature_matches_dqn_one_step() -> None:
         }
     predictions, delayed = _q(torch.zeros(2, 2), torch.zeros(2, 2))
     nstep_loss, nstep_m = _nstep(temperature=1.0)(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
-    dqn_loss, dqn_m = DqnObjective(head=BoundHead("action_value"), temperature=1.0, grouping_field=None, **_GAMMAS)(
+    dqn_loss, dqn_m = DqnObjective(head=BoundHead("action_value"), temperature=1.0, grouping_field=None, discount=_disc(), reward=_rew(), value=_val())(
         objective_data=step_stream, predictions=predictions, delayed_predictions=delayed
     )
     assert abs(nstep_loss.item() - dqn_loss.item()) < 1e-06

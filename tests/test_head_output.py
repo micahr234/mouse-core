@@ -11,9 +11,34 @@ from mouse_core.models import LatentReasoner, Model, ModelOutput
 from mouse_core.models.backbone import TransformerBackbone
 from mouse_core.models.heads import RegressionHead
 from mouse_core.models.reasoner import _plan_insertions
-from mouse_core.objectives import DqnObjective
+from mouse_core.objectives import DqnObjective, affine_reward, affine_value, boundary_discount
 from tests._bound_head import BoundHead
 from tests._token_batch_helpers import batch_to_packed
+
+
+def _disc(**overrides: float | None):
+    kwargs: dict[str, float | None] = dict(
+        gamma_step=None,
+        gamma_episode_terminal=0.0,
+        gamma_episode_truncated=0.0,
+        gamma_task_terminal=0.0,
+        gamma_task_truncated=0.0,
+    )
+    kwargs.update(overrides)
+    return boundary_discount(**kwargs)
+
+
+def _rew(**overrides: object):
+    kwargs: dict[str, object] = dict(scale=None, shift=None)
+    kwargs.update(overrides)
+    return affine_reward(**kwargs)  # type: ignore[arg-type]
+
+
+def _val(**overrides: object):
+    kwargs: dict[str, object] = dict(scale=None, shift=None)
+    kwargs.update(overrides)
+    return affine_value(**kwargs)  # type: ignore[arg-type]
+
 
 _HIDDEN = 32
 _ACTIONS = 4
@@ -319,7 +344,7 @@ def test_dqn_duplicated_rows_match_single_head_output() -> None:
     N, A = 5, _ACTIONS
     q = torch.randn(N, A)
     q_target = torch.randn(N, A)
-    objective = DqnObjective(head=BoundHead("action_value"), gamma_step=0.9, gamma_episode_terminal=0.0, gamma_episode_truncated=0.0, gamma_task_terminal=0.0, gamma_task_truncated=0.0, grouping_field=None, temperature=0.0)
+    objective = DqnObjective(head=BoundHead("action_value"), reward=_rew(), value=_val(), discount=_disc(gamma_step=0.9), grouping_field=None, temperature=0.0)
 
     base_loss, base_metrics = objective(
         objective_data=_objective_data(N), predictions={"action_value": q}, delayed_predictions={"action_value": q_target},
@@ -341,7 +366,7 @@ def test_dqn_multi_head_output_shares_step_target() -> None:
     gamma = 0.9
     q = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
     q_target = torch.tensor([[10.0, 20.0], [30.0, 40.0], [50.0, 60.0]])
-    objective = DqnObjective(head=BoundHead("action_value"), gamma_step=gamma, gamma_episode_terminal=0.0, gamma_episode_truncated=0.0, gamma_task_terminal=0.0, gamma_task_truncated=0.0, grouping_field=None, temperature=0.0)
+    objective = DqnObjective(head=BoundHead("action_value"), reward=_rew(), value=_val(), discount=_disc(gamma_step=gamma), grouping_field=None, temperature=0.0)
     data = _objective_data(2, counts=[2, 1], actions=[0, 1])
     data["reward"] = torch.tensor([0.0, 0.5])
     loss, _ = objective(
@@ -356,7 +381,7 @@ def test_dqn_misaligned_head_output_count_raises() -> None:
     N = 3
     q = torch.randn(2 * N, _ACTIONS)
     preds = {"action_value": q}
-    objective = DqnObjective(head=BoundHead("action_value"), gamma_step=1.0, gamma_episode_terminal=0.0, gamma_episode_truncated=0.0, gamma_task_terminal=0.0, gamma_task_truncated=0.0, grouping_field=None, temperature=0.0)
+    objective = DqnObjective(head=BoundHead("action_value"), reward=_rew(), value=_val(), discount=_disc(), grouping_field=None, temperature=0.0)
     with pytest.raises(ValueError, match="misaligned"):
         objective(objective_data=_objective_data(N, counts=[2, 2, 1]), predictions=preds, delayed_predictions={key: value.clone() for key, value in preds.items()})
     with pytest.raises(ValueError, match="head_output_count column"):

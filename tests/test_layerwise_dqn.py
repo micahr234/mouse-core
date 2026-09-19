@@ -6,8 +6,34 @@ from mouse_core.models.backbone import TransformerBackbone
 from mouse_core.data import Tokenizer
 from mouse_core.models.heads import LayerwiseRegressionHead
 from mouse_core.models.base import Model
-from mouse_core.objectives import LayerwiseDqnObjective
+from mouse_core.objectives import LayerwiseDqnObjective, affine_reward, affine_value, boundary_discount
 from tests._bound_head import BoundHead
+
+
+def _disc(**overrides: float | None):
+    kwargs: dict[str, float | None] = dict(
+        gamma_step=None,
+        gamma_episode_terminal=0.0,
+        gamma_episode_truncated=0.0,
+        gamma_task_terminal=0.0,
+        gamma_task_truncated=0.0,
+    )
+    kwargs.update(overrides)
+    return boundary_discount(**kwargs)
+
+
+def _rew(**overrides: object):
+    kwargs: dict[str, object] = dict(scale=None, shift=None)
+    kwargs.update(overrides)
+    return affine_reward(**kwargs)  # type: ignore[arg-type]
+
+
+def _val(**overrides: object):
+    kwargs: dict[str, object] = dict(scale=None, shift=None)
+    kwargs.update(overrides)
+    return affine_value(**kwargs)  # type: ignore[arg-type]
+
+
 from mouse_core.polyak import Polyak
 from tests._token_batch_helpers import batch_to_packed, batch_to_token_batch, token_tokenizer
 
@@ -41,7 +67,16 @@ def test_model_layerwise_forward_and_objective() -> None:
         delayed_predictions = delayed(token_batch).predictions
     assert 'action_value_layerwise' in predictions.keys()
     assert predictions['action_value_layerwise'].shape[-2:] == (2, 4)
-    objective = LayerwiseDqnObjective(head=model._heads["action_value_layerwise"], num_backbone_layers=2, gamma_step_start=0.0, gamma_step=0.99, gamma_episode_terminal_start=0.0, gamma_episode_terminal=0.0, gamma_episode_truncated_start=0.0, gamma_episode_truncated=0.0, gamma_task_terminal_start=0.0, gamma_task_terminal=0.0, gamma_task_truncated_start=0.0, gamma_task_truncated=0.0, grouping_field=None, temperature=0.0)
+    objective = LayerwiseDqnObjective(
+        head=model._heads["action_value_layerwise"],
+        num_backbone_layers=2,
+        discount_start=_disc(gamma_step=0.0),
+        discount=_disc(gamma_step=0.99),
+        grouping_field=None,
+        temperature=0.0,
+        reward=_rew(),
+        value=_val(),
+    )
     loss, metrics = objective(objective_data=objective_data, predictions=predictions, delayed_predictions=delayed_predictions)
     assert loss.ndim == 0
     assert metrics['action_value_layerwise'] >= 0.0
@@ -52,7 +87,17 @@ def test_layerwise_objective_q_metrics_use_curr_max_q() -> None:
     step_stream = {'action': torch.tensor([0, 1, 0]), 'reward': torch.tensor([0.0, 1.0, 5.0]), 'episode_done': torch.tensor([0, 0, 0]), 'task_done': torch.tensor([0, 0, 0])}
     predictions = {'action_value_layerwise': torch.tensor([[[0.0, 2.0], [3.0, 0.0]], [[0.0, 0.0], [0.0, 0.0]], [[0.0, 0.0], [0.0, 0.0]]])}
     delayed = {'action_value_layerwise': torch.zeros(3, 2, 2)}
-    _, metrics = LayerwiseDqnObjective(head=BoundHead("action_value_layerwise"), num_backbone_layers=2, gamma_step_start=0.0, gamma_step=0.0, gamma_episode_terminal_start=0.0, gamma_episode_terminal=0.0, gamma_episode_truncated_start=0.0, gamma_episode_truncated=0.0, gamma_task_terminal_start=0.0, gamma_task_terminal=0.0, gamma_task_truncated_start=0.0, gamma_task_truncated=0.0, grouping_field=None, temperature=0.0)(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
+    zero = _disc(gamma_step=0.0)
+    _, metrics = LayerwiseDqnObjective(
+        head=BoundHead("action_value_layerwise"),
+        num_backbone_layers=2,
+        discount_start=zero,
+        discount=zero,
+        grouping_field=None,
+        temperature=0.0,
+        reward=_rew(),
+        value=_val(),
+    )(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
     assert abs(metrics['q_values_mean'] - 1.5) < 1e-05
     assert abs(metrics['layer_0_q_mean'] - 1.0) < 1e-05
     assert abs(metrics['layer_1_q_mean'] - 1.5) < 1e-05
@@ -82,18 +127,18 @@ def _layerwise_lambda_fixture() -> tuple[dict[str, torch.Tensor], dict[str, torc
 # Layer 0 (gamma 0.5): one-step 2.5 / 60 → ((5-2.5)^2 + 60^2) / 2 = 1803.125;
 #   λ=1: G_0 = 1 + 0.5 * 60 = 31 → (676 + 3600) / 2 = 2138.
 def _layerwise(td_lambda: float = 0.0, watkins: bool = False) -> LayerwiseDqnObjective:
-    return LayerwiseDqnObjective(head=BoundHead("action_value_layerwise"), 
-        num_backbone_layers=2, gamma_step_start=0.5, gamma_step=0.9,
-        td_lambda=td_lambda, watkins=watkins,
-        gamma_episode_terminal_start=0.0,
-        gamma_episode_terminal=0.0,
-        gamma_episode_truncated_start=0.0,
-        gamma_episode_truncated=0.0,
-        gamma_task_terminal_start=0.0,
-        gamma_task_terminal=0.0,
-        gamma_task_truncated_start=0.0,
-        gamma_task_truncated=0.0,
-        grouping_field=None, temperature=0.0)
+    return LayerwiseDqnObjective(
+        head=BoundHead("action_value_layerwise"),
+        num_backbone_layers=2,
+        discount_start=_disc(gamma_step=0.5),
+        discount=_disc(gamma_step=0.9),
+        td_lambda=td_lambda,
+        watkins=watkins,
+        grouping_field=None,
+        temperature=0.0,
+        reward=_rew(),
+        value=_val(),
+    )
 
 
 def test_layerwise_td_lambda_zero_is_one_step() -> None:
