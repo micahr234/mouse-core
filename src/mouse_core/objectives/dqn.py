@@ -404,19 +404,19 @@ class DqnObjective(Objective):
             passed to ``Model(heads=)``.
         discount: Per-step γ from unpacked ``objective_data`` columns.
             ``boundary_discount`` is the standard ``gamma_step`` × extra
-            lookup (factory args are required; ``None`` is identity);
+            lookup (``None`` skips the call and uses ``1``);
             any ``discount(**objective_data) -> [N]`` is accepted.
         reward: Per-step reward from unpacked ``objective_data`` columns.
             ``affine_reward`` is the column affine; ``boundary_reward``
             applies episode / task scale and shift extras
-            (factory args are required; ``None`` is identity);
+            (``None`` skips the call);
             any ``reward(**objective_data) -> [N]`` is accepted.
             Does not change ``objective_data``.
         value: Per-step affine on online and delayed Q from unpacked
             ``objective_data`` columns plus ``value=``. ``affine_value``
             is the prediction affine; ``boundary_value`` applies episode
             / task scale and shift extras
-            (factory args are required; ``None`` is identity);
+            (``None`` skips the call);
             any ``value(value=..., **objective_data)`` returning the same
             shape is accepted. Same callable on both networks. Does not
             change the prediction tensors or eval ``argmax``.
@@ -444,9 +444,9 @@ class DqnObjective(Objective):
         self,
         *,
         head: BaseHead,
-        discount: Discount,
-        reward: Reward,
-        value: Value,
+        discount: Discount | None,
+        reward: Reward | None,
+        value: Value | None,
         temperature: float,
         action_key: str = "action",
         episode_done_key: str = "episode_done",
@@ -525,6 +525,7 @@ class DqnObjective(Objective):
             N=N,
             dtype=value_dtype,
             device=device,
+            identity=objective_data["reward"],
         )
 
         _require_done_codes(
@@ -583,6 +584,7 @@ class DqnObjective(Objective):
             N=N,
             dtype=value_dtype,
             device=device,
+            identity=torch.ones(N, dtype=value_dtype, device=device),
         )
 
         q_values = q.gather(dim=-1, index=next_actions.unsqueeze(-1)).squeeze(-1)  # [P]

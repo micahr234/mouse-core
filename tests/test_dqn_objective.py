@@ -11,9 +11,9 @@ from mouse_core.objectives.dqn import (
 )
 
 
-def _disc(**overrides: float | None):
-    kwargs: dict[str, float | None] = dict(
-        gamma_step=None,
+def _disc(**overrides: float):
+    kwargs = dict(
+        gamma_step=1.0,
         gamma_episode_terminal=0.0,
         gamma_episode_truncated=0.0,
         gamma_task_terminal=0.0,
@@ -24,13 +24,13 @@ def _disc(**overrides: float | None):
 
 
 def _rew(**overrides: object):
-    kwargs: dict[str, object] = dict(scale=None, shift=None)
+    kwargs: dict[str, object] = dict(scale=1.0, shift=0.0)
     kwargs.update(overrides)
     return affine_reward(**kwargs)  # type: ignore[arg-type]
 
 
 def _val(**overrides: object):
-    kwargs: dict[str, object] = dict(scale=None, shift=None)
+    kwargs: dict[str, object] = dict(scale=1.0, shift=0.0)
     kwargs.update(overrides)
     return affine_value(**kwargs)  # type: ignore[arg-type]
 
@@ -112,50 +112,27 @@ def test_boundary_value_applies_episode_and_task_affine() -> None:
     assert torch.allclose(got, want_rows.unsqueeze(-1).expand_as(q))
 
 
-def test_factory_none_args_are_identity() -> None:
-    reward_col = torch.tensor([0.5, -1.0, 3.0])
-    q = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
-    episode_done = torch.tensor([0, 1, 2])
-    task_done = torch.tensor([1, 2, 0])
-    reward = boundary_reward(
-        scale=None,
-        shift=None,
-        reward_episode_terminal_scale=None,
-        reward_episode_terminal_shift=None,
-        reward_episode_truncated_scale=None,
-        reward_episode_truncated_shift=None,
-        reward_task_terminal_scale=None,
-        reward_task_terminal_shift=None,
-        reward_task_truncated_scale=None,
-        reward_task_truncated_shift=None,
+def test_objective_none_transforms_are_identity() -> None:
+    """``None`` skips the callable: reward column, raw Q, discount ``1``."""
+    step_stream = {
+            "action": torch.tensor([0, 1, 0]),
+            "reward": torch.tensor([0.0, 1.0, 5.0]),
+            "episode_done": torch.tensor([0, 1, 0]),
+            "task_done": torch.tensor([0, 0, 0]),
+        }
+    predictions, delayed = _q(
+        torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]]),
+        torch.zeros(3, 2),
     )
-    value = boundary_value(
-        scale=None,
-        shift=None,
-        value_episode_terminal_scale=None,
-        value_episode_terminal_shift=None,
-        value_episode_truncated_scale=None,
-        value_episode_truncated_shift=None,
-        value_task_terminal_scale=None,
-        value_task_terminal_shift=None,
-        value_task_truncated_scale=None,
-        value_task_truncated_shift=None,
-    )
-    discount = boundary_discount(
-        gamma_step=None,
-        gamma_episode_terminal=None,
-        gamma_episode_truncated=None,
-        gamma_task_terminal=None,
-        gamma_task_truncated=None,
-    )
-    got_reward = reward(reward=reward_col, episode_done=episode_done, task_done=task_done)
-    got_value = value(value=q, episode_done=torch.tensor([0, 1]), task_done=torch.tensor([2, 0]))
-    got_discount = discount(episode_done=episode_done, task_done=task_done)
-    assert got_reward is reward_col
-    assert got_value is q
-    assert torch.equal(got_discount, torch.ones(3))
-    assert affine_reward(scale=None, shift=None)(reward=reward_col) is reward_col
-    assert affine_value(scale=None, shift=None)(value=q) is q
+    skipped, _ = DqnObjective(
+        head=_Q, reward=None, value=None, discount=None,
+        grouping_field=None, temperature=0.0,
+    )(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
+    explicit, _ = DqnObjective(
+        head=_Q, reward=_rew(), value=_val(), discount=_disc(gamma_step=1.0, gamma_episode_terminal=1.0, gamma_episode_truncated=1.0, gamma_task_terminal=1.0, gamma_task_truncated=1.0),
+        grouping_field=None, temperature=0.0,
+    )(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
+    assert abs(skipped.item() - explicit.item()) < 1e-05
 
 
 def test_factory_args_are_required() -> None:
@@ -756,6 +733,16 @@ def test_temperature_does_not_change_gamma_zero_target() -> None:
 def test_dqn_requires_discount_argument() -> None:
     with pytest.raises(TypeError, match="discount"):
         DqnObjective(head=_Q, reward=_rew(), value=_val(), grouping_field=None, temperature=0.0)  # type: ignore[call-arg]
+
+
+def test_dqn_requires_reward_argument() -> None:
+    with pytest.raises(TypeError, match="reward"):
+        DqnObjective(head=_Q, value=_val(), discount=_disc(), grouping_field=None, temperature=0.0)  # type: ignore[call-arg]
+
+
+def test_dqn_requires_value_argument() -> None:
+    with pytest.raises(TypeError, match="value"):
+        DqnObjective(head=_Q, reward=_rew(), discount=_disc(), grouping_field=None, temperature=0.0)  # type: ignore[call-arg]
 
 
 def test_dqn_custom_discount_function() -> None:

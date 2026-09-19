@@ -16,9 +16,9 @@ from mouse_core.objectives.retrace import _softmax_policy
 _T = 3.0 / math.log(3.0)
 
 
-def _disc(**overrides: float | None):
-    kwargs: dict[str, float | None] = dict(
-        gamma_step=None,
+def _disc(**overrides: float):
+    kwargs = dict(
+        gamma_step=1.0,
         gamma_episode_terminal=0.0,
         gamma_episode_truncated=0.0,
         gamma_task_terminal=0.0,
@@ -29,13 +29,13 @@ def _disc(**overrides: float | None):
 
 
 def _rew(**overrides: object):
-    kwargs: dict[str, object] = dict(scale=None, shift=None)
+    kwargs: dict[str, object] = dict(scale=1.0, shift=0.0)
     kwargs.update(overrides)
     return affine_reward(**kwargs)  # type: ignore[arg-type]
 
 
 def _val(**overrides: object):
-    kwargs: dict[str, object] = dict(scale=None, shift=None)
+    kwargs: dict[str, object] = dict(scale=1.0, shift=0.0)
     kwargs.update(overrides)
     return affine_value(**kwargs)  # type: ignore[arg-type]
 

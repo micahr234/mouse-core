@@ -246,18 +246,18 @@ class RetraceObjective(Objective):
             the trace.
         discount: Per-step γ from unpacked ``objective_data`` columns.
             ``boundary_discount`` is the standard ``gamma_step`` × extra
-            lookup (factory args are required; ``None`` is identity);
+            lookup (``None`` skips the call and uses ``1``);
             any ``discount(**objective_data) -> [N]`` is accepted.
         reward: Per-step reward from unpacked ``objective_data`` columns.
             ``affine_reward`` is the column affine; ``boundary_reward``
             applies episode / task scale and shift extras
-            (factory args are required; ``None`` is identity);
+            (``None`` skips the call);
             any ``reward(**objective_data) -> [N]`` is accepted.
         value: Per-step affine on online and delayed Q from unpacked
             ``objective_data`` columns plus ``value=``. ``affine_value``
             is the prediction affine; ``boundary_value`` applies episode
             / task scale and shift extras
-            (factory args are required; ``None`` is identity);
+            (``None`` skips the call);
             any ``value(value=..., **objective_data)`` returning the same
             shape is accepted. Same callable on both networks; ``π`` is
             taken over the raw Q and is unchanged by it.
@@ -291,9 +291,9 @@ class RetraceObjective(Objective):
         td_lambda: float,
         temperature: float,
         behavior_weight: float,
-        discount: Discount,
-        reward: Reward,
-        value: Value,
+        discount: Discount | None,
+        reward: Reward | None,
+        value: Value | None,
         head: BaseHead,
         behavior_head: BaseHead,
         action_key: str = "action",
@@ -379,6 +379,7 @@ class RetraceObjective(Objective):
             N=N,
             dtype=value_dtype,
             device=device,
+            identity=objective_data["reward"],
         )
 
         _require_done_codes(
@@ -426,6 +427,7 @@ class RetraceObjective(Objective):
             N=N,
             dtype=value_dtype,
             device=device,
+            identity=torch.ones(N, dtype=value_dtype, device=device),
         )
 
         # Behavior head outputs logits; log_softmax is log μ(· | s). Every row of

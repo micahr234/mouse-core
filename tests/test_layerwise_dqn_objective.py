@@ -8,9 +8,9 @@ from tests._bound_head import BoundHead
 _LW = BoundHead("action_value_layerwise")
 
 
-def _disc(**overrides: float | None):
-    kwargs: dict[str, float | None] = dict(
-        gamma_step=None,
+def _disc(**overrides: float):
+    kwargs = dict(
+        gamma_step=1.0,
         gamma_episode_terminal=0.0,
         gamma_episode_truncated=0.0,
         gamma_task_terminal=0.0,
@@ -21,13 +21,13 @@ def _disc(**overrides: float | None):
 
 
 def _rew(**overrides: object):
-    kwargs: dict[str, object] = dict(scale=None, shift=None)
+    kwargs: dict[str, object] = dict(scale=1.0, shift=0.0)
     kwargs.update(overrides)
     return affine_reward(**kwargs)  # type: ignore[arg-type]
 
 
 def _val(**overrides: object):
-    kwargs: dict[str, object] = dict(scale=None, shift=None)
+    kwargs: dict[str, object] = dict(scale=1.0, shift=0.0)
     kwargs.update(overrides)
     return affine_value(**kwargs)  # type: ignore[arg-type]
 
@@ -166,6 +166,22 @@ def test_single_layer_rejects_mismatched_start_and_deep_gamma() -> None:
     same = _disc(gamma_step=0.5)
     objective = _lw(num_backbone_layers=1, discount_start=same, discount=same)
     assert objective.layer_gamma_step == [0.5]
+
+
+def test_layerwise_none_discounts_are_identity() -> None:
+    """``None`` skips both discount callables; every layer uses γ ``1``."""
+    objective = LayerwiseDqnObjective(
+        head=_LW,
+        num_backbone_layers=3,
+        discount_start=None,
+        discount=None,
+        grouping_field=None,
+        temperature=0.0,
+        reward=None,
+        value=None,
+    )
+    assert objective.layer_gamma_step == [1.0, 1.0, 1.0]
+    assert objective.layer_gamma_episode_terminal == [1.0, 1.0, 1.0]
 
 
 def _layerwise(**overrides: object) -> LayerwiseDqnObjective:

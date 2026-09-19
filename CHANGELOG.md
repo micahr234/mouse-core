@@ -10,35 +10,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - ``boundary_discount``: ``gamma_step`` × episode extra × task extra
   done-code lookup. ``gamma_step`` multiplies every transition; extras
-  are ``1.0`` when the matching code is ``0``. Every factory argument
-  is required; ``None`` is identity (``1.0``). All ``None`` returns
-  ``1`` at every step. Pass it as ``discount=`` (and
-  ``discount_start=`` on layerwise) to the DQN-family and PPO
+  are ``1.0`` when the matching code is ``0``. Pass it as ``discount=``
+  (and ``discount_start=`` on layerwise) to the DQN-family and PPO
   objectives, or any ``discount(**objective_data)`` returning
-  per-step γ.
+  per-step γ. ``discount=None`` skips the call and uses ``1``.
 - ``affine_reward``: ``scale * reward + shift``. Shared by the
   DQN-family and PPO objectives (with ``boundary_discount``) in
-  ``mouse_core.objectives``. Every argument is required; ``None``
-  is identity. Both ``None`` returns the ``reward`` column unchanged.
-  Pass it as ``reward=``, or any ``reward(**objective_data)``
-  returning per-step r.
+  ``mouse_core.objectives``. Pass it as ``reward=``, or any
+  ``reward(**objective_data)`` returning per-step r. ``reward=None``
+  skips the call and uses the ``reward`` column.
 - ``boundary_reward``: ``(scale × episode scale × task scale) *
   reward + shift + episode shift + task shift`` done-code lookup.
   Scale extras are ``1.0`` and shift extras are ``0.0`` when the
-  matching code is ``0``. Every argument is required; ``None`` is
-  identity. All ``None`` returns the ``reward`` column unchanged.
-  Pass it as ``reward=``.
+  matching code is ``0``. Pass it as ``reward=``.
 - ``affine_value``: ``scale * value + shift`` on a Q / V tensor.
-  Shared by the DQN-family and PPO objectives. Every argument is
-  required; ``None`` is identity. Both ``None`` returns the tensor
-  unchanged. Pass it as ``value=``, or any
-  ``value(value=..., **objective_data)`` returning the same shape.
+  Shared by the DQN-family and PPO objectives. Pass it as ``value=``,
+  or any ``value(value=..., **objective_data)`` returning the same
+  shape. ``value=None`` skips the call and leaves Q / V unchanged.
 - ``boundary_value``: ``(scale × episode scale × task scale) *
   value + shift + episode shift + task shift`` done-code lookup.
   Scale extras are ``1.0`` and shift extras are ``0.0`` when the
-  matching code is ``0``. Every argument is required; ``None`` is
-  identity. All ``None`` returns the value / Q tensor unchanged.
-  Pass it as ``value=``.
+  matching code is ``0``. Pass it as ``value=``.
 - ``TransformerBackbone``: one public transformer backbone. ``pretrained=``
   inspects the Hub config. Packed Flex / varlen / padded kernels run when
   every layer is a Llama/Qwen3-shaped softmax block (including other
@@ -66,9 +58,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of ``q_scale`` / ``q_shift``. Columns are unpacked as
   keyword arguments. ``affine_value`` is the prediction affine;
   ``boundary_value`` applies episode / task scale and shift extras.
-  Factory arguments on ``affine_*`` / ``boundary_*`` are required
-  and take ``None`` as identity (reward / value unchanged, discount
-  ``1``).
+  ``discount=``, ``reward=``, and ``value=`` are required; ``None``
+  skips that callable (reward column / Q unchanged, discount ``1``).
 - ``objective_data`` and ``predictions`` are ``dict[str, Tensor]``. Move a
   dict with ``to_device(data=, device=)``. ``Model.head`` no longer takes
   ``batch_size``.

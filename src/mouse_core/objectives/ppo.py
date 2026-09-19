@@ -145,18 +145,18 @@ class PpoObjective(Objective):
     Args:
         discount: Per-step γ from unpacked ``objective_data`` columns.
             ``boundary_discount`` is the standard ``gamma_step`` × extra
-            lookup (factory args are required; ``None`` is identity);
+            lookup (``None`` skips the call and uses ``1``);
             any ``discount(**objective_data) -> [N]`` is accepted.
         reward: Per-step reward from unpacked ``objective_data`` columns.
             ``affine_reward`` is the column affine; ``boundary_reward``
             applies episode / task scale and shift extras
-            (factory args are required; ``None`` is identity);
+            (``None`` skips the call);
             any ``reward(**objective_data) -> [N]`` is accepted.
         value: Per-step affine on the value-head output from unpacked
             ``objective_data`` columns plus ``value=``. ``affine_value``
             is the prediction affine; ``boundary_value`` applies episode
             / task scale and shift extras
-            (factory args are required; ``None`` is identity);
+            (``None`` skips the call);
             any ``value(value=..., **objective_data)`` returning the same
             shape is accepted.
         gae_lambda: GAE λ (``1.0`` = Monte Carlo returns within the discount).
@@ -182,9 +182,9 @@ class PpoObjective(Objective):
     def __init__(
         self,
         *,
-        discount: Discount,
-        reward: Reward,
-        value: Value,
+        discount: Discount | None,
+        reward: Reward | None,
+        value: Value | None,
         gae_lambda: float = 0.95,
         clip_eps: float = 0.2,
         vf_coef: float = 0.5,
@@ -285,6 +285,7 @@ class PpoObjective(Objective):
             N=N,
             dtype=dtype,
             device=device,
+            identity=objective_data["reward"],
         )
 
         _require_done_codes(
@@ -323,6 +324,7 @@ class PpoObjective(Objective):
             N=N,
             dtype=dtype,
             device=device,
+            identity=torch.ones(N, dtype=dtype, device=device),
         )
         discounts = discount_all[1:]
 

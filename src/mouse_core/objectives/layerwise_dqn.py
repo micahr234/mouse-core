@@ -100,11 +100,13 @@ def _done_code_grid() -> tuple[torch.Tensor, torch.Tensor]:
 
 def _probe_discount(
     *,
-    discount: Discount,
+    discount: Discount | None,
     episode_done: int,
     task_done: int,
 ) -> float:
     """Evaluate ``discount`` on a single done-code pair."""
+    if discount is None:
+        return 1.0
     values = discount(
         episode_done=torch.tensor([episode_done], dtype=torch.int64),
         task_done=torch.tensor([task_done], dtype=torch.int64),
@@ -224,21 +226,22 @@ class LayerwiseDqnObjective(Objective):
         num_backbone_layers: Number of transformer blocks (and Q heads).
         discount: Per-step γ at the deepest layer, from unpacked
             ``objective_data`` columns. ``boundary_discount`` is the
-            standard ``gamma_step`` × extra lookup (factory args are
-            required; ``None`` is identity).
+            standard ``gamma_step`` × extra lookup (``None`` skips the
+            call and uses ``1``).
         discount_start: Per-step γ at layer 0. Intermediate layers
             horizon-lerp ``discount_start`` and ``discount``. With one
             layer both callables must agree on every done-code pair.
+            ``None`` skips the call and uses ``1``.
         reward: Per-step reward from unpacked ``objective_data`` columns.
             ``affine_reward`` is the column affine; ``boundary_reward``
             applies episode / task scale and shift extras
-            (factory args are required; ``None`` is identity);
+            (``None`` skips the call);
             any ``reward(**objective_data) -> [N]`` is accepted.
         value: Per-step affine on online and delayed Q from unpacked
             ``objective_data`` columns plus ``value=``. ``affine_value``
             is the prediction affine; ``boundary_value`` applies episode
             / task scale and shift extras
-            (factory args are required; ``None`` is identity);
+            (``None`` skips the call);
             any ``value(value=..., **objective_data)`` returning the same
             shape is accepted. Same callable on both networks.
         action_key: Key in ``objective_data`` for the integer action.
@@ -265,10 +268,10 @@ class LayerwiseDqnObjective(Objective):
         *,
         head: BaseHead,
         num_backbone_layers: int,
-        discount: Discount,
-        discount_start: Discount,
-        reward: Reward,
-        value: Value,
+        discount: Discount | None,
+        discount_start: Discount | None,
+        reward: Reward | None,
+        value: Value | None,
         temperature: float,
         action_key: str = "action",
         episode_done_key: str = "episode_done",
@@ -299,10 +302,19 @@ class LayerwiseDqnObjective(Objective):
 
         n = self.num_backbone_layers
         grid_episode, grid_task = _done_code_grid()
-        start_grid = self.discount_start(
-            episode_done=grid_episode, task_done=grid_task
+        ones = torch.ones(grid_episode.shape, dtype=torch.float32)
+        start_grid = (
+            ones
+            if self.discount_start is None
+            else self.discount_start(
+                episode_done=grid_episode, task_done=grid_task
+            )
         )
-        deep_grid = self.discount(episode_done=grid_episode, task_done=grid_task)
+        deep_grid = (
+            ones
+            if self.discount is None
+            else self.discount(episode_done=grid_episode, task_done=grid_task)
+        )
         if n == 1:
             if not torch.equal(start_grid, deep_grid):
                 raise ValueError(
@@ -392,6 +404,7 @@ class LayerwiseDqnObjective(Objective):
             N=N,
             dtype=value_dtype,
             device=device,
+            identity=objective_data["reward"],
         )
 
         _require_done_codes(
@@ -441,6 +454,7 @@ class LayerwiseDqnObjective(Objective):
             q_target[last_rows], temperature=self.temperature
         )  # [N, L]  V_l(s_i): max_a Q, or α logsumexp
 
+        ones = torch.ones(N, dtype=value_dtype, device=device)
         gamma_start = _apply_transform(
             transform=self.discount_start,
             name="discount_start",
@@ -448,6 +462,7 @@ class LayerwiseDqnObjective(Objective):
             N=N,
             dtype=value_dtype,
             device=device,
+            identity=ones,
         )
         gamma_deep = _apply_transform(
             transform=self.discount,
@@ -456,6 +471,7 @@ class LayerwiseDqnObjective(Objective):
             N=N,
             dtype=value_dtype,
             device=device,
+            identity=ones,
         )
 
         layer_losses: list[torch.Tensor] = []
