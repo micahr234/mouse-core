@@ -1064,8 +1064,7 @@ class FlexDecodeSession:
             grouping_ids: Left-padded **absolute** per-token grouping ids
                 ``[B, S]`` matching ``embeds`` (from the data pipeline
                 ``grouping_id`` field; pad columns ignored).
-            output_hidden_states: Also return every layer's hidden states
-                (for layerwise heads).
+            output_hidden_states: Also return every layer's hidden states.
 
         Returns:
             Hidden states ``[B, S, D]`` (values at pad positions are

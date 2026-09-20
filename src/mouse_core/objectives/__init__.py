@@ -11,11 +11,6 @@ from mouse_core.objectives.transforms import (
     boundary_value,
 )
 from mouse_core.objectives.grpo import GrpoObjective, group_relative_advantages
-from mouse_core.objectives.layerwise_dqn import (
-    LayerwiseDqnObjective,
-    effective_horizon,
-    gamma_from_horizon,
-)
 from mouse_core.objectives.nstep import NStepDqnObjective
 from mouse_core.objectives.ppo import PpoObjective, sample_discrete_action
 from mouse_core.objectives.retrace import RetraceObjective
@@ -35,9 +30,6 @@ __all__ = [
     "boundary_value",
     "GrpoObjective",
     "group_relative_advantages",
-    "LayerwiseDqnObjective",
-    "effective_horizon",
-    "gamma_from_horizon",
     "NStepDqnObjective",
     "PpoObjective",
     "sample_discrete_action",

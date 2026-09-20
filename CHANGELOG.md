@@ -8,10 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- ``Model.pool(output=)`` gathers last-layer states at
+  ``head_output_indices`` for ``Model.head(h=)``. Use it when
+  ``copy(..., backbone=False, reasoner=False)`` so delayed heads read
+  the online stream without a second backbone pass.
 - ``boundary_discount``: ``gamma_step`` × episode extra × task extra
   done-code lookup. ``gamma_step`` multiplies every transition; extras
   are ``1.0`` when the matching code is ``0``. Pass it as ``discount=``
-  (and ``discount_start=`` on layerwise) to the DQN-family and PPO
+  to the DQN-family and PPO
   objectives, or any ``discount(**objective_data)`` returning
   per-step γ. ``discount=None`` skips the call and uses ``1``.
 - ``affine_reward``: ``scale * reward + shift``. Shared by the
@@ -52,9 +56,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``discount(**objective_data) -> [N]`` — instead of five
   ``gamma_*`` scalars. Columns are unpacked as keyword arguments.
   ``boundary_discount`` is the standard ``gamma_step`` × extra lookup
-  (``gamma_step`` always multiplies). ``LayerwiseDqnObjective`` takes
-  ``discount`` and ``discount_start`` and horizon-lerps their per-step
-  outputs.
+  (``gamma_step`` always multiplies).
 - DQN-family and PPO objectives take ``reward`` — a callable
   ``reward(**objective_data) -> [N]`` — instead of ``reward_key`` /
   ``reward_scale`` / ``reward_shift``. Columns are unpacked as
@@ -73,37 +75,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Aligned with mouse-gym 1.1.0: ``EnvConfig.episodes_per_task`` is
   ``max_task_episodes`` (task-length timeout, ``task_done=2``).
   ``task_done=1`` is ``terminate_task`` (no longer reserved).
-  ``DqnObjective`` / ``NStepDqnObjective`` / ``LayerwiseDqnObjective`` /
+  ``DqnObjective`` / ``NStepDqnObjective`` /
   ``RetraceObjective`` / ``PpoObjective`` ``gamma_task_terminal`` /
   ``gamma_task_truncated`` docs match. Live-env notebooks pass
   ``max_task_episodes=``.
 - Depend on ``huggingface_hub>=1.32.0``.
-- ``Model.copy(heads=...)``: ``heads`` is required and is the
-  head instances the delayed model carries — only those the objective
-  reads from ``delayed_predictions`` (the Q head for ``DqnObjective`` /
-  ``RetraceObjective``, each n-step Q head, the layerwise Q head). Heads
-  left out are neither copied, run, nor Polyak-interpolated; the copy's
-  ``action_source`` is the online one when listed, else the first head.
-  ``Polyak`` pairs each delayed head with the online head of the same
-  name and rejects a delayed head that does not exist online. Every DQN
-  notebook passes ``heads=``.
+- ``Model.copy(heads=..., backbone=..., reasoner=...)``: every section
+  is required. ``heads=True`` copies every head; ``False`` attaches
+  the online heads; a sequence of instances copies only those (a
+  policy or behavior head left out is neither run nor
+  Polyak-interpolated). At least one section must be copied.
+  ``backbone=True`` / ``reasoner=True`` copy those modules; ``False``
+  attaches the online module. The copy's ``action_source`` is the
+  online one when listed, else the first head. ``Polyak`` interpolates
+  only copied sections. ``Polyak.update`` requires a ``tau`` only for
+  sections the delayed model copied; omit a shared section (or pass
+  ``None`` or ``1``). The n-step example shares the backbone and
+  delays only the Q heads.
 - Objectives take the head instance they train (``head=``, plus
   ``value_head=`` / ``behavior_head=`` where needed) instead of a
   prediction-key string. ``Model`` stamps the storage key on each head.
-  ``DqnObjective``, ``NStepDqnObjective``, ``LayerwiseDqnObjective``,
+  ``DqnObjective``, ``NStepDqnObjective``,
   ``RetraceObjective``, ``PpoObjective``, ``GrpoObjective``,
   ``SpObjective``, and ``SvObjective`` all require the head.
-- ``TransformerBackbone``, ``RegressionHead``, ``ClassificationHead``, and
-  ``LayerwiseRegressionHead`` require ``use_norm``. ``save_model`` writes
+- ``TransformerBackbone``, ``RegressionHead``, and ``ClassificationHead``
+  require ``use_norm``. ``save_model`` writes
   backbone type ``transformer`` with an ``architecture`` field
   (``llama`` / ``qwen3`` / ``hf``). Packed train dispatch is
   ``backbone.uses_packed``, not ``hasattr(model, "layers")``.
 - Head classes: ``DiscreteActionValueHead`` is ``RegressionHead``,
-  ``DiscreteActionHead`` is ``ClassificationHead``,
-  ``LayerwiseDiscreteActionValueHead`` is ``LayerwiseRegressionHead``.
-  Prediction keys are unchanged (``action_value``, ``action``,
-  ``action_value_layerwise``). ``save_model`` writes head types
-  ``regression``, ``classification``, and ``regression_layerwise``.
+  ``DiscreteActionHead`` is ``ClassificationHead``.
+  Prediction keys are ``action_value`` and ``action``. ``save_model``
+  writes head types ``regression`` and ``classification``.
 - ``Model(..., action_source=)`` is the head instance ``get_action``
   uses, not a string name. It must be one of the objects in ``heads``.
   The stored prediction key is still inferred from type (or the dict
@@ -126,10 +129,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   loads native ``embed_tokens``; from-scratch stacks take ``vocab_size=``.
   ``IdentityBackbone`` requires ``hidden_dim=`` and ``vocab_size=``.
   ``Model`` takes ``backbone=`` and ``heads=`` (no ``encoder=`` /
-  ``embedder=``). ``Polyak.update`` is ``tau_heads=`` + ``tau_backbone=``;
-  embeddings interpolate with the backbone.
+  ``embedder=``). ``Polyak.update`` takes a ``tau`` only for copied
+  sections; embeddings interpolate with the backbone when it was
+  copied.
 
 ### Removed
+- ``LayerwiseRegressionHead``, ``LayerwiseDqnObjective``,
+  ``effective_horizon``, ``gamma_from_horizon``,
+  ``ModelOutput.hidden_states``, and
+  ``examples/04_train_offline_layerwise_dqn.ipynb``.
 - Dependency on ``tensordict``.
 - ``Recurrence`` and ``Model(recurrence=)``. ``Model.forward`` runs the
   backbone once. ``ModelOutput.passes`` and ``PassOutput`` are gone;
@@ -150,8 +158,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``examples/15_train_offline_max_n_step_dqn.ipynb``.
 - ``DiscreteActionValueHead``, ``DiscreteActionHead``,
   ``LayerwiseDiscreteActionValueHead``, and ``SwiGLUHead``. Use
-  ``RegressionHead``, ``ClassificationHead``, or
-  ``LayerwiseRegressionHead``.
+  ``RegressionHead`` or ``ClassificationHead``.
 - ``prediction_key``, ``predictions_key``, ``value_key``, and
   ``behavior_key`` on objectives. Pass the head instance
   (``head=``, plus ``value_head=`` / ``behavior_head=``).
@@ -171,8 +178,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - ``temperature`` (SAC / soft Q-learning ``α``, required, ``>= 0``)
-  on ``DqnObjective``, ``NStepDqnObjective``, and
-  ``LayerwiseDqnObjective``. ``0`` is hard max-Q; ``> 0`` bootstraps
+  on ``DqnObjective`` and ``NStepDqnObjective``.
+  ``0`` is hard max-Q; ``> 0`` bootstraps
   from ``α logsumexp(Q / α)``. Same units and meaning as
   ``get_action(temperature=)``. ``RetraceObjective`` already required
   ``temperature`` for ``π = softmax(Q / α)``; that same ``α`` is now
@@ -187,8 +194,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   head — call it once per head and add the losses to train several
   horizons. ``examples/13_train_offline_n_step_dqn.ipynb`` is the same
   offline loop as ``02`` with three ``RegressionHead``s
-  (``n=1, 3, 5``), ``copy`` of every Q head, and the three
-  n-step losses summed.
+  (``n=1, 3, 5``), ``copy`` of every Q head with a shared
+  backbone, and the three n-step losses summed.
 - ``RetraceObjective``: Retrace(λ) off-policy return-based Q-learning
   (Munos et al., 2016).   The TD target is the delayed soft one-step backup
   ``V_π = E_π Q + temperature H[π]`` plus a trace of later TD errors
@@ -212,8 +219,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``examples/12_train_offline_retrace.ipynb`` is the same offline loop
   as ``02`` with ``heads={"action_value": ..., "behavior": ...}``,
   ``td_lambda=1.0``, ``temperature=0.1``, and
-  ``copy(heads=("action_value",))`` so the behavior head is
-  never run or Polyak-interpolated on the delayed side.
+  ``copy(heads=(q_head,), backbone=True, reasoner=False)`` (not
+  ``heads=True``) so the behavior head is never run or
+  Polyak-interpolated on the delayed side.
 - ``use_norm`` (required, saved with the model) on transformer
   backbones and on ``RegressionHead`` / ``ClassificationHead``. On
   ``LlamaBackbone`` / ``Qwen3Backbone``, ``True`` keeps the final

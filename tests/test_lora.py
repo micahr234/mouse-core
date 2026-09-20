@@ -316,7 +316,7 @@ def test_full_fp32_path_trains_backbone_directly_with_adamw_and_polyak() -> None
     model = _model(None).train().to(device=torch.device("cpu"))
     assert all(p.requires_grad and p.dtype == torch.float32 for p in model.parameters())
     assert model.backbone is not None and model.backbone.dtype == torch.float32
-    delayed = model.copy(heads=(model._heads["action_value"],))
+    delayed = model.copy(heads=True, backbone=True, reasoner=False)
     assert delayed.backbone is not None
     online = dict(model.backbone.named_parameters())
     for name, p in delayed.backbone.named_parameters():
@@ -343,7 +343,7 @@ def test_full_fp32_model_cast_to_bf16_is_rejected_by_adamw_and_polyak() -> None:
     model = _model(None, dtype=torch.bfloat16)
     with pytest.raises(TypeError, match="dtype=torch.float32"):
         AdamW(params=model.parameters(), lr=1e-3, fused=False)
-    delayed = model.copy(heads=(model._heads["action_value"],))
+    delayed = model.copy(heads=True, backbone=True, reasoner=False)
     with pytest.raises(TypeError, match="fp32 parameters only"):
         Polyak(online=model, delayed=delayed)
 
@@ -392,7 +392,7 @@ def test_save_load_roundtrip_without_lora_has_no_lora_key(tmp_path) -> None:
 def test_delayed_backbone_shares_frozen_base_and_copies_adapters() -> None:
     torch.manual_seed(0)
     model = _model(dtype=torch.bfloat16)
-    delayed = model.copy(heads=(model._heads["action_value"],))
+    delayed = model.copy(heads=True, backbone=True, reasoner=False)
     assert model.backbone is not None and delayed.backbone is not None
     online = dict(model.backbone.named_parameters())
     for name, p in delayed.backbone.named_parameters():
@@ -408,7 +408,7 @@ def test_delayed_backbone_shares_frozen_base_and_copies_adapters() -> None:
 def test_polyak_interpolates_lora_adapters_in_fp32_without_shadows() -> None:
     torch.manual_seed(0)
     model = _model(dtype=torch.bfloat16).eval()
-    delayed = model.copy(heads=(model._heads["action_value"],)).eval()
+    delayed = model.copy(heads=True, backbone=True, reasoner=False).eval()
     polyak = Polyak(online=model, delayed=delayed)
     assert model.backbone is not None and delayed.backbone is not None
     online_b = [m.lora_B.weight for m in lora_modules(model.backbone)]

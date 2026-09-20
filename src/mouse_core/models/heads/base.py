@@ -38,8 +38,6 @@ class HeadSpec:
     num_layers: int | None = None
     scale: float | None = None
     use_norm: bool | None = None
-    # Layerwise regression specific
-    num_backbone_layers: int | None = None
 
     def __post_init__(self) -> None:
         if self.num_layers is not None and int(self.num_layers) < 0:
@@ -47,8 +45,6 @@ class HeadSpec:
                 f"head {self.name!r} has negative num_layers ({self.num_layers}); "
                 f"use 0 to disable or a positive integer"
             )
-        if self.num_backbone_layers is not None and int(self.num_backbone_layers) <= 0:
-            raise ValueError(f"num_backbone_layers must be positive, got {self.num_backbone_layers!r}")
 
 
 def prediction_key(*, head: BaseHead) -> str:

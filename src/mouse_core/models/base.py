@@ -18,7 +18,6 @@ from mouse_core.models.backbone.flex_decode import DecodeKernel, FlexDecodeSessi
 from mouse_core.models.backbone.packed_train import TrainKernel
 from mouse_core.models.heads.base import BaseHead, _bind_prediction_key
 from mouse_core.models.heads.classification import ClassificationHead
-from mouse_core.models.heads.layerwise_regression import LayerwiseRegressionHead
 from mouse_core.models.heads.regression import RegressionHead
 from mouse_core.models.lora import LoRAConfig
 from mouse_core.models.reasoner import LatentReasoner, _InsertionPlan, _plan_insertions
@@ -26,22 +25,6 @@ from mouse_core.models.reasoner import LatentReasoner, _InsertionPlan, _plan_ins
 if TYPE_CHECKING:
     from mouse_core.data.token_batch import TokenBatch
     from mouse_core.data.tokenizer import Tokenizer
-
-def _backbone_num_layers(backbone: nn.Module) -> int | None:
-    """Return transformer block count when the backbone exposes block layers."""
-    inner = getattr(backbone, "model", None)
-    layers = getattr(inner, "layers", None)
-    if layers is not None:
-        return len(layers)
-    encoder = getattr(inner, "encoder", None)
-    encoder_layers = getattr(encoder, "layer", None)
-    if encoder_layers is not None:
-        return len(encoder_layers)
-    from mouse_core.models.backbone import IdentityBackbone
-
-    if isinstance(backbone, IdentityBackbone):
-        return 1
-    return None
 
 
 def _hub_repo_id_for_user(repo_id: str, token: str | bool | None = None) -> str:
@@ -427,18 +410,6 @@ def _heads_config(model: "Model") -> dict[str, Any]:
 
 
 def _head_config(name: str, head: BaseHead) -> dict[str, Any] | None:
-    if isinstance(head, LayerwiseRegressionHead):
-        return {
-            "name": name,
-            "type": "regression_layerwise",
-            "num_backbone_layers": head.num_backbone_layers,
-            "in_features": head.in_features,
-            "out_features": head.out_features,
-            "hidden_dim": head.hidden_dim,
-            "num_layers": head.num_layers,
-            "scale": head.scale,
-            "use_norm": head.use_norm,
-        }
     if isinstance(head, ClassificationHead):
         return {
             "name": name,
@@ -639,17 +610,7 @@ def _build_heads_from_config(heads: list[dict[str, Any]]) -> dict[str, BaseHead]
     for spec in heads:
         name = spec["name"]
         head_type = spec["type"]
-        if head_type == "regression_layerwise":
-            built[name] = LayerwiseRegressionHead(
-                num_backbone_layers=spec["num_backbone_layers"],
-                in_features=spec["in_features"],
-                out_features=spec["out_features"],
-                hidden_dim=spec["hidden_dim"],
-                num_layers=spec["num_layers"],
-                scale=spec.get("scale", 1.0),
-                use_norm=spec["use_norm"],
-            )
-        elif head_type == "classification":
+        if head_type == "classification":
             built[name] = ClassificationHead(
                 in_features=spec["in_features"],
                 out_features=spec["out_features"],
@@ -698,20 +659,11 @@ def _pool_head_outputs(
     return h.gather(1, idx)
 
 
-def _layer_hiddens(
-    session_out: torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, ...]],
-) -> tuple[torch.Tensor, ...] | None:
-    """Per-layer hidden states when the backbone returned them, else ``None``."""
-    if isinstance(session_out, tuple):
-        return session_out[1]
-    return None
-
-
 def _run_heads(
     heads: dict[str, BaseHead],
     h: torch.Tensor,
 ) -> dict[str, torch.Tensor]:
-    """Run ``heads`` on pooled ``h``. Layerwise ``h`` is ``[N, L, D]`` or ``[B, L, S, D]``."""
+    """Run ``heads`` on pooled last-layer ``h`` (``[N, D]`` or ``[B, S, D]``)."""
     h = h.float()
     return {name: head_fn.forward(h) for name, head_fn in heads.items()}
 
@@ -745,8 +697,8 @@ class DecodeCache:
 class ModelOutput:
     """Head predictions plus the token states they were read from.
 
-    ``predictions``, ``last_hidden_state``, and ``hidden_states`` come from
-    the single backbone forward.
+    ``predictions`` and ``last_hidden_state`` come from the single
+    backbone forward.
 
     ``head_output_indices`` maps token states to the rows heads read. A
     reasoning forward extends the stream, so those indices and the states
@@ -760,7 +712,6 @@ class ModelOutput:
     predictions: dict[str, torch.Tensor]
     last_hidden_state: torch.Tensor
     head_output_indices: torch.Tensor
-    hidden_states: tuple[torch.Tensor, ...] | None = None
     cache: DecodeCache | None = None
     head_output_valid: torch.Tensor | None = None
 
@@ -784,7 +735,7 @@ class Model(nn.Module):
           names are inferred from type;
         - a dict mapping caller-chosen names to head instances or ``None``.
       When a plain head is passed without a name the key is inferred from
-      type (``action_value`` / ``action`` / ``action_value_layerwise``);
+      type (``action_value`` / ``action``);
       use the dict form to pick the key.
 
     ``action_source`` is the head instance ``get_action`` consults. It must
@@ -805,10 +756,10 @@ class Model(nn.Module):
 
     ``forward`` returns a :class:`ModelOutput` with ``predictions`` and
     ``last_hidden_state``.
-    The delayed DQN model
-    comes from :meth:`copy` (a copy of every trainable parameter;
-    frozen weights shared by reference), runs on the same ``TokenBatch``,
-    and is interpolated per section with :class:`~mouse_core.polyak.Polyak`.
+    The delayed DQN model comes from :meth:`copy`, which names every
+    section (``heads``, ``backbone``, ``reasoner``). Copied sections are
+    frozen; uncopied sections stay this model's modules.
+    :class:`~mouse_core.polyak.Polyak` interpolates only copied sections.
     """
 
     @staticmethod
@@ -820,8 +771,7 @@ class Model(nn.Module):
         Supported inputs:
           - dict (caller-chosen names to head or None): passed through.
           - single BaseHead instance: becomes the only head; name is inferred
-            from type (``action_value`` / ``action`` /
-            ``action_value_layerwise``).
+            from type (``action_value`` / ``action``).
           - list/tuple of BaseHead: each gets an inferred name.
         """
         if heads is None:
@@ -873,10 +823,8 @@ class Model(nn.Module):
         """Infer a default storage key from the head type when no dict key is given.
 
         ``RegressionHead`` → ``action_value``, ``ClassificationHead``
-        → ``action``, ``LayerwiseRegressionHead`` → ``action_value_layerwise``.
+        → ``action``.
         """
-        if isinstance(head, LayerwiseRegressionHead):
-            return "action_value_layerwise"
         if isinstance(head, ClassificationHead):
             return "action"
         if isinstance(head, RegressionHead):
@@ -959,23 +907,6 @@ class Model(nn.Module):
 
         self.action_source = Model._action_source_name(self._heads, action_source)
 
-        bb_layers: int | None = None
-        for name, head in self._heads.items():
-            if not isinstance(head, LayerwiseRegressionHead):
-                continue
-            if bb_layers is None:
-                bb_layers = _backbone_num_layers(self.backbone)
-                if bb_layers is None:
-                    raise ValueError(
-                        f"{name} is layerwise and needs a backbone with a known "
-                        "layer count (e.g. TransformerBackbone)."
-                    )
-            if head.num_backbone_layers != bb_layers:
-                raise ValueError(
-                    f"Layerwise head {name!r} expects {head.num_backbone_layers} "
-                    f"backbone layers but backbone has {bb_layers}."
-                )
-
         self.hidden_dim = hidden_dim
         # Best-effort inference of action cardinality for introspection only.
         self.max_num_actions: int = 0
@@ -985,59 +916,86 @@ class Model(nn.Module):
                 self.max_num_actions = out
                 break
 
-    def copy(self, *, heads: Sequence[BaseHead]) -> "Model":
-        """Return a frozen copy of this model: backbone, reasoner, and ``heads``.
+    def copy(
+        self,
+        *,
+        heads: bool | Sequence[BaseHead],
+        backbone: bool,
+        reasoner: bool,
+    ) -> "Model":
+        """Return a model that copies the named sections and shares the rest.
 
-        The backbone is always copied (token embeddings included). A
-        reasoner, if this model has one, is copied too. ``heads``
-        selects which heads the copy carries — only those the
-        objective reads from ``delayed_predictions`` (the Q head for
-        ``DqnObjective`` / ``RetraceObjective``, each n-step Q head,
-        the layerwise Q head). Heads left out (a policy or behavior
-        head whose values nothing uses on the copy) are neither
-        copied, run, nor Polyak-interpolated. Every instance must be
-        one of this model's heads and the list must not be empty. The
-        copy's ``action_source`` is this model's when it is among
-        ``heads``, else the first head listed (the copy does not pick
-        actions).
+        ``heads``, ``backbone``, and ``reasoner`` are required.
+        ``heads=True`` copies every head. ``heads=False`` attaches this
+        model's heads. A sequence of head instances copies only those —
+        use that to leave out a policy or behavior head whose delayed
+        values nothing reads. Every instance must be one of this model's
+        heads and the list must not be empty. At least one section must
+        be copied. The copy's ``action_source`` is this model's when it
+        is among the copied or shared heads, else the first head listed
+        (the copy does not pick actions).
 
-        Every trainable parameter gets its own copy; every frozen
-        parameter (``requires_grad=False`` — the base weights of a LoRA
-        backbone) is shared by reference with this model, so a LoRA
-        backbone costs one extra copy of the adapters, not of the
-        base. A fully trainable fp32 backbone is copied whole. The
-        copy has every parameter frozen and is left in ``train()``
-        mode.
+        ``backbone=True`` deep-copies trainable backbone weights (token
+        embeddings included; a frozen LoRA base stays shared by
+        reference). ``False`` attaches this model's backbone module —
+        no second embed / backbone pass; run the copy's heads on
+        :meth:`pool` of the online :class:`ModelOutput`.
 
-        Typical TD use: run the copy as ``copied(inputs)`` with the
-        same ``TokenBatch`` (and ``reasoning=``) as the online
-        forward, under ``torch.no_grad()``.
-        :class:`~mouse_core.polyak.Polyak` interpolates the copy
-        toward this model — that averaging is what delays the
-        weights. Token embeddings ride with the backbone
-        ``embed_tokens``.
+        ``reasoner=True`` deep-copies the reasoner. Illegal when this
+        model has no reasoner. ``False`` is ``None`` when unused,
+        otherwise this model's reasoner module.
 
-        Construct after ``model.to(...)``. Do not call
+        Copied modules are frozen and left in ``train()``. Shared
+        modules are not frozen (they belong to this model).
+        :class:`~mouse_core.polyak.Polyak` interpolates only copied
+        sections. Construct after ``model.to(...)``. Do not call
         ``requires_grad_`` / ``to`` on the copy: shared frozen
-        parameters belong to this model too.
+        parameters (and a shared backbone / reasoner) belong to this
+        model too.
         """
+        if type(backbone) is not bool:
+            raise TypeError(f"backbone must be a bool, got {type(backbone).__name__}.")
+        if type(reasoner) is not bool:
+            raise TypeError(f"reasoner must be a bool, got {type(reasoner).__name__}.")
+        if reasoner and self.reasoner is None:
+            raise ValueError(
+                "copy reasoner=True requires a reasoner; construct "
+                "Model(..., reasoner=LatentReasoner(...)) or pass reasoner=False."
+            )
         if not any(p.requires_grad for p in self.parameters()):
             raise ValueError(
                 "copy needs a trainable online model (no parameter requires grad)."
             )
-        if isinstance(heads, (str, BaseHead)) or not isinstance(heads, Sequence):
+        share_heads = False
+        if heads is True:
+            names = tuple(self._heads)
+            if not names:
+                raise ValueError("copy heads=True requires the model to have at least one head.")
+        elif heads is False:
+            names = tuple(self._heads)
+            if not names:
+                raise ValueError("copy heads=False requires the model to have at least one head.")
+            share_heads = True
+        elif isinstance(heads, (str, BaseHead)) or not isinstance(heads, Sequence):
             raise TypeError(
-                f"copy heads must be a sequence of head instances, got {type(heads).__name__}."
+                f"copy heads must be True, False, or a sequence of head instances, "
+                f"got {type(heads).__name__}."
             )
-        head_list = tuple(heads)
-        if not head_list:
-            raise ValueError("copy heads must include at least one head.")
-        names = tuple(
-            Model._head_name(self._heads, head, what="copy heads")
-            for head in head_list
-        )
-        if len(set(names)) != len(names):
-            raise ValueError(f"copy heads has duplicate heads: {names}.")
+        else:
+            head_list = tuple(heads)
+            if not head_list:
+                raise ValueError("copy heads must include at least one head.")
+            names = tuple(
+                Model._head_name(self._heads, head, what="copy heads")
+                for head in head_list
+            )
+            if len(set(names)) != len(names):
+                raise ValueError(f"copy heads has duplicate heads: {names}.")
+        if share_heads and not backbone and not reasoner:
+            raise ValueError(
+                "copy must copy at least one section; pass heads=True, "
+                "backbone=True, or reasoner=True."
+            )
 
         def _copy(module: nn.Module) -> nn.Module:
             shared = {id(p): p for p in module.parameters() if not p.requires_grad}
@@ -1046,14 +1004,42 @@ class Model(nn.Module):
             delayed.train()
             return delayed
 
-        copied_heads = {name: cast(BaseHead, _copy(self._heads[name])) for name in names}
-        action_name = self.action_source if self.action_source in names else names[0]
+        if share_heads:
+            copied_heads = {name: self._heads[name] for name in names}
+            action_name = self.action_source
+        else:
+            copied_heads = {name: cast(BaseHead, _copy(self._heads[name])) for name in names}
+            action_name = self.action_source if self.action_source in names else names[0]
+        copied_backbone = (
+            cast(Backbone, _copy(self.backbone)) if backbone else self.backbone
+        )
+        if self.reasoner is None:
+            copied_reasoner: LatentReasoner | None = None
+        elif reasoner:
+            copied_reasoner = cast(LatentReasoner, _copy(self.reasoner))
+        else:
+            copied_reasoner = self.reasoner
         return Model(
-            backbone=cast(Backbone, _copy(self.backbone)),
+            backbone=copied_backbone,
             heads=copied_heads,
             action_source=copied_heads[action_name],
-            reasoner=None if self.reasoner is None else cast(LatentReasoner, _copy(self.reasoner)),
+            reasoner=copied_reasoner,
         )
+
+    def pool(self, *, output: ModelOutput) -> torch.Tensor:
+        """Gather last-layer states at the rows heads read.
+
+        ``output.last_hidden_state`` is ``[L, D]`` (train) or
+        ``[B, T, D]`` (decode). ``output.head_output_indices`` selects
+        the head-output tokens: ``[P]`` into the packed stream, or
+        ``[B, S]`` into the decode token axis. The result is the tensor
+        :meth:`head` consumes.
+        """
+        if not isinstance(output, ModelOutput):
+            raise TypeError(
+                f"pool output must be a ModelOutput, got {type(output).__name__}."
+            )
+        return _pool_head_outputs(output.last_hidden_state, output.head_output_indices)
 
     def to(self, *args: Any, **kwargs: Any) -> Self:
         """Move the model to a device; never casts.
@@ -1089,8 +1075,7 @@ class Model(nn.Module):
         embeds: torch.Tensor,
         sequence_ids: torch.Tensor,
         grouping_ids: torch.Tensor,
-        needs_layerwise: bool,
-    ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+    ) -> torch.Tensor:
         """Uncached backbone pass over the flat packed stream.
 
         Transformer backbones run :func:`packed_forward` with the backbone's
@@ -1116,7 +1101,7 @@ class Model(nn.Module):
                 embeds=embeds,
                 sequence_ids=sequence_ids,
                 grouping_ids=grouping_ids,
-                output_hidden_states=needs_layerwise,
+                output_hidden_states=False,
                 checkpoint=backbone.gradient_checkpointing,
                 train_kernel=backbone.train_kernel,
                 autocast_dtype=backbone.train_autocast_dtype,
@@ -1132,40 +1117,21 @@ class Model(nn.Module):
         )
         session_out = backbone(
             embeds.unsqueeze(0),
-            output_hidden_states=needs_layerwise,
+            output_hidden_states=False,
             attention_mask=attention_mask,
             position_ids=position_ids,
         )
-        if needs_layerwise:
-            h0, layers = session_out
-            if h0.ndim == 3:
-                h0 = h0.squeeze(0)
-            layers = tuple(x.squeeze(0) if x.ndim == 3 else x for x in layers)
-            return (h0, layers)
         if isinstance(session_out, torch.Tensor) and session_out.ndim == 3:
             return session_out.squeeze(0)
-        return session_out
+        return cast(torch.Tensor, session_out)
 
     def _pool_backbone_out(
         self,
-        session_out: torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, ...]],
+        session_out: torch.Tensor,
         head_output_indices: torch.Tensor,
-        needs_layerwise: bool,
     ) -> torch.Tensor:
-        """Pool backbone hidden states to the tensor :meth:`head` consumes."""
-        if needs_layerwise:
-            _, layer_hiddens = cast(
-                tuple[torch.Tensor, tuple[torch.Tensor, ...]], session_out
-            )
-            return torch.stack(
-                [
-                    _pool_head_outputs(layer_h, head_output_indices)
-                    for layer_h in layer_hiddens
-                ],
-                dim=1,
-            )
-        h = cast(torch.Tensor, session_out)
-        return _pool_head_outputs(h, head_output_indices)
+        """Pool last-layer hidden states to the tensor :meth:`head` consumes."""
+        return _pool_head_outputs(session_out, head_output_indices)
 
     def _generate_latents(
         self,
@@ -1222,7 +1188,6 @@ class Model(nn.Module):
                 torch.cat(parts),
                 torch.cat(seq_parts),
                 torch.cat(group_parts),
-                False,
             )
             h_last = cast(torch.Tensor, gen_out)[
                 torch.as_tensor(last_positions, device=device)
@@ -1266,10 +1231,14 @@ class Model(nn.Module):
 
         Training: ``inputs, objective_data = loader.next_batch()`` then
         ``out = model(inputs)``. Delayed DQN: ``delayed_model =
-        model.copy(heads=(head,))`` then ``delayed_model(inputs)`` under
-        ``torch.no_grad()`` (same ``TokenBatch`` and ``reasoning=`` as the
-        online forward); interpolate with ``Polyak(online=model, delayed=delayed_model)``
-        and ``polyak.update(tau_heads=..., tau_backbone=...)``.
+        model.copy(heads=True, backbone=True, reasoner=False)`` then
+        ``delayed_model(inputs)`` under ``torch.no_grad()`` (same
+        ``TokenBatch`` and ``reasoning=`` as the online forward). When
+        ``backbone=False`` (and ``reasoner=False``), skip the second
+        backbone pass: ``delayed_model.head(h=delayed_model.pool(output=out))``
+        under ``torch.no_grad()``. Interpolate with
+        ``Polyak(online=model, delayed=delayed_model)`` and
+        ``polyak.update(...)`` with a ``tau`` for each copied section.
         Online / inference: ``inputs, _ = pack_token_batch(steps=[eval_transform(step)],
         sequence_ids=[0])`` then ``model(inputs, use_cache=True)``
         (optionally ragged; empty-only batches raise). Pass ``out.cache``
@@ -1342,9 +1311,6 @@ class Model(nn.Module):
         sequence_ids = t["sequence_ids"]
         grouping_ids = t["grouping_ids"]
 
-        needs_layerwise = any(
-            isinstance(head, LayerwiseRegressionHead) for head in self._heads.values()
-        )
         new_cache: DecodeCache | None
 
         if use_cache:
@@ -1386,7 +1352,7 @@ class Model(nn.Module):
             # ``token_lengths`` already counts only real tokens (tokenize is ragged;
             # empty rows contribute 0). Do not re-derive from left-padded step indices.
             session_out = session.forward(
-                output_hidden_states=needs_layerwise,
+                output_hidden_states=False,
                 embeds=flex_embeds,
                 lengths=token_lengths,
                 grouping_ids=flex_grouping_ids,
@@ -1421,18 +1387,17 @@ class Model(nn.Module):
                 embeds,
                 sequence_ids,
                 grouping_ids,
-                needs_layerwise,
             )
             new_cache = None
             head_output_valid = None
 
+        last_h = _last_hidden(session_out)
         return ModelOutput(
             predictions=self.head(
-                h=self._pool_backbone_out(session_out, resolved_indices, needs_layerwise),
+                h=self._pool_backbone_out(last_h, resolved_indices),
             ),
-            last_hidden_state=_last_hidden(session_out),
+            last_hidden_state=last_h,
             head_output_indices=resolved_indices,
-            hidden_states=_layer_hiddens(session_out) if needs_layerwise else None,
             cache=new_cache,
             head_output_valid=head_output_valid,
         )
@@ -1442,10 +1407,9 @@ class Model(nn.Module):
         *,
         h: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """Run enabled heads on pooled ``h``.
+        """Run enabled heads on pooled last-layer ``h``.
 
-        Regular heads take last-layer ``[N, D]`` or ``[B, S, D]``. A layerwise
-        Q head takes stacked layers ``[N, L, D]`` or ``[B, L, S, D]``.
+        Heads take ``[N, D]`` (train) or ``[B, S, D]`` (decode).
         """
         return _run_heads(self._heads, h)
 
@@ -1459,7 +1423,7 @@ class Model(nn.Module):
         """Select an action from the value head at the last valid head-output.
 
         Cached decode writes Q at each step's last head-output token
-        (left-padded ``[B, S, A]``, or layerwise ``[B, S, L, A]``). Pass the
+        (left-padded ``[B, S, A]``). Pass the
         :class:`ModelOutput` from ``forward(..., use_cache=True)`` so this
         reads the last-layer residual stream at the last *valid* (non-pad)
         head-output of each row — not a padded step column and not a token
@@ -1479,7 +1443,6 @@ class Model(nn.Module):
         scores = _last_action_scores(
             cast(torch.Tensor, preds[self.action_source]),
             name=self.action_source,
-            head=self._heads[self.action_source],
             valid=valid,
         )
         if num_actions is not None:
@@ -1512,15 +1475,13 @@ def _last_action_scores(
     raw: torch.Tensor,
     *,
     name: str,
-    head: BaseHead,
     valid: torch.Tensor | None,
 ) -> torch.Tensor:
     """Action scores at the last valid head-output of each row.
 
-    Layerwise Q: ``[B, S, L, A]`` / ``[N, L, A]`` → last valid step,
-    deepest layer. Other Q / logit heads: ``[B, S, A]`` / ``[N, A]``.
-    ``valid`` is the decode ``[B, S]`` mask; omitted, the last step
-    column is used (left-padded decode).
+    Q / logit heads: ``[B, S, A]`` / ``[N, A]``. ``valid`` is the decode
+    ``[B, S]`` mask; omitted, the last step column is used (left-padded
+    decode).
     """
     if valid is not None and raw.ndim >= 3 and valid.shape != raw.shape[:2]:
         raise ValueError(
@@ -1529,23 +1490,6 @@ def _last_action_scores(
         )
     step = None if valid is None else _last_valid_step(valid)
     batch = None if step is None else torch.arange(raw.shape[0], device=raw.device)
-    if isinstance(head, LayerwiseRegressionHead):
-        if raw.ndim == 4:
-            if step is None:
-                return raw[:, -1, -1, :]
-            return raw[batch, step, -1, :]
-        if raw.ndim == 3:
-            if raw.shape[0] != 1:
-                raise ValueError(
-                    f"{name} has shape {tuple(raw.shape)}; "
-                    "get_action on flat [N, L, A] training outputs needs N=1. "
-                    "Use cached-decode [B, S, L, A] outputs for a batch."
-                )
-            return raw[-1, -1, :].unsqueeze(0)
-        raise ValueError(
-            f"{name} expects [B, S, L, A] or [N, L, A], "
-            f"got {tuple(raw.shape)}"
-        )
     if raw.ndim == 3:
         if step is None:
             return raw[:, -1]

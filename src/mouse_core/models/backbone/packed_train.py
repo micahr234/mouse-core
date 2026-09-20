@@ -441,7 +441,7 @@ def packed_forward(
             passes ``Backbone.train_autocast_dtype``. Calling ``packed_forward``
             inside an ambient ``torch.autocast`` region raises.
         output_hidden_states: Also return every layer's output (before the
-            final norm) for layerwise heads.
+            final norm).
         checkpoint: Recompute each layer in backward instead of storing its
             activations (``Backbone.gradient_checkpointing``).
 

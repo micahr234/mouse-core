@@ -94,8 +94,9 @@ class NStepDqnObjective(Objective):
     the tensor for ``head``; bootstrap Q is the same key on
     ``delayed_predictions`` from the delayed
     :class:`~mouse_core.models.base.Model`
-    (``model.copy(heads=(head,))``) run on the same
-    ``TokenBatch``. The delayed tensor is detached before the Bellman
+    (``model.copy(heads=True, backbone=False, reasoner=False)``)
+    whose heads run on the online pooled states. The delayed tensor is
+    detached before the Bellman
     target, so the TD error does not backprop through it.
 
     One objective trains one Q head. To train several horizons, build

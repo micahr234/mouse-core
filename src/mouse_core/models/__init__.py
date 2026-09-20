@@ -13,7 +13,6 @@ from mouse_core.models.heads import (
     BaseHead,
     HeadSpec,
     ClassificationHead,
-    LayerwiseRegressionHead,
     RegressionHead,
     prediction_key,
 )
@@ -40,7 +39,6 @@ __all__ = [
     "Polyak",
     "sample_reasoning_splits",
     "ClassificationHead",
-    "LayerwiseRegressionHead",
     "RegressionHead",
     "prediction_key",
     "TokenBatch",

@@ -499,7 +499,7 @@ class TransformerBackbone(Backbone):
             states = getattr(out, "hidden_states", None)
             if states is None:
                 raise RuntimeError("TransformerBackbone expected hidden_states but the model returned None.")
-            # HF includes the embedding output at index 0; layerwise heads want post-layer states.
+            # HF includes the embedding output at index 0; drop it so the tuple is post-layer states.
             layer_states = states[1:] if len(states) > 1 else states
             return hidden, tuple(layer_states)
         return hidden

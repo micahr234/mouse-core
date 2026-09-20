@@ -216,8 +216,7 @@ class Backbone(nn.Module, ABC):
 
         Args:
             embeds: Token embeddings ``[B, T, D]``.
-            output_hidden_states: Also return every layer's hidden states
-                (for layerwise heads).
+            output_hidden_states: Also return every layer's hidden states.
             **kwargs: Implementation-specific options.
 
         Returns:
