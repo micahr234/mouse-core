@@ -62,7 +62,7 @@ def test_model_forward_injects_sequence_id_and_runs_flat() -> None:
         heads=(head := RegressionHead(
             in_features=8, out_features=4, hidden_dim=8, num_layers=1, use_norm=True
         )),
-        action_source=head,
+        action_source="action_value",
         reasoner=None,
     )
     batch = [[{"action": i % 4} for i in range(3)], [{"action": 1}, {"action": 2}]]

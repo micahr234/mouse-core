@@ -5,8 +5,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from mouse_core.models.heads.base import BaseHead
-from mouse_core.objectives.base import Objective, predictions_for, require_head
+from mouse_core.objectives.base import Objective
 from mouse_core.objectives.transforms import (
     Discount,
     Reward,
@@ -319,9 +318,9 @@ class DqnObjective(Objective):
     """Bellman TD(λ) objective with a delayed target network.
 
     Instantiate with hyperparameters, then call with
-    ``objective_data=``, ``predictions=``, and ``delayed_predictions=``. Online Q is
-    the tensor for ``head``; bootstrap Q is the same key on
-    ``delayed_predictions`` from the delayed
+    ``objective_data=``, the online Q tensor as ``predictions=``, and
+    the delayed Q tensor as ``delayed_predictions=``. Both tensors come
+    from the matching head on
     :class:`~mouse_core.models.base.Model`
     (``model.copy(heads=True, backbone=True, reasoner=False)``) run on
     the same ``TokenBatch``. The delayed tensor is detached before
@@ -375,7 +374,7 @@ class DqnObjective(Objective):
     (discounted) into the reset frame's return. Off-policy behavior is not
     corrected unless ``watkins=True`` (Watkins's Q(λ)), which also cuts the
     trace wherever the taken action is not the online argmax of
-    the online ``head`` (ties included; never compared against
+    online Q (ties included; never compared against
     oracle columns such as ``info_q_star``). Watkins still uses the hard
     argmax; it does not read ``π``. ``metrics["watkins_greedy_frac"]``
     then reports the in-run fraction of taken actions that were greedy —
@@ -400,8 +399,6 @@ class DqnObjective(Objective):
         )
 
     Args:
-        head: Q head this objective trains. Must be the same instance
-            passed to ``Model(heads=)``.
         discount: Per-step γ from unpacked ``objective_data`` columns.
             ``boundary_discount`` is the standard ``gamma_step`` × extra
             lookup (``None`` skips the call and uses ``1``);
@@ -443,7 +440,6 @@ class DqnObjective(Objective):
     def __init__(
         self,
         *,
-        head: BaseHead,
         discount: Discount | None,
         reward: Reward | None,
         value: Value | None,
@@ -459,7 +455,6 @@ class DqnObjective(Objective):
     ) -> None:
         if not 0.0 <= float(td_lambda) <= 1.0:
             raise ValueError(f"td_lambda must be in [0, 1], got {td_lambda}.")
-        self.head = require_head(head=head, what="head")
         self.temperature = _require_temperature(temperature)
         self.discount = _require_transform(discount, name="discount")
         self.reward = _require_transform(reward, name="reward")
@@ -477,15 +472,11 @@ class DqnObjective(Objective):
         self,
         *,
         objective_data: dict[str, torch.Tensor],
-        predictions: dict[str, torch.Tensor],
-        delayed_predictions: dict[str, torch.Tensor] | None = None,
+        predictions: torch.Tensor,
+        delayed_predictions: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        if delayed_predictions is None:
-            raise ValueError("DqnObjective requires delayed_predictions.")
-        q: torch.Tensor = predictions_for(head=self.head, predictions=predictions, who="DQN")
-        q_target: torch.Tensor = predictions_for(
-            head=self.head, predictions=delayed_predictions, who="DQN delayed"
-        ).detach()
+        q: torch.Tensor = predictions
+        q_target: torch.Tensor = delayed_predictions.detach()
 
         if q.ndim != 2:
             raise ValueError(

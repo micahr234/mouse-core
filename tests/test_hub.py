@@ -86,6 +86,28 @@ def _write_snapshot(root: Path, *store_names: str, split: str='train') -> Path:
         (store_dir / f'{split}-00000-of-00001.parquet').touch()
     return root
 
+def test_align_splits_raises_on_missing_columns() -> None:
+    """Absent columns are never fabricated — 0 done codes would train wrong later."""
+    splits = {
+        'train': Dataset.from_list([{'action': 1, 'episode_done': 0}]),
+        'eval': Dataset.from_list([{'action': 2}]),
+    }
+    with pytest.raises(ValueError, match="missing \\['episode_done'\\]"):
+        hub._align_splits(splits)
+
+
+def test_align_splits_unifies_null_types_and_column_order() -> None:
+    splits = {
+        'train': Dataset.from_list([{'action': 1, 'note': None}]),
+        'eval': Dataset.from_list([{'note': 'x', 'action': 2}]),
+    }
+    aligned = hub._align_splits(splits)
+    assert aligned['train'].column_names == aligned['eval'].column_names == ['action', 'note']
+    assert aligned['train'].features == aligned['eval'].features
+    assert aligned['train']['note'] == [None]
+    assert aligned['eval']['note'] == ['x']
+
+
 def test_load_stores_from_hub_loads_requested_stores_in_one_call(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     calls: list[tuple[str, dict]] = []
     snapshot_calls: list[tuple[str, list[str] | None, str, str | None, str | bool | None]] = []

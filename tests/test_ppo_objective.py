@@ -3,7 +3,6 @@ from __future__ import annotations
 import pytest
 import torch
 from mouse_core.objectives import PpoObjective, affine_reward, affine_value, boundary_discount, sample_discrete_action
-from tests._bound_head import BoundHead
 
 
 def _disc(**overrides: float):
@@ -30,21 +29,27 @@ def _val(**overrides: object):
     return affine_value(**kwargs)  # type: ignore[arg-type]
 
 
-_POLICY = BoundHead("action")
-_VALUE = BoundHead("value")
+class _PpoCall:
+    def __init__(self, objective: PpoObjective) -> None:
+        self.objective = objective
+
+    def __call__(self, *, objective_data: dict[str, torch.Tensor], predictions: dict[str, torch.Tensor]):
+        return self.objective(
+            objective_data=objective_data,
+            predictions=predictions["action"],
+            value_predictions=predictions["value"],
+        )
 
 
-def _ppo(**overrides: object) -> PpoObjective:
+def _ppo(**overrides: object) -> _PpoCall:
     kwargs: dict[str, object] = dict(
-        head=_POLICY,
-        value_head=_VALUE,
         discount=_disc(gamma_step=0.99),
         reward=_rew(),
         value=_val(),
         grouping_field=None,
     )
     kwargs.update(overrides)
-    return PpoObjective(**kwargs)  # type: ignore[arg-type]
+    return _PpoCall(PpoObjective(**kwargs))  # type: ignore[arg-type]
 
 
 def _ppo_batch(*, n: int=8, a: int=3, with_old_log_prob: bool=True, sequence_id: list[int] | None=None) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
@@ -168,7 +173,7 @@ def test_sample_discrete_action_shapes() -> None:
 
 def test_ppo_requires_grouping_field_argument() -> None:
     with pytest.raises(TypeError, match="grouping_field"):
-        PpoObjective(head=_POLICY, value_head=_VALUE, discount=_disc(), reward=_rew(), value=_val())  # type: ignore[call-arg]
+        PpoObjective(discount=_disc(), reward=_rew(), value=_val())  # type: ignore[call-arg]
 
 
 def test_ppo_rejects_multi_head_output_rows() -> None:

@@ -7,7 +7,6 @@ import pytest
 import torch
 
 from mouse_core.objectives import DqnObjective, RetraceObjective, affine_reward, affine_value, boundary_discount
-from tests._bound_head import BoundHead
 from mouse_core.objectives.dqn import _policy_entropy
 from mouse_core.objectives.retrace import _softmax_policy
 
@@ -40,8 +39,6 @@ def _val(**overrides: object):
     return affine_value(**kwargs)  # type: ignore[arg-type]
 
 
-_Q = BoundHead("action_value")
-_MU = BoundHead("behavior")
 
 
 def _preds(
@@ -54,12 +51,33 @@ def _preds(
     )
 
 
-def _retrace(**overrides: object) -> RetraceObjective:
+class _RetraceCall:
+    def __init__(self, objective: RetraceObjective) -> None:
+        self.objective = objective
+
+    def __call__(
+        self,
+        *,
+        objective_data: dict[str, torch.Tensor],
+        predictions: dict[str, torch.Tensor],
+        delayed_predictions: dict[str, torch.Tensor] | None = None,
+    ):
+        kwargs: dict[str, object] = dict(
+            objective_data=objective_data,
+            predictions=predictions["action_value"],
+            behavior_predictions=predictions["behavior"],
+        )
+        if delayed_predictions is not None:
+            kwargs["delayed_predictions"] = delayed_predictions["action_value"]
+        return self.objective(**kwargs)  # type: ignore[arg-type]
+
+
+def _retrace(**overrides: object) -> _RetraceCall:
     kwargs: dict[str, object] = dict(
-        head=_Q, behavior_head=_MU, td_lambda=1.0, temperature=_T, behavior_weight=1.0, grouping_field=None, discount=_disc(), reward=_rew(), value=_val()
+        td_lambda=1.0, temperature=_T, behavior_weight=1.0, grouping_field=None, discount=_disc(), reward=_rew(), value=_val()
     )
     kwargs.update(overrides)
-    return RetraceObjective(**kwargs)  # type: ignore[arg-type]
+    return _RetraceCall(RetraceObjective(**kwargs))  # type: ignore[arg-type]
 
 
 def _fixture(mu_1: float) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], dict[str, torch.Tensor]]:
@@ -114,13 +132,13 @@ def _nll_loss(mu_1: float) -> float:
 
 def test_retrace_requires_lambda_temperature_weight_and_grouping_field() -> None:
     with pytest.raises(TypeError, match="td_lambda"):
-        RetraceObjective(head=_Q, behavior_head=_MU, temperature=1.0, behavior_weight=1.0, grouping_field=None, discount=_disc(), reward=_rew(), value=_val())  # type: ignore[call-arg]
+        RetraceObjective(temperature=1.0, behavior_weight=1.0, grouping_field=None, discount=_disc(), reward=_rew(), value=_val())  # type: ignore[call-arg]
     with pytest.raises(TypeError, match="temperature"):
-        RetraceObjective(head=_Q, behavior_head=_MU, td_lambda=1.0, behavior_weight=1.0, grouping_field=None, discount=_disc(), reward=_rew(), value=_val())  # type: ignore[call-arg]
+        RetraceObjective(td_lambda=1.0, behavior_weight=1.0, grouping_field=None, discount=_disc(), reward=_rew(), value=_val())  # type: ignore[call-arg]
     with pytest.raises(TypeError, match="behavior_weight"):
-        RetraceObjective(head=_Q, behavior_head=_MU, td_lambda=1.0, temperature=1.0, grouping_field=None, discount=_disc(), reward=_rew(), value=_val())  # type: ignore[call-arg]
+        RetraceObjective(td_lambda=1.0, temperature=1.0, grouping_field=None, discount=_disc(), reward=_rew(), value=_val())  # type: ignore[call-arg]
     with pytest.raises(TypeError, match="grouping_field"):
-        RetraceObjective(head=_Q, behavior_head=_MU, td_lambda=1.0, temperature=1.0, behavior_weight=1.0, discount=_disc(), reward=_rew(), value=_val())  # type: ignore[call-arg]
+        RetraceObjective(td_lambda=1.0, temperature=1.0, behavior_weight=1.0, discount=_disc(), reward=_rew(), value=_val())  # type: ignore[call-arg]
 
 
 def test_retrace_rejects_out_of_range_hyperparameters() -> None:
@@ -199,10 +217,14 @@ def test_retrace_greedy_target_cuts_non_greedy_actions() -> None:
     """temperature = 0: delayed argmax at s1 is 0, taken a_1 = 1 → the trace is cut."""
     step_stream, predictions, delayed = _fixture(mu_1=0.25)
     _, metrics = _retrace(temperature=0.0)(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
-    one_step, _ = DqnObjective(head=_Q, reward=_rew(), value=_val(), discount=_disc(),
+    one_step, _ = DqnObjective(reward=_rew(), value=_val(), discount=_disc(),
         grouping_field=None,
         temperature=0.0,
-    )(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
+    )(
+        objective_data=step_stream,
+        predictions=predictions["action_value"],
+        delayed_predictions=delayed["action_value"],
+    )
     assert abs(metrics["td_loss"] - one_step.item()) < 1e-4
     # a_0 = 0 is a greedy tie at s0 (π = 0.5 ≥ μ = 0.5); a_1 is not greedy.
     assert abs(metrics["retrace_ratio_mean"] - 0.5) < 1e-6
@@ -322,18 +344,17 @@ def test_retrace_q_affine_applies_to_online_and_delayed() -> None:
     assert abs(metrics["td_loss"] - ((10.0 - g0) ** 2 + g1**2) / 2) < 5e-2
 
 
-def test_retrace_requires_behavior_head() -> None:
+def test_retrace_requires_behavior_predictions() -> None:
     step_stream, predictions, delayed = _fixture(mu_1=0.25)
-    predictions = {key: value for key, value in predictions.items() if key != "behavior"}
-    with pytest.raises(KeyError, match="behavior"):
-        _retrace()(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
-
-
-def test_retrace_reads_behavior_head_under_custom_key() -> None:
-    step_stream, predictions, delayed = _fixture(mu_1=0.25)
-    predictions = {("mu" if key == "behavior" else key): value for key, value in predictions.items()}
-    _, metrics = _retrace(behavior_head=BoundHead("mu"))(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
-    assert abs(metrics["retrace_ratio_mean"] - 1.0) < 1e-6
+    with pytest.raises(TypeError, match="behavior_predictions"):
+        RetraceObjective(
+            td_lambda=1.0, temperature=_T, behavior_weight=1.0, grouping_field=None,
+            discount=_disc(), reward=_rew(), value=_val(),
+        )(
+            objective_data=step_stream,
+            predictions=predictions["action_value"],
+            delayed_predictions=delayed["action_value"],
+        )  # type: ignore[call-arg]
 
 
 def test_retrace_rejects_misaligned_behavior_head() -> None:
@@ -349,8 +370,15 @@ def test_retrace_rejects_misaligned_behavior_head() -> None:
 
 def test_retrace_requires_delayed_predictions() -> None:
     step_stream, predictions, _ = _fixture(mu_1=0.25)
-    with pytest.raises(ValueError, match="delayed_predictions"):
-        _retrace()(objective_data=step_stream, predictions=predictions, delayed_predictions=None)
+    with pytest.raises(TypeError, match="delayed_predictions"):
+        RetraceObjective(
+            td_lambda=1.0, temperature=_T, behavior_weight=1.0, grouping_field=None,
+            discount=_disc(), reward=_rew(), value=_val(),
+        )(
+            objective_data=step_stream,
+            predictions=predictions["action_value"],
+            behavior_predictions=predictions["behavior"],
+        )  # type: ignore[call-arg]
 
 
 def test_retrace_cql_penalty_metric() -> None:

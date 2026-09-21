@@ -19,6 +19,7 @@ batches. All other I/O is standard Hugging Face Dataset / DatasetDict.
 
 from __future__ import annotations
 
+import copy
 from typing import Any
 
 import numpy as np
@@ -53,6 +54,17 @@ def _normalize_value(value: Any) -> Any:
 def _normalize_row(row: dict[str, Any]) -> dict[str, Any]:
     """Copy ``row`` with 0-d arrays/tensors unwrapped to Python scalars."""
     return {k: _normalize_value(v) for k, v in row.items()}
+
+
+def _copied_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Deep-copied ``row`` with 0-d arrays/tensors unwrapped to Python scalars.
+
+    Nested values (lists, arrays) are copied too, so neither side of an
+    ``append`` / ``__getitem__`` can mutate the other through a shared
+    reference — e.g. an env that fills one observation buffer in place must
+    not silently overwrite every stored row's observation.
+    """
+    return {k: _normalize_value(copy.deepcopy(v)) for k, v in row.items()}
 
 
 def _hf_batch_to_rows(batch: dict[str, Any]) -> list[dict]:
@@ -154,7 +166,7 @@ class Datastore:
                 result[pos] = src_rows[k]
 
         for pos in np.where(~src_mask)[0]:
-            result[pos] = _normalize_row(self._rows[int(idx[pos]) - src_len])
+            result[pos] = _copied_row(self._rows[int(idx[pos]) - src_len])
 
         return result
 
@@ -166,7 +178,9 @@ class Datastore:
         """Append a row, another store, or a list of stores.
 
         Row append is the fast path for collection loops. The row can contain
-        any keys and nested values; nothing is validated or transformed here.
+        any keys and nested values; nothing is validated. The row and its
+        nested values are copied, so mutating the caller's dict (or a reused
+        buffer inside it) after ``append`` never alters the store.
 
         Store append extends this store's sequence with the appended store's
         rows, preserving order.
@@ -184,7 +198,7 @@ class Datastore:
             raise TypeError("append expects a row dict, Datastore, or list of Datastore objects.")
         if not data:
             raise ValueError("Row cannot be empty.")
-        self._rows.append({k: _normalize_value(v) for k, v in data.items()})
+        self._rows.append(_copied_row(data))
 
     # ------------------------------------------------------------------
     # HuggingFace Dataset I/O

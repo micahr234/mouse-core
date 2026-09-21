@@ -5,7 +5,6 @@ import pytest
 import torch
 
 from mouse_core.objectives import DqnObjective, NStepDqnObjective, affine_reward, affine_value, boundary_discount
-from tests._bound_head import BoundHead
 from mouse_core.objectives.nstep import _n_step_targets
 
 
@@ -36,19 +35,13 @@ def _val(**overrides: object):
 def _q(
     online: torch.Tensor,
     delayed: torch.Tensor,
-    *,
-    key: str = "action_value",
-) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-    n = online.shape[0]
-    return (
-        {key: online},
-        {key: delayed},
-    )
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return online, delayed
 
 
 def _nstep(**overrides: object) -> NStepDqnObjective:
     kwargs: dict[str, object] = dict(
-        n=1, head=BoundHead("action_value"), grouping_field=None, temperature=0.0, discount=_disc(), reward=_rew(), value=_val()
+        n=1, grouping_field=None, temperature=0.0, discount=_disc(), reward=_rew(), value=_val()
     )
     kwargs.update(overrides)
     return NStepDqnObjective(**kwargs)  # type: ignore[arg-type]
@@ -78,17 +71,15 @@ _ONE_STEP = 6050.5
 _TWO_STEP = 11668.0
 
 
-def test_nstep_requires_n_head_and_grouping_field() -> None:
+def test_nstep_requires_n_and_grouping_field() -> None:
     with pytest.raises(TypeError, match="n"):
         NStepDqnObjective(  # type: ignore[call-arg]
-            head=BoundHead("action_value"), grouping_field=None, temperature=0.0, discount=_disc(), reward=_rew(), value=_val()
+            grouping_field=None, temperature=0.0, discount=_disc(), reward=_rew(), value=_val()
         )
-    with pytest.raises(TypeError, match="head"):
-        NStepDqnObjective(n=1, grouping_field=None, temperature=0.0, discount=_disc(), reward=_rew(), value=_val())  # type: ignore[call-arg]
     with pytest.raises(TypeError, match="grouping_field"):
-        NStepDqnObjective(n=1, head=BoundHead("action_value"), temperature=0.0, discount=_disc(), reward=_rew(), value=_val())  # type: ignore[call-arg]
+        NStepDqnObjective(n=1, temperature=0.0, discount=_disc(), reward=_rew(), value=_val())  # type: ignore[call-arg]
     with pytest.raises(TypeError, match="temperature"):
-        NStepDqnObjective(n=1, head=BoundHead("action_value"), grouping_field=None, discount=_disc(), reward=_rew(), value=_val())  # type: ignore[call-arg]
+        NStepDqnObjective(n=1, grouping_field=None, discount=_disc(), reward=_rew(), value=_val())  # type: ignore[call-arg]
 
 
 def test_nstep_rejects_non_positive_n() -> None:
@@ -100,34 +91,16 @@ def test_nstep_rejects_non_positive_n() -> None:
         _nstep(n=True)
 
 
-def test_nstep_rejects_unattached_head() -> None:
-    class _Unbound(BoundHead):
-        def __init__(self) -> None:
-            super(BoundHead, self).__init__()
-
-    with pytest.raises(ValueError, match="not attached"):
-        _nstep(head=_Unbound())
-
-
 def test_nstep_requires_delayed_predictions() -> None:
     step_stream, predictions, _ = _lambda_fixture()
-    with pytest.raises(ValueError, match="delayed_predictions"):
-        _nstep()(objective_data=step_stream, predictions=predictions)
-
-
-def test_nstep_requires_prediction_key_on_both_sides() -> None:
-    step_stream, predictions, delayed = _lambda_fixture()
-    with pytest.raises(KeyError, match="action_value_3"):
-        _nstep(head=BoundHead("action_value_3"))(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
-    delayed_only = {"action_value_3": delayed["action_value"]}
-    with pytest.raises(KeyError, match="n-step DQN delayed"):
-        _nstep()(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed_only)
+    with pytest.raises(TypeError, match="delayed_predictions"):
+        _nstep()(objective_data=step_stream, predictions=predictions)  # type: ignore[call-arg]
 
 
 def test_nstep_one_matches_dqn() -> None:
     step_stream, predictions, delayed = _lambda_fixture()
     nstep, metrics = _nstep(n=1)(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
-    dqn, _ = DqnObjective(head=BoundHead("action_value"), grouping_field=None, temperature=0.0, discount=_disc(), reward=_rew(), value=_val())(
+    dqn, _ = DqnObjective(grouping_field=None, temperature=0.0, discount=_disc(), reward=_rew(), value=_val())(
         objective_data=step_stream, predictions=predictions, delayed_predictions=delayed
     )
     assert abs(nstep.item() - dqn.item()) < 1e-05
@@ -206,18 +179,16 @@ def test_nstep_all_out_of_run_pairs_yield_zero_loss() -> None:
 
 
 def test_nstep_trains_multiple_heads_independently() -> None:
-    """Two keys, two n's: each loss reads only its own Q and they add."""
+    """Two tensors, two n's: each loss reads only its own Q and they add."""
     step_stream, pred_1, delayed_1 = _lambda_fixture()
-    q1 = pred_1["action_value"].detach().clone().requires_grad_(True)
-    q3 = pred_1["action_value"].detach().clone().requires_grad_(True)
-    delayed_q = delayed_1["action_value"]
-    predictions = {"action_value_1": q1, "action_value_3": q3}
-    delayed = {"action_value_1": delayed_q, "action_value_3": delayed_q}
-    loss_1, m1 = _nstep(n=1, head=BoundHead("action_value_1"))(
-        objective_data=step_stream, predictions=predictions, delayed_predictions=delayed
+    q1 = pred_1.detach().clone().requires_grad_(True)
+    q3 = pred_1.detach().clone().requires_grad_(True)
+    delayed_q = delayed_1
+    loss_1, m1 = _nstep(n=1)(
+        objective_data=step_stream, predictions=q1, delayed_predictions=delayed_q
     )
-    loss_3, m3 = _nstep(n=3, head=BoundHead("action_value_3"))(
-        objective_data=step_stream, predictions=predictions, delayed_predictions=delayed
+    loss_3, m3 = _nstep(n=3)(
+        objective_data=step_stream, predictions=q3, delayed_predictions=delayed_q
     )
     assert abs(loss_1.item() - _ONE_STEP) < 1e-03
     assert abs(loss_3.item() - _TWO_STEP) < 1e-03
@@ -285,8 +256,7 @@ def test_nstep_requires_min_sequence() -> None:
 
 def test_nstep_rejects_non_fp32_q() -> None:
     step_stream, predictions, delayed = _lambda_fixture()
-    predictions = {key: value.clone() for key, value in predictions.items()}
-    predictions["action_value"] = predictions["action_value"].to(torch.bfloat16)
+    predictions = predictions.to(torch.bfloat16)
     with pytest.raises(TypeError, match="float32"):
         _nstep()(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
 
@@ -301,7 +271,7 @@ def test_nstep_temperature_matches_dqn_one_step() -> None:
         }
     predictions, delayed = _q(torch.zeros(2, 2), torch.zeros(2, 2))
     nstep_loss, nstep_m = _nstep(temperature=1.0)(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
-    dqn_loss, dqn_m = DqnObjective(head=BoundHead("action_value"), temperature=1.0, grouping_field=None, discount=_disc(), reward=_rew(), value=_val())(
+    dqn_loss, dqn_m = DqnObjective(temperature=1.0, grouping_field=None, discount=_disc(), reward=_rew(), value=_val())(
         objective_data=step_stream, predictions=predictions, delayed_predictions=delayed
     )
     assert abs(nstep_loss.item() - dqn_loss.item()) < 1e-06

@@ -603,7 +603,7 @@ def test_text_model_card_describes_tokenizer(tmp_path) -> None:
         heads=(head := RegressionHead(
             in_features=8, out_features=4, hidden_dim=8, num_layers=1, use_norm=True
         )),
-        action_source=head,
+        action_source="action_value",
         reasoner=None,
     )
     path = tmp_path / "README.md"

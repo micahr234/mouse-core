@@ -470,6 +470,45 @@ def test_gradient_checkpointing_matches_plain_backward(no_compiled_decoder: None
 
 
 @_cuda
+def test_gradient_checkpointing_flex_survives_interleaved_forward(no_compiled_decoder: None) -> None:
+    """A packed forward between forward and backward must not corrupt the recompute.
+
+    The flex mask_mod reads segment ids from a module-level holder that every
+    ``packed_forward`` overwrites (reasoner generation passes, gradient
+    accumulation, a second model on another batch). The checkpointed recompute
+    during ``backward()`` must rebind the ids its BlockMask was built from.
+    FlexAttention has no CPU backward, so this runs on CUDA only.
+    """
+    torch.manual_seed(3)
+    device = torch.device("cuda")
+    bb = cast(Any, _backbone("qwen3", layers=3, kv_heads=2).to(device))
+    _scale_up(bb)
+    L = 31
+    seq, grp = _stream(L, n_seq=2, n_grp=2, seed=8, device="cuda")
+    embeds = torch.randn(L, 64, device=device, requires_grad=True)
+
+    def grads(checkpoint: bool) -> list[torch.Tensor]:
+        out = packed_forward(model=bb.model, embeds=embeds, sequence_ids=seq, grouping_ids=grp, train_kernel="flex", checkpoint=checkpoint)
+        loss = out.square().sum()
+        # A single-segment stream between forward and backward: without the
+        # rebind, the recompute would attend across sequence boundaries.
+        flat = torch.zeros(57, dtype=torch.long, device=device)
+        with torch.no_grad():
+            packed_forward(model=bb.model, embeds=torch.randn(57, 64, device=device), sequence_ids=flat, grouping_ids=flat, train_kernel="flex")
+        loss.backward()
+        assert embeds.grad is not None
+        result = [embeds.grad.clone()] + [p.grad.clone() for p in bb.parameters() if p.grad is not None]
+        embeds.grad = None
+        bb.zero_grad()
+        return result
+
+    g_plain = grads(False)
+    g_ckpt = grads(True)
+    for a, b in zip(g_ckpt, g_plain, strict=True):
+        torch.testing.assert_close(a, b, atol=1e-5, rtol=1e-4)
+
+
+@_cuda
 @pytest.mark.parametrize("kernel", _KERNELS)
 def test_cuda_bf16_lora_gradients_on_frozen_base(no_compiled_decoder: None, kernel: TrainKernel) -> None:
     """fp32 LoRA and input-embedding grads flow through the fused kernel; frozen base gets none."""
@@ -556,7 +595,7 @@ def test_cuda_bf16_lora_compiled_body_matches_eager_and_trains(no_compiled_decod
     device = torch.device("cuda")
     backbone = _backbone("qwen3", kv_heads=2, lora=LoRAConfig(rank=4, alpha=8.0), dtype=torch.bfloat16)
     head = RegressionHead(in_features=64, out_features=4, hidden_dim=64, num_layers=1, use_norm=True)
-    model = Model(backbone=backbone, heads=head, action_source=head, reasoner=None).to(device)
+    model = Model(backbone=backbone, heads=head, action_source="action_value", reasoner=None).to(device)
     bb = cast(TransformerBackbone, model.backbone)
     for n, p in bb.named_parameters():
         if ".lora_B." in n:
@@ -684,7 +723,7 @@ def test_model_forward_isolates_sequences(no_compiled_decoder: None, device: str
     torch.manual_seed(2)
     backbone = TransformerBackbone(architecture="qwen3", train_kernel=kernel, decode_kernel="flex", dtype=torch.float32, use_norm=True, hidden_dim=64, num_layers=2, num_heads=4, num_key_value_heads=4, vocab_size=32)
     head = RegressionHead(in_features=backbone.hidden_dim, out_features=4, hidden_dim=backbone.hidden_dim, num_layers=1, use_norm=True)
-    model = Model(backbone=backbone, heads=head, action_source=head, reasoner=None).to(device).eval()
+    model = Model(backbone=backbone, heads=head, action_source="action_value", reasoner=None).to(device).eval()
     batch = [[{"action": i % 4} for i in range(3)], [{"action": i % 4} for i in range(3)]]
     tb = batch_to_token_batch(token_tokenizer("action"), batch)
     with torch.no_grad():
@@ -705,7 +744,7 @@ def test_model_train_isolates_tasks_within_sequence(no_compiled_decoder: None) -
     torch.manual_seed(11)
     backbone = TransformerBackbone(architecture="qwen3", train_kernel="reference", decode_kernel="flex", dtype=torch.float32, use_norm=True, hidden_dim=32, num_layers=2, num_heads=4, num_key_value_heads=4, vocab_size=32)
     head = RegressionHead(in_features=backbone.hidden_dim, out_features=4, hidden_dim=backbone.hidden_dim, num_layers=1, use_norm=True)
-    model = Model(backbone=backbone, heads=head, action_source=head, reasoner=None).eval()
+    model = Model(backbone=backbone, heads=head, action_source="action_value", reasoner=None).eval()
     task0 = [
         {"action": 0, "episode_done": 0, "task_done": 0, "task_index": 0},
         {"action": 1, "episode_done": 0, "task_done": 0, "task_index": 0},
@@ -729,7 +768,7 @@ def test_model_gradient_checkpointing_flag_reaches_backward(no_compiled_decoder:
     torch.manual_seed(12)
     backbone = TransformerBackbone(architecture="qwen3", train_kernel="reference", decode_kernel="flex", dtype=torch.float32, use_norm=True, hidden_dim=32, num_layers=2, num_heads=4, vocab_size=32)
     head = RegressionHead(in_features=32, out_features=4, hidden_dim=32, num_layers=1, use_norm=True)
-    model = Model(backbone=backbone, heads=head, action_source=head, reasoner=None)
+    model = Model(backbone=backbone, heads=head, action_source="action_value", reasoner=None)
     tb = batch_to_token_batch(token_tokenizer("action"), [[{"action": i % 4} for i in range(5)], [{"action": 1}]])
 
     def step() -> list[torch.Tensor]:
@@ -756,7 +795,7 @@ def test_model_forwards_autocast_dtype_to_packed_forward(no_compiled_decoder: No
         hidden_dim=32, num_layers=2, num_heads=4, vocab_size=32)
     assert backbone.train_autocast_dtype is torch.bfloat16 and backbone.decode_autocast_dtype is None
     head = RegressionHead(in_features=32, out_features=4, hidden_dim=32, num_layers=1, use_norm=True)
-    model = Model(backbone=backbone, heads=head, action_source=head, reasoner=None).to("cuda")
+    model = Model(backbone=backbone, heads=head, action_source="action_value", reasoner=None).to("cuda")
     tb = batch_to_token_batch(token_tokenizer("action"), [[{"action": i % 4} for i in range(5)], [{"action": 1}]])
     model(tb).predictions["action_value"].square().sum().backward()
     grads = [cast(torch.Tensor, p.grad) for p in model.parameters() if p.grad is not None]

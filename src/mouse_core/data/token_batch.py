@@ -420,7 +420,13 @@ def _stack_objective_fields(
     sequence_ids: Sequence[int],
     grouping_field: str,
 ) -> dict[str, np.ndarray]:
-    """Stack per-step ``objective_fields`` into ``[N]`` / ``[N, ...]`` arrays."""
+    """Stack per-step ``objective_fields`` into ``[N]`` / ``[N, ...]`` arrays.
+
+    Ragged float vector columns are right-padded with ``-inf`` — the sentinel
+    for actions that do not exist, which objectives exclude. Ragged integer
+    columns raise: there is no integer sentinel, so the caller must pad them
+    explicitly or store the field as float.
+    """
     n = len(steps)
     keys: set[str] = set()
     for st in steps:
@@ -463,7 +469,19 @@ def _stack_objective_fields(
         else:
             shapes = [a.shape for a in present]
             max_shape = tuple(max(s[d] for s in shapes) for d in range(ndim))
-            buf = np.zeros((n, *max_shape), dtype=dtype)
+            ragged = any(s != max_shape for s in shapes)
+            if ragged and dtype is not np.float32:
+                raise ValueError(
+                    f"objective field {key!r} has ragged shapes "
+                    f"{sorted(set(shapes))} and an integer dtype; only float "
+                    "columns can be padded (with -inf). Pad the values "
+                    "explicitly or store the field as float."
+                )
+            # Pad ragged float vectors with -inf, the library-wide sentinel for
+            # actions that do not exist (SP / SV exclude non-finite entries).
+            # Finite zero padding would silently train toward fabricated values.
+            fill = -np.inf if ragged else 0
+            buf = np.full((n, *max_shape), fill, dtype=dtype)
             for i, a in enumerate(arrays):
                 slicer = tuple(slice(0, a.shape[d]) for d in range(a.ndim))
                 buf[i][slicer] = a
@@ -508,6 +526,10 @@ def pack_token_batch(
     All steps must share the same ``modality_names``, ``modality_map``, and
     ``grouping_field``. Returns ``(inputs, objective_data)``. Move
     ``objective_data`` with :func:`to_device`.
+
+    Ragged float vector columns in ``objective_data`` are right-padded with
+    ``-inf``, the sentinel objectives exclude as "action does not exist".
+    Ragged integer columns raise — there is no integer sentinel.
 
     When a step carries ``group_prefix_*`` tokens (from
     :class:`~mouse_core.data.tokenizer.Tokenizer` ``group_prefix=``),

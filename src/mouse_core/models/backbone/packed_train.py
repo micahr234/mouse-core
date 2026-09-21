@@ -176,11 +176,30 @@ def _segment_mask_mod(b, h, q_idx, kv_idx):
     return (kv_idx <= q_idx) & (seg[q_idx] == seg[kv_idx])
 
 
-def _flex_block_mask(plan: _PackingPlan, device: torch.device) -> BlockMask:
+def _run_layer_rebound(
+    body: Callable[..., torch.Tensor],
+    segment: torch.Tensor | None,
+    *args: object,
+) -> torch.Tensor:
+    """Run one decoder layer with ``segment`` bound as the flex mask table.
+
+    Gradient checkpointing re-executes this during ``backward()``. By then a
+    later ``packed_forward`` (reasoner generation passes, gradient
+    accumulation, a second model on another batch) may have replaced
+    ``_segment_holder["segment"]``, so the recompute must rebind the ids this
+    forward's BlockMask was built from before the flex kernel reads them.
+    ``segment`` is ``None`` for kernels that do not read the holder.
+    """
+    if segment is not None:
+        with _segment_lock:
+            _segment_holder["segment"] = segment
+    return body(*args)
+
+
+def _flex_block_mask(segment: torch.Tensor, L: int, device: torch.device) -> BlockMask:
     """Block-sparse Flex mask over the packed order: causal within each segment."""
     with _segment_lock:
-        _segment_holder["segment"] = _segment_ids(plan)
-        L = plan.order.shape[0]
+        _segment_holder["segment"] = segment
         return flex_block_mask(
             _segment_mask_mod,
             B=1,
@@ -491,9 +510,11 @@ def packed_forward(
     attn_mask: torch.Tensor | None = None
     block_mask: BlockMask | None = None
     flex_fn: Callable[..., torch.Tensor] | None = None
+    flex_segment: torch.Tensor | None = None
     padded = train_kernel == "padded"
     if train_kernel == "flex":
-        block_mask = _flex_block_mask(plan, device)
+        flex_segment = _segment_ids(plan)
+        block_mask = _flex_block_mask(flex_segment, int(plan.order.shape[0]), device)
         flex_fn = _flex_fn(device)
     elif train_kernel == "padded":
         lengths = plan.cu_seqlens[1:] - plan.cu_seqlens[:-1]
@@ -524,7 +545,11 @@ def packed_forward(
                 layer, h, cos, sin, plan.cu_seqlens, plan.max_seqlen,
                 attn_mask, block_mask, flex_fn, padded, n_heads, n_kv_heads, head_dim,
             )
-            h = _checkpoint(body, *args, use_reentrant=False) if recompute else body(*args)
+            h = (
+                _checkpoint(_run_layer_rebound, body, flex_segment, *args, use_reentrant=False)
+                if recompute
+                else body(*args)
+            )
             if output_hidden_states:
                 layer_hiddens.append(h[plan.inverse])
         out = hf.norm(h)[plan.inverse]

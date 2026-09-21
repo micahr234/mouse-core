@@ -16,8 +16,7 @@ Example — custom objective::
             self,
             *,
             objective_data: dict[str, torch.Tensor],
-            predictions: dict[str, torch.Tensor],
-            delayed_predictions: dict[str, torch.Tensor] | None = None,
+            predictions: torch.Tensor,
         ) -> tuple[torch.Tensor, dict[str, float]]:
             ...
             return loss, {"my_objective": loss.item()}
@@ -29,15 +28,13 @@ from abc import ABC, abstractmethod
 
 import torch
 
-from mouse_core.models.heads.base import BaseHead, prediction_key
-
 
 class Objective(ABC):
     """Abstract base for all MOUSE objective objects.
 
     Subclass this and implement :meth:`__call__` to create a custom objective.
     Instantiate with hyperparameters; call with ``objective_data=`` and
-    ``predictions=``.
+    the prediction tensor for the head being trained.
     """
 
     @abstractmethod
@@ -45,8 +42,7 @@ class Objective(ABC):
         self,
         *,
         objective_data: dict[str, torch.Tensor],
-        predictions: dict[str, torch.Tensor],
-        delayed_predictions: dict[str, torch.Tensor] | None = None,
+        predictions: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         """Compute a scalar loss and return diagnostic metrics.
 
@@ -54,29 +50,16 @@ class Objective(ABC):
             objective_data: ``dict[str, Tensor]`` of tokenizer ``objective_fields``
                 (``action``, ``reward``, ``episode_done``, ``task_done``, …),
                 keyed by flat step index with ``sequence_id``.
-            predictions: ``dict[str, Tensor]`` of model head outputs from
-                :meth:`~mouse_core.models.base.Model.forward`.
-            delayed_predictions: Delayed-model head outputs. Required by DQN
-                family objectives; ignored by PPO, GRPO, SP, and SV.
+            predictions: Tensor for the head this objective trains, taken
+                from :meth:`~mouse_core.models.base.Model.forward` (index
+                ``ModelOutput.predictions`` with
+                :func:`~mouse_core.models.heads.base.prediction_key`).
+                DQN-family subclasses also take ``delayed_predictions=``;
+                PPO takes ``value_predictions=``; Retrace takes both
+                ``delayed_predictions=`` and ``behavior_predictions=``.
 
         Returns:
             ``(scalar_loss, metrics)`` where ``metrics`` is a ``dict[str, float]``
             ready for logging.
         """
         ...
-
-
-def require_head(*, head: object, what: str) -> BaseHead:
-    """Require ``head`` to be a :class:`BaseHead` already attached to a Model."""
-    if not isinstance(head, BaseHead):
-        raise TypeError(f"{what} must be a BaseHead instance, got {type(head).__name__}.")
-    prediction_key(head=head)
-    return head
-
-
-def predictions_for(*, head: BaseHead, predictions: dict[str, torch.Tensor], who: str) -> torch.Tensor:
-    """Return ``predictions`` for ``head``'s bound storage key."""
-    key = prediction_key(head=head)
-    if key not in predictions.keys():
-        raise KeyError(f"{who} expects predictions[{key!r}] for the given head.")
-    return predictions[key]

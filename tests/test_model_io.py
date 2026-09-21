@@ -18,7 +18,7 @@ def test_composed_model_roundtrip(tmp_path) -> None:
     hidden_dim = 8
     backbone = IdentityBackbone(hidden_dim=hidden_dim, vocab_size=32)
     heads = RegressionHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, use_norm=True)
-    model = Model(backbone=backbone, heads=heads, action_source=heads, reasoner=None).eval()
+    model = Model(backbone=backbone, heads=heads, action_source="action_value", reasoner=None).eval()
     batch = [[{'action': 0, 'reward': 0.0, 'episode_done': 0, 'task_done': 0}, {'action': 1, 'reward': 1.0, 'episode_done': 0, 'task_done': 0}, {'action': 2, 'reward': 2.0, 'episode_done': 1, 'task_done': 0}]]
     expected = model(batch_to_token_batch(_TOK, batch)).predictions
     save_model(model=model, path=tmp_path)
@@ -45,7 +45,7 @@ def test_kernels_and_dtype_are_not_saved_and_come_from_the_loader(tmp_path) -> N
     hidden_dim = 8
     backbone = TransformerBackbone(architecture="qwen3", train_kernel="reference", decode_kernel="flex", dtype=torch.float32, use_norm=True, hidden_dim=hidden_dim, num_layers=1, num_heads=2, vocab_size=32)
     heads = RegressionHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, use_norm=True)
-    save_model(model=Model(backbone=backbone, heads=heads, action_source=heads, reasoner=None), path=tmp_path)
+    save_model(model=Model(backbone=backbone, heads=heads, action_source="action_value", reasoner=None), path=tmp_path)
     with (tmp_path / 'config.json').open() as fh:
         cfg = json.load(fh)['backbone']
     assert 'train_kernel' not in cfg and 'decode_kernel' not in cfg and 'dtype' not in cfg
@@ -67,7 +67,7 @@ def test_use_norm_false_roundtrip(tmp_path) -> None:
         in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1,
         use_norm=False,
     )
-    model = Model(backbone=backbone, heads=heads, action_source=heads, reasoner=None)
+    model = Model(backbone=backbone, heads=heads, action_source="action_value", reasoner=None)
     save_model(model=model, path=tmp_path)
     with (tmp_path / 'config.json').open() as fh:
         config = json.load(fh)
@@ -102,7 +102,7 @@ def test_identity_embed_tokens_roundtrip(tmp_path) -> None:
     hidden_dim = 8
     backbone = IdentityBackbone(hidden_dim=hidden_dim, vocab_size=32)
     heads = RegressionHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, use_norm=True)
-    model = Model(backbone=backbone, heads=heads, action_source=heads, reasoner=None).eval()
+    model = Model(backbone=backbone, heads=heads, action_source="action_value", reasoner=None).eval()
     tokenizer = token_tokenizer("action", "prev_action")
     batch = [[{'action': 0, 'prev_action': 1, 'reward': 0.5, 'grouping_id': 0}, {'action': 2, 'prev_action': 0, 'reward': 1.0, 'grouping_id': 0}]]
     expected = model(batch_to_token_batch(tokenizer, batch)).predictions
@@ -118,7 +118,7 @@ def test_identity_embed_tokens_roundtrip(tmp_path) -> None:
 
 
 def test_model_card_includes_usage_and_architecture(tmp_path) -> None:
-    model = Model(backbone=IdentityBackbone(hidden_dim=8, vocab_size=32), heads=(head := RegressionHead(in_features=8, out_features=4, hidden_dim=8, num_layers=1, use_norm=True)), action_source=head, reasoner=None)
+    model = Model(backbone=IdentityBackbone(hidden_dim=8, vocab_size=32), heads=(head := RegressionHead(in_features=8, out_features=4, hidden_dim=8, num_layers=1, use_norm=True)), action_source="action_value", reasoner=None)
     path = tmp_path / 'README.md'
     _write_model_card(repo_id='user/mouse-example-model', tokenizer_repo_id='user/mouse-example-tokenizer', model=model, path=path)
     text = path.read_text()
@@ -152,7 +152,7 @@ def _lora_model(dtype: torch.dtype) -> Model:
     hidden_dim = 8
     backbone = TransformerBackbone(architecture="qwen3", train_kernel="reference", decode_kernel="flex", dtype=dtype, use_norm=True, hidden_dim=hidden_dim, num_layers=1, num_heads=2, lora=LoRAConfig(rank=2), vocab_size=32)
     heads = RegressionHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, use_norm=True)
-    return Model(backbone=backbone, heads=heads, action_source=heads, reasoner=None).eval()
+    return Model(backbone=backbone, heads=heads, action_source="action_value", reasoner=None).eval()
 
 
 def test_backbone_dtype_applies_to_base_only_and_trainable_sections_stay_float32() -> None:
@@ -223,7 +223,7 @@ def test_save_model_does_not_write_tokenizer(tmp_path) -> None:
     model = Model(
         backbone=IdentityBackbone(hidden_dim=8, vocab_size=32),
         heads=(head := RegressionHead(in_features=8, out_features=4, hidden_dim=8, num_layers=1, use_norm=True)),
-        action_source=head,
+        action_source="action_value",
         reasoner=None,
     )
     save_model(model=model, path=tmp_path)
@@ -273,7 +273,7 @@ def test_push_model_to_hub_requires_distinct_tokenizer_repo() -> None:
     model = Model(
         backbone=IdentityBackbone(hidden_dim=8, vocab_size=32),
         heads=(head := RegressionHead(in_features=8, out_features=4, hidden_dim=8, num_layers=1, use_norm=True)),
-        action_source=head,
+        action_source="action_value",
         reasoner=None,
     )
     tokenizer = Tokenizer(

@@ -36,7 +36,7 @@ def _tiny_model() -> Model:
     hidden_dim = 8
     backbone = IdentityBackbone(hidden_dim=hidden_dim, vocab_size=32)
     head = _head(hidden_dim)
-    return Model(backbone=backbone, heads=head, action_source=head, reasoner=None)
+    return Model(backbone=backbone, heads=head, action_source="action_value", reasoner=None)
 
 
 def _llama_model() -> Model:
@@ -45,7 +45,7 @@ def _llama_model() -> Model:
         train_kernel="reference", decode_kernel="flex", dtype=torch.float32, use_norm=True,
         hidden_dim=hidden_dim, num_layers=2, num_heads=2, max_position_embeddings=64, vocab_size=32)
     head = _head(hidden_dim)
-    return Model(backbone=backbone, heads=head, action_source=head, reasoner=None)
+    return Model(backbone=backbone, heads=head, action_source="action_value", reasoner=None)
 
 
 def _token_batch(model: Model):
@@ -126,7 +126,7 @@ def _two_head_model(hidden_dim: int = 8) -> Model:
                 in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, use_norm=True
             ),
         },
-        action_source=q_head,
+        action_source="action_value",
         reasoner=None,
     )
 
@@ -208,7 +208,7 @@ def test_copy_carries_reasoner() -> None:
     reasoning = Model(
         backbone=IdentityBackbone(hidden_dim=hidden_dim, vocab_size=32),
         heads=(head := _head(hidden_dim)),
-        action_source=head,
+        action_source="action_value",
         reasoner=LatentReasoner(hidden_dim=hidden_dim, num_thoughts=1),
     )
     dr = reasoning.copy(heads=True, backbone=True, reasoner=True)
@@ -430,7 +430,7 @@ def test_tau_backbone_also_moves_reasoner() -> None:
     reasoning = Model(
         backbone=IdentityBackbone(hidden_dim=hidden_dim, vocab_size=32),
         heads=(head := _head(hidden_dim)),
-        action_source=head,
+        action_source="action_value",
         reasoner=LatentReasoner(hidden_dim=hidden_dim, num_thoughts=1),
     )
     dr = reasoning.copy(heads=True, backbone=True, reasoner=True)
@@ -507,7 +507,7 @@ def test_polyak_rejects_wrong_models() -> None:
     mismatched = Model(
         backbone=IdentityBackbone(hidden_dim=8, vocab_size=32),
         heads=(head := RegressionHead(in_features=8, out_features=4, hidden_dim=8, num_layers=2, use_norm=True)),
-        action_source=head,
+        action_source="action_value",
         reasoner=None,
     ).requires_grad_(False)
     with pytest.raises(ValueError, match="parameter names"):

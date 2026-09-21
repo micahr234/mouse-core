@@ -69,8 +69,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``boundary_value`` applies episode / task scale and shift extras.
   ``discount=``, ``reward=``, and ``value=`` are required; ``None``
   skips that callable (reward column / Q unchanged, discount ``1``).
-- ``objective_data`` and ``predictions`` are ``dict[str, Tensor]``. Move a
-  dict with ``to_device(data=, device=)``. ``Model.head`` no longer takes
+- ``objective_data`` is ``dict[str, Tensor]``. Move it with
+  ``to_device(data=, device=)``. ``Model.forward`` still returns
+  ``predictions`` as a dict of every head. Objective ``__call__`` takes
+  the tensor for the head being trained (index with
+  ``prediction_key(head=)``). ``Model.head`` no longer takes
   ``batch_size``.
 - Aligned with mouse-gym 1.1.0: ``EnvConfig.episodes_per_task`` is
   ``max_task_episodes`` (task-length timeout, ``task_done=2``).
@@ -92,12 +95,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sections the delayed model copied; omit a shared section (or pass
   ``None`` or ``1``). The n-step example shares the backbone and
   delays only the Q heads.
-- Objectives take the head instance they train (``head=``, plus
-  ``value_head=`` / ``behavior_head=`` where needed) instead of a
-  prediction-key string. ``Model`` stamps the storage key on each head.
-  ``DqnObjective``, ``NStepDqnObjective``,
-  ``RetraceObjective``, ``PpoObjective``, ``GrpoObjective``,
-  ``SpObjective``, and ``SvObjective`` all require the head.
+- Objectives no longer take a head instance or a prediction-key
+  string. The caller indexes ``ModelOutput.predictions`` with
+  ``prediction_key(head=)`` and passes that tensor as
+  ``predictions=``. DQN-family objectives also take
+  ``delayed_predictions=``; ``PpoObjective`` takes
+  ``value_predictions=``; ``RetraceObjective`` takes both
+  ``delayed_predictions=`` and ``behavior_predictions=``.
 - ``TransformerBackbone``, ``RegressionHead``, and ``ClassificationHead``
   require ``use_norm``. ``save_model`` writes
   backbone type ``transformer`` with an ``architecture`` field
@@ -107,10 +111,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``DiscreteActionHead`` is ``ClassificationHead``.
   Prediction keys are ``action_value`` and ``action``. ``save_model``
   writes head types ``regression`` and ``classification``.
-- ``Model(..., action_source=)`` is the head instance ``get_action``
-  uses, not a string name. It must be one of the objects in ``heads``.
-  The stored prediction key is still inferred from type (or the dict
-  key). ``save_model`` writes that key as ``action_source``.
+- ``Model(..., action_source=)`` is the ``heads`` dict key
+  ``get_action`` reads, not a head instance. ``save_model`` writes
+  that same key.
 - Public constructors and helpers are keyword-only. Call them by name
   (``Polyak(online=model, delayed=delayed_model)``,
   ``save_model(model=model, path=path)``,
@@ -159,12 +162,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ``DiscreteActionValueHead``, ``DiscreteActionHead``,
   ``LayerwiseDiscreteActionValueHead``, and ``SwiGLUHead``. Use
   ``RegressionHead`` or ``ClassificationHead``.
-- ``prediction_key``, ``predictions_key``, ``value_key``, and
-  ``behavior_key`` on objectives. Pass the head instance
-  (``head=``, plus ``value_head=`` / ``behavior_head=``).
-  ``copy(heads=)`` takes those instances, not name strings.
+- ``head=``, ``value_head=``, and ``behavior_head=`` on
+  objectives, and ``prediction_key`` / ``predictions_key`` /
+  ``value_key`` / ``behavior_key`` stored on them. Pass the
+  tensors from ``ModelOutput.predictions``. ``copy(heads=)``
+  still takes head instances, not name strings.
 
 ### Fixed
+- Incremental Flex decode drops a captured CUDA graph when a chunk of a
+  new shape replaces the query mask tables. Replays after the shape
+  changed back used to read the capture-time (stale or freed) tables,
+  silently corrupting attention masks mid-generation.
+- Gradient checkpointing with ``train_kernel="flex"`` rebinds the
+  packed-segment ids during the backward-pass recompute. Any
+  ``packed_forward`` between forward and backward (reasoner generation
+  passes, gradient accumulation, a second model) used to leak its
+  segment layout into the recompute, silently corrupting gradients.
+- ``pack_token_batch`` pads ragged float vector objective columns with
+  ``-inf`` — the nonexistent-action sentinel objectives exclude —
+  instead of ``0``, which silently trained SP / SV toward fabricated
+  Q-targets. Ragged integer columns now raise instead of zero-filling.
+- ``Datastore.append`` and ``__getitem__`` deep-copy nested values.
+  Rows used to alias caller arrays: an env refilling one observation
+  buffer in place silently rewrote every stored row, and mutating a
+  returned row corrupted the store.
+- ``push_to_hub`` raises when splits have different columns instead of
+  filling the missing ones with placeholders (``0`` done codes, ``0``
+  ints), which baked fabricated values into the pushed parquet.
+- ``SpObjective(loss_type="ce")`` excludes ``-inf``-padded actions from
+  the student softmax denominator and from label smoothing, matching
+  the soft losses. Junk student logits at padded slots no longer affect
+  the loss.
 - Latent reasoner thoughts are cast to the backbone embed dtype so a
   bf16 ``embed_tokens`` table can host them.
 - ``huggingface_hub`` 1.32.0 dropped ``CommitOperationAdd`` from

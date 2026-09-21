@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from mouse_core.models.heads.base import BaseHead, prediction_key
-from mouse_core.objectives.base import Objective, predictions_for, require_head
+from mouse_core.objectives.base import Objective
 from mouse_core.objectives.dqn import (
     _boltzmann_entropy,
     _head_output_layout,
@@ -90,18 +89,18 @@ class NStepDqnObjective(Objective):
     """Bellman n-step objective with a delayed target network.
 
     Instantiate with hyperparameters, then call with
-    ``objective_data=``, ``predictions=``, and ``delayed_predictions=``. Online Q is
-    the tensor for ``head``; bootstrap Q is the same key on
-    ``delayed_predictions`` from the delayed
+    ``objective_data=``, the online Q tensor as ``predictions=``, and
+    the delayed Q tensor as ``delayed_predictions=``. Both tensors come
+    from the matching head on the delayed
     :class:`~mouse_core.models.base.Model`
     (``model.copy(heads=True, backbone=False, reasoner=False)``)
     whose heads run on the online pooled states. The delayed tensor is
     detached before the Bellman
     target, so the TD error does not backprop through it.
 
-    One objective trains one Q head. To train several horizons, build
-    one :class:`NStepDqnObjective` per head (each with its own ``n`` and
-    ``head``) and add the returned losses. ``n=1`` is the
+    One objective trains one Q tensor. To train several horizons, build
+    one :class:`NStepDqnObjective` per head (each with its own ``n``)
+    and pass that head's tensors on each call. ``n=1`` is the
     one-step target ``r + γ V``; larger ``n`` sums that many discounted
     rewards and bootstraps from the delayed state value at ``s_{t+n}``.
     ``V`` is delayed max-Q when ``temperature=0``; a positive
@@ -160,8 +159,6 @@ class NStepDqnObjective(Objective):
 
     Args:
         n: Backup horizon. ``1`` is one-step DQN; must be an ``int >= 1``.
-        head: Q head this objective trains. Must be the same instance
-            passed to ``Model(heads=)``.
         discount: Per-step γ from unpacked ``objective_data`` columns.
             ``boundary_discount`` is the standard ``gamma_step`` × extra
             lookup (``None`` skips the call and uses ``1``);
@@ -199,7 +196,6 @@ class NStepDqnObjective(Objective):
         self,
         *,
         n: int,
-        head: BaseHead,
         discount: Discount | None,
         reward: Reward | None,
         value: Value | None,
@@ -214,8 +210,6 @@ class NStepDqnObjective(Objective):
         if not isinstance(n, int) or isinstance(n, bool) or n < 1:
             raise ValueError(f"n must be an int >= 1, got {n!r}.")
         self.n = n
-        self.head = require_head(head=head, what="head")
-        self.prediction_key = prediction_key(head=self.head)
         self.discount = _require_transform(discount, name="discount")
         self.reward = _require_transform(reward, name="reward")
         self.value = _require_transform(value, name="value")
@@ -231,19 +225,15 @@ class NStepDqnObjective(Objective):
         self,
         *,
         objective_data: dict[str, torch.Tensor],
-        predictions: dict[str, torch.Tensor],
-        delayed_predictions: dict[str, torch.Tensor] | None = None,
+        predictions: torch.Tensor,
+        delayed_predictions: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        if delayed_predictions is None:
-            raise ValueError("NStepDqnObjective requires delayed_predictions.")
-        q: torch.Tensor = predictions_for(head=self.head, predictions=predictions, who="n-step DQN")
-        q_target: torch.Tensor = predictions_for(
-            head=self.head, predictions=delayed_predictions, who="n-step DQN delayed"
-        ).detach()
+        q: torch.Tensor = predictions
+        q_target: torch.Tensor = delayed_predictions.detach()
 
         if q.ndim != 2:
             raise ValueError(
-                f"n-step DQN expects {self.prediction_key} shape [P, A], "
+                f"n-step DQN expects predictions shape [P, A], "
                 f"got {tuple(q.shape)}."
             )
         if q.dtype != torch.float32 or q_target.dtype != torch.float32:
@@ -253,7 +243,7 @@ class NStepDqnObjective(Objective):
             )
         if q_target.shape != q.shape:
             raise ValueError(
-                f"n-step DQN delayed {self.prediction_key} shape "
+                f"n-step DQN delayed predictions shape "
                 f"{tuple(q_target.shape)} must match online shape {tuple(q.shape)}."
             )
         P, A = q.shape

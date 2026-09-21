@@ -67,7 +67,7 @@ def _tiny_model(architecture: str = "qwen3", tokens: int=1, dtype: torch.dtype =
     hidden_dim = 16
     backbone = TransformerBackbone(architecture=architecture, train_kernel=train_kernel, decode_kernel="flex", dtype=dtype, use_norm=True, hidden_dim=hidden_dim, num_layers=2, num_heads=2, vocab_size=32, **backbone_kwargs)
     head = RegressionHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, use_norm=True)
-    return Model(backbone=backbone, heads=head, action_source=head, reasoner=None).eval()
+    return Model(backbone=backbone, heads=head, action_source="action_value", reasoner=None).eval()
 
 def _steps(n: int, start: int=0) -> list[dict]:
     return [{'action': i % 4, 'reward': float(i), 'episode_done': int(i % 7 == 6), 'task_done': 0} for i in range(start, start + n)]
@@ -181,7 +181,7 @@ def test_cuda_bf16_lora_compiled_train_matches_cached_decode() -> None:
     head = RegressionHead(
         in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, use_norm=True
     )
-    model = Model(backbone=backbone, heads=head, action_source=head, reasoner=None).eval().to(torch.device('cuda'))
+    model = Model(backbone=backbone, heads=head, action_source="action_value", reasoner=None).eval().to(torch.device('cuda'))
     steps = _steps(8)
     for step, task in zip(steps, (0, 0, 1, 1, 0, 0, 2, 0)):
         step["task_index"] = task
@@ -306,6 +306,58 @@ def test_cuda_step_cudagraph_matches_eager_decode(S: int) -> None:
     graphed = run(graph=True)
     eager = run(graph=False)
     for i, (a, b) in enumerate(zip(graphed, eager)):
+        assert torch.allclose(a.float(), b.float(), atol=5e-2, rtol=5e-2), (
+            i, (a - b).abs().max().item()
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='decode CUDA graph is CUDA-only')
+def test_cuda_step_graph_survives_chunk_shape_change() -> None:
+    """Replays after an intervening chunk of another shape must stay correct.
+
+    A different chunk shape replaces the mask-holder tensors the captured
+    graph closed over; without invalidation the next same-shape step would
+    replay against the stale (capture-time) query tables.
+    """
+    from mouse_core.models.backbone.flex_decode import FlexDecodeSession
+
+    torch.manual_seed(0)
+    device = torch.device('cuda')
+    backbone = TransformerBackbone(architecture="qwen3", 
+        train_kernel="varlen", decode_kernel="flex", dtype=torch.bfloat16, use_norm=True,
+        hidden_dim=64, num_layers=2, num_heads=4).to(device).eval()
+    inner = cast(nn.Module, cast(Any, backbone).model)
+    B, D = 2, 64
+    pre = torch.randn(B, 8, D, device=device, dtype=torch.bfloat16)
+    preg = torch.zeros(B, 8, dtype=torch.long, device=device)
+    # S=1 twice captures a graph, S=4 replaces the holder tensors, then the
+    # S=1 steps that follow must not replay against the old tables.
+    chunk_sizes = [1, 1, 4, 1, 1, 1, 1]
+    chunks = [torch.randn(B, s, D, device=device, dtype=torch.bfloat16) for s in chunk_sizes]
+
+    def run(*, graph: bool) -> list[torch.Tensor]:
+        session = FlexDecodeSession(inner, batch_size=B)
+        if not graph:
+            session._graph_disabled = True
+        outs: list[torch.Tensor] = []
+        with torch.no_grad():
+            session.forward(embeds=pre, lengths=[8, 8], grouping_ids=preg)
+            for embeds in chunks:
+                s = embeds.shape[1]
+                hidden = session.forward(
+                    embeds=embeds, lengths=[s, s],
+                    grouping_ids=torch.zeros(B, s, dtype=torch.long, device=device),
+                )
+                assert isinstance(hidden, torch.Tensor)
+                outs.append(hidden.clone())
+        if graph:
+            assert session._graph is not None
+            assert not session._graph_disabled
+        return outs
+
+    graphed = run(graph=True)
+    eager = run(graph=False)
+    for i, (a, b) in enumerate(zip(graphed, eager, strict=True)):
         assert torch.allclose(a.float(), b.float(), atol=5e-2, rtol=5e-2), (
             i, (a - b).abs().max().item()
         )

@@ -6,7 +6,7 @@ from mouse_core.models import Model, load_model, save_model
 from mouse_core.models.backbone import IdentityBackbone
 from mouse_core.models.base import Model as ModelClass
 from mouse_core.data import Tokenizer
-from mouse_core.models.heads import ClassificationHead, RegressionHead
+from mouse_core.models.heads import ClassificationHead
 from tests._token_batch_helpers import batch_to_token_batch, token_tokenizer
 
 _TOK = token_tokenizer("action")
@@ -21,19 +21,16 @@ def test_infer_head_name_is_action() -> None:
     assert ModelClass._infer_head_name(head) == 'action'
 
 
-def test_action_source_must_be_an_enabled_instance() -> None:
+def test_action_source_must_be_an_enabled_name() -> None:
     hidden_dim = 8
     enabled = ClassificationHead(
         in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, use_norm=True
     )
-    other = RegressionHead(
-        in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, use_norm=True
-    )
-    with pytest.raises(ValueError, match="not one of the heads"):
+    with pytest.raises(ValueError, match="not among heads"):
         Model(
             backbone=IdentityBackbone(hidden_dim=hidden_dim, vocab_size=32),
             heads=enabled,
-            action_source=other,
+            action_source="action_value",
             reasoner=None,
         )
 
@@ -41,7 +38,7 @@ def test_classification_head_save_load_roundtrip(tmp_path) -> None:
     torch.manual_seed(0)
     hidden_dim = 8
     head = ClassificationHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, use_norm=True)
-    model = Model(backbone=IdentityBackbone(hidden_dim=hidden_dim, vocab_size=32), heads=head, action_source=head, reasoner=None).eval()
+    model = Model(backbone=IdentityBackbone(hidden_dim=hidden_dim, vocab_size=32), heads=head, action_source="action", reasoner=None).eval()
     batch = [[{'action': 0, 'reward': 0.0}, {'action': 1, 'reward': 1.0}]]
     expected = model(batch_to_token_batch(_TOK, batch)).predictions
     save_model(model=model, path=tmp_path)

@@ -3,7 +3,6 @@ from __future__ import annotations
 import torch
 
 from mouse_core.objectives import SpObjective
-from tests._bound_head import BoundHead
 from mouse_core.objectives.sp import _argmax_random_tie, sp_ce, sp_js
 
 
@@ -16,8 +15,8 @@ def test_sp_objective_allows_negative_infinity_action_padding() -> None:
             "info_q_star": torch.tensor([[[0.0, 1.0, -torch.inf]]]),
             "episode_done": _episode_done(1, 1),
         }
-    predictions = {"action": torch.tensor([[[0.0, 1.0, 100.0]]])}
-    loss, metrics = SpObjective(head=BoundHead("action"), loss_type="ce")(objective_data=objective_data, predictions=predictions)
+    predictions = torch.tensor([[[0.0, 1.0, 100.0]]])
+    loss, metrics = SpObjective(loss_type="ce")(objective_data=objective_data, predictions=predictions)
     assert loss.ndim == 0
     assert metrics["action"] >= 0.0
 
@@ -27,8 +26,8 @@ def test_sp_objective_skips_rows_with_no_finite_action_targets() -> None:
             "info_q_star": torch.tensor([[[-torch.inf, -torch.inf], [0.0, 1.0]]]),
             "episode_done": _episode_done(1, 2),
         }
-    predictions = {"action": torch.tensor([[[100.0, 0.0], [0.0, 100.0]]])}
-    loss, _ = SpObjective(head=BoundHead("action"), loss_type="ce")(objective_data=objective_data, predictions=predictions)
+    predictions = torch.tensor([[[100.0, 0.0], [0.0, 100.0]]])
+    loss, _ = SpObjective(loss_type="ce")(objective_data=objective_data, predictions=predictions)
     assert loss.item() < 0.0001
 
 
@@ -37,8 +36,8 @@ def test_sp_objective_skips_nonzero_mask_rows() -> None:
     q = torch.tensor([[[0.0, 0.0], [0.0, 1.0], [0.0, 1.0]]])
     logits = torch.tensor([[[0.0, 100.0], [100.0, 0.0], [0.0, 100.0]]])
     objective_data = {"info_q_star": q, "episode_done": torch.tensor([[1, 2, 0]], dtype=torch.int64)}
-    predictions = {"action": logits}
-    loss, _ = SpObjective(head=BoundHead("action"), loss_type="ce")(objective_data=objective_data, predictions=predictions)
+    predictions = logits
+    loss, _ = SpObjective(loss_type="ce")(objective_data=objective_data, predictions=predictions)
     assert loss.item() < 1e-4
 
 
@@ -46,8 +45,8 @@ def test_sp_objective_mask_key_none_keeps_terminals() -> None:
     q = torch.tensor([[[1.0, 0.0]]])
     logits = torch.tensor([[[0.0, 100.0]]])
     objective_data = {"info_q_star": q}
-    predictions = {"action": logits}
-    loss, _ = SpObjective(head=BoundHead("action"), loss_type="ce", mask_key=None)(objective_data=objective_data, predictions=predictions)
+    predictions = logits
+    loss, _ = SpObjective(loss_type="ce", mask_key=None)(objective_data=objective_data, predictions=predictions)
     assert loss.item() > 1.0
 
 
@@ -59,8 +58,8 @@ def test_sp_objective_soft_losses_finite_with_padded_actions() -> None:
     objective_data = {"info_q_star": q, "episode_done": _episode_done(2, 3)}
     for loss_type in ("kl-fwd", "kl-bwd", "ce-soft-fwd", "ce-soft-bwd", "js"):
         logits = torch.randn(2, 3, 4, requires_grad=True)
-        predictions = {"action": logits}
-        loss, _ = SpObjective(head=BoundHead("action"), loss_type=loss_type, label_smoothing=0.1)(
+        predictions = logits
+        loss, _ = SpObjective(loss_type=loss_type, label_smoothing=0.1)(
             objective_data=objective_data, predictions=predictions
         )
         loss.backward()
@@ -73,9 +72,9 @@ def test_sp_objective_soft_losses_ignore_padded_student_logits() -> None:
     """A junk student logit at a padded slot must not affect the loss."""
     q = torch.tensor([[[1.0, 2.0, 3.0, -torch.inf]]])
     objective_data = {"info_q_star": q, "episode_done": _episode_done(1, 1)}
-    matching = {"action": torch.tensor([[[1.0, 2.0, 3.0, 100.0]]])}
+    matching = torch.tensor([[[1.0, 2.0, 3.0, 100.0]]])
     for direction in ("kl-fwd", "kl-bwd"):
-        loss, _ = SpObjective(head=BoundHead("action"), loss_type=direction)(objective_data=objective_data, predictions=matching)
+        loss, _ = SpObjective(loss_type=direction)(objective_data=objective_data, predictions=matching)
         assert loss.item() < 1e-06, direction
 
 
@@ -104,6 +103,24 @@ def test_sp_ce_matches_cross_entropy_on_unique_max() -> None:
     logits = torch.tensor([[0.5, -1.0, 2.0]])
     expected = torch.nn.functional.cross_entropy(logits, torch.tensor([1]))
     assert torch.allclose(sp_ce(q, logits), expected)
+    smoothed = torch.nn.functional.cross_entropy(logits, torch.tensor([1]), label_smoothing=0.2)
+    assert torch.allclose(sp_ce(q, logits, label_smoothing=0.2), smoothed)
+
+
+def test_sp_ce_ignores_padded_student_logits() -> None:
+    """A junk student logit at a padded slot must not affect the hard CE loss."""
+    q = torch.tensor([[0.0, 2.0, 1.0, -torch.inf]])
+    logits = torch.tensor([[0.5, -1.0, 2.0, 100.0]], requires_grad=True)
+    clean = sp_ce(q[:, :3], logits[:, :3])
+    padded = sp_ce(q, logits)
+    assert torch.allclose(padded, clean)
+    clean_smoothed = sp_ce(q[:, :3], logits[:, :3], label_smoothing=0.1)
+    padded_smoothed = sp_ce(q, logits, label_smoothing=0.1)
+    assert torch.isfinite(padded_smoothed)
+    assert torch.allclose(padded_smoothed, clean_smoothed)
+    padded_smoothed.backward()
+    assert logits.grad is not None
+    assert logits.grad[0, -1].item() == 0.0
 
 
 def test_sp_objective_custom_targets_key() -> None:
@@ -111,8 +128,8 @@ def test_sp_objective_custom_targets_key() -> None:
             "action_value": torch.tensor([[[0.0, 2.0]]]),
             "episode_done": _episode_done(1, 1),
         }
-    predictions = {"action": torch.tensor([[[0.0, 1.0]]])}
-    loss, _ = SpObjective(head=BoundHead("action"), loss_type="ce", targets_key="action_value")(
+    predictions = torch.tensor([[[0.0, 1.0]]])
+    loss, _ = SpObjective(loss_type="ce", targets_key="action_value")(
         objective_data=objective_data, predictions=predictions
     )
     assert loss.item() > 0.0

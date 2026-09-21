@@ -734,7 +734,11 @@ class FlexDecodeSession:
             )
 
     def _update_mask_tables(self, t: torch.Tensor, q_mask: torch.Tensor) -> None:
-        """Write query tables; copy in-place when the CUDA graph closed over them."""
+        """Write query tables; copy in-place when the CUDA graph closed over them.
+
+        A shape/dtype/device change replaces the tensors and drops any
+        captured graph, which read the old ones by device address.
+        """
         ht = self._mask_holder["t"]
         hq = self._mask_holder["q_mask"]
         if (
@@ -747,8 +751,12 @@ class FlexDecodeSession:
             ht.copy_(t)
             hq.copy_(q_mask)
         else:
+            # A captured step graph closed over the previous tensors by device
+            # address; after replacing them its kernels would keep reading the
+            # old (freed / stale) memory on replay. Drop it and recapture.
             self._mask_holder["t"] = t.contiguous()
             self._mask_holder["q_mask"] = q_mask.contiguous()
+            self._invalidate_graph()
         self._mask_holder["kv_mask"] = self.grouping_ids
         _bind_decode_mask_holder(self._mask_holder)
 

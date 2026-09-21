@@ -50,9 +50,9 @@ class HeadSpec:
 def prediction_key(*, head: BaseHead) -> str:
     """Storage key ``Model`` uses for this head's outputs in ``predictions``.
 
-    Bound when the head is passed to ``Model(heads=)``. Objectives look up
-    tensors with this key so the caller passes the head instance, not a
-    string name.
+    Bound when the head is passed to ``Model(heads=)``. Index
+    ``ModelOutput.predictions`` with this key and pass the tensor to the
+    objective.
     """
     if not isinstance(head, BaseHead):
         raise TypeError(f"head must be a BaseHead instance, got {type(head).__name__}.")

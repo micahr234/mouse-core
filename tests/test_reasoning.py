@@ -44,7 +44,7 @@ def _tiny_model(*, num_thoughts: int = 2, with_reasoner: bool = True) -> Model:
         if with_reasoner
         else None
     )
-    return Model(backbone=backbone, heads=heads, action_source=heads, reasoner=reasoner)
+    return Model(backbone=backbone, heads=heads, action_source="action_value", reasoner=reasoner)
 
 
 def _rows(n: int, offset: int = 0, groups: list[int] | None = None) -> list[dict]:

@@ -100,6 +100,43 @@ def test_objective_vector_column_promotes_dtype() -> None:
     assert objective["q"].tolist() == [[1.0, 2.0], [0.5, 0.25]]
 
 
+def test_objective_ragged_float_vectors_pad_with_neg_inf() -> None:
+    """Shorter rows are padded with -inf (the nonexistent-action sentinel), not 0."""
+    tok = Tokenizer(
+        input_fields=[
+            {"type": "token", "input_field": "action", "head_output": True}
+        ],
+        objective_fields=[{"input_field": "q"}],
+        grouping_field="task_index",
+    )
+    steps = [
+        tok({"action": 0, "q": np.array([1.0, 2.0, 3.0]), "task_index": 0}),
+        tok({"action": 0, "q": np.array([0.5, 0.25]), "task_index": 0}),
+    ]
+    _, objective = pack_token_batch(steps=steps, sequence_ids=[0, 0], batch_size=1)
+    q = objective["q"]
+    assert q[0].tolist() == [1.0, 2.0, 3.0]
+    assert q[1, :2].tolist() == [0.5, 0.25]
+    assert q[1, 2].item() == -torch.inf
+
+
+def test_objective_ragged_int_vectors_raise() -> None:
+    """Integer columns have no padding sentinel, so ragged shapes are an error."""
+    tok = Tokenizer(
+        input_fields=[
+            {"type": "token", "input_field": "action", "head_output": True}
+        ],
+        objective_fields=[{"input_field": "q"}],
+        grouping_field="task_index",
+    )
+    steps = [
+        tok({"action": 0, "q": np.array([1, 2, 3]), "task_index": 0}),
+        tok({"action": 0, "q": np.array([4, 5]), "task_index": 0}),
+    ]
+    with pytest.raises(ValueError, match="ragged"):
+        pack_token_batch(steps=steps, sequence_ids=[0, 0], batch_size=1)
+
+
 def test_objective_mixed_rank_raises() -> None:
     tok = Tokenizer(
         input_fields=[

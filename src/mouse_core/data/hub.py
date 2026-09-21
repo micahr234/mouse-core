@@ -32,7 +32,6 @@ import tempfile
 import time
 from typing import TYPE_CHECKING, Any, NoReturn
 
-import numpy as np
 from datasets import Dataset, DatasetDict, Features, Value, load_dataset
 from datasets import config as datasets_config
 from huggingface_hub import CommitOperationAdd, HfApi, snapshot_download
@@ -50,55 +49,18 @@ def _is_null_typed(feature: Any) -> bool:
     return isinstance(feature, Value) and feature.dtype == "null"
 
 
-def _placeholder_column_like(ref_ds: Dataset, col: str, n_rows: int) -> list[Any]:
-    """Build ``n_rows`` placeholder values matching the shape/dtype of ``ref_ds[col][0]``."""
-    sample = ref_ds[col][0]
-    if isinstance(sample, str):
-        return [""] * n_rows
-    if isinstance(sample, (float, np.floating)):
-        return [float("nan")] * n_rows
-    if isinstance(sample, (bool, np.bool_)):
-        return [False] * n_rows
-    if isinstance(sample, (int, np.integer)):
-        return [0] * n_rows
-
-    def _fill_array(a: np.ndarray) -> np.ndarray:
-        if a.dtype.kind == "f":
-            return np.full_like(a, np.nan)
-        if a.dtype.kind in ("i", "u"):
-            return np.zeros_like(a)
-        if a.dtype.kind == "b":
-            return np.zeros_like(a, dtype=bool)
-        return np.zeros_like(a)
-
-    if isinstance(sample, list):
-        a = np.asarray(sample)
-        if a.dtype == object or a.size == 0:
-            return [[] for _ in range(n_rows)]
-        row = _fill_array(a).tolist()
-        return [list(row) for _ in range(n_rows)]
-
-    a = np.asarray(sample)
-    if a.dtype == object:
-        return [None] * n_rows
-    if a.size == 0:
-        return [a.copy() for _ in range(n_rows)]
-    fill = _fill_array(a)
-    return [fill.copy() for _ in range(n_rows)]
-
-
 def _align_splits(splits: dict[str, Dataset]) -> dict[str, Dataset]:
     """Ensure every split has identical columns, types, and order.
 
-    Three cases are handled:
+    Two cases are handled:
 
-    - A column is entirely absent from a split (different env params across runs).
     - A column exists but is ``Value('null')`` in one split while another has a
       proper dtype — the non-null type wins.
     - Column order differs between splits.
 
-    Strategy: build a canonical ``Features`` schema (preferring non-null types)
-    then fill missing columns with placeholders and ``Dataset.cast`` to it.
+    A column entirely absent from a split is an error: fabricating values
+    (``0`` done codes, ``0`` actions) would silently train wrong later. Add
+    the column to every split's rows explicitly before pushing.
     """
     if len(splits) <= 1:
         return splits
@@ -112,34 +74,35 @@ def _align_splits(splits: dict[str, Dataset]) -> dict[str, Dataset]:
                 canonical_cols.append(col)
                 seen.add(col)
 
+    absent = {
+        name: missing
+        for name, ds in splits.items()
+        if (missing := [c for c in canonical_cols if c not in ds.column_names])
+    }
+    if absent:
+        detail = "; ".join(f"split {name!r} is missing {cols}" for name, cols in absent.items())
+        raise ValueError(
+            f"push_to_hub requires every split to have the same columns: {detail}. "
+            "Add the missing columns to those rows explicitly before pushing — "
+            "fabricated placeholder values would silently train wrong later."
+        )
+
     # For each column, prefer a split with a non-null dtype as the reference.
     best_feature: dict[str, Any] = {}
     for col in canonical_cols:
         for ds in splits.values():
-            if col in ds.column_names and not _is_null_typed(ds.features[col]):
+            if not _is_null_typed(ds.features[col]):
                 best_feature[col] = ds.features[col]
                 break
         if col not in best_feature:
-            for ds in splits.values():
-                if col in ds.column_names:
-                    best_feature[col] = ds.features[col]
-                    break
+            best_feature[col] = next(iter(splits.values())).features[col]
 
     canonical_features = Features(best_feature)
 
-    out: dict[str, Dataset] = {}
-    for name, ds in splits.items():
-        cur = ds
-        for col in canonical_cols:
-            if col not in cur.column_names:
-                ref_ds = next(d for d in splits.values() if col in d.column_names)
-                cur = cur.add_column(
-                    col,
-                    _placeholder_column_like(ref_ds=ref_ds, col=col, n_rows=len(cur)),
-                )
-        cur = cur.select_columns(canonical_cols).cast(canonical_features)
-        out[name] = cur
-    return out
+    return {
+        name: ds.select_columns(canonical_cols).cast(canonical_features)
+        for name, ds in splits.items()
+    }
 
 
 def _raise_for_hub_http_error(error: HfHubHTTPError, repo_id: str) -> NoReturn:

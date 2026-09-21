@@ -12,7 +12,6 @@ from mouse_core.models.backbone import TransformerBackbone
 from mouse_core.models.heads import RegressionHead
 from mouse_core.models.reasoner import _plan_insertions
 from mouse_core.objectives import DqnObjective, affine_reward, affine_value, boundary_discount
-from tests._bound_head import BoundHead
 from tests._token_batch_helpers import batch_to_packed
 
 
@@ -97,7 +96,7 @@ def _tiny_model(*, with_reasoner: bool = False) -> Model:
     reasoner = (
         LatentReasoner(hidden_dim=_HIDDEN, num_thoughts=2) if with_reasoner else None
     )
-    return Model(backbone=backbone, heads=heads, action_source=heads, reasoner=reasoner)
+    return Model(backbone=backbone, heads=heads, action_source="action_value", reasoner=reasoner)
 
 
 def _rows(n: int, offset: int = 0) -> list[dict]:
@@ -247,7 +246,7 @@ def test_get_action_uses_last_valid_head_output_not_last_token() -> None:
         heads=(head := RegressionHead(
             in_features=hidden, out_features=_ACTIONS, hidden_dim=hidden, num_layers=1, use_norm=True,
         )),
-        action_source=head,
+        action_source="action_value",
         reasoner=None,
     ).eval()
     tok = _head_output_tokenizer("action", "observation", tail="tail")
@@ -344,16 +343,16 @@ def test_dqn_duplicated_rows_match_single_head_output() -> None:
     N, A = 5, _ACTIONS
     q = torch.randn(N, A)
     q_target = torch.randn(N, A)
-    objective = DqnObjective(head=BoundHead("action_value"), reward=_rew(), value=_val(), discount=_disc(gamma_step=0.9), grouping_field=None, temperature=0.0)
+    objective = DqnObjective(reward=_rew(), value=_val(), discount=_disc(gamma_step=0.9), grouping_field=None, temperature=0.0)
 
     base_loss, base_metrics = objective(
-        objective_data=_objective_data(N), predictions={"action_value": q}, delayed_predictions={"action_value": q_target},
+        objective_data=_objective_data(N), predictions=q, delayed_predictions=q_target,
     )
     # Duplicate every step's head-output row: same targets, same loss.
     q2 = q.repeat_interleave(2, dim=0)
     q2_target = q_target.repeat_interleave(2, dim=0)
     dup_loss, dup_metrics = objective(
-        objective_data=_objective_data(N, counts=[2] * N), predictions={"action_value": q2}, delayed_predictions={"action_value": q2_target},
+        objective_data=_objective_data(N, counts=[2] * N), predictions=q2, delayed_predictions=q2_target,
     )
     assert torch.allclose(base_loss, dup_loss, atol=1e-6)
     for key in ("q_values_mean", "q_values_min", "q_values_max"):
@@ -366,11 +365,11 @@ def test_dqn_multi_head_output_shares_step_target() -> None:
     gamma = 0.9
     q = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
     q_target = torch.tensor([[10.0, 20.0], [30.0, 40.0], [50.0, 60.0]])
-    objective = DqnObjective(head=BoundHead("action_value"), reward=_rew(), value=_val(), discount=_disc(gamma_step=gamma), grouping_field=None, temperature=0.0)
+    objective = DqnObjective(reward=_rew(), value=_val(), discount=_disc(gamma_step=gamma), grouping_field=None, temperature=0.0)
     data = _objective_data(2, counts=[2, 1], actions=[0, 1])
     data["reward"] = torch.tensor([0.0, 0.5])
     loss, _ = objective(
-        objective_data=data, predictions={"action_value": q}, delayed_predictions={"action_value": q_target},
+        objective_data=data, predictions=q, delayed_predictions=q_target,
     )
     target = 0.5 + gamma * 60.0  # r_1 + gamma * max_a Q_target(s_1) (row 2)
     expected = ((2.0 - target) ** 2 + (4.0 - target) ** 2) / 2  # a_1 = 1
@@ -380,12 +379,11 @@ def test_dqn_multi_head_output_shares_step_target() -> None:
 def test_dqn_misaligned_head_output_count_raises() -> None:
     N = 3
     q = torch.randn(2 * N, _ACTIONS)
-    preds = {"action_value": q}
-    objective = DqnObjective(head=BoundHead("action_value"), reward=_rew(), value=_val(), discount=_disc(), grouping_field=None, temperature=0.0)
+    objective = DqnObjective(reward=_rew(), value=_val(), discount=_disc(), grouping_field=None, temperature=0.0)
     with pytest.raises(ValueError, match="misaligned"):
-        objective(objective_data=_objective_data(N, counts=[2, 2, 1]), predictions=preds, delayed_predictions={key: value.clone() for key, value in preds.items()})
+        objective(objective_data=_objective_data(N, counts=[2, 2, 1]), predictions=q, delayed_predictions=q.clone())
     with pytest.raises(ValueError, match="head_output_count column"):
-        objective(objective_data=_objective_data(N), predictions=preds, delayed_predictions={key: value.clone() for key, value in preds.items()})
+        objective(objective_data=_objective_data(N), predictions=q, delayed_predictions=q.clone())
 
 
 # ---------------------------------------------------------------------------

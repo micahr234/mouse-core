@@ -8,8 +8,7 @@ from typing import Literal
 import torch
 import torch.nn.functional as F
 
-from mouse_core.models.heads.base import BaseHead
-from mouse_core.objectives.base import Objective, predictions_for, require_head
+from mouse_core.objectives.base import Objective
 
 
 def _argmax_random_tie(q_targets: torch.Tensor) -> torch.Tensor:
@@ -35,13 +34,28 @@ def sp_ce(
     When several finite actions share the maximum Q, one is sampled uniformly
     each call so the label is not biased toward the lowest index.
 
+    ``-inf`` entries in ``q_targets`` are padding sentinels for actions that
+    do not exist. As in the soft losses, those actions are excluded from the
+    student softmax denominator and from label smoothing, so a junk student
+    logit at a padded slot never affects the loss.
+
     Args:
         q_targets: ``[N, A]`` teacher Q-values.
         logits: ``[N, A]`` student action logits.
-        label_smoothing: Passed through to ``F.cross_entropy``.
+        label_smoothing: Mixes uniform mass over the *valid* actions into the
+            hard label.
     """
     target_actions = _argmax_random_tie(q_targets)
-    return F.cross_entropy(logits, target_actions, label_smoothing=label_smoothing)
+    invalid = ~torch.isfinite(q_targets)
+    fill = torch.finfo(logits.dtype).min / 4
+    log_probs = F.log_softmax(logits.masked_fill(invalid, fill), dim=-1)
+    nll = -log_probs.gather(dim=-1, index=target_actions.unsqueeze(-1)).squeeze(-1)
+    if label_smoothing > 0.0:
+        valid = (~invalid).to(dtype=log_probs.dtype)
+        num_valid = valid.sum(dim=-1).clamp(min=1.0)
+        smooth = -(log_probs * valid).sum(dim=-1) / num_valid
+        nll = (1.0 - label_smoothing) * nll + label_smoothing * smooth
+    return nll.mean()
 
 
 def _soft_distributions(
@@ -196,7 +210,7 @@ def _skip_mask(mask: torch.Tensor, n_rows: int) -> torch.Tensor:
 class SpObjective(Objective):
     """Supervised policy objective distilling per-action Q targets into action logits.
 
-    Reads the tensor for ``head`` (shape ``[B, S, A]``) and compares against
+    Reads ``predictions`` (shape ``[B, S, A]``) and compares against
     ``objective_data[targets_key]`` (same shape).
 
     ``info_q_star`` is Q of taking an action *from the current observation* (the
@@ -210,11 +224,10 @@ class SpObjective(Objective):
             random each forward); the soft variants treat it as a distribution.
         temperature: Softmax temperature applied to targets before soft losses
             (ignored for ``"ce"``).
-        label_smoothing: Mixes uniform mass into the teacher. On hard ``"ce"``
-            this is ``F.cross_entropy`` smoothing; on soft losses it is applied
-            to the teacher distribution only.
-        head: Policy head this objective trains. Must be the same
-            instance passed to ``Model(heads=)``.
+        label_smoothing: Mixes uniform mass over the valid (finite-target)
+            actions into the teacher. On hard ``"ce"`` it smooths the hard
+            label; on soft losses it is applied to the teacher distribution
+            only.
         targets_key: Key in ``objective_data`` that holds ``[B, S, A]`` Q targets
             (default ``"info_q_star"`` from env expert Q; use e.g. ``"action_value"``
             for teacher-model distillation).
@@ -229,14 +242,12 @@ class SpObjective(Objective):
         loss_type: Literal["ce", "ce-soft-fwd", "ce-soft-bwd", "js", "kl-fwd", "kl-bwd"] = "ce",
         temperature: float = 1.0,
         label_smoothing: float = 0.0,
-        head: BaseHead,
         targets_key: str = "info_q_star",
         mask_key: str | None = "episode_done",
     ) -> None:
         self.loss_type = loss_type
         self.temperature = temperature
         self.label_smoothing = label_smoothing
-        self.head = require_head(head=head, what="head")
         self.targets_key = targets_key
         self.mask_key = mask_key
 
@@ -244,10 +255,9 @@ class SpObjective(Objective):
         self,
         *,
         objective_data: dict[str, torch.Tensor],
-        predictions: dict[str, torch.Tensor],
-        delayed_predictions: dict[str, torch.Tensor] | None = None,
+        predictions: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        logits: torch.Tensor = predictions_for(head=self.head, predictions=predictions, who="SpObjective")
+        logits: torch.Tensor = predictions
         temp = float(self.temperature)
 
         A = logits.shape[-1]

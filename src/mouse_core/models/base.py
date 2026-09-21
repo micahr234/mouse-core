@@ -561,7 +561,7 @@ def _build_model_from_config(
     return Model(
         backbone=backbone,
         heads=heads,
-        action_source=heads[action_name],
+        action_source=action_name,
         reasoner=reasoner,
     )
 
@@ -738,19 +738,19 @@ class Model(nn.Module):
       type (``action_value`` / ``action``);
       use the dict form to pick the key.
 
-    ``action_source`` is the head instance ``get_action`` consults. It must
-    be one of the objects in ``heads``. Required.
+    ``action_source`` is the ``heads`` dict key ``get_action`` consults.
+    Required.
     ``reasoner`` is required (pass ``None`` when unused).
 
     Full construction::
 
         backbone = TransformerBackbone(pretrained=..., ...)
-        head = RegressionHead(...)            # or a dict/list of heads
+        head = RegressionHead(...)
 
         model = Model(
             backbone=backbone,
-            heads=head,
-            action_source=head,
+            heads={"action_value": head},
+            action_source="action_value",
             reasoner=None,
         )
 
@@ -847,16 +847,24 @@ class Model(nn.Module):
         )
 
     @staticmethod
-    def _action_source_name(heads: Mapping[str, BaseHead], action_source: BaseHead) -> str:
-        """Resolve ``action_source`` to the storage key of that same instance."""
-        return Model._head_name(heads, action_source, what="action_source")
+    def _require_action_source(heads: Mapping[str, BaseHead], action_source: str) -> str:
+        """Require ``action_source`` to be a key in ``heads``."""
+        if not isinstance(action_source, str) or not action_source:
+            raise TypeError(
+                f"action_source must be a non-empty string, got {action_source!r}."
+            )
+        if action_source not in heads:
+            raise ValueError(
+                f"action_source {action_source!r} is not among heads {tuple(heads)}."
+            )
+        return action_source
 
     def __init__(
         self,
         *,
         backbone: Backbone,
         heads: BaseHead | list[BaseHead] | Mapping[str, BaseHead | None],
-        action_source: BaseHead,
+        action_source: str,
         reasoner: LatentReasoner | None,
     ):
         """Construct a Model from backbone and heads.
@@ -905,7 +913,7 @@ class Model(nn.Module):
         for name, head in self._heads.items():
             _bind_prediction_key(head, name)
 
-        self.action_source = Model._action_source_name(self._heads, action_source)
+        self.action_source = Model._require_action_source(self._heads, action_source)
 
         self.hidden_dim = hidden_dim
         # Best-effort inference of action cardinality for introspection only.
@@ -1022,7 +1030,7 @@ class Model(nn.Module):
         return Model(
             backbone=copied_backbone,
             heads=copied_heads,
-            action_source=copied_heads[action_name],
+            action_source=action_name,
             reasoner=copied_reasoner,
         )
 
@@ -1432,7 +1440,7 @@ class Model(nn.Module):
 
         Flat training outputs ``[N, A]`` are rejected unless ``N == 1``.
 
-        Scores come from the head passed as ``action_source``.
+        Scores come from the head named by ``action_source``.
         """
         if isinstance(out, ModelOutput):
             preds = out.predictions

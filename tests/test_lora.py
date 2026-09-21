@@ -55,7 +55,7 @@ def _model(
         heads=(head := RegressionHead(
             in_features=_HIDDEN, out_features=_ACTIONS, hidden_dim=_HIDDEN, num_layers=1, use_norm=True
         )),
-        action_source=head,
+        action_source="action_value",
         reasoner=LatentReasoner(hidden_dim=_HIDDEN, num_thoughts=1) if reasoner else None,
     )
 

@@ -105,6 +105,30 @@ def test_getitem_slice_and_copies() -> None:
     assert store[0][0]['action'] == 0
 
 
+def test_append_copies_nested_values() -> None:
+    """An env that refills one observation buffer in place must not rewrite the store."""
+    import numpy as np
+
+    store = Datastore()
+    obs = np.zeros(3)
+    row = {'obs': obs, 'action': 0}
+    store.append(data=row)
+    obs[:] = 99.0
+    row['action'] = 5
+    stored = store[0][0]
+    assert list(stored['obs']) == [0.0, 0.0, 0.0]
+    assert stored['action'] == 0
+
+
+def test_getitem_copies_nested_values() -> None:
+    """Mutating a nested value on a returned row must not alter the store."""
+    store = Datastore()
+    store.append(data={'obs': [0.0, 0.0], 'action': 0})
+    row = store[0][0]
+    row['obs'][0] = 99.0
+    assert store[0][0]['obs'][0] == 0.0
+
+
 def test_getitem_mixed_source_and_buffer() -> None:
     """Rows from the HF source and from the append buffer interleave correctly."""
     store = Datastore()

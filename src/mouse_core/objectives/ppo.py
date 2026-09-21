@@ -7,8 +7,7 @@ from typing import cast
 import torch
 import torch.nn.functional as F
 
-from mouse_core.models.heads.base import BaseHead
-from mouse_core.objectives.base import Objective, predictions_for, require_head
+from mouse_core.objectives.base import Objective
 from mouse_core.objectives.dqn import (
     _pair_weight,
     _require_action_ids,
@@ -94,10 +93,11 @@ class PpoObjective(Objective):
     Instantiate with hyperparameters, then call with
     ``objective_data=`` and ``predictions=`` to compute the loss.
 
-    Requires dual heads on the model:
+    Call with the policy logits as ``predictions=`` and the value
+    tensor as ``value_predictions=``:
 
-    * ``head`` — ``[N, A]`` discrete policy logits
-    * ``value_head`` — ``[N, 1]`` or ``[N]`` scalar state values
+    * ``predictions`` — ``[N, A]`` discrete policy logits
+    * ``value_predictions`` — ``[N, 1]`` or ``[N]`` scalar state values
 
     A run is the same ``sequence_id`` and, when ``grouping_field=`` is set,
     the same grouping column. Neighbor reads must stay in-run: out-of-run
@@ -132,11 +132,13 @@ class PpoObjective(Objective):
             ],
         )
         from mouse_core.data import to_device
+        from mouse_core.models import prediction_key
         inputs, objective_data = loader.next_batch()
-        predictions = model(inputs).predictions
+        out = model(inputs)
         loss, metrics = objective(
             objective_data=to_device(data=objective_data, device=device),
-            predictions=predictions,
+            predictions=out.predictions[prediction_key(head=policy_head)],
+            value_predictions=out.predictions[prediction_key(head=value_head)],
         )
 
     When ``old_log_prob`` is absent, the detached current log-probs are used
@@ -168,10 +170,6 @@ class PpoObjective(Objective):
         episode_done_key: Key in ``objective_data`` for episode-done codes.
         task_done_key: Key in ``objective_data`` for task-done codes.
         old_log_prob_key: Key in ``objective_data`` for behavior log-probs.
-        head: Policy head this objective trains. Must be the same
-            instance passed to ``Model(heads=)``.
-        value_head: Value head this objective trains. Must be the same
-            instance passed to ``Model(heads=)``.
         num_actions: If set, only the first ``num_actions`` logits participate.
         grouping_field: Step column that isolates runs (typically
             ``task_index``). Required. Pass ``None`` only when the batch
@@ -194,8 +192,6 @@ class PpoObjective(Objective):
         episode_done_key: str = "episode_done",
         task_done_key: str = "task_done",
         old_log_prob_key: str = "old_log_prob",
-        head: BaseHead,
-        value_head: BaseHead,
         num_actions: int | None = None,
         grouping_field: str | None,
     ) -> None:
@@ -211,8 +207,6 @@ class PpoObjective(Objective):
         self.episode_done_key = episode_done_key
         self.task_done_key = task_done_key
         self.old_log_prob_key = old_log_prob_key
-        self.head = require_head(head=head, what="head")
-        self.value_head = require_head(head=value_head, what="value_head")
         self.num_actions = num_actions
         self.grouping_field = grouping_field
 
@@ -220,11 +214,11 @@ class PpoObjective(Objective):
         self,
         *,
         objective_data: dict[str, torch.Tensor],
-        predictions: dict[str, torch.Tensor],
-        delayed_predictions: dict[str, torch.Tensor] | None = None,
+        predictions: torch.Tensor,
+        value_predictions: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        logits: torch.Tensor = predictions_for(head=self.head, predictions=predictions, who="PPO")
-        values_raw: torch.Tensor = predictions_for(head=self.value_head, predictions=predictions, who="PPO")
+        logits: torch.Tensor = predictions
+        values_raw: torch.Tensor = value_predictions
 
         if logits.ndim != 2:
             raise ValueError(

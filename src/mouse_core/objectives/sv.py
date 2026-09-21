@@ -7,14 +7,13 @@ from typing import Literal
 import torch
 import torch.nn.functional as F
 
-from mouse_core.models.heads.base import BaseHead
-from mouse_core.objectives.base import Objective, predictions_for, require_head
+from mouse_core.objectives.base import Objective
 
 
 class SvObjective(Objective):
     """Supervised value regression objective on per-action Q targets.
 
-    Reads the tensor for ``head`` (shape ``[B, S, A]``) and regresses toward
+    Reads ``predictions`` (shape ``[B, S, A]``) and regresses toward
     ``objective_data[targets_key]``. Every finite target entry participates,
     including terminal / truncated rows — unlike :class:`~mouse_core.objectives.sp.SpObjective`,
     there is no ``mask_key``. ``-inf`` sentinels used for padded or invalid
@@ -22,8 +21,6 @@ class SvObjective(Objective):
 
     Args:
         loss_type: ``"mse"`` (L2) or ``"mae"`` (L1) regression loss.
-        head: Value head this objective trains. Must be the same
-            instance passed to ``Model(heads=)``.
         targets_key: Key in ``objective_data`` that holds ``[B, S, A]`` Q targets
             (default ``"info_q_star"``).
     """
@@ -32,21 +29,18 @@ class SvObjective(Objective):
         self,
         *,
         loss_type: Literal["mse", "mae"] = "mse",
-        head: BaseHead,
         targets_key: str = "info_q_star",
     ) -> None:
         self.loss_type = loss_type
-        self.head = require_head(head=head, what="head")
         self.targets_key = targets_key
 
     def __call__(
         self,
         *,
         objective_data: dict[str, torch.Tensor],
-        predictions: dict[str, torch.Tensor],
-        delayed_predictions: dict[str, torch.Tensor] | None = None,
+        predictions: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        logits: torch.Tensor = predictions_for(head=self.head, predictions=predictions, who="SvObjective")
+        logits: torch.Tensor = predictions
 
         A = logits.shape[-1]
         logits = logits.reshape(-1, A)
