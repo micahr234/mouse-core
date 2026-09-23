@@ -436,6 +436,7 @@ def value_gap_gate(
     normalize: bool,
     policy_delayed: bool,
     value_delayed: bool,
+    bias: float,
     eps: float | None = None,
 ) -> Gate:
     """Soft trace cut from the optimality gap.
@@ -445,39 +446,47 @@ def value_gap_gate(
     ``True`` reads ``q_delayed``. Ties take the lowest index, the same
     rule as ``get_action(temperature=0)``. ``value_delayed`` scores
     that action and the taken action on online ``q`` or on
-    ``q_delayed``. ``V = Q_value(s, a*)``. The gap is
-    ``max(0, V - Q_value(s, a_taken))``. When the two flags agree,
-    ``V`` is ``max_a`` of that Q, so a taken action tied with the max
-    continues at ``c = 1``. The bootstrap state value stays the delayed
-    one the objective already computes. ``normalize=True`` divides by
-    the range of the value Q at that state:
+    ``q_delayed``. ``V = Q_value(s, a*)``. The signed gap is
+    ``Q_value(s, a_taken) - V``. ``normalize=True`` divides it by the
+    range of the value Q. ``bias`` is added, then the gap is capped at
+    ``0``:
 
-    ``c = exp(-beta * (V - Q(s, a_taken)) / (max_a Q - min_a Q + eps))``.
+    ``gap = min(0, Q(s, a_taken) - V + bias)``
 
-    ``normalize=False`` leaves that range term out and uses the raw gap,
-    ``c = exp(-beta * (V - Q(s, a_taken)))``. ``eps`` is required when
-    ``normalize`` is ``True`` and is rejected when ``normalize`` is
-    ``False``. Returns ``[N, N]``. Column ``s`` is that continuation
-    through step ``s`` for every earlier start, the same step
-    ``watkins_gate`` marks with its greedy flag. Column ``0`` and the
-    last column are ``0`` (no action leaves the batch). A zero gap
-    continues with ``c = 1``. A larger gap shrinks the continuation
-    toward a bootstrap of the delayed state value. The objective still
-    applies the in-run mask. Fewer than 2 steps, or an ``action`` whose
-    length is not ``N``, raises.
+    ``c = exp(beta * gap)``. ``normalize=True`` uses
+
+    ``gap = min(0, (Q(s, a_taken) - V) / (max_a Q - min_a Q + eps) + bias)``.
+
+    ``eps`` is required when ``normalize`` is ``True`` and is rejected
+    when ``normalize`` is ``False``. When the two flags agree, ``V`` is
+    ``max_a`` of that Q, so a taken action tied with the max has signed
+    gap ``0`` before ``bias``. The bootstrap state value stays the
+    delayed one the objective already computes. Returns ``[N, N]``.
+    Column ``s`` is that continuation through step ``s`` for every
+    earlier start, the same step ``watkins_gate`` marks with its greedy
+    flag. Column ``0`` and the last column are ``0`` (no action leaves
+    the batch). A gap of ``0`` continues with ``c = 1``. A negative gap
+    shrinks the continuation toward a bootstrap of the delayed state
+    value. The objective still applies the in-run mask. Fewer than 2
+    steps, or an ``action`` whose length is not ``N``, raises.
 
     Args:
         beta: Positive scale on the gap. With ``normalize=True``, a
             taken action at the minimum of the value Q continues near
-            ``exp(-beta)`` when the range is large next to ``eps`` and
-            ``a*`` is a max of that Q. With ``normalize=False``, a gap
-            of ``1`` continues at ``exp(-beta)``.
-        normalize: ``True`` divides the gap by ``max_a Q - min_a Q + eps``
-            on the value Q. ``False`` uses the raw gap.
+            ``exp(-beta)`` when the range is large next to ``eps``,
+            ``bias`` is ``0``, and ``a*`` is a max of that Q. With
+            ``normalize=False``, a gap of ``-1`` continues at
+            ``exp(-beta)``.
+        normalize: ``True`` divides the signed gap by
+            ``max_a Q - min_a Q + eps`` on the value Q before ``bias``.
+            ``False`` uses the raw signed gap.
         policy_delayed: ``False`` picks ``a*`` from online Q. ``True``
             picks ``a*`` from delayed Q.
         value_delayed: ``False`` scores ``V`` and the taken action on
             online Q. ``True`` scores them on delayed Q.
+        bias: Shift added to the signed gap before the cap at ``0``.
+            ``0`` leaves that gap in place. A positive shift moves a
+            negative gap toward ``0``. A negative shift moves it down.
         eps: Positive floor added to ``max_a Q - min_a Q``. Required
             when ``normalize`` is ``True``. Omit it when ``normalize``
             is ``False``.
@@ -497,6 +506,11 @@ def value_gap_gate(
         raise TypeError(
             f"value_delayed must be a bool, got {type(value_delayed)}."
         )
+    if isinstance(bias, bool) or not isinstance(bias, (int, float)):
+        raise TypeError(f"bias must be a real number, got {type(bias)}.")
+    shift = float(bias)
+    if not math.isfinite(shift):
+        raise ValueError(f"bias must be finite, got {bias}.")
     floor: float | None
     if normalize:
         if eps is None:
@@ -525,12 +539,13 @@ def value_gap_gate(
         chosen = policy.argmax(dim=-1, keepdim=True)
         q_star = values.gather(dim=-1, index=chosen).squeeze(-1)
         q_taken = values.gather(dim=-1, index=taken).squeeze(-1)
-        gap = (q_star - q_taken).clamp(min=0)
+        signed = q_taken - q_star
         if floor is not None:
             q_max = values.amax(dim=-1)
             q_min = values.amin(dim=-1)
-            gap = gap / (q_max - q_min + floor)
-        cont = torch.exp(-scale * gap)
+            signed = signed / (q_max - q_min + floor)
+        gap = (signed + shift).clamp(max=0)
+        cont = torch.exp(scale * gap)
         cont[0] = 0
         column = torch.cat([cont, cont.new_zeros(1)])
         t = torch.arange(N, device=values.device).unsqueeze(1)
