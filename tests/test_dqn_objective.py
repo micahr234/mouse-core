@@ -907,6 +907,32 @@ def test_value_gap_gate_stores_exp_neg_beta_gap_at_the_taken_step() -> None:
     assert abs(float(c[0, 1]) - math.exp(-beta * 4.0 / 5.0)) < 1e-6
 
 
+def test_value_gap_gate_eps_none_uses_the_raw_gap() -> None:
+    """``eps=None`` skips the range and uses ``exp(-beta * (max - Q))``."""
+    q = torch.tensor([[1.0, 4.0], [5.0, 1.0], [0.0, 0.0]])
+    action = torch.tensor([0, 0, 1])
+    beta = 0.5
+    c = value_gap_gate(beta=beta, eps=None)(q=q, action=action)
+    assert abs(float(c[0, 1]) - math.exp(-beta * 4.0)) < 1e-6
+
+
+def test_value_gap_gate_eps_none_soft_cuts_by_the_raw_gap() -> None:
+    """Taken action at s1 is 2 below the online max; c = exp(-beta * 2)."""
+    step_stream, predictions, delayed = _lambda_fixture()
+    q = predictions.clone()
+    q[1] = torch.tensor([2.0, 0.0])
+    predictions = q
+    beta = 0.5
+    loss, _ = DqnObjective(
+        reward=_rew(), value=_val(), discount=_disc(), gate=value_gap_gate(beta=beta, eps=None),
+        grouping_field=None, temperature=0.0, double=False,
+    )(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
+    c = math.exp(-beta * 2.0)
+    g0 = 1.0 + (1.0 - c) * 3.0 + c * 110.0
+    expected = ((5.0 - g0) ** 2 + 12100.0) / 2
+    assert abs(loss.item() - expected) < 1e-03
+
+
 def test_value_gap_gate_normalizes_a_mid_range_action() -> None:
     """A mid-range action uses (max - Q) / (max - min + eps)."""
     q = torch.tensor([[0.0, 0.0, 0.0], [0.0, 3.0, 10.0], [0.0, 0.0, 0.0]])

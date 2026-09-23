@@ -457,9 +457,11 @@ class DqnObjective(Objective):
     the detached per-step online Q. ``lambda_gate`` is the λ-return to
     the end of the run. ``nstep_gate`` is the n-step return.
     ``watkins_gate`` cuts where the taken action is not an online
-    argmax. ``value_gap_gate`` is the optimality-gap cut,
-    ``c = exp(-beta * (V - Q(s, a_taken)) / (max_a Q - min_a Q + eps))``
-    with ``V = max_a Q`` on that online Q. ``general_gate(gates=)``
+    argmax. ``value_gap_gate`` is the optimality-gap cut. ``V = max_a Q`` on
+    that online Q. A positive ``eps`` uses
+    ``c = exp(-beta * (V - Q(s, a_taken)) / (max_a Q - min_a Q + eps))``;
+    ``eps=None`` uses the raw gap
+    ``c = exp(-beta * (V - Q(s, a_taken)))``. ``general_gate(gates=)``
     multiplies those matrices, so a step continues only where every
     gate continues. The callable returns
     ``[N, N]``. ``gate=None`` is the one-step target (a zero matrix).
@@ -495,10 +497,12 @@ class DqnObjective(Objective):
     action reads detached online Q. ``watkins_gate`` cuts
     wherever the taken action is not the online argmax (ties included).
     ``value_gap_gate(beta=, eps=)`` softens that cut. ``V = max_a Q``
-    on the same online Q and
-    ``c = exp(-beta * (V - Q(s, a_taken)) / (max_a Q - min_a Q + eps))``,
-    so a zero gap (a tie with the online max) continues and a larger
-    relative gap bootstraps the delayed state value. Both gates read
+    on the same online Q. A positive ``eps`` uses
+    ``c = exp(-beta * (V - Q(s, a_taken)) / (max_a Q - min_a Q + eps))``;
+    ``eps=None`` turns that range term off and uses
+    ``c = exp(-beta * (V - Q(s, a_taken)))``. A zero gap (a tie with
+    the online max) continues and a larger gap bootstraps the delayed
+    state value. Both gates read
     that online Q and leave oracle columns such as ``info_q_star``
     unread. ``metrics["entropy"]`` is the in-run mean of
     ``H[softmax(Q / α)]`` on online Q when ``temperature > 0``. The
@@ -554,9 +558,10 @@ class DqnObjective(Objective):
             ``lambda_gate`` is the λ-return to the end of the run
             (``td_lambda=``). ``nstep_gate`` is the n-step return
             (``n=``). ``watkins_gate`` cuts where the taken action is
-            not an online argmax. ``value_gap_gate`` is the optimality-gap cut
-            ``c = exp(-beta * (V - Q(s, a_taken)) / (max_a Q - min_a Q + eps))``
-            with ``V = max_a Q`` on that online Q. ``general_gate(gates=)`` is the
+            not an online argmax. ``value_gap_gate`` is the optimality-gap cut.
+            ``V = max_a Q`` on that online Q. A positive ``eps`` divides by
+            ``max_a Q - min_a Q + eps``; ``eps=None`` uses the raw gap.
+            ``general_gate(gates=)`` is the
             element-wise product of those matrices. A callable returning
             ``[N, N]`` is accepted. Row ``t``, column ``s`` is the continuation at
             absolute step ``s`` for the return that started at ``t``.

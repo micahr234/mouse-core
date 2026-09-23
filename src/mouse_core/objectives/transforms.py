@@ -428,42 +428,50 @@ def nstep_gate(*, n: int) -> Gate:
     return gate
 
 
-def value_gap_gate(*, beta: float, eps: float) -> Gate:
-    """Soft trace cut from the normalized online optimality gap.
+def value_gap_gate(*, beta: float, eps: float | None) -> Gate:
+    """Soft trace cut from the online optimality gap.
 
-    ``V = max_a Q(s, a)`` and
+    ``V = max_a Q(s, a)`` on the detached per-step online Q the
+    objective passes as ``q`` (after ``value``). ``V`` here is that
+    online max, not the delayed bootstrap. A positive ``eps`` divides
+    by the range of Q at that state:
 
-    ``c = exp(-beta * (V - Q(s, a_taken)) / (max_a Q - min_a Q + eps))``,
+    ``c = exp(-beta * (V - Q(s, a_taken)) / (max_a Q - min_a Q + eps))``.
 
-    on the detached per-step online Q the objective passes as ``q``
-    (after ``value``). ``V`` here is that online max, not the delayed
-    bootstrap. Returns ``[N, N]``. Column ``s`` is that continuation
-    through step ``s`` for every earlier start, the same step
-    ``watkins_gate`` marks with its greedy flag. Column ``0`` and the
-    last column are ``0`` (no action leaves the batch). A zero gap —
-    the taken action is an online max, ties included — continues with
-    ``c = 1``. Dividing by the range of Q at that state makes ``beta``
-    dimensionless. A larger relative gap shrinks the continuation
-    toward a bootstrap of the delayed state value. The objective still
-    applies the in-run mask. Fewer than 2 steps, or an ``action`` whose
-    length is not ``N``, raises.
+    ``eps=None`` turns that range term off and uses the raw gap,
+    ``c = exp(-beta * (V - Q(s, a_taken)))``. Returns ``[N, N]``.
+    Column ``s`` is that continuation through step ``s`` for every
+    earlier start, the same step ``watkins_gate`` marks with its
+    greedy flag. Column ``0`` and the last column are ``0`` (no action
+    leaves the batch). A zero gap — the taken action is an online max,
+    ties included — continues with ``c = 1``. A larger gap shrinks the
+    continuation toward a bootstrap of the delayed state value. The
+    objective still applies the in-run mask. Fewer than 2 steps, or an
+    ``action`` whose length is not ``N``, raises.
 
     Args:
-        beta: Positive scale on the normalized gap. A taken action at
-            the online minimum, with a range much larger than ``eps``,
-            continues at ``exp(-beta)``.
-        eps: Positive floor added to ``max_a Q - min_a Q``.
+        beta: Positive scale on the gap. With a positive ``eps``, a
+            taken action at the online minimum continues near
+            ``exp(-beta)`` when the range is large next to ``eps``.
+            With ``eps=None``, a gap of ``1`` continues at
+            ``exp(-beta)``.
+        eps: Positive floor added to ``max_a Q - min_a Q``, or ``None``
+            to skip that division.
     """
     if isinstance(beta, bool) or not isinstance(beta, (int, float)):
         raise TypeError(f"beta must be a real number, got {type(beta)}.")
     scale = float(beta)
     if not math.isfinite(scale) or scale <= 0.0:
         raise ValueError(f"beta must be finite and > 0, got {beta}.")
-    if isinstance(eps, bool) or not isinstance(eps, (int, float)):
-        raise TypeError(f"eps must be a real number, got {type(eps)}.")
-    floor = float(eps)
-    if not math.isfinite(floor) or floor <= 0.0:
-        raise ValueError(f"eps must be finite and > 0, got {eps}.")
+    floor: float | None
+    if eps is None:
+        floor = None
+    else:
+        if isinstance(eps, bool) or not isinstance(eps, (int, float)):
+            raise TypeError(f"eps must be a real number or None, got {type(eps)}.")
+        floor = float(eps)
+        if not math.isfinite(floor) or floor <= 0.0:
+            raise ValueError(f"eps must be finite and > 0, or None, got {eps}.")
 
     def gate(
         *,
@@ -476,9 +484,11 @@ def value_gap_gate(*, beta: float, eps: float) -> Gate:
         taken = action[1:].unsqueeze(-1)
         q_taken = scores.gather(dim=-1, index=taken).squeeze(-1)
         q_max = scores.amax(dim=-1)
-        q_min = scores.amin(dim=-1)
-        relative_gap = (q_max - q_taken) / (q_max - q_min + floor)
-        cont = torch.exp(-scale * relative_gap)
+        gap = q_max - q_taken
+        if floor is not None:
+            q_min = scores.amin(dim=-1)
+            gap = gap / (q_max - q_min + floor)
+        cont = torch.exp(-scale * gap)
         cont[0] = 0
         column = torch.cat([cont, cont.new_zeros(1)])
         t = torch.arange(N, device=q.device).unsqueeze(1)
