@@ -434,44 +434,50 @@ def value_gap_gate(
     *,
     beta: float,
     normalize: bool,
-    delayed: bool,
+    policy_delayed: bool,
+    value_delayed: bool,
     eps: float | None = None,
 ) -> Gate:
     """Soft trace cut from the optimality gap.
 
-    ``V = max_a Q(s, a)`` on the detached per-step Q selected by
-    ``delayed``, after ``value``. ``delayed=False`` reads the online Q
-    the objective passes as ``q``. ``delayed=True`` reads the delayed Q
-    passed as ``q_delayed`` (same ``[N, A]`` layout). ``V`` here is
-    that max. The bootstrap state value stays the delayed one the
-    objective already computes. ``normalize=True`` divides by the range
-    of the selected Q at that state:
+    ``policy_delayed`` picks the greedy action ``a* = argmax Q`` on
+    detached per-step Q after ``value``. ``False`` reads online ``q``.
+    ``True`` reads ``q_delayed``. Ties take the lowest index, the same
+    rule as ``get_action(temperature=0)``. ``value_delayed`` scores
+    that action and the taken action on online ``q`` or on
+    ``q_delayed``. ``V = Q_value(s, a*)``. The gap is
+    ``max(0, V - Q_value(s, a_taken))``. When the two flags agree,
+    ``V`` is ``max_a`` of that Q, so a taken action tied with the max
+    continues at ``c = 1``. The bootstrap state value stays the delayed
+    one the objective already computes. ``normalize=True`` divides by
+    the range of the value Q at that state:
 
     ``c = exp(-beta * (V - Q(s, a_taken)) / (max_a Q - min_a Q + eps))``.
 
     ``normalize=False`` leaves that range term out and uses the raw gap,
     ``c = exp(-beta * (V - Q(s, a_taken)))``. ``eps`` is required when
     ``normalize`` is ``True`` and is rejected when ``normalize`` is
-    ``False``. Returns ``[N, N]``. Column ``s`` is that continuation through step
-    ``s`` for every earlier start, the same step ``watkins_gate`` marks
-    with its greedy flag. Column ``0`` and the last column are ``0``
-    (no action leaves the batch). A zero gap — the taken action is a
-    max of the selected Q, ties included — continues with ``c = 1``. A
-    larger gap shrinks the continuation toward a bootstrap of the
-    delayed state value. The objective still applies the in-run mask.
-    Fewer than 2 steps, or an ``action`` whose length is not ``N``,
-    raises.
+    ``False``. Returns ``[N, N]``. Column ``s`` is that continuation
+    through step ``s`` for every earlier start, the same step
+    ``watkins_gate`` marks with its greedy flag. Column ``0`` and the
+    last column are ``0`` (no action leaves the batch). A zero gap
+    continues with ``c = 1``. A larger gap shrinks the continuation
+    toward a bootstrap of the delayed state value. The objective still
+    applies the in-run mask. Fewer than 2 steps, or an ``action`` whose
+    length is not ``N``, raises.
 
     Args:
         beta: Positive scale on the gap. With ``normalize=True``, a
-            taken action at the minimum of the selected Q continues
-            near ``exp(-beta)`` when the range is large next to
-            ``eps``. With ``normalize=False``, a gap of ``1`` continues
-            at ``exp(-beta)``.
-        normalize: ``True`` divides the gap by ``max_a Q - min_a Q + eps``.
-            ``False`` uses the raw gap.
-        delayed: ``False`` reads online Q (``q``). ``True`` reads
-            delayed Q (``q_delayed``).
+            taken action at the minimum of the value Q continues near
+            ``exp(-beta)`` when the range is large next to ``eps`` and
+            ``a*`` is a max of that Q. With ``normalize=False``, a gap
+            of ``1`` continues at ``exp(-beta)``.
+        normalize: ``True`` divides the gap by ``max_a Q - min_a Q + eps``
+            on the value Q. ``False`` uses the raw gap.
+        policy_delayed: ``False`` picks ``a*`` from online Q. ``True``
+            picks ``a*`` from delayed Q.
+        value_delayed: ``False`` scores ``V`` and the taken action on
+            online Q. ``True`` scores them on delayed Q.
         eps: Positive floor added to ``max_a Q - min_a Q``. Required
             when ``normalize`` is ``True``. Omit it when ``normalize``
             is ``False``.
@@ -483,8 +489,14 @@ def value_gap_gate(
         raise ValueError(f"beta must be finite and > 0, got {beta}.")
     if not isinstance(normalize, bool):
         raise TypeError(f"normalize must be a bool, got {type(normalize)}.")
-    if not isinstance(delayed, bool):
-        raise TypeError(f"delayed must be a bool, got {type(delayed)}.")
+    if not isinstance(policy_delayed, bool):
+        raise TypeError(
+            f"policy_delayed must be a bool, got {type(policy_delayed)}."
+        )
+    if not isinstance(value_delayed, bool):
+        raise TypeError(
+            f"value_delayed must be a bool, got {type(value_delayed)}."
+        )
     floor: float | None
     if normalize:
         if eps is None:
@@ -507,19 +519,22 @@ def value_gap_gate(
         **_: torch.Tensor,
     ) -> torch.Tensor:
         N = _require_gate_batch(q=q, action=action)
-        scores = (q_delayed if delayed else q)[:-1]
+        policy = (q_delayed if policy_delayed else q)[:-1]
+        values = (q_delayed if value_delayed else q)[:-1]
         taken = action[1:].unsqueeze(-1)
-        q_taken = scores.gather(dim=-1, index=taken).squeeze(-1)
-        q_max = scores.amax(dim=-1)
-        gap = q_max - q_taken
+        chosen = policy.argmax(dim=-1, keepdim=True)
+        q_star = values.gather(dim=-1, index=chosen).squeeze(-1)
+        q_taken = values.gather(dim=-1, index=taken).squeeze(-1)
+        gap = (q_star - q_taken).clamp(min=0)
         if floor is not None:
-            q_min = scores.amin(dim=-1)
+            q_max = values.amax(dim=-1)
+            q_min = values.amin(dim=-1)
             gap = gap / (q_max - q_min + floor)
         cont = torch.exp(-scale * gap)
         cont[0] = 0
         column = torch.cat([cont, cont.new_zeros(1)])
-        t = torch.arange(N, device=scores.device).unsqueeze(1)
-        s = torch.arange(N, device=scores.device).unsqueeze(0)
+        t = torch.arange(N, device=values.device).unsqueeze(1)
+        s = torch.arange(N, device=values.device).unsqueeze(0)
         return torch.where(s > t, column, column.new_zeros(()))
 
     return gate
