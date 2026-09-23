@@ -301,10 +301,12 @@ def boundary_discount(
 class Gate(Protocol):
     """Continuation of a DQN return, from unpacked ``objective_data``.
 
-    Called as ``gate(**objective_data, q=q)``. ``q`` is the detached
-    per-step online Q at each step's last head-output row, shape
-    ``[N, A]``, after ``value``. Extra columns must be accepted
-    (``**_``). Does not mutate ``objective_data``.
+    Called as ``gate(**objective_data, q=q, q_delayed=q_delayed)``.
+    ``q`` is the detached per-step online Q at each step's last
+    head-output row, shape ``[N, A]``, after ``value``. ``q_delayed``
+    is the detached per-step delayed Q, same layout, after ``value``.
+    Extra columns must be accepted (``**_``). Does not mutate
+    ``objective_data``.
 
     Return ``[N, N]``. Row ``t``, column ``s`` is the continuation at
     absolute step ``s`` for the return that started at ``t``. The value
@@ -432,38 +434,44 @@ def value_gap_gate(
     *,
     beta: float,
     normalize: bool,
+    delayed: bool,
     eps: float | None = None,
 ) -> Gate:
-    """Soft trace cut from the online optimality gap.
+    """Soft trace cut from the optimality gap.
 
-    ``V = max_a Q(s, a)`` on the detached per-step online Q the
-    objective passes as ``q`` (after ``value``). ``V`` here is that
-    online max, not the delayed bootstrap. ``normalize=True`` divides
-    by the range of Q at that state:
+    ``V = max_a Q(s, a)`` on the detached per-step Q selected by
+    ``delayed``, after ``value``. ``delayed=False`` reads the online Q
+    the objective passes as ``q``. ``delayed=True`` reads the delayed Q
+    passed as ``q_delayed`` (same ``[N, A]`` layout). ``V`` here is
+    that max. The bootstrap state value stays the delayed one the
+    objective already computes. ``normalize=True`` divides by the range
+    of the selected Q at that state:
 
     ``c = exp(-beta * (V - Q(s, a_taken)) / (max_a Q - min_a Q + eps))``.
 
     ``normalize=False`` leaves that range term out and uses the raw gap,
     ``c = exp(-beta * (V - Q(s, a_taken)))``. ``eps`` is required when
     ``normalize`` is ``True`` and is rejected when ``normalize`` is
-    ``False``. Returns ``[N, N]``. Column ``s`` is that continuation
-    through step ``s`` for every earlier start, the same step
-    ``watkins_gate`` marks with its greedy flag. Column ``0`` and the
-    last column are ``0`` (no action leaves the batch). A zero gap —
-    the taken action is an online max, ties included — continues with
-    ``c = 1``. A larger gap shrinks the continuation toward a bootstrap
-    of the delayed state value. The objective still applies the in-run
-    mask. Fewer than 2 steps, or an ``action`` whose length is not
-    ``N``, raises.
+    ``False``. Returns ``[N, N]``. Column ``s`` is that continuation through step
+    ``s`` for every earlier start, the same step ``watkins_gate`` marks
+    with its greedy flag. Column ``0`` and the last column are ``0``
+    (no action leaves the batch). A zero gap — the taken action is a
+    max of the selected Q, ties included — continues with ``c = 1``. A
+    larger gap shrinks the continuation toward a bootstrap of the
+    delayed state value. The objective still applies the in-run mask.
+    Fewer than 2 steps, or an ``action`` whose length is not ``N``,
+    raises.
 
     Args:
         beta: Positive scale on the gap. With ``normalize=True``, a
-            taken action at the online minimum continues near
-            ``exp(-beta)`` when the range is large next to ``eps``.
-            With ``normalize=False``, a gap of ``1`` continues at
-            ``exp(-beta)``.
+            taken action at the minimum of the selected Q continues
+            near ``exp(-beta)`` when the range is large next to
+            ``eps``. With ``normalize=False``, a gap of ``1`` continues
+            at ``exp(-beta)``.
         normalize: ``True`` divides the gap by ``max_a Q - min_a Q + eps``.
             ``False`` uses the raw gap.
+        delayed: ``False`` reads online Q (``q``). ``True`` reads
+            delayed Q (``q_delayed``).
         eps: Positive floor added to ``max_a Q - min_a Q``. Required
             when ``normalize`` is ``True``. Omit it when ``normalize``
             is ``False``.
@@ -475,6 +483,8 @@ def value_gap_gate(
         raise ValueError(f"beta must be finite and > 0, got {beta}.")
     if not isinstance(normalize, bool):
         raise TypeError(f"normalize must be a bool, got {type(normalize)}.")
+    if not isinstance(delayed, bool):
+        raise TypeError(f"delayed must be a bool, got {type(delayed)}.")
     floor: float | None
     if normalize:
         if eps is None:
@@ -493,10 +503,11 @@ def value_gap_gate(
         *,
         q: torch.Tensor,
         action: torch.Tensor,
+        q_delayed: torch.Tensor,
         **_: torch.Tensor,
     ) -> torch.Tensor:
         N = _require_gate_batch(q=q, action=action)
-        scores = q[:-1]
+        scores = (q_delayed if delayed else q)[:-1]
         taken = action[1:].unsqueeze(-1)
         q_taken = scores.gather(dim=-1, index=taken).squeeze(-1)
         q_max = scores.amax(dim=-1)
@@ -507,8 +518,8 @@ def value_gap_gate(
         cont = torch.exp(-scale * gap)
         cont[0] = 0
         column = torch.cat([cont, cont.new_zeros(1)])
-        t = torch.arange(N, device=q.device).unsqueeze(1)
-        s = torch.arange(N, device=q.device).unsqueeze(0)
+        t = torch.arange(N, device=scores.device).unsqueeze(1)
+        s = torch.arange(N, device=scores.device).unsqueeze(0)
         return torch.where(s > t, column, column.new_zeros(()))
 
     return gate
@@ -517,8 +528,8 @@ def value_gap_gate(
 def general_gate(*, gates: Sequence[Gate]) -> Gate:
     """Element-wise product of continuation matrices.
 
-    Each gate is called as ``gate(**objective_data, q=q)``. The result
-    is the product of those ``[N, N]`` matrices, so a step continues
+    Each gate is called as ``gate(**objective_data, q=q, q_delayed=q_delayed)``.
+    The result is the product of those ``[N, N]`` matrices, so a step continues
     only where every gate continues. One gate returns that gate's
     matrix. An empty sequence, a non-sequence, or a non-callable
     raises. A matrix that is not ``[N, N]`` raises. Fewer than 2 steps,

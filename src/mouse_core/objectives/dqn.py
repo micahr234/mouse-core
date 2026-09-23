@@ -379,6 +379,7 @@ def _read_gate(
     gate: object,
     objective_data: dict[str, torch.Tensor],
     q_step: torch.Tensor,
+    q_delayed: torch.Tensor,
     N: int,
     dtype: torch.dtype,
     device: torch.device | str,
@@ -387,12 +388,13 @@ def _read_gate(
 
     Type and shape are checked here. Values in ``[0, 1]`` are the gate's
     contract (:class:`~mouse_core.objectives.transforms.Gate`); reading that
-    reduction back to the host would sync every forward.
+    reduction back to the host would sync every forward. ``q_delayed`` is
+    the detached per-step delayed Q, same layout as ``q_step``.
     """
     if gate is None:
         return torch.zeros(N, N, dtype=dtype, device=device)
     with torch.no_grad():
-        values = gate(**objective_data, q=q_step)  # type: ignore[operator]
+        values = gate(**objective_data, q=q_step, q_delayed=q_delayed)  # type: ignore[operator]
     if not isinstance(values, torch.Tensor):
         raise TypeError(f"gate must return a Tensor, got {type(values)}.")
     values = values.to(dtype=dtype, device=device)
@@ -453,12 +455,14 @@ class DqnObjective(Objective):
     supplies the per-step γ that multiplies the bootstrap and the
     continued return. ``boundary_discount`` is the standard
     ``gamma_step`` × episode-extra × task-extra lookup.
-    ``gate(**objective_data, q=q)`` supplies the continuation. ``q`` is
-    the detached per-step online Q. ``lambda_gate`` is the λ-return to
-    the end of the run. ``nstep_gate`` is the n-step return.
-    ``watkins_gate`` cuts where the taken action is not an online
-    argmax. ``value_gap_gate`` is the optimality-gap cut. ``V = max_a Q`` on
-    that online Q. ``normalize=True`` uses
+    ``gate(**objective_data, q=q, q_delayed=q_delayed)`` supplies the
+    continuation. ``q`` is the detached per-step online Q.
+    ``q_delayed`` is the detached per-step delayed Q. ``lambda_gate``
+    is the λ-return to the end of the run. ``nstep_gate`` is the n-step
+    return. ``watkins_gate`` cuts where the taken action is not an
+    online argmax. ``value_gap_gate`` is the optimality-gap cut.
+    ``V = max_a Q``. ``delayed=False`` reads that online Q.
+    ``delayed=True`` reads delayed Q. ``normalize=True`` uses
     ``c = exp(-beta * (V - Q(s, a_taken)) / (max_a Q - min_a Q + eps))``
     (``eps`` required). ``normalize=False`` uses the raw gap
     ``c = exp(-beta * (V - Q(s, a_taken)))``. ``general_gate(gates=)``
@@ -494,18 +498,19 @@ class DqnObjective(Objective):
     multiplies both the bootstrap and the continued return, so a ``0``
     discount ends the trace while a non-zero truncation gamma carries it
     (discounted) into the reset frame's return. A gate that cuts on the
-    action reads detached online Q. ``watkins_gate`` cuts
-    wherever the taken action is not the online argmax (ties included).
-    ``value_gap_gate(beta=, normalize=, eps=)`` softens that cut.
-    ``V = max_a Q`` on the same online Q. ``normalize=True`` uses
+    action reads detached Q. ``watkins_gate`` cuts wherever the taken
+    action is not the online argmax (ties included).
+    ``value_gap_gate(beta=, normalize=, delayed=, eps=)`` softens that
+    cut. ``V = max_a Q``. ``delayed=False`` reads online Q.
+    ``delayed=True`` reads delayed Q. ``normalize=True`` uses
     ``c = exp(-beta * (V - Q(s, a_taken)) / (max_a Q - min_a Q + eps))``
     (``eps`` required). ``normalize=False`` uses the raw gap
     ``c = exp(-beta * (V - Q(s, a_taken)))`` and takes no ``eps``.
     A zero gap (a tie with
-    the online max) continues and a larger gap bootstraps the delayed
-    state value. Both gates read
-    that online Q and leave oracle columns such as ``info_q_star``
-    unread. ``metrics["entropy"]`` is the in-run mean of
+    the selected max) continues and a larger gap bootstraps the delayed
+    state value. ``watkins_gate`` reads online Q.
+    ``value_gap_gate`` reads the Q named by ``delayed``. Both leave
+    oracle columns such as ``info_q_star`` unread. ``metrics["entropy"]`` is the in-run mean of
     ``H[softmax(Q / α)]`` on online Q when ``temperature > 0``. The
     continuation matrix stays the one ``[N, N]`` the gate returned. Rows
     are cumprod'd in blocks, and that read does not sync the host.
@@ -554,13 +559,15 @@ class DqnObjective(Objective):
         cql_weight: Alpha coefficient for the Conservative Q-Learning penalty.
             ``0.0`` disables CQL.
         cql_scale_q_eps: Additive floor used when scaling the CQL penalty.
-        gate: Continuation from unpacked ``objective_data`` plus ``q=``.
+        gate: Continuation from unpacked ``objective_data`` plus ``q=``
+            and ``q_delayed=``.
             Required. ``None`` is the one-step target (a zero matrix).
             ``lambda_gate`` is the λ-return to the end of the run
             (``td_lambda=``). ``nstep_gate`` is the n-step return
             (``n=``). ``watkins_gate`` cuts where the taken action is
             not an online argmax. ``value_gap_gate`` is the optimality-gap cut.
-            ``V = max_a Q`` on that online Q. ``normalize=True`` divides by
+            ``V = max_a Q``. ``delayed=False`` reads online Q.
+            ``delayed=True`` reads delayed Q. ``normalize=True`` divides by
             ``max_a Q - min_a Q + eps`` (``eps`` required). ``normalize=False``
             uses the raw gap and takes no ``eps``. ``general_gate(gates=)`` is the
             element-wise product of those matrices. A callable returning
@@ -731,6 +738,7 @@ class DqnObjective(Objective):
             gate=self.gate,
             objective_data=objective_data,
             q_step=q[last_rows].detach(),
+            q_delayed=q_target[last_rows].detach(),
             N=N,
             dtype=value_dtype,
             device=device,

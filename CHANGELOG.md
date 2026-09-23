@@ -11,9 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ``general_gate(gates=)`` multiplies DQN continuation matrices. Each
   entry is the product of the gates at that step, so a return continues
   only where every gate continues.
-- ``value_gap_gate(beta=, normalize=, eps=)``: DQN continuation on
-  detached online Q (after ``value``), with ``V = max_a Q``.
-  ``normalize=True`` uses
+- ``value_gap_gate(beta=, normalize=, delayed=, eps=)``: DQN
+  continuation on detached Q (after ``value``), with ``V = max_a Q``.
+  ``delayed=False`` reads online Q. ``delayed=True`` reads delayed Q,
+  passed to the gate as ``q_delayed``. ``normalize=True`` uses
   ``c = exp(-beta * (V - Q(s, a_taken)) / (max_a Q - min_a Q + eps))``
   and requires ``eps``. ``normalize=False`` uses the raw gap
   ``c = exp(-beta * (V - Q(s, a_taken)))`` and takes no ``eps``. A zero

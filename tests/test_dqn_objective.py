@@ -769,7 +769,7 @@ def test_gates_reject_a_short_batch() -> None:
     q = torch.zeros(1, 2)
     action = torch.zeros(1, dtype=torch.long)
     with pytest.raises(ValueError, match="at least 2"):
-        value_gap_gate(beta=1.0, normalize=True, eps=1.0)(q=q, action=action)
+        value_gap_gate(beta=1.0, delayed=False, normalize=True, eps=1.0)(q=q, action=action, q_delayed=q)
     with pytest.raises(ValueError, match="at least 2"):
         lambda_gate(td_lambda=1.0)(q=q, action=action)
     with pytest.raises(ValueError, match="at least 2"):
@@ -779,7 +779,7 @@ def test_gates_reject_a_short_batch() -> None:
     with pytest.raises(ValueError, match="at least 2"):
         general_gate(gates=(lambda_gate(td_lambda=1.0),))(q=q, action=action)
     with pytest.raises(ValueError, match="action must have shape"):
-        value_gap_gate(beta=1.0, normalize=True, eps=1.0)(q=torch.zeros(2, 2), action=torch.zeros(1, dtype=torch.long))
+        value_gap_gate(beta=1.0, delayed=False, normalize=True, eps=1.0)(q=torch.zeros(2, 2), action=torch.zeros(1, dtype=torch.long), q_delayed=torch.zeros(2, 2))
     with pytest.raises(ValueError, match="at least 2"):
         _pair_weight(
             {"action": action}, 1, "cpu", grouping_field=None
@@ -799,22 +799,26 @@ def test_gate_rejects_a_vector() -> None:
         )(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
     for beta in (0.0, -1.0, float("nan"), float("inf")):
         with pytest.raises(ValueError, match="beta"):
-            value_gap_gate(beta=beta, normalize=True, eps=1.0)
+            value_gap_gate(beta=beta, delayed=False, normalize=True, eps=1.0)
     for beta in (True, "1"):
         with pytest.raises(TypeError, match="beta"):
-            value_gap_gate(beta=beta, normalize=True, eps=1.0)  # type: ignore[arg-type]
+            value_gap_gate(beta=beta, delayed=False, normalize=True, eps=1.0)  # type: ignore[arg-type]
     for eps in (0.0, -1.0, float("nan"), float("inf")):
         with pytest.raises(ValueError, match="eps"):
-            value_gap_gate(beta=1.0, normalize=True, eps=eps)
+            value_gap_gate(beta=1.0, delayed=False, normalize=True, eps=eps)
     for eps in (True, "1"):
         with pytest.raises(TypeError, match="eps"):
-            value_gap_gate(beta=1.0, normalize=True, eps=eps)  # type: ignore[arg-type]
+            value_gap_gate(beta=1.0, delayed=False, normalize=True, eps=eps)  # type: ignore[arg-type]
     with pytest.raises(TypeError, match="normalize"):
-        value_gap_gate(beta=1.0, normalize=1, eps=1.0)  # type: ignore[arg-type]
+        value_gap_gate(beta=1.0, delayed=False, normalize=1, eps=1.0)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="delayed"):
+        value_gap_gate(beta=1.0, normalize=False)  # type: ignore[call-arg]
+    with pytest.raises(TypeError, match="delayed"):
+        value_gap_gate(beta=1.0, delayed=1, normalize=False)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="eps is required"):
-        value_gap_gate(beta=1.0, normalize=True)
+        value_gap_gate(beta=1.0, delayed=False, normalize=True)
     with pytest.raises(ValueError, match="only when normalize"):
-        value_gap_gate(beta=1.0, normalize=False, eps=1.0)
+        value_gap_gate(beta=1.0, delayed=False, normalize=False, eps=1.0)
 
 
 def test_general_gate_multiplies_continuation_matrices() -> None:
@@ -824,13 +828,13 @@ def test_general_gate_multiplies_continuation_matrices() -> None:
     lam = lambda_gate(td_lambda=0.5)(q=q, action=action)
     horizon = nstep_gate(n=2)(q=q, action=action)
     greedy = watkins_gate()(q=q, action=action)
-    gap = value_gap_gate(beta=0.5, normalize=True, eps=1.0)(q=q, action=action)
+    gap = value_gap_gate(beta=0.5, delayed=False, normalize=True, eps=1.0)(q=q, action=action, q_delayed=q)
     got = general_gate(gates=(
         lambda_gate(td_lambda=0.5),
         nstep_gate(n=2),
         watkins_gate(),
-        value_gap_gate(beta=0.5, normalize=True, eps=1.0),
-    ))(q=q, action=action)
+        value_gap_gate(beta=0.5, delayed=False, normalize=True, eps=1.0),
+    ))(q=q, action=action, q_delayed=q)
     assert torch.equal(got, lam * horizon * greedy * gap)
     one = general_gate(gates=(lambda_gate(td_lambda=0.5),))(q=q, action=action)
     assert torch.equal(one, lam)
@@ -901,7 +905,7 @@ def test_value_gap_gate_stores_exp_neg_beta_gap_at_the_taken_step() -> None:
     action = torch.tensor([0, 0, 1])
     beta = 0.5
     eps = 1.0
-    c = value_gap_gate(beta=beta, normalize=True, eps=eps)(q=q, action=action)
+    c = value_gap_gate(beta=beta, delayed=False, normalize=True, eps=eps)(q=q, action=action, q_delayed=q)
     # Action from s1 is stored at index 2 and is 1: Q = [5, 1].
     # (max - Q) / (max - min + eps) = 4 / 5.
     # That continuation is column 1, for the return that started at 0.
@@ -913,12 +917,92 @@ def test_value_gap_gate_stores_exp_neg_beta_gap_at_the_taken_step() -> None:
     assert abs(float(c[0, 1]) - math.exp(-beta * 4.0 / 5.0)) < 1e-6
 
 
+def test_value_gap_gate_delayed_reads_q_delayed() -> None:
+    """``delayed=True`` uses ``q_delayed``; ``delayed=False`` keeps online Q."""
+    q = torch.tensor([[1.0, 4.0], [5.0, 1.0], [0.0, 0.0]])
+    q_delayed = torch.tensor([[0.0, 0.0], [9.0, 1.0], [0.0, 0.0]])
+    action = torch.tensor([0, 0, 1])
+    beta = 0.5
+    eps = 1.0
+    online = value_gap_gate(beta=beta, delayed=False, normalize=True, eps=eps)(
+        q=q, action=action, q_delayed=torch.zeros(3, 1),
+    )
+    delayed = value_gap_gate(beta=beta, delayed=True, normalize=True, eps=eps)(
+        q=q, action=action, q_delayed=q_delayed,
+    )
+    forwarded = general_gate(gates=(
+        value_gap_gate(beta=beta, delayed=True, normalize=True, eps=eps),
+    ))(q=q, action=action, q_delayed=q_delayed)
+    # Online at s1 is [5, 1], taken action 1: (5 - 1) / (5 - 1 + 1) = 4 / 5.
+    assert abs(float(online[0, 1]) - math.exp(-beta * 4.0 / 5.0)) < 1e-6
+    # Delayed at s1 is [9, 1], taken action 1: (9 - 1) / (9 - 1 + 1) = 8 / 9.
+    assert abs(float(delayed[0, 1]) - math.exp(-beta * 8.0 / 9.0)) < 1e-6
+    assert torch.equal(forwarded, delayed)
+
+
+def test_value_gap_gate_delayed_soft_cuts_by_the_delayed_gap() -> None:
+    """Online Q at s1 is flat. The cut follows delayed Q [3, 0], action 1."""
+    step_stream, predictions, delayed = _lambda_fixture()
+    q = predictions.clone()
+    q[1] = torch.tensor([10.0, 0.0])
+    predictions = q
+    beta = 0.5
+    eps = 1.0
+    loss, _ = DqnObjective(
+        reward=_rew(), value=_val(), discount=_disc(),
+        gate=value_gap_gate(beta=beta, delayed=True, normalize=True, eps=eps),
+        grouping_field=None, temperature=0.0, double=False,
+    )(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
+    c = math.exp(-beta * 3.0 / 4.0)
+    g0 = 1.0 + (1.0 - c) * 3.0 + c * 110.0
+    expected = ((5.0 - g0) ** 2 + 12100.0) / 2
+    assert abs(loss.item() - expected) < 1e-03
+
+
+def test_value_gap_gate_delayed_uses_q_after_value() -> None:
+    """The delayed gap sees the same affine as the delayed bootstrap."""
+    step_stream, predictions, delayed = _lambda_fixture()
+    beta = 0.5
+    eps = 1.0
+    loss, _ = DqnObjective(
+        reward=_rew(), value=_val(scale=2.0), discount=_disc(),
+        gate=value_gap_gate(beta=beta, delayed=True, normalize=True, eps=eps),
+        grouping_field=None, temperature=0.0, double=False,
+    )(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
+    c = math.exp(-beta * 6.0 / 7.0)
+    g0 = 1.0 + (1.0 - c) * 6.0 + c * 210.0
+    expected = ((10.0 - g0) ** 2 + (210.0 ** 2)) / 2
+    assert abs(loss.item() - expected) < 1e-02
+
+
+def test_value_gap_gate_delayed_reads_the_last_head_output_row() -> None:
+    """Two rows at s1: the gap uses the last delayed row, ``[3, 0]``."""
+    step_stream, _, _ = _lambda_fixture()
+    step_stream = {key: value.clone() for key, value in step_stream.items()}
+    step_stream["head_output_count"] = torch.tensor([1, 2, 1])
+    online = torch.tensor([[5.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0]])
+    delayed_q = torch.tensor([[0.0, 0.0], [0.0, 10.0], [3.0, 0.0], [0.0, 100.0]])
+    predictions, delayed = _q(online, delayed_q)
+    beta = 0.5
+    eps = 1.0
+    loss, _ = DqnObjective(
+        reward=_rew(), value=_val(), discount=_disc(),
+        gate=value_gap_gate(beta=beta, delayed=True, normalize=True, eps=eps),
+        grouping_field=None, temperature=0.0, double=False,
+    )(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
+    c = math.exp(-beta * 3.0 / 4.0)
+    g0 = 1.0 + (1.0 - c) * 3.0 + c * 110.0
+    # s0 row trains Q=5. Both s1 rows train Q(s1, a=1)=0 toward 110. s2 has weight 0.
+    expected = ((5.0 - g0) ** 2 + 12100.0 + 12100.0) / 3
+    assert abs(loss.item() - expected) < 1e-03
+
+
 def test_value_gap_gate_normalize_false_uses_the_raw_gap() -> None:
     """``normalize=False`` skips the range and uses ``exp(-beta * (max - Q))``."""
     q = torch.tensor([[1.0, 4.0], [5.0, 1.0], [0.0, 0.0]])
     action = torch.tensor([0, 0, 1])
     beta = 0.5
-    c = value_gap_gate(beta=beta, normalize=False)(q=q, action=action)
+    c = value_gap_gate(beta=beta, delayed=False, normalize=False)(q=q, action=action, q_delayed=q)
     assert abs(float(c[0, 1]) - math.exp(-beta * 4.0)) < 1e-6
 
 
@@ -930,7 +1014,7 @@ def test_value_gap_gate_normalize_false_soft_cuts_by_the_raw_gap() -> None:
     predictions = q
     beta = 0.5
     loss, _ = DqnObjective(
-        reward=_rew(), value=_val(), discount=_disc(), gate=value_gap_gate(beta=beta, normalize=False),
+        reward=_rew(), value=_val(), discount=_disc(), gate=value_gap_gate(beta=beta, delayed=False, normalize=False),
         grouping_field=None, temperature=0.0, double=False,
     )(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
     c = math.exp(-beta * 2.0)
@@ -945,7 +1029,7 @@ def test_value_gap_gate_normalizes_a_mid_range_action() -> None:
     action = torch.tensor([0, 0, 1])
     beta = 2.0
     eps = 1.0
-    c = value_gap_gate(beta=beta, normalize=True, eps=eps)(q=q, action=action)
+    c = value_gap_gate(beta=beta, delayed=False, normalize=True, eps=eps)(q=q, action=action, q_delayed=q)
     assert abs(float(c[0, 1]) - math.exp(-beta * 7.0 / 11.0)) < 1e-6
 
 
@@ -953,7 +1037,7 @@ def test_value_gap_gate_flat_q_is_a_full_continuation() -> None:
     """max = min leaves a zero numerator, so c = 1."""
     q = torch.zeros(3, 4)
     action = torch.tensor([1, 2, 3])
-    c = value_gap_gate(beta=4.0, normalize=True, eps=1e-3)(q=q, action=action)
+    c = value_gap_gate(beta=4.0, delayed=False, normalize=True, eps=1e-3)(q=q, action=action, q_delayed=q)
     assert abs(float(c[0, 1]) - 1.0) < 1e-6
 
 
@@ -961,7 +1045,7 @@ def test_value_gap_gate_zero_gap_is_the_full_return() -> None:
     """Tied online Q at s1 has gap 0, so the trace continues with c = 1."""
     step_stream, predictions, delayed = _lambda_fixture()
     loss, _ = DqnObjective(
-        reward=_rew(), value=_val(), discount=_disc(), gate=value_gap_gate(beta=1.0, normalize=True, eps=1.0),
+        reward=_rew(), value=_val(), discount=_disc(), gate=value_gap_gate(beta=1.0, delayed=False, normalize=True, eps=1.0),
         grouping_field=None, temperature=0.0, double=False,
     )(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
     assert abs(loss.item() - _FULL_RETURN) < 1e-03
@@ -976,7 +1060,7 @@ def test_value_gap_gate_soft_cuts_by_the_online_optimality_gap() -> None:
     beta = 0.5
     eps = 1.0
     loss, _ = DqnObjective(
-        reward=_rew(), value=_val(), discount=_disc(), gate=value_gap_gate(beta=beta, normalize=True, eps=eps),
+        reward=_rew(), value=_val(), discount=_disc(), gate=value_gap_gate(beta=beta, delayed=False, normalize=True, eps=eps),
         grouping_field=None, temperature=0.0, double=False,
     )(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
     c = math.exp(-beta * 2.0 / 3.0)
@@ -994,7 +1078,7 @@ def test_value_gap_gate_uses_q_after_value() -> None:
     beta = 0.5
     eps = 1.0
     loss, _ = DqnObjective(
-        reward=_rew(), value=_val(scale=2.0), discount=_disc(), gate=value_gap_gate(beta=beta, normalize=True, eps=eps),
+        reward=_rew(), value=_val(scale=2.0), discount=_disc(), gate=value_gap_gate(beta=beta, delayed=False, normalize=True, eps=eps),
         grouping_field=None, temperature=0.0, double=False,
     )(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
     c = math.exp(-beta * 4.0 / 5.0)
@@ -1010,7 +1094,7 @@ def test_value_gap_gate_ignores_the_gap_of_the_action_being_trained() -> None:
     q[0] = torch.tensor([5.0, 100.0])
     predictions = q
     loss, _ = DqnObjective(
-        reward=_rew(), value=_val(), discount=_disc(), gate=value_gap_gate(beta=10.0, normalize=True, eps=1.0),
+        reward=_rew(), value=_val(), discount=_disc(), gate=value_gap_gate(beta=10.0, delayed=False, normalize=True, eps=1.0),
         grouping_field=None, temperature=0.0, double=False,
     )(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
     assert abs(loss.item() - _FULL_RETURN) < 1e-03
@@ -1022,7 +1106,7 @@ def test_value_gap_gate_large_beta_matches_a_hard_cut() -> None:
     q[1] = torch.tensor([10.0, 0.0])
     predictions = q
     loss, _ = DqnObjective(
-        reward=_rew(), value=_val(), discount=_disc(), gate=value_gap_gate(beta=50.0, normalize=True, eps=1e-6),
+        reward=_rew(), value=_val(), discount=_disc(), gate=value_gap_gate(beta=50.0, delayed=False, normalize=True, eps=1e-6),
         grouping_field=None, temperature=0.0, double=False,
     )(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
     one_step, _ = DqnObjective(
@@ -1037,7 +1121,7 @@ def test_gap_does_not_backprop_into_the_online_max() -> None:
     step_stream, _, delayed = _lambda_fixture()
     online = torch.tensor([[5.0, 0.0], [2.0, 0.0], [0.0, 0.0]], requires_grad=True)
     loss, _ = DqnObjective(
-        reward=_rew(), value=_val(), discount=_disc(), gate=value_gap_gate(beta=1.0, normalize=True, eps=1.0),
+        reward=_rew(), value=_val(), discount=_disc(), gate=value_gap_gate(beta=1.0, delayed=False, normalize=True, eps=1.0),
         grouping_field=None, temperature=0.0, double=False,
     )(objective_data=step_stream, predictions=online, delayed_predictions=delayed)
     loss.backward()
