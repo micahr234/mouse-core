@@ -71,7 +71,7 @@ The [example notebooks](examples/) are short usage docs, not full experiments. W
 | Notebook | What it covers |
 |----------|----------------|
 | [01 — Collect dataset](examples/01_collect_dataset.ipynb) | `Datastore`, collecting transitions, pushing to the Hub |
-| [02 — Train offline DQN](examples/02_train_offline_dqn.ipynb) | Offline replay baseline: `Tokenizer` text fields + pretrained `embed_tokens`, model architecture, DQN training |
+| [02 — Train offline DQN](examples/02_train_offline_dqn.ipynb) | Offline replay baseline: `Tokenizer` text fields + pretrained `embed_tokens`, model architecture, DQN training. The loss is `mean((δ − ω)²)`: `δ = G − Q(s, a)` and `ω ← (1 − rho) ω + rho * mean(δ)`. `rho=0` holds `ω` at `0` |
 | [03 — Train online DQN](examples/03_train_online_dqn.ipynb) | Live `mouse-gym` rollouts, in-memory replay, DQN updates |
 | [05 — Train offline SV](examples/05_train_offline_sv.ipynb) | Same offline loop as `02`, regressing the action-value head onto `info_q_star` with `SvObjective` |
 | [07 — Train online PPO](examples/07_train_online_ppo.ipynb) | Online on-policy PPO (`ClassificationHead` + value head, `PpoObjective` with GAE) |

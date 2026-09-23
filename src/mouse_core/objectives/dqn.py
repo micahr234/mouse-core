@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn.functional as F
 
@@ -187,6 +189,16 @@ def _require_temperature(temperature: float) -> float:
     if float(temperature) < 0.0:
         raise ValueError(f"temperature must be >= 0, got {temperature}.")
     return float(temperature)
+
+
+def _require_rho(rho: float) -> float:
+    """EMA rate of the scalar TD-error center, in ``[0, 1]``."""
+    if isinstance(rho, bool) or not isinstance(rho, (int, float)):
+        raise TypeError(f"rho must be a real number, got {type(rho)}.")
+    rate = float(rho)
+    if not math.isfinite(rate) or rate < 0.0 or rate > 1.0:
+        raise ValueError(f"rho must be finite and in [0, 1], got {rho}.")
+    return rate
 
 
 def _policy_entropy(pi: torch.Tensor) -> torch.Tensor:
@@ -495,6 +507,16 @@ class DqnObjective(Objective):
     ``E_π[Q_delayed] + α H[π]`` for ``π = softmax(Q_online / α)``.
     The online scores that choose the action are detached, so the TD
     error does not train them.
+    The loss centers that TD error. On each in-run head-output row
+    ``δ = G - Q(s, a)``, with ``G`` the backup above. A scalar ``ω``
+    starts at ``0``. Each call updates
+    ``ω ← (1 - rho) ω + rho * mean(δ)`` from the detached in-run
+    mean, then the loss is the weighted mean of ``(δ - ω)²``.
+    An all-zero weight batch leaves ``ω`` where it is. ``rho=0``
+    holds ``ω`` at ``0``, which is the mean square TD error.
+    ``metrics["td_center"]`` is the updated ``ω``. One-step,
+    ``temperature=0``, and ``double=False`` make ``δ`` the residual
+    ``r + γ max_a Q_delayed(s', a) - Q(s, a)``.
     The trace never crosses a run break. At an episode /
     task boundary ``γ`` is ``discount`` at the done codes stored there and
     multiplies both the bootstrap and the continued return, so a ``0``
@@ -590,6 +612,10 @@ class DqnObjective(Objective):
             ``True`` is Double DQN: online Q chooses the action and
             delayed Q evaluates it. ``temperature`` selects hard argmax
             or the online Boltzmann policy, as above.
+        rho: EMA rate of the scalar TD-error center ``ω``, in
+            ``[0, 1]``. Required. ``0`` holds ``ω`` at its initial
+            ``0``. ``1`` sets ``ω`` to the current in-run mean before
+            the loss.
     """
 
     def __init__(
@@ -600,6 +626,7 @@ class DqnObjective(Objective):
         value: Value | None,
         temperature: float,
         double: bool,
+        rho: float,
         action_key: str = "action",
         episode_done_key: str = "episode_done",
         task_done_key: str = "task_done",
@@ -610,6 +637,8 @@ class DqnObjective(Objective):
     ) -> None:
         self.temperature = _require_temperature(temperature)
         self.double = bool(double)
+        self.rho = _require_rho(rho)
+        self._omega: torch.Tensor | None = None
         self.discount = _require_transform(discount, name="discount")
         self.reward = _require_transform(reward, name="reward")
         self.value = _require_transform(value, name="value")
@@ -620,6 +649,24 @@ class DqnObjective(Objective):
         self.cql_weight = cql_weight
         self.cql_scale_q_eps = cql_scale_q_eps
         self.gate = _require_transform(gate, name="gate")
+
+    def _mix_td_center(
+        self, *, delta: torch.Tensor, row_weight: torch.Tensor
+    ) -> torch.Tensor:
+        """Update ``ω ← (1-ρ)ω + ρ δ̄`` and return that center, detached.
+
+        ``δ̄`` is the weighted mean of detached ``delta``. Weights that
+        sum to ``0`` leave ``ω`` unchanged. ``ω`` starts at ``0``.
+        """
+        delta_bar = _weighted_mean(delta.detach(), row_weight)
+        if self._omega is None:
+            omega = delta_bar.new_zeros(())
+        else:
+            omega = self._omega.to(device=delta_bar.device, dtype=delta_bar.dtype)
+        active = row_weight.sum() > 0
+        updated = (1.0 - self.rho) * omega + self.rho * delta_bar
+        self._omega = torch.where(active, updated, omega).detach()
+        return self._omega
 
     def __call__(
         self,
@@ -759,7 +806,11 @@ class DqnObjective(Objective):
         )
         td_target = _pair_values_to_rows(pair_target, step_of)  # [P]
 
-        loss = (q_values - td_target) ** 2
+        # δ = G - Q. Mix the detached in-run mean into ω, then square
+        # the centered residual. ρ = 0 leaves ω at 0 (mean square TD error).
+        delta = td_target - q_values
+        omega = self._mix_td_center(delta=delta, row_weight=row_weight)
+        loss = (delta - omega) ** 2
 
         cql_penalty_mean: torch.Tensor | None = None
         if self.cql_weight > 0.0:
@@ -778,6 +829,7 @@ class DqnObjective(Objective):
             "q_values_min":    q_min,
             "q_values_max":    q_max,
             "action_value":    loss.detach(),
+            "td_center":       omega.detach(),
         }
         if cql_penalty_mean is not None:
             named["cql_penalty"] = cql_penalty_mean

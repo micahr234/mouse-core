@@ -217,7 +217,7 @@ def test_retrace_greedy_target_cuts_non_greedy_actions() -> None:
     """temperature = 0: delayed argmax at s1 is 0, taken a_1 = 1 → the trace is cut."""
     step_stream, predictions, delayed = _fixture(mu_1=0.25)
     _, metrics = _retrace(temperature=0.0)(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
-    one_step, _ = DqnObjective(reward=_rew(), value=_val(), discount=_disc(),
+    one_step, _ = DqnObjective(rho=0.0, reward=_rew(), value=_val(), discount=_disc(),
         grouping_field=None,
         temperature=0.0, double=False, gate=None,
     )(
