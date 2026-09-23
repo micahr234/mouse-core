@@ -219,7 +219,7 @@ def test_retrace_greedy_target_cuts_non_greedy_actions() -> None:
     _, metrics = _retrace(temperature=0.0)(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
     one_step, _ = DqnObjective(reward=_rew(), value=_val(), discount=_disc(),
         grouping_field=None,
-        temperature=0.0,
+        temperature=0.0, double=False, gate=None,
     )(
         objective_data=step_stream,
         predictions=predictions["action_value"],

@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from mouse_core.objectives.base import Objective
 from mouse_core.objectives.transforms import (
     Discount,
+    Gate,
     Reward,
     Value,
     _apply_transform,
@@ -97,12 +98,12 @@ def _pair_weight(
     A run is the same ``sequence_id`` (when that column is present) and, when
     ``grouping_field`` is set, the same grouping column. ``grouping_field``
     set but missing from ``objective_data`` is an error — it must not silently
-    train across task boundaries.
+    train across task boundaries. ``N < 2`` raises.
     """
     if device is None:
         device = torch.device("cpu")
     if N < 2:
-        return torch.zeros(0, dtype=dtype, device=device)
+        raise ValueError(f"pair weight needs at least 2 steps, got {N}.")
     same_run = torch.ones(N - 1, dtype=torch.bool, device=device)
     if "sequence_id" in objective_data.keys():
         sequence_id = objective_data["sequence_id"]
@@ -208,6 +209,30 @@ def _soft_state_value(q: torch.Tensor, *, temperature: float) -> torch.Tensor:
     return alpha * torch.logsumexp(q / alpha, dim=-1)
 
 
+def _double_state_value(
+    *,
+    q_online: torch.Tensor,
+    q_target: torch.Tensor,
+    temperature: float,
+) -> torch.Tensor:
+    """Double DQN state value: choose with online Q, evaluate with delayed Q.
+
+    ``temperature == 0`` is ``Q_target(s, argmax_a Q_online)``. Ties take
+    the lowest index, the same rule as ``get_action(temperature=0)``.
+    ``temperature > 0`` is ``E_π[Q_target] + α H[π]`` for
+    ``π = softmax(Q_online / α)``. Online Q is detached, so the bootstrap
+    stays a constant.
+    """
+    online = q_online.detach()
+    alpha = float(temperature)
+    if alpha == 0.0:
+        chosen = online.argmax(dim=-1, keepdim=True)
+        return q_target.gather(dim=-1, index=chosen).squeeze(-1)
+    log_pi = F.log_softmax(online / alpha, dim=-1)
+    pi = log_pi.exp()
+    return (pi * q_target).sum(dim=-1) + alpha * _policy_entropy(pi)
+
+
 def _boltzmann_entropy(q: torch.Tensor, *, temperature: float) -> torch.Tensor:
     """Per-row entropy of ``softmax(Q / α)``. ``α == 0`` is the greedy policy."""
     alpha = float(temperature)
@@ -219,25 +244,6 @@ def _boltzmann_entropy(q: torch.Tensor, *, temperature: float) -> torch.Tensor:
         return _policy_entropy(pi)
     log_pi = F.log_softmax(q / alpha, dim=-1)
     return _policy_entropy(log_pi.exp())
-
-
-def _greedy_from_online_q(
-    *,
-    q: torch.Tensor,
-    action: torch.Tensor,
-    last_rows: torch.Tensor,
-) -> torch.Tensor:
-    """``[N-1]``: 1 if the action taken from step ``i`` matches online Q.
-
-    Compares the taken action (stored at ``i+1``) to the online network's
-    scores at step ``i`` (its last head-output row). Ties count as a match
-    if the taken action is among the max scores. Never reads oracle columns
-    such as ``info_q_star``.
-    """
-    scores = q.detach()[last_rows][:-1]  # [N-1, A]  Q(s_i)
-    taken = action[1:].unsqueeze(-1)  # [N-1, 1]  a_i
-    is_max = scores == scores.amax(dim=-1, keepdim=True)
-    return is_max.gather(dim=-1, index=taken).squeeze(-1).to(dtype=scores.dtype)
 
 
 def _shift_next(values: torch.Tensor) -> torch.Tensor:
@@ -266,43 +272,135 @@ def _affine_scan_backward(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return A.flip(0)
 
 
+# Rows of the gate matrix unrolled together. The workspace is this many
+# rows by the remaining horizon, not a second ``[N, N]`` copy.
+_CONTINUATION_ROWS = 256
+
+
+def _run_mask(*, pair_weight: torch.Tensor, N: int) -> torch.Tensor:
+    """``[N]`` factor on a continuation stored at that step.
+
+    ``mask[s]`` is 1 when the pair that starts at step ``s`` stays in the
+    run. The first step and the last step are ``0``.
+    """
+    mask = torch.zeros(N, dtype=pair_weight.dtype, device=pair_weight.device)
+    if N > 2:
+        in_run = pair_weight > 0
+        mask[1 : N - 1] = in_run[1:].to(dtype=pair_weight.dtype)
+    return mask
+
+
+def _block_returns(
+    *,
+    continuation: torch.Tensor,
+    col_mask: torch.Tensor,
+    reward: torch.Tensor,
+    discount: torch.Tensor,
+    v_next: torch.Tensor,
+    t0: int,
+    rows: int,
+) -> torch.Tensor:
+    """Returns for starts ``t0 .. t0+rows`` from the gate matrix.
+
+    Reads columns ``t0+1:`` of those rows into one strip. Entries before
+    each start are outside that start's return: their step is ``1`` so
+    the cumprod is unchanged, and their reward term is ``0``.
+    """
+    device = continuation.device
+    dtype = reward.dtype
+    end = t0 + rows
+    width = int(col_mask.shape[0]) - t0
+    step = continuation[t0:end, t0 + 1 :].contiguous().to(dtype=dtype)
+    g = discount[t0:]
+    step.mul_(col_mask[t0:])
+    term = reward[t0:] + g * (1 - step) * v_next[t0:]
+    step.mul_(g)
+    if rows > 1:
+        local_row = torch.arange(rows, device=device).unsqueeze(1)
+        local_col = torch.arange(rows, device=device)
+        before = local_col < local_row
+        step[:, :rows] = torch.where(before, step.new_ones(()), step[:, :rows])
+        term[:, :rows] = torch.where(before, term.new_zeros(()), term[:, :rows])
+    if width > 1:
+        torch.cumprod(step, dim=1, out=step)
+        term[:, 1:].mul_(step[:, :-1])
+    return term.sum(dim=1)
+
+
 @torch.no_grad()
-def _td_lambda_targets(
+def _continuation_targets(
     *,
     reward: torch.Tensor,
     discount_all: torch.Tensor,
     v_step: torch.Tensor,
     pair_weight: torch.Tensor,
-    td_lambda: float,
-    greedy_from: torch.Tensor | None,
+    continuation: torch.Tensor,
 ) -> torch.Tensor:
-    """TD(λ) target for every pair ``(t, t+1)``, shape ``[N-1]``.
+    """Return for every pair ``(t, t+1)``, shape ``[N-1]``.
 
-    ``G_t = r_{t+1} + γ_{t+1} * ((1 - λ c_t) * V_{t+1} + λ c_t * G_{t+1})``
-    where ``V`` is the delayed state value and ``c_t`` says whether the trace
-    continues through ``s_{t+1}``: pair ``t+1`` must exist and be in-run, and
-    with Watkins the action taken from ``s_{t+1}`` must be online-greedy
-    (``greedy_from``). Episode / task boundaries are handled by ``γ_{t+1}``
-    itself — the done-code discount from ``discount`` multiplies
-    both the bootstrap and the continued return, so a ``0`` gamma ends the
-    trace and a non-zero truncation gamma carries it through, discounted.
-    ``λ = 0`` or ``c_t = 0`` is exactly the one-step target ``r + γ V``.
-    Out-of-run pairs return ``0`` (their rows carry weight ``0``).
+    ``G_t = r_{t+1} + γ_{t+1} ((1 - c) V_{t+1} + c G_{t+1})``.
+    ``continuation`` is the gate matrix ``[N, N]``: row ``t``, column
+    ``s`` is the continuation at absolute step ``s`` for the return that
+    started at ``t``. Rows are cumprod'd in blocks of
+    ``_CONTINUATION_ROWS`` and never read another start's return. The
+    in-run mask zeros a continuation that would leave the run.
+    Out-of-run pairs return ``0``.
     """
     r = reward[1:].to(dtype=v_step.dtype)  # [N-1]  r_t (stored at t+1)
-    g = discount_all[1:]  # [N-1]  γ_t from done codes at t+1
+    g = discount_all[1:]  # [N-1]  γ_t
     v_next = v_step[1:]  # [N-1]  V(s_{t+1})
+    N = int(reward.shape[0])
+    if tuple(continuation.shape) != (N, N):
+        raise ValueError(
+            f"continuation must have shape [{N}, {N}], "
+            f"got {tuple(continuation.shape)}."
+        )
+    T = N - 1
     in_run = pair_weight > 0
-    cont = _shift_next(in_run.to(dtype=v_step.dtype))
-    if greedy_from is not None:
-        cont = cont * _shift_next(greedy_from)
-    mix = float(td_lambda) * cont
-    a = r + g * (1.0 - mix) * v_next
-    if td_lambda == 0.0:
-        returns = a
-    else:
-        returns = _affine_scan_backward(a, g * mix)
+    mask = _run_mask(pair_weight=pair_weight.to(dtype=v_step.dtype), N=N)
+    col_mask = mask[1:]
+    returns = r.new_empty(T)
+    for t0 in range(0, T, _CONTINUATION_ROWS):
+        rows = min(_CONTINUATION_ROWS, T - t0)
+        returns[t0 : t0 + rows] = _block_returns(
+            continuation=continuation,
+            col_mask=col_mask,
+            reward=r,
+            discount=g,
+            v_next=v_next,
+            t0=t0,
+            rows=rows,
+        )
     return returns * in_run.to(dtype=returns.dtype)
+
+
+def _read_gate(
+    *,
+    gate: object,
+    objective_data: dict[str, torch.Tensor],
+    q_step: torch.Tensor,
+    N: int,
+    dtype: torch.dtype,
+    device: torch.device | str,
+) -> torch.Tensor:
+    """Call ``gate`` and check the continuation matrix. ``None`` is zeros.
+
+    Type and shape are checked here. Values in ``[0, 1]`` are the gate's
+    contract (:class:`~mouse_core.objectives.transforms.Gate`); reading that
+    reduction back to the host would sync every forward.
+    """
+    if gate is None:
+        return torch.zeros(N, N, dtype=dtype, device=device)
+    with torch.no_grad():
+        values = gate(**objective_data, q=q_step)  # type: ignore[operator]
+    if not isinstance(values, torch.Tensor):
+        raise TypeError(f"gate must return a Tensor, got {type(values)}.")
+    values = values.to(dtype=dtype, device=device)
+    if tuple(values.shape) != (N, N):
+        raise ValueError(
+            f"gate must return shape [{N}, {N}], got {tuple(values.shape)}."
+        )
+    return values
 
 
 def _pair_values_to_rows(
@@ -355,33 +453,55 @@ class DqnObjective(Objective):
     supplies the per-step γ that multiplies the bootstrap and the
     continued return. ``boundary_discount`` is the standard
     ``gamma_step`` × episode-extra × task-extra lookup.
+    ``gate(**objective_data, q=q)`` supplies the continuation. ``q`` is
+    the detached per-step online Q. ``lambda_gate`` is the λ-return to
+    the end of the run. ``nstep_gate`` is the n-step return.
+    ``watkins_gate`` cuts where the taken action is not an online
+    argmax. ``value_gap_gate`` is the optimality-gap cut,
+    ``c = exp(-beta * g)`` with
+    ``g = max_a Q(s, a) - Q(s, a_taken)``. ``general_gate(gates=)``
+    multiplies those matrices, so a step continues only where every
+    gate continues. The callable returns
+    ``[N, N]``. ``gate=None`` is the one-step target (a zero matrix).
 
-    The target is the TD(λ) return along the run,
-    ``G_i = r + γ * ((1 - λ) * V(s_{i+1}) + λ * G_{i+1})`` with ``V`` the
-    delayed state value, so ``td_lambda=0`` (default) is the plain one-step
-    target ``r + γ V`` and ``td_lambda=1`` is the full n-step return to the
-    end of the run. ``V`` is delayed max-Q when ``temperature=0``. A
+    The target is
+    ``G_t = r_{t+1} + γ_{t+1} ((1 - c) V(s_{t+1}) + c G_{t+1})`` with ``V``
+    the delayed state value. The gate returns ``[N, N]``. Row ``t``,
+    column ``s`` is the continuation at absolute step ``s`` for the
+    return that started at ``t``, and that row is unrolled on its own.
+    The objective then zeros a
+    continuation that would leave the run. ``V`` is delayed max-Q when
+    ``temperature=0``. A
     positive ``temperature`` (SAC / soft Q-learning ``α``) replaces that
     with the soft value ``α log Σ_a exp(Q / α)``, equal to
     ``E_π[Q] + α H[π]`` for the Boltzmann policy
     ``π = softmax(Q / α)`` over the same (affine) delayed Q the TD error
     uses. ``α → 0`` recovers hard max. Pair a non-zero ``α`` with
     ``get_action(temperature=)`` so rollout samples that same policy.
+    ``double=False`` reads that ``V`` from delayed Q alone.
+    ``double=True`` is Double DQN (van Hasselt, Guez, and Silver, 2016):
+    the action comes from online Q and the value from delayed Q, both
+    after ``value``. ``temperature=0`` is
+    ``Q_delayed(s, argmax_a Q_online)`` (lowest index on ties, same as
+    ``get_action``). ``temperature > 0`` is
+    ``E_π[Q_delayed] + α H[π]`` for ``π = softmax(Q_online / α)``.
+    The online scores that choose the action are detached, so the TD
+    error does not train them.
     The trace never crosses a run break. At an episode /
     task boundary ``γ`` is ``discount`` at the done codes stored there and
     multiplies both the bootstrap and the continued return, so a ``0``
     discount ends the trace while a non-zero truncation gamma carries it
-    (discounted) into the reset frame's return. Off-policy behavior is not
-    corrected unless ``watkins=True`` (Watkins's Q(λ)), which also cuts the
-    trace wherever the taken action is not the online argmax of
-    online Q (ties included; never compared against
-    oracle columns such as ``info_q_star``). Watkins still uses the hard
-    argmax; it does not read ``π``. ``metrics["watkins_greedy_frac"]``
-    then reports the in-run fraction of taken actions that were greedy —
-    near ``0`` means the traces are cut everywhere and the target is one-step.
-    ``metrics["entropy"]`` is the in-run mean of ``H[softmax(Q / α)]`` on
-    online Q when ``temperature > 0``. The λ-return is computed with a
-    parallel scan on the device (no host syncs).
+    (discounted) into the reset frame's return. A gate that cuts on the
+    action reads detached online Q. ``watkins_gate`` cuts
+    wherever the taken action is not the online argmax (ties included).
+    ``value_gap_gate(beta=)`` softens that cut:
+    ``g = max_a Q(s, a) - Q(s, a_taken)`` and ``c = exp(-beta * g)``,
+    so a zero gap (a tie with the online max) continues and a larger
+    gap bootstraps ``V``. Both gates read that online Q and leave
+    oracle columns such as ``info_q_star`` unread. ``metrics["entropy"]`` is the in-run mean of
+    ``H[softmax(Q / α)]`` on online Q when ``temperature > 0``. The
+    continuation matrix stays the one ``[N, N]`` the gate returned. Rows
+    are cumprod'd in blocks, and that read does not sync the host.
 
     Those columns arrive in ``objective_data`` only if they are listed in the
     tokenizer ``objective_fields`` keep-list (input fields are not auto-copied).
@@ -427,14 +547,26 @@ class DqnObjective(Objective):
         cql_weight: Alpha coefficient for the Conservative Q-Learning penalty.
             ``0.0`` disables CQL.
         cql_scale_q_eps: Additive floor used when scaling the CQL penalty.
-        td_lambda: λ of the TD(λ) target in ``[0, 1]``. ``0.0`` (default) is
-            the one-step target; ``1.0`` is the full in-run n-step return.
-        watkins: Cut the λ-trace at non-greedy actions (Watkins's Q(λ)).
+        gate: Continuation from unpacked ``objective_data`` plus ``q=``.
+            Required. ``None`` is the one-step target (a zero matrix).
+            ``lambda_gate`` is the λ-return to the end of the run
+            (``td_lambda=``). ``nstep_gate`` is the n-step return
+            (``n=``). ``watkins_gate`` cuts where the taken action is
+            not an online argmax. ``value_gap_gate`` is the optimality-gap cut
+            ``c = exp(-beta * g)``. ``general_gate(gates=)`` is the
+            element-wise product of those matrices. A callable returning
+            ``[N, N]`` is accepted. Row ``t``, column ``s`` is the continuation at
+            absolute step ``s`` for the return that started at ``t``.
+            See :class:`~mouse_core.objectives.transforms.Gate`.
         temperature: SAC / soft Q-learning ``α`` (``>= 0``). Required.
             ``0`` is hard max-Q. ``> 0`` bootstraps from
             ``α logsumexp(Q / α)`` on delayed Q (after ``value``) and
             logs ``metrics["entropy"]``. Same units and meaning as
             ``get_action(temperature=)``.
+        double: Required. ``False`` bootstraps from delayed Q alone.
+            ``True`` is Double DQN: online Q chooses the action and
+            delayed Q evaluates it. ``temperature`` selects hard argmax
+            or the online Boltzmann policy, as above.
     """
 
     def __init__(
@@ -444,18 +576,17 @@ class DqnObjective(Objective):
         reward: Reward | None,
         value: Value | None,
         temperature: float,
+        double: bool,
         action_key: str = "action",
         episode_done_key: str = "episode_done",
         task_done_key: str = "task_done",
         grouping_field: str | None,
+        gate: Gate | None,
         cql_weight: float = 0.0,
         cql_scale_q_eps: float = 1.0,
-        td_lambda: float = 0.0,
-        watkins: bool = False,
     ) -> None:
-        if not 0.0 <= float(td_lambda) <= 1.0:
-            raise ValueError(f"td_lambda must be in [0, 1], got {td_lambda}.")
         self.temperature = _require_temperature(temperature)
+        self.double = bool(double)
         self.discount = _require_transform(discount, name="discount")
         self.reward = _require_transform(reward, name="reward")
         self.value = _require_transform(value, name="value")
@@ -465,8 +596,7 @@ class DqnObjective(Objective):
         self.grouping_field = grouping_field
         self.cql_weight = cql_weight
         self.cql_scale_q_eps = cql_scale_q_eps
-        self.td_lambda = float(td_lambda)
-        self.watkins = bool(watkins)
+        self.gate = _require_transform(gate, name="gate")
 
     def __call__(
         self,
@@ -579,20 +709,29 @@ class DqnObjective(Objective):
         )
 
         q_values = q.gather(dim=-1, index=next_actions.unsqueeze(-1)).squeeze(-1)  # [P]
-        greedy_from = (
-            _greedy_from_online_q(q=q, action=action, last_rows=last_rows)
-            if self.watkins
-            else None
+        q_next = q_target[last_rows]
+        if self.double:
+            v_step = _double_state_value(
+                q_online=q[last_rows],
+                q_target=q_next,
+                temperature=self.temperature,
+            )
+        else:
+            v_step = _soft_state_value(q_next, temperature=self.temperature)
+        continuation = _read_gate(
+            gate=self.gate,
+            objective_data=objective_data,
+            q_step=q[last_rows].detach(),
+            N=N,
+            dtype=value_dtype,
+            device=device,
         )
-        pair_target = _td_lambda_targets(
+        pair_target = _continuation_targets(
             reward=reward,
             discount_all=discount_all,
-            v_step=_soft_state_value(
-                q_target[last_rows], temperature=self.temperature
-            ),  # [N]  V(s_i): max_a Q, or α logsumexp
+            v_step=v_step,  # [N]  V(s_i)
             pair_weight=pair_weight,
-            td_lambda=self.td_lambda,
-            greedy_from=greedy_from,
+            continuation=continuation,
         )
         td_target = _pair_values_to_rows(pair_target, step_of)  # [P]
 
@@ -618,8 +757,6 @@ class DqnObjective(Objective):
         }
         if cql_penalty_mean is not None:
             named["cql_penalty"] = cql_penalty_mean
-        if greedy_from is not None:
-            named["watkins_greedy_frac"] = _weighted_mean(greedy_from, pair_weight)
         if self.temperature > 0.0:
             named["entropy"] = _weighted_mean(
                 _boltzmann_entropy(q.detach(), temperature=self.temperature),

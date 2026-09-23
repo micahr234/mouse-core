@@ -1,8 +1,9 @@
-"""Shared reward, value, and discount callables for the DQN-family and PPO objectives."""
+"""Shared reward, value, discount, and gate callables for the DQN-family and PPO objectives."""
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import math
+from collections.abc import Callable, Sequence
 from typing import Protocol, cast
 
 import torch
@@ -295,6 +296,232 @@ def boundary_discount(
         return gamma_step * episode_gammas[episode_done] * task_gammas[task_done]
 
     return discount
+
+
+class Gate(Protocol):
+    """Continuation of a DQN return, from unpacked ``objective_data``.
+
+    Called as ``gate(**objective_data, q=q)``. ``q`` is the detached
+    per-step online Q at each step's last head-output row, shape
+    ``[N, A]``, after ``value``. Extra columns must be accepted
+    (``**_``). Does not mutate ``objective_data``.
+
+    Return ``[N, N]``. Row ``t``, column ``s`` is the continuation at
+    absolute step ``s`` for the return that started at ``t``. The value
+    at column ``t + 1`` is the continuation through ``s_{t+1}``, the
+    same place the reward and γ of that transition are stored. Entries
+    with ``s <= t`` are ignored. A ``0`` bootstraps ``V`` at that step.
+    The objective then zeros any continuation that would leave the run
+    (``sequence_id`` / ``grouping_field``). Values must lie in
+    ``[0, 1]``. One row cumprod.
+    """
+
+    def __call__(self, **columns: torch.Tensor) -> torch.Tensor: ...
+
+
+def _require_gate_batch(*, q: torch.Tensor, action: torch.Tensor) -> int:
+    """``N`` for a gate. A shorter batch raises; it is not a zero continuation.
+
+    The action taken from step ``t`` is stored at index ``t + 1``, so a
+    gate needs at least two steps. ``q`` is ``[N, A]`` and ``action`` is
+    ``[N]``.
+    """
+    if q.ndim != 2:
+        raise ValueError(f"q must have shape [N, A], got {tuple(q.shape)}.")
+    N = int(q.shape[0])
+    if action.ndim != 1 or int(action.shape[0]) != N:
+        raise ValueError(
+            f"action must have shape [{N}], got {tuple(action.shape)}."
+        )
+    if N < 2:
+        raise ValueError(f"gate needs at least 2 steps, got {N}.")
+    return N
+
+
+def lambda_gate(*, td_lambda: float) -> Gate:
+    """λ-return to the end of the run.
+
+    Returns ``[N, N]``. ``out[t, s]`` is λ at absolute step ``s`` for the
+    return that started at ``t``, and ``0`` when ``s <= t``.
+    ``td_lambda=0`` is the zero matrix (one-step). The objective still
+    applies the in-run mask. Fewer than 2 steps, or an ``action`` whose
+    length is not ``N``, raises.
+
+    Args:
+        td_lambda: λ in ``[0, 1]``.
+    """
+    if not 0.0 <= float(td_lambda) <= 1.0:
+        raise ValueError(f"td_lambda must be in [0, 1], got {td_lambda}.")
+    lam = float(td_lambda)
+
+    def gate(
+        *,
+        q: torch.Tensor,
+        action: torch.Tensor,
+        **_: torch.Tensor,
+    ) -> torch.Tensor:
+        N = _require_gate_batch(q=q, action=action)
+        t = torch.arange(N, device=q.device).unsqueeze(1)
+        s = torch.arange(N, device=q.device).unsqueeze(0)
+        fill = q.new_full((), lam)
+        return torch.where(s > t, fill, fill.new_zeros(()))
+
+    return gate
+
+
+def watkins_gate() -> Gate:
+    """Hard trace cut where the taken action is not an online argmax.
+
+    Returns ``[N, N]``. Column ``s`` is ``1`` when the action taken from
+    step ``s`` is an online max of ``q`` (ties count) and ``0`` otherwise.
+    Column ``0`` and the last column are ``0``. The objective still
+    applies the in-run mask. Fewer than 2 steps, or an ``action`` whose
+    length is not ``N``, raises.
+    """
+
+    def gate(
+        *,
+        q: torch.Tensor,
+        action: torch.Tensor,
+        **_: torch.Tensor,
+    ) -> torch.Tensor:
+        N = _require_gate_batch(q=q, action=action)
+        scores = q[:-1]
+        taken = action[1:].unsqueeze(-1)
+        is_max = scores == scores.amax(dim=-1, keepdim=True)
+        greedy = is_max.gather(dim=-1, index=taken).squeeze(-1).to(dtype=q.dtype)
+        column = torch.cat([greedy, greedy.new_zeros(1)])
+        t = torch.arange(N, device=q.device).unsqueeze(1)
+        s = torch.arange(N, device=q.device).unsqueeze(0)
+        return torch.where(s > t, column, column.new_zeros(()))
+
+    return gate
+
+
+def nstep_gate(*, n: int) -> Gate:
+    """n-step return. The continuation is ``1`` out to lag ``n``.
+
+    Returns ``[N, N]``. ``out[t, s]`` is ``1`` when ``t < s < t + n``
+    and ``0`` otherwise, so each return bootstraps at lag ``n``.
+    ``n=1`` is the zero matrix (one-step). An ``n`` at least as long as
+    the batch keeps every later step. Fewer than 2 steps, or an
+    ``action`` whose length is not ``N``, raises.
+
+    Args:
+        n: Horizon, an ``int >= 1``.
+    """
+    if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+        raise ValueError(f"n must be an int >= 1, got {n!r}.")
+    horizon = n
+
+    def gate(
+        *,
+        q: torch.Tensor,
+        action: torch.Tensor,
+        **_: torch.Tensor,
+    ) -> torch.Tensor:
+        N = _require_gate_batch(q=q, action=action)
+        t = torch.arange(N, device=q.device).unsqueeze(1)
+        s = torch.arange(N, device=q.device).unsqueeze(0)
+        return ((s > t) & (s < t + horizon)).to(dtype=q.dtype)
+
+    return gate
+
+
+def value_gap_gate(*, beta: float) -> Gate:
+    """Soft trace cut from the online optimality gap.
+
+    ``g = max_a Q(s, a) - Q(s, a_taken)`` and ``c = exp(-beta * g)``,
+    on the detached per-step online Q the objective passes as ``q``
+    (after ``value``). Returns ``[N, N]``. Column ``s`` is that
+    continuation through step ``s`` for every earlier start, the same
+    step ``watkins_gate`` marks with its greedy flag.
+    Column ``0`` and the last column are ``0`` (no action leaves the
+    batch). A zero gap — the taken action is an online max, ties
+    included — continues with ``c = 1``. A larger gap shrinks the
+    continuation toward a bootstrap of ``V``. The objective still
+    applies the in-run mask. Fewer than 2 steps, or an ``action`` whose
+    length is not ``N``, raises.
+
+    Args:
+        beta: Positive scale on the gap, in units of ``1 / Q``. A gap
+            of ``1`` continues at ``exp(-beta)``.
+    """
+    if isinstance(beta, bool) or not isinstance(beta, (int, float)):
+        raise TypeError(f"beta must be a real number, got {type(beta)}.")
+    scale = float(beta)
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError(f"beta must be finite and > 0, got {beta}.")
+
+    def gate(
+        *,
+        q: torch.Tensor,
+        action: torch.Tensor,
+        **_: torch.Tensor,
+    ) -> torch.Tensor:
+        N = _require_gate_batch(q=q, action=action)
+        scores = q[:-1]
+        taken = action[1:].unsqueeze(-1)
+        q_taken = scores.gather(dim=-1, index=taken).squeeze(-1)
+        gap = scores.amax(dim=-1) - q_taken
+        cont = torch.exp(-scale * gap)
+        cont[0] = 0
+        column = torch.cat([cont, cont.new_zeros(1)])
+        t = torch.arange(N, device=q.device).unsqueeze(1)
+        s = torch.arange(N, device=q.device).unsqueeze(0)
+        return torch.where(s > t, column, column.new_zeros(()))
+
+    return gate
+
+
+def general_gate(*, gates: Sequence[Gate]) -> Gate:
+    """Element-wise product of continuation matrices.
+
+    Each gate is called as ``gate(**objective_data, q=q)``. The result
+    is the product of those ``[N, N]`` matrices, so a step continues
+    only where every gate continues. One gate returns that gate's
+    matrix. An empty sequence, a non-sequence, or a non-callable
+    raises. A matrix that is not ``[N, N]`` raises. Fewer than 2 steps,
+    or an ``action`` whose length is not ``N``, raises.
+
+    Args:
+        gates: Gates to multiply, in order.
+    """
+    if isinstance(gates, (str, bytes)) or not isinstance(gates, Sequence):
+        raise TypeError(f"gates must be a sequence of gates, got {type(gates)}.")
+    if len(gates) < 1:
+        raise ValueError("general_gate needs at least one gate.")
+    for item in gates:
+        if not callable(item):
+            raise TypeError(f"gates must be callables, got {type(item)}.")
+    chosen = tuple(gates)
+
+    def gate(
+        *,
+        q: torch.Tensor,
+        action: torch.Tensor,
+        **columns: torch.Tensor,
+    ) -> torch.Tensor:
+        N = _require_gate_batch(q=q, action=action)
+
+        def matrix_of(item: Gate) -> torch.Tensor:
+            matrix = item(q=q, action=action, **columns)
+            if not isinstance(matrix, torch.Tensor):
+                raise TypeError(
+                    f"gate must return a Tensor, got {type(matrix)}."
+                )
+            if matrix.shape != (N, N):
+                raise ValueError(
+                    f"gate must return shape [{N}, {N}], got {tuple(matrix.shape)}."
+                )
+            return matrix
+
+        acc = matrix_of(chosen[0])
+        for item in chosen[1:]:
+            acc.mul_(matrix_of(item))
+        return acc
+
+    return gate
 
 
 def _require_transform(

@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- ``general_gate(gates=)`` multiplies DQN continuation matrices. Each
+  entry is the product of the gates at that step, so a return continues
+  only where every gate continues.
+- ``value_gap_gate(beta=)``: DQN continuation ``c = exp(-beta * g)`` with
+  ``g = max_a Q(s, a) - Q(s, a_taken)`` on detached online Q (after
+  ``value``). A zero gap continues (``c = 1``); a larger gap bootstraps
+  ``V``. ``examples/14_train_offline_value_gap_dqn.ipynb`` is the same offline
+  loop as ``02`` with this gate.
+- ``DqnObjective`` requires ``double``. ``False`` bootstraps from delayed
+  Q (max, or ``α logsumexp``). ``True`` is Double DQN: detached online Q
+  chooses the action and delayed Q evaluates it. ``temperature=0`` reads
+  delayed Q at the online argmax (lowest index on ties, same as
+  ``get_action``). ``temperature > 0`` is ``E_π[Q_delayed] + α H[π]``
+  for ``π = softmax(Q_online / α)``.
 - ``Model.pool(output=)`` gathers last-layer states at
   ``head_output_indices`` for ``Model.head(h=)``. Use it when
   ``copy(..., backbone=False, reasoner=False)`` so delayed heads read
@@ -45,6 +59,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pass ``architecture="qwen3"`` or ``architecture="llama"``.
 
 ### Changed
+- ``DqnObjective`` checks a gate's type and shape only. Values in
+  ``[0, 1]`` stay the gate's contract; the objective does not reduce
+  the ``[N, N]`` matrix back to the host on each forward.
+- ``nstep_gate(n=)`` is the n-step continuation: ``1`` on
+  ``t < s < t + n``, else ``0``. ``lambda_gate(td_lambda=)`` is the
+  λ-return to the end of the run. ``watkins_gate`` cuts where the
+  taken action is not an online argmax. A finite horizon, λ, and the
+  Watkins cut are separate gates.
+- ``lambda_gate``, ``nstep_gate``, ``watkins_gate``, ``value_gap_gate``, and
+  ``general_gate`` return ``[N, N]``
+  and raise when ``q`` has fewer than 2 steps or ``action`` is not
+  shape ``[N]``. A short batch is an error, not a zero continuation.
+  Row ``t``, column ``s`` is the continuation at step ``s`` for the
+  return that started at ``t``.
 - ``Model.copy`` replaces ``Model.delayed_copy``. The method copies
   the model; Polyak averaging is what delays the weights.
 - ``DataLoader`` reseeds the transform once per sampled sequence, not
@@ -78,7 +106,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Aligned with mouse-gym 1.1.0: ``EnvConfig.episodes_per_task`` is
   ``max_task_episodes`` (task-length timeout, ``task_done=2``).
   ``task_done=1`` is ``terminate_task`` (no longer reserved).
-  ``DqnObjective`` / ``NStepDqnObjective`` /
+  ``DqnObjective`` /
   ``RetraceObjective`` / ``PpoObjective`` ``gamma_task_terminal`` /
   ``gamma_task_truncated`` docs match. Live-env notebooks pass
   ``max_task_episodes=``.
@@ -137,6 +165,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   copied.
 
 ### Removed
+- ``DqnObjective`` parameters ``td_lambda`` and ``watkins``, and
+  ``metrics["watkins_greedy_frac"]``. The continuation is ``gate``;
+  ``lambda_gate`` builds the λ-return, ``nstep_gate`` the n-step
+  return, and ``watkins_gate`` the greedy cut.
 - ``LayerwiseRegressionHead``, ``LayerwiseDqnObjective``,
   ``effective_horizon``, ``gamma_from_horizon``,
   ``ModelOutput.hidden_states``, and
@@ -169,6 +201,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still takes head instances, not name strings.
 
 ### Fixed
+- DQN continuation backups read the gate's ``[N, N]`` matrix in row
+  blocks instead of gathering a second square window and a stack of
+  full-size cumprod tensors. ``general_gate`` multiplies into one
+  matrix instead of stacking every factor.
 - Incremental Flex decode drops a captured CUDA graph when a chunk of a
   new shape replaces the query mask tables. Replays after the shape
   changed back used to read the capture-time (stale or freed) tables,
@@ -206,24 +242,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - ``temperature`` (SAC / soft Q-learning ``α``, required, ``>= 0``)
-  on ``DqnObjective`` and ``NStepDqnObjective``.
+  on ``DqnObjective``.
   ``0`` is hard max-Q; ``> 0`` bootstraps
   from ``α logsumexp(Q / α)``. Same units and meaning as
   ``get_action(temperature=)``. ``RetraceObjective`` already required
   ``temperature`` for ``π = softmax(Q / α)``; that same ``α`` is now
   also the backup, ``V_π = E_π[Q] + α H[π]``.
   ``metrics["entropy"]`` is the in-run mean of ``H[softmax(Q / α)]``
-  on online Q when ``α > 0``. Watkins still cuts on the hard argmax.
-- ``NStepDqnObjective``: fixed-horizon n-step DQN. Required ``n``
-  (``int >= 1``) and ``prediction_key`` select the backup length and
-  which Q head to train; ``n=1`` is the one-step target ``r + γ V``.
-  A window that hits a run break or the end of the batch truncates and
-  bootstraps at the last in-run next state. One objective trains one
-  head — call it once per head and add the losses to train several
-  horizons. ``examples/13_train_offline_n_step_dqn.ipynb`` is the same
-  offline loop as ``02`` with three ``RegressionHead``s
-  (``n=1, 3, 5``), ``copy`` of every Q head with a shared
-  backbone, and the three n-step losses summed.
+  on online Q when ``α > 0``.
+- ``DqnObjective`` takes required ``gate``, the continuation, the same
+  way it takes ``reward``, ``value``, and ``discount``. ``gate=None``
+  is the one-step target (a zero matrix). A callable
+  ``gate(**objective_data, q=q)`` returns ``[N, N]``: row ``t``,
+  column ``s`` is the continuation at absolute step ``s`` for the
+  return that started at ``t``. The objective then zeros a continuation
+  that would leave the run. ``lambda_gate(td_lambda=)`` is the
+  λ-return to the end of the run. ``td_lambda=0`` is one-step.
+  ``nstep_gate(n=)`` is the n-step return (``n=1`` is one-step).
+  ``watkins_gate`` cuts where the taken action is not the online
+  argmax. ``general_gate(gates=)`` multiplies those matrices.
+  One objective trains one head — call it once
+  per head and add the losses to train several horizons.
+  ``examples/13_train_offline_n_step_dqn.ipynb`` is the same offline
+  loop as ``02`` with three ``RegressionHead``s
+  (``nstep_gate(n=1, 3, 5)``), ``copy``
+  of every Q head with a shared backbone, and the three losses summed.
 - ``RetraceObjective``: Retrace(λ) off-policy return-based Q-learning
   (Munos et al., 2016).   The TD target is the delayed soft one-step backup
   ``V_π = E_π Q + temperature H[π]`` plus a trace of later TD errors

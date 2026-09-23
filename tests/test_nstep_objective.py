@@ -1,11 +1,18 @@
-"""Tests for the n-step DQN objective on synthetic tensors."""
+"""Tests for fixed-horizon DQN backups on synthetic tensors."""
 from __future__ import annotations
 
 import pytest
 import torch
 
-from mouse_core.objectives import DqnObjective, NStepDqnObjective, affine_reward, affine_value, boundary_discount
-from mouse_core.objectives.nstep import _n_step_targets
+from mouse_core.objectives import (
+    DqnObjective,
+    affine_reward,
+    affine_value,
+    boundary_discount,
+    lambda_gate,
+    nstep_gate,
+)
+from mouse_core.objectives.dqn import _continuation_targets
 
 
 def _disc(**overrides: float):
@@ -39,12 +46,15 @@ def _q(
     return online, delayed
 
 
-def _nstep(**overrides: object) -> NStepDqnObjective:
+def _nstep(**overrides: object) -> DqnObjective:
+    n = overrides.pop("n", 1)
     kwargs: dict[str, object] = dict(
-        n=1, grouping_field=None, temperature=0.0, discount=_disc(), reward=_rew(), value=_val()
+        gate=nstep_gate(n=n),  # type: ignore[arg-type]
+        grouping_field=None, temperature=0.0, double=False,
+        discount=_disc(), reward=_rew(), value=_val(),
     )
     kwargs.update(overrides)
-    return NStepDqnObjective(**kwargs)  # type: ignore[arg-type]
+    return DqnObjective(**kwargs)  # type: ignore[arg-type]
 
 
 def _lambda_fixture() -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], dict[str, torch.Tensor]]:
@@ -71,24 +81,27 @@ _ONE_STEP = 6050.5
 _TWO_STEP = 11668.0
 
 
-def test_nstep_requires_n_and_grouping_field() -> None:
-    with pytest.raises(TypeError, match="n"):
-        NStepDqnObjective(  # type: ignore[call-arg]
-            grouping_field=None, temperature=0.0, discount=_disc(), reward=_rew(), value=_val()
+def test_nstep_requires_gate_and_double() -> None:
+    with pytest.raises(TypeError, match="gate"):
+        DqnObjective(  # type: ignore[call-arg]
+            grouping_field=None, temperature=0.0, double=False,
+            discount=_disc(), reward=_rew(), value=_val(),
         )
-    with pytest.raises(TypeError, match="grouping_field"):
-        NStepDqnObjective(n=1, temperature=0.0, discount=_disc(), reward=_rew(), value=_val())  # type: ignore[call-arg]
-    with pytest.raises(TypeError, match="temperature"):
-        NStepDqnObjective(n=1, grouping_field=None, discount=_disc(), reward=_rew(), value=_val())  # type: ignore[call-arg]
+    with pytest.raises(TypeError, match="double"):
+        DqnObjective(  # type: ignore[call-arg]
+            gate=nstep_gate(n=1),
+            grouping_field=None, temperature=0.0,
+            discount=_disc(), reward=_rew(), value=_val(),
+        )
 
 
-def test_nstep_rejects_non_positive_n() -> None:
+def test_nstep_gate_rejects_non_positive_n() -> None:
     with pytest.raises(ValueError, match="int >= 1"):
-        _nstep(n=0)
+        nstep_gate(n=0)
     with pytest.raises(ValueError, match="int >= 1"):
-        _nstep(n=1.5)
+        nstep_gate(n=1.5)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="int >= 1"):
-        _nstep(n=True)
+        nstep_gate(n=True)  # type: ignore[arg-type]
 
 
 def test_nstep_requires_delayed_predictions() -> None:
@@ -100,12 +113,12 @@ def test_nstep_requires_delayed_predictions() -> None:
 def test_nstep_one_matches_dqn() -> None:
     step_stream, predictions, delayed = _lambda_fixture()
     nstep, metrics = _nstep(n=1)(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
-    dqn, _ = DqnObjective(grouping_field=None, temperature=0.0, discount=_disc(), reward=_rew(), value=_val())(
+    dqn, _ = DqnObjective(grouping_field=None, temperature=0.0, double=False, gate=None, discount=_disc(), reward=_rew(), value=_val())(
         objective_data=step_stream, predictions=predictions, delayed_predictions=delayed
     )
     assert abs(nstep.item() - dqn.item()) < 1e-05
     assert abs(nstep.item() - _ONE_STEP) < 1e-03
-    assert "n_step" in metrics
+    assert "action_value" in metrics
     assert "watkins_greedy_frac" not in metrics
 
 
@@ -123,16 +136,50 @@ def test_nstep_past_batch_end_truncates_to_available_steps() -> None:
     assert abs(two.item() - ten.item()) < 1e-05
 
 
+def _blank_batch(n: int) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.zeros(n, 1), torch.zeros(n, dtype=torch.long)
+
+
 def test_n_step_targets_window() -> None:
     reward = torch.tensor([0.0, 1.0, 10.0, 100.0])
     discount = torch.ones(4)
     v = torch.tensor([0.0, 3.0, 7.0, 11.0])
     pair_weight = torch.ones(3)
-    got = _n_step_targets(
-        reward=reward, discount_all=discount, v_step=v, pair_weight=pair_weight, n=2
+    q, action = _blank_batch(4)
+    got = _continuation_targets(
+        reward=reward, discount_all=discount, v_step=v, pair_weight=pair_weight,
+        continuation=nstep_gate(n=2)(q=q, action=action),
     )
     # G0 = 1 + 10 + 7 = 18; G1 = 10 + 100 + 11 = 121; G2 = 100 + 11 = 111.
     assert torch.allclose(got, torch.tensor([18.0, 121.0, 111.0]))
+    full = _continuation_targets(
+        reward=reward, discount_all=discount, v_step=v, pair_weight=pair_weight,
+        continuation=lambda_gate(td_lambda=1.0)(q=q, action=action),
+    )
+    # λ = 1 out to the run break keeps going: G0 = 1 + 10 + 100 + 11 = 122.
+    assert torch.allclose(full, torch.tensor([122.0, 121.0, 111.0]))
+
+
+def test_nstep_gate_returns_a_square_matrix() -> None:
+    """``nstep_gate`` is ``[N, N]``: 1 on ``t < s < t + n``, else 0."""
+    reward = torch.tensor([0.0, 1.0, 10.0, 100.0])
+    discount = torch.ones(4)
+    v = torch.tensor([0.0, 3.0, 7.0, 11.0])
+    pair_weight = torch.ones(3)
+    N = 4
+    n = 2
+    q, action = _blank_batch(N)
+    got = nstep_gate(n=n)(q=q, action=action)
+    matrix = torch.zeros(N, N)
+    for t in range(N):
+        for s in range(t + 1, min(N, t + n)):
+            matrix[t, s] = 1.0
+    assert torch.equal(got, matrix)
+    targets = _continuation_targets(
+        reward=reward, discount_all=discount, v_step=v, pair_weight=pair_weight,
+        continuation=got,
+    )
+    assert torch.allclose(targets, torch.tensor([18.0, 121.0, 111.0]))
 
 
 def test_nstep_terminal_gamma_zero_ends_the_sum() -> None:
@@ -192,7 +239,7 @@ def test_nstep_trains_multiple_heads_independently() -> None:
     )
     assert abs(loss_1.item() - _ONE_STEP) < 1e-03
     assert abs(loss_3.item() - _TWO_STEP) < 1e-03
-    assert m1["n_step"] != m3["n_step"]
+    assert m1["action_value"] != m3["action_value"]
     total = loss_1 + loss_3
     total.backward()
     assert q1.grad is not None
@@ -271,7 +318,7 @@ def test_nstep_temperature_matches_dqn_one_step() -> None:
         }
     predictions, delayed = _q(torch.zeros(2, 2), torch.zeros(2, 2))
     nstep_loss, nstep_m = _nstep(temperature=1.0)(objective_data=step_stream, predictions=predictions, delayed_predictions=delayed)
-    dqn_loss, dqn_m = DqnObjective(temperature=1.0, grouping_field=None, discount=_disc(), reward=_rew(), value=_val())(
+    dqn_loss, dqn_m = DqnObjective(temperature=1.0, double=False, gate=None, grouping_field=None, discount=_disc(), reward=_rew(), value=_val())(
         objective_data=step_stream, predictions=predictions, delayed_predictions=delayed
     )
     assert abs(nstep_loss.item() - dqn_loss.item()) < 1e-06
