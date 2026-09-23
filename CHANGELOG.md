@@ -11,14 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ``general_gate(gates=)`` multiplies DQN continuation matrices. Each
   entry is the product of the gates at that step, so a return continues
   only where every gate continues.
-- ``value_gap_gate(beta=, eps=)``: DQN continuation on detached online
-  Q (after ``value``), with ``V = max_a Q``. A positive ``eps`` uses
-  ``c = exp(-beta * (V - Q(s, a_taken)) / (max_a Q - min_a Q + eps))``.
-  ``eps=None`` turns that range term off and uses
-  ``c = exp(-beta * (V - Q(s, a_taken)))``. A zero gap continues
-  (``c = 1``); a larger gap bootstraps the delayed state value.
-  ``examples/14_train_offline_value_gap_dqn.ipynb`` is the same offline
-  loop as ``02`` with this gate.
+- ``value_gap_gate(beta=, normalize=, eps=)``: DQN continuation on
+  detached online Q (after ``value``), with ``V = max_a Q``.
+  ``normalize=True`` uses
+  ``c = exp(-beta * (V - Q(s, a_taken)) / (max_a Q - min_a Q + eps))``
+  and requires ``eps``. ``normalize=False`` uses the raw gap
+  ``c = exp(-beta * (V - Q(s, a_taken)))`` and takes no ``eps``. A zero
+  gap continues (``c = 1``); a larger gap bootstraps the delayed state
+  value. ``examples/14_train_offline_value_gap_dqn.ipynb`` is the same
+  offline loop as ``02`` with this gate.
 - ``DqnObjective`` requires ``double``. ``False`` bootstraps from delayed
   Q (max, or ``α logsumexp``). ``True`` is Double DQN: detached online Q
   chooses the action and delayed Q evaluates it. ``temperature=0`` reads

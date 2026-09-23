@@ -458,9 +458,9 @@ class DqnObjective(Objective):
     the end of the run. ``nstep_gate`` is the n-step return.
     ``watkins_gate`` cuts where the taken action is not an online
     argmax. ``value_gap_gate`` is the optimality-gap cut. ``V = max_a Q`` on
-    that online Q. A positive ``eps`` uses
-    ``c = exp(-beta * (V - Q(s, a_taken)) / (max_a Q - min_a Q + eps))``;
-    ``eps=None`` uses the raw gap
+    that online Q. ``normalize=True`` uses
+    ``c = exp(-beta * (V - Q(s, a_taken)) / (max_a Q - min_a Q + eps))``
+    (``eps`` required). ``normalize=False`` uses the raw gap
     ``c = exp(-beta * (V - Q(s, a_taken)))``. ``general_gate(gates=)``
     multiplies those matrices, so a step continues only where every
     gate continues. The callable returns
@@ -496,11 +496,12 @@ class DqnObjective(Objective):
     (discounted) into the reset frame's return. A gate that cuts on the
     action reads detached online Q. ``watkins_gate`` cuts
     wherever the taken action is not the online argmax (ties included).
-    ``value_gap_gate(beta=, eps=)`` softens that cut. ``V = max_a Q``
-    on the same online Q. A positive ``eps`` uses
-    ``c = exp(-beta * (V - Q(s, a_taken)) / (max_a Q - min_a Q + eps))``;
-    ``eps=None`` turns that range term off and uses
-    ``c = exp(-beta * (V - Q(s, a_taken)))``. A zero gap (a tie with
+    ``value_gap_gate(beta=, normalize=, eps=)`` softens that cut.
+    ``V = max_a Q`` on the same online Q. ``normalize=True`` uses
+    ``c = exp(-beta * (V - Q(s, a_taken)) / (max_a Q - min_a Q + eps))``
+    (``eps`` required). ``normalize=False`` uses the raw gap
+    ``c = exp(-beta * (V - Q(s, a_taken)))`` and takes no ``eps``.
+    A zero gap (a tie with
     the online max) continues and a larger gap bootstraps the delayed
     state value. Both gates read
     that online Q and leave oracle columns such as ``info_q_star``
@@ -559,9 +560,9 @@ class DqnObjective(Objective):
             (``td_lambda=``). ``nstep_gate`` is the n-step return
             (``n=``). ``watkins_gate`` cuts where the taken action is
             not an online argmax. ``value_gap_gate`` is the optimality-gap cut.
-            ``V = max_a Q`` on that online Q. A positive ``eps`` divides by
-            ``max_a Q - min_a Q + eps``; ``eps=None`` uses the raw gap.
-            ``general_gate(gates=)`` is the
+            ``V = max_a Q`` on that online Q. ``normalize=True`` divides by
+            ``max_a Q - min_a Q + eps`` (``eps`` required). ``normalize=False``
+            uses the raw gap and takes no ``eps``. ``general_gate(gates=)`` is the
             element-wise product of those matrices. A callable returning
             ``[N, N]`` is accepted. Row ``t``, column ``s`` is the continuation at
             absolute step ``s`` for the return that started at ``t``.
