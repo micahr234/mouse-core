@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn.functional as F
 
@@ -415,7 +417,7 @@ def _require_w(
     """One offset per head-output row. ``None`` is regular DQN.
 
     A one-output regression head returns ``[P, 1]``. ``[P]`` is the
-    same row. The tensor stays in the graph so that head can learn.
+    same row. ``rho`` scales the gradient that still flows through it.
     """
     if w is None:
         return None
@@ -434,6 +436,23 @@ def _require_w(
     return w
 
 
+def _require_rho(rho: float) -> float:
+    """Fraction of the ``w`` gradient that flows. ``1`` is full, ``0`` stops it."""
+    if isinstance(rho, bool) or not isinstance(rho, (int, float)):
+        raise TypeError(f"rho must be a float, got {type(rho)}.")
+    if not math.isfinite(rho) or not 0.0 <= float(rho) <= 1.0:
+        raise ValueError(f"rho must be in [0, 1], got {rho}.")
+    return float(rho)
+
+
+def _scale_w_grad(offset: torch.Tensor, *, rho: float) -> torch.Tensor:
+    """Same forward value as ``offset``. Backward is multiplied by ``rho``."""
+    if rho == 1.0:
+        return offset
+    stopped = offset.detach()
+    return stopped + rho * (offset - stopped)
+
+
 def _pair_values_to_rows(
     pair_values: torch.Tensor,
     step_of: torch.Tensor,
@@ -450,11 +469,12 @@ class DqnObjective(Objective):
     ``objective_data=``, the online Q tensor as ``predictions=``, the
     delayed Q tensor as ``delayed_predictions=``, and the offset as
     ``w=``. Both Q tensors come
-    from the matching head on
+    from the Q head on
     :class:`~mouse_core.models.base.Model`
-    (``model.copy(heads=True, backbone=True, reasoner=False)``) run on
+    (``model.copy(heads=(q_head,), backbone=True, reasoner=False)``) run on
     the same ``TokenBatch``. The delayed tensor is detached before
     the Bellman target, so the TD error does not backprop through it.
+    The offset head is not in that copy.
 
     Q rows are **per head-output token** (``[P, A]``), not per step: a step may
     own several head-output tokens (tokenizer input field flagged
@@ -526,14 +546,18 @@ class DqnObjective(Objective):
     The online scores that choose the action are detached, so the TD
     error does not train them.
     The loss is the weighted mean of ``δ²`` on those rows, with
-    ``δ = G - Q(s, a)`` and ``G`` the backup above. ``w`` is optional
-    in the sense that ``None`` is that loss. A tensor is the output of
-    a one-output regression head on the history ``h``, one scalar per
-    head-output row (``[P]`` or ``[P, 1]``). The loss is then the
-    weighted mean of ``(δ - w)²``. ``w`` is not detached: its gradient
-    trains that head, and the head's learning rate sets how fast the
-    offset moves. Detach ``h`` before the head when the backbone
-    should not train through the offset. ``metrics["td_offset"]`` is
+    ``δ = G - Q(s, a)`` and ``G`` the backup above. ``w=None`` is that
+    loss. A tensor is the online one-output regression head on the
+    history ``h``, one scalar per head-output row (``[P]`` or ``[P, 1]``).
+    The loss is then the weighted mean of ``(δ - w)²``. Leave that head
+    out of :meth:`~mouse_core.models.base.Model.copy`: the delayed model
+    does not run it, and Polyak does not average it. ``rho`` is the
+    fraction of this loss's gradient that reaches ``w``. ``1`` is full
+    gradient descent on that head. ``0`` stops it. Values in between
+    scale it. The forward value of ``w`` does not change with ``rho``,
+    so the center of the TD error is the same. That head's learning
+    rate sets the step size. ``rho`` is required when ``w`` is ``None``
+    too, and does not change that loss. ``metrics["td_offset"]`` is
     the in-run mean of ``w`` when ``w`` is a tensor. One-step,
     ``temperature=0``, and ``double=False`` make ``δ`` the residual
     ``r + γ max_a Q_delayed(s', a) - Q(s, a)``.
@@ -670,6 +694,7 @@ class DqnObjective(Objective):
         predictions: torch.Tensor,
         delayed_predictions: torch.Tensor,
         w: torch.Tensor | None,
+        rho: float,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         q: torch.Tensor = predictions
         q_target: torch.Tensor = delayed_predictions.detach()
@@ -803,10 +828,15 @@ class DqnObjective(Objective):
         td_target = _pair_values_to_rows(pair_target, step_of)  # [P]
 
         # δ = G - Q. w is a one-output head on the history. None squares δ.
-        # w stays in the graph so that head's learning rate moves the offset.
+        # rho scales the backward through w. The forward value is unchanged.
         delta = td_target - q_values
         offset = _require_w(w, P=P, dtype=value_dtype, device=device)
-        loss = delta ** 2 if offset is None else (delta - offset) ** 2
+        rho = _require_rho(rho)
+        loss = (
+            delta ** 2
+            if offset is None
+            else (delta - _scale_w_grad(offset, rho=rho)) ** 2
+        )
 
         cql_penalty_mean: torch.Tensor | None = None
         if self.cql_weight > 0.0:

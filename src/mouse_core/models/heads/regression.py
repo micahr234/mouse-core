@@ -10,7 +10,8 @@ class RegressionHead(_MlpHead):
 
     Use ``out_features=A`` for per-action values (Q-learning), or
     ``out_features=1`` for a state-value baseline or the DQN offset
-    ``w(h)`` (``DqnObjective`` ``w=``). Pair multi-action
-    outputs with :meth:`~mouse_core.models.base.Model.copy` when
-    an objective bootstraps from a delayed copy.
+    ``w(h)`` (``DqnObjective`` ``w=``). Pair the Q head with
+    :meth:`~mouse_core.models.base.Model.copy` when an objective
+    bootstraps from a delayed copy. Leave the offset head out of that
+    copy: Polyak does not average it, and gradient descent trains it.
     """
