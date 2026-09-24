@@ -405,35 +405,6 @@ def _read_gate(
     return values
 
 
-def _require_w(
-    w: torch.Tensor | None,
-    *,
-    P: int,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> torch.Tensor | None:
-    """One offset per head-output row. ``None`` is regular DQN.
-
-    A one-output regression head returns ``[P, 1]``. ``[P]`` is the
-    same row. The tensor stays in the graph so that head can learn.
-    """
-    if w is None:
-        return None
-    if not isinstance(w, torch.Tensor):
-        raise TypeError(f"w must be a Tensor or None, got {type(w)}.")
-    if w.dtype != dtype:
-        raise TypeError(f"w must be {dtype}, got {w.dtype}.")
-    if w.device != device:
-        raise ValueError(f"w must be on {device}, got {w.device}.")
-    if tuple(w.shape) == (P, 1):
-        return w.squeeze(-1)
-    if tuple(w.shape) != (P,):
-        raise ValueError(
-            f"w must have shape [{P}] or [{P}, 1], got {tuple(w.shape)}."
-        )
-    return w
-
-
 def _pair_values_to_rows(
     pair_values: torch.Tensor,
     step_of: torch.Tensor,
@@ -448,14 +419,12 @@ class DqnObjective(Objective):
 
     Instantiate with hyperparameters, then call with
     ``objective_data=``, the online Q tensor as ``predictions=``, the
-    delayed Q tensor as ``delayed_predictions=``, and the offset as
-    ``w=``. Both Q tensors come
-    from the Q head on
+    delayed Q tensor as ``delayed_predictions=``. Both Q tensors come
+    from the matching head on
     :class:`~mouse_core.models.base.Model`
-    (``model.copy(heads=(q_head,), backbone=True, reasoner=False)``) run on
+    (``model.copy(heads=True, backbone=True, reasoner=False)``) run on
     the same ``TokenBatch``. The delayed tensor is detached before
     the Bellman target, so the TD error does not backprop through it.
-    The offset head is not in that copy.
 
     Q rows are **per head-output token** (``[P, A]``), not per step: a step may
     own several head-output tokens (tokenizer input field flagged
@@ -527,15 +496,7 @@ class DqnObjective(Objective):
     The online scores that choose the action are detached, so the TD
     error does not train them.
     The loss is the weighted mean of ``δ²`` on those rows, with
-    ``δ = G - Q(s, a)`` and ``G`` the backup above. ``w=None`` is that
-    loss. A tensor is the online one-output regression head on the
-    history ``h``, one scalar per head-output row (``[P]`` or ``[P, 1]``).
-    The loss is then the weighted mean of ``(δ - w)²``. Leave that head
-    out of :meth:`~mouse_core.models.base.Model.copy`: the delayed model
-    does not run it, and Polyak does not average it. Gradient descent
-    trains it, and that head's learning rate sets how fast the offset
-    moves. ``metrics["td_offset"]`` is the in-run mean of ``w`` when
-    ``w`` is a tensor. One-step,
+    ``δ = G - Q(s, a)`` and ``G`` the backup above. One-step,
     ``temperature=0``, and ``double=False`` make ``δ`` the residual
     ``r + γ max_a Q_delayed(s', a) - Q(s, a)``.
     The trace never crosses a run break. At an episode /
@@ -670,7 +631,6 @@ class DqnObjective(Objective):
         objective_data: dict[str, torch.Tensor],
         predictions: torch.Tensor,
         delayed_predictions: torch.Tensor,
-        w: torch.Tensor | None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         q: torch.Tensor = predictions
         q_target: torch.Tensor = delayed_predictions.detach()
@@ -803,11 +763,9 @@ class DqnObjective(Objective):
         )
         td_target = _pair_values_to_rows(pair_target, step_of)  # [P]
 
-        # δ = G - Q. w is a one-output head on the history. None squares δ.
-        # w stays in the graph so that head's learning rate moves the offset.
+        # δ = G - Q(s, a). The loss is the mean square TD error.
         delta = td_target - q_values
-        offset = _require_w(w, P=P, dtype=value_dtype, device=device)
-        loss = delta ** 2 if offset is None else (delta - offset) ** 2
+        loss = delta ** 2
 
         cql_penalty_mean: torch.Tensor | None = None
         if self.cql_weight > 0.0:
@@ -827,8 +785,6 @@ class DqnObjective(Objective):
             "q_values_max":    q_max,
             "action_value":    loss.detach(),
         }
-        if offset is not None:
-            named["td_offset"] = _weighted_mean(offset.detach(), row_weight)
         if cql_penalty_mean is not None:
             named["cql_penalty"] = cql_penalty_mean
         if self.temperature > 0.0:

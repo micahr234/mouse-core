@@ -936,8 +936,8 @@ class Model(nn.Module):
         ``heads``, ``backbone``, and ``reasoner`` are required.
         ``heads=True`` copies every head. ``heads=False`` attaches this
         model's heads. A sequence of head instances copies only those —
-        use that to leave out a policy, behavior, or offset head whose
-        delayed values nothing reads. Every instance must be one of this model's
+        use that to leave out a policy or behavior head whose delayed
+        values nothing reads. Every instance must be one of this model's
         heads and the list must not be empty. At least one section must
         be copied. The copy's ``action_source`` is this model's when it
         is among the copied or shared heads, else the first head listed

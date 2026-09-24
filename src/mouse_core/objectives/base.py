@@ -54,9 +54,7 @@ class Objective(ABC):
                 from :meth:`~mouse_core.models.base.Model.forward` (index
                 ``ModelOutput.predictions`` with
                 :func:`~mouse_core.models.heads.base.prediction_key`).
-                DQN takes ``delayed_predictions=`` and ``w=``
-                (``None``, or the online offset head, which stays out of
-                the delayed copy so Polyak does not average it);
+                DQN takes ``delayed_predictions=``;
                 other DQN-family subclasses also take ``delayed_predictions=``;
                 PPO takes ``value_predictions=``; Retrace takes both
                 ``delayed_predictions=`` and ``behavior_predictions=``.

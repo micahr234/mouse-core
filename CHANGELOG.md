@@ -67,13 +67,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pass ``architecture="qwen3"`` or ``architecture="llama"``.
 
 ### Changed
-- ``DqnObjective`` takes ``w=`` on each call. ``None`` squares the
-  TD error ``δ = G - Q(s, a)``. A tensor is the online one-output
-  regression head on the history, shape ``[P]`` or ``[P, 1]`` aligned
-  with the Q rows, and the loss is the weighted mean of ``(δ - w)²``.
-  Leave that head out of ``Model.copy``: Polyak does not average it.
-  Gradient descent trains it, and that learning rate sets how fast the
-  offset moves. ``metrics["td_offset"]`` is the in-run mean of ``w``.
 - ``DqnObjective`` checks a gate's type and shape only. Values in
   ``[0, 1]`` stay the gate's contract; the objective does not reduce
   the ``[N, N]`` matrix back to the host on each forward.
