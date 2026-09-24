@@ -223,7 +223,7 @@ def test_retrace_greedy_target_cuts_non_greedy_actions() -> None:
     )(
         objective_data=step_stream,
         predictions=predictions["action_value"],
-        w=None, rho=1.0,
+        w=None,
         delayed_predictions=delayed["action_value"],
     )
     assert abs(metrics["td_loss"] - one_step.item()) < 1e-4

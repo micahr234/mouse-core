@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import math
-
 import torch
 import torch.nn.functional as F
 
@@ -417,7 +415,7 @@ def _require_w(
     """One offset per head-output row. ``None`` is regular DQN.
 
     A one-output regression head returns ``[P, 1]``. ``[P]`` is the
-    same row. ``rho`` scales the gradient that still flows through it.
+    same row. The tensor stays in the graph so that head can learn.
     """
     if w is None:
         return None
@@ -434,23 +432,6 @@ def _require_w(
             f"w must have shape [{P}] or [{P}, 1], got {tuple(w.shape)}."
         )
     return w
-
-
-def _require_rho(rho: float) -> float:
-    """Fraction of the ``w`` gradient that flows. ``1`` is full, ``0`` stops it."""
-    if isinstance(rho, bool) or not isinstance(rho, (int, float)):
-        raise TypeError(f"rho must be a float, got {type(rho)}.")
-    if not math.isfinite(rho) or not 0.0 <= float(rho) <= 1.0:
-        raise ValueError(f"rho must be in [0, 1], got {rho}.")
-    return float(rho)
-
-
-def _scale_w_grad(offset: torch.Tensor, *, rho: float) -> torch.Tensor:
-    """Same forward value as ``offset``. Backward is multiplied by ``rho``."""
-    if rho == 1.0:
-        return offset
-    stopped = offset.detach()
-    return stopped + rho * (offset - stopped)
 
 
 def _pair_values_to_rows(
@@ -551,14 +532,10 @@ class DqnObjective(Objective):
     history ``h``, one scalar per head-output row (``[P]`` or ``[P, 1]``).
     The loss is then the weighted mean of ``(δ - w)²``. Leave that head
     out of :meth:`~mouse_core.models.base.Model.copy`: the delayed model
-    does not run it, and Polyak does not average it. ``rho`` is the
-    fraction of this loss's gradient that reaches ``w``. ``1`` is full
-    gradient descent on that head. ``0`` stops it. Values in between
-    scale it. The forward value of ``w`` does not change with ``rho``,
-    so the center of the TD error is the same. That head's learning
-    rate sets the step size. ``rho`` is required when ``w`` is ``None``
-    too, and does not change that loss. ``metrics["td_offset"]`` is
-    the in-run mean of ``w`` when ``w`` is a tensor. One-step,
+    does not run it, and Polyak does not average it. Gradient descent
+    trains it, and that head's learning rate sets how fast the offset
+    moves. ``metrics["td_offset"]`` is the in-run mean of ``w`` when
+    ``w`` is a tensor. One-step,
     ``temperature=0``, and ``double=False`` make ``δ`` the residual
     ``r + γ max_a Q_delayed(s', a) - Q(s, a)``.
     The trace never crosses a run break. At an episode /
@@ -694,7 +671,6 @@ class DqnObjective(Objective):
         predictions: torch.Tensor,
         delayed_predictions: torch.Tensor,
         w: torch.Tensor | None,
-        rho: float,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         q: torch.Tensor = predictions
         q_target: torch.Tensor = delayed_predictions.detach()
@@ -828,15 +804,10 @@ class DqnObjective(Objective):
         td_target = _pair_values_to_rows(pair_target, step_of)  # [P]
 
         # δ = G - Q. w is a one-output head on the history. None squares δ.
-        # rho scales the backward through w. The forward value is unchanged.
+        # w stays in the graph so that head's learning rate moves the offset.
         delta = td_target - q_values
         offset = _require_w(w, P=P, dtype=value_dtype, device=device)
-        rho = _require_rho(rho)
-        loss = (
-            delta ** 2
-            if offset is None
-            else (delta - _scale_w_grad(offset, rho=rho)) ** 2
-        )
+        loss = delta ** 2 if offset is None else (delta - offset) ** 2
 
         cql_penalty_mean: torch.Tensor | None = None
         if self.cql_weight > 0.0:

@@ -56,9 +56,7 @@ class Objective(ABC):
                 :func:`~mouse_core.models.heads.base.prediction_key`).
                 DQN takes ``delayed_predictions=`` and ``w=``
                 (``None``, or the online offset head, which stays out of
-                the delayed copy so Polyak does not average it) and
-                ``rho=``, the fraction of the loss gradient that reaches
-                that head (``1`` full, ``0`` stopped);
+                the delayed copy so Polyak does not average it);
                 other DQN-family subclasses also take ``delayed_predictions=``;
                 PPO takes ``value_predictions=``; Retrace takes both
                 ``delayed_predictions=`` and ``behavior_predictions=``.
