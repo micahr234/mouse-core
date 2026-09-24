@@ -54,7 +54,9 @@ class Objective(ABC):
                 from :meth:`~mouse_core.models.base.Model.forward` (index
                 ``ModelOutput.predictions`` with
                 :func:`~mouse_core.models.heads.base.prediction_key`).
-                DQN-family subclasses also take ``delayed_predictions=``;
+                DQN takes ``delayed_predictions=`` and ``w=``
+                (``None`` or a one-output regression on the history);
+                other DQN-family subclasses also take ``delayed_predictions=``;
                 PPO takes ``value_predictions=``; Retrace takes both
                 ``delayed_predictions=`` and ``behavior_predictions=``.
 

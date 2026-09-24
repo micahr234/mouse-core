@@ -67,14 +67,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pass ``architecture="qwen3"`` or ``architecture="llama"``.
 
 ### Changed
-- ``DqnObjective`` requires ``rho`` and squares the centered TD error.
-  On each in-run head-output row, ``δ = G - Q(s, a)`` with ``G`` the
-  backup. A scalar ``ω`` starts at ``0``. Each call updates
-  ``ω ← (1 - rho) ω + rho * mean(δ)`` from the detached in-run mean,
-  then the loss is the weighted mean of ``(δ - ω)²``. An all-zero
-  weight batch leaves ``ω`` unchanged. ``rho=0`` holds ``ω`` at ``0``,
-  which is the mean square TD error. ``metrics["td_center"]`` is the
-  updated ``ω``.
+- ``DqnObjective`` takes ``w=`` on each call. ``None`` squares the
+  TD error ``δ = G - Q(s, a)``. A tensor is a one-output regression
+  head on the history, shape ``[P]`` or ``[P, 1]`` aligned with the Q
+  rows, and the loss is the weighted mean of ``(δ - w)²``. ``w`` is
+  not detached, so that head's learning rate sets how fast the offset
+  moves. ``metrics["td_offset"]`` is the in-run mean of ``w``.
 - ``DqnObjective`` checks a gate's type and shape only. Values in
   ``[0, 1]`` stay the gate's contract; the objective does not reduce
   the ``[N, N]`` matrix back to the host on each forward.

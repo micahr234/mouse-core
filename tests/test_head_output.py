@@ -343,16 +343,16 @@ def test_dqn_duplicated_rows_match_single_head_output() -> None:
     N, A = 5, _ACTIONS
     q = torch.randn(N, A)
     q_target = torch.randn(N, A)
-    objective = DqnObjective(rho=0.0, reward=_rew(), value=_val(), discount=_disc(gamma_step=0.9), grouping_field=None, temperature=0.0, double=False, gate=None)
+    objective = DqnObjective( reward=_rew(), value=_val(), discount=_disc(gamma_step=0.9), grouping_field=None, temperature=0.0, double=False, gate=None)
 
     base_loss, base_metrics = objective(
-        objective_data=_objective_data(N), predictions=q, delayed_predictions=q_target,
+        objective_data=_objective_data(N), predictions=q, w=None, delayed_predictions=q_target,
     )
     # Duplicate every step's head-output row: same targets, same loss.
     q2 = q.repeat_interleave(2, dim=0)
     q2_target = q_target.repeat_interleave(2, dim=0)
     dup_loss, dup_metrics = objective(
-        objective_data=_objective_data(N, counts=[2] * N), predictions=q2, delayed_predictions=q2_target,
+        objective_data=_objective_data(N, counts=[2] * N), predictions=q2, w=None, delayed_predictions=q2_target,
     )
     assert torch.allclose(base_loss, dup_loss, atol=1e-6)
     for key in ("q_values_mean", "q_values_min", "q_values_max"):
@@ -365,11 +365,11 @@ def test_dqn_multi_head_output_shares_step_target() -> None:
     gamma = 0.9
     q = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
     q_target = torch.tensor([[10.0, 20.0], [30.0, 40.0], [50.0, 60.0]])
-    objective = DqnObjective(rho=0.0, reward=_rew(), value=_val(), discount=_disc(gamma_step=gamma), grouping_field=None, temperature=0.0, double=False, gate=None)
+    objective = DqnObjective( reward=_rew(), value=_val(), discount=_disc(gamma_step=gamma), grouping_field=None, temperature=0.0, double=False, gate=None)
     data = _objective_data(2, counts=[2, 1], actions=[0, 1])
     data["reward"] = torch.tensor([0.0, 0.5])
     loss, _ = objective(
-        objective_data=data, predictions=q, delayed_predictions=q_target,
+        objective_data=data, predictions=q, w=None, delayed_predictions=q_target,
     )
     target = 0.5 + gamma * 60.0  # r_1 + gamma * max_a Q_target(s_1) (row 2)
     expected = ((2.0 - target) ** 2 + (4.0 - target) ** 2) / 2  # a_1 = 1
@@ -379,11 +379,11 @@ def test_dqn_multi_head_output_shares_step_target() -> None:
 def test_dqn_misaligned_head_output_count_raises() -> None:
     N = 3
     q = torch.randn(2 * N, _ACTIONS)
-    objective = DqnObjective(rho=0.0, reward=_rew(), value=_val(), discount=_disc(), grouping_field=None, temperature=0.0, double=False, gate=None)
+    objective = DqnObjective( reward=_rew(), value=_val(), discount=_disc(), grouping_field=None, temperature=0.0, double=False, gate=None)
     with pytest.raises(ValueError, match="misaligned"):
-        objective(objective_data=_objective_data(N, counts=[2, 2, 1]), predictions=q, delayed_predictions=q.clone())
+        objective(objective_data=_objective_data(N, counts=[2, 2, 1]), predictions=q, w=None, delayed_predictions=q.clone())
     with pytest.raises(ValueError, match="head_output_count column"):
-        objective(objective_data=_objective_data(N), predictions=q, delayed_predictions=q.clone())
+        objective(objective_data=_objective_data(N), predictions=q, w=None, delayed_predictions=q.clone())
 
 
 # ---------------------------------------------------------------------------

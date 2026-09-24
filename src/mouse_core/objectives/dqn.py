@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import math
-
 import torch
 import torch.nn.functional as F
 
@@ -189,16 +187,6 @@ def _require_temperature(temperature: float) -> float:
     if float(temperature) < 0.0:
         raise ValueError(f"temperature must be >= 0, got {temperature}.")
     return float(temperature)
-
-
-def _require_rho(rho: float) -> float:
-    """EMA rate of the scalar TD-error center, in ``[0, 1]``."""
-    if isinstance(rho, bool) or not isinstance(rho, (int, float)):
-        raise TypeError(f"rho must be a real number, got {type(rho)}.")
-    rate = float(rho)
-    if not math.isfinite(rate) or rate < 0.0 or rate > 1.0:
-        raise ValueError(f"rho must be finite and in [0, 1], got {rho}.")
-    return rate
 
 
 def _policy_entropy(pi: torch.Tensor) -> torch.Tensor:
@@ -417,6 +405,35 @@ def _read_gate(
     return values
 
 
+def _require_w(
+    w: torch.Tensor | None,
+    *,
+    P: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor | None:
+    """One offset per head-output row. ``None`` is regular DQN.
+
+    A one-output regression head returns ``[P, 1]``. ``[P]`` is the
+    same row. The tensor stays in the graph so that head can learn.
+    """
+    if w is None:
+        return None
+    if not isinstance(w, torch.Tensor):
+        raise TypeError(f"w must be a Tensor or None, got {type(w)}.")
+    if w.dtype != dtype:
+        raise TypeError(f"w must be {dtype}, got {w.dtype}.")
+    if w.device != device:
+        raise ValueError(f"w must be on {device}, got {w.device}.")
+    if tuple(w.shape) == (P, 1):
+        return w.squeeze(-1)
+    if tuple(w.shape) != (P,):
+        raise ValueError(
+            f"w must have shape [{P}] or [{P}, 1], got {tuple(w.shape)}."
+        )
+    return w
+
+
 def _pair_values_to_rows(
     pair_values: torch.Tensor,
     step_of: torch.Tensor,
@@ -430,8 +447,9 @@ class DqnObjective(Objective):
     """Bellman TD(λ) objective with a delayed target network.
 
     Instantiate with hyperparameters, then call with
-    ``objective_data=``, the online Q tensor as ``predictions=``, and
-    the delayed Q tensor as ``delayed_predictions=``. Both tensors come
+    ``objective_data=``, the online Q tensor as ``predictions=``, the
+    delayed Q tensor as ``delayed_predictions=``, and the offset as
+    ``w=``. Both Q tensors come
     from the matching head on
     :class:`~mouse_core.models.base.Model`
     (``model.copy(heads=True, backbone=True, reasoner=False)``) run on
@@ -507,14 +525,16 @@ class DqnObjective(Objective):
     ``E_π[Q_delayed] + α H[π]`` for ``π = softmax(Q_online / α)``.
     The online scores that choose the action are detached, so the TD
     error does not train them.
-    The loss centers that TD error. On each in-run head-output row
-    ``δ = G - Q(s, a)``, with ``G`` the backup above. A scalar ``ω``
-    starts at ``0``. Each call updates
-    ``ω ← (1 - rho) ω + rho * mean(δ)`` from the detached in-run
-    mean, then the loss is the weighted mean of ``(δ - ω)²``.
-    An all-zero weight batch leaves ``ω`` where it is. ``rho=0``
-    holds ``ω`` at ``0``, which is the mean square TD error.
-    ``metrics["td_center"]`` is the updated ``ω``. One-step,
+    The loss is the weighted mean of ``δ²`` on those rows, with
+    ``δ = G - Q(s, a)`` and ``G`` the backup above. ``w`` is optional
+    in the sense that ``None`` is that loss. A tensor is the output of
+    a one-output regression head on the history ``h``, one scalar per
+    head-output row (``[P]`` or ``[P, 1]``). The loss is then the
+    weighted mean of ``(δ - w)²``. ``w`` is not detached: its gradient
+    trains that head, and the head's learning rate sets how fast the
+    offset moves. Detach ``h`` before the head when the backbone
+    should not train through the offset. ``metrics["td_offset"]`` is
+    the in-run mean of ``w`` when ``w`` is a tensor. One-step,
     ``temperature=0``, and ``double=False`` make ``δ`` the residual
     ``r + γ max_a Q_delayed(s', a) - Q(s, a)``.
     The trace never crosses a run break. At an episode /
@@ -612,10 +632,6 @@ class DqnObjective(Objective):
             ``True`` is Double DQN: online Q chooses the action and
             delayed Q evaluates it. ``temperature`` selects hard argmax
             or the online Boltzmann policy, as above.
-        rho: EMA rate of the scalar TD-error center ``ω``, in
-            ``[0, 1]``. Required. ``0`` holds ``ω`` at its initial
-            ``0``. ``1`` sets ``ω`` to the current in-run mean before
-            the loss.
     """
 
     def __init__(
@@ -626,7 +642,6 @@ class DqnObjective(Objective):
         value: Value | None,
         temperature: float,
         double: bool,
-        rho: float,
         action_key: str = "action",
         episode_done_key: str = "episode_done",
         task_done_key: str = "task_done",
@@ -637,8 +652,6 @@ class DqnObjective(Objective):
     ) -> None:
         self.temperature = _require_temperature(temperature)
         self.double = bool(double)
-        self.rho = _require_rho(rho)
-        self._omega: torch.Tensor | None = None
         self.discount = _require_transform(discount, name="discount")
         self.reward = _require_transform(reward, name="reward")
         self.value = _require_transform(value, name="value")
@@ -650,30 +663,13 @@ class DqnObjective(Objective):
         self.cql_scale_q_eps = cql_scale_q_eps
         self.gate = _require_transform(gate, name="gate")
 
-    def _mix_td_center(
-        self, *, delta: torch.Tensor, row_weight: torch.Tensor
-    ) -> torch.Tensor:
-        """Update ``ω ← (1-ρ)ω + ρ δ̄`` and return that center, detached.
-
-        ``δ̄`` is the weighted mean of detached ``delta``. Weights that
-        sum to ``0`` leave ``ω`` unchanged. ``ω`` starts at ``0``.
-        """
-        delta_bar = _weighted_mean(delta.detach(), row_weight)
-        if self._omega is None:
-            omega = delta_bar.new_zeros(())
-        else:
-            omega = self._omega.to(device=delta_bar.device, dtype=delta_bar.dtype)
-        active = row_weight.sum() > 0
-        updated = (1.0 - self.rho) * omega + self.rho * delta_bar
-        self._omega = torch.where(active, updated, omega).detach()
-        return self._omega
-
     def __call__(
         self,
         *,
         objective_data: dict[str, torch.Tensor],
         predictions: torch.Tensor,
         delayed_predictions: torch.Tensor,
+        w: torch.Tensor | None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         q: torch.Tensor = predictions
         q_target: torch.Tensor = delayed_predictions.detach()
@@ -806,11 +802,11 @@ class DqnObjective(Objective):
         )
         td_target = _pair_values_to_rows(pair_target, step_of)  # [P]
 
-        # δ = G - Q. Mix the detached in-run mean into ω, then square
-        # the centered residual. ρ = 0 leaves ω at 0 (mean square TD error).
+        # δ = G - Q. w is a one-output head on the history. None squares δ.
+        # w stays in the graph so that head's learning rate moves the offset.
         delta = td_target - q_values
-        omega = self._mix_td_center(delta=delta, row_weight=row_weight)
-        loss = (delta - omega) ** 2
+        offset = _require_w(w, P=P, dtype=value_dtype, device=device)
+        loss = delta ** 2 if offset is None else (delta - offset) ** 2
 
         cql_penalty_mean: torch.Tensor | None = None
         if self.cql_weight > 0.0:
@@ -829,8 +825,9 @@ class DqnObjective(Objective):
             "q_values_min":    q_min,
             "q_values_max":    q_max,
             "action_value":    loss.detach(),
-            "td_center":       omega.detach(),
         }
+        if offset is not None:
+            named["td_offset"] = _weighted_mean(offset.detach(), row_weight)
         if cql_penalty_mean is not None:
             named["cql_penalty"] = cql_penalty_mean
         if self.temperature > 0.0:
