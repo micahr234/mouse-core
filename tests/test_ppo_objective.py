@@ -191,7 +191,7 @@ def test_ppo_bootstrap_cutoff_is_switchable() -> None:
         normalize_advantage=False,
     )
 
-    def run(*, bootstrap_cutoff: bool, episode_done: torch.Tensor) -> tuple[float, dict[str, float]]:
+    def run(*, bootstrap_cutoff: bool, episode_done: torch.Tensor) -> tuple[float, dict[str, float | torch.Tensor]]:
         objective_data = {
             "action": torch.tensor([0, 0]),
             "reward": torch.tensor([0.0, 4.0]),
@@ -259,7 +259,7 @@ def test_ppo_zero_lambda_keeps_the_in_sample_step() -> None:
         "old_log_prob": torch.zeros(3),
     }
 
-    def run(*, bootstrap_cutoff: bool, gae_lambda: float) -> tuple[float, dict[str, float]]:
+    def run(*, bootstrap_cutoff: bool, gae_lambda: float) -> tuple[float, dict[str, float | torch.Tensor]]:
         loss, metrics = _ppo(
             bootstrap_cutoff=bootstrap_cutoff,
             discount=_disc(gamma_step=1.0),

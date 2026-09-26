@@ -40,7 +40,7 @@ class SvObjective(Objective):
         *,
         objective_data: dict[str, torch.Tensor],
         predictions: torch.Tensor,
-    ) -> tuple[torch.Tensor, dict[str, float]]: ...
+    ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]: ...
 
     @overload
     def __call__(
@@ -50,7 +50,7 @@ class SvObjective(Objective):
         predictions: torch.Tensor,
         delayed_predictions: None = None,
         value_predictions: None = None,
-    ) -> tuple[torch.Tensor, dict[str, float]]: ...
+    ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]: ...
 
     def __call__(
         self,
@@ -59,7 +59,7 @@ class SvObjective(Objective):
         predictions: torch.Tensor,
         delayed_predictions: torch.Tensor | None = None,
         value_predictions: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, dict[str, float]]:
+    ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]:
         _reject_predictions(
             "SvObjective",
             delayed_predictions=delayed_predictions,
@@ -89,5 +89,5 @@ class SvObjective(Objective):
                 f"Invalid SvObjective loss_type: {self.loss_type!r} (expected 'mse' or 'mae')."
             )
 
-        metrics: dict[str, float] = {"value": float(loss.detach().item())}
+        metrics: dict[str, float | torch.Tensor] = {"value": float(loss.detach().item())}
         return loss, metrics

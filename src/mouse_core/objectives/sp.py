@@ -257,7 +257,7 @@ class SpObjective(Objective):
         *,
         objective_data: dict[str, torch.Tensor],
         predictions: torch.Tensor,
-    ) -> tuple[torch.Tensor, dict[str, float]]: ...
+    ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]: ...
 
     @overload
     def __call__(
@@ -267,7 +267,7 @@ class SpObjective(Objective):
         predictions: torch.Tensor,
         delayed_predictions: None = None,
         value_predictions: None = None,
-    ) -> tuple[torch.Tensor, dict[str, float]]: ...
+    ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]: ...
 
     def __call__(
         self,
@@ -276,7 +276,7 @@ class SpObjective(Objective):
         predictions: torch.Tensor,
         delayed_predictions: torch.Tensor | None = None,
         value_predictions: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, dict[str, float]]:
+    ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]:
         _reject_predictions(
             "SpObjective",
             delayed_predictions=delayed_predictions,
@@ -327,5 +327,5 @@ class SpObjective(Objective):
                 "(expected 'ce', 'ce-soft-fwd', 'ce-soft-bwd', 'js', 'kl-fwd', or 'kl-bwd')."
             )
 
-        metrics: dict[str, float] = {"action": float(loss.detach().item())}
+        metrics: dict[str, float | torch.Tensor] = {"action": float(loss.detach().item())}
         return loss, metrics
