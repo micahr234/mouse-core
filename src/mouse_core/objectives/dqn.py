@@ -299,12 +299,18 @@ def _block_returns(
     v_next: torch.Tensor,
     t0: int,
     rows: int,
+    bootstrap_cutoff: bool,
 ) -> torch.Tensor:
     """Returns for starts ``t0 .. t0+rows`` from the gate matrix.
 
     Reads columns ``t0+1:`` of those rows into one strip. Entries before
     each start are outside that start's return: their step is ``1`` so
     the cumprod is unchanged, and their reward term is ``0``.
+
+    ``col_mask`` is ``0`` where the continuation is outside the sampled
+    run. ``bootstrap_cutoff=True`` still adds ``V`` there. ``bootstrap_cutoff=False``
+    does not. A ``0`` from the gate, at a step the mask still keeps,
+    bootstraps either way.
     """
     device = continuation.device
     dtype = reward.dtype
@@ -312,8 +318,11 @@ def _block_returns(
     width = int(col_mask.shape[0]) - t0
     step = continuation[t0:end, t0 + 1 :].contiguous().to(dtype=dtype)
     g = discount[t0:]
-    step.mul_(col_mask[t0:])
-    term = reward[t0:] + g * (1 - step) * v_next[t0:]
+    alive = col_mask[t0:]
+    # ``alive == 0`` is a cutoff whose continuation was not sampled.
+    boot = (1 - step * alive) if bootstrap_cutoff else (1 - step) * alive
+    step.mul_(alive)
+    term = reward[t0:] + g * boot * v_next[t0:]
     step.mul_(g)
     if rows > 1:
         local_row = torch.arange(rows, device=device).unsqueeze(1)
@@ -335,6 +344,7 @@ def _continuation_targets(
     v_step: torch.Tensor,
     pair_weight: torch.Tensor,
     continuation: torch.Tensor,
+    bootstrap_cutoff: bool,
 ) -> torch.Tensor:
     """Return for every pair ``(t, t+1)``, shape ``[N-1]``.
 
@@ -344,6 +354,8 @@ def _continuation_targets(
     started at ``t``. Rows are cumprod'd in blocks of
     ``_CONTINUATION_ROWS`` and never read another start's return. The
     in-run mask zeros a continuation that would leave the run.
+    ``bootstrap_cutoff=False`` does not add ``V`` at that masked cutoff.
+    A gate ``0`` on a step still inside the run still bootstraps.
     Out-of-run pairs return ``0``.
     """
     r = reward[1:].to(dtype=v_step.dtype)  # [N-1]  r_t (stored at t+1)
@@ -370,6 +382,7 @@ def _continuation_targets(
             v_next=v_next,
             t0=t0,
             rows=rows,
+            bootstrap_cutoff=bootstrap_cutoff,
         )
     return returns * in_run.to(dtype=returns.dtype)
 
@@ -478,7 +491,10 @@ class DqnObjective(Objective):
     column ``s`` is the continuation at absolute step ``s`` for the
     return that started at ``t``, and that row is unrolled on its own.
     The objective then zeros a
-    continuation that would leave the run. ``V`` is delayed max-Q when
+    continuation that would leave the run. ``bootstrap_cutoff=True`` adds ``V``
+    at that cutoff (the rest of the episode is not in the sample).
+    ``bootstrap_cutoff=False`` does not. A gate cut on a later in-run step still
+    bootstraps. ``V`` is delayed max-Q when
     ``temperature=0``. A
     positive ``temperature`` (SAC / soft Q-learning ``α``) replaces that
     with the soft value ``α log Σ_a exp(Q / α)``, equal to
@@ -594,6 +610,14 @@ class DqnObjective(Objective):
             ``True`` is Double DQN: online Q chooses the action and
             delayed Q evaluates it. ``temperature`` selects hard argmax
             or the online Boltzmann policy, as above.
+        bootstrap_cutoff: Required. ``True`` adds ``V`` where the continuation
+            leaves the sampled run (end of the batch, or a
+            ``sequence_id`` / ``grouping_field`` break): a chunk
+            boundary, time limit, or truncation whose rest was not
+            sampled. ``False`` omits that value. A bootstrap at a state
+            that still has later in-run steps is unchanged. A true
+            terminal is unchanged either way: its γ already multiplies
+            the value.
     """
 
     def __init__(
@@ -604,6 +628,7 @@ class DqnObjective(Objective):
         value: Value | None,
         temperature: float,
         double: bool,
+        bootstrap_cutoff: bool,
         action_key: str = "action",
         episode_done_key: str = "episode_done",
         task_done_key: str = "task_done",
@@ -614,6 +639,7 @@ class DqnObjective(Objective):
     ) -> None:
         self.temperature = _require_temperature(temperature)
         self.double = bool(double)
+        self.bootstrap_cutoff = bool(bootstrap_cutoff)
         self.discount = _require_transform(discount, name="discount")
         self.reward = _require_transform(reward, name="reward")
         self.value = _require_transform(value, name="value")
@@ -760,6 +786,7 @@ class DqnObjective(Objective):
             v_step=v_step,  # [N]  V(s_i)
             pair_weight=pair_weight,
             continuation=continuation,
+            bootstrap_cutoff=self.bootstrap_cutoff,
         )
         td_target = _pair_values_to_rows(pair_target, step_of)  # [P]
 

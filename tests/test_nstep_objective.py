@@ -50,7 +50,7 @@ def _nstep(**overrides: object) -> DqnObjective:
     n = overrides.pop("n", 1)
     kwargs: dict[str, object] = dict(
         gate=nstep_gate(n=n),  # type: ignore[arg-type]
-        grouping_field=None, temperature=0.0, double=False,         discount=_disc(), reward=_rew(), value=_val(),
+        grouping_field=None, temperature=0.0, double=False, bootstrap_cutoff=True, discount=_disc(), reward=_rew(), value=_val(),
     )
     kwargs.update(overrides)
     return DqnObjective(**kwargs)  # type: ignore[arg-type]
@@ -85,13 +85,13 @@ def test_nstep_requires_gate_and_double() -> None:
         DqnObjective(  # type: ignore[call-arg]
             grouping_field=None, temperature=0.0, double=False,
             discount=_disc(), reward=_rew(), value=_val(),
-        )
+         bootstrap_cutoff=True)
     with pytest.raises(TypeError, match="double"):
         DqnObjective(  # type: ignore[call-arg]
             gate=nstep_gate(n=1),
             grouping_field=None, temperature=0.0,
             discount=_disc(), reward=_rew(), value=_val(),
-        )
+         bootstrap_cutoff=True)
 
 
 def test_nstep_gate_rejects_non_positive_n() -> None:
@@ -112,7 +112,7 @@ def test_nstep_requires_delayed_predictions() -> None:
 def test_nstep_one_matches_dqn() -> None:
     step_stream, predictions, delayed = _lambda_fixture()
     nstep, metrics = _nstep(n=1)(objective_data=step_stream, predictions=predictions,  delayed_predictions=delayed)
-    dqn, _ = DqnObjective( grouping_field=None, temperature=0.0, double=False, gate=None, discount=_disc(), reward=_rew(), value=_val())(
+    dqn, _ = DqnObjective( grouping_field=None, temperature=0.0, double=False, gate=None, discount=_disc(), reward=_rew(), value=_val(), bootstrap_cutoff=True)(
         objective_data=step_stream, predictions=predictions,  delayed_predictions=delayed
     )
     assert abs(nstep.item() - dqn.item()) < 1e-05
@@ -148,13 +148,13 @@ def test_n_step_targets_window() -> None:
     got = _continuation_targets(
         reward=reward, discount_all=discount, v_step=v, pair_weight=pair_weight,
         continuation=nstep_gate(n=2)(q=q, action=action),
-    )
+     bootstrap_cutoff=True)
     # G0 = 1 + 10 + 7 = 18; G1 = 10 + 100 + 11 = 121; G2 = 100 + 11 = 111.
     assert torch.allclose(got, torch.tensor([18.0, 121.0, 111.0]))
     full = _continuation_targets(
         reward=reward, discount_all=discount, v_step=v, pair_weight=pair_weight,
         continuation=lambda_gate(td_lambda=1.0)(q=q, action=action),
-    )
+     bootstrap_cutoff=True)
     # λ = 1 out to the run break keeps going: G0 = 1 + 10 + 100 + 11 = 122.
     assert torch.allclose(full, torch.tensor([122.0, 121.0, 111.0]))
 
@@ -177,7 +177,7 @@ def test_nstep_gate_returns_a_square_matrix() -> None:
     targets = _continuation_targets(
         reward=reward, discount_all=discount, v_step=v, pair_weight=pair_weight,
         continuation=got,
-    )
+     bootstrap_cutoff=True)
     assert torch.allclose(targets, torch.tensor([18.0, 121.0, 111.0]))
 
 
@@ -317,7 +317,7 @@ def test_nstep_temperature_matches_dqn_one_step() -> None:
         }
     predictions, delayed = _q(torch.zeros(2, 2), torch.zeros(2, 2))
     nstep_loss, nstep_m = _nstep(temperature=1.0)(objective_data=step_stream, predictions=predictions,  delayed_predictions=delayed)
-    dqn_loss, dqn_m = DqnObjective( temperature=1.0, double=False, gate=None, grouping_field=None, discount=_disc(), reward=_rew(), value=_val())(
+    dqn_loss, dqn_m = DqnObjective( temperature=1.0, double=False, gate=None, grouping_field=None, discount=_disc(), reward=_rew(), value=_val(), bootstrap_cutoff=True)(
         objective_data=step_stream, predictions=predictions,  delayed_predictions=delayed
     )
     assert abs(nstep_loss.item() - dqn_loss.item()) < 1e-06

@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- ``bootstrap_cutoff`` on ``DqnObjective``, ``RetraceObjective``, and
+  ``PpoObjective``. Required. ``True`` adds the value estimate where
+  the continuation leaves the sampled run (end of the batch, or a
+  ``sequence_id`` / ``grouping_field`` break): a chunk boundary, time
+  limit, or truncation whose rest was not sampled. ``False`` omits
+  that value and stops the return on the rewards still in the run. A
+  bootstrap at a state that still has later in-run steps is unchanged.
+  A true terminal is unchanged either way, because its done-code γ
+  already multiplies the value.
 - ``general_gate(gates=)`` multiplies DQN continuation matrices. Each
   entry is the product of the gates at that step, so a return continues
   only where every gate continues.

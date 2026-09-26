@@ -47,6 +47,7 @@ def _ppo(**overrides: object) -> _PpoCall:
         reward=_rew(),
         value=_val(),
         grouping_field=None,
+        bootstrap_cutoff=True,
     )
     kwargs.update(overrides)
     return _PpoCall(PpoObjective(**kwargs))  # type: ignore[arg-type]
@@ -173,7 +174,74 @@ def test_sample_discrete_action_shapes() -> None:
 
 def test_ppo_requires_grouping_field_argument() -> None:
     with pytest.raises(TypeError, match="grouping_field"):
-        PpoObjective(discount=_disc(), reward=_rew(), value=_val())  # type: ignore[call-arg]
+        PpoObjective(discount=_disc(), reward=_rew(), value=_val(), bootstrap_cutoff=True)  # type: ignore[call-arg]
+
+
+def test_ppo_bootstrap_cutoff_is_switchable() -> None:
+    """GAE adds V at the batch end unless bootstrap_cutoff is off. A terminal does not."""
+    predictions = {
+        "action": torch.tensor([[20.0, -20.0], [20.0, -20.0]]),
+        "value": torch.tensor([[1.0], [5.0]]),
+    }
+    common = dict(
+        discount=_disc(gamma_step=1.0),
+        gae_lambda=1.0,
+        vf_coef=1.0,
+        ent_coef=0.0,
+        normalize_advantage=False,
+    )
+
+    def run(*, bootstrap_cutoff: bool, episode_done: torch.Tensor) -> float:
+        objective_data = {
+            "action": torch.tensor([0, 0]),
+            "reward": torch.tensor([0.0, 4.0]),
+            "episode_done": episode_done,
+            "task_done": torch.tensor([0, 0]),
+            "old_log_prob": torch.tensor([0.0, 0.0]),
+        }
+        loss, _ = _ppo(bootstrap_cutoff=bootstrap_cutoff, **common)(
+            objective_data=objective_data, predictions=predictions,
+        )
+        return float(loss.item())
+
+    # δ = 4 + V(s') - 1 = 8; value loss 64; policy loss -8.
+    assert abs(run(bootstrap_cutoff=True, episode_done=torch.tensor([0, 0])) - 56.0) < 0.001
+    # Same transition with the cutoff value omitted: δ = 3, as if γV were 0.
+    assert abs(run(bootstrap_cutoff=False, episode_done=torch.tensor([0, 0])) - 6.0) < 0.001
+    truncated = _disc(gamma_step=1.0, gamma_episode_truncated=1.0)
+    on, _ = _ppo(bootstrap_cutoff=True, discount=truncated, gae_lambda=1.0, vf_coef=1.0, ent_coef=0.0, normalize_advantage=False)(
+        objective_data={
+            "action": torch.tensor([0, 0]),
+            "reward": torch.tensor([0.0, 4.0]),
+            "episode_done": torch.tensor([0, 2]),
+            "task_done": torch.tensor([0, 0]),
+            "old_log_prob": torch.tensor([0.0, 0.0]),
+        },
+        predictions=predictions,
+    )
+    off, _ = _ppo(bootstrap_cutoff=False, discount=truncated, gae_lambda=1.0, vf_coef=1.0, ent_coef=0.0, normalize_advantage=False)(
+        objective_data={
+            "action": torch.tensor([0, 0]),
+            "reward": torch.tensor([0.0, 4.0]),
+            "episode_done": torch.tensor([0, 2]),
+            "task_done": torch.tensor([0, 0]),
+            "old_log_prob": torch.tensor([0.0, 0.0]),
+        },
+        predictions=predictions,
+    )
+    assert abs(on.item() - 56.0) < 0.001
+    assert abs(off.item() - 6.0) < 0.001
+    terminal_on = run(bootstrap_cutoff=True, episode_done=torch.tensor([0, 1]))
+    terminal_off = run(bootstrap_cutoff=False, episode_done=torch.tensor([0, 1]))
+    assert abs(terminal_on - 6.0) < 0.001
+    assert abs(terminal_off - terminal_on) < 1e-05
+
+
+def test_ppo_requires_bootstrap_cutoff_argument() -> None:
+    with pytest.raises(TypeError, match="bootstrap_cutoff"):
+        PpoObjective(  # type: ignore[call-arg]
+            discount=_disc(), reward=_rew(), value=_val(), grouping_field=None,
+        )
 
 
 def test_ppo_rejects_multi_head_output_rows() -> None:

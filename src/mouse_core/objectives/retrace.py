@@ -76,6 +76,7 @@ def _retrace_targets(
     pair_weight: torch.Tensor,
     td_lambda: float,
     temperature: float,
+    bootstrap_cutoff: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Retrace(λ) target for every pair ``(t, t+1)`` and its trace ratio.
 
@@ -95,6 +96,9 @@ def _retrace_targets(
     exist or is out-of-run, so the trace never crosses a run break.
     Episode / task boundaries are handled by ``γ_t`` itself: a ``0`` gamma
     ends the trace and a non-zero truncation gamma carries it, discounted.
+    ``bootstrap_cutoff=False`` drops ``V_π`` where ``c`` is already ``0`` because
+    the next step is outside the sampled run (end of the batch, or a run
+    break). A ``V_π`` at a state that still has a later in-run step stays.
     ``λ = 0`` is the expected one-step target ``r + γ V_π``.
     ``temperature`` is the SAC ``α`` on that same ``π``; ``0`` is
     greedy ``π`` and ``V_π = E_π Q``.
@@ -121,6 +125,8 @@ def _retrace_targets(
 
     in_run = pair_weight > 0
     cont = _shift_next(in_run.to(dtype=dtype))  # pair t+1 exists and is in-run
+    if not bootstrap_cutoff:
+        v_next = v_next * cont
     c_next = float(td_lambda) * _shift_next(ratio) * cont  # [N-1]  c_{t+1}
     q_next_taken = _shift_next(q_taken)  # [N-1]  Q(s_{t+1}, a_{t+1})
 
@@ -193,6 +199,8 @@ class RetraceObjective(Objective):
     gamma at ``i+1`` multiplies both the bootstrap and the continued trace,
     so a ``0`` gamma ends the trace there and a non-zero truncation gamma
     carries it (discounted) into the reset frame's return.
+    ``bootstrap_cutoff=True`` adds ``V_π`` where that trace is cut because the
+    next step is outside the sampled run. ``bootstrap_cutoff=False`` does not.
 
     The target along a run is::
 
@@ -266,6 +274,13 @@ class RetraceObjective(Objective):
         grouping_field: Step column that isolates runs (typically
             ``task_index``). Required. Pass ``None`` only when the batch
             has no grouping isolation.
+        bootstrap_cutoff: Required. ``True`` adds ``V_π`` where the continuation
+            leaves the sampled run (end of the batch, or a
+            ``sequence_id`` / ``grouping_field`` break): a chunk
+            boundary, time limit, or truncation whose rest was not
+            sampled. ``False`` omits that value. ``V_π`` at a state that
+            still has a later in-run step is unchanged. A true terminal
+            is unchanged either way: its γ already multiplies the value.
         cql_weight: Alpha coefficient for the Conservative Q-Learning penalty
             on the Q head. ``0.0`` disables CQL.
         cql_scale_q_eps: Additive floor used when scaling the CQL penalty.
@@ -293,6 +308,7 @@ class RetraceObjective(Objective):
         episode_done_key: str = "episode_done",
         task_done_key: str = "task_done",
         grouping_field: str | None,
+        bootstrap_cutoff: bool,
         cql_weight: float = 0.0,
         cql_scale_q_eps: float = 1.0,
     ) -> None:
@@ -312,6 +328,7 @@ class RetraceObjective(Objective):
         self.episode_done_key = episode_done_key
         self.task_done_key = task_done_key
         self.grouping_field = grouping_field
+        self.bootstrap_cutoff = bool(bootstrap_cutoff)
         self.cql_weight = cql_weight
         self.cql_scale_q_eps = cql_scale_q_eps
 
@@ -441,6 +458,7 @@ class RetraceObjective(Objective):
             pair_weight=pair_weight,
             td_lambda=self.td_lambda,
             temperature=self.temperature,
+            bootstrap_cutoff=self.bootstrap_cutoff,
         )
         td_target = _pair_values_to_rows(pair_target, step_of)  # [P]
 
