@@ -18,7 +18,7 @@ from mouse_core.objectives.transforms import (
 )
 from mouse_core.objectives.grpo import GrpoObjective, group_relative_advantages
 from mouse_core.objectives.ppo import PpoObjective, sample_discrete_action
-from mouse_core.objectives.sp import SpObjective
+from mouse_core.objectives.sp import SpObjective, best_action
 from mouse_core.objectives.sv import SvObjective
 
 __all__ = [
@@ -43,5 +43,6 @@ __all__ = [
     "PpoObjective",
     "sample_discrete_action",
     "SpObjective",
+    "best_action",
     "SvObjective",
 ]

@@ -19,6 +19,7 @@ Example — custom objective::
             predictions: torch.Tensor,
             delayed_predictions: torch.Tensor | None = None,
             value_predictions: torch.Tensor | None = None,
+            targets: torch.Tensor | None = None,
         ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]:
             ...
             return loss, {"my_objective": loss.item()}
@@ -58,8 +59,10 @@ class Objective(ABC):
     Instantiate with hyperparameters; call with ``objective_data=`` and
     the prediction tensor for the head being trained. Objectives that read
     another head also take that tensor: DQN takes ``delayed_predictions=``
-    and PPO takes ``value_predictions=``. A custom subclass must accept the
-    same optional parameters (pass ``None`` for a tensor it does not read).
+    and PPO takes ``value_predictions=``. Supervised objectives take
+    ``targets=`` (action ids for SP, Q vectors for SV). A custom subclass
+    must accept the same optional parameters (pass ``None`` for a tensor
+    it does not read).
     """
 
     @abstractmethod
@@ -70,6 +73,7 @@ class Objective(ABC):
         predictions: torch.Tensor,
         delayed_predictions: torch.Tensor | None = None,
         value_predictions: torch.Tensor | None = None,
+        targets: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]:
         """Compute a scalar loss and return diagnostic metrics.
 
@@ -86,6 +90,10 @@ class Objective(ABC):
                 that does read it raises ``TypeError``.
             value_predictions: Value-head tensor for PPO. ``None`` on
                 objectives that do not read it.
+            targets: Supervised target tensor for SP / SV (action ids or
+                Q vectors). ``None`` on objectives that do not read it.
+                Callers pass the tensor at call time; objectives do not
+                look up a ``targets_key`` in ``objective_data``.
 
         Returns:
             ``(scalar_loss, metrics)`` where ``metrics`` holds scalar floats
