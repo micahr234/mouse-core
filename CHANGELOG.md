@@ -93,6 +93,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pass ``architecture="qwen3"`` or ``architecture="llama"``.
 
 ### Changed
+- Examples and ``bench/bench_dataloader.py`` replace the CSV
+  ``group_prefix`` legend ``action,observation,r=reward,d=done`` with
+  a local FrozenLake game / strategy / step-format blurb (episode
+  budget ``20``). Each site owns its own string.
 - Objective ``__call__`` metrics are ``dict[str, float | Tensor]``.
   Scalar diagnostics stay floats; DQN also returns tensor fields.
 - ``Objective.__call__`` takes optional ``delayed_predictions`` and
