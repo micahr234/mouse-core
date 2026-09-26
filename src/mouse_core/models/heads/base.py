@@ -78,10 +78,15 @@ class BaseHead(nn.Module, ABC):
     A head receives the pooled step representations ``[B, S, D]`` from the
     backbone and maps them to a per-step output tensor.
 
+    ``_prediction_key`` is the ``predictions`` dict key, bound when the head
+    is passed to ``Model(heads=)``.
+
     Subclass this and implement :meth:`forward` to create a custom head.
     The output shape is up to you — ``[B, S, A]`` for logit heads,
     ``[B, S, A, D]`` for vector heads, etc.
     """
+
+    _prediction_key: str
 
     @abstractmethod
     def forward(self, h: torch.Tensor) -> torch.Tensor:

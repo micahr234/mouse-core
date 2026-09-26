@@ -205,6 +205,11 @@ class Backbone(nn.Module, ABC):
         except ValueError:
             return torch.float32
 
+    @property
+    @abstractmethod
+    def hidden_dim(self) -> int:
+        """Width ``D`` of the hidden states this backbone returns."""
+
     @abstractmethod
     def forward(
         self,

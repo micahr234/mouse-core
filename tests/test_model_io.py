@@ -83,7 +83,7 @@ def test_use_norm_false_roundtrip(tmp_path) -> None:
 
 def test_head_requires_use_norm() -> None:
     with pytest.raises(TypeError, match="use_norm"):
-        RegressionHead(in_features=8, out_features=4, hidden_dim=8, num_layers=1)
+        RegressionHead(in_features=8, out_features=4, hidden_dim=8, num_layers=1)  # type: ignore[call-arg]
 
 
 def test_transformer_backbone_requires_kernels_and_dtype() -> None:

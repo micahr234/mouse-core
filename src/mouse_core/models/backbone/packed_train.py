@@ -66,11 +66,13 @@ recomputes each layer in backward instead of storing its activations.
 from __future__ import annotations
 
 import threading
+from collections.abc import Iterator
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Any, Callable, Literal, cast, get_args, overload
+from typing import Any, Callable, Literal, Protocol, cast, get_args, overload
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 from torch.nn.attention.varlen import varlen_attn
@@ -383,10 +385,70 @@ def install_compiled_decoder() -> bool:
     return installed
 
 
+class _FinalNorm(Protocol):
+    """Final RMSNorm: callable, with a readable ``weight``."""
+
+    @property
+    def weight(self) -> torch.Tensor: ...
+
+    def __call__(self, hidden: torch.Tensor) -> torch.Tensor: ...
+
+
+class _DecoderStack(Protocol):
+    """Llama / Qwen3 decoder ``TransformerBackbone.model`` points at.
+
+    Read-only properties keep ``norm`` and ``layers`` covariant, so the
+    concrete RMSNorm and ``ModuleList`` match. A generic HuggingFace module
+    is stored with a cast.
+    """
+
+    @property
+    def config(self) -> Any: ...
+
+    @property
+    def layers(self) -> nn.ModuleList: ...
+
+    @property
+    def norm(self) -> _FinalNorm: ...
+
+    def get_input_embeddings(self) -> nn.Module: ...
+
+    def parameters(self, recurse: bool = True) -> Iterator[nn.Parameter]: ...
+
+    def named_parameters(
+        self,
+        prefix: str = "",
+        recurse: bool = True,
+        remove_duplicate: bool = True,
+    ) -> Iterator[tuple[str, nn.Parameter]]: ...
+
+    def modules(self) -> Iterator[nn.Module]: ...
+
+    def named_modules(
+        self,
+        memo: set[nn.Module] | None = None,
+        prefix: str = "",
+        remove_duplicate: bool = True,
+    ) -> Iterator[tuple[str, nn.Module]]: ...
+
+    def named_children(self) -> Iterator[tuple[str, nn.Module]]: ...
+
+    def __call__(
+        self,
+        *,
+        inputs_embeds: torch.Tensor | None = None,
+        output_hidden_states: bool = False,
+        **kwargs: Any,
+    ) -> Any: ...
+
+
+_PackedModel = nn.Module | _DecoderStack
+
+
 @overload
 def packed_forward(
     *,
-    model: torch.nn.Module,
+    model: _PackedModel,
     embeds: torch.Tensor,
     sequence_ids: torch.Tensor,
     grouping_ids: torch.Tensor,
@@ -400,7 +462,7 @@ def packed_forward(
 @overload
 def packed_forward(
     *,
-    model: torch.nn.Module,
+    model: _PackedModel,
     embeds: torch.Tensor,
     sequence_ids: torch.Tensor,
     grouping_ids: torch.Tensor,
@@ -414,7 +476,7 @@ def packed_forward(
 @overload
 def packed_forward(
     *,
-    model: torch.nn.Module,
+    model: _PackedModel,
     embeds: torch.Tensor,
     sequence_ids: torch.Tensor,
     grouping_ids: torch.Tensor,
@@ -427,7 +489,7 @@ def packed_forward(
 
 def packed_forward(
     *,
-    model: torch.nn.Module,
+    model: _PackedModel,
     embeds: torch.Tensor,
     sequence_ids: torch.Tensor,
     grouping_ids: torch.Tensor,

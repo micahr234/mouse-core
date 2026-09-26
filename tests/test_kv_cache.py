@@ -10,7 +10,7 @@ inside the returned ``cache``. These tests verify that feeding sequences in
 chunks — alone, or batched with other sequences of different lengths — yields
 the same per-step predictions as one full unbatched pass.
 """
-from typing import Any, cast
+from typing import Any, Literal, cast
 import pytest
 import torch
 import torch.nn as nn
@@ -18,7 +18,7 @@ from mouse_core.models import Model
 from mouse_core.models.backbone import TransformerBackbone
 from mouse_core.models.backbone import packed_train as packed_train_mod
 from mouse_core.models.backbone.flex_decode import _decode_rope_positions
-from mouse_core.models.backbone.packed_train import install_compiled_decoder
+from mouse_core.models.backbone.packed_train import TrainKernel, install_compiled_decoder
 from mouse_core.models.lora import LoRAConfig
 from mouse_core.models.heads import RegressionHead
 from tests._token_batch_helpers import batch_to_token_batch, token_tokenizer
@@ -63,7 +63,7 @@ def _as_rect(preds: torch.Tensor) -> torch.Tensor:
 
 _TOK = token_tokenizer("action", "episode_done", grouping_field="task_index")
 
-def _tiny_model(architecture: str = "qwen3", tokens: int=1, dtype: torch.dtype = torch.float32, train_kernel: str = "reference", **backbone_kwargs) -> Model:
+def _tiny_model(architecture: Literal["llama", "qwen3"] = "qwen3", tokens: int=1, dtype: torch.dtype = torch.float32, train_kernel: TrainKernel = "reference", **backbone_kwargs) -> Model:
     hidden_dim = 16
     backbone = TransformerBackbone(architecture=architecture, train_kernel=train_kernel, decode_kernel="flex", dtype=dtype, use_norm=True, hidden_dim=hidden_dim, num_layers=2, num_heads=2, vocab_size=32, **backbone_kwargs)
     head = RegressionHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, use_norm=True)
@@ -87,7 +87,7 @@ def _fwd(model: Model, rows: list[list[dict]], **kwargs):
     return out.predictions, out.cache
 
 @pytest.mark.parametrize('backbone_cls', ["qwen3", "llama"])
-def test_chunked_cached_forward_matches_full_forward(backbone_cls) -> None:
+def test_chunked_cached_forward_matches_full_forward(backbone_cls: Literal["llama", "qwen3"]) -> None:
     torch.manual_seed(0)
     model = _tiny_model(backbone_cls)
     steps = _steps(6)
@@ -104,7 +104,7 @@ def test_chunked_cached_forward_matches_full_forward(backbone_cls) -> None:
     assert torch.allclose(incremental, full_q, atol=1e-05), 'cached incremental decode diverged from full forward — RoPE cache positions are not being inferred correctly'
 
 @pytest.mark.parametrize('backbone_cls', ["qwen3", "llama"])
-def test_recurring_grouping_id_matches_between_full_and_cached(backbone_cls) -> None:
+def test_recurring_grouping_id_matches_between_full_and_cached(backbone_cls: Literal["llama", "qwen3"]) -> None:
     """A grouping id that reappears after another id must use one position rule everywhere."""
     torch.manual_seed(3)
     model = _tiny_model(backbone_cls)
@@ -533,7 +533,7 @@ def test_eval_loop_get_action_model_output_matches_full_forward() -> None:
 
 @pytest.mark.parametrize('backbone_cls', ["qwen3", "llama"])
 @pytest.mark.parametrize('tokens', [1, 2])
-def test_ragged_batched_chunks_match_unbatched(backbone_cls, tokens) -> None:
+def test_ragged_batched_chunks_match_unbatched(backbone_cls: Literal["llama", "qwen3"], tokens) -> None:
     """Batched decode of ragged (variable-size) chunks == unbatched decode.
 
     Each call, every row contributes a different number of new steps — including
@@ -571,7 +571,7 @@ def test_ragged_batched_chunks_match_unbatched(backbone_cls, tokens) -> None:
         assert action[b] == reference[b][-1].argmax()
 
 @pytest.mark.parametrize('backbone_cls', ["qwen3", "llama"])
-def test_empty_first_chunk_then_real_rows_match_unbatched(backbone_cls) -> None:
+def test_empty_first_chunk_then_real_rows_match_unbatched(backbone_cls: Literal["llama", "qwen3"]) -> None:
     """A row that is empty on the very first cached call must still decode exactly.
 
     The empty row's slots enter the shared cache as fully-masked padding (its
@@ -628,7 +628,7 @@ def test_concat_fusion_ragged_chunks_match_unbatched() -> None:
 
 @pytest.mark.parametrize('backbone_cls', ["qwen3", "llama"])
 @pytest.mark.parametrize('seed', range(5))
-def test_ragged_decode_fuzz(backbone_cls, seed) -> None:
+def test_ragged_decode_fuzz(backbone_cls: Literal["llama", "qwen3"], seed) -> None:
     """Randomized chunk schedules: any split of any batch through the cache
     must reproduce the unbatched full forward at every real step."""
     torch.manual_seed(100 + seed)
@@ -697,7 +697,7 @@ def test_uniform_then_ragged_cached_decode() -> None:
         assert torch.allclose(batched, reference[b], atol=1e-05)
 
 @pytest.mark.parametrize('backbone_cls', ["qwen3", "llama"])
-def test_reset_rows_restarts_one_sequence_without_rebuild(backbone_cls) -> None:
+def test_reset_rows_restarts_one_sequence_without_rebuild(backbone_cls: Literal["llama", "qwen3"]) -> None:
     """Clearing one row's cache length must restart that row; others keep decoding.
 
     Mimics a single env hitting a task boundary: reset that stream and continue
@@ -887,7 +887,7 @@ def test_reset_rows_returns_pages_to_pool() -> None:
 
 
 @pytest.mark.parametrize('backbone_cls', ["qwen3", "llama"])
-def test_decode_task_mask_isolates_without_reset(backbone_cls) -> None:
+def test_decode_task_mask_isolates_without_reset(backbone_cls: Literal["llama", "qwen3"]) -> None:
     """Continuing past a task boundary without reset_rows matches a fresh task forward.
 
     Older grouping-id-run KV slots remain in the shared session; grouping-id masking + per-run

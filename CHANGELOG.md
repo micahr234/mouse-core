@@ -76,6 +76,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pass ``architecture="qwen3"`` or ``architecture="llama"``.
 
 ### Changed
+- ``Objective.__call__`` takes optional ``delayed_predictions``,
+  ``value_predictions``, and ``behavior_predictions`` so DQN, PPO, and
+  Retrace overrides match the base. Each objective still requires the
+  tensors it reads and raises ``TypeError`` when one of those is
+  missing or when it is given a tensor it does not use. A custom
+  ``Objective`` must accept the same optional parameters (``None`` for
+  a tensor it does not read).
+- ``Backbone.hidden_dim`` is an abstract property returning ``int``.
 - ``DqnObjective`` checks a gate's type and shape only. Values in
   ``[0, 1]`` stay the gate's contract; the objective does not reduce
   the ``[N, N]`` matrix back to the host on each forward.

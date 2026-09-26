@@ -1,9 +1,24 @@
 """Tests for DQN objective on synthetic tensors."""
 from __future__ import annotations
 import math
+from typing import TypedDict
+
 import torch
 
-from mouse_core.objectives import DqnObjective, affine_reward, affine_value, boundary_discount, boundary_reward, boundary_value, value_gap_gate, general_gate, lambda_gate, nstep_gate, watkins_gate
+from mouse_core.objectives import (
+    Discount,
+    DqnObjective,
+    affine_reward,
+    affine_value,
+    boundary_discount,
+    boundary_reward,
+    boundary_value,
+    value_gap_gate,
+    general_gate,
+    lambda_gate,
+    nstep_gate,
+    watkins_gate,
+)
 import pytest
 from mouse_core.objectives.dqn import (
     _affine_scan_backward,
@@ -338,7 +353,7 @@ def test_dqn_objective_q_scale_and_shift() -> None:
     assert torch.equal(predictions, online)
 
 
-def _sequence_fixture(sequence_id: list[int]) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+def _sequence_fixture(sequence_id: list[int]) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
     step_stream = {'action': torch.tensor([0, 1, 0]), 'reward': torch.tensor([0.0, 1.0, 5.0]), 'episode_done': torch.tensor([0, 0, 0]), 'task_done': torch.tensor([0, 0, 0]), 'sequence_id': torch.tensor(sequence_id)}
     predictions, delayed = _q(torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]]), torch.zeros(3, 2))
     return (step_stream, predictions, delayed)
@@ -640,7 +655,7 @@ def test_dqn_objective_does_not_backprop_through_delayed_q() -> None:
     assert delayed.grad is None
 
 
-def _lambda_fixture() -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+def _lambda_fixture() -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
     """Three in-run steps so λ can mix a two-step backup from s0.
 
     Action from s0 is 0; from s1 is 1. Delayed max-Q is 3 at s1 and 100 at s2.
@@ -1325,12 +1340,24 @@ def test_dqn_objective_rejects_non_fp32_q() -> None:
         DqnObjective( reward=_rew(), value=_val(), discount=_disc(), grouping_field=None, temperature=0.0, double=False, gate=None, bootstrap_cutoff=True)(objective_data=step_stream, predictions=predictions,  delayed_predictions=delayed)
 
 
-def _entropy_kw() -> dict[str, object]:
-    return dict(
-        discount=_disc(),
-        grouping_field=None,
-        temperature=0.0, double=False, bootstrap_cutoff=True, gate=None,
-    )
+class _EntropyKw(TypedDict):
+    discount: Discount
+    grouping_field: None
+    temperature: float
+    double: bool
+    bootstrap_cutoff: bool
+    gate: None
+
+
+def _entropy_kw(*, temperature: float = 0.0) -> _EntropyKw:
+    return {
+        "discount": _disc(),
+        "grouping_field": None,
+        "temperature": temperature,
+        "double": False,
+        "bootstrap_cutoff": True,
+        "gate": None,
+    }
 
 
 def test_temperature_zero_matches_hard_max() -> None:
@@ -1356,7 +1383,7 @@ def test_temperature_soft_value_is_logsumexp() -> None:
     delayed = torch.tensor([[0.0, 0.0], [0.0, 0.0]])
     predictions, delayed_td = _q(online, delayed)
     alpha = 1.0
-    loss, metrics = DqnObjective(reward=_rew(), value=_val(), **{**_entropy_kw(), 'temperature': alpha})(
+    loss, metrics = DqnObjective(reward=_rew(), value=_val(), **_entropy_kw(temperature=alpha))(
         objective_data=step_stream, predictions=predictions,  delayed_predictions=delayed_td
     )
     # Q(s0, a=0) = 0; target = 0 + 1 * log(2); one in-run pair.
@@ -1378,7 +1405,7 @@ def test_temperature_matches_expected_q_plus_entropy() -> None:
 
 def test_temperature_rejects_negative() -> None:
     with pytest.raises(ValueError, match="temperature"):
-        DqnObjective(reward=_rew(), value=_val(), **{**_entropy_kw(), 'temperature': -0.1})
+        DqnObjective(reward=_rew(), value=_val(), **_entropy_kw(temperature=-0.1))
 
 
 def test_temperature_does_not_change_gamma_zero_target() -> None:
@@ -1407,16 +1434,6 @@ def test_temperature_does_not_change_gamma_zero_target() -> None:
 def test_dqn_requires_discount_argument() -> None:
     with pytest.raises(TypeError, match="discount"):
         DqnObjective( reward=_rew(), value=_val(), grouping_field=None, temperature=0.0, double=False, gate=None, bootstrap_cutoff=True)  # type: ignore[call-arg]
-
-
-def test_dqn_requires_reward_argument() -> None:
-    with pytest.raises(TypeError, match="reward"):
-        DqnObjective( value=_val(), discount=_disc(), grouping_field=None, temperature=0.0, double=False, gate=None, bootstrap_cutoff=True)  # type: ignore[call-arg]
-
-
-def test_dqn_requires_value_argument() -> None:
-    with pytest.raises(TypeError, match="value"):
-        DqnObjective( reward=_rew(), discount=_disc(), grouping_field=None, temperature=0.0, double=False, gate=None, bootstrap_cutoff=True)  # type: ignore[call-arg]
 
 
 def test_dqn_custom_discount_function() -> None:

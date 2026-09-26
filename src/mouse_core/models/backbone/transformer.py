@@ -29,6 +29,7 @@ from mouse_core.models.backbone.base import (
     _load_transformer_weights,
     _rope_parameters_from_config,
 )
+from mouse_core.models.backbone.packed_train import _DecoderStack
 from mouse_core.models.backbone.flex_decode import FlexDecodeSession
 from mouse_core.models.backbone.llama import _LlamaBackboneConfig, llama_config_kwargs
 from mouse_core.models.backbone.qwen3 import _Qwen3BackboneConfig, qwen3_config_kwargs
@@ -36,6 +37,11 @@ from mouse_core.models.backbone.embed import embed_token_ids
 from mouse_core.models.lora import LoRAConfig
 
 Architecture = Literal["llama", "qwen3", "hf"]
+
+
+def _as_module(model: _DecoderStack) -> nn.Module:
+    """View a decoder stack as ``nn.Module`` for helpers typed that way."""
+    return cast(nn.Module, model)
 
 _SOFTMAX_LAYER_TYPES = frozenset({"full_attention", "attention"})
 _HYBRID_MODEL_TYPES = frozenset({"qwen3_5", "qwen3_5_text"})
@@ -191,6 +197,7 @@ class TransformerBackbone(Backbone):
 
     architecture: Architecture
     uses_packed: bool
+    model: _DecoderStack
 
     def __init__(
         self,
@@ -301,16 +308,16 @@ class TransformerBackbone(Backbone):
             )
         self.architecture = architecture
         self.uses_packed = True
-        _ensure_packed_head_dim(self.model)
+        _ensure_packed_head_dim(_as_module(self.model))
         self._config_kwargs = (
             llama_config_kwargs(cast(Any, self.model))
             if architecture == "llama"
             else qwen3_config_kwargs(cast(Any, self.model))
         )
-        _apply_final_norm(self.model, use_norm)
+        _apply_final_norm(_as_module(self.model), use_norm)
         self._config_kwargs["use_norm"] = use_norm
-        cast(nn.Module, self.model).to(dtype)
-        self._attach_lora(self.model, lora)
+        _as_module(self.model).to(dtype)
+        self._attach_lora(_as_module(self.model), lora)
 
     def _init_from_pretrained(
         self,
@@ -416,19 +423,19 @@ class TransformerBackbone(Backbone):
         self.model = model
         self.architecture = architecture
         self.uses_packed = True
-        _ensure_packed_head_dim(self.model)
+        _ensure_packed_head_dim(_as_module(self.model))
         self._config_kwargs = dict(extracted_kwargs)
         self._config_kwargs["vocab_size"] = vocab_size
-        _apply_final_norm(self.model, use_norm)
+        _apply_final_norm(_as_module(self.model), use_norm)
         self._config_kwargs["use_norm"] = use_norm
         if load_weights:
             _load_transformer_weights(
                 hub_kwargs=hub_kwargs,
-                model=self.model,
+                model=_as_module(self.model),
                 repo_id_or_path=pretrained,
             )
-        cast(nn.Module, self.model).to(dtype)
-        self._attach_lora(self.model, lora)
+        _as_module(self.model).to(dtype)
+        self._attach_lora(_as_module(self.model), lora)
 
     def _init_hf_module(
         self,
@@ -453,13 +460,13 @@ class TransformerBackbone(Backbone):
                     "train_kernel='reference' (HuggingFace forward + grouping mask), "
                     f"got {self.train_kernel!r}."
                 )
-        self.model = model
+        self.model = cast(_DecoderStack, model)
         self.architecture = "hf"
         self.uses_packed = packed
-        _apply_final_norm(self.model, use_norm)
-        self._config_kwargs = {"use_norm": use_norm, "hf_config": _hf_config_dict(self.model)}
-        cast(nn.Module, self.model).to(dtype)
-        self._attach_lora(self.model, lora)
+        _apply_final_norm(_as_module(self.model), use_norm)
+        self._config_kwargs = {"use_norm": use_norm, "hf_config": _hf_config_dict(_as_module(self.model))}
+        _as_module(self.model).to(dtype)
+        self._attach_lora(_as_module(self.model), lora)
 
     @property
     def hidden_dim(self) -> int:
