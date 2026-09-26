@@ -25,6 +25,7 @@ from mouse_core.objectives.dqn import (
     _require_temperature,
     _shift_next,
     _weighted_mean,
+    _zero_off_data_factor_scan,
 )
 from mouse_core.objectives.transforms import (
     Discount,
@@ -79,12 +80,12 @@ def _retrace_targets(
     td_lambda: float,
     temperature: float,
     bootstrap_cutoff: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Retrace(λ) target for every pair ``(t, t+1)`` and its trace ratio.
 
     ``q_step`` / ``pi_step`` / ``mu_step`` are ``[N, A]`` per-step reads at
     the last head-output row: delayed Q, the softmax target policy over it,
-    and the learned behavior distribution. Returns ``(G [N-1], ratio [N-1])``::
+    and the learned behavior distribution. Returns ``(G [N-1], ratio [N-1], participate [N-1])``::
 
         G_t = r_t + γ_t * ( V_π(s_{t+1})
                             + c_{t+1} * (G_{t+1} - Q(s_{t+1}, a_{t+1})) )
@@ -96,11 +97,16 @@ def _retrace_targets(
     taken *from* ``s_t`` (before λ and before the continuation mask); it is
     reported as a metric. ``c_{t+1}`` is ``0`` when pair ``t+1`` does not
     exist or is out-of-run, so the trace never crosses a run break.
+    The third return is ``participate`` ``[N-1]``: ``1`` when the step stays
+    in the loss and in logged metrics.
     Episode / task boundaries are handled by ``γ_t`` itself: a ``0`` gamma
     ends the trace and a non-zero truncation gamma carries it, discounted.
-    ``bootstrap_cutoff=False`` drops ``V_π`` where ``c`` is already ``0`` because
-    the next step is outside the sampled run (end of the batch, or a run
-    break). A ``V_π`` at a state that still has a later in-run step stays.
+    ``bootstrap_cutoff=True`` adds ``V_π`` at a cutoff and keeps the step.
+    ``bootstrap_cutoff=False`` drops the step from the loss and from logged
+    metrics when the factor on that off-data ``V_π`` is non-zero. A zero
+    factor (the trace does not carry the cutoff value, or γ is ``0``) leaves
+    it out of the target, so the step stays. Reaching past the sample is
+    not enough. A ``V_π`` at a state that still has a later in-run step stays.
     ``λ = 0`` is the expected one-step target ``r + γ V_π``.
     ``temperature`` is the SAC ``α`` on that same ``π``; ``0`` is
     greedy ``π`` and ``V_π = E_π Q``.
@@ -127,9 +133,18 @@ def _retrace_targets(
 
     in_run = pair_weight > 0
     cont = _shift_next(in_run.to(dtype=dtype))  # pair t+1 exists and is in-run
-    if not bootstrap_cutoff:
-        v_next = v_next * cont
     c_next = float(td_lambda) * _shift_next(ratio) * cont  # [N-1]  c_{t+1}
+    if bootstrap_cutoff:
+        participate = torch.ones(r.shape[0], dtype=dtype, device=r.device)
+    else:
+        # ``cont == 0`` is the off-data next state. The factor on its value
+        # is γ here, and γ * c on every earlier step the trace still carries.
+        v_next = v_next * cont
+        participate = _zero_off_data_factor_scan(
+            discount=g,
+            in_sample=cont > 0,
+            carries=c_next != 0,
+        )
     q_next_taken = _shift_next(q_taken)  # [N-1]  Q(s_{t+1}, a_{t+1})
 
     a = r + g * (v_next - c_next * q_next_taken)
@@ -138,7 +153,7 @@ def _retrace_targets(
         returns = a
     else:
         returns = _affine_scan_backward(a, b)
-    return returns * in_run.to(dtype=returns.dtype), ratio
+    return returns * in_run.to(dtype=returns.dtype), ratio, participate
 
 
 class RetraceObjective(Objective):
@@ -202,7 +217,10 @@ class RetraceObjective(Objective):
     so a ``0`` gamma ends the trace there and a non-zero truncation gamma
     carries it (discounted) into the reset frame's return.
     ``bootstrap_cutoff=True`` adds ``V_π`` where that trace is cut because the
-    next step is outside the sampled run. ``bootstrap_cutoff=False`` does not.
+    next step is outside the sampled run, and the step stays in the loss and
+    in logged metrics. ``bootstrap_cutoff=False`` drops the step from both
+    when the factor on that off-data ``V_π`` is non-zero. A zero factor
+    leaves the value out of the target, so the step stays.
 
     The target along a run is::
 
@@ -280,9 +298,13 @@ class RetraceObjective(Objective):
             leaves the sampled run (end of the batch, or a
             ``sequence_id`` / ``grouping_field`` break): a chunk
             boundary, time limit, or truncation whose rest was not
-            sampled. ``False`` omits that value. ``V_π`` at a state that
-            still has a later in-run step is unchanged. A true terminal
-            is unchanged either way: its γ already multiplies the value.
+            sampled. That step stays in the loss and in logged metrics.
+            ``False`` drops the step from both when the factor on that
+            off-data value is non-zero. A zero factor leaves the value
+            out of the target, so the step stays. Reaching past the
+            sample is not enough. ``V_π`` at a state that still has a
+            later in-run step stays. A true terminal stays either way:
+            its γ is ``0``, so the factor is already ``0``.
         cql_weight: Alpha coefficient for the Conservative Q-Learning penalty
             on the Q head. ``0.0`` disables CQL.
         cql_scale_q_eps: Additive floor used when scaling the CQL penalty.
@@ -451,7 +473,6 @@ class RetraceObjective(Objective):
             grouping_field=self.grouping_field,
             dtype=value_dtype,
         )
-        row_weight = torch.cat([pair_weight, pair_weight.new_zeros(1)])[step_of]  # [P]
 
         # The action stored at i+1 is the one taken *from* obs_i.
         step_next = (step_of + 1).clamp(max=N - 1)  # [P]
@@ -472,7 +493,6 @@ class RetraceObjective(Objective):
         # (detached) distribution at the step's last row is the μ the trace uses.
         log_mu = F.log_softmax(behavior_logits, dim=-1)  # [P, A]
         behavior_nll = F.nll_loss(log_mu, next_actions, reduction="none")  # [P]  -log μ(a_i | s_i)
-        behavior_loss = _weighted_mean(behavior_nll, row_weight)
         mu_step = log_mu.detach().exp()[last_rows]  # [N, A]  μ(· | s_i)
 
         q_values = q.gather(dim=-1, index=next_actions.unsqueeze(-1)).squeeze(-1)  # [P]
@@ -480,7 +500,7 @@ class RetraceObjective(Objective):
         pi_step = _softmax_policy(
             q_target_raw[last_rows], temperature=self.temperature
         )  # [N, A]  π(· | s_i)
-        pair_target, ratio = _retrace_targets(
+        pair_target, ratio, participate = _retrace_targets(
             reward=reward,
             discount_all=discount_all,
             q_step=q_step,
@@ -492,6 +512,9 @@ class RetraceObjective(Objective):
             temperature=self.temperature,
             bootstrap_cutoff=self.bootstrap_cutoff,
         )
+        pair_weight = pair_weight * participate
+        row_weight = torch.cat([pair_weight, pair_weight.new_zeros(1)])[step_of]  # [P]
+        behavior_loss = _weighted_mean(behavior_nll, row_weight)
         td_target = _pair_values_to_rows(pair_target, step_of)  # [P]
 
         td_loss = (q_values - td_target) ** 2

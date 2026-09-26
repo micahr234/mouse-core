@@ -345,22 +345,23 @@ def test_retrace_q_affine_applies_to_online_and_delayed() -> None:
 
 
 def test_retrace_bootstrap_cutoff_is_switchable() -> None:
-    """The last in-run V_π drops when bootstrap_cutoff is off. A terminal γ of 0 does not."""
+    """A non-zero trace factor on the cutoff V drops the step. A terminal γ of 0 does not."""
     step_stream, predictions, delayed = _fixture(mu_1=0.25)
-    # c = 1, Q(s1, a1) = 0. G1 = 10 + V(s2) or 10. G0 keeps V(s1) either way.
+    # c = 1, Q(s1, a1) = 0. Both returns include V(s2), so the flag off drops both.
     g1_on = 10.0 + _V_S2
     g0_on = 1.0 + _V_S1 + g1_on
-    g1_off = 10.0
-    g0_off = 1.0 + _V_S1 + g1_off
-    on = _retrace(behavior_weight=0.0, bootstrap_cutoff=True)(
+    _, on = _retrace(behavior_weight=0.0, bootstrap_cutoff=True)(
         objective_data=step_stream, predictions=predictions, delayed_predictions=delayed,
-    )[1]["td_loss"]
-    off = _retrace(behavior_weight=0.0, bootstrap_cutoff=False)(
+    )
+    _, off = _retrace(behavior_weight=0.0, bootstrap_cutoff=False)(
         objective_data=step_stream, predictions=predictions, delayed_predictions=delayed,
-    )[1]["td_loss"]
-    assert abs(on - ((5.0 - g0_on) ** 2 + g1_on ** 2) / 2) < 1e-03
-    assert abs(off - ((5.0 - g0_off) ** 2 + g1_off ** 2) / 2) < 1e-03
-    assert abs(on - off) > 1.0
+    )
+    assert abs(on["td_loss"] - ((5.0 - g0_on) ** 2 + g1_on ** 2) / 2) < 1e-03
+    assert abs(on["q_values_mean"] - 2.5) < 1e-04
+    assert abs(off["td_loss"]) < 1e-04
+    assert abs(off["q_values_mean"]) < 1e-05
+    assert abs(off["behavior_loss"]) < 1e-05
+    assert on["behavior_loss"] > 0.1
 
     ended = {key: value.clone() for key, value in step_stream.items()}
     ended["episode_done"] = torch.tensor([0, 0, 1])
@@ -368,14 +369,31 @@ def test_retrace_bootstrap_cutoff_is_switchable() -> None:
     g1 = 10.0
     g0 = 1.0 + _V_S1 + g1
     expected = ((5.0 - g0) ** 2 + g1 ** 2) / 2
-    term_on = _retrace(behavior_weight=0.0, bootstrap_cutoff=True)(
+    _, term_on = _retrace(behavior_weight=0.0, bootstrap_cutoff=True)(
         objective_data=ended, predictions=predictions, delayed_predictions=delayed,
-    )[1]["td_loss"]
-    term_off = _retrace(behavior_weight=0.0, bootstrap_cutoff=False)(
+    )
+    _, term_off = _retrace(behavior_weight=0.0, bootstrap_cutoff=False)(
         objective_data=ended, predictions=predictions, delayed_predictions=delayed,
-    )[1]["td_loss"]
-    assert abs(term_on - expected) < 1e-03
-    assert abs(term_off - term_on) < 1e-04
+    )
+    assert abs(term_on["td_loss"] - expected) < 1e-03
+    assert abs(term_off["td_loss"] - term_on["td_loss"]) < 1e-04
+    assert abs(term_off["q_values_mean"] - term_on["q_values_mean"]) < 1e-04
+
+
+def test_retrace_zero_lambda_keeps_the_in_sample_backup() -> None:
+    """λ = 0 does not carry the cutoff value, so the in-run step stays in the loss and the logs."""
+    step_stream, predictions, delayed = _fixture(mu_1=0.25)
+    sq0 = (5.0 - _ONE_STEP_G0) ** 2
+    _, on = _retrace(td_lambda=0.0, behavior_weight=0.0, bootstrap_cutoff=True)(
+        objective_data=step_stream, predictions=predictions, delayed_predictions=delayed,
+    )
+    _, off = _retrace(td_lambda=0.0, behavior_weight=0.0, bootstrap_cutoff=False)(
+        objective_data=step_stream, predictions=predictions, delayed_predictions=delayed,
+    )
+    assert abs(off["td_loss"] - sq0) < 1e-03
+    assert abs(off["q_values_mean"] - 5.0) < 1e-04
+    assert abs(on["td_loss"] - (sq0 + _S1_SQ) / 2) < 1e-03
+    assert abs(on["q_values_mean"] - 2.5) < 1e-04
 
 
 def test_retrace_requires_behavior_predictions() -> None:

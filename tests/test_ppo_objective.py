@@ -178,7 +178,7 @@ def test_ppo_requires_grouping_field_argument() -> None:
 
 
 def test_ppo_bootstrap_cutoff_is_switchable() -> None:
-    """GAE adds V at the batch end unless bootstrap_cutoff is off. A terminal does not."""
+    """GAE bootstraps at the batch end when the flag is on. A non-zero factor drops the step when it is off."""
     predictions = {
         "action": torch.tensor([[20.0, -20.0], [20.0, -20.0]]),
         "value": torch.tensor([[1.0], [5.0]]),
@@ -191,7 +191,7 @@ def test_ppo_bootstrap_cutoff_is_switchable() -> None:
         normalize_advantage=False,
     )
 
-    def run(*, bootstrap_cutoff: bool, episode_done: torch.Tensor) -> float:
+    def run(*, bootstrap_cutoff: bool, episode_done: torch.Tensor) -> tuple[float, dict[str, float]]:
         objective_data = {
             "action": torch.tensor([0, 0]),
             "reward": torch.tensor([0.0, 4.0]),
@@ -199,17 +199,22 @@ def test_ppo_bootstrap_cutoff_is_switchable() -> None:
             "task_done": torch.tensor([0, 0]),
             "old_log_prob": torch.tensor([0.0, 0.0]),
         }
-        loss, _ = _ppo(bootstrap_cutoff=bootstrap_cutoff, **common)(
+        loss, metrics = _ppo(bootstrap_cutoff=bootstrap_cutoff, **common)(
             objective_data=objective_data, predictions=predictions,
         )
-        return float(loss.item())
+        return float(loss.item()), metrics
 
     # δ = 4 + V(s') - 1 = 8; value loss 64; policy loss -8.
-    assert abs(run(bootstrap_cutoff=True, episode_done=torch.tensor([0, 0])) - 56.0) < 0.001
-    # Same transition with the cutoff value omitted: δ = 3, as if γV were 0.
-    assert abs(run(bootstrap_cutoff=False, episode_done=torch.tensor([0, 0])) - 6.0) < 0.001
+    on_loss, on_metrics = run(bootstrap_cutoff=True, episode_done=torch.tensor([0, 0]))
+    assert abs(on_loss - 56.0) < 0.001
+    assert abs(on_metrics["value_mean"] - 1.0) < 0.001
+    # The only step's factor on V(s') is non-zero, so it leaves the loss and the logs.
+    off_loss, off_metrics = run(bootstrap_cutoff=False, episode_done=torch.tensor([0, 0]))
+    assert abs(off_loss) < 0.001
+    assert abs(off_metrics["value_mean"]) < 0.001
+    assert abs(off_metrics["policy_loss"]) < 0.001
     truncated = _disc(gamma_step=1.0, gamma_episode_truncated=1.0)
-    on, _ = _ppo(bootstrap_cutoff=True, discount=truncated, gae_lambda=1.0, vf_coef=1.0, ent_coef=0.0, normalize_advantage=False)(
+    on, on_logs = _ppo(bootstrap_cutoff=True, discount=truncated, gae_lambda=1.0, vf_coef=1.0, ent_coef=0.0, normalize_advantage=False)(
         objective_data={
             "action": torch.tensor([0, 0]),
             "reward": torch.tensor([0.0, 4.0]),
@@ -219,7 +224,7 @@ def test_ppo_bootstrap_cutoff_is_switchable() -> None:
         },
         predictions=predictions,
     )
-    off, _ = _ppo(bootstrap_cutoff=False, discount=truncated, gae_lambda=1.0, vf_coef=1.0, ent_coef=0.0, normalize_advantage=False)(
+    off, off_logs = _ppo(bootstrap_cutoff=False, discount=truncated, gae_lambda=1.0, vf_coef=1.0, ent_coef=0.0, normalize_advantage=False)(
         objective_data={
             "action": torch.tensor([0, 0]),
             "reward": torch.tensor([0.0, 4.0]),
@@ -230,11 +235,55 @@ def test_ppo_bootstrap_cutoff_is_switchable() -> None:
         predictions=predictions,
     )
     assert abs(on.item() - 56.0) < 0.001
-    assert abs(off.item() - 6.0) < 0.001
-    terminal_on = run(bootstrap_cutoff=True, episode_done=torch.tensor([0, 1]))
-    terminal_off = run(bootstrap_cutoff=False, episode_done=torch.tensor([0, 1]))
+    assert abs(on_logs["value_mean"] - 1.0) < 0.001
+    assert abs(off.item()) < 0.001
+    assert abs(off_logs["value_mean"]) < 0.001
+    terminal_on, terminal_on_logs = run(bootstrap_cutoff=True, episode_done=torch.tensor([0, 1]))
+    terminal_off, terminal_off_logs = run(bootstrap_cutoff=False, episode_done=torch.tensor([0, 1]))
     assert abs(terminal_on - 6.0) < 0.001
     assert abs(terminal_off - terminal_on) < 1e-05
+    assert abs(terminal_off_logs["value_mean"] - terminal_on_logs["value_mean"]) < 1e-05
+
+
+def test_ppo_zero_lambda_keeps_the_in_sample_step() -> None:
+    """λ = 0 does not carry the cutoff value, so the in-run step stays. λ = 1 drops both."""
+    predictions = {
+        "action": torch.tensor([[20.0, -20.0], [20.0, -20.0], [20.0, -20.0]]),
+        "value": torch.tensor([[1.0], [2.0], [5.0]]),
+    }
+    objective_data = {
+        "action": torch.tensor([0, 0, 0]),
+        "reward": torch.tensor([0.0, 4.0, 8.0]),
+        "episode_done": torch.zeros(3, dtype=torch.long),
+        "task_done": torch.zeros(3, dtype=torch.long),
+        "old_log_prob": torch.zeros(3),
+    }
+
+    def run(*, bootstrap_cutoff: bool, gae_lambda: float) -> tuple[float, dict[str, float]]:
+        loss, metrics = _ppo(
+            bootstrap_cutoff=bootstrap_cutoff,
+            discount=_disc(gamma_step=1.0),
+            gae_lambda=gae_lambda,
+            vf_coef=1.0,
+            ent_coef=0.0,
+            normalize_advantage=False,
+        )(objective_data=objective_data, predictions=predictions)
+        return float(loss.item()), metrics
+
+    # t0 uses V(s1)=2 inside the run. δ = 5, return = 6, value loss 25, policy -5.
+    off, off_logs = run(bootstrap_cutoff=False, gae_lambda=0.0)
+    assert abs(off - 20.0) < 0.001
+    assert abs(off_logs["value_mean"] - 1.0) < 0.001
+    on, on_logs = run(bootstrap_cutoff=True, gae_lambda=0.0)
+    assert abs(on - 65.0) < 0.001
+    assert abs(on_logs["value_mean"] - 1.5) < 0.001
+    # λ = 1 carries V(s2) into both steps. The factor is non-zero, so both drop.
+    carried_off, carried_logs = run(bootstrap_cutoff=False, gae_lambda=1.0)
+    assert abs(carried_off) < 0.001
+    assert abs(carried_logs["value_mean"]) < 0.001
+    carried_on, carried_on_logs = run(bootstrap_cutoff=True, gae_lambda=1.0)
+    assert abs(carried_on - 175.0) < 0.001
+    assert abs(carried_on_logs["value_mean"] - 1.5) < 0.001
 
 
 def test_ppo_requires_bootstrap_cutoff_argument() -> None:
