@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- ``RegressionHead`` / ``ClassificationHead`` take required
+  ``propagate_gradient`` in ``[0, 1]``. ``1`` is full gradient from
+  the head into the backbone; ``0`` detaches the pooled hidden state
+  so the backbone gets none; values in between keep the forward value
+  as ``h`` and scale the backbone gradient by ``propagate_gradient``.
+  The head's own parameters still train. Saved in the model config.
 - ``DqnObjective`` metrics ``backup`` and ``backup_weight``: detached
   per-row Bellman target ``G`` and its row weight, the same tensors
   the loss uses. Callers log those instead of rebuilding the backup.

@@ -66,7 +66,7 @@ _TOK = token_tokenizer("action", "episode_done", grouping_field="task_index")
 def _tiny_model(architecture: Literal["llama", "qwen3"] = "qwen3", tokens: int=1, dtype: torch.dtype = torch.float32, train_kernel: TrainKernel = "reference", **backbone_kwargs) -> Model:
     hidden_dim = 16
     backbone = TransformerBackbone(architecture=architecture, train_kernel=train_kernel, decode_kernel="flex", dtype=dtype, use_norm=True, hidden_dim=hidden_dim, num_layers=2, num_heads=2, vocab_size=32, **backbone_kwargs)
-    head = RegressionHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, use_norm=True)
+    head = RegressionHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, use_norm=True, propagate_gradient=1.0)
     return Model(backbone=backbone, heads=head, action_source="action_value", reasoner=None).eval()
 
 def _steps(n: int, start: int=0) -> list[dict]:
@@ -179,7 +179,8 @@ def test_cuda_bf16_lora_compiled_train_matches_cached_decode() -> None:
         num_heads=4,
         lora=LoRAConfig(rank=4, alpha=8.0), vocab_size=32)
     head = RegressionHead(
-        in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, use_norm=True
+        in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, use_norm=True,
+        propagate_gradient=1.0,
     )
     model = Model(backbone=backbone, heads=head, action_source="action_value", reasoner=None).eval().to(torch.device('cuda'))
     steps = _steps(8)

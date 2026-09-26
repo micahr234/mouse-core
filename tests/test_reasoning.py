@@ -38,6 +38,7 @@ def _tiny_model(*, num_thoughts: int = 2, with_reasoner: bool = True) -> Model:
         out_features=_ACTIONS,
         hidden_dim=_HIDDEN,
         num_layers=1, use_norm=True,
+        propagate_gradient=1.0,
     )
     reasoner = (
         LatentReasoner(hidden_dim=_HIDDEN, num_thoughts=num_thoughts)

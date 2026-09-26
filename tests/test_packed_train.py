@@ -594,7 +594,7 @@ def test_cuda_bf16_lora_compiled_body_matches_eager_and_trains(no_compiled_decod
     torch.manual_seed(6)
     device = torch.device("cuda")
     backbone = _backbone("qwen3", kv_heads=2, lora=LoRAConfig(rank=4, alpha=8.0), dtype=torch.bfloat16)
-    head = RegressionHead(in_features=64, out_features=4, hidden_dim=64, num_layers=1, use_norm=True)
+    head = RegressionHead(in_features=64, out_features=4, hidden_dim=64, num_layers=1, use_norm=True, propagate_gradient=1.0)
     model = Model(backbone=backbone, heads=head, action_source="action_value", reasoner=None).to(device)
     bb = cast(TransformerBackbone, model.backbone)
     for n, p in bb.named_parameters():
@@ -722,7 +722,7 @@ def test_prepare_sequence_id_col_matches_step_counts() -> None:
 def test_model_forward_isolates_sequences(no_compiled_decoder: None, device: str, kernel: TrainKernel) -> None:
     torch.manual_seed(2)
     backbone = TransformerBackbone(architecture="qwen3", train_kernel=kernel, decode_kernel="flex", dtype=torch.float32, use_norm=True, hidden_dim=64, num_layers=2, num_heads=4, num_key_value_heads=4, vocab_size=32)
-    head = RegressionHead(in_features=backbone.hidden_dim, out_features=4, hidden_dim=backbone.hidden_dim, num_layers=1, use_norm=True)
+    head = RegressionHead(in_features=backbone.hidden_dim, out_features=4, hidden_dim=backbone.hidden_dim, num_layers=1, use_norm=True, propagate_gradient=1.0)
     model = Model(backbone=backbone, heads=head, action_source="action_value", reasoner=None).to(device).eval()
     batch = [[{"action": i % 4} for i in range(3)], [{"action": i % 4} for i in range(3)]]
     tb = batch_to_token_batch(token_tokenizer("action"), batch)
@@ -743,7 +743,7 @@ def test_model_train_isolates_tasks_within_sequence(no_compiled_decoder: None) -
     """Packed train forward on a two-task window matches a single-task suffix forward."""
     torch.manual_seed(11)
     backbone = TransformerBackbone(architecture="qwen3", train_kernel="reference", decode_kernel="flex", dtype=torch.float32, use_norm=True, hidden_dim=32, num_layers=2, num_heads=4, num_key_value_heads=4, vocab_size=32)
-    head = RegressionHead(in_features=backbone.hidden_dim, out_features=4, hidden_dim=backbone.hidden_dim, num_layers=1, use_norm=True)
+    head = RegressionHead(in_features=backbone.hidden_dim, out_features=4, hidden_dim=backbone.hidden_dim, num_layers=1, use_norm=True, propagate_gradient=1.0)
     model = Model(backbone=backbone, heads=head, action_source="action_value", reasoner=None).eval()
     task0 = [
         {"action": 0, "episode_done": 0, "task_done": 0, "task_index": 0},
@@ -767,7 +767,7 @@ def test_model_train_isolates_tasks_within_sequence(no_compiled_decoder: None) -
 def test_model_gradient_checkpointing_flag_reaches_backward(no_compiled_decoder: None) -> None:
     torch.manual_seed(12)
     backbone = TransformerBackbone(architecture="qwen3", train_kernel="reference", decode_kernel="flex", dtype=torch.float32, use_norm=True, hidden_dim=32, num_layers=2, num_heads=4, vocab_size=32)
-    head = RegressionHead(in_features=32, out_features=4, hidden_dim=32, num_layers=1, use_norm=True)
+    head = RegressionHead(in_features=32, out_features=4, hidden_dim=32, num_layers=1, use_norm=True, propagate_gradient=1.0)
     model = Model(backbone=backbone, heads=head, action_source="action_value", reasoner=None)
     tb = batch_to_token_batch(token_tokenizer("action"), [[{"action": i % 4} for i in range(5)], [{"action": 1}]])
 
@@ -794,7 +794,7 @@ def test_model_forwards_autocast_dtype_to_packed_forward(no_compiled_decoder: No
         train_autocast_dtype=torch.bfloat16,
         hidden_dim=32, num_layers=2, num_heads=4, vocab_size=32)
     assert backbone.train_autocast_dtype is torch.bfloat16 and backbone.decode_autocast_dtype is None
-    head = RegressionHead(in_features=32, out_features=4, hidden_dim=32, num_layers=1, use_norm=True)
+    head = RegressionHead(in_features=32, out_features=4, hidden_dim=32, num_layers=1, use_norm=True, propagate_gradient=1.0)
     model = Model(backbone=backbone, heads=head, action_source="action_value", reasoner=None).to("cuda")
     tb = batch_to_token_batch(token_tokenizer("action"), [[{"action": i % 4} for i in range(5)], [{"action": 1}]])
     model(tb).predictions["action_value"].square().sum().backward()

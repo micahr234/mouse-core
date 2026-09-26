@@ -12,4 +12,8 @@ class RegressionHead(_MlpHead):
     ``out_features=1`` for a state-value baseline. Pair multi-action
     outputs with :meth:`~mouse_core.models.base.Model.copy` when
     an objective bootstraps from a delayed copy.
+
+    ``propagate_gradient`` in ``[0, 1]`` scales backbone gradient through
+    the pooled hidden state: ``1`` full flow, ``0`` none. The head's own
+    parameters still train.
     """

@@ -100,6 +100,7 @@ def _tiny_model(*, with_reasoner: bool = False) -> Model:
         out_features=_ACTIONS,
         hidden_dim=_HIDDEN,
         num_layers=1, use_norm=True,
+        propagate_gradient=1.0,
     )
     reasoner = (
         LatentReasoner(hidden_dim=_HIDDEN, num_thoughts=2) if with_reasoner else None
@@ -272,6 +273,7 @@ def test_get_action_uses_last_valid_head_output_not_last_token() -> None:
         backbone=backbone,
         heads=(head := RegressionHead(
             in_features=hidden, out_features=_ACTIONS, hidden_dim=hidden, num_layers=1, use_norm=True,
+            propagate_gradient=1.0,
         )),
         action_source="action_value",
         reasoner=None,
