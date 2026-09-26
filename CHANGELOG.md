@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- ``frozenlake_group_prefix(max_task_episodes=)``: FrozenLake game /
+  strategy / step-format text for ``Tokenizer`` ``group_prefix``.
+  Examples and ``bench/bench_dataloader.py`` use it (episode budget
+  ``20``, matching experiment ``MAX_EPISODES_PER_TASK``) in place of
+  the old CSV legend ``action,observation,r=reward,d=done``.
 - ``DqnObjective`` metrics ``backup`` and ``backup_weight``: detached
   per-row Bellman target ``G`` and its row weight, the same tensors
   the loss uses. Callers log those instead of rebuilding the backup.

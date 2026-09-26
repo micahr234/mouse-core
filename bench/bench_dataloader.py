@@ -28,7 +28,14 @@ from typing import Any
 import numpy as np
 from datasets import Dataset
 
-from mouse_core.data import Augmenter, DataLoader, Datastore, Tokenizer, compose
+from mouse_core.data import (
+    Augmenter,
+    DataLoader,
+    Datastore,
+    Tokenizer,
+    compose,
+    frozenlake_group_prefix,
+)
 from mouse_core.data.token_batch import TokenBatch
 
 _BENCH_DIR = Path(__file__).resolve().parent
@@ -158,7 +165,9 @@ def _train_transform() -> Any:
             {"input_field": "task_done"},
         ],
         grouping_field="task_index",
-        group_prefix="action,observation,r=reward,d=done\n",
+        group_prefix=frozenlake_group_prefix(
+            max_task_episodes=_EPISODES_PER_TASK
+        ),
         pretrained="Qwen/Qwen3-0.6B",
     )
     return compose(stages=(augmenter, tokenizer))

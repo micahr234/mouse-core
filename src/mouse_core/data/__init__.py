@@ -7,6 +7,7 @@ from mouse_core.data.augmenter import (
 )
 from mouse_core.data.compose import compose
 from mouse_core.data.modality import TokenizerModalitySpec
+from mouse_core.data.prompts import frozenlake_group_prefix
 from mouse_core.data.tokenizer import Tokenizer, load_tokenizer, save_tokenizer
 from mouse_core.data.token_batch import (
     ModalityInfo,
@@ -35,6 +36,7 @@ __all__ = [
     "empty_token_batch",
     "step_counts_from_sequence_id",
     "to_device",
+    "frozenlake_group_prefix",
     "load_stores_from_hub",
     "push_stores_to_hub",
     "push_to_hub",
