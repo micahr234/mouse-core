@@ -10,23 +10,19 @@ def _episode_done(*shape: int, fill: int = 0) -> torch.Tensor:
     return torch.full(shape, fill, dtype=torch.int64)
 
 
-def _ce_data(q: torch.Tensor, episode_done: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
-    """Hard-CE objective_data: best_action labels from Q*, plus mask."""
-    actions = best_action(q.reshape(-1, q.shape[-1])).reshape(q.shape[:-1])
-    data: dict[str, torch.Tensor] = {"best_action": actions}
-    if episode_done is None:
-        data["episode_done"] = _episode_done(*q.shape[:-1])
-    else:
-        data["episode_done"] = episode_done
-    return data
+def _ce_targets(q: torch.Tensor) -> torch.Tensor:
+    """Hard-CE target action ids from Q* via ``best_action``."""
+    return best_action(q.reshape(-1, q.shape[-1])).reshape(q.shape[:-1])
 
 
 def test_sp_objective_ce_uses_best_action_ids() -> None:
     q = torch.tensor([[[0.0, 1.0, -torch.inf]]])
-    objective_data = _ce_data(q)
+    objective_data = {"episode_done": _episode_done(*q.shape[:-1])}
     predictions = torch.tensor([[[0.0, 1.0, 100.0]]])
-    loss, metrics = SpObjective(targets_key="best_action")(
-        objective_data=objective_data, predictions=predictions
+    loss, metrics = SpObjective()(
+        objective_data=objective_data,
+        predictions=predictions,
+        targets=_ce_targets(q),
     )
     assert loss.ndim == 0
     assert metrics["action"] >= 0.0
@@ -36,31 +32,33 @@ def test_sp_objective_ce_skips_nonzero_mask_rows() -> None:
     """Any nonzero mask (terminated=1, truncated=2, ...) drops the row."""
     q = torch.tensor([[[0.0, 0.0], [0.0, 1.0], [0.0, 1.0]]])
     logits = torch.tensor([[[0.0, 100.0], [100.0, 0.0], [0.0, 100.0]]])
-    objective_data = _ce_data(q, episode_done=torch.tensor([[1, 2, 0]], dtype=torch.int64))
-    loss, _ = SpObjective(targets_key="best_action")(
-        objective_data=objective_data, predictions=logits
+    objective_data = {"episode_done": torch.tensor([[1, 2, 0]], dtype=torch.int64)}
+    loss, _ = SpObjective()(
+        objective_data=objective_data,
+        predictions=logits,
+        targets=_ce_targets(q),
     )
     assert loss.item() < 1e-4
 
 
 def test_sp_objective_ce_mask_key_none_keeps_terminals() -> None:
-    objective_data = {"best_action": torch.tensor([[0]])}
     predictions = torch.tensor([[[0.0, 100.0]]])
-    loss, _ = SpObjective(targets_key="best_action", mask_key=None)(
-        objective_data=objective_data, predictions=predictions
+    loss, _ = SpObjective(mask_key=None)(
+        objective_data={},
+        predictions=predictions,
+        targets=torch.tensor([[0]]),
     )
     assert loss.item() > 1.0
 
 
 def test_sp_objective_ce_rejects_out_of_range_actions() -> None:
-    objective_data = {
-        "best_action": torch.tensor([[3]]),
-        "episode_done": _episode_done(1, 1),
-    }
+    objective_data = {"episode_done": _episode_done(1, 1)}
     predictions = torch.tensor([[[0.0, 1.0]]])
     try:
-        SpObjective(targets_key="best_action")(
-            objective_data=objective_data, predictions=predictions
+        SpObjective()(
+            objective_data=objective_data,
+            predictions=predictions,
+            targets=torch.tensor([[3]]),
         )
     except ValueError as exc:
         assert "action ids must be in" in str(exc)
@@ -68,13 +66,15 @@ def test_sp_objective_ce_rejects_out_of_range_actions() -> None:
         raise AssertionError("expected ValueError for out-of-range action")
 
 
-def test_sp_objective_requires_targets_key() -> None:
+def test_sp_objective_requires_targets() -> None:
+    objective_data = {"episode_done": _episode_done(1, 1)}
+    predictions = torch.tensor([[[0.0, 1.0]]])
     try:
-        SpObjective()  # type: ignore[call-arg]
+        SpObjective()(objective_data=objective_data, predictions=predictions)
     except TypeError as exc:
-        assert "targets_key" in str(exc)
+        assert "targets" in str(exc)
     else:
-        raise AssertionError("expected TypeError for missing targets_key")
+        raise AssertionError("expected TypeError for missing targets")
 
 
 def test_best_action_unique_max_is_deterministic() -> None:
@@ -127,13 +127,12 @@ def test_sp_ce_ignores_padded_student_logits() -> None:
     assert logits.grad[0, -1].item() == 0.0
 
 
-def test_sp_objective_custom_targets_key_for_ce() -> None:
-    objective_data = {
-        "teacher_action": torch.tensor([[1]]),
-        "episode_done": _episode_done(1, 1),
-    }
+def test_sp_objective_accepts_direct_action_ids() -> None:
+    objective_data = {"episode_done": _episode_done(1, 1)}
     predictions = torch.tensor([[[0.0, 1.0]]])
-    loss, _ = SpObjective(targets_key="teacher_action")(
-        objective_data=objective_data, predictions=predictions
+    loss, _ = SpObjective()(
+        objective_data=objective_data,
+        predictions=predictions,
+        targets=torch.tensor([[1]]),
     )
     assert loss.item() > 0.0

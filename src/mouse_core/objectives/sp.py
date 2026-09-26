@@ -7,7 +7,7 @@ from typing import overload
 import torch
 import torch.nn.functional as F
 
-from mouse_core.objectives.base import Objective, _reject_predictions
+from mouse_core.objectives.base import Objective, _reject_predictions, _require_prediction
 
 
 def best_action(q_targets: torch.Tensor) -> torch.Tensor:
@@ -15,7 +15,7 @@ def best_action(q_targets: torch.Tensor) -> torch.Tensor:
 
     Callers that distill from a Q vector (e.g. ``info_q_star``) run this
     outside ``SpObjective`` and pass the resulting action ids as
-    ``targets_key``.
+    ``targets=``.
 
     ``-inf`` padding is never selected. Rows with no finite entry fall through
     to ``argmax`` of an all-``-inf`` mask (index 0), matching ``torch.argmax``.
@@ -104,15 +104,16 @@ class SpObjective(Objective):
     """Hard CE from integer action ids onto action logits at head-output positions.
 
     Reads ``predictions`` (shape ``[B, S, A]``) and compares against
-    ``objective_data[targets_key]`` integer actions shaped ``[B, S]`` (or
-    ``[B, S, 1]``). Filter Q* outside with ``best_action`` (uniform among
-    tied maxima) and pass those ids, or pass dataset / behavior actions.
+    ``targets`` integer actions shaped ``[B, S]`` (or ``[B, S, 1]``). Filter
+    Q* outside with ``best_action`` (uniform among tied maxima) and pass
+    those ids, or pass dataset / behavior actions. Callers pass the tensor
+    at call time (same pattern as DQN ``predictions=`` /
+    ``delayed_predictions=``); there is no ``targets_key`` batch lookup.
 
     Rows where ``mask_key`` is True or any nonzero number are dropped. Pass
     ``mask_key="episode_done"`` to skip terminated and truncated steps.
 
     Args:
-        targets_key: Key in ``objective_data`` for integer action ids ``[B, S]``.
         label_smoothing: Mixes uniform mass over all action slots into the
             hard label.
         mask_key: Key in ``objective_data`` for a per-row skip mask (bool True
@@ -122,11 +123,9 @@ class SpObjective(Objective):
     def __init__(
         self,
         *,
-        targets_key: str,
         label_smoothing: float = 0.0,
         mask_key: str | None = "episode_done",
     ) -> None:
-        self.targets_key = targets_key
         self.label_smoothing = label_smoothing
         self.mask_key = mask_key
 
@@ -136,6 +135,7 @@ class SpObjective(Objective):
         *,
         objective_data: dict[str, torch.Tensor],
         predictions: torch.Tensor,
+        targets: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]: ...
 
     @overload
@@ -144,6 +144,7 @@ class SpObjective(Objective):
         *,
         objective_data: dict[str, torch.Tensor],
         predictions: torch.Tensor,
+        targets: torch.Tensor,
         delayed_predictions: None = None,
         value_predictions: None = None,
     ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]: ...
@@ -155,11 +156,15 @@ class SpObjective(Objective):
         predictions: torch.Tensor,
         delayed_predictions: torch.Tensor | None = None,
         value_predictions: torch.Tensor | None = None,
+        targets: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]:
         _reject_predictions(
             "SpObjective",
             delayed_predictions=delayed_predictions,
             value_predictions=value_predictions,
+        )
+        target_tensor = _require_prediction(
+            targets, owner="SpObjective", name="targets"
         )
         logits: torch.Tensor = predictions
         A = logits.shape[-1]
@@ -175,13 +180,12 @@ class SpObjective(Objective):
         else:
             valid_rows = torch.ones(n_rows, dtype=torch.bool, device=logits.device)
 
-        targets = objective_data[self.targets_key]
-        if targets.shape != leading and targets.shape != (*leading, 1):
+        if target_tensor.shape != leading and target_tensor.shape != (*leading, 1):
             raise ValueError(
-                f"SpObjective: {self.targets_key!r} must have shape "
-                f"{tuple(leading)} or {(*leading, 1)}, got {tuple(targets.shape)}."
+                f"SpObjective: targets must have shape "
+                f"{tuple(leading)} or {(*leading, 1)}, got {tuple(target_tensor.shape)}."
             )
-        target_actions = targets.reshape(-1).to(dtype=torch.long)
+        target_actions = target_tensor.reshape(-1).to(dtype=torch.long)
         if not valid_rows.any():
             raise ValueError(
                 "SpObjective: no rows left after applying the skip mask."
@@ -190,7 +194,7 @@ class SpObjective(Objective):
         target_actions = target_actions[valid_rows]
         if (target_actions < 0).any() or (target_actions >= A).any():
             raise ValueError(
-                f"SpObjective: {self.targets_key!r} action ids must be in "
+                f"SpObjective: targets action ids must be in "
                 f"[0, {A}), got min={int(target_actions.min())} "
                 f"max={int(target_actions.max())}."
             )

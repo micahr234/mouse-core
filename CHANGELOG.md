@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - ``best_action(q)``: integer action id per row, uniform among finite
   maxima (``-inf`` padding never selected). ``SpObjective`` callers that
-  distill from Q* run this outside and pass the ids as ``targets_key``.
+  distill from Q* run this outside and pass the ids as ``targets=``.
 - ``RegressionHead`` / ``ClassificationHead`` take required
   ``propagate_gradient`` in ``[0, 1]``. ``1`` is full gradient from
   the head into the backbone; ``0`` detaches the pooled hidden state
@@ -102,20 +102,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pass ``architecture="qwen3"`` or ``architecture="llama"``.
 
 ### Changed
-- ``SpObjective`` is hard CE only: required ``targets_key`` holds
-  integer action ids ``[B, S]``. Soft modes (``ce-soft-*``, ``js``,
+- ``SpObjective`` / ``SvObjective`` take supervised labels as call-time
+  ``targets=`` (action ids for hard CE; Q vectors for SV), matching DQN
+  ``predictions=`` / ``delayed_predictions=``. ``targets_key`` is
+  removed. DQN / PPO / GRPO reject ``targets=``. Env-column keys
+  (``action_key``, ``mask_key``, …) are unchanged.
+- ``SpObjective`` is hard CE only. Soft modes (``ce-soft-*``, ``js``,
   ``kl-*``), ``loss_type``, and ``temperature`` are removed.
   ``examples/09_train_offline_sp.ipynb`` calls ``best_action`` on
-  ``info_q_star`` and passes ``targets_key="best_action"``.
+  ``info_q_star`` and passes those ids as ``targets=``.
 - Examples and ``bench/bench_dataloader.py`` replace the CSV
   ``group_prefix`` legend ``action,observation,r=reward,d=done`` with
   a local FrozenLake game / strategy / step-format blurb (episode
   budget ``20``). Each site owns its own string.
 - Objective ``__call__`` metrics are ``dict[str, float | Tensor]``.
   Scalar diagnostics stay floats; DQN also returns tensor fields.
-- ``Objective.__call__`` takes optional ``delayed_predictions`` and
-  ``value_predictions`` so DQN and PPO overrides match the base.
-  Each objective still requires the
+- ``Objective.__call__`` takes optional ``delayed_predictions``,
+  ``value_predictions``, and ``targets`` so DQN, PPO, and SP/SV
+  overrides match the base. Each objective still requires the
   tensors it reads and raises ``TypeError`` when one of those is
   missing or when it is given a tensor it does not use. A custom
   ``Objective`` must accept the same optional parameters (``None`` for
