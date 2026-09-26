@@ -19,7 +19,6 @@ Example — custom objective::
             predictions: torch.Tensor,
             delayed_predictions: torch.Tensor | None = None,
             value_predictions: torch.Tensor | None = None,
-            behavior_predictions: torch.Tensor | None = None,
         ) -> tuple[torch.Tensor, dict[str, float]]:
             ...
             return loss, {"my_objective": loss.item()}
@@ -58,9 +57,8 @@ class Objective(ABC):
     Subclass this and implement :meth:`__call__` to create a custom objective.
     Instantiate with hyperparameters; call with ``objective_data=`` and
     the prediction tensor for the head being trained. Objectives that read
-    another head also take that tensor: DQN and Retrace take
-    ``delayed_predictions=``, PPO takes ``value_predictions=``, and Retrace
-    also takes ``behavior_predictions=``. A custom subclass must accept the
+    another head also take that tensor: DQN takes ``delayed_predictions=``
+    and PPO takes ``value_predictions=``. A custom subclass must accept the
     same optional parameters (pass ``None`` for a tensor it does not read).
     """
 
@@ -72,7 +70,6 @@ class Objective(ABC):
         predictions: torch.Tensor,
         delayed_predictions: torch.Tensor | None = None,
         value_predictions: torch.Tensor | None = None,
-        behavior_predictions: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         """Compute a scalar loss and return diagnostic metrics.
 
@@ -84,13 +81,11 @@ class Objective(ABC):
                 from :meth:`~mouse_core.models.base.Model.forward` (index
                 ``ModelOutput.predictions`` with
                 :func:`~mouse_core.models.heads.base.prediction_key`).
-            delayed_predictions: Delayed Q for DQN and Retrace. ``None`` on
+            delayed_predictions: Delayed Q for DQN. ``None`` on
                 objectives that do not read it. Omitting it on an objective
                 that does read it raises ``TypeError``.
             value_predictions: Value-head tensor for PPO. ``None`` on
                 objectives that do not read it.
-            behavior_predictions: Behavior-head logits for Retrace. ``None``
-                on objectives that do not read it.
 
         Returns:
             ``(scalar_loss, metrics)`` where ``metrics`` is a ``dict[str, float]``
