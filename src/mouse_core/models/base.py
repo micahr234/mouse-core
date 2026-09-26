@@ -420,6 +420,7 @@ def _head_config(name: str, head: BaseHead) -> dict[str, Any] | None:
             "num_layers": head.num_layers,
             "scale": head.scale,
             "use_norm": head.use_norm,
+            "propagate_gradient": head.propagate_gradient,
         }
     if isinstance(head, RegressionHead):
         return {
@@ -431,6 +432,7 @@ def _head_config(name: str, head: BaseHead) -> dict[str, Any] | None:
             "num_layers": head.num_layers,
             "scale": head.scale,
             "use_norm": head.use_norm,
+            "propagate_gradient": head.propagate_gradient,
         }
     raise TypeError(f"save_model does not know how to serialize head {name!r} ({type(head).__name__}).")
 
@@ -618,6 +620,7 @@ def _build_heads_from_config(heads: list[dict[str, Any]]) -> dict[str, BaseHead]
                 num_layers=spec["num_layers"],
                 scale=spec.get("scale", 1.0),
                 use_norm=spec["use_norm"],
+                propagate_gradient=spec["propagate_gradient"],
             )
         elif head_type == "regression":
             built[name] = RegressionHead(
@@ -627,6 +630,7 @@ def _build_heads_from_config(heads: list[dict[str, Any]]) -> dict[str, BaseHead]
                 num_layers=spec["num_layers"],
                 scale=spec.get("scale", 1.0),
                 use_norm=spec["use_norm"],
+                propagate_gradient=spec["propagate_gradient"],
             )
         else:
             raise ValueError(f"Unsupported head type {head_type!r}.")

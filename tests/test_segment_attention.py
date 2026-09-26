@@ -60,7 +60,8 @@ def test_model_forward_injects_sequence_id_and_runs_flat() -> None:
     model = Model(
         backbone=backbone,
         heads=(head := RegressionHead(
-            in_features=8, out_features=4, hidden_dim=8, num_layers=1, use_norm=True
+            in_features=8, out_features=4, hidden_dim=8, num_layers=1, use_norm=True,
+            propagate_gradient=1.0,
         )),
         action_source="action_value",
         reasoner=None,

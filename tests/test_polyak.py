@@ -28,7 +28,8 @@ _BATCH = [
 
 def _head(hidden_dim: int) -> RegressionHead:
     return RegressionHead(
-        in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, use_norm=True
+        in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, use_norm=True,
+        propagate_gradient=1.0,
     )
 
 
@@ -123,7 +124,8 @@ def _two_head_model(hidden_dim: int = 8) -> Model:
         heads={
             "action_value": q_head,
             "behavior": ClassificationHead(
-                in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, use_norm=True
+                in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, use_norm=True,
+                propagate_gradient=1.0,
             ),
         },
         action_source="action_value",
@@ -506,7 +508,7 @@ def test_polyak_rejects_wrong_models() -> None:
         Polyak(online=model, delayed=other)  # trainable sections that are not copies
     mismatched = Model(
         backbone=IdentityBackbone(hidden_dim=8, vocab_size=32),
-        heads=(head := RegressionHead(in_features=8, out_features=4, hidden_dim=8, num_layers=2, use_norm=True)),
+        heads=(head := RegressionHead(in_features=8, out_features=4, hidden_dim=8, num_layers=2, use_norm=True, propagate_gradient=1.0)),
         action_source="action_value",
         reasoner=None,
     ).requires_grad_(False)

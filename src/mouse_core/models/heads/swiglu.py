@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -31,6 +33,12 @@ class _MlpHead(BaseHead):
 
     ``use_norm`` (required) prepends an ``RMSNorm`` on the input before
     the first SwiGLU block — independent of the backbone's final RMSNorm.
+    ``propagate_gradient`` in ``[0, 1]`` scales how much of this head's
+    loss gradient reaches the backbone through the pooled hidden state.
+    ``1`` is full gradient flow. ``0`` detaches the pooled input so the
+    backbone gets none. A value in between keeps the forward value as
+    ``h`` and scales the backbone gradient by ``propagate_gradient``.
+    The head's own parameters still receive the full loss gradient.
     ``scale`` controls the output weight initialisation magnitude — set
     small (e.g. ``0.01``) for a near-zero initial output.
     """
@@ -43,17 +51,29 @@ class _MlpHead(BaseHead):
         hidden_dim: int,
         num_layers: int,
         use_norm: bool,
+        propagate_gradient: float,
         scale: float = 1.0,
     ):
         super().__init__()
         if type(use_norm) is not bool:
             raise TypeError(f"use_norm must be a bool, got {use_norm!r}.")
+        if (
+            not isinstance(propagate_gradient, (int, float))
+            or isinstance(propagate_gradient, bool)
+            or not math.isfinite(float(propagate_gradient))
+            or not 0.0 <= float(propagate_gradient) <= 1.0
+        ):
+            raise ValueError(
+                "propagate_gradient must be a finite number in [0, 1], "
+                f"got {propagate_gradient!r}."
+            )
         self.in_features = int(in_features)
         self.out_features = int(out_features)
         self.hidden_dim = int(hidden_dim)
         self.num_layers = int(num_layers)
         self.scale = float(scale)
         self.use_norm = use_norm
+        self.propagate_gradient = float(propagate_gradient)
         if use_norm:
             self.norm = nn.RMSNorm(in_features, elementwise_affine=True, eps=1e-5)
         else:
@@ -65,6 +85,10 @@ class _MlpHead(BaseHead):
         )
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
+        if self.propagate_gradient == 0.0:
+            h = h.detach()
+        elif self.propagate_gradient != 1.0:
+            h = h + (1.0 - self.propagate_gradient) * (h.detach() - h)
         if self.norm is not None:
             h = self.norm(h)
         return self.layers(h)

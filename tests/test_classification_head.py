@@ -12,19 +12,20 @@ from tests._token_batch_helpers import batch_to_token_batch, token_tokenizer
 _TOK = token_tokenizer("action")
 
 def test_classification_head_forward_shape() -> None:
-    head = ClassificationHead(in_features=8, out_features=4, hidden_dim=8, num_layers=1, use_norm=True)
+    head = ClassificationHead(in_features=8, out_features=4, hidden_dim=8, num_layers=1, use_norm=True, propagate_gradient=1.0)
     out = head(torch.randn(2, 5, 8))
     assert out.shape == (2, 5, 4)
 
 def test_infer_head_name_is_action() -> None:
-    head = ClassificationHead(in_features=8, out_features=4, hidden_dim=8, num_layers=1, use_norm=True)
+    head = ClassificationHead(in_features=8, out_features=4, hidden_dim=8, num_layers=1, use_norm=True, propagate_gradient=1.0)
     assert ModelClass._infer_head_name(head) == 'action'
 
 
 def test_action_source_must_be_an_enabled_name() -> None:
     hidden_dim = 8
     enabled = ClassificationHead(
-        in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, use_norm=True
+        in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, use_norm=True,
+        propagate_gradient=1.0,
     )
     with pytest.raises(ValueError, match="not among heads"):
         Model(
@@ -37,7 +38,7 @@ def test_action_source_must_be_an_enabled_name() -> None:
 def test_classification_head_save_load_roundtrip(tmp_path) -> None:
     torch.manual_seed(0)
     hidden_dim = 8
-    head = ClassificationHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, use_norm=True)
+    head = ClassificationHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, use_norm=True, propagate_gradient=1.0)
     model = Model(backbone=IdentityBackbone(hidden_dim=hidden_dim, vocab_size=32), heads=head, action_source="action", reasoner=None).eval()
     batch = [[{'action': 0, 'reward': 0.0}, {'action': 1, 'reward': 1.0}]]
     expected = model(batch_to_token_batch(_TOK, batch)).predictions

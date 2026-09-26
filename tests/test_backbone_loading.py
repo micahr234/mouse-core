@@ -180,7 +180,7 @@ def test_generic_hf_backbone_roundtrip(tmp_path) -> None:
     )
     model = Model(
         backbone=backbone,
-        heads=(head := RegressionHead(in_features=8, out_features=4, hidden_dim=8, num_layers=1, use_norm=True)),
+        heads=(head := RegressionHead(in_features=8, out_features=4, hidden_dim=8, num_layers=1, use_norm=True, propagate_gradient=1.0)),
         action_source="action_value",
         reasoner=None,
     )

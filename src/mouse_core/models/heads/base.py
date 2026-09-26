@@ -38,6 +38,7 @@ class HeadSpec:
     num_layers: int | None = None
     scale: float | None = None
     use_norm: bool | None = None
+    propagate_gradient: float | None = None
 
     def __post_init__(self) -> None:
         if self.num_layers is not None and int(self.num_layers) < 0:
