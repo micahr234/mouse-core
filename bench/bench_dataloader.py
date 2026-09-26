@@ -28,14 +28,7 @@ from typing import Any
 import numpy as np
 from datasets import Dataset
 
-from mouse_core.data import (
-    Augmenter,
-    DataLoader,
-    Datastore,
-    Tokenizer,
-    compose,
-    frozenlake_group_prefix,
-)
+from mouse_core.data import Augmenter, DataLoader, Datastore, Tokenizer, compose
 from mouse_core.data.token_batch import TokenBatch
 
 _BENCH_DIR = Path(__file__).resolve().parent
@@ -55,6 +48,18 @@ _MAX_ACTIONS = 4
 _MAX_OBS = 64
 _STEPS_PER_EPISODE = 30
 _EPISODES_PER_TASK = 20
+_GROUP_PREFIX = (
+    "Your job is to predict the future sum of rewards in FrozenLake. "
+    "Navigate a grid; reach the goal for reward; a hole ends the "
+    "episode with none. You have 20 episodes to solve the task. The "
+    "grid is permuted, so squares are not in order; action ids may be "
+    "remapped.\n"
+    "Strategy: explore; keep a mental map of what has and has not been "
+    "explored; avoid holes you have already fallen in; once you have a "
+    "path to the goal, repeat it.\n"
+    "Predict when you see a new line. Step format: "
+    "action,observation[,r=reward][,d=done][,e=episode].\n"
+)
 
 
 def _free_threading_ok() -> bool:
@@ -165,9 +170,7 @@ def _train_transform() -> Any:
             {"input_field": "task_done"},
         ],
         grouping_field="task_index",
-        group_prefix=frozenlake_group_prefix(
-            max_task_episodes=_EPISODES_PER_TASK
-        ),
+        group_prefix=_GROUP_PREFIX,
         pretrained="Qwen/Qwen3-0.6B",
     )
     return compose(stages=(augmenter, tokenizer))
