@@ -753,7 +753,6 @@ class DqnObjective(Objective):
         predictions: torch.Tensor,
         delayed_predictions: torch.Tensor,
         value_predictions: None = None,
-        behavior_predictions: None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]: ...
 
     def __call__(
@@ -763,12 +762,10 @@ class DqnObjective(Objective):
         predictions: torch.Tensor,
         delayed_predictions: torch.Tensor | None = None,
         value_predictions: torch.Tensor | None = None,
-        behavior_predictions: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         _reject_predictions(
             "DqnObjective",
             value_predictions=value_predictions,
-            behavior_predictions=behavior_predictions,
         )
         q: torch.Tensor = predictions
         q_target: torch.Tensor = _require_prediction(

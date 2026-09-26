@@ -273,7 +273,6 @@ class PpoObjective(Objective):
         predictions: torch.Tensor,
         value_predictions: torch.Tensor,
         delayed_predictions: None = None,
-        behavior_predictions: None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]: ...
 
     def __call__(
@@ -283,12 +282,10 @@ class PpoObjective(Objective):
         predictions: torch.Tensor,
         delayed_predictions: torch.Tensor | None = None,
         value_predictions: torch.Tensor | None = None,
-        behavior_predictions: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         _reject_predictions(
             "PpoObjective",
             delayed_predictions=delayed_predictions,
-            behavior_predictions=behavior_predictions,
         )
         logits: torch.Tensor = predictions
         values_raw: torch.Tensor = _require_prediction(

@@ -14,8 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   including a later episode packed into the same store. Window length
   stays ``min(sequence_length, steps remaining in the store)``. A short
   suffix is a shorter window; rows are not padded.
-- ``bootstrap_cutoff`` on ``DqnObjective``, ``RetraceObjective``, and
-  ``PpoObjective``. Required. ``True`` adds the value where the
+- ``bootstrap_cutoff`` on ``DqnObjective`` and ``PpoObjective``.
+  Required. ``True`` adds the value where the
   continuation leaves the sampled run (end of the batch, or a
   ``sequence_id`` / ``grouping_field`` break): a chunk boundary, time
   limit, or truncation whose rest was not sampled, and that step stays
@@ -84,9 +84,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pass ``architecture="qwen3"`` or ``architecture="llama"``.
 
 ### Changed
-- ``Objective.__call__`` takes optional ``delayed_predictions``,
-  ``value_predictions``, and ``behavior_predictions`` so DQN, PPO, and
-  Retrace overrides match the base. Each objective still requires the
+- ``Objective.__call__`` takes optional ``delayed_predictions`` and
+  ``value_predictions`` so DQN and PPO overrides match the base.
+  Each objective still requires the
   tensors it reads and raises ``TypeError`` when one of those is
   missing or when it is given a tensor it does not use. A custom
   ``Objective`` must accept the same optional parameters (``None`` for
@@ -139,8 +139,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Aligned with mouse-gym 1.1.0: ``EnvConfig.episodes_per_task`` is
   ``max_task_episodes`` (task-length timeout, ``task_done=2``).
   ``task_done=1`` is ``terminate_task`` (no longer reserved).
-  ``DqnObjective`` /
-  ``RetraceObjective`` / ``PpoObjective`` ``gamma_task_terminal`` /
+  ``DqnObjective`` / ``PpoObjective`` ``gamma_task_terminal`` /
   ``gamma_task_truncated`` docs match. Live-env notebooks pass
   ``max_task_episodes=``.
 - Depend on ``huggingface_hub>=1.32.0``.
@@ -161,8 +160,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``prediction_key(head=)`` and passes that tensor as
   ``predictions=``. DQN-family objectives also take
   ``delayed_predictions=``; ``PpoObjective`` takes
-  ``value_predictions=``; ``RetraceObjective`` takes both
-  ``delayed_predictions=`` and ``behavior_predictions=``.
+  ``value_predictions=``.
 - ``TransformerBackbone``, ``RegressionHead``, and ``ClassificationHead``
   require ``use_norm``. ``save_model`` writes
   backbone type ``transformer`` with an ``architecture`` field
@@ -198,6 +196,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   copied.
 
 ### Removed
+- ``RetraceObjective`` and
+  ``examples/12_train_offline_retrace.ipynb``. ``Objective.__call__``
+  no longer takes ``behavior_predictions``.
 - ``DqnObjective`` parameters ``td_lambda`` and ``watkins``, and
   ``metrics["watkins_greedy_frac"]``. The continuation is ``gate``;
   ``lambda_gate`` builds the λ-return, ``nstep_gate`` the n-step
@@ -278,9 +279,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on ``DqnObjective``.
   ``0`` is hard max-Q; ``> 0`` bootstraps
   from ``α logsumexp(Q / α)``. Same units and meaning as
-  ``get_action(temperature=)``. ``RetraceObjective`` already required
-  ``temperature`` for ``π = softmax(Q / α)``; that same ``α`` is now
-  also the backup, ``V_π = E_π[Q] + α H[π]``.
+  ``get_action(temperature=)``.
   ``metrics["entropy"]`` is the in-run mean of ``H[softmax(Q / α)]``
   on online Q when ``α > 0``.
 - ``DqnObjective`` takes required ``gate``, the continuation, the same
@@ -300,32 +299,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   loop as ``02`` with three ``RegressionHead``s
   (``nstep_gate(n=1, 3, 5)``), ``copy``
   of every Q head with a shared backbone, and the three losses summed.
-- ``RetraceObjective``: Retrace(λ) off-policy return-based Q-learning
-  (Munos et al., 2016).   The TD target is the delayed soft one-step backup
-  ``V_π = E_π Q + temperature H[π]`` plus a trace of later TD errors
-  scaled by truncated importance
-  ratios ``c = td_lambda * min(1, π/μ)``;
-  ``π = softmax(Q / temperature)`` over the delayed head's raw Q,
-  treated as logits (``temperature``, required, ``>= 0``, same
-  convention as ``get_action``). Every target quantity reads the delayed
-  network, and the λ-return is a parallel scan.
-  ``μ`` is not stored with the data: the model carries a second
-  ``ClassificationHead`` under ``predictions[behavior_key]``
-  (``"behavior"``) whose outputs are logits; the objective fits it by NLL
-  of the taken actions, ``-log softmax(logits)[a]`` (``behavior_weight``,
-  required, ``>= 0``; ``0`` drops the NLL from the loss), and reads the
-  same distribution, detached, as ``μ``.
-  Loss is ``td_loss + behavior_weight *
-  behavior_loss``; metrics add ``td_loss``, ``behavior_loss``,
-  ``behavior_prob_mean``, and ``retrace_ratio_mean``. ``temperature=0``
-  is the greedy target policy, i.e. Watkins's Q(λ) with the greedy check
-  on the delayed network.
-  ``examples/12_train_offline_retrace.ipynb`` is the same offline loop
-  as ``02`` with ``heads={"action_value": ..., "behavior": ...}``,
-  ``td_lambda=1.0``, ``temperature=0.1``, and
-  ``copy(heads=(q_head,), backbone=True, reasoner=False)`` (not
-  ``heads=True``) so the behavior head is never run or
-  Polyak-interpolated on the delayed side.
 - ``use_norm`` (required, saved with the model) on transformer
   backbones and on ``RegressionHead`` / ``ClassificationHead``. On
   ``LlamaBackbone`` / ``Qwen3Backbone``, ``True`` keeps the final
