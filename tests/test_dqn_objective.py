@@ -224,6 +224,59 @@ def test_dqn_objective_runs() -> None:
     assert metrics['action_value'] >= 0.0
     assert 'watkins_greedy_frac' not in metrics
     assert 'entropy' not in metrics
+    backup = metrics['backup']
+    backup_weight = metrics['backup_weight']
+    assert isinstance(backup, torch.Tensor)
+    assert isinstance(backup_weight, torch.Tensor)
+    assert backup.shape == (n,)
+    assert backup_weight.shape == (n,)
+    assert not backup.requires_grad
+    assert not backup_weight.requires_grad
+
+def test_dqn_metrics_backup_matches_loss_target() -> None:
+    """``backup`` / ``backup_weight`` are the tensors the loss already built."""
+    data = {
+        'action': torch.tensor([0, 0], dtype=torch.int64),
+        'reward': torch.tensor([0.0, 1.0]),
+        'episode_done': torch.zeros(2, dtype=torch.int64),
+        'task_done': torch.zeros(2, dtype=torch.int64),
+        'task_index': torch.zeros(2, dtype=torch.int64),
+    }
+    online = torch.zeros(2, 2, requires_grad=True)
+    delayed = torch.tensor([[0.0, 0.0], [5.0, 0.0]])
+    backups: dict[bool, float] = {}
+    for flag in (True, False):
+        objective = DqnObjective(
+            reward=_rew(),
+            value=_val(),
+            discount=_disc(gamma_step=1.0),
+            grouping_field='task_index',
+            temperature=0.0,
+            double=False,
+            gate=None,
+            bootstrap_cutoff=flag,
+        )
+        loss, metrics = objective(
+            objective_data=data,
+            predictions=online,
+            delayed_predictions=delayed,
+        )
+        backup = metrics['backup']
+        weight = metrics['backup_weight']
+        assert isinstance(backup, torch.Tensor)
+        assert isinstance(weight, torch.Tensor)
+        backups[flag] = float(backup[0].item())
+        if flag:
+            assert weight[0].item() == pytest.approx(1.0)
+            assert backup[0].item() ** 2 == pytest.approx(loss.item())
+        else:
+            # The batch ends on an unsampled value, so the pair leaves the loss.
+            assert weight[0].item() == pytest.approx(0.0)
+            assert loss.item() == pytest.approx(0.0)
+    # End of the batch: r + V = 6 with bootstrap_cutoff on. Off leaves V out
+    # of the target (reward alone) and drops the pair from the average.
+    assert backups[True] == pytest.approx(6.0)
+    assert backups[False] == pytest.approx(1.0)
 
 def test_dqn_objective_rejects_wrong_action_shape() -> None:
     n, a = (4, 3)
@@ -1591,7 +1644,7 @@ def test_in_run_horizon_backup_stays_in_loss_and_logs() -> None:
     online = torch.tensor([[10.0], [30.0], [50.0], [0.0]])
     delayed = torch.tensor([[0.0], [3.0], [7.0], [11.0]])
 
-    def run(*, bootstrap_cutoff: bool) -> tuple[float, dict[str, float]]:
+    def run(*, bootstrap_cutoff: bool) -> tuple[float, dict[str, float | torch.Tensor]]:
         loss, metrics = DqnObjective(
             reward=_rew(),
             value=_val(),
@@ -1635,7 +1688,7 @@ def _long_horizon_loss(
     td_lambda: float,
     n: int,
     episode_done: torch.Tensor | None = None,
-) -> tuple[float, dict[str, float]]:
+) -> tuple[float, dict[str, float | torch.Tensor]]:
     """Four steps. ``n`` runs past the batch. ``td_lambda`` is the trace factor."""
     done = torch.zeros(4, dtype=torch.long) if episode_done is None else episode_done
     step_stream = {

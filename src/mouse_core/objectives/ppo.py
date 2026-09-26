@@ -263,7 +263,7 @@ class PpoObjective(Objective):
         objective_data: dict[str, torch.Tensor],
         predictions: torch.Tensor,
         value_predictions: torch.Tensor,
-    ) -> tuple[torch.Tensor, dict[str, float]]: ...
+    ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]: ...
 
     @overload
     def __call__(
@@ -273,7 +273,7 @@ class PpoObjective(Objective):
         predictions: torch.Tensor,
         value_predictions: torch.Tensor,
         delayed_predictions: None = None,
-    ) -> tuple[torch.Tensor, dict[str, float]]: ...
+    ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]: ...
 
     def __call__(
         self,
@@ -282,7 +282,7 @@ class PpoObjective(Objective):
         predictions: torch.Tensor,
         delayed_predictions: torch.Tensor | None = None,
         value_predictions: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, dict[str, float]]:
+    ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]:
         _reject_predictions(
             "PpoObjective",
             delayed_predictions=delayed_predictions,
@@ -469,7 +469,7 @@ class PpoObjective(Objective):
             "advantage_mean": _weighted_mean(advantages, pair_weight),
             "value_mean": _weighted_mean(curr_values, pair_weight),
         }
-        metrics: dict[str, float] = dict(
+        metrics: dict[str, float | torch.Tensor] = dict(
             zip(named, torch.stack(list(named.values())).tolist())
         )
         return loss, metrics

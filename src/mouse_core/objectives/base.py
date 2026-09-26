@@ -19,7 +19,7 @@ Example — custom objective::
             predictions: torch.Tensor,
             delayed_predictions: torch.Tensor | None = None,
             value_predictions: torch.Tensor | None = None,
-        ) -> tuple[torch.Tensor, dict[str, float]]:
+        ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]:
             ...
             return loss, {"my_objective": loss.item()}
 """
@@ -70,7 +70,7 @@ class Objective(ABC):
         predictions: torch.Tensor,
         delayed_predictions: torch.Tensor | None = None,
         value_predictions: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, dict[str, float]]:
+    ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]:
         """Compute a scalar loss and return diagnostic metrics.
 
         Args:
@@ -88,7 +88,8 @@ class Objective(ABC):
                 objectives that do not read it.
 
         Returns:
-            ``(scalar_loss, metrics)`` where ``metrics`` is a ``dict[str, float]``
-            ready for logging.
+            ``(scalar_loss, metrics)`` where ``metrics`` holds scalar floats
+            ready for logging and, when an objective exposes them, detached
+            tensors built during the loss (for example DQN ``backup``).
         """
         ...

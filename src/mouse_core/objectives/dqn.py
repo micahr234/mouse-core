@@ -616,7 +616,11 @@ class DqnObjective(Objective):
     state value. ``watkins_gate`` reads online Q.
     ``value_gap_gate`` reads online Q, delayed Q, or both. Both leave
     oracle columns such as ``info_q_star`` unread. ``metrics["entropy"]`` is the in-run mean of
-    ``H[softmax(Q / α)]`` on online Q when ``temperature > 0``. The
+    ``H[softmax(Q / α)]`` on online Q when ``temperature > 0``.
+    ``metrics["backup"]`` is the per-row Bellman target ``G`` (``[P]``)
+    the taken action is regressed to. ``metrics["backup_weight"]`` is
+    the matching per-row weight (``0`` when the step is out of the loss
+    and out of logged metrics). Both are detached. The
     continuation matrix stays the one ``[N, N]`` the gate returned. Rows
     are cumprod'd in blocks, and that read does not sync the host.
 
@@ -743,7 +747,7 @@ class DqnObjective(Objective):
         objective_data: dict[str, torch.Tensor],
         predictions: torch.Tensor,
         delayed_predictions: torch.Tensor,
-    ) -> tuple[torch.Tensor, dict[str, float]]: ...
+    ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]: ...
 
     @overload
     def __call__(
@@ -753,7 +757,7 @@ class DqnObjective(Objective):
         predictions: torch.Tensor,
         delayed_predictions: torch.Tensor,
         value_predictions: None = None,
-    ) -> tuple[torch.Tensor, dict[str, float]]: ...
+    ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]: ...
 
     def __call__(
         self,
@@ -762,7 +766,7 @@ class DqnObjective(Objective):
         predictions: torch.Tensor,
         delayed_predictions: torch.Tensor | None = None,
         value_predictions: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, dict[str, float]]:
+    ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]:
         _reject_predictions(
             "DqnObjective",
             value_predictions=value_predictions,
@@ -933,5 +937,11 @@ class DqnObjective(Objective):
                 row_weight,
             )
 
-        metrics: dict[str, float] = dict(zip(named, torch.stack(list(named.values())).tolist()))
+        metrics: dict[str, float | torch.Tensor] = dict(
+            zip(named, torch.stack(list(named.values())).tolist())
+        )
+        # Same G and row weight the loss used — callers log these
+        # instead of rebuilding the backup.
+        metrics["backup"] = td_target.detach()
+        metrics["backup_weight"] = row_weight.detach()
         return loss, metrics

@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- ``DqnObjective`` metrics ``backup`` and ``backup_weight``: detached
+  per-row Bellman target ``G`` and its row weight, the same tensors
+  the loss uses. Callers log those instead of rebuilding the backup.
 - Tokenizer fields take ``when_field=`` and ``when_equals=`` together.
   The field emits only when that step value equals ``when_equals``.
   Any other value, or a missing key, emits nothing. Fields that leave
@@ -90,6 +93,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pass ``architecture="qwen3"`` or ``architecture="llama"``.
 
 ### Changed
+- Objective ``__call__`` metrics are ``dict[str, float | Tensor]``.
+  Scalar diagnostics stay floats; DQN also returns tensor fields.
 - ``Objective.__call__`` takes optional ``delayed_predictions`` and
   ``value_predictions`` so DQN and PPO overrides match the base.
   Each objective still requires the

@@ -136,7 +136,7 @@ class GrpoObjective(Objective):
         *,
         objective_data: dict[str, torch.Tensor],
         predictions: torch.Tensor,
-    ) -> tuple[torch.Tensor, dict[str, float]]: ...
+    ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]: ...
 
     @overload
     def __call__(
@@ -146,7 +146,7 @@ class GrpoObjective(Objective):
         predictions: torch.Tensor,
         delayed_predictions: None = None,
         value_predictions: None = None,
-    ) -> tuple[torch.Tensor, dict[str, float]]: ...
+    ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]: ...
 
     def __call__(
         self,
@@ -155,7 +155,7 @@ class GrpoObjective(Objective):
         predictions: torch.Tensor,
         delayed_predictions: torch.Tensor | None = None,
         value_predictions: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, dict[str, float]]:
+    ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]:
         _reject_predictions(
             "GrpoObjective",
             delayed_predictions=delayed_predictions,
@@ -266,7 +266,7 @@ class GrpoObjective(Objective):
             "clipfrac": clipfrac,
             "advantage_mean": _weighted_mean(advantage, pair_weight),
         }
-        metrics: dict[str, float] = dict(
+        metrics: dict[str, float | torch.Tensor] = dict(
             zip(named, torch.stack(list(named.values())).tolist())
         )
         return loss, metrics
