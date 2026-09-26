@@ -54,7 +54,7 @@ def _gae_advantages(
     discounts: torch.Tensor,
     valid: torch.Tensor,
     gae_lambda: float,
-    bootstrap: bool,
+    bootstrap_cutoff: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Generalized advantage estimation over valid consecutive pairs.
 
@@ -65,7 +65,7 @@ def _gae_advantages(
         valid: ``[N-1]`` mask — False at run boundaries (different
             ``sequence_id`` or grouping).
         gae_lambda: GAE λ.
-        bootstrap: ``True`` adds ``V`` at a state whose next step is not an
+        bootstrap_cutoff: ``True`` adds ``V`` at a state whose next step is not an
             in-run pair (end of the batch, or a run break). ``False`` omits
             that value. ``V`` at a state that still has a later in-run step
             is unchanged. A ``0`` discount (true terminal) removes the value
@@ -83,7 +83,7 @@ def _gae_advantages(
         device = rewards.device
         dtype = rewards.dtype
         next_values = values[1:]
-        if not bootstrap:
+        if not bootstrap_cutoff:
             # Continuation after s_{t+1} is sampled only when pair t+1 stays in-run.
             sampled = torch.zeros(T, dtype=torch.bool, device=device)
             if T > 1:
@@ -177,7 +177,7 @@ class PpoObjective(Objective):
             any ``value(value=..., **objective_data)`` returning the same
             shape is accepted.
         gae_lambda: GAE λ (``1.0`` = Monte Carlo returns within the discount).
-        bootstrap: Required. ``True`` adds ``V`` where the continuation
+        bootstrap_cutoff: Required. ``True`` adds ``V`` where the continuation
             leaves the sampled run (end of the batch, or a
             ``sequence_id`` / ``grouping_field`` break): a chunk
             boundary, time limit, or truncation whose rest was not
@@ -206,7 +206,7 @@ class PpoObjective(Objective):
         reward: Reward | None,
         value: Value | None,
         gae_lambda: float = 0.95,
-        bootstrap: bool,
+        bootstrap_cutoff: bool,
         clip_eps: float = 0.2,
         vf_coef: float = 0.5,
         ent_coef: float = 0.01,
@@ -222,7 +222,7 @@ class PpoObjective(Objective):
         self.reward = _require_transform(reward, name="reward")
         self.value = _require_transform(value, name="value")
         self.gae_lambda = gae_lambda
-        self.bootstrap = bool(bootstrap)
+        self.bootstrap_cutoff = bool(bootstrap_cutoff)
         self.clip_eps = clip_eps
         self.vf_coef = vf_coef
         self.ent_coef = ent_coef
@@ -352,7 +352,7 @@ class PpoObjective(Objective):
             discounts=discounts,
             valid=valid,
             gae_lambda=self.gae_lambda,
-            bootstrap=self.bootstrap,
+            bootstrap_cutoff=self.bootstrap_cutoff,
         )
 
         log_probs_all = F.log_softmax(curr_logits, dim=-1)

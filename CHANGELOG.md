@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- ``bootstrap`` on ``DqnObjective``, ``RetraceObjective``, and
+- ``bootstrap_cutoff`` on ``DqnObjective``, ``RetraceObjective``, and
   ``PpoObjective``. Required. ``True`` adds the value estimate where
   the continuation leaves the sampled run (end of the batch, or a
   ``sequence_id`` / ``grouping_field`` break): a chunk boundary, time
