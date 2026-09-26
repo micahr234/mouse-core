@@ -557,3 +557,140 @@ def test_dataloader_transform_returns_token_batch() -> None:
         assert "sequence_id" in obj.keys()
     finally:
         loader.close()
+
+
+def _packed_episode_store() -> tuple[Datastore, set[int]]:
+    """Three episodes packed in one store. Returns start offsets.
+
+    Layout (action, episode_done):
+    ``(10, 0), (11, 1) | (12, 1) | (13, 0), (14, 0), (15, 2)``.
+    Starts are 0, 2, and 3. Index 1, 4, and 5 are mid-episode.
+    """
+    store = Datastore()
+    rows = (
+        (10, 0),
+        (11, 1),
+        (12, 1),
+        (13, 0),
+        (14, 0),
+        (15, 2),
+    )
+    for action, episode_done in rows:
+        store.append(
+            data={
+                "action": action,
+                "reward": 0.0,
+                "episode_done": episode_done,
+                "task_done": 0,
+            }
+        )
+    return store, {0, 2, 3}
+
+
+def _index_transform():
+    return compose(
+        stages=(
+            _stamp_grouping,
+            _tokenizer(objective_fields=_obj("action", "store_index", "episode_done")),
+        )
+    )
+
+
+def _sampled_windows(loader: DataLoader, n: int) -> list[list[tuple[int, int]]]:
+    """Per batch, one ``(start, length)`` for each packed sequence."""
+    batches: list[list[tuple[int, int]]] = []
+    for _ in range(n):
+        _, obj = loader.next_batch()
+        by_seq: dict[int, list[int]] = {}
+        for seq_id, store_index in zip(obj["sequence_id"], obj["store_index"], strict=True):
+            by_seq.setdefault(int(seq_id), []).append(int(store_index))
+        batches.append([(indices[0], len(indices)) for _, indices in sorted(by_seq.items())])
+    return batches
+
+
+def test_dataloader_episode_start_off_can_begin_mid_episode() -> None:
+    store, episode_starts = _packed_episode_store()
+    loader = _loader(
+        sequence_length=2,
+        batch_size=2,
+        num_workers=0,
+        seed=0,
+        episode_start=False,
+        stores=store,
+        index_field="store_index",
+        transform=_index_transform(),
+    )
+    starts = {start for batch in _sampled_windows(loader, 48) for start, _ in batch}
+    assert starts - episode_starts
+
+
+def test_dataloader_episode_start_defaults_to_mid_episode_sampling() -> None:
+    store, _episode_starts = _packed_episode_store()
+    kwargs = dict(
+        sequence_length=2,
+        batch_size=2,
+        num_workers=0,
+        seed=0,
+        stores=store,
+        index_field="store_index",
+        transform=_index_transform(),
+    )
+    omitted = _loader(**kwargs)
+    explicit = _loader(episode_start=False, **kwargs)
+    assert _sampled_windows(omitted, 4) == _sampled_windows(explicit, 4)
+
+
+def test_dataloader_episode_start_on_begins_at_episode_start() -> None:
+    """Every packed sequence starts on an episode, including a later one."""
+    store, episode_starts = _packed_episode_store()
+    loader = _loader(
+        sequence_length=2,
+        batch_size=2,
+        num_workers=0,
+        seed=1,
+        episode_start=True,
+        stores=store,
+        index_field="store_index",
+        transform=_index_transform(),
+    )
+    windows = _sampled_windows(loader, 64)
+    starts = {start for batch in windows for start, _ in batch}
+    assert starts <= episode_starts
+    assert 0 in starts
+    assert starts - {0}
+
+
+def test_dataloader_episode_start_short_suffix_stays_ragged() -> None:
+    """A short episode at the store end is a shorter window, not a padded one."""
+    store, episode_starts = _packed_episode_store()
+    sequence_length = 10
+    loader = _loader(
+        sequence_length=sequence_length,
+        batch_size=1,
+        num_workers=0,
+        seed=2,
+        episode_start=True,
+        stores=store,
+        index_field="store_index",
+        transform=_index_transform(),
+    )
+    windows = [window for batch in _sampled_windows(loader, 32) for window in batch]
+    assert windows
+    assert {start for start, _ in windows} <= episode_starts
+    n = len(store)
+    for start, length in windows:
+        assert length == min(sequence_length, n - start)
+        assert length < sequence_length
+
+
+def test_dataloader_episode_start_requires_episode_done() -> None:
+    store = Datastore()
+    store.append(data={"action": 1, "reward": 0.0, "task_done": 0})
+    with pytest.raises(ValueError, match="episode_done"):
+        _loader(
+            sequence_length=2,
+            batch_size=1,
+            num_workers=0,
+            episode_start=True,
+            stores=store,
+        )
