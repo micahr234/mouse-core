@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- ``best_action(q)``: integer action id per row, uniform among finite
+  maxima (``-inf`` padding never selected). Hard ``SpObjective`` CE
+  callers that distill from Q* run this outside and pass the ids.
 - ``RegressionHead`` / ``ClassificationHead`` take required
   ``propagate_gradient`` in ``[0, 1]``. ``1`` is full gradient from
   the head into the backbone; ``0`` detaches the pooled hidden state
@@ -99,6 +102,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pass ``architecture="qwen3"`` or ``architecture="llama"``.
 
 ### Changed
+- ``SpObjective(loss_type="ce")`` reads integer action ids from
+  ``targets_key`` (shape ``[B, S]``), not a full Q vector. Soft loss
+  types still take ``[B, S, A]`` Q teachers. ``examples/09_train_offline_sp.ipynb``
+  calls ``best_action`` on ``info_q_star`` and passes ``targets_key="best_action"``.
 - Examples and ``bench/bench_dataloader.py`` replace the CSV
   ``group_prefix`` legend ``action,observation,r=reward,d=done`` with
   a local FrozenLake game / strategy / step-format blurb (episode

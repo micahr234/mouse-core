@@ -11,8 +11,12 @@ import torch.nn.functional as F
 from mouse_core.objectives.base import Objective, _reject_predictions
 
 
-def _argmax_random_tie(q_targets: torch.Tensor) -> torch.Tensor:
+def best_action(q_targets: torch.Tensor) -> torch.Tensor:
     """Index of a uniformly random finite maximizer per row.
+
+    Callers that distill hard CE from a Q vector (e.g. ``info_q_star``) run
+    this outside ``SpObjective`` and pass the resulting action ids as
+    ``targets_key``. Soft SP losses still take the full Q vector.
 
     ``-inf`` padding is never selected. Rows with no finite entry fall through
     to ``argmax`` of an all-``-inf`` mask (index 0), matching ``torch.argmax``.
@@ -25,29 +29,56 @@ def _argmax_random_tie(q_targets: torch.Tensor) -> torch.Tensor:
 
 
 def sp_ce(
-    q_targets: torch.Tensor,
+    target_actions: torch.Tensor,
     logits: torch.Tensor,
+    *,
     label_smoothing: float = 0.0,
+    invalid: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Hard CE onto a uniformly random argmax of ``q_targets`` (aligned rows).
+    """Hard CE onto integer action labels (aligned rows).
 
-    When several finite actions share the maximum Q, one is sampled uniformly
-    each call so the label is not biased toward the lowest index.
-
-    ``-inf`` entries in ``q_targets`` are padding sentinels for actions that
-    do not exist. As in the soft losses, those actions are excluded from the
-    student softmax denominator and from label smoothing, so a junk student
-    logit at a padded slot never affects the loss.
+    ``invalid`` is an optional ``[N, A]`` bool mask of action slots that do
+    not exist (same role as ``-inf`` padding in soft SP losses). Those slots
+    are excluded from the student softmax and from label smoothing.
 
     Args:
-        q_targets: ``[N, A]`` teacher Q-values.
+        target_actions: ``[N]`` integer action ids.
         logits: ``[N, A]`` student action logits.
         label_smoothing: Mixes uniform mass over the *valid* actions into the
             hard label.
+        invalid: Optional ``[N, A]`` bool; ``True`` marks a padded action.
     """
-    target_actions = _argmax_random_tie(q_targets)
-    invalid = ~torch.isfinite(q_targets)
+    if target_actions.ndim != 1:
+        raise ValueError(
+            f"sp_ce target_actions must be 1-D [N], got shape {tuple(target_actions.shape)}."
+        )
+    if logits.ndim != 2:
+        raise ValueError(
+            f"sp_ce logits must be 2-D [N, A], got shape {tuple(logits.shape)}."
+        )
+    if target_actions.shape[0] != logits.shape[0]:
+        raise ValueError(
+            f"sp_ce row count mismatch: target_actions {target_actions.shape[0]} "
+            f"vs logits {logits.shape[0]}."
+        )
+    if invalid is not None:
+        if invalid.shape != logits.shape:
+            raise ValueError(
+                f"sp_ce invalid shape {tuple(invalid.shape)} must match "
+                f"logits {tuple(logits.shape)}."
+            )
+        if invalid.dtype != torch.bool:
+            raise TypeError(
+                f"sp_ce invalid must be bool, got {invalid.dtype}."
+            )
     fill = torch.finfo(logits.dtype).min / 4
+    if invalid is None:
+        log_probs = F.log_softmax(logits, dim=-1)
+        nll = -log_probs.gather(dim=-1, index=target_actions.unsqueeze(-1)).squeeze(-1)
+        if label_smoothing > 0.0:
+            smooth = -log_probs.mean(dim=-1)
+            nll = (1.0 - label_smoothing) * nll + label_smoothing * smooth
+        return nll.mean()
     log_probs = F.log_softmax(logits.masked_fill(invalid, fill), dim=-1)
     nll = -log_probs.gather(dim=-1, index=target_actions.unsqueeze(-1)).squeeze(-1)
     if label_smoothing > 0.0:
@@ -208,29 +239,34 @@ def _skip_mask(mask: torch.Tensor, n_rows: int) -> torch.Tensor:
 
 
 class SpObjective(Objective):
-    """Supervised policy objective distilling per-action Q targets into action logits.
+    """Supervised policy objective over action logits at head-output positions.
 
     Reads ``predictions`` (shape ``[B, S, A]``) and compares against
-    ``objective_data[targets_key]`` (same shape).
+    ``objective_data[targets_key]``.
 
-    ``info_q_star`` is Q of taking an action *from the current observation* (the
-    next action). Rows where ``mask_key`` is True or any nonzero number are
-    dropped. Pass ``mask_key="episode_done"`` to skip both terminated and
-    truncated steps (the episode is over; there is no next action to imitate).
+    Hard ``"ce"`` expects **integer action ids** shaped like ``predictions``
+    without the action axis (``[B, S]``). Filter Q* outside with
+    ``best_action`` (uniform among tied maxima) and pass those ids, or pass
+    dataset / behavior actions for a data-policy head. Soft losses still take
+    a full ``[B, S, A]`` Q teacher (e.g. ``info_q_star``).
+
+    Rows where ``mask_key`` is True or any nonzero number are dropped. Pass
+    ``mask_key="episode_done"`` to skip both terminated and truncated steps
+    (the episode is over; there is no next action to imitate). Soft losses
+    also drop rows with no finite teacher entry.
 
     Args:
-        loss_type: Which distillation loss to apply.  ``"ce"`` uses a uniformly
-            random argmax of ``targets_key`` as a hard label (ties broken at
-            random each forward); the soft variants treat it as a distribution.
+        loss_type: Which distillation loss to apply.  ``"ce"`` uses hard
+            labels from ``targets_key``; the soft variants treat a Q vector as
+            a distribution.
         temperature: Softmax temperature applied to targets before soft losses
             (ignored for ``"ce"``).
         label_smoothing: Mixes uniform mass over the valid (finite-target)
             actions into the teacher. On hard ``"ce"`` it smooths the hard
-            label; on soft losses it is applied to the teacher distribution
-            only.
-        targets_key: Key in ``objective_data`` that holds ``[B, S, A]`` Q targets
-            (default ``"info_q_star"`` from env expert Q; use e.g. ``"action_value"``
-            for teacher-model distillation).
+            label over all action slots; on soft losses it is applied to the
+            teacher distribution only (excluding ``-inf`` padding).
+        targets_key: Key in ``objective_data``. For ``"ce"``, integer actions
+            ``[B, S]``; for soft losses, Q targets ``[B, S, A]``.
         mask_key: Key in ``objective_data`` for a per-row skip mask (bool True
             or any nonzero number). ``None`` disables the skip (e.g. teacher-logit
             distillation with no mask column).
@@ -286,46 +322,72 @@ class SpObjective(Objective):
         temp = float(self.temperature)
 
         A = logits.shape[-1]
-        logits = logits.reshape(-1, A)
-        q_targets = objective_data[self.targets_key].reshape(-1, A).to(dtype=logits.dtype)
+        leading = logits.shape[:-1]
+        logits_flat = logits.reshape(-1, A)
+        n_rows = logits_flat.shape[0]
 
-        if q_targets.shape[0] == 0:
+        if n_rows == 0:
             raise ValueError("SpObjective: batch is empty (no tokens).")
-        if torch.isnan(q_targets).any():
-            raise ValueError(f"SpObjective: {self.targets_key!r} contains NaN values.")
-        if torch.isposinf(q_targets).any():
-            raise ValueError(f"SpObjective: {self.targets_key!r} contains +inf values.")
 
-        valid_rows = torch.isfinite(q_targets).any(dim=-1)
         if self.mask_key is not None:
-            valid_rows = valid_rows & ~_skip_mask(
-                objective_data[self.mask_key], q_targets.shape[0]
-            )
-        if not valid_rows.any():
-            raise ValueError(
-                "SpObjective: no rows left after applying the skip mask "
-                f"and dropping non-finite {self.targets_key!r} targets."
-            )
-        logits = logits[valid_rows]
-        q_targets = q_targets[valid_rows]
+            valid_rows = ~_skip_mask(objective_data[self.mask_key], n_rows)
+        else:
+            valid_rows = torch.ones(n_rows, dtype=torch.bool, device=logits.device)
 
         if self.loss_type == "ce":
-            loss = sp_ce(q_targets=q_targets, logits=logits, label_smoothing=self.label_smoothing)
-        elif self.loss_type == "ce-soft-fwd":
-            loss = sp_soft_ce(q_targets=q_targets, logits=logits, temperature=temp, label_smoothing=self.label_smoothing, direction="fwd")
-        elif self.loss_type == "ce-soft-bwd":
-            loss = sp_soft_ce(q_targets=q_targets, logits=logits, temperature=temp, label_smoothing=self.label_smoothing, direction="bwd")
-        elif self.loss_type == "js":
-            loss = sp_js(q_targets=q_targets, logits=logits, temperature=temp, label_smoothing=self.label_smoothing)
-        elif self.loss_type == "kl-fwd":
-            loss = sp_kl(q_targets=q_targets, logits=logits, temperature=temp, label_smoothing=self.label_smoothing, direction="fwd")
-        elif self.loss_type == "kl-bwd":
-            loss = sp_kl(q_targets=q_targets, logits=logits, temperature=temp, label_smoothing=self.label_smoothing, direction="bwd")
-        else:
-            raise ValueError(
-                f"Invalid SpObjective loss_type: {self.loss_type!r} "
-                "(expected 'ce', 'ce-soft-fwd', 'ce-soft-bwd', 'js', 'kl-fwd', or 'kl-bwd')."
+            targets = objective_data[self.targets_key]
+            if targets.shape != leading and targets.shape != (*leading, 1):
+                raise ValueError(
+                    f"SpObjective: {self.targets_key!r} for loss_type='ce' must have "
+                    f"shape {tuple(leading)} or {(*leading, 1)}, got {tuple(targets.shape)}."
+                )
+            target_actions = targets.reshape(-1).to(dtype=torch.long)
+            if not valid_rows.any():
+                raise ValueError(
+                    "SpObjective: no rows left after applying the skip mask."
+                )
+            logits_flat = logits_flat[valid_rows]
+            target_actions = target_actions[valid_rows]
+            if (target_actions < 0).any() or (target_actions >= A).any():
+                raise ValueError(
+                    f"SpObjective: {self.targets_key!r} action ids must be in "
+                    f"[0, {A}), got min={int(target_actions.min())} "
+                    f"max={int(target_actions.max())}."
+                )
+            loss = sp_ce(
+                target_actions=target_actions,
+                logits=logits_flat,
+                label_smoothing=self.label_smoothing,
             )
+        else:
+            q_targets = objective_data[self.targets_key].reshape(-1, A).to(dtype=logits.dtype)
+            if torch.isnan(q_targets).any():
+                raise ValueError(f"SpObjective: {self.targets_key!r} contains NaN values.")
+            if torch.isposinf(q_targets).any():
+                raise ValueError(f"SpObjective: {self.targets_key!r} contains +inf values.")
+            valid_rows = valid_rows & torch.isfinite(q_targets).any(dim=-1)
+            if not valid_rows.any():
+                raise ValueError(
+                    "SpObjective: no rows left after applying the skip mask "
+                    f"and dropping non-finite {self.targets_key!r} targets."
+                )
+            logits_flat = logits_flat[valid_rows]
+            q_targets = q_targets[valid_rows]
+            if self.loss_type == "ce-soft-fwd":
+                loss = sp_soft_ce(q_targets=q_targets, logits=logits_flat, temperature=temp, label_smoothing=self.label_smoothing, direction="fwd")
+            elif self.loss_type == "ce-soft-bwd":
+                loss = sp_soft_ce(q_targets=q_targets, logits=logits_flat, temperature=temp, label_smoothing=self.label_smoothing, direction="bwd")
+            elif self.loss_type == "js":
+                loss = sp_js(q_targets=q_targets, logits=logits_flat, temperature=temp, label_smoothing=self.label_smoothing)
+            elif self.loss_type == "kl-fwd":
+                loss = sp_kl(q_targets=q_targets, logits=logits_flat, temperature=temp, label_smoothing=self.label_smoothing, direction="fwd")
+            elif self.loss_type == "kl-bwd":
+                loss = sp_kl(q_targets=q_targets, logits=logits_flat, temperature=temp, label_smoothing=self.label_smoothing, direction="bwd")
+            else:
+                raise ValueError(
+                    f"Invalid SpObjective loss_type: {self.loss_type!r} "
+                    "(expected 'ce', 'ce-soft-fwd', 'ce-soft-bwd', 'js', 'kl-fwd', or 'kl-bwd')."
+                )
 
         metrics: dict[str, float | torch.Tensor] = {"action": float(loss.detach().item())}
         return loss, metrics
