@@ -292,6 +292,67 @@ def _run_mask(*, pair_weight: torch.Tensor, N: int) -> torch.Tensor:
     return mask
 
 
+def _zero_off_data_factor_scan(
+    *,
+    discount: torch.Tensor,
+    in_sample: torch.Tensor,
+    carries: torch.Tensor,
+) -> torch.Tensor:
+    """``1`` when every off-data value has factor ``0`` in this backup.
+
+    ``in_sample`` is true when this transition's next-state value is
+    inside the run. ``carries`` is true when a non-zero factor would pass
+    a later off-data value back through this step. A ``0`` discount zeros
+    the factor, which is why a true terminal stays. Reaching a cutoff is
+    not enough: the step stays when that factor is ``0``.
+    """
+    open_discount = discount != 0
+    direct = (open_discount & ~in_sample).to(dtype=discount.dtype)
+    carry = (open_discount & carries).to(dtype=discount.dtype)
+    reached = _affine_scan_backward(direct, carry)
+    return (reached == 0).to(dtype=discount.dtype)
+
+
+def _block_cutoff_factor_is_zero(
+    *,
+    step: torch.Tensor,
+    alive: torch.Tensor,
+    discount: torch.Tensor,
+) -> torch.Tensor:
+    """``1`` when no cutoff column has a non-zero factor on ``V``.
+
+    ``step`` is the discounted in-run continuation, with columns before
+    the start set to ``1``. A cutoff (``alive == 0``) contributes only
+    when every earlier factor is non-zero and this column's discount is
+    non-zero. Links are tested as non-zero, not as a float product, so a
+    small λ still counts. A horizon that runs past the sample with a
+    ``0`` link does not put the off-data value in the target.
+    """
+    rows, width = step.shape
+    device = step.device
+    if width == 1:
+        reached = torch.ones(rows, 1, dtype=torch.bool, device=device)
+    else:
+        open_link = (step != 0).to(dtype=step.dtype)
+        survived = torch.cumprod(open_link, dim=1)
+        reached = torch.cat(
+            [
+                torch.ones(rows, 1, dtype=torch.bool, device=device),
+                survived[:, :-1] != 0,
+            ],
+            dim=1,
+        )
+    row = torch.arange(rows, device=device).unsqueeze(1)
+    col = torch.arange(width, device=device)
+    hit = (
+        reached
+        & (col >= row)
+        & (alive == 0).unsqueeze(0)
+        & (discount != 0).unsqueeze(0)
+    )
+    return (~hit.any(dim=1)).to(dtype=step.dtype)
+
+
 def _block_returns(
     *,
     continuation: torch.Tensor,
@@ -302,17 +363,22 @@ def _block_returns(
     t0: int,
     rows: int,
     bootstrap_cutoff: bool,
-) -> torch.Tensor:
-    """Returns for starts ``t0 .. t0+rows`` from the gate matrix.
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Returns for starts ``t0 .. t0+rows``, and which starts stay.
 
     Reads columns ``t0+1:`` of those rows into one strip. Entries before
     each start are outside that start's return: their step is ``1`` so
     the cumprod is unchanged, and their reward term is ``0``.
 
     ``col_mask`` is ``0`` where the continuation is outside the sampled
-    run. ``bootstrap_cutoff=True`` still adds ``V`` there. ``bootstrap_cutoff=False``
-    does not. A ``0`` from the gate, at a step the mask still keeps,
-    bootstraps either way.
+    run. ``bootstrap_cutoff=True`` still adds ``V`` there, and every
+    start stays. ``bootstrap_cutoff=False`` drops a start when the factor
+    on that off-data ``V`` is non-zero. A zero factor leaves the value
+    out of the target, so the start stays. A gate ``0`` on a step the
+    mask still keeps bootstraps either way.
+
+    The second tensor is ``1`` for a start that stays and ``0`` for a
+    start that drops.
     """
     device = continuation.device
     dtype = reward.dtype
@@ -332,10 +398,14 @@ def _block_returns(
         before = local_col < local_row
         step[:, :rows] = torch.where(before, step.new_ones(()), step[:, :rows])
         term[:, :rows] = torch.where(before, term.new_zeros(()), term[:, :rows])
+    if bootstrap_cutoff:
+        participate = step.new_ones(rows)
+    else:
+        participate = _block_cutoff_factor_is_zero(step=step, alive=alive, discount=g)
     if width > 1:
         torch.cumprod(step, dim=1, out=step)
         term[:, 1:].mul_(step[:, :-1])
-    return term.sum(dim=1)
+    return term.sum(dim=1), participate
 
 
 @torch.no_grad()
@@ -347,8 +417,8 @@ def _continuation_targets(
     pair_weight: torch.Tensor,
     continuation: torch.Tensor,
     bootstrap_cutoff: bool,
-) -> torch.Tensor:
-    """Return for every pair ``(t, t+1)``, shape ``[N-1]``.
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return for every pair ``(t, t+1)``, and which pairs stay.
 
     ``G_t = r_{t+1} + γ_{t+1} ((1 - c) V_{t+1} + c G_{t+1})``.
     ``continuation`` is the gate matrix ``[N, N]``: row ``t``, column
@@ -356,9 +426,15 @@ def _continuation_targets(
     started at ``t``. Rows are cumprod'd in blocks of
     ``_CONTINUATION_ROWS`` and never read another start's return. The
     in-run mask zeros a continuation that would leave the run.
-    ``bootstrap_cutoff=False`` does not add ``V`` at that masked cutoff.
-    A gate ``0`` on a step still inside the run still bootstraps.
-    Out-of-run pairs return ``0``.
+    ``bootstrap_cutoff=True`` adds ``V`` at that masked cutoff and keeps
+    the pair. ``bootstrap_cutoff=False`` drops the pair when the factor
+    on that off-data ``V`` is non-zero, from the loss and from logged
+    metrics. A zero factor leaves the value out of the target, so the
+    pair stays. A gate ``0`` on a step still inside the run still
+    bootstraps. Out-of-run pairs return ``0``.
+
+    Returns ``(returns [N-1], participate [N-1])``. ``participate`` is
+    ``1`` for a pair that stays.
     """
     r = reward[1:].to(dtype=v_step.dtype)  # [N-1]  r_t (stored at t+1)
     g = discount_all[1:]  # [N-1]  γ_t
@@ -374,9 +450,10 @@ def _continuation_targets(
     mask = _run_mask(pair_weight=pair_weight.to(dtype=v_step.dtype), N=N)
     col_mask = mask[1:]
     returns = r.new_empty(T)
+    participate = r.new_empty(T)
     for t0 in range(0, T, _CONTINUATION_ROWS):
         rows = min(_CONTINUATION_ROWS, T - t0)
-        returns[t0 : t0 + rows] = _block_returns(
+        returns[t0 : t0 + rows], participate[t0 : t0 + rows] = _block_returns(
             continuation=continuation,
             col_mask=col_mask,
             reward=r,
@@ -386,7 +463,7 @@ def _continuation_targets(
             rows=rows,
             bootstrap_cutoff=bootstrap_cutoff,
         )
-    return returns * in_run.to(dtype=returns.dtype)
+    return returns * in_run.to(dtype=returns.dtype), participate
 
 
 def _read_gate(
@@ -494,8 +571,11 @@ class DqnObjective(Objective):
     return that started at ``t``, and that row is unrolled on its own.
     The objective then zeros a
     continuation that would leave the run. ``bootstrap_cutoff=True`` adds ``V``
-    at that cutoff (the rest of the episode is not in the sample).
-    ``bootstrap_cutoff=False`` does not. A gate cut on a later in-run step still
+    at that cutoff (the rest of the episode is not in the sample) and the
+    step stays in the loss and in logged metrics.
+    ``bootstrap_cutoff=False`` drops the step from both when the factor on
+    that off-data ``V`` is non-zero. A zero factor leaves the value out of
+    the target, so the step stays. A gate cut on a later in-run step still
     bootstraps. ``V`` is delayed max-Q when
     ``temperature=0``. A
     positive ``temperature`` (SAC / soft Q-learning ``α``) replaces that
@@ -616,10 +696,13 @@ class DqnObjective(Objective):
             leaves the sampled run (end of the batch, or a
             ``sequence_id`` / ``grouping_field`` break): a chunk
             boundary, time limit, or truncation whose rest was not
-            sampled. ``False`` omits that value. A bootstrap at a state
-            that still has later in-run steps is unchanged. A true
-            terminal is unchanged either way: its γ already multiplies
-            the value.
+            sampled. That step stays in the loss and in logged metrics.
+            ``False`` drops the step from both when the factor on that
+            off-data value is non-zero. A zero factor leaves the value
+            out of the target, so the step stays. Reaching past the
+            sample is not enough. An in-run backup stays. A true terminal
+            stays either way: its γ is ``0``, so the factor is already
+            ``0``.
     """
 
     def __init__(
@@ -770,9 +853,6 @@ class DqnObjective(Objective):
             grouping_field=self.grouping_field,
             dtype=value_dtype,
         )
-        # Row weight = the (i, i+1) pair weight of the row's step; rows of the
-        # final step have no next step and get weight 0.
-        row_weight = torch.cat([pair_weight, pair_weight.new_zeros(1)])[step_of]  # [P]
 
         # Each token at position i encodes (obs_i, action_{i-1}, reward_{i-1},
         # episode_done_{i-1}, task_done_{i-1}), i.e. the action, reward, and
@@ -811,7 +891,7 @@ class DqnObjective(Objective):
             dtype=value_dtype,
             device=device,
         )
-        pair_target = _continuation_targets(
+        pair_target, participate = _continuation_targets(
             reward=reward,
             discount_all=discount_all,
             v_step=v_step,  # [N]  V(s_i)
@@ -819,6 +899,11 @@ class DqnObjective(Objective):
             continuation=continuation,
             bootstrap_cutoff=self.bootstrap_cutoff,
         )
+        # A non-zero factor on an off-data value drops the step from the loss
+        # and from every logged metric. A zero factor leaves that value out
+        # of the target, so the step keeps its in-run weight.
+        pair_weight = pair_weight * participate
+        row_weight = torch.cat([pair_weight, pair_weight.new_zeros(1)])[step_of]  # [P]
         td_target = _pair_values_to_rows(pair_target, step_of)  # [P]
 
         # δ = G - Q(s, a). The loss is the mean square TD error.

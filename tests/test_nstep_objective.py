@@ -145,13 +145,13 @@ def test_n_step_targets_window() -> None:
     v = torch.tensor([0.0, 3.0, 7.0, 11.0])
     pair_weight = torch.ones(3)
     q, action = _blank_batch(4)
-    got = _continuation_targets(
+    got, _ = _continuation_targets(
         reward=reward, discount_all=discount, v_step=v, pair_weight=pair_weight,
         continuation=nstep_gate(n=2)(q=q, action=action),
      bootstrap_cutoff=True)
     # G0 = 1 + 10 + 7 = 18; G1 = 10 + 100 + 11 = 121; G2 = 100 + 11 = 111.
     assert torch.allclose(got, torch.tensor([18.0, 121.0, 111.0]))
-    full = _continuation_targets(
+    full, _ = _continuation_targets(
         reward=reward, discount_all=discount, v_step=v, pair_weight=pair_weight,
         continuation=lambda_gate(td_lambda=1.0)(q=q, action=action),
      bootstrap_cutoff=True)
@@ -174,7 +174,7 @@ def test_nstep_gate_returns_a_square_matrix() -> None:
         for s in range(t + 1, min(N, t + n)):
             matrix[t, s] = 1.0
     assert torch.equal(got, matrix)
-    targets = _continuation_targets(
+    targets, _ = _continuation_targets(
         reward=reward, discount_all=discount, v_step=v, pair_weight=pair_weight,
         continuation=got,
      bootstrap_cutoff=True)

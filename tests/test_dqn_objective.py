@@ -866,7 +866,7 @@ def test_general_gate_matches_the_truncated_lambda_return() -> None:
     in_run = pair_weight > 0
     run_mask = torch.cat([in_run[1:].to(dtype=torch.float32), in_run.new_zeros(1)])
     greedy_cont = run_mask * torch.cat([greedy[1:], greedy.new_zeros(1)])
-    got = _continuation_targets(
+    got, _ = _continuation_targets(
         reward=reward, discount_all=discount, v_step=v, pair_weight=pair_weight,
         continuation=general_gate(gates=(
             lambda_gate(td_lambda=lam), nstep_gate(n=horizon),
@@ -878,7 +878,7 @@ def test_general_gate_matches_the_truncated_lambda_return() -> None:
     )
     ref = ref * in_run.to(dtype=ref.dtype)
     assert torch.allclose(got, ref, atol=1e-5, rtol=1e-5)
-    watkins = _continuation_targets(
+    watkins, _ = _continuation_targets(
         reward=reward, discount_all=discount, v_step=v, pair_weight=pair_weight,
         continuation=general_gate(gates=(
             lambda_gate(td_lambda=lam), watkins_gate(),
@@ -1294,10 +1294,11 @@ def test_nstep_and_lambda_match_per_start_recursion() -> None:
     v_next = v[1:]
 
     def returns(continuation: torch.Tensor) -> torch.Tensor:
-        return _continuation_targets(
+        values, _ = _continuation_targets(
             reward=reward, discount_all=discount, v_step=v, pair_weight=pair_weight,
             continuation=continuation,
          bootstrap_cutoff=True)
+        return values
 
     for n in (2, 6, 15):
         got = returns(nstep_gate(n=n)(q=torch.zeros(N, 1), action=torch.zeros(N, dtype=torch.long)))
@@ -1322,11 +1323,11 @@ def test_nstep_and_lambda_match_per_start_recursion() -> None:
     ones = torch.ones(T)
     open_q = torch.zeros(N, 1)
     open_action = torch.zeros(N, dtype=torch.long)
-    short = _continuation_targets(
+    short, _ = _continuation_targets(
         reward=reward, discount_all=discount, v_step=v, pair_weight=ones,
         continuation=nstep_gate(n=3)(q=open_q, action=open_action),
      bootstrap_cutoff=True)
-    opened = _continuation_targets(
+    opened, _ = _continuation_targets(
         reward=reward, discount_all=discount, v_step=v, pair_weight=ones,
         continuation=lambda_gate(td_lambda=1.0)(q=open_q, action=open_action),
      bootstrap_cutoff=True)
@@ -1543,11 +1544,11 @@ def _cutoff_loss(
 
 
 def test_bootstrap_cutoff_adds_value_when_continuation_is_outside_the_sample() -> None:
-    """Chunk end and truncation bootstrap V; turning it off leaves the reward."""
+    """A non-zero cutoff factor bootstraps when the flag is on and drops the step when it is off."""
     running = torch.tensor([0, 0])
-    # r + V(s') = 6 → 36. Without that V the target is the reward 1.
+    # r + V(s') = 6 → 36. The only step's factor on that V is non-zero, so the flag off drops it.
     assert abs(_cutoff_loss(bootstrap_cutoff=True, episode_done=running) - 36.0) < 1e-05
-    assert abs(_cutoff_loss(bootstrap_cutoff=False, episode_done=running) - 1.0) < 1e-05
+    assert abs(_cutoff_loss(bootstrap_cutoff=False, episode_done=running) - 0.0) < 1e-05
     truncated = torch.tensor([0, 2])
     trunc_discount = _disc(gamma_episode_truncated=1.0)
     assert abs(_cutoff_loss(
@@ -1555,7 +1556,7 @@ def test_bootstrap_cutoff_adds_value_when_continuation_is_outside_the_sample() -
     ) - 36.0) < 1e-05
     assert abs(_cutoff_loss(
         bootstrap_cutoff=False, episode_done=truncated, discount=trunc_discount,
-    ) - 1.0) < 1e-05
+    ) - 0.0) < 1e-05
 
 
 def test_bootstrap_cutoff_off_keeps_an_in_run_horizon_backup() -> None:
@@ -1569,12 +1570,49 @@ def test_bootstrap_cutoff_off_keeps_an_in_run_horizon_backup() -> None:
         reward=reward, discount_all=discount, v_step=v, pair_weight=pair_weight,
         continuation=nstep_gate(n=2)(q=q, action=action),
     )
-    on = _continuation_targets(bootstrap_cutoff=True, **common)
-    off = _continuation_targets(bootstrap_cutoff=False, **common)
+    on, on_keep = _continuation_targets(bootstrap_cutoff=True, **common)
+    off, off_keep = _continuation_targets(bootstrap_cutoff=False, **common)
     # Horizon lands on s2, which still has s3 in the run: V(s2)=7 stays.
-    # The backup on s3 is outside the sample and drops.
+    # The backups that reach s3 have a non-zero cutoff factor and drop.
     assert torch.allclose(on, torch.tensor([18.0, 121.0, 111.0]))
-    assert torch.allclose(off, torch.tensor([18.0, 110.0, 100.0]))
+    assert torch.equal(on_keep, torch.ones(3))
+    assert torch.equal(off_keep, torch.tensor([1.0, 0.0, 0.0]))
+    assert abs(float(off[0]) - 18.0) < 1e-05
+
+
+def test_in_run_horizon_backup_stays_in_loss_and_logs() -> None:
+    """The n-step backup that lands inside the run stays; the ones that reach the cutoff drop."""
+    step_stream = {
+        "action": torch.zeros(4, dtype=torch.long),
+        "reward": torch.tensor([0.0, 1.0, 10.0, 100.0]),
+        "episode_done": torch.zeros(4, dtype=torch.long),
+        "task_done": torch.zeros(4, dtype=torch.long),
+    }
+    online = torch.tensor([[10.0], [30.0], [50.0], [0.0]])
+    delayed = torch.tensor([[0.0], [3.0], [7.0], [11.0]])
+
+    def run(*, bootstrap_cutoff: bool) -> tuple[float, dict[str, float]]:
+        loss, metrics = DqnObjective(
+            reward=_rew(),
+            value=_val(),
+            discount=_disc(),
+            grouping_field=None,
+            temperature=0.0,
+            double=False,
+            gate=nstep_gate(n=2),
+            bootstrap_cutoff=bootstrap_cutoff,
+        )(objective_data=step_stream, predictions=online, delayed_predictions=delayed)
+        return float(loss.item()), metrics
+
+    # s0 lands on V(s2)=7 inside the run: target 18. s1 and s2 reach V(s3).
+    off_loss, off_metrics = run(bootstrap_cutoff=False)
+    assert abs(off_loss - (18.0 - 10.0) ** 2) < 1e-04
+    assert abs(off_metrics["q_values_mean"] - 10.0) < 1e-04
+    assert abs(off_metrics["action_value"] - off_loss) < 1e-04
+    on_loss, on_metrics = run(bootstrap_cutoff=True)
+    on_sq = (18.0 - 10.0) ** 2 + (121.0 - 30.0) ** 2 + (111.0 - 50.0) ** 2
+    assert abs(on_loss - on_sq / 3) < 1e-02
+    assert abs(on_metrics["q_values_mean"] - 30.0) < 1e-04
 
 
 def test_true_terminal_ignores_bootstrap_cutoff() -> None:
@@ -1589,6 +1627,86 @@ def test_true_terminal_ignores_bootstrap_cutoff() -> None:
     task_off = _cutoff_loss(bootstrap_cutoff=False, episode_done=torch.zeros(2, dtype=torch.int64), task_done=task)
     assert abs(task_on - 1.0) < 1e-05
     assert abs(task_off - task_on) < 1e-05
+
+
+def _long_horizon_loss(
+    *,
+    bootstrap_cutoff: bool,
+    td_lambda: float,
+    n: int,
+    episode_done: torch.Tensor | None = None,
+) -> tuple[float, dict[str, float]]:
+    """Four steps. ``n`` runs past the batch. ``td_lambda`` is the trace factor."""
+    done = torch.zeros(4, dtype=torch.long) if episode_done is None else episode_done
+    step_stream = {
+        "action": torch.zeros(4, dtype=torch.long),
+        "reward": torch.tensor([0.0, 1.0, 10.0, 100.0]),
+        "episode_done": done,
+        "task_done": torch.zeros(4, dtype=torch.long),
+    }
+    online = torch.tensor([[10.0], [30.0], [50.0], [0.0]])
+    delayed = torch.tensor([[0.0], [3.0], [7.0], [11.0]])
+    loss, metrics = DqnObjective(
+        reward=_rew(),
+        value=_val(),
+        discount=_disc(),
+        grouping_field=None,
+        temperature=0.0,
+        double=False,
+        gate=general_gate(gates=(nstep_gate(n=n), lambda_gate(td_lambda=td_lambda))),
+        bootstrap_cutoff=bootstrap_cutoff,
+    )(objective_data=step_stream, predictions=online, delayed_predictions=delayed)
+    return float(loss.item()), metrics
+
+
+def test_zero_cutoff_factor_keeps_the_step_when_the_horizon_passes_the_sample() -> None:
+    """``n`` runs past the batch, but a 0 trace factor puts no weight on the cutoff value."""
+    # One-step targets: s0 uses V(s1)=3, s1 uses V(s2)=7. Both are inside the run.
+    # s2's one-step value is the cutoff, so that step still drops.
+    kept_sq = (4.0 - 10.0) ** 2 + (17.0 - 30.0) ** 2
+    off_loss, off_metrics = _long_horizon_loss(bootstrap_cutoff=False, td_lambda=0.0, n=10)
+    assert abs(off_loss - kept_sq / 2) < 1e-04
+    assert abs(off_metrics["action_value"] - off_loss) < 1e-04
+    assert abs(off_metrics["q_values_mean"] - 20.0) < 1e-04
+    # The flag on still bootstraps the cutoff step and still logs it.
+    on_loss, on_metrics = _long_horizon_loss(bootstrap_cutoff=True, td_lambda=0.0, n=10)
+    cutoff_sq = (111.0 - 50.0) ** 2
+    assert abs(on_loss - (kept_sq + cutoff_sq) / 3) < 1e-03
+    assert abs(on_metrics["q_values_mean"] - 30.0) < 1e-04
+
+
+def test_nonzero_cutoff_factor_excludes_the_step_when_the_horizon_passes_the_sample() -> None:
+    """The same window with a non-zero factor on the cutoff value drops every step."""
+    # λ = 1 carries V(s3)=11 into every return: 122, 121, 111.
+    boot_sq = (122.0 - 10.0) ** 2 + (121.0 - 30.0) ** 2 + (111.0 - 50.0) ** 2
+    on_loss, on_metrics = _long_horizon_loss(bootstrap_cutoff=True, td_lambda=1.0, n=10)
+    assert abs(on_loss - boot_sq / 3) < 1e-02
+    assert abs(on_metrics["action_value"] - on_loss) < 1e-03
+    assert abs(on_metrics["q_values_mean"] - 30.0) < 1e-04
+    off_loss, off_metrics = _long_horizon_loss(bootstrap_cutoff=False, td_lambda=1.0, n=10)
+    assert abs(off_loss) < 1e-05
+    assert abs(off_metrics["action_value"]) < 1e-05
+    assert abs(off_metrics["q_values_mean"]) < 1e-05
+    # A reward-only target for those same steps would not be zero.
+    reward_only = (111.0 - 10.0) ** 2 + (110.0 - 30.0) ** 2 + (100.0 - 50.0) ** 2
+    assert reward_only / 3 > 1.0
+
+
+def test_true_terminal_stays_when_the_horizon_passes_the_sample() -> None:
+    """γ = 0 at the cutoff zeros the factor, so a long horizon still trains."""
+    done = torch.tensor([0, 0, 0, 1])
+    # Returns stop on the rewards: 111, 110, 100. No cutoff value either way.
+    sq = (111.0 - 10.0) ** 2 + (110.0 - 30.0) ** 2 + (100.0 - 50.0) ** 2
+    on_loss, on_metrics = _long_horizon_loss(
+        bootstrap_cutoff=True, td_lambda=1.0, n=10, episode_done=done,
+    )
+    off_loss, off_metrics = _long_horizon_loss(
+        bootstrap_cutoff=False, td_lambda=1.0, n=10, episode_done=done,
+    )
+    assert abs(on_loss - sq / 3) < 1e-02
+    assert abs(off_loss - on_loss) < 1e-04
+    assert abs(off_metrics["q_values_mean"] - 30.0) < 1e-04
+    assert abs(on_metrics["q_values_mean"] - off_metrics["q_values_mean"]) < 1e-04
 
 
 def test_dqn_requires_bootstrap_cutoff_argument() -> None:

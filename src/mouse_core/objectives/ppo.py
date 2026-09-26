@@ -14,6 +14,7 @@ from mouse_core.objectives.dqn import (
     _require_done_codes,
     _require_step_aligned_predictions,
     _weighted_mean,
+    _zero_off_data_factor_scan,
 )
 from mouse_core.objectives.transforms import (
     Discount,
@@ -55,7 +56,7 @@ def _gae_advantages(
     valid: torch.Tensor,
     gae_lambda: float,
     bootstrap_cutoff: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Generalized advantage estimation over valid consecutive pairs.
 
     Args:
@@ -66,16 +67,21 @@ def _gae_advantages(
             ``sequence_id`` or grouping).
         gae_lambda: GAE λ.
         bootstrap_cutoff: ``True`` adds ``V`` at a state whose next step is not an
-            in-run pair (end of the batch, or a run break). ``False`` omits
-            that value. ``V`` at a state that still has a later in-run step
-            is unchanged. A ``0`` discount (true terminal) removes the value
+            in-run pair (end of the batch, or a run break) and keeps the
+            step. ``False`` drops the step when the factor on that off-data
+            ``V`` is non-zero. A zero factor leaves the value out of the
+            advantage, so the step stays. Reaching past the sample is not
+            enough. ``V`` at a state that still has a later in-run step is
+            unchanged. A ``0`` discount (true terminal) removes the value
             either way.
 
     Returns:
-        ``(advantages, returns)`` each ``[N-1]``, detached from autograd:
-        both are regression / weighting targets, so the policy surrogate must
-        not differentiate through the value head via the advantage. Invalid
-        positions are zero.
+        ``(advantages, returns, participate)`` each ``[N-1]``. Advantages
+        and returns are detached from autograd: both are regression /
+        weighting targets, so the policy surrogate must not differentiate
+        through the value head via the advantage. Invalid positions are
+        zero. ``participate`` is ``1`` for a step that stays in the loss
+        and in logged metrics.
     """
     with torch.no_grad():
         values = values.detach()
@@ -83,13 +89,25 @@ def _gae_advantages(
         device = rewards.device
         dtype = rewards.dtype
         next_values = values[1:]
-        if not bootstrap_cutoff:
-            # Continuation after s_{t+1} is sampled only when pair t+1 stays in-run.
-            sampled = torch.zeros(T, dtype=torch.bool, device=device)
-            if T > 1:
-                sampled[:-1] = valid[1:]
+        # Continuation after s_{t+1} is sampled only when pair t+1 stays in-run.
+        sampled = torch.zeros(T, dtype=torch.bool, device=device)
+        if T > 1:
+            sampled[:-1] = valid[1:]
+        if bootstrap_cutoff:
+            participate = torch.ones(T, dtype=dtype, device=device)
+        else:
             next_values = torch.where(
                 sampled, next_values, torch.zeros_like(next_values)
+            )
+            # λ = 0 does not carry a later cutoff value. A non-zero λ does,
+            # and that factor drops the step when the value is off-data.
+            carries = sampled if gae_lambda != 0.0 else torch.zeros(
+                T, dtype=torch.bool, device=device
+            )
+            participate = _zero_off_data_factor_scan(
+                discount=discounts,
+                in_sample=sampled,
+                carries=carries,
             )
         advantages = torch.zeros(T, device=device, dtype=dtype)
         gae = torch.zeros((), device=device, dtype=dtype)
@@ -99,7 +117,7 @@ def _gae_advantages(
             gae = torch.where(valid[t], gae, torch.zeros_like(gae))
             advantages[t] = gae
         returns = advantages + values[:-1]
-    return advantages, returns
+    return advantages, returns, participate
 
 
 class PpoObjective(Objective):
@@ -181,9 +199,13 @@ class PpoObjective(Objective):
             leaves the sampled run (end of the batch, or a
             ``sequence_id`` / ``grouping_field`` break): a chunk
             boundary, time limit, or truncation whose rest was not
-            sampled. ``False`` omits that value. ``V`` at a state that
-            still has a later in-run step is unchanged. A true terminal
-            is unchanged either way: its γ already multiplies the value.
+            sampled. That step stays in the loss and in logged metrics.
+            ``False`` drops the step from both when the factor on that
+            off-data value is non-zero. A zero factor leaves the value
+            out of the target, so the step stays. Reaching past the
+            sample is not enough. ``V`` at a state that still has a
+            later in-run step is unchanged. A true terminal is unchanged
+            either way: its γ is ``0``, so the factor is already ``0``.
         clip_eps: PPO ratio clip ε.
         vf_coef: Weight on the value-function MSE term.
         ent_coef: Weight on the policy entropy bonus (subtracted from the loss).
@@ -375,7 +397,7 @@ class PpoObjective(Objective):
         )
         discounts = discount_all[1:]
 
-        advantages, returns = _gae_advantages(
+        advantages, returns, participate = _gae_advantages(
             rewards=next_rewards,
             values=values,
             discounts=discounts,
@@ -383,6 +405,8 @@ class PpoObjective(Objective):
             gae_lambda=self.gae_lambda,
             bootstrap_cutoff=self.bootstrap_cutoff,
         )
+        pair_weight = pair_weight * participate
+        valid = pair_weight > 0
 
         log_probs_all = F.log_softmax(curr_logits, dim=-1)
         new_log_prob = log_probs_all.gather(
