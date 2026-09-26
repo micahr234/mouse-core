@@ -40,13 +40,18 @@ class TokenizerModalitySpec:
     step value into exactly one placeholder ``{field}``; a format spec
     such as ``"{field:.0f}"`` is allowed. Omit ``input_field=`` and the
     field is a const: ``output_field=`` names it and ``format=`` is the
-    literal string to tokenize (no placeholders). ``skip=`` and
+    literal string to tokenize (no placeholders).     ``skip=`` and
     ``format_skipped=`` are a pair: when the step value equals
     ``skip``, ``format_skipped=`` is tokenized instead (a literal,
-    including ``""`` for no tokens). ``format=`` / ``format_skipped=``
-    / const ``format=`` are all ``str.format`` strings: write ``{{`` /
-    ``}}`` for a literal brace in any of them. ``token`` / ``image``
-    do not accept ``format=`` / ``format_skipped=``.
+    including ``""`` for no tokens). ``when_field=`` and
+    ``when_equals=`` are a pair: the field emits only when that other
+    step value equals ``when_equals`` (a missing key does not).
+    Otherwise the field emits nothing, and its own ``required`` /
+    ``skip`` are not consulted. Unrelated fields leave both unset and
+    emit as before. ``format=`` / ``format_skipped=`` / const
+    ``format=`` are all ``str.format`` strings: write ``{{`` / ``}}``
+    for a literal brace in any of them. ``token`` / ``image`` do not
+    accept ``format=`` / ``format_skipped=``.
 
     ``required`` (default ``True``) means the step must carry
     ``input_field``; a missing / ``None`` value raises. With
@@ -75,6 +80,8 @@ class TokenizerModalitySpec:
     format_skipped: str | None = None
     max_tokens: int | None = None
     skip: Any = None
+    when_field: str | None = None
+    when_equals: Any = None
     required: bool = True
     head_output: bool = False
 
@@ -97,6 +104,7 @@ class TokenizerModalitySpec:
             _validate_max_tokens(self)
         else:
             self._reject_max_tokens(k)
+        _validate_when_pair(self)
 
     def _init_text(self) -> None:
         if self.input_field is None:
@@ -128,6 +136,7 @@ class TokenizerModalitySpec:
             )
         _validate_skip_pair(self)
         _validate_max_tokens(self)
+        _validate_when_pair(self)
 
     def _init_named_input(self) -> None:
         if not self.input_field:
@@ -170,6 +179,11 @@ class TokenizerModalitySpec:
                 f"{kind} tokenizer modalities do not accept required=False "
                 "(no input_field; the field always emits)"
             )
+        if self.when_field is not None or self.when_equals is not None:
+            raise TypeError(
+                f"{kind} tokenizer modalities do not accept when_field= "
+                "(no input_field; the field always emits)"
+            )
 
 
 def _text_format_placeholders(format_str: str | None, *, who: str | None) -> list[str]:
@@ -202,6 +216,28 @@ def _validate_max_tokens(spec: TokenizerModalitySpec) -> None:
             f"tokenizer modality {spec.output_field!r} max_tokens must be >= 1"
         )
     object.__setattr__(spec, "max_tokens", n)
+
+
+def _validate_when_pair(spec: TokenizerModalitySpec) -> None:
+    name = spec.output_field or spec.input_field
+    if spec.input_field is None:
+        return
+    if (spec.when_field is None) != (spec.when_equals is None):
+        raise TypeError(
+            f"tokenizer modality {name!r} when_field= and when_equals= "
+            "must be set together"
+        )
+    if spec.when_field is None:
+        return
+    if not isinstance(spec.when_field, str) or spec.when_field == "":
+        raise TypeError(
+            f"tokenizer modality {name!r} when_field= must be a non-empty string"
+        )
+    if spec.head_output:
+        raise ValueError(
+            f"tokenizer modality {name!r} is head_output and cannot set "
+            "when_field= (that field must emit on every step)"
+        )
 
 
 def _validate_skip_pair(spec: TokenizerModalitySpec) -> None:

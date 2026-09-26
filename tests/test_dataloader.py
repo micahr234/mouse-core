@@ -53,6 +53,12 @@ def _tokenizer(*, objective_fields: list[dict[str, str]] | None = None) -> Token
     return Tokenizer(
         input_fields=[
             {"type": "token", "input_field": "action", "head_output": True},
+            {
+                "type": "token",
+                "input_field": "episode_index",
+                "when_field": "step_index",
+                "when_equals": 0,
+            },
         ],
         objective_fields=keep,
         grouping_field="grouping_id",

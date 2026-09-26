@@ -11,7 +11,13 @@ from mouse_core.data import Tokenizer, pack_token_batch, to_device
 def _tok(**kwargs) -> Tokenizer:
     return Tokenizer(
         input_fields=[
-            {"type": "token", "input_field": "action", "head_output": True}
+            {"type": "token", "input_field": "action", "head_output": True},
+            {
+                "type": "token",
+                "input_field": "episode_index",
+                "when_field": "step_index",
+                "when_equals": 0,
+            },
         ],
         objective_fields=[{"input_field": "reward"}, {"input_field": "action"}],
         grouping_field="task_index",
@@ -86,7 +92,13 @@ def test_objective_column_stays_int_when_all_steps_are_int() -> None:
 def test_objective_vector_column_promotes_dtype() -> None:
     tok = Tokenizer(
         input_fields=[
-            {"type": "token", "input_field": "action", "head_output": True}
+            {"type": "token", "input_field": "action", "head_output": True},
+            {
+                "type": "token",
+                "input_field": "episode_index",
+                "when_field": "step_index",
+                "when_equals": 0,
+            },
         ],
         objective_fields=[{"input_field": "q"}],
         grouping_field="task_index",
@@ -104,7 +116,13 @@ def test_objective_ragged_float_vectors_pad_with_neg_inf() -> None:
     """Shorter rows are padded with -inf (the nonexistent-action sentinel), not 0."""
     tok = Tokenizer(
         input_fields=[
-            {"type": "token", "input_field": "action", "head_output": True}
+            {"type": "token", "input_field": "action", "head_output": True},
+            {
+                "type": "token",
+                "input_field": "episode_index",
+                "when_field": "step_index",
+                "when_equals": 0,
+            },
         ],
         objective_fields=[{"input_field": "q"}],
         grouping_field="task_index",
@@ -124,7 +142,13 @@ def test_objective_ragged_int_vectors_raise() -> None:
     """Integer columns have no padding sentinel, so ragged shapes are an error."""
     tok = Tokenizer(
         input_fields=[
-            {"type": "token", "input_field": "action", "head_output": True}
+            {"type": "token", "input_field": "action", "head_output": True},
+            {
+                "type": "token",
+                "input_field": "episode_index",
+                "when_field": "step_index",
+                "when_equals": 0,
+            },
         ],
         objective_fields=[{"input_field": "q"}],
         grouping_field="task_index",
@@ -140,7 +164,13 @@ def test_objective_ragged_int_vectors_raise() -> None:
 def test_objective_mixed_rank_raises() -> None:
     tok = Tokenizer(
         input_fields=[
-            {"type": "token", "input_field": "action", "head_output": True}
+            {"type": "token", "input_field": "action", "head_output": True},
+            {
+                "type": "token",
+                "input_field": "episode_index",
+                "when_field": "step_index",
+                "when_equals": 0,
+            },
         ],
         objective_fields=[{"input_field": "q"}],
         grouping_field="task_index",
@@ -166,6 +196,12 @@ def test_positions_index_tokens_within_modality_per_step() -> None:
         input_fields=[
             {"type": "token", "input_field": "action"},
             {"type": "text", "output_field": "value", "format": "ab", "head_output": True},
+            {
+                "type": "token",
+                "input_field": "episode_index",
+                "when_field": "step_index",
+                "when_equals": 0,
+            },
         ],
         tokenizer=_FakeTokenizer(),
         objective_fields=[],

@@ -58,8 +58,28 @@ def _text_pair(hidden_dim: int = 8, **kwargs):
     head_output = kwargs.pop("head_output", "action")
     if kwargs:
         raise TypeError(f"unexpected kwargs: {sorted(kwargs)}")
+    fields = _tokenizer_fields(input_fields, head_output=head_output)
+    if not any(
+        field.get("input_field") == "episode_index"
+        or field.get("output_field") == "episode_index"
+        for field in fields
+    ):
+        head_at = next(
+            (i for i, field in enumerate(fields) if field.get("head_output")),
+            len(fields),
+        )
+        fields.insert(
+            head_at,
+            {
+                "type": "text",
+                "input_field": "episode_index",
+                "format": "{field}",
+                "when_field": "step_index",
+                "when_equals": 0,
+            },
+        )
     tokenizer = Tokenizer(
-        input_fields=_tokenizer_fields(input_fields, head_output=head_output),
+        input_fields=fields,
         group_prefix=group_prefix,
         tokenizer=hf_tok,
         image_tokenizer=image_tokenizer,
@@ -139,6 +159,12 @@ def test_text_tokenizer_field_format_uses_str() -> None:
     tokenizer = Tokenizer(
         input_fields=[
             {"type": "text", "input_field": "reward", "format": "{field}", "head_output": True},
+            {
+                "type": "token",
+                "input_field": "episode_index",
+                "when_field": "step_index",
+                "when_equals": 0,
+            },
         ],
         tokenizer=_FakeTokenizer(),
         grouping_field="grouping_id",
@@ -155,6 +181,12 @@ def test_text_tokenizer_field_format_spec() -> None:
                 "input_field": "reward",
                 "format": "{field:.0f}",
                 "head_output": True,
+            },
+            {
+                "type": "token",
+                "input_field": "episode_index",
+                "when_field": "step_index",
+                "when_equals": 0,
             },
         ],
         tokenizer=_FakeTokenizer(),
@@ -174,11 +206,17 @@ def test_text_tokenizer_omitted_input_field_is_const() -> None:
                 "format": ",value",
                 "head_output": True,
             },
+            {
+                "type": "token",
+                "input_field": "episode_index",
+                "when_field": "step_index",
+                "when_equals": 0,
+            },
         ],
         tokenizer=_FakeTokenizer(),
         grouping_field="grouping_id",
     )
-    spec = tokenizer.input_fields[-1]
+    spec = next(field for field in tokenizer.input_fields if field.output_field == "value")
     assert spec.input_field is None
     assert spec.output_field == "value"
     assert spec.format == ",value"
@@ -201,6 +239,12 @@ def test_text_tokenizer_const_format_rejects_placeholder() -> None:
                     "format": ",{value}",
                     "head_output": True,
                 },
+                {
+                    "type": "token",
+                    "input_field": "episode_index",
+                    "when_field": "step_index",
+                    "when_equals": 0,
+                },
             ],
             tokenizer=_FakeTokenizer(),
             grouping_field="grouping_id",
@@ -216,6 +260,12 @@ def test_text_tokenizer_max_tokens_allows_at_limit() -> None:
                 "format": "x",
                 "max_tokens": 1,
                 "head_output": True,
+            },
+            {
+                "type": "token",
+                "input_field": "episode_index",
+                "when_field": "step_index",
+                "when_equals": 0,
             },
         ],
         tokenizer=_FakeTokenizer(),
@@ -236,6 +286,12 @@ def test_text_tokenizer_max_tokens_raises_when_exceeded() -> None:
                 "format": "xy",
                 "max_tokens": 1,
                 "head_output": True,
+            },
+            {
+                "type": "token",
+                "input_field": "episode_index",
+                "when_field": "step_index",
+                "when_equals": 0,
             },
         ],
         tokenizer=_FakeTokenizer(),
@@ -258,6 +314,12 @@ def test_text_tokenizer_max_tokens_must_be_positive() -> None:
                     "max_tokens": 0,
                     "head_output": True,
                 },
+                {
+                    "type": "token",
+                    "input_field": "episode_index",
+                    "when_field": "step_index",
+                    "when_equals": 0,
+                },
             ],
             tokenizer=_FakeTokenizer(),
             grouping_field="grouping_id",
@@ -271,6 +333,12 @@ def test_text_tokenizer_const_requires_output_field() -> None:
         Tokenizer(
             input_fields=[
                 {"type": "text", "format": "value", "head_output": True},
+                {
+                    "type": "token",
+                    "input_field": "episode_index",
+                    "when_field": "step_index",
+                    "when_equals": 0,
+                },
             ],
             tokenizer=_FakeTokenizer(),
             grouping_field="grouping_id",
@@ -299,6 +367,12 @@ def test_text_tokenizer_format_skipped_emits_literal() -> None:
                 "skip": 0.0,
                 "format_skipped": ",",
             },
+            {
+                "type": "token",
+                "input_field": "episode_index",
+                "when_field": "step_index",
+                "when_equals": 0,
+            },
         ],
         tokenizer=_CaptureTok(),
         grouping_field="grouping_id",
@@ -321,6 +395,12 @@ def test_text_tokenizer_skip_requires_format_skipped() -> None:
                     "skip": 0.0,
                     "head_output": True,
                 },
+                {
+                    "type": "token",
+                    "input_field": "episode_index",
+                    "when_field": "step_index",
+                    "when_equals": 0,
+                },
             ],
             tokenizer=_FakeTokenizer(),
             grouping_field="grouping_id",
@@ -340,6 +420,12 @@ def test_text_tokenizer_format_skipped_requires_skip() -> None:
                     "format_skipped": ",",
                     "head_output": True,
                 },
+                {
+                    "type": "token",
+                    "input_field": "episode_index",
+                    "when_field": "step_index",
+                    "when_equals": 0,
+                },
             ],
             tokenizer=_FakeTokenizer(),
             grouping_field="grouping_id",
@@ -353,6 +439,12 @@ def test_text_tokenizer_requires_field_format() -> None:
         Tokenizer(
             input_fields=[
                 {"type": "text", "input_field": "observation", "head_output": True},
+                {
+                    "type": "token",
+                    "input_field": "episode_index",
+                    "when_field": "step_index",
+                    "when_equals": 0,
+                },
             ],
             tokenizer=_FakeTokenizer(),
             grouping_field="grouping_id",
@@ -370,6 +462,12 @@ def test_text_tokenizer_field_format_must_use_field_placeholder() -> None:
                     "input_field": "observation",
                     "format": "{observation}",
                     "head_output": True,
+                },
+                {
+                    "type": "token",
+                    "input_field": "episode_index",
+                    "when_field": "step_index",
+                    "when_equals": 0,
                 },
             ],
             tokenizer=_FakeTokenizer(),
@@ -393,6 +491,12 @@ def test_text_tokenizer_const_and_format_skipped_unescape_braces() -> None:
                 "format_skipped": "{{-}}",
             },
             {"type": "text", "output_field": "c", "format": "{{c}}", "head_output": True},
+            {
+                "type": "token",
+                "input_field": "episode_index",
+                "when_field": "step_index",
+                "when_equals": 0,
+            },
         ],
         tokenizer=_FakeTokenizer(),
         grouping_field="grouping_id",
@@ -414,6 +518,12 @@ def test_text_tokenizer_optional_missing_value_emits_nothing() -> None:
                 "format_skipped": ",",
             },
             {"type": "text", "output_field": "v", "format": "\n", "head_output": True},
+            {
+                "type": "token",
+                "input_field": "episode_index",
+                "when_field": "step_index",
+                "when_equals": 0,
+            },
         ],
         tokenizer=_FakeTokenizer(),
         grouping_field="grouping_id",
@@ -433,7 +543,14 @@ def test_text_tokenizer_required_defaults_true() -> None:
     assert TokenizerModalitySpec(type="text", output_field="c", format="c").required is True
     assert TokenizerModalitySpec(type="token", input_field="a").required is True
     tokenizer = Tokenizer(
-        input_fields=[{"type": "text", "input_field": "a", "format": "{field}", "head_output": True}],
+        input_fields=[{"type": "text", "input_field": "a", "format": "{field}", "head_output": True},
+            {
+                "type": "token",
+                "input_field": "episode_index",
+                "when_field": "step_index",
+                "when_equals": 0,
+            },
+        ],
         tokenizer=_FakeTokenizer(),
         grouping_field="grouping_id",
     )
@@ -487,6 +604,12 @@ def test_text_tokenizer_rejects_duplicate_field_names_across_types() -> None:
             input_fields=[
                 {"type": "text", "input_field": "a", "output_field": "value", "format": "{field}"},
                 {"type": "token", "input_field": "value", "head_output": True},
+                {
+                    "type": "token",
+                    "input_field": "episode_index",
+                    "when_field": "step_index",
+                    "when_equals": 0,
+                },
             ],
             tokenizer=_FakeTokenizer(),
             grouping_field="grouping_id",
@@ -496,6 +619,12 @@ def test_text_tokenizer_rejects_duplicate_field_names_across_types() -> None:
             input_fields=[
                 {"type": "text", "input_field": "a", "format": "{field}"},
                 {"type": "token", "input_field": "a", "head_output": True},
+                {
+                    "type": "token",
+                    "input_field": "episode_index",
+                    "when_field": "step_index",
+                    "when_equals": 0,
+                },
             ],
             tokenizer=_FakeTokenizer(),
             grouping_field="grouping_id",
@@ -511,7 +640,14 @@ def test_token_modality_is_single_embed_row() -> None:
     tokenizer, backbone = _text_pair(
         hidden_dim=D,
         embed_tokens=emb,
-        input_fields=[{"type": "token", "input_field": "action"}],
+        input_fields=[{"type": "token", "input_field": "action"},
+            {
+                "type": "token",
+                "input_field": "episode_index",
+                "when_field": "step_index",
+                "when_equals": 0,
+            },
+        ],
         objective_fields=_obj("action"),
     )
     embeds, indices = backbone.embed(batch_to_token_batch(tokenizer, [[{"action": 16}]]))
@@ -539,6 +675,12 @@ def test_text_tokenizer_tokenizes_each_field_separately() -> None:
         input_fields=[
             {"type": "text", "input_field": "observation", "format": "o={field}"},
             {"type": "text", "input_field": "action", "format": "a={field}"},
+            {
+                "type": "token",
+                "input_field": "episode_index",
+                "when_field": "step_index",
+                "when_equals": 0,
+            },
         ],
         objective_fields=_obj("action"),
     )
@@ -560,6 +702,12 @@ def test_identity_embed_image_token_ids() -> None:
         input_fields=[
             {"type": "text", "input_field": "observation", "format": "{field}"},
             {"type": "image", "input_field": "pixels"},
+            {
+                "type": "token",
+                "input_field": "episode_index",
+                "when_field": "step_index",
+                "when_equals": 0,
+            },
         ],
         objective_fields=_obj("observation", "pixels"),
         head_output="pixels",
@@ -627,6 +775,12 @@ def _group_prefix_tokenizer(**kwargs):
     return Tokenizer(
         input_fields=[
             {"type": "token", "input_field": "action", "head_output": True},
+            {
+                "type": "token",
+                "input_field": "episode_index",
+                "when_field": "step_index",
+                "when_equals": 0,
+            },
         ],
         group_prefix=kwargs.pop("group_prefix", "task={task_index}\n"),
         tokenizer=kwargs.pop("tokenizer", _FakeTokenizer()),
@@ -763,6 +917,12 @@ def test_text_tokenizer_group_prefix_without_text_fields_adds_text_modality() ->
     tok = Tokenizer(
         input_fields=[
             {"type": "token", "input_field": "action", "head_output": True},
+            {
+                "type": "token",
+                "input_field": "episode_index",
+                "when_field": "step_index",
+                "when_equals": 0,
+            },
         ],
         group_prefix="task={task_index}\n",
         tokenizer=_FakeTokenizer(),
@@ -781,7 +941,14 @@ def test_token_pack_ignores_missing_group_prefix() -> None:
     from mouse_core.data import Tokenizer, pack_token_batch
 
     tok = Tokenizer(
-        input_fields=[{"type": "token", "input_field": "action", "head_output": True}],
+        input_fields=[{"type": "token", "input_field": "action", "head_output": True},
+            {
+                "type": "token",
+                "input_field": "episode_index",
+                "when_field": "step_index",
+                "when_equals": 0,
+            },
+        ],
         objective_fields=_obj("action"),
         grouping_field="task_index",
     )
@@ -792,3 +959,156 @@ def test_token_pack_ignores_missing_group_prefix() -> None:
     inputs, _ = pack_token_batch(steps=steps, sequence_ids=[0, 0], batch_size=1)
     assert inputs.L == steps[0].T + steps[1].T
     assert steps[0].group_prefix_ids is None
+
+
+def test_episode_index_emits_only_on_step_zero() -> None:
+    """``episode_index`` is text only when ``step_index`` is 0, including a later episode."""
+    seen: list[str] = []
+
+    class _CaptureTok:
+
+        def __call__(
+            self, text: str, add_special_tokens: bool = False, return_tensors: str | None = None
+        ):
+            seen.append(text)
+            ids = [ord(c) % 20 + 1 for c in text] or [1]
+            return {"input_ids": torch.tensor([ids], dtype=torch.long)}
+
+    tok = Tokenizer(
+        input_fields=[
+            {"type": "text", "input_field": "action", "format": "{field}"},
+            {
+                "type": "text",
+                "input_field": "episode_index",
+                "format": ",e={field}",
+                "when_field": "step_index",
+                "when_equals": 0,
+            },
+            {
+                "type": "text",
+                "output_field": "value",
+                "format": "\n",
+                "max_tokens": 1,
+                "head_output": True,
+            },
+        ],
+        tokenizer=_CaptureTok(),
+        grouping_field="task_index",
+    )
+
+    def rendered(*, episode_index: int, step_index: Any) -> list[str]:
+        seen.clear()
+        tok(
+            {
+                "action": 1,
+                "episode_index": episode_index,
+                "step_index": step_index,
+                "task_index": 3,
+            }
+        )
+        return list(seen)
+
+    assert rendered(episode_index=0, step_index=0) == ["1", ",e=0", "\n"]
+    assert rendered(episode_index=0, step_index=torch.tensor(0)) == ["1", ",e=0", "\n"]
+    assert rendered(episode_index=0, step_index=1) == ["1", "\n"]
+    assert rendered(episode_index=0, step_index=2) == ["1", "\n"]
+    # Same task, later episode, its own zero step.
+    assert rendered(episode_index=4, step_index=0) == ["1", ",e=4", "\n"]
+    assert rendered(episode_index=4, step_index=5) == ["1", "\n"]
+    seen.clear()
+    tok({"action": 1, "episode_index": 2, "task_index": 3})
+    assert seen == ["1", "\n"]
+
+
+def test_token_episode_index_emits_only_on_step_zero() -> None:
+    tok = Tokenizer(
+        input_fields=[
+            {"type": "token", "input_field": "action", "head_output": True},
+            {
+                "type": "token",
+                "input_field": "episode_index",
+                "when_field": "step_index",
+                "when_equals": 0,
+            },
+        ],
+        grouping_field="task_index",
+    )
+    zero = tok({"action": 1, "episode_index": 4, "step_index": 0, "task_index": 0})
+    assert zero.ids.tolist() == [1, 4]
+    assert zero.head_output_mask.tolist() == [True, False]
+    later = tok({"action": 1, "episode_index": 4, "step_index": 2, "task_index": 0})
+    assert later.ids.tolist() == [1]
+    again = tok({"action": 1, "episode_index": 9, "step_index": 0, "task_index": 0})
+    assert again.ids.tolist() == [1, 9]
+
+
+def test_when_field_and_when_equals_are_a_pair() -> None:
+    import pytest
+
+    with pytest.raises(TypeError, match="must be set together"):
+        Tokenizer(
+            input_fields=[
+                {
+                    "type": "text",
+                    "input_field": "episode_index",
+                    "format": ",e={field}",
+                    "when_field": "step_index",
+                    "head_output": True,
+                }
+            ],
+            tokenizer=_FakeTokenizer(),
+            grouping_field="task_index",
+        )
+    with pytest.raises(TypeError, match="must be set together"):
+        Tokenizer(
+            input_fields=[
+                {
+                    "type": "token",
+                    "input_field": "episode_index",
+                    "when_equals": 0,
+                    "head_output": True,
+                }
+            ],
+            grouping_field="task_index",
+        )
+
+
+def test_head_output_and_const_reject_when_field() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="head_output"):
+        Tokenizer(
+            input_fields=[
+                {
+                    "type": "text",
+                    "input_field": "episode_index",
+                    "format": "{field}",
+                    "when_field": "step_index",
+                    "when_equals": 0,
+                    "head_output": True,
+                }
+            ],
+            tokenizer=_FakeTokenizer(),
+            grouping_field="task_index",
+        )
+    with pytest.raises(TypeError, match="when_field"):
+        Tokenizer(
+            input_fields=[
+                {
+                    "type": "text",
+                    "output_field": "value",
+                    "format": "\n",
+                    "when_field": "step_index",
+                    "when_equals": 0,
+                    "head_output": True,
+                },
+                {
+                    "type": "token",
+                    "input_field": "episode_index",
+                    "when_field": "step_index",
+                    "when_equals": 0,
+                },
+            ],
+            tokenizer=_FakeTokenizer(),
+            grouping_field="task_index",
+        )

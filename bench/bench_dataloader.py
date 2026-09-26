@@ -74,6 +74,8 @@ def _synthetic_rows(n: int, *, seed: int) -> list[dict[str, Any]]:
                 "episode_done": episode_done,
                 "task_done": task_done,
                 "task_index": task,
+                "episode_index": episode,
+                "step_index": ep_step,
                 "info_q_star": rng.random(_MAX_ACTIONS, dtype=np.float32).tolist(),
             }
         )
@@ -133,6 +135,13 @@ def _train_transform() -> Any:
                 "format": "d={field},",
                 "skip": 0,
                 "format_skipped": "",
+            },
+            {
+                "type": "text",
+                "input_field": "episode_index",
+                "format": "e={field},",
+                "when_field": "step_index",
+                "when_equals": 0,
             },
             {
                 "type": "text",

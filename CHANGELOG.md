@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Tokenizer fields take ``when_field=`` and ``when_equals=`` together.
+  The field emits only when that step value equals ``when_equals``.
+  Any other value, or a missing key, emits nothing. Fields that leave
+  the pair unset are unchanged. Text and token constructions emit
+  ``episode_index`` only when ``step_index`` is ``0``, including a
+  later episode's zero step in the same task.
 - ``DataLoader(episode_start=False)`` (default) may start a sampled window
   mid-episode. ``episode_start=True`` starts every window at an episode
   start: store index 0, or the step after a non-zero ``episode_done``,

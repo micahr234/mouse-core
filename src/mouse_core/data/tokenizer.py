@@ -69,7 +69,11 @@ class Tokenizer:
     names it and ``format=`` is the literal string (no placeholders;
     ``{{`` / ``}}`` for a literal brace, as in every ``format=``).
     ``skip=`` / ``format_skipped=`` replace the run with that literal
-    when the step value matches ``skip``. A ``required=False`` field
+    when the step value matches ``skip``. ``when_field=`` /
+    ``when_equals=`` emit the field only when that other step value
+    equals ``when_equals``; any other value, or a missing key, emits
+    nothing (``required`` / ``skip`` are not consulted). Leave both
+    unset and the field emits as before. A ``required=False`` field
     whose value is missing / ``None`` emits nothing (``format_skipped=``
     does not apply). ``max_tokens=`` (``text`` / ``image``) raises if
     that run is longer. ``group_prefix=`` is a format string over the raw
@@ -352,6 +356,8 @@ def _tokenize_step(
 
     for m in meta:
         spec = m.spec
+        if not _when_emits(spec, row):
+            continue
         if m.kind == KIND_TEXT:
             rendered = _field_text_value(spec, row)
             if rendered is None:
@@ -434,6 +440,20 @@ def _tokenize_step(
         objective_fields=copy_keep_fields(row, objective_fields_keep),
         **group_prefix_kwargs,
     )
+
+
+def _when_emits(spec: TokenizerModalitySpec, row: dict) -> bool:
+    """True when this field should emit on ``row``.
+
+    ``when_field=`` / ``when_equals=`` gate emission. A missing key is
+    not a match, so the field emits nothing. Fields that leave the pair
+    unset always pass.
+    """
+    if spec.when_field is None:
+        return True
+    if spec.when_field not in row:
+        return False
+    return values_equal(row[spec.when_field], spec.when_equals)
 
 
 def _render_group_prefix(group_prefix: str, row: dict[str, Any]) -> str:

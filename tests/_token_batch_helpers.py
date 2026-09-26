@@ -30,6 +30,23 @@ def token_tokenizer(
     ]
     if input_fields:
         input_fields[-1]["head_output"] = True
+    if input_fields and not any(
+        field.get("input_field") == "episode_index"
+        or field.get("output_field") == "episode_index"
+        for field in input_fields
+    ):
+        head_at = next(
+            i for i, field in enumerate(input_fields) if field.get("head_output")
+        )
+        input_fields.insert(
+            head_at,
+            {
+                "type": "token",
+                "input_field": "episode_index",
+                "when_field": "step_index",
+                "when_equals": 0,
+            },
+        )
     if objective_fields is None:
         resolved = [{"input_field": name} for name in fields]
     elif objective_fields and isinstance(objective_fields[0], str):

@@ -237,6 +237,12 @@ def test_tokenizer_roundtrip(tmp_path) -> None:
             {"type": "token", "input_field": "action"},
             {"type": "token", "input_field": "episode_done", "required": False},
             {"type": "token", "input_field": "done_code", "head_output": True},
+            {
+                "type": "token",
+                "input_field": "episode_index",
+                "when_field": "step_index",
+                "when_equals": 0,
+            },
         ],
         grouping_field="task_index",
         objective_fields=[
@@ -258,9 +264,16 @@ def test_tokenizer_roundtrip(tmp_path) -> None:
         ("episode_done", "episode_done"),
         ("task_done", "task_done"),
     )
-    assert [s.input_field for s in loaded.input_fields] == ["action", "episode_done", "done_code"]
+    assert [s.input_field for s in loaded.input_fields] == [
+        "action",
+        "episode_done",
+        "done_code",
+        "episode_index",
+    ]
     assert loaded.input_fields[1].required is False
     assert loaded.input_fields[2].head_output is True
+    assert loaded.input_fields[3].when_field == "step_index"
+    assert loaded.input_fields[3].when_equals == 0
     assert sum(1 for s in loaded.input_fields if s.head_output) == 1
 
 
@@ -277,7 +290,14 @@ def test_push_model_to_hub_requires_distinct_tokenizer_repo() -> None:
         reasoner=None,
     )
     tokenizer = Tokenizer(
-        input_fields=[{"type": "token", "input_field": "action", "head_output": True}],
+        input_fields=[{"type": "token", "input_field": "action", "head_output": True},
+            {
+                "type": "token",
+                "input_field": "episode_index",
+                "when_field": "step_index",
+                "when_equals": 0,
+            },
+        ],
         grouping_field="task_index",
         objective_fields=[],
     )
