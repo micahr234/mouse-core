@@ -54,6 +54,7 @@ def _gae_advantages(
     discounts: torch.Tensor,
     valid: torch.Tensor,
     gae_lambda: float,
+    bootstrap: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Generalized advantage estimation over valid consecutive pairs.
 
@@ -64,6 +65,11 @@ def _gae_advantages(
         valid: ``[N-1]`` mask — False at run boundaries (different
             ``sequence_id`` or grouping).
         gae_lambda: GAE λ.
+        bootstrap: ``True`` adds ``V`` at a state whose next step is not an
+            in-run pair (end of the batch, or a run break). ``False`` omits
+            that value. ``V`` at a state that still has a later in-run step
+            is unchanged. A ``0`` discount (true terminal) removes the value
+            either way.
 
     Returns:
         ``(advantages, returns)`` each ``[N-1]``, detached from autograd:
@@ -76,10 +82,19 @@ def _gae_advantages(
         T = rewards.shape[0]
         device = rewards.device
         dtype = rewards.dtype
+        next_values = values[1:]
+        if not bootstrap:
+            # Continuation after s_{t+1} is sampled only when pair t+1 stays in-run.
+            sampled = torch.zeros(T, dtype=torch.bool, device=device)
+            if T > 1:
+                sampled[:-1] = valid[1:]
+            next_values = torch.where(
+                sampled, next_values, torch.zeros_like(next_values)
+            )
         advantages = torch.zeros(T, device=device, dtype=dtype)
         gae = torch.zeros((), device=device, dtype=dtype)
         for t in range(T - 1, -1, -1):
-            delta = rewards[t] + discounts[t] * values[t + 1] - values[t]
+            delta = rewards[t] + discounts[t] * next_values[t] - values[t]
             gae = delta + discounts[t] * gae_lambda * gae
             gae = torch.where(valid[t], gae, torch.zeros_like(gae))
             advantages[t] = gae
@@ -162,6 +177,13 @@ class PpoObjective(Objective):
             any ``value(value=..., **objective_data)`` returning the same
             shape is accepted.
         gae_lambda: GAE λ (``1.0`` = Monte Carlo returns within the discount).
+        bootstrap: Required. ``True`` adds ``V`` where the continuation
+            leaves the sampled run (end of the batch, or a
+            ``sequence_id`` / ``grouping_field`` break): a chunk
+            boundary, time limit, or truncation whose rest was not
+            sampled. ``False`` omits that value. ``V`` at a state that
+            still has a later in-run step is unchanged. A true terminal
+            is unchanged either way: its γ already multiplies the value.
         clip_eps: PPO ratio clip ε.
         vf_coef: Weight on the value-function MSE term.
         ent_coef: Weight on the policy entropy bonus (subtracted from the loss).
@@ -184,6 +206,7 @@ class PpoObjective(Objective):
         reward: Reward | None,
         value: Value | None,
         gae_lambda: float = 0.95,
+        bootstrap: bool,
         clip_eps: float = 0.2,
         vf_coef: float = 0.5,
         ent_coef: float = 0.01,
@@ -199,6 +222,7 @@ class PpoObjective(Objective):
         self.reward = _require_transform(reward, name="reward")
         self.value = _require_transform(value, name="value")
         self.gae_lambda = gae_lambda
+        self.bootstrap = bool(bootstrap)
         self.clip_eps = clip_eps
         self.vf_coef = vf_coef
         self.ent_coef = ent_coef
@@ -328,6 +352,7 @@ class PpoObjective(Objective):
             discounts=discounts,
             valid=valid,
             gae_lambda=self.gae_lambda,
+            bootstrap=self.bootstrap,
         )
 
         log_probs_all = F.log_softmax(curr_logits, dim=-1)

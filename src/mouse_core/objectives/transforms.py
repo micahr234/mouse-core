@@ -314,7 +314,9 @@ class Gate(Protocol):
     same place the reward and γ of that transition are stored. Entries
     with ``s <= t`` are ignored. A ``0`` bootstraps ``V`` at that step.
     The objective then zeros any continuation that would leave the run
-    (``sequence_id`` / ``grouping_field``). Values must lie in
+    (``sequence_id`` / ``grouping_field``). ``bootstrap=False`` on the
+    objective does not add ``V`` at that masked cutoff; a gate ``0`` on
+    a step still inside the run still bootstraps. Values must lie in
     ``[0, 1]``. One row cumprod.
     """
 
