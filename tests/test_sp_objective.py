@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 
 from mouse_core.objectives import SpObjective, best_action
-from mouse_core.objectives.sp import sp_ce, sp_js
+from mouse_core.objectives.sp import sp_ce
 
 
 def _episode_done(*shape: int, fill: int = 0) -> torch.Tensor:
@@ -25,7 +25,7 @@ def test_sp_objective_ce_uses_best_action_ids() -> None:
     q = torch.tensor([[[0.0, 1.0, -torch.inf]]])
     objective_data = _ce_data(q)
     predictions = torch.tensor([[[0.0, 1.0, 100.0]]])
-    loss, metrics = SpObjective(loss_type="ce", targets_key="best_action")(
+    loss, metrics = SpObjective(targets_key="best_action")(
         objective_data=objective_data, predictions=predictions
     )
     assert loss.ndim == 0
@@ -37,7 +37,7 @@ def test_sp_objective_ce_skips_nonzero_mask_rows() -> None:
     q = torch.tensor([[[0.0, 0.0], [0.0, 1.0], [0.0, 1.0]]])
     logits = torch.tensor([[[0.0, 100.0], [100.0, 0.0], [0.0, 100.0]]])
     objective_data = _ce_data(q, episode_done=torch.tensor([[1, 2, 0]], dtype=torch.int64))
-    loss, _ = SpObjective(loss_type="ce", targets_key="best_action")(
+    loss, _ = SpObjective(targets_key="best_action")(
         objective_data=objective_data, predictions=logits
     )
     assert loss.item() < 1e-4
@@ -46,7 +46,7 @@ def test_sp_objective_ce_skips_nonzero_mask_rows() -> None:
 def test_sp_objective_ce_mask_key_none_keeps_terminals() -> None:
     objective_data = {"best_action": torch.tensor([[0]])}
     predictions = torch.tensor([[[0.0, 100.0]]])
-    loss, _ = SpObjective(loss_type="ce", targets_key="best_action", mask_key=None)(
+    loss, _ = SpObjective(targets_key="best_action", mask_key=None)(
         objective_data=objective_data, predictions=predictions
     )
     assert loss.item() > 1.0
@@ -59,7 +59,7 @@ def test_sp_objective_ce_rejects_out_of_range_actions() -> None:
     }
     predictions = torch.tensor([[[0.0, 1.0]]])
     try:
-        SpObjective(loss_type="ce", targets_key="best_action")(
+        SpObjective(targets_key="best_action")(
             objective_data=objective_data, predictions=predictions
         )
     except ValueError as exc:
@@ -68,32 +68,13 @@ def test_sp_objective_ce_rejects_out_of_range_actions() -> None:
         raise AssertionError("expected ValueError for out-of-range action")
 
 
-def test_sp_objective_soft_losses_finite_with_padded_actions() -> None:
-    """-inf padding sentinels must not blow up any soft loss or its gradient."""
-    torch.manual_seed(0)
-    q = torch.randn(2, 3, 4)
-    q[..., -1] = -torch.inf
-    objective_data = {"info_q_star": q, "episode_done": _episode_done(2, 3)}
-    for loss_type in ("kl-fwd", "kl-bwd", "ce-soft-fwd", "ce-soft-bwd", "js"):
-        logits = torch.randn(2, 3, 4, requires_grad=True)
-        predictions = logits
-        loss, _ = SpObjective(loss_type=loss_type, label_smoothing=0.1)(
-            objective_data=objective_data, predictions=predictions
-        )
-        loss.backward()
-        assert torch.isfinite(loss), loss_type
-        assert logits.grad is not None and torch.isfinite(logits.grad).all(), loss_type
-        assert logits.grad[..., -1].abs().max() == 0.0, loss_type
-
-
-def test_sp_objective_soft_losses_ignore_padded_student_logits() -> None:
-    """A junk student logit at a padded slot must not affect the loss."""
-    q = torch.tensor([[[1.0, 2.0, 3.0, -torch.inf]]])
-    objective_data = {"info_q_star": q, "episode_done": _episode_done(1, 1)}
-    matching = torch.tensor([[[1.0, 2.0, 3.0, 100.0]]])
-    for direction in ("kl-fwd", "kl-bwd"):
-        loss, _ = SpObjective(loss_type=direction)(objective_data=objective_data, predictions=matching)
-        assert loss.item() < 1e-06, direction
+def test_sp_objective_requires_targets_key() -> None:
+    try:
+        SpObjective()  # type: ignore[call-arg]
+    except TypeError as exc:
+        assert "targets_key" in str(exc)
+    else:
+        raise AssertionError("expected TypeError for missing targets_key")
 
 
 def test_best_action_unique_max_is_deterministic() -> None:
@@ -152,28 +133,7 @@ def test_sp_objective_custom_targets_key_for_ce() -> None:
         "episode_done": _episode_done(1, 1),
     }
     predictions = torch.tensor([[[0.0, 1.0]]])
-    loss, _ = SpObjective(loss_type="ce", targets_key="teacher_action")(
+    loss, _ = SpObjective(targets_key="teacher_action")(
         objective_data=objective_data, predictions=predictions
     )
     assert loss.item() > 0.0
-
-
-def test_sp_js_scales_by_temperature_squared() -> None:
-    q = torch.tensor([[1.0, 0.0, -1.0]])
-    logits = torch.tensor([[0.5, 0.2, -0.1]])
-    unscaled = sp_js(q, logits, temperature=1.0)
-    scaled = sp_js(q, logits, temperature=2.0)
-    # Softmax(x/T) at T=2 is not 4× the T=1 JS; only the explicit T² factor
-    # is asserted relative to the T=1 formula on the T=2 distributions.
-    from mouse_core.objectives.sp import _soft_distributions
-    import math
-    import torch.nn.functional as F
-
-    log_t, log_s = _soft_distributions(q, logits, 2.0, 0.0)
-    log_m = torch.logaddexp(log_t, log_s) - math.log(2.0)
-    js = 0.5 * (
-        F.kl_div(log_m, log_t, log_target=True, reduction="none").sum(-1)
-        + F.kl_div(log_m, log_s, log_target=True, reduction="none").sum(-1)
-    ).mean()
-    assert torch.allclose(scaled, js * 4.0)
-    assert unscaled.ndim == 0
