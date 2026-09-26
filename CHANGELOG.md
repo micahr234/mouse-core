@@ -268,6 +268,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still takes head instances, not name strings.
 
 ### Fixed
+- ``Model`` calls each head as a module. ``head.forward`` had skipped
+  forward and backward hooks, so a hook on the head never saw the
+  gradient into the pooled hidden state.
 - DQN continuation backups read the gate's ``[N, N]`` matrix in row
   blocks instead of gathering a second square window and a stack of
   full-size cumprod tensors. ``general_gate`` multiplies into one

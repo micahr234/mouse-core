@@ -7,6 +7,7 @@ import copy
 import pytest
 import torch
 
+from mouse_core.models.base import _run_heads
 from mouse_core.models.heads import ClassificationHead, RegressionHead
 
 
@@ -70,6 +71,36 @@ def test_propagate_gradient_rejects_bad_values(bad: object) -> None:
             use_norm=True,
             propagate_gradient=bad,  # type: ignore[arg-type]
         )
+
+
+def test_run_heads_fires_per_head_backward_hooks() -> None:
+    """The pooled-state hook sees that head's scaled grad, not the sum."""
+    torch.manual_seed(0)
+    full = _filled_head(propagate_gradient=1.0)
+    half = _filled_head(propagate_gradient=0.5)
+    half.load_state_dict(full.state_dict())
+    seen: dict[str, torch.Tensor | None] = {}
+
+    def hook(name: str):
+        def _hook(
+            module: torch.nn.Module,
+            grad_input: tuple[torch.Tensor | None, ...],
+            grad_output: tuple[torch.Tensor | None, ...],
+        ) -> None:
+            del module, grad_output
+            seen[name] = grad_input[0] if grad_input else None
+
+        return _hook
+
+    full.register_full_backward_hook(hook("full"))
+    half.register_full_backward_hook(hook("half"))
+    hidden = torch.randn(3, 8, requires_grad=True)
+    preds = _run_heads({"full": full, "half": half}, hidden)
+    (preds["full"].sum() + preds["half"].sum()).backward()
+    full_grad = seen["full"]
+    half_grad = seen["half"]
+    assert full_grad is not None and half_grad is not None
+    assert torch.allclose(half_grad, full_grad * 0.5)
 
 
 def test_classification_head_accepts_propagate_gradient() -> None:

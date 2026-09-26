@@ -667,9 +667,14 @@ def _run_heads(
     heads: dict[str, BaseHead],
     h: torch.Tensor,
 ) -> dict[str, torch.Tensor]:
-    """Run ``heads`` on pooled last-layer ``h`` (``[N, D]`` or ``[B, S, D]``)."""
+    """Run ``heads`` on pooled last-layer ``h`` (``[N, D]`` or ``[B, S, D]``).
+
+    Each head is called as a module. ``head.forward`` skips forward and
+    backward hooks, so a hook on the head would never see the gradient
+    into this pooled state.
+    """
     h = h.float()
-    return {name: head_fn.forward(h) for name, head_fn in heads.items()}
+    return {name: head(h) for name, head in heads.items()}
 
 
 @dataclass
@@ -1422,6 +1427,8 @@ class Model(nn.Module):
         """Run enabled heads on pooled last-layer ``h``.
 
         Heads take ``[N, D]`` (train) or ``[B, S, D]`` (decode).
+        Each head is called as a module, so its forward and backward
+        hooks run.
         """
         return _run_heads(self._heads, h)
 
