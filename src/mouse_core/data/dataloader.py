@@ -7,6 +7,15 @@ A ``Datastore`` is a flat sequence of arbitrary rows. The loader samples
 :class:`~mouse_core.data.token_batch.TokenBatch` plus a CPU
 ``dict[str, Tensor]`` of step-level objective columns.
 
+``episode_start=False`` (the default) may begin a window at any store
+offset, including mid-episode. ``episode_start=True`` begins every window
+at an episode start: index 0, or the step after a non-zero ``episode_done``
+(a later episode packed into the same store counts). The window then runs
+forward for ``min(sequence_length, steps remaining in the store)`` — the
+same ragged suffix as unrestricted sampling. A short episode does not add
+padding or a second cutoff; if the store runs out first, the window is
+shorter.
+
 The loader is stage-agnostic: compose augmenter / tokenizer
 (or any ``dict → StepTokens`` callable) outside and pass the result as
 ``transform=``. Before each sampled sequence ``b`` of batch ``k``, if
@@ -98,6 +107,43 @@ class _SnapshotConfig:
     sequence_length: int
     batch_size: int
     index_field: str | None
+    episode_starts: tuple[np.ndarray, ...] | None
+
+
+def _done_codes(*, column: Any, n: int) -> np.ndarray:
+    """``episode_done`` as a length-``n`` array. Object columns are unwrapped."""
+    values = np.asarray(column)
+    if values.dtype != object and values.shape == (n,):
+        return values
+    raw = list(column)
+    if len(raw) != n:
+        raise ValueError(
+            f"episode_done length ({len(raw)}) does not match the store ({n})."
+        )
+    codes = np.empty(n, dtype=np.int64)
+    for i, value in enumerate(raw):
+        codes[i] = int(_normalize_value(value))
+    return codes
+
+
+def _episode_start_indices(*, ds: Any) -> np.ndarray:
+    """Offsets where an episode starts, including a later packed episode.
+
+    Index 0 is a start. So is the step after every non-zero ``episode_done``
+    (terminated ``1`` or truncated ``2``). An empty store has no starts.
+    """
+    n = len(ds)
+    if n == 0:
+        return np.zeros(0, dtype=np.int64)
+    if "episode_done" not in ds.column_names:
+        raise ValueError(
+            "episode_start=True requires an episode_done column on every store."
+        )
+    done = _done_codes(column=ds["episode_done"], n=n)
+    if n == 1:
+        return np.zeros(1, dtype=np.int64)
+    after = np.flatnonzero(done[:-1] != 0).astype(np.int64, copy=False) + 1
+    return np.concatenate((np.zeros(1, dtype=np.int64), after))
 
 
 def _fetch_sequence(
@@ -115,7 +161,14 @@ def _fetch_sequence(
     if n < 1:
         raise ValueError("Cannot sample from an empty store.")
 
-    start = int(rng.integers(0, n))
+    if cfg.episode_starts is None:
+        start = int(rng.integers(0, n))
+    else:
+        starts = cfg.episode_starts[store_idx]
+        if len(starts) == 0:
+            raise ValueError("Cannot sample episode starts from a store with no episodes.")
+        start = int(starts[int(rng.integers(0, len(starts)))])
+    # Same suffix rule either way: stop at the store end, do not pad.
     end = min(start + S_max, n)
     hf_slice = ds[start:end]
     count = end - start
@@ -246,6 +299,13 @@ class DataLoader:
         at construction (and on :meth:`refresh`) via ``Datastore.to_dataset()``.
     sequence_length :
         Maximum length of each contiguous window (in steps).
+    episode_start :
+        When ``False`` (default), a window may start at any store offset,
+        including mid-episode. When ``True``, every window starts at the
+        first step of an episode (index 0, or the step after a non-zero
+        ``episode_done``). A later episode in the same store is a start.
+        The window still runs forward until ``sequence_length`` or the
+        store ends. A short suffix is a shorter window; rows are not padded.
     batch_size :
         How many such windows per batch.
     transform :
@@ -270,6 +330,7 @@ class DataLoader:
         sequence_length: int,
         batch_size: int,
         transform: StepTransform,
+        episode_start: bool = False,
         index_field: str | None = None,
         weights: list[float] | None = None,
         weight_mode: str = "per_store",
@@ -302,6 +363,10 @@ class DataLoader:
             raise ValueError(f"weight_mode must be 'per_store' or 'per_step', got {weight_mode!r}")
         if sequence_length < 1:
             raise ValueError(f"sequence_length must be >= 1, got {sequence_length}.")
+        if not isinstance(episode_start, bool):
+            raise TypeError(
+                f"episode_start must be a bool, got {type(episode_start).__name__}."
+            )
         if batch_size < 1:
             raise ValueError(f"batch_size must be >= 1, got {batch_size}.")
         if prefetch < 1:
@@ -321,6 +386,7 @@ class DataLoader:
         self.stores = stores
         self.sequence_length = sequence_length
         self.batch_size = batch_size
+        self.episode_start = episode_start
         self.weight_mode = weight_mode
         self.seed = seed
         self.transform = transform
@@ -337,6 +403,7 @@ class DataLoader:
         self._datasets: list = []
         self._ns: list[int] = []
         self._probs: np.ndarray = np.empty(0)
+        self._episode_starts: tuple[np.ndarray, ...] | None = None
         self._resnapshot_stores()
 
         if num_workers > 0:
@@ -409,7 +476,7 @@ class DataLoader:
         )
         return (
             f"DataLoader(stores=[{store_info}], S_max={self.sequence_length}, "
-            f"B={self.batch_size}, seed={self.seed})"
+            f"B={self.batch_size}, episode_start={self.episode_start}, seed={self.seed})"
         )
 
     def _snapshot_config(self) -> _SnapshotConfig:
@@ -420,6 +487,7 @@ class DataLoader:
             sequence_length=self.sequence_length,
             batch_size=self.batch_size,
             index_field=self.index_field,
+            episode_starts=self._episode_starts,
         )
 
     def _start_workers(self) -> None:
@@ -469,6 +537,11 @@ class DataLoader:
     def _resnapshot_stores(self) -> None:
         self._datasets = [s.to_dataset() for s in self.stores]
         self._ns = [len(ds) for ds in self._datasets]
+        self._episode_starts = (
+            tuple(_episode_start_indices(ds=ds) for ds in self._datasets)
+            if self.episode_start
+            else None
+        )
 
         w = self._weights.copy()
         ns = np.array(self._ns, dtype=float)

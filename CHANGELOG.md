@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- ``DataLoader(episode_start=False)`` (default) may start a sampled window
+  mid-episode. ``episode_start=True`` starts every window at an episode
+  start: store index 0, or the step after a non-zero ``episode_done``,
+  including a later episode packed into the same store. Window length
+  stays ``min(sequence_length, steps remaining in the store)``. A short
+  suffix is a shorter window; rows are not padded.
 - ``bootstrap_cutoff`` on ``DqnObjective``, ``RetraceObjective``, and
   ``PpoObjective``. Required. ``True`` adds the value where the
   continuation leaves the sampled run (end of the batch, or a
