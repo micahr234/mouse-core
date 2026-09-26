@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from typing import overload
+
 import torch
 import torch.nn.functional as F
 
-from mouse_core.objectives.base import Objective
+from mouse_core.objectives.base import Objective, _reject_predictions, _require_prediction
 from mouse_core.objectives.transforms import (
     Discount,
     Gate,
@@ -651,15 +653,44 @@ class DqnObjective(Objective):
         self.cql_scale_q_eps = cql_scale_q_eps
         self.gate = _require_transform(gate, name="gate")
 
+    @overload
     def __call__(
         self,
         *,
         objective_data: dict[str, torch.Tensor],
         predictions: torch.Tensor,
         delayed_predictions: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, float]]: ...
+
+    @overload
+    def __call__(
+        self,
+        *,
+        objective_data: dict[str, torch.Tensor],
+        predictions: torch.Tensor,
+        delayed_predictions: torch.Tensor,
+        value_predictions: None = None,
+        behavior_predictions: None = None,
+    ) -> tuple[torch.Tensor, dict[str, float]]: ...
+
+    def __call__(
+        self,
+        *,
+        objective_data: dict[str, torch.Tensor],
+        predictions: torch.Tensor,
+        delayed_predictions: torch.Tensor | None = None,
+        value_predictions: torch.Tensor | None = None,
+        behavior_predictions: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
+        _reject_predictions(
+            "DqnObjective",
+            value_predictions=value_predictions,
+            behavior_predictions=behavior_predictions,
+        )
         q: torch.Tensor = predictions
-        q_target: torch.Tensor = delayed_predictions.detach()
+        q_target: torch.Tensor = _require_prediction(
+            delayed_predictions, owner="DqnObjective", name="delayed_predictions"
+        ).detach()
 
         if q.ndim != 2:
             raise ValueError(

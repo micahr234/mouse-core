@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import pytest
 import torch
@@ -38,7 +38,7 @@ _BATCH = [
 def _backbone(
     lora: LoRAConfig | None,
     *,
-    architecture: str = "qwen3",
+    architecture: Literal["llama", "qwen3"] = "qwen3",
     dtype: torch.dtype = torch.float32,
 ):
     return TransformerBackbone(architecture=architecture, train_kernel="reference", decode_kernel="flex", dtype=dtype, use_norm=True, hidden_dim=_HIDDEN, num_layers=2, num_heads=2, max_position_embeddings=64, vocab_size=32, lora=lora)
@@ -95,13 +95,14 @@ def test_apply_lora_wraps_every_linear_and_freezes_base() -> None:
     cfg = LoRAConfig(rank=2)
     backbone = _backbone(None)
     inner = backbone.model
+    module = cast(nn.Module, inner)
     n_linear = sum(isinstance(m, nn.Linear) for m in inner.modules())
     assert n_linear == 7 * 2  # q/k/v/o + gate/up/down, two layers
     assert all(p.requires_grad for p in inner.parameters())
-    wrapped = apply_lora(model=inner, config=cfg)
+    wrapped = apply_lora(model=module, config=cfg)
     assert all(not p.requires_grad for n, p in inner.named_parameters() if ".lora_" not in n)
     assert wrapped == n_linear
-    assert _unadapted_linears(inner) == []
+    assert _unadapted_linears(module) == []
     for raw_layer in inner.layers:
         layer = cast(Any, raw_layer)
         assert isinstance(layer.self_attn.q_proj, LoRALinear)
@@ -114,7 +115,7 @@ def test_apply_lora_wraps_every_linear_and_freezes_base() -> None:
     trainable = {n for n, p in inner.named_parameters() if p.requires_grad}
     assert trainable
     assert all(".lora_A." in n or ".lora_B." in n for n in trainable)
-    assert len(list(lora_modules(inner))) == wrapped
+    assert len(list(lora_modules(module))) == wrapped
 
 
 def test_apply_lora_rejects_module_without_linear() -> None:
@@ -131,7 +132,7 @@ def test_backbone_without_lora_is_fully_trainable() -> None:
 
 
 @pytest.mark.parametrize("architecture", ["qwen3", "llama"])
-def test_backbone_lora_kwarg_on_both_transformers(architecture) -> None:
+def test_backbone_lora_kwarg_on_both_transformers(architecture: Literal["llama", "qwen3"]) -> None:
     backbone = _backbone(LoRAConfig(rank=2), architecture=architecture)
     assert backbone.lora == LoRAConfig(rank=2)
     assert len(list(lora_modules(backbone))) == 7 * 2

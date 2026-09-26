@@ -56,7 +56,7 @@ def _nstep(**overrides: object) -> DqnObjective:
     return DqnObjective(**kwargs)  # type: ignore[arg-type]
 
 
-def _lambda_fixture() -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+def _lambda_fixture() -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
     """Three in-run steps. Action from s0 is 0; from s1 is 1.
 
     Delayed max-Q is 3 at s1 and 100 at s2. Rewards out of s0 / s1 are 1

@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import numpy as np
 import pytest
+import torch
 from datasets import Dataset
 
 from mouse_core.data import (

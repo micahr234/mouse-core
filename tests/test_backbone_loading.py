@@ -67,7 +67,8 @@ def test_backbones_can_drop_the_final_norm(tmp_path) -> None:
 
 def test_transformer_backbone_requires_use_norm() -> None:
     with pytest.raises(TypeError, match="use_norm"):
-        TransformerBackbone(architecture="qwen3", 
+        TransformerBackbone(  # type: ignore[call-arg]
+            architecture="qwen3",
             train_kernel="reference", decode_kernel="flex", dtype=torch.float32,
             hidden_dim=8, num_layers=1, num_heads=2,
         )

@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, overload
 
 import torch
 import torch.nn.functional as F
 
-from mouse_core.objectives.base import Objective
+from mouse_core.objectives.base import Objective, _reject_predictions
 
 
 class SvObjective(Objective):
@@ -34,12 +34,40 @@ class SvObjective(Objective):
         self.loss_type = loss_type
         self.targets_key = targets_key
 
+    @overload
     def __call__(
         self,
         *,
         objective_data: dict[str, torch.Tensor],
         predictions: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, float]]: ...
+
+    @overload
+    def __call__(
+        self,
+        *,
+        objective_data: dict[str, torch.Tensor],
+        predictions: torch.Tensor,
+        delayed_predictions: None = None,
+        value_predictions: None = None,
+        behavior_predictions: None = None,
+    ) -> tuple[torch.Tensor, dict[str, float]]: ...
+
+    def __call__(
+        self,
+        *,
+        objective_data: dict[str, torch.Tensor],
+        predictions: torch.Tensor,
+        delayed_predictions: torch.Tensor | None = None,
+        value_predictions: torch.Tensor | None = None,
+        behavior_predictions: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
+        _reject_predictions(
+            "SvObjective",
+            delayed_predictions=delayed_predictions,
+            value_predictions=value_predictions,
+            behavior_predictions=behavior_predictions,
+        )
         logits: torch.Tensor = predictions
 
         A = logits.shape[-1]

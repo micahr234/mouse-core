@@ -6,10 +6,12 @@ reinforcement learning* (2016). https://arxiv.org/abs/1606.02647
 
 from __future__ import annotations
 
+from typing import overload
+
 import torch
 import torch.nn.functional as F
 
-from mouse_core.objectives.base import Objective
+from mouse_core.objectives.base import Objective, _reject_predictions, _require_prediction
 from mouse_core.objectives.dqn import (
     _affine_scan_backward,
     _boltzmann_entropy,
@@ -332,6 +334,7 @@ class RetraceObjective(Objective):
         self.cql_weight = cql_weight
         self.cql_scale_q_eps = cql_scale_q_eps
 
+    @overload
     def __call__(
         self,
         *,
@@ -339,9 +342,38 @@ class RetraceObjective(Objective):
         predictions: torch.Tensor,
         delayed_predictions: torch.Tensor,
         behavior_predictions: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, float]]: ...
+
+    @overload
+    def __call__(
+        self,
+        *,
+        objective_data: dict[str, torch.Tensor],
+        predictions: torch.Tensor,
+        delayed_predictions: torch.Tensor,
+        behavior_predictions: torch.Tensor,
+        value_predictions: None = None,
+    ) -> tuple[torch.Tensor, dict[str, float]]: ...
+
+    def __call__(
+        self,
+        *,
+        objective_data: dict[str, torch.Tensor],
+        predictions: torch.Tensor,
+        delayed_predictions: torch.Tensor | None = None,
+        value_predictions: torch.Tensor | None = None,
+        behavior_predictions: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
+        _reject_predictions("RetraceObjective", value_predictions=value_predictions)
         q: torch.Tensor = predictions
-        q_target: torch.Tensor = delayed_predictions.detach()
+        q_target: torch.Tensor = _require_prediction(
+            delayed_predictions, owner="RetraceObjective", name="delayed_predictions"
+        ).detach()
+        behavior_in = _require_prediction(
+            behavior_predictions,
+            owner="RetraceObjective",
+            name="behavior_predictions",
+        )
 
         if q.ndim != 2:
             raise ValueError(
@@ -358,7 +390,7 @@ class RetraceObjective(Objective):
                 f"match online shape {tuple(q.shape)}."
             )
         behavior_logits = _require_aligned(
-            behavior_predictions, shape=q.shape, who="Retrace"
+            behavior_in, shape=q.shape, who="Retrace"
         )
         q_target_raw = q_target  # π is taken over the head's own Q (get_action units)
         P, A = q.shape
