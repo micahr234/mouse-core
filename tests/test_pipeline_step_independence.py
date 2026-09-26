@@ -27,7 +27,7 @@ def _io(*pairs: tuple[str, str]) -> list[dict[str, str]]:
 def _tok_in(
     *names: str, type: str = "token", head_output: str | None = None
 ) -> list[dict[str, Any]]:
-    return [
+    fields: list[dict[str, Any]] = [
         {
             "type": type,
             "input_field": name,
@@ -35,6 +35,20 @@ def _tok_in(
         }
         for name in names
     ]
+    if not any(
+        field.get("input_field") == "episode_index"
+        or field.get("output_field") == "episode_index"
+        for field in fields
+    ):
+        fields.append(
+            {
+                "type": "token",
+                "input_field": "episode_index",
+                "when_field": "step_index",
+                "when_equals": 0,
+            }
+        )
+    return fields
 
 
 def _rows() -> list[dict]:
@@ -77,6 +91,12 @@ def test_tokenizer_renames_input_and_objective_fields() -> None:
                 "input_field": "act",
                 "output_field": "action",
                 "head_output": True,
+            },
+            {
+                "type": "token",
+                "input_field": "episode_index",
+                "when_field": "step_index",
+                "when_equals": 0,
             },
         ],
         objective_fields=_io(("q", "info_q_star")),

@@ -61,6 +61,14 @@ def _head_output_tokenizer(
 ) -> Tokenizer:
     fields: list[dict] = [{"type": "token", "input_field": name} for name in token_fields]
     fields.append(
+        {
+            "type": "token",
+            "input_field": "episode_index",
+            "when_field": "step_index",
+            "when_equals": 0,
+        }
+    )
+    fields.append(
         {"type": "text", "output_field": "value", "format": value, "head_output": True}
     )
     if tail is not None:
@@ -128,7 +136,14 @@ def _packed(model: Model):
 def test_tokenizer_requires_exactly_one_head_output_field() -> None:
     with pytest.raises(ValueError, match="exactly one input field with"):
         Tokenizer(
-            input_fields=[{"type": "token", "input_field": "action"}],
+            input_fields=[{"type": "token", "input_field": "action"},
+                {
+                    "type": "token",
+                    "input_field": "episode_index",
+                    "when_field": "step_index",
+                    "when_equals": 0,
+                },
+            ],
             grouping_field="task_index",
         )
     with pytest.raises(ValueError, match="exactly one input field with"):
@@ -136,6 +151,12 @@ def test_tokenizer_requires_exactly_one_head_output_field() -> None:
             input_fields=[
                 {"type": "token", "input_field": "action", "head_output": True},
                 {"type": "token", "input_field": "obs", "head_output": True},
+                {
+                    "type": "token",
+                    "input_field": "episode_index",
+                    "when_field": "step_index",
+                    "when_equals": 0,
+                },
             ],
             grouping_field="task_index",
         )
@@ -152,6 +173,12 @@ def test_step_without_head_output_token_raises() -> None:
                 "skip": 0.0,
                 "format_skipped": "",
                 "head_output": True,
+            },
+            {
+                "type": "token",
+                "input_field": "episode_index",
+                "when_field": "step_index",
+                "when_equals": 0,
             },
         ],
         tokenizer=_FakeTokenizer(),
