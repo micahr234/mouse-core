@@ -43,8 +43,7 @@ def token_tokenizer(
             {
                 "type": "token",
                 "input_field": "episode_index",
-                "when_field": "step_index",
-                "when_equals": 0,
+                "when": {"equals": [("step_index", 0)]},
             },
         )
     if objective_fields is None:

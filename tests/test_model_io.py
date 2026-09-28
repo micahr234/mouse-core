@@ -250,8 +250,7 @@ def test_tokenizer_roundtrip(tmp_path) -> None:
             {
                 "type": "token",
                 "input_field": "episode_index",
-                "when_field": "step_index",
-                "when_equals": 0,
+                "when": {"equals": [("step_index", 0)]},
             },
         ],
         grouping_field="task_index",
@@ -281,12 +280,11 @@ def test_tokenizer_roundtrip(tmp_path) -> None:
     ]
     assert loaded.input_fields[1].required is False
     assert loaded.input_fields[2].head_output is True
-    assert loaded.input_fields[3].when_field == "step_index"
-    assert loaded.input_fields[3].when_equals == 0
+    assert loaded.input_fields[3].when == {"equals": [("step_index", 0)]}
     assert sum(1 for s in loaded.input_fields if s.head_output) == 1
 
 
-def test_tokenizer_roundtrip_when_group_start_and_not_equals(tmp_path) -> None:
+def test_tokenizer_roundtrip_group_start_and_not_equals(tmp_path) -> None:
     class _Tok:
         def __call__(self, text: str, add_special_tokens: bool = False):
             return {"input_ids": [1, 2]}
@@ -297,14 +295,13 @@ def test_tokenizer_roundtrip_when_group_start_and_not_equals(tmp_path) -> None:
                 "type": "text",
                 "output_field": "group_start",
                 "format": "hello\n",
-                "when_group_start": True,
+                "when": {"group_start": True},
             },
             {
                 "type": "text",
                 "input_field": "reward",
                 "format": "{field}",
-                "when_field": "reward",
-                "when_not_equals": 0.0,
+                "when": {"not_equals": [("reward", 0.0)]},
             },
             {"type": "token", "input_field": "action", "head_output": True},
         ],
@@ -313,11 +310,9 @@ def test_tokenizer_roundtrip_when_group_start_and_not_equals(tmp_path) -> None:
     )
     save_tokenizer(tokenizer=tokenizer, path=tmp_path)
     loaded = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizer=_Tok())
-    assert loaded.input_fields[0].when_group_start is True
+    assert loaded.input_fields[0].when == {"group_start": True}
     assert loaded.input_fields[0].output_field == "group_start"
-    assert loaded.input_fields[1].when_field == "reward"
-    assert loaded.input_fields[1].when_not_equals == 0.0
-    assert loaded.input_fields[1].when_equals is None
+    assert loaded.input_fields[1].when == {"not_equals": [("reward", 0.0)]}
     st = loaded({"action": 1, "reward": 1.0, "task_index": 0})
     assert st.group_start_ids is not None
     assert st.group_start_ids.tolist() == [1, 2]
@@ -340,8 +335,7 @@ def test_push_model_to_hub_requires_distinct_tokenizer_repo() -> None:
             {
                 "type": "token",
                 "input_field": "episode_index",
-                "when_field": "step_index",
-                "when_equals": 0,
+                "when": {"equals": [("step_index", 0)]},
             },
         ],
         grouping_field="task_index",

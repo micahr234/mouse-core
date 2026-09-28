@@ -84,11 +84,14 @@ def test_run_heads_fires_per_head_backward_hooks() -> None:
     def hook(name: str):
         def _hook(
             module: torch.nn.Module,
-            grad_input: tuple[torch.Tensor | None, ...],
-            grad_output: tuple[torch.Tensor | None, ...],
+            grad_input: object,
+            grad_output: object,
         ) -> None:
             del module, grad_output
-            seen[name] = grad_input[0] if grad_input else None
+            if isinstance(grad_input, tuple) and grad_input:
+                seen[name] = grad_input[0]  # type: ignore[assignment]
+            else:
+                seen[name] = None
 
         return _hook
 

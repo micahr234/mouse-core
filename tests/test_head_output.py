@@ -64,8 +64,7 @@ def _head_output_tokenizer(
         {
             "type": "token",
             "input_field": "episode_index",
-            "when_field": "step_index",
-            "when_equals": 0,
+            "when": {"equals": [("step_index", 0)]},
         }
     )
     fields.append(
@@ -141,8 +140,7 @@ def test_tokenizer_requires_exactly_one_head_output_field() -> None:
                 {
                     "type": "token",
                     "input_field": "episode_index",
-                    "when_field": "step_index",
-                    "when_equals": 0,
+                    "when": {"equals": [("step_index", 0)]},
                 },
             ],
             grouping_field="task_index",
@@ -155,8 +153,7 @@ def test_tokenizer_requires_exactly_one_head_output_field() -> None:
                 {
                     "type": "token",
                     "input_field": "episode_index",
-                    "when_field": "step_index",
-                    "when_equals": 0,
+                    "when": {"equals": [("step_index", 0)]},
                 },
             ],
             grouping_field="task_index",
@@ -177,8 +174,7 @@ def test_step_without_head_output_token_raises() -> None:
             {
                 "type": "token",
                 "input_field": "episode_index",
-                "when_field": "step_index",
-                "when_equals": 0,
+                "when": {"equals": [("step_index", 0)]},
             },
         ],
         tokenizer=_FakeTokenizer(),
@@ -192,16 +188,15 @@ def test_step_without_head_output_token_raises() -> None:
         tok({"action": 1, "reward": None, "task_index": 0})
 
 
-def test_head_output_rejects_when_field() -> None:
-    with pytest.raises(ValueError, match="head_output and cannot set when_field"):
+def test_head_output_rejects_when() -> None:
+    with pytest.raises(ValueError, match="head_output and cannot set when="):
         Tokenizer(
             input_fields=[
                 {
                     "type": "text",
                     "input_field": "reward",
                     "format": "{field}",
-                    "when_field": "reward",
-                    "when_not_equals": 0.0,
+                    "when": {"not_equals": [("reward", 0.0)]},
                     "head_output": True,
                 },
             ],
@@ -210,15 +205,15 @@ def test_head_output_rejects_when_field() -> None:
         )
 
 
-def test_head_output_rejects_when_group_start() -> None:
-    with pytest.raises(ValueError, match="head_output and cannot set when_group_start"):
+def test_head_output_rejects_group_start() -> None:
+    with pytest.raises(ValueError, match="head_output and cannot set when="):
         Tokenizer(
             input_fields=[
                 {
                     "type": "text",
                     "output_field": "value",
                     "format": "\n",
-                    "when_group_start": True,
+                    "when": {"group_start": True},
                     "head_output": True,
                 },
             ],
