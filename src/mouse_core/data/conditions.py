@@ -35,8 +35,10 @@ Each callable receives a column mapping ``name → 1-d array`` over the
 rows being considered and must return a boolean numpy array of the
 same length. ``sample_start`` marks legal window starts (the matching
 row itself). ``sample_end`` marks the inclusive end row; if set but
-never met before ``sequence_length`` / store end, sampling raises.
-``None`` leaves starts unrestricted / never truncates early.
+never met before ``sequence_length`` / store end for a chosen start,
+that draw is skipped and another start is sampled. Exhaustion or a
+yielded window that lacks an end match raises. ``None`` leaves starts
+unrestricted / never truncates early.
 
 Example full-task FrozenLake windows (predicates defined by the
 caller)::

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- ``DataLoader`` with ``sample_end`` set: a chosen start that never
+  hits an end match before ``sequence_length`` / store end is
+  **skipped** and another start is sampled (no silent truncate). Raises
+  ``ValueError`` only when every candidate start is incomplete, after
+  too many consecutive misses (``_SAMPLE_END_MAX_RETRIES``), or if a
+  yielded window somehow lacks an end match (invariant guard). Docs,
+  examples, and tests follow.
+
 ### Added
 - Tokenizer ``when=`` and ``DataLoader`` ``sample_start`` /
   ``sample_end`` take callables. Tokenizer ``when`` is ``ctx → bool``:
@@ -20,9 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   benches define any FrozenLake-shaped predicates **inline** (not a
   shared helper module) — e.g. ``when_group_start``,
   ``when_reward_nonzero``, ``full_task_start`` / ``full_task_end``.
-  If ``sample_end`` is set but never met before
-  ``sequence_length`` or the store end, ``next_batch`` raises
-  ``ValueError``.
+  Incomplete ``sample_end`` starts are skipped (see Changed).
 - ``best_action(q)``: integer action id per row, uniform among finite
   maxima (``-inf`` padding never selected). ``SpObjective`` callers that
   distill from Q* run this outside and pass the ids as ``targets=``.
@@ -121,10 +128,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``sample_start`` / ``sample_end`` so each packed sequence is one
   full task (episode-0 start through ``task_done != 0`` inclusive).
   Example ``SEQUENCE_LENGTH`` is ``MAX_TASK_EPISODES * MAX_STEPS_PER_EPISODE``
-  (a safety cap so the end-match wins). If ``sample_end`` is set but no
-  matching row appears before ``sequence_length`` or the store end,
-  ``next_batch`` raises ``ValueError`` instead of returning a truncated
-  segment.
+  (a safety cap so the end-match wins). Incomplete ``sample_end``
+  starts are skipped rather than truncated (see Changed above).
 - Tokenizer fields use inline condition callables in each notebook:
   FrozenLake prompt via ``when_group_start``, reward / episode_done
   zeros via ``when_reward_nonzero`` / ``when_episode_done_nonzero``,
