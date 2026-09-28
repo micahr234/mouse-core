@@ -53,7 +53,7 @@ def _nstep(**overrides: object) -> DqnObjective:
         grouping_field=None, temperature=0.0, double=False, bootstrap_cutoff=True, discount=_disc(), reward=_rew(), value=_val(),
     )
     kwargs.update(overrides)
-    return DqnObjective(**kwargs)  # type: ignore[arg-type]
+    return DqnObjective(**kwargs, reward_centering=None)  # type: ignore[arg-type]
 
 
 def _lambda_fixture() -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
@@ -85,13 +85,13 @@ def test_nstep_requires_gate_and_double() -> None:
         DqnObjective(  # type: ignore[call-arg]
             grouping_field=None, temperature=0.0, double=False,
             discount=_disc(), reward=_rew(), value=_val(),
-         bootstrap_cutoff=True)
+         bootstrap_cutoff=True, reward_centering=None)
     with pytest.raises(TypeError, match="double"):
         DqnObjective(  # type: ignore[call-arg]
             gate=nstep_gate(n=1),
             grouping_field=None, temperature=0.0,
             discount=_disc(), reward=_rew(), value=_val(),
-         bootstrap_cutoff=True)
+         bootstrap_cutoff=True, reward_centering=None)
 
 
 def test_nstep_gate_rejects_non_positive_n() -> None:
@@ -112,7 +112,7 @@ def test_nstep_requires_delayed_predictions() -> None:
 def test_nstep_one_matches_dqn() -> None:
     step_stream, predictions, delayed = _lambda_fixture()
     nstep, metrics = _nstep(n=1)(objective_data=step_stream, predictions=predictions,  delayed_predictions=delayed)
-    dqn, _ = DqnObjective( grouping_field=None, temperature=0.0, double=False, gate=None, discount=_disc(), reward=_rew(), value=_val(), bootstrap_cutoff=True)(
+    dqn, _ = DqnObjective( grouping_field=None, temperature=0.0, double=False, gate=None, discount=_disc(), reward=_rew(), value=_val(), bootstrap_cutoff=True, reward_centering=None)(
         objective_data=step_stream, predictions=predictions,  delayed_predictions=delayed
     )
     assert abs(nstep.item() - dqn.item()) < 1e-05
@@ -317,7 +317,7 @@ def test_nstep_temperature_matches_dqn_one_step() -> None:
         }
     predictions, delayed = _q(torch.zeros(2, 2), torch.zeros(2, 2))
     nstep_loss, nstep_m = _nstep(temperature=1.0)(objective_data=step_stream, predictions=predictions,  delayed_predictions=delayed)
-    dqn_loss, dqn_m = DqnObjective( temperature=1.0, double=False, gate=None, grouping_field=None, discount=_disc(), reward=_rew(), value=_val(), bootstrap_cutoff=True)(
+    dqn_loss, dqn_m = DqnObjective( temperature=1.0, double=False, gate=None, grouping_field=None, discount=_disc(), reward=_rew(), value=_val(), bootstrap_cutoff=True, reward_centering=None)(
         objective_data=step_stream, predictions=predictions,  delayed_predictions=delayed
     )
     assert abs(nstep_loss.item() - dqn_loss.item()) < 1e-06
