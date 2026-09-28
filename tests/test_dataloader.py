@@ -859,9 +859,9 @@ def _packed_episode_index_store() -> tuple[Datastore, set[int]]:
     return store, {0, 4}
 
 
-def test_sample_match_rejects_empty_equals() -> None:
+def test_sample_match_rejects_empty_equals_and_not_equals() -> None:
     with pytest.raises(ValueError, match="non-empty"):
-        SampleMatch(equals=())
+        SampleMatch(equals=(), not_equals=())
 
 
 def test_dataloader_sample_start_match_requires_both_fields() -> None:
@@ -872,7 +872,7 @@ def test_dataloader_sample_start_match_requires_both_fields() -> None:
         batch_size=2,
         num_workers=0,
         seed=5,
-        sample_start=SampleMatch(equals=(("episode_index", 0), ("step_index", 0))),
+        sample_start=SampleMatch(equals=(("episode_index", 0), ("step_index", 0)), not_equals=()),
         stores=store,
         index_field="store_index",
         transform=_index_transform(),
@@ -889,8 +889,8 @@ def test_dataloader_sample_start_match_with_task_end() -> None:
         batch_size=1,
         num_workers=0,
         seed=6,
-        sample_start=SampleMatch(equals=(("episode_index", 0), ("step_index", 0))),
-        sample_end=SampleBoundary(field="task_done", value=0),
+        sample_start=SampleMatch(equals=(("episode_index", 0), ("step_index", 0)), not_equals=()),
+        sample_end=SampleMatch(equals=(), not_equals=(("task_done", 0),)),
         stores=store,
         index_field="store_index",
         transform=_index_transform(),
@@ -914,16 +914,19 @@ def test_dataloader_sample_start_match_requires_field_column() -> None:
             sequence_length=2,
             batch_size=1,
             num_workers=0,
-            sample_start=SampleMatch(equals=(("episode_index", 0), ("step_index", 0))),
+            sample_start=SampleMatch(equals=(("episode_index", 0), ("step_index", 0)), not_equals=()),
             stores=store,
         )
 
 
-def test_dataloader_sample_end_rejects_sample_match() -> None:
-    with pytest.raises(TypeError, match="sample_end"):
+def test_dataloader_sample_end_match_requires_field_column() -> None:
+    store = Datastore()
+    store.append(data={"action": 1, "reward": 0.0, "episode_done": 0})
+    with pytest.raises(ValueError, match="task_done"):
         _loader(
             sequence_length=2,
             batch_size=1,
             num_workers=0,
-            sample_end=SampleMatch(equals=(("step_index", 0),)),  # type: ignore[arg-type]
+            sample_end=SampleMatch(equals=(), not_equals=(("task_done", 0),)),
+            stores=store,
         )

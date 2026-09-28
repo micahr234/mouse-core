@@ -8,13 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- ``SampleMatch(equals=((field, value), ...))`` for ``DataLoader``
-  ``sample_start``. Legal starts are rows where every pair holds (AND);
-  the matching row itself is the start (unlike ``SampleBoundary``, which
-  starts at index 0 or the step *after* ``field != value``). Examples and
-  ``bench/bench_dataloader.py`` use
-  ``SampleMatch(equals=(("episode_index", 0), ("step_index", 0)))`` with
-  ``sample_end=SampleBoundary(field="task_done", value=0)``.
+- ``SampleMatch(equals=..., not_equals=...)`` for ``DataLoader``
+  ``sample_start`` and ``sample_end``. A row matches when every
+  ``equals`` pair holds (``==``) and every ``not_equals`` pair holds
+  (``!=``), all ANDed; at least one side must be non-empty. As
+  ``sample_start``, the matching row itself is the start (unlike
+  ``SampleBoundary``, which starts at index 0 or the step *after*
+  ``field != value``). As ``sample_end``, the window includes the first
+  matching row then stops. Examples and ``bench/bench_dataloader.py``
+  use
+  ``SampleMatch(equals=(("episode_index", 0), ("step_index", 0)), not_equals=())``
+  with
+  ``SampleMatch(equals=(), not_equals=(("task_done", 0),))``.
 - Tokenizer fields take ``when_not_equals=`` with ``when_field=``
   (exactly one of ``when_equals=`` / ``when_not_equals=``). The field
   emits only when that step value does **not** equal the given value.
@@ -127,9 +132,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - Training examples and ``bench/bench_dataloader.py`` pin
-  ``sample_start=SampleMatch(equals=(("episode_index", 0), ("step_index", 0)))``
-  and ``sample_end=SampleBoundary(field="task_done", value=0)`` so windows
-  open on the first step of episode 0 and stop on the task-done row.
+  ``sample_start=SampleMatch(equals=(("episode_index", 0), ("step_index", 0)), not_equals=())``
+  and
+  ``sample_end=SampleMatch(equals=(), not_equals=(("task_done", 0),))``
+  so windows open on the first step of episode 0 and stop on the first
+  non-zero ``task_done``.
 - Tokenizer ``when_field=`` pairs with exactly one of ``when_equals=``
   or ``when_not_equals=`` (was ``when_equals=`` only). Const text
   fields may use ``when_field=`` / ``when_group_start=``.

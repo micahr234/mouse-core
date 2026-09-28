@@ -28,7 +28,7 @@ from typing import Any
 import numpy as np
 from datasets import Dataset
 
-from mouse_core.data import Augmenter, DataLoader, Datastore, SampleBoundary, SampleMatch, Tokenizer, compose
+from mouse_core.data import Augmenter, DataLoader, Datastore, SampleMatch, Tokenizer, compose
 from mouse_core.data.token_batch import TokenBatch
 
 _BENCH_DIR = Path(__file__).resolve().parent
@@ -233,8 +233,8 @@ def main() -> None:
                 stores=stores,
                 sequence_length=seq_len,
                 batch_size=batch_size,
-                sample_start=SampleMatch(equals=(("episode_index", 0), ("step_index", 0))),
-                sample_end=SampleBoundary(field="task_done", value=0),
+                sample_start=SampleMatch(equals=(("episode_index", 0), ("step_index", 0)), not_equals=()),
+                sample_end=SampleMatch(equals=(), not_equals=(("task_done", 0),)),
                 transform=transform,
                 prefetch=args.prefetch,
                 num_workers=n_workers,
