@@ -7,6 +7,7 @@ from typing import overload
 import torch
 import torch.nn.functional as F
 
+from mouse_core.models.reward_centering import RewardCentering
 from mouse_core.objectives.base import Objective, _reject_predictions, _require_prediction
 from mouse_core.objectives.transforms import (
     Discount,
@@ -597,6 +598,13 @@ class DqnObjective(Objective):
     ``δ = G - Q(s, a)`` and ``G`` the backup above. One-step,
     ``temperature=0``, and ``double=False`` make ``δ`` the residual
     ``r + γ max_a Q_delayed(s', a) - Q(s, a)``.
+    ``reward_centering`` is an optional
+    :class:`~mouse_core.models.reward_centering.RewardCentering`
+    (not a head): a scalar Parameter that learns mean ``δ`` by MSE
+    with real gradients and its own optimizer LR. When set, the Q
+    residual is ``(δ - c.detach())²`` and the returned loss also
+    includes ``loss_scale * (c - δ.detach())²`` so only the constant
+    trains from the centering term. ``None`` keeps plain ``δ²``.
     The trace never crosses a run break. At an episode /
     task boundary ``γ`` is ``discount`` at the done codes stored there and
     multiplies both the bootstrap and the continued return, so a ``0``
@@ -707,6 +715,10 @@ class DqnObjective(Objective):
             sample is not enough. An in-run backup stays. A true terminal
             stays either way: its γ is ``0``, so the factor is already
             ``0``.
+        reward_centering: Optional
+            :class:`~mouse_core.models.reward_centering.RewardCentering`
+            constant (not a head). ``None`` disables. When set, centers
+            the TD residual and adds the constant's MSE term.
     """
 
     def __init__(
@@ -718,6 +730,7 @@ class DqnObjective(Objective):
         temperature: float,
         double: bool,
         bootstrap_cutoff: bool,
+        reward_centering: RewardCentering | None,
         action_key: str = "action",
         episode_done_key: str = "episode_done",
         task_done_key: str = "task_done",
@@ -739,6 +752,14 @@ class DqnObjective(Objective):
         self.cql_weight = cql_weight
         self.cql_scale_q_eps = cql_scale_q_eps
         self.gate = _require_transform(gate, name="gate")
+        if reward_centering is not None and not isinstance(
+            reward_centering, RewardCentering
+        ):
+            raise TypeError(
+                "reward_centering must be a RewardCentering or None, got "
+                f"{type(reward_centering).__name__}."
+            )
+        self.reward_centering = reward_centering
 
     @overload
     def __call__(
@@ -910,18 +931,29 @@ class DqnObjective(Objective):
         row_weight = torch.cat([pair_weight, pair_weight.new_zeros(1)])[step_of]  # [P]
         td_target = _pair_values_to_rows(pair_target, step_of)  # [P]
 
-        # δ = G - Q(s, a). The loss is the mean square TD error.
+        # δ = G - Q(s, a). Plain loss is mean δ². With reward_centering,
+        # Q sees (δ - c.detach())² and the constant learns mean δ via MSE.
         delta = td_target - q_values
-        loss = delta ** 2
+        center = self.reward_centering
+        if center is None:
+            td_sq = delta ** 2
+            center_mse: torch.Tensor | None = None
+        else:
+            td_sq = (delta - center.center.detach()) ** 2
+            center_mse = center.centering_mse(td_error=delta, weight=row_weight)
 
+        per_row = td_sq
         cql_penalty_mean: torch.Tensor | None = None
         if self.cql_weight > 0.0:
             q_scale = (td_target.abs() + self.cql_scale_q_eps).detach()
             cql_penalty = torch.logsumexp(q, dim=-1) - q_values
-            loss = loss + self.cql_weight * q_scale * cql_penalty
+            per_row = per_row + self.cql_weight * q_scale * cql_penalty
             cql_penalty_mean = _weighted_mean(cql_penalty.detach(), row_weight)
 
-        loss = _weighted_mean(loss, row_weight)
+        td_loss = _weighted_mean(per_row, row_weight)
+        # Unscaled TD MSE for logging (before centering constant term).
+        td_loss_log = _weighted_mean(td_sq.detach(), row_weight)
+        loss = td_loss if center_mse is None else td_loss + center_mse
 
         curr_max_q = q.amax(dim=-1)  # [P]  max online Q at s_i
         q_mean, q_std, q_min, q_max = _in_run_stats(curr_max_q.detach(), row_weight)
@@ -930,10 +962,14 @@ class DqnObjective(Objective):
             "q_values_std":    q_std,
             "q_values_min":    q_min,
             "q_values_max":    q_max,
-            "action_value":    loss.detach(),
+            "action_value":    td_loss_log,
         }
         if cql_penalty_mean is not None:
             named["cql_penalty"] = cql_penalty_mean
+        if center is not None:
+            assert center_mse is not None
+            named["reward_center"] = center.center.detach()
+            named["reward_center_loss"] = center_mse.detach()
         if self.temperature > 0.0:
             named["entropy"] = _weighted_mean(
                 _boltzmann_entropy(q.detach(), temperature=self.temperature),

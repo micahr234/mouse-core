@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- ``RewardCentering``: one-parameter module (not a head) that learns
+  mean TD error by MSE with real gradients. ``DqnObjective`` takes
+  required ``reward_centering`` (``None`` disables). When set, the Q
+  residual is ``(δ - c.detach())²`` and the loss also includes
+  ``loss_scale * (c - δ.detach())²`` so only the constant trains from
+  the centering term. Metrics ``reward_center`` /
+  ``reward_center_loss`` when enabled. Step the constant with its own
+  AdamW learning rate (separate optimizer / param group) — not Polyak
+  or EMA. ``examples/16_train_offline_reward_centering_dqn.ipynb``
+  wires the knobs (``REWARD_CENTERING``, init, ``loss_scale``,
+  ``LR_REWARD_CENTERING``).
+
 ### Changed
 - ``DataLoader`` ``sample_end`` finds the first match **strictly after**
   the chosen start index (search from ``start + 1``). The start row
