@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- ``scripts/worker.sh``: start a Cursor My Machines self-hosted worker
+  in tmux (``mouse-worker``) that registers sibling
+  ``mouse-core`` / ``mouse-experiment`` / ``mouse-gym`` checkouts.
+  Default name ``mouse``; optional name override. Same script lives in
+  each Mouse repo.
 - ``best_action(q)``: integer action id per row, uniform among finite
   maxima (``-inf`` padding never selected). ``SpObjective`` callers that
   distill from Q* run this outside and pass the ids as ``targets=``.
