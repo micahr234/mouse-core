@@ -31,8 +31,10 @@ row in the window where ``field != value``, then stops even if
 ``sample_end=SampleMatch(...)`` includes the first row matching the
 same equals / not_equals rules then stops. Examples use
 ``SampleMatch(equals=(), not_equals=(("task_done", 0),))`` so the
-window ends on the first non-zero ``task_done``. A short store suffix
-still ends the window first; rows are not padded.
+window ends on the first non-zero ``task_done``. If ``sample_end`` is
+set but no matching row appears before ``sequence_length`` or the
+store end, sampling raises ``ValueError`` (incomplete segment —
+not a silent truncate).
 
 The loader is stage-agnostic: compose augmenter / tokenizer
 (or any ``dict → StepTokens`` callable) outside and pass the result as
@@ -277,6 +279,17 @@ def _start_indices_at_match(*, ds: Any, match: SampleMatch) -> np.ndarray:
     return np.flatnonzero(mask).astype(np.int64, copy=False)
 
 
+def _sample_end_label(end_spec: SampleBoundary | SampleMatch) -> str:
+    if isinstance(end_spec, SampleBoundary):
+        return (
+            f"SampleBoundary(field={end_spec.field!r}, value={end_spec.value!r}) "
+            f"(stop on {end_spec.field!r} != {end_spec.value!r})"
+        )
+    return (
+        f"SampleMatch(equals={end_spec.equals!r}, not_equals={end_spec.not_equals!r})"
+    )
+
+
 def _window_end(
     *,
     start: int,
@@ -285,7 +298,11 @@ def _window_end(
     ds: Any,
     end_spec: SampleBoundary | SampleMatch | None,
 ) -> int:
-    """Exclusive end index for a window starting at ``start``."""
+    """Exclusive end index for a window starting at ``start``.
+
+    When ``end_spec`` is set, the first matching row must appear at or
+    before ``min(start + s_max, n) - 1``; otherwise raise ``ValueError``.
+    """
     end = min(start + s_max, n)
     if end_spec is None or start >= end:
         return end
@@ -302,7 +319,12 @@ def _window_end(
         mask = _match_mask(ds=ds, match=end_spec, n=end - start, offset=start)
         hits = np.flatnonzero(mask)
     if len(hits) == 0:
-        return end
+        raise ValueError(
+            "sample_end was not met before sequence_length or the store end: "
+            f"{_sample_end_label(end_spec)}; start={start}, "
+            f"searched={end - start} step(s) through exclusive end={end}, "
+            f"sequence_length={s_max}, store_len={n}."
+        )
     return start + int(hits[0]) + 1
 
 
@@ -479,7 +501,10 @@ class DataLoader:
         or the store end. When a :class:`SampleBoundary`, the window includes
         the first row where ``field != value`` then stops. When a
         :class:`SampleMatch`, the window includes the first matching row then
-        stops. A short suffix is a shorter window; rows are not padded.
+        stops. If ``sample_end`` is set but no matching row appears before
+        ``sequence_length`` or the store end, :meth:`next_batch` raises
+        ``ValueError``. A short matching segment is a shorter window; rows
+        are not padded.
     batch_size :
         How many such windows per batch.
     transform :

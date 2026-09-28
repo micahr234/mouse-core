@@ -46,8 +46,8 @@ _WORKLOADS: dict[str, tuple[int, int]] = {
 
 _MAX_ACTIONS = 4
 _MAX_OBS = 64
-_STEPS_PER_EPISODE = 30
-_EPISODES_PER_TASK = 20
+_STEPS_PER_EPISODE = 8
+_EPISODES_PER_TASK = 4  # max task = 32 steps; keep ≤ shortest --workloads S
 _GROUP_PREFIX = (
     "Your job is to predict the future sum of rewards in FrozenLake. "
     "Navigate a grid; reach the goal for reward; a hole ends the "

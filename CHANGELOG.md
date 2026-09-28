@@ -135,8 +135,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``sample_start=SampleMatch(equals=(("episode_index", 0), ("step_index", 0)), not_equals=())``
   and
   ``sample_end=SampleMatch(equals=(), not_equals=(("task_done", 0),))``
-  so windows open on the first step of episode 0 and stop on the first
-  non-zero ``task_done``.
+  so each packed sequence is one full task (episode-0 start through
+  ``task_done != 0`` inclusive). Example ``SEQUENCE_LENGTH`` is
+  ``MAX_TASK_EPISODES * MAX_STEPS_PER_EPISODE`` (a safety cap so the
+  end-match wins). If ``sample_end`` is set but no matching row appears
+  before ``sequence_length`` or the store end, ``next_batch`` raises
+  ``ValueError`` instead of returning a truncated segment.
 - Tokenizer ``when_field=`` pairs with exactly one of ``when_equals=``
   or ``when_not_equals=`` (was ``when_equals=`` only). Const text
   fields may use ``when_field=`` / ``when_group_start=``.
