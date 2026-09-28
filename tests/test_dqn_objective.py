@@ -221,7 +221,11 @@ def test_dqn_objective_runs() -> None:
     loss, metrics = objective(objective_data=step_stream, predictions=predictions,  delayed_predictions=delayed)
     assert loss.ndim == 0
     assert 'action_value' in metrics
+    assert isinstance(metrics['action_value'], torch.Tensor)
+    assert metrics['action_value'].ndim == 0
     assert metrics['action_value'] >= 0.0
+    assert isinstance(metrics['q_values_mean'], torch.Tensor)
+    assert metrics['q_values_mean'].ndim == 0
     assert 'watkins_greedy_frac' not in metrics
     assert 'entropy' not in metrics
     backup = metrics['backup']

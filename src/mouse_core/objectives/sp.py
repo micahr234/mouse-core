@@ -203,5 +203,6 @@ class SpObjective(Objective):
             logits=logits_flat,
             label_smoothing=self.label_smoothing,
         )
-        metrics: dict[str, float | torch.Tensor] = {"action": float(loss.detach().item())}
+        # Keep the CE scalar on-device; loggers can ``.item()`` at log time.
+        metrics: dict[str, float | torch.Tensor] = {"action": loss.detach()}
         return loss, metrics

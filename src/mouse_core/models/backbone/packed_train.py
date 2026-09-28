@@ -111,14 +111,14 @@ class _PackingPlan:
     Packed token ``i`` is original token ``order[i]``;
     ``original = packed[inverse]``. ``cu_seqlens`` are the int32 segment
     boundaries the varlen kernel consumes, ``max_seqlen`` the largest class
-    size, and ``position_ids`` the RoPE position of every packed token (its
-    index inside its class).
+    size as a 0-dim on-device tensor, and ``position_ids`` the RoPE position
+    of every packed token (its index inside its class).
     """
 
     order: torch.Tensor
     inverse: torch.Tensor
     cu_seqlens: torch.Tensor
-    max_seqlen: int
+    max_seqlen: torch.Tensor
     position_ids: torch.Tensor
 
 
@@ -136,11 +136,12 @@ def _packing_plan(sequence_ids: torch.Tensor, grouping_ids: torch.Tensor) -> _Pa
     arange = torch.arange(L, device=device)
     is_start = torch.ones(L, dtype=torch.bool, device=device)
     is_start[1:] = (packed_seq[1:] != packed_seq[:-1]) | (packed_grp[1:] != packed_grp[:-1])
-    # Two host syncs per forward (segment count and longest segment); both
-    # are inputs the kernel needs as Python ints / a sized tensor.
+    # Longest segment stays on-device. ``varlen`` / ``padded`` materialize a
+    # Python int once when those kernels need a size; ``flex`` / ``reference``
+    # never read it as a host int.
     starts = arange[is_start]
     cu_seqlens = torch.cat([starts, arange.new_tensor([L])]).to(torch.int32)
-    max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())
+    max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
     segment_start = torch.cummax(torch.where(is_start, arange, arange.new_tensor(-1)), dim=0).values
     inverse = torch.empty_like(order)
     inverse[order] = arange
@@ -574,14 +575,21 @@ def packed_forward(
     flex_fn: Callable[..., torch.Tensor] | None = None
     flex_segment: torch.Tensor | None = None
     padded = train_kernel == "padded"
+    # Flash varlen and padded shapes need a Python int size; materialize once
+    # for those kernels only. Flex / reference never read this size.
+    max_seqlen = (
+        int(plan.max_seqlen.item())
+        if train_kernel in ("varlen", "padded")
+        else 0
+    )
     if train_kernel == "flex":
         flex_segment = _segment_ids(plan)
         block_mask = _flex_block_mask(flex_segment, int(plan.order.shape[0]), device)
         flex_fn = _flex_fn(device)
     elif train_kernel == "padded":
         lengths = plan.cu_seqlens[1:] - plan.cu_seqlens[:-1]
-        if not bool((lengths == plan.max_seqlen).all()):
-            attn_mask = _padded_causal_mask(plan.cu_seqlens, plan.max_seqlen)
+        if not bool((lengths == max_seqlen).all()):
+            attn_mask = _padded_causal_mask(plan.cu_seqlens, max_seqlen)
     elif train_kernel == "reference":
         attn_mask = _block_causal_mask(plan)
 
@@ -604,7 +612,7 @@ def packed_forward(
     with run_ctx:
         for layer in hf.layers:
             args = (
-                layer, h, cos, sin, plan.cu_seqlens, plan.max_seqlen,
+                layer, h, cos, sin, plan.cu_seqlens, max_seqlen,
                 attn_mask, block_mask, flex_fn, padded, n_heads, n_kv_heads, head_dim,
             )
             h = (

@@ -25,7 +25,10 @@ def test_sp_objective_ce_uses_best_action_ids() -> None:
         targets=_ce_targets(q),
     )
     assert loss.ndim == 0
+    assert isinstance(metrics["action"], torch.Tensor)
+    assert metrics["action"].ndim == 0
     assert metrics["action"] >= 0.0
+    assert not metrics["action"].requires_grad
 
 
 def test_sp_objective_ce_skips_nonzero_mask_rows() -> None:

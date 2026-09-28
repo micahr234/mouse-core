@@ -88,7 +88,9 @@ def test_packing_plan_matches_handoff_example() -> None:
     assert plan.inverse.tolist() == [0, 1, 4, 5, 2, 3]
     assert plan.cu_seqlens.tolist() == [0, 4, 6]
     assert plan.cu_seqlens.dtype == torch.int32
-    assert plan.max_seqlen == 4
+    assert isinstance(plan.max_seqlen, torch.Tensor)
+    assert plan.max_seqlen.ndim == 0
+    assert int(plan.max_seqlen.item()) == 4
     assert plan.position_ids.tolist() == [0, 1, 2, 3, 0, 1]
     assert plan.position_ids[plan.inverse].tolist() == [0, 1, 0, 1, 2, 3]
 
@@ -102,7 +104,7 @@ def test_packing_plan_non_self_inverse_permutation() -> None:
     assert plan.inverse.tolist() == [0, 3, 2, 4, 1]
     assert plan.order.tolist() != plan.inverse.tolist()
     assert plan.cu_seqlens.tolist() == [0, 2, 3, 5]
-    assert plan.max_seqlen == 2
+    assert int(plan.max_seqlen.item()) == 2
 
 
 @pytest.mark.parametrize("device", _DEVICES)
@@ -116,7 +118,8 @@ def test_packing_plan_invariants(device: str, L: int) -> None:
     packed_seq, packed_grp = seq[plan.order], grp[plan.order]
     lengths = (plan.cu_seqlens[1:] - plan.cu_seqlens[:-1]).tolist()
     assert all(n > 0 for n in lengths) and sum(lengths) == L
-    assert plan.max_seqlen == max(lengths)
+    assert isinstance(plan.max_seqlen, torch.Tensor)
+    assert int(plan.max_seqlen.item()) == max(lengths)
     pairs = {(int(s), int(g)) for s, g in zip(seq.tolist(), grp.tolist())}
     assert len(lengths) == len(pairs)
     for start, end in zip(plan.cu_seqlens[:-1].tolist(), plan.cu_seqlens[1:].tolist()):
