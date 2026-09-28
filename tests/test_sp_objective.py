@@ -70,7 +70,11 @@ def test_sp_objective_requires_targets() -> None:
     objective_data = {"episode_done": _episode_done(1, 1)}
     predictions = torch.tensor([[[0.0, 1.0]]])
     try:
-        SpObjective()(objective_data=objective_data, predictions=predictions)
+        SpObjective()(
+            objective_data=objective_data,
+            predictions=predictions,
+            targets=None,  # type: ignore[arg-type]
+        )
     except TypeError as exc:
         assert "targets" in str(exc)
     else:

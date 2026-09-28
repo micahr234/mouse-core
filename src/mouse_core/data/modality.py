@@ -274,7 +274,7 @@ def _normalize_when(
 
 
 def _validate_when(spec: TokenizerModalitySpec) -> None:
-    name = spec.output_field or spec.input_field
+    name = spec.output_field or spec.input_field or "field"
     normalized = _normalize_when(spec.when, name=name)
     object.__setattr__(spec, "when", normalized)
     if normalized is None:
