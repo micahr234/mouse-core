@@ -12,13 +12,26 @@ from mouse_core.models.backbone import TransformerBackbone
 from mouse_core.models.heads import RegressionHead
 from mouse_core.models.reasoner import _plan_insertions
 from mouse_core.objectives import DqnObjective, affine_reward, affine_value, boundary_discount
-from mouse_core.data.conditions import (
-    when_episode_done_nonzero,
-    when_group_start,
-    when_reward_nonzero,
-    when_step_index_zero,
-    when_step_index_zero_or_group_start,
-)
+
+def when_episode_done_nonzero(ctx):
+    return "episode_done" in ctx and ctx["episode_done"] != 0
+
+
+def when_group_start(ctx):
+    return bool(ctx["group_start"])
+
+
+def when_reward_nonzero(ctx):
+    return "reward" in ctx and ctx["reward"] != 0.0
+
+
+def when_step_index_zero(ctx):
+    return "step_index" in ctx and ctx["step_index"] == 0
+
+
+def when_step_index_zero_or_group_start(ctx):
+    return (ctx.get("step_index") == 0) | bool(ctx["group_start"])
+
 from tests._token_batch_helpers import batch_to_packed
 
 

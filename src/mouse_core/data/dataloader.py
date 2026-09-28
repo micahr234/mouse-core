@@ -11,7 +11,7 @@ A ``Datastore`` is a flat sequence of arbitrary rows. The loader samples
 offset. ``sample_start`` may also be a callable
 ``cols → bool ndarray``: ``cols`` maps column name → 1-d array over the
 whole store, and ``True`` marks legal start rows (the matching row
-itself). Examples use :func:`~mouse_core.data.conditions.full_task_start`
+itself). Notebooks often define a ``full_task_start`` callable inline
 so windows open only on ``episode_index == 0`` and ``step_index == 0``.
 The window then runs forward for
 ``min(sequence_length, steps remaining in the store)`` — the same
@@ -21,7 +21,7 @@ set.
 ``sample_end=None`` (the default) never truncates early for a field.
 ``sample_end`` may be a callable ``cols → bool ndarray`` over the
 candidate window rows; the window includes the first ``True`` row then
-stops. Examples use :func:`~mouse_core.data.conditions.full_task_end`
+stops. Notebooks often define a ``full_task_end`` callable inline
 (``task_done != 0``). If ``sample_end`` is set but no matching row
 appears before ``sequence_length`` or the store end, sampling raises
 ``ValueError`` (incomplete segment — not a silent truncate).
@@ -55,7 +55,13 @@ Usage
 -----
 ::
 
-    from mouse_core.data.conditions import full_task_end, full_task_start
+    def full_task_start(cols):
+        return (np.asarray(cols["episode_index"]) == 0) & (
+            np.asarray(cols["step_index"]) == 0
+        )
+
+    def full_task_end(cols):
+        return np.asarray(cols["task_done"]) != 0
 
     train_transform = compose(stages=(augmenter, tokenizer))
     loader = DataLoader(

@@ -12,7 +12,10 @@ from mouse_core.data import (
     Tokenizer,
     pack_token_batch,
 )
-from mouse_core.data.conditions import when_step_index_zero
+
+def when_step_index_zero(ctx):
+    return "step_index" in ctx and ctx["step_index"] == 0
+
 
 
 def _io(*pairs: tuple[str, str]) -> list[dict[str, str]]:

@@ -1,4 +1,4 @@
-"""Callable emission / sample-window conditions.
+"""Callable emission / sample-window condition types and save/load refs.
 
 Tokenizer ``when=`` and ``DataLoader`` ``sample_start`` / ``sample_end``
 take callables — not equals / not_equals / group_start dicts.
@@ -22,10 +22,12 @@ OR of several reasons to emit is written in the callable with ``|`` /
 
 Omit ``when`` (``None``) and the field always emits on the ordinary run.
 
-Named module-level functions (or the helpers below) round-trip through
+Named module-level functions round-trip through
 :func:`~mouse_core.data.tokenizer.save_tokenizer` /
 :func:`~mouse_core.data.tokenizer.load_tokenizer` via an import path.
-Lambdas work at runtime but cannot be saved.
+Lambdas work at runtime but cannot be saved. Define any named
+predicates inline in the notebook or caller module — this package
+does not ship convenience helpers.
 
 DataLoader ``sample_start`` / ``sample_end``
 -------------------------------------------
@@ -36,7 +38,16 @@ row itself). ``sample_end`` marks the inclusive end row; if set but
 never met before ``sequence_length`` / store end, sampling raises.
 ``None`` leaves starts unrestricted / never truncates early.
 
-Full-task FrozenLake windows::
+Example full-task FrozenLake windows (predicates defined by the
+caller)::
+
+    def full_task_start(cols):
+        return (np.asarray(cols["episode_index"]) == 0) & (
+            np.asarray(cols["step_index"]) == 0
+        )
+
+    def full_task_end(cols):
+        return np.asarray(cols["task_done"]) != 0
 
     sample_start=full_task_start
     sample_end=full_task_end
@@ -50,76 +61,12 @@ from typing import Any, cast
 
 import numpy as np
 
-from mouse_core.data.modality import values_equal
-
 # Per-step tokenizer gate: ctx → bool.
 WhenFn = Callable[[Mapping[str, Any]], bool]
 # DataLoader window predicate: column arrays → bool mask.
 SampleFn = Callable[[Mapping[str, Any]], np.ndarray]
 
 GROUP_START_KEY = "group_start"
-
-
-def when_group_start(ctx: Mapping[str, Any]) -> bool:
-    """Emit only as pack-time ``group_start_*`` tokens."""
-    return bool(ctx[GROUP_START_KEY])
-
-
-def when_reward_nonzero(ctx: Mapping[str, Any]) -> bool:
-    """Emit when ``reward`` is present and not ``0.0``."""
-    return "reward" in ctx and not values_equal(ctx["reward"], 0.0)
-
-
-def when_episode_done_nonzero(ctx: Mapping[str, Any]) -> bool:
-    """Emit when ``episode_done`` is present and not ``0``."""
-    return "episode_done" in ctx and not values_equal(ctx["episode_done"], 0)
-
-
-def when_step_index_zero(ctx: Mapping[str, Any]) -> bool:
-    """Emit when ``step_index`` is present and equals ``0``."""
-    return "step_index" in ctx and values_equal(ctx["step_index"], 0)
-
-
-def when_step_index_zero_or_group_start(ctx: Mapping[str, Any]) -> bool:
-    """Emit on ``step_index == 0`` (ordinary) or at group start."""
-    step0 = "step_index" in ctx and values_equal(ctx["step_index"], 0)
-    return bool(step0) | bool(ctx[GROUP_START_KEY])
-
-
-def full_task_start(cols: Mapping[str, Any]) -> np.ndarray:
-    """Legal starts: ``episode_index == 0`` and ``step_index == 0``."""
-    return (np.asarray(cols["episode_index"]) == 0) & (
-        np.asarray(cols["step_index"]) == 0
-    )
-
-
-def full_task_end(cols: Mapping[str, Any]) -> np.ndarray:
-    """Inclusive end rows: ``task_done != 0``."""
-    return np.asarray(cols["task_done"]) != 0
-
-
-def after_field_ne(*, field: str, value: object) -> SampleFn:
-    """Start after each ``field != value`` row (plus store index 0).
-
-    Matches the old ``SampleBoundary`` start semantics. Returns a named
-    module-level-style callable only when used as a factory result —
-    prefer writing the mask inline when the logic is one-off.
-    """
-
-    def _after(cols: Mapping[str, Any]) -> np.ndarray:
-        codes = np.asarray(cols[field])
-        n = len(codes)
-        mask = np.zeros(n, dtype=bool)
-        if n == 0:
-            return mask
-        mask[0] = True
-        if n > 1:
-            mask[1:] = codes[:-1] != value
-        return mask
-
-    _after.__name__ = f"after_{field}_ne"
-    _after.__qualname__ = f"after_field_ne.<locals>._after"
-    return _after
 
 
 def when_ref(fn: WhenFn) -> str:
@@ -130,8 +77,7 @@ def when_ref(fn: WhenFn) -> str:
         raise TypeError(
             "tokenizer when= must be a named module-level function to "
             "save/load; got "
-            f"{fn!r}. Prefer helpers in mouse_core.data.conditions "
-            "(e.g. when_group_start) or a def at module scope."
+            f"{fn!r}. Prefer a def at module scope in the caller."
         )
     return f"{module}:{qualname}"
 

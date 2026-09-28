@@ -11,7 +11,7 @@ import numpy as np
 import torch
 
 # Shared text stream. ``type="text"`` / ``type="token"`` fields emit here;
-# ``when=when_group_start`` fields are tokenized into the same modality.
+# Group-start ``when`` fields are tokenized into the same modality.
 NAME_TEXT = "__text__"
 
 # Step-backed ``text`` ``format=`` interpolates the field value here.
@@ -54,7 +54,8 @@ class TokenizerModalitySpec:
     ``group_start_*`` tokens. Write OR in the callable
     (``|`` / ``or``), e.g.
     ``lambda ctx: (ctx.get("step_index") == 0) | ctx["group_start"]``.
-    Helpers live in :mod:`mouse_core.data.conditions`. Omit ``when``
+    Named callables round-trip via ``module:qualname``; define them
+    inline in the notebook or caller. Omit ``when``
     (``None``) and the field always emits on the ordinary run.
     ``head_output`` fields cannot set ``when`` (they must emit on every
     step).

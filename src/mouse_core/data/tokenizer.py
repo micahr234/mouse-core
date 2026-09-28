@@ -71,7 +71,8 @@ class Tokenizer:
     step dict plus injected boolean ``group_start``. Ordinary emission
     uses ``group_start=False``; pack-time ``group_start_*`` uses
     ``True``. Combine reasons with ``|`` / ``or`` inside the callable
-    (helpers in :mod:`mouse_core.data.conditions`). Omit ``when``
+    (named module-level callables defined by the caller).
+    Omit ``when``
     (``None``) and the field always emits on the ordinary run. A
     ``required=False`` field whose value is missing / ``None`` emits
     nothing. ``max_tokens=`` (``text`` / ``image``) raises if that run
