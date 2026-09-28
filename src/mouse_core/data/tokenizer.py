@@ -21,7 +21,6 @@ import json
 from collections.abc import Sequence
 from dataclasses import asdict
 from pathlib import Path
-from string import Formatter
 from typing import Any
 
 import numpy as np
@@ -53,38 +52,37 @@ class Tokenizer:
     """CPU packer: one step dict → :class:`StepTokens`.
 
     Alignment is by modality **name**: ``__text__`` for ``text`` /
-    ``token`` fields (and ``group_prefix=``), ``output_field`` for
-    ``image``. ``input_fields=`` are the tokens fed to the transformer,
-    emitted in list order. Each field is its own tokenize/emit run (no
-    BPE merge across ``text`` fields). Exactly one input field must set
-    ``head_output=True``: its tokens are the step's head-output tokens —
-    the positions the model reads Q / action outputs from. Every step
-    must emit at least one (never skip that field); a step may emit
-    several (e.g. a ``text`` run with more than one id), and the DQN
-    objectives then train each of them toward the same per-step target.
+    ``token`` fields, ``output_field`` for ``image``. ``input_fields=``
+    are the tokens fed to the transformer, emitted in list order. Each
+    field is its own tokenize/emit run (no BPE merge across ``text``
+    fields). Exactly one input field must set ``head_output=True``: its
+    tokens are the step's head-output tokens — the positions the model
+    reads Q / action outputs from. Every step must emit at least one
+    (never gate that field off); a step may emit several (e.g. a
+    ``text`` run with more than one id), and the DQN objectives then
+    train each of them toward the same per-step target.
 
     A ``text`` field requires ``format=``. ``input_field=`` reads the
     step into exactly one placeholder ``{field}``.
     Omit ``input_field=`` and the field is a const: ``output_field=``
     names it and ``format=`` is the literal string (no placeholders;
     ``{{`` / ``}}`` for a literal brace, as in every ``format=``).
-    ``skip=`` / ``format_skipped=`` replace the run with that literal
-    when the step value matches ``skip``. ``when_field=`` /
-    ``when_equals=`` emit the field only when that other step value
-    equals ``when_equals``; any other value, or a missing key, emits
-    nothing (``required`` / ``skip`` are not consulted). Leave both
-    unset and the field emits as before. A ``required=False`` field
-    whose value is missing / ``None`` emits nothing (``format_skipped=``
-    does not apply). ``max_tokens=`` (``text`` / ``image``) raises if
-    that run is longer. ``group_prefix=`` is a format string over the raw
-    step dict (placeholders need not be ``input_fields``); it is
-    tokenized as ``__text__`` and :func:`~mouse_core.data.token_batch.pack_token_batch`
-    inserts those tokens at the start of each grouping-field segment.
-    ``objective_fields=`` is a list of ``{input_field}`` dicts (optional
-    ``output_field``; defaults to the input name)
-    copied into ``StepTokens.objective_fields`` (input fields are not
-    auto-copied). ``grouping_field`` names the step key used for
-    attention isolation (typically ``task_index``).
+    ``when_field=`` pairs with exactly one of ``when_equals=`` or
+    ``when_not_equals=``: the field emits only when that other step
+    value equals / does not equal the given value; any other value, or
+    a missing key, emits nothing (``required`` is not consulted). Leave
+    the when knobs unset and the field emits as before. A
+    ``required=False`` field whose value is missing / ``None`` emits
+    nothing. ``max_tokens=`` (``text`` / ``image``) raises if that run
+    is longer. ``when_group_start=True`` marks a field's tokens for
+    insertion at the start of each grouping-field segment by
+    :func:`~mouse_core.data.token_batch.pack_token_batch` (those tokens
+    are not part of the step's ordinary run). ``objective_fields=`` is
+    a list of ``{input_field}`` dicts (optional ``output_field``;
+    defaults to the input name) copied into
+    ``StepTokens.objective_fields`` (input fields are not auto-copied).
+    ``grouping_field`` names the step key used for attention isolation
+    (typically ``task_index``).
 
     TD / PPO / GRPO objectives read ``action``, ``reward``,
     ``episode_done``, and ``task_done`` from that keep-list (plus extras
@@ -98,7 +96,6 @@ class Tokenizer:
         *,
         input_fields: Sequence[dict[str, Any] | TokenizerModalitySpec] | None = None,
         grouping_field: str,
-        group_prefix: str | None = None,
         tokenizer=None,
         image_tokenizer=None,
         objective_fields: Sequence[dict[str, Any]] | None = None,
@@ -120,9 +117,7 @@ class Tokenizer:
                 f"— the Q / action readout positions); got {flagged or 'none'}"
             )
 
-        if group_prefix is not None and group_prefix == "":
-            raise ValueError("Tokenizer group_prefix= must be a non-empty string")
-        needs_tokenizer = has_text or group_prefix is not None
+        needs_tokenizer = has_text
         if tokenizer is not None:
             tok = tokenizer
         elif pretrained is not None and needs_tokenizer:
@@ -131,8 +126,7 @@ class Tokenizer:
             tok = AutoTokenizer.from_pretrained(pretrained, **dict(hub_kwargs or {}))
         elif needs_tokenizer:
             raise TypeError(
-                "Tokenizer with text input_fields or group_prefix= requires "
-                "tokenizer= or pretrained="
+                "Tokenizer with text input_fields requires tokenizer= or pretrained="
             )
         else:
             tok = None
@@ -146,7 +140,7 @@ class Tokenizer:
 
         names: list[str] = []
         mmap: dict[str, ModalityInfo] = {}
-        if has_text or has_token or group_prefix is not None:
+        if has_text or has_token:
             names.append(NAME_TEXT)
             mmap[NAME_TEXT] = ModalityInfo(type="token")
         for m in meta:
@@ -161,7 +155,6 @@ class Tokenizer:
                 raise ValueError(f"unsupported modality kind {m.kind!r}")
 
         self.pretrained = None if pretrained is None else str(pretrained)
-        self.group_prefix = group_prefix
         self.input_fields: tuple[TokenizerModalitySpec, ...] = tuple(specs)
         self._meta: tuple[TokenizerModalityMeta, ...] = tuple(meta)
         self.grouping_field = grouping_field
@@ -184,7 +177,6 @@ class Tokenizer:
         return _tokenize_step(
             row=step,
             meta=self._meta,
-            group_prefix_str=self.group_prefix,
             tokenizer=self.tokenizer,
             image_tokenizer=self.image_tokenizer,
             objective_fields_keep=self.objective_fields,
@@ -213,10 +205,11 @@ class Tokenizer:
 
         ``prev_grouping_ids`` is the last grouping id already cached per
         sequence (length ``len(rows)``, ``None`` entries where nothing is
-        cached), so incremental decode with ``group_prefix=`` does not
-        re-emit a cached grouping segment's prefix. Pass ``None`` when no
-        sequence has cached steps (fresh sequences / full prefill).
-        Without ``group_prefix=`` the value has no effect.
+        cached), so incremental decode with ``when_group_start`` fields
+        does not re-emit a cached grouping segment's prefix. Pass ``None``
+        when no sequence has cached steps (fresh sequences / full
+        prefill). Without ``when_group_start`` fields the value has no
+        effect.
         """
         steps: list[StepTokens] = []
         sids: list[int] = []
@@ -237,9 +230,9 @@ class Tokenizer:
 def _field_text_value(spec: TokenizerModalitySpec, row: dict[str, Any]) -> str | None:
     assert isinstance(spec.output_field, str)
     assert spec.format is not None
-    # Const ``format=`` and ``format_skipped=`` are validated as
-    # placeholder-free format strings, so render them through ``format_map``
-    # too: ``{{`` / ``}}`` un-escape the same way as in a step-backed format.
+    # Const ``format=`` is validated as a placeholder-free format string,
+    # so render it through ``format_map`` too: ``{{`` / ``}}`` un-escape
+    # the same way as in a step-backed format.
     if spec.input_field is None:
         return spec.format.format_map({})
     raw = row.get(spec.input_field)
@@ -247,9 +240,6 @@ def _field_text_value(spec: TokenizerModalitySpec, row: dict[str, Any]) -> str |
         if spec.required:
             raise KeyError(f"Required modality {spec.input_field!r} is missing")
         return None
-    if spec.skip is not None and values_equal(raw, spec.skip):
-        assert spec.format_skipped is not None
-        return spec.format_skipped.format_map({})
     return spec.format.format_map({TEXT_FORMAT_KEY: unwrap_scalar(raw)})
 
 
@@ -304,7 +294,6 @@ def _tokenize_step(
     *,
     row: dict,
     meta: Sequence[TokenizerModalityMeta],
-    group_prefix_str: str | None,
     tokenizer: Any,
     image_tokenizer: Any,
     objective_fields_keep: Sequence[tuple[str, str]],
@@ -329,6 +318,12 @@ def _tokenize_step(
     # keeps counting across separately emitted runs of the same modality.
     next_position: dict[int, int] = {}
 
+    group_modality_ids: list[int] = []
+    group_ids: list[int] = []
+    group_values: list[float] = []
+    group_positions: list[int] = []
+    group_next_position: dict[int, int] = {}
+
     def _emit(
         token_ids: list[int],
         *,
@@ -338,13 +333,25 @@ def _tokenize_step(
         head_output: bool = False,
     ) -> None:
         _require_max_tokens(spec, token_ids)
+        if not token_ids:
+            return
         mid = name_to_index[name]
-        pos = next_position.get(mid, 0)
         vals = token_values if token_values is not None else [0.0] * len(token_ids)
         if len(vals) != len(token_ids):
             raise ValueError(
                 f"token values length {len(vals)} != token id length {len(token_ids)}"
             )
+        if spec.when_group_start:
+            pos = group_next_position.get(mid, 0)
+            for tid, val in zip(token_ids, vals, strict=True):
+                group_modality_ids.append(mid)
+                group_ids.append(tid)
+                group_values.append(val)
+                group_positions.append(pos)
+                pos += 1
+            group_next_position[mid] = pos
+            return
+        pos = next_position.get(mid, 0)
         for tid, val in zip(token_ids, vals, strict=True):
             modality_ids.append(mid)
             ids.append(tid)
@@ -380,8 +387,6 @@ def _tokenize_step(
                     f"Required input field {in_name!r} is missing from step"
                 )
             continue
-        if spec.skip is not None and values_equal(value, spec.skip):
-            continue
 
         if m.kind == KIND_TOKEN:
             _emit(
@@ -398,33 +403,17 @@ def _tokenize_step(
 
     if not modality_ids:
         raise ValueError(
-            "step has no tokens after skips; ensure at least one input field "
-            "still produces a token"
+            "step has no tokens after when-gates; ensure at least one input "
+            "field still produces a token"
         )
 
-    group_prefix_kwargs: dict[str, np.ndarray] = {}
-    if group_prefix_str is not None:
-        if NAME_TEXT not in name_to_index:
-            raise RuntimeError(
-                "group_prefix= requires a text or token input field so __text__ exists"
-            )
-        if tokenizer is None:
-            raise RuntimeError("tokenizer required to tokenize group_prefix=")
-        rendered = _render_group_prefix(group_prefix_str, row)
-        group_prefix_ids = _tokenize_ids(tokenizer, rendered)
-        if not group_prefix_ids:
-            raise ValueError(
-                f"group_prefix= {group_prefix_str!r} tokenized to no tokens "
-                "for this step"
-            )
-        mid = name_to_index[NAME_TEXT]
-        group_prefix_kwargs = {
-            "group_prefix_modality_ids": np.full(
-                len(group_prefix_ids), mid, dtype=np.int64
-            ),
-            "group_prefix_ids": np.asarray(group_prefix_ids, dtype=np.int64),
-            "group_prefix_values": np.zeros(len(group_prefix_ids), dtype=np.float32),
-            "group_prefix_positions": np.arange(len(group_prefix_ids), dtype=np.int64),
+    group_start_kwargs: dict[str, np.ndarray] = {}
+    if group_ids:
+        group_start_kwargs = {
+            "group_start_modality_ids": np.asarray(group_modality_ids, dtype=np.int64),
+            "group_start_ids": np.asarray(group_ids, dtype=np.int64),
+            "group_start_values": np.asarray(group_values, dtype=np.float32),
+            "group_start_positions": np.asarray(group_positions, dtype=np.int64),
         }
 
     return StepTokens(
@@ -438,36 +427,25 @@ def _tokenize_step(
         grouping_field=grouping_field,
         head_output_mask=np.asarray(head_output_mask, dtype=bool),
         objective_fields=copy_keep_fields(row, objective_fields_keep),
-        **group_prefix_kwargs,
+        **group_start_kwargs,
     )
 
 
 def _when_emits(spec: TokenizerModalitySpec, row: dict) -> bool:
     """True when this field should emit on ``row``.
 
-    ``when_field=`` / ``when_equals=`` gate emission. A missing key is
-    not a match, so the field emits nothing. Fields that leave the pair
-    unset always pass.
+    ``when_field=`` / ``when_equals=`` / ``when_not_equals=`` gate
+    emission. A missing key is not a match, so the field emits nothing.
+    Fields that leave the when knobs unset always pass.
     """
     if spec.when_field is None:
         return True
     if spec.when_field not in row:
         return False
-    return values_equal(row[spec.when_field], spec.when_equals)
-
-
-def _render_group_prefix(group_prefix: str, row: dict[str, Any]) -> str:
-    mapping: dict[str, Any] = {}
-    for _, name, _, _ in Formatter().parse(group_prefix):
-        if name is None or name == "":
-            continue
-        if name not in row:
-            raise KeyError(
-                f"group_prefix placeholder {{{name}}} missing from step "
-                f"(have {sorted(row)})"
-            )
-        mapping[name] = unwrap_scalar(row[name])
-    return group_prefix.format_map(mapping)
+    actual = row[spec.when_field]
+    if spec.when_equals is not None:
+        return values_equal(actual, spec.when_equals)
+    return not values_equal(actual, spec.when_not_equals)
 
 
 TOKENIZER_FORMAT = "mouse-core-tokenizer-v1"
@@ -475,7 +453,7 @@ TOKENIZER_FILENAME = "tokenizer.json"
 
 
 def _jsonable(value: Any) -> Any:
-    """JSON-safe form of a tokenizer field value (``skip=`` especially)."""
+    """JSON-safe form of a tokenizer field value (``when_equals=`` especially)."""
     if isinstance(value, np.generic):
         return value.item()
     if isinstance(value, np.ndarray):
@@ -494,6 +472,8 @@ def tokenizer_config(*, tokenizer: Tokenizer) -> dict[str, Any]:
                 continue
             if key == "head_output" and value is False:
                 continue
+            if key == "when_group_start" and value is False:
+                continue
             if key == "required" and value is True:
                 continue
             field[key] = _jsonable(value)
@@ -507,7 +487,6 @@ def tokenizer_config(*, tokenizer: Tokenizer) -> dict[str, Any]:
     return {
         "format": TOKENIZER_FORMAT,
         "grouping_field": tokenizer.grouping_field,
-        "group_prefix": tokenizer.group_prefix,
         "pretrained": tokenizer.pretrained,
         "input_fields": input_fields,
         "objective_fields": objective_fields,
@@ -534,7 +513,7 @@ def load_tokenizer(
 ) -> Tokenizer:
     """Load a tokenizer packing spec from a checkpoint directory or Hub repo.
 
-    The JSON is the packing contract (fields, ``group_prefix``,
+    The JSON is the packing contract (fields, ``when_group_start``,
     ``objective_fields``, ``pretrained`` name). A live HF tokenizer or
     image tokenizer is an execution choice: pass ``tokenizer=`` /
     ``image_tokenizer=`` when the spec needs them; otherwise
@@ -585,7 +564,6 @@ def load_tokenizer(
     return Tokenizer(
         input_fields=config["input_fields"],
         grouping_field=config["grouping_field"],
-        group_prefix=config.get("group_prefix"),
         objective_fields=config.get("objective_fields") or (),
         pretrained=config.get("pretrained"),
         tokenizer=tokenizer,

@@ -266,7 +266,6 @@ def test_tokenizer_roundtrip(tmp_path) -> None:
     assert (tmp_path / "tokenizer.json").is_file()
     loaded = load_tokenizer(repo_id_or_path=str(tmp_path))
     assert loaded.grouping_field == "task_index"
-    assert loaded.group_prefix is None
     assert loaded.pretrained is None
     assert loaded.objective_fields == (
         ("action", "action"),
@@ -285,6 +284,43 @@ def test_tokenizer_roundtrip(tmp_path) -> None:
     assert loaded.input_fields[3].when_field == "step_index"
     assert loaded.input_fields[3].when_equals == 0
     assert sum(1 for s in loaded.input_fields if s.head_output) == 1
+
+
+def test_tokenizer_roundtrip_when_group_start_and_not_equals(tmp_path) -> None:
+    class _Tok:
+        def __call__(self, text: str, add_special_tokens: bool = False):
+            return {"input_ids": [1, 2]}
+
+    tokenizer = Tokenizer(
+        input_fields=[
+            {
+                "type": "text",
+                "output_field": "group_start",
+                "format": "hello\n",
+                "when_group_start": True,
+            },
+            {
+                "type": "text",
+                "input_field": "reward",
+                "format": "{field}",
+                "when_field": "reward",
+                "when_not_equals": 0.0,
+            },
+            {"type": "token", "input_field": "action", "head_output": True},
+        ],
+        grouping_field="task_index",
+        tokenizer=_Tok(),
+    )
+    save_tokenizer(tokenizer=tokenizer, path=tmp_path)
+    loaded = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizer=_Tok())
+    assert loaded.input_fields[0].when_group_start is True
+    assert loaded.input_fields[0].output_field == "group_start"
+    assert loaded.input_fields[1].when_field == "reward"
+    assert loaded.input_fields[1].when_not_equals == 0.0
+    assert loaded.input_fields[1].when_equals is None
+    st = loaded({"action": 1, "reward": 1.0, "task_index": 0})
+    assert st.group_start_ids is not None
+    assert st.group_start_ids.tolist() == [1, 2]
 
 
 def test_load_tokenizer_missing_file_raises(tmp_path) -> None:

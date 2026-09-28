@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Tokenizer fields take ``when_not_equals=`` with ``when_field=``
+  (exactly one of ``when_equals=`` / ``when_not_equals=``). The field
+  emits only when that step value does **not** equal the given value.
+  A missing key emits nothing. Text constructions omit reward ``0.0``
+  and done code ``0`` this way (replacing ``skip`` /
+  ``format_skipped=""``).
+- Tokenizer fields take ``when_group_start=True``. Those tokens are
+  carried on the step and inserted by ``pack_token_batch`` at the start
+  of each grouping-field segment (and each packed sequence). Incremental
+  decode still passes ``prev_grouping_ids`` so a cached segment does not
+  re-emit them. Text constructions use a const ``format=`` for the
+  FrozenLake prompt this way (replacing ``Tokenizer(group_prefix=)``).
 - ``best_action(q)``: integer action id per row, uniform among finite
   maxima (``-inf`` padding never selected). ``SpObjective`` callers that
   distill from Q* run this outside and pass the ids as ``targets=``.
@@ -102,6 +114,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pass ``architecture="qwen3"`` or ``architecture="llama"``.
 
 ### Changed
+- Tokenizer ``when_field=`` pairs with exactly one of ``when_equals=``
+  or ``when_not_equals=`` (was ``when_equals=`` only). Const text
+  fields may use ``when_field=`` / ``when_group_start=``.
+- Examples and ``bench/bench_dataloader.py`` emit the FrozenLake group
+  prompt via an ``input_fields`` const with ``when_group_start=True``,
+  and gate reward / episode_done zeros with ``when_not_equals``.
 - ``SpObjective`` / ``SvObjective`` take supervised labels as call-time
   ``targets=`` (action ids for hard CE; Q vectors for SV), matching DQN
   ``predictions=`` / ``delayed_predictions=``. ``targets_key`` is
@@ -111,10 +129,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``kl-*``), ``loss_type``, and ``temperature`` are removed.
   ``examples/09_train_offline_sp.ipynb`` calls ``best_action`` on
   ``info_q_star`` and passes those ids as ``targets=``.
-- Examples and ``bench/bench_dataloader.py`` replace the CSV
-  ``group_prefix`` legend ``action,observation,r=reward,d=done`` with
-  a local FrozenLake game / strategy / step-format blurb (episode
-  budget ``20``). Each site owns its own string.
 - Objective ``__call__`` metrics are ``dict[str, float | Tensor]``.
   Scalar diagnostics stay floats; DQN also returns tensor fields.
 - ``Objective.__call__`` takes optional ``delayed_predictions``,
@@ -229,6 +243,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   copied.
 
 ### Removed
+- ``Tokenizer(group_prefix=)``. Use an ``input_fields`` entry with
+  ``when_group_start=True`` (typically a text const). StepTokens /
+  packing carry ``group_start_*`` arrays (was ``group_prefix_*``).
+- Tokenizer ``skip=`` / ``format_skipped=``. Use ``when_field=`` with
+  ``when_equals=`` or ``when_not_equals=`` (two fields when a zero
+  value still needs a different literal).
 - ``scripts/worker.sh``. The Cursor My Machines worker script lives
   only in ``mouse-experiment`` (``scripts/worker.sh`` there still
   registers sibling ``mouse-core`` / ``mouse-experiment`` /

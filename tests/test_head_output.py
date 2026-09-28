@@ -171,8 +171,7 @@ def test_step_without_head_output_token_raises() -> None:
                 "type": "text",
                 "input_field": "reward",
                 "format": "{field}",
-                "skip": 0.0,
-                "format_skipped": "",
+                "required": False,
                 "head_output": True,
             },
             {
@@ -188,9 +187,44 @@ def test_step_without_head_output_token_raises() -> None:
     # Head-output field present → fine.
     st = tok({"action": 1, "reward": 0.5, "task_index": 0})
     assert st.head_output_mask.tolist() == [False] + [True] * len("0.5")
-    # Head-output field skipped → the step has no head-output token.
+    # Head-output field missing → the step has no head-output token.
     with pytest.raises(ValueError, match="no head-output tokens"):
-        tok({"action": 1, "reward": 0.0, "task_index": 0})
+        tok({"action": 1, "reward": None, "task_index": 0})
+
+
+def test_head_output_rejects_when_field() -> None:
+    with pytest.raises(ValueError, match="head_output and cannot set when_field"):
+        Tokenizer(
+            input_fields=[
+                {
+                    "type": "text",
+                    "input_field": "reward",
+                    "format": "{field}",
+                    "when_field": "reward",
+                    "when_not_equals": 0.0,
+                    "head_output": True,
+                },
+            ],
+            tokenizer=_FakeTokenizer(),
+            grouping_field="task_index",
+        )
+
+
+def test_head_output_rejects_when_group_start() -> None:
+    with pytest.raises(ValueError, match="head_output and cannot set when_group_start"):
+        Tokenizer(
+            input_fields=[
+                {
+                    "type": "text",
+                    "output_field": "value",
+                    "format": "\n",
+                    "when_group_start": True,
+                    "head_output": True,
+                },
+            ],
+            tokenizer=_FakeTokenizer(),
+            grouping_field="task_index",
+        )
 
 
 # ---------------------------------------------------------------------------

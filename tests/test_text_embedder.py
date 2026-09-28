@@ -23,8 +23,8 @@ class _FakeTokenizer:
 _DEFAULT_FIELDS: list[dict[str, Any]] = [
     {"type": "token", "input_field": "action"},
     {"type": "text", "input_field": "observation", "format": "{field}"},
-    {"type": "text", "input_field": "reward", "format": "{field}", "skip": 0.0, "format_skipped": ""},
-    {"type": "text", "input_field": "episode_done", "format": "{field}", "skip": 0, "format_skipped": ""},
+    {"type": "text", "input_field": "reward", "format": "{field}", "when_field": "reward", "when_not_equals": 0.0},
+    {"type": "text", "input_field": "episode_done", "format": "{field}", "when_field": "episode_done", "when_not_equals": 0},
 ]
 
 
@@ -48,7 +48,6 @@ def _text_pair(hidden_dim: int = 8, **kwargs):
     vocab = 32
     emb = kwargs.pop("embed_tokens", None)
     hf_tok = kwargs.pop("tokenizer", _FakeTokenizer())
-    group_prefix = kwargs.pop("group_prefix", None)
     input_fields = kwargs.pop("input_fields", list(_DEFAULT_FIELDS))
     image_tokenizer = kwargs.pop("image_tokenizer", None)
     objective_fields = kwargs.pop(
@@ -80,7 +79,6 @@ def _text_pair(hidden_dim: int = 8, **kwargs):
         )
     tokenizer = Tokenizer(
         input_fields=fields,
-        group_prefix=group_prefix,
         tokenizer=hf_tok,
         image_tokenizer=image_tokenizer,
         objective_fields=objective_fields,
@@ -103,7 +101,7 @@ def test_text_tokenizer_positions_count_per_modality_within_step() -> None:
     assert st.positions.tolist() == list(range(st.T))
 
 
-def test_text_tokenizer_skip_omits_value_keeps_commas() -> None:
+def test_text_tokenizer_when_not_equals_omits_value() -> None:
     tokenizer, backbone = _text_pair()
     batch = [
         [
@@ -117,7 +115,7 @@ def test_text_tokenizer_skip_omits_value_keeps_commas() -> None:
     assert obj["action"].dtype == torch.int64
     assert obj["reward"].tolist() == [0.0, 1.0]
     assert embeds.ndim == 2 and embeds.shape[1] == 8
-    # Skips shorten step 0 relative to step 1; head-output indices point at
+    # when_not_equals shortens step 0 relative to step 1; head-output indices point at
     # each step's action token (the flagged head-output field).
     import numpy as np
 
@@ -345,7 +343,8 @@ def test_text_tokenizer_const_requires_output_field() -> None:
         )
 
 
-def test_text_tokenizer_format_skipped_emits_literal() -> None:
+def test_text_tokenizer_when_gates_cover_skip_literal_pattern() -> None:
+    """Former skip/format_skipped=',' is two when-gated fields."""
     seen: list[str] = []
 
     class _CaptureTok:
@@ -364,8 +363,15 @@ def test_text_tokenizer_format_skipped_emits_literal() -> None:
                 "type": "text",
                 "input_field": "reward",
                 "format": "{field:.0f},",
-                "skip": 0.0,
-                "format_skipped": ",",
+                "when_field": "reward",
+                "when_not_equals": 0.0,
+            },
+            {
+                "type": "text",
+                "output_field": "reward_zero",
+                "format": ",",
+                "when_field": "reward",
+                "when_equals": 0.0,
             },
             {
                 "type": "token",
@@ -382,17 +388,17 @@ def test_text_tokenizer_format_skipped_emits_literal() -> None:
     assert seen == ["1", ",", "1", "2,"]
 
 
-def test_text_tokenizer_skip_requires_format_skipped() -> None:
+def test_text_tokenizer_when_field_requires_exactly_one_compare() -> None:
     import pytest
 
-    with pytest.raises(TypeError, match="must be set together"):
+    with pytest.raises(TypeError, match="exactly one of"):
         Tokenizer(
             input_fields=[
                 {
                     "type": "text",
                     "input_field": "reward",
                     "format": "{field}",
-                    "skip": 0.0,
+                    "when_field": "reward",
                     "head_output": True,
                 },
                 {
@@ -407,17 +413,19 @@ def test_text_tokenizer_skip_requires_format_skipped() -> None:
         )
 
 
-def test_text_tokenizer_format_skipped_requires_skip() -> None:
+def test_text_tokenizer_when_equals_and_not_equals_exclusive() -> None:
     import pytest
 
-    with pytest.raises(TypeError, match="must be set together"):
+    with pytest.raises(TypeError, match="exactly one of"):
         Tokenizer(
             input_fields=[
                 {
                     "type": "text",
                     "input_field": "reward",
                     "format": "{field}",
-                    "format_skipped": ",",
+                    "when_field": "reward",
+                    "when_equals": 0.0,
+                    "when_not_equals": 1.0,
                     "head_output": True,
                 },
                 {
@@ -479,16 +487,16 @@ def _enc(text: str) -> list[int]:
     return [ord(c) % 20 + 1 for c in text]
 
 
-def test_text_tokenizer_const_and_format_skipped_unescape_braces() -> None:
+def test_text_tokenizer_const_and_when_gated_unescape_braces() -> None:
     tokenizer = Tokenizer(
         input_fields=[
             {"type": "text", "input_field": "a", "format": "{{{field}}}"},
             {
                 "type": "text",
-                "input_field": "r",
-                "format": "{field}",
-                "skip": 0,
-                "format_skipped": "{{-}}",
+                "output_field": "r_zero",
+                "format": "{{-}}",
+                "when_field": "r",
+                "when_equals": 0,
             },
             {"type": "text", "output_field": "c", "format": "{{c}}", "head_output": True},
             {
@@ -514,8 +522,15 @@ def test_text_tokenizer_optional_missing_value_emits_nothing() -> None:
                 "input_field": "r",
                 "format": "{field},",
                 "required": False,
-                "skip": 0.0,
-                "format_skipped": ",",
+                "when_field": "r",
+                "when_not_equals": 0.0,
+            },
+            {
+                "type": "text",
+                "output_field": "r_zero",
+                "format": ",",
+                "when_field": "r",
+                "when_equals": 0.0,
             },
             {"type": "text", "output_field": "v", "format": "\n", "head_output": True},
             {
@@ -563,8 +578,6 @@ def test_text_tokenizer_no_input_fields_reject_step_knobs() -> None:
 
     from mouse_core.data import TokenizerModalitySpec
 
-    with pytest.raises(TypeError, match="do not accept skip="):
-        TokenizerModalitySpec(type="text", output_field="c", format="c", skip=0)
     with pytest.raises(TypeError, match="do not accept required=False"):
         TokenizerModalitySpec(type="text", output_field="c", format="c", required=False)
 
@@ -772,18 +785,27 @@ def test_text_model_card_describes_tokenizer(tmp_path) -> None:
 
 
 
-def _group_prefix_tokenizer(**kwargs):
+def _group_start_tokenizer(**kwargs):
+    prefix_format = kwargs.pop("prefix_format", "task={field}\n")
+    prefix_field = kwargs.pop("prefix_field", "task_index")
+    fields = [
+        {
+            "type": "text",
+            "input_field": prefix_field,
+            "output_field": "group_start",
+            "format": prefix_format,
+            "when_group_start": True,
+        },
+        {"type": "token", "input_field": "action", "head_output": True},
+        {
+            "type": "token",
+            "input_field": "episode_index",
+            "when_field": "step_index",
+            "when_equals": 0,
+        },
+    ]
     return Tokenizer(
-        input_fields=[
-            {"type": "token", "input_field": "action", "head_output": True},
-            {
-                "type": "token",
-                "input_field": "episode_index",
-                "when_field": "step_index",
-                "when_equals": 0,
-            },
-        ],
-        group_prefix=kwargs.pop("group_prefix", "task={task_index}\n"),
+        input_fields=fields,
         tokenizer=kwargs.pop("tokenizer", _FakeTokenizer()),
         objective_fields=_obj("action"),
         grouping_field="task_index",
@@ -791,28 +813,28 @@ def _group_prefix_tokenizer(**kwargs):
     )
 
 
-def test_text_tokenizer_group_prefix_carried_on_step() -> None:
-    tok = _group_prefix_tokenizer()
+def test_text_tokenizer_group_start_carried_on_step() -> None:
+    tok = _group_start_tokenizer()
     st = tok({"action": 1, "task_index": 7})
-    assert st.group_prefix_ids is not None
-    assert st.group_prefix_modality_ids is not None
+    assert st.group_start_ids is not None
+    assert st.group_start_modality_ids is not None
     expected = _FakeTokenizer()("task=7\n")["input_ids"].view(-1).tolist()
-    assert st.group_prefix_ids.tolist() == expected
-    assert st.group_prefix_modality_ids.tolist() == [0] * len(expected)
+    assert st.group_start_ids.tolist() == expected
+    assert st.group_start_modality_ids.tolist() == [0] * len(expected)
     assert st.head_output_mask.tolist() == [True]
 
 
-def test_pack_emits_group_prefix_once_per_grouping_segment() -> None:
+def test_pack_emits_group_start_once_per_grouping_segment() -> None:
     from mouse_core.data import pack_token_batch
 
-    tok = _group_prefix_tokenizer()
+    tok = _group_start_tokenizer()
     steps = [
         tok({"action": 1, "task_index": 0}),
         tok({"action": 2, "task_index": 0}),
         tok({"action": 3, "task_index": 1}),
     ]
     inputs, obj = pack_token_batch(steps=steps, sequence_ids=[0, 0, 0], batch_size=1)
-    prefix = steps[0].group_prefix_ids
+    prefix = steps[0].group_start_ids
     assert prefix is not None
     p = int(prefix.shape[0])
     assert inputs.L == p + steps[0].T + steps[1].T + p + steps[2].T
@@ -822,23 +844,23 @@ def test_pack_emits_group_prefix_once_per_grouping_segment() -> None:
         p + steps[0].T + int(steps[1].head_output_mask.nonzero()[0][0]),
         p + steps[0].T + steps[1].T + p + int(steps[2].head_output_mask.nonzero()[0][0]),
     ]
-    # Group-prefix tokens are __text__ and never head-output.
+    # Group-start tokens are __text__ and never head-output.
     assert not any(
         int(i) in set(inputs.head_output_indices.tolist())
         for i in range(p)
     )
 
 
-def test_pack_group_prefix_is_per_sequence() -> None:
+def test_pack_group_start_is_per_sequence() -> None:
     from mouse_core.data import pack_token_batch
 
-    tok = _group_prefix_tokenizer()
+    tok = _group_start_tokenizer()
     steps = [
         tok({"action": 1, "task_index": 0}),
         tok({"action": 2, "task_index": 0}),
     ]
     inputs, _ = pack_token_batch(steps=steps, sequence_ids=[0, 1], batch_size=2)
-    prefix = steps[0].group_prefix_ids
+    prefix = steps[0].group_start_ids
     assert prefix is not None
     p = int(prefix.shape[0])
     assert inputs.L == (p + steps[0].T) + (p + steps[1].T)
@@ -847,13 +869,13 @@ def test_pack_group_prefix_is_per_sequence() -> None:
     )
 
 
-def test_pack_prev_grouping_ids_suppresses_and_reemits_group_prefix() -> None:
+def test_pack_prev_grouping_ids_suppresses_and_reemits_group_start() -> None:
     from mouse_core.data import pack_token_batch
 
-    tok = _group_prefix_tokenizer()
+    tok = _group_start_tokenizer()
     continue_step = tok({"action": 1, "task_index": 5})
     change_step = tok({"action": 2, "task_index": 6})
-    prefix = continue_step.group_prefix_ids
+    prefix = continue_step.group_start_ids
     assert prefix is not None
     p = int(prefix.shape[0])
 
@@ -883,11 +905,11 @@ def test_pack_prev_grouping_ids_suppresses_and_reemits_group_prefix() -> None:
 
 
 def test_tokenizer_pack_rows_forwards_prev_grouping_ids() -> None:
-    tok = _group_prefix_tokenizer()
+    tok = _group_start_tokenizer()
     row = {"action": 1, "task_index": 5}
     st = tok(row)
-    assert st.group_prefix_ids is not None
-    p = int(st.group_prefix_ids.shape[0])
+    assert st.group_start_ids is not None
+    p = int(st.group_start_ids.shape[0])
 
     fresh = tok.pack_rows(rows=[[row]], prev_grouping_ids=None)
     assert fresh.L == p + st.T
@@ -899,24 +921,23 @@ def test_tokenizer_pack_rows_forwards_prev_grouping_ids() -> None:
     assert changed_task.L == p + st.T
 
 
-def test_text_tokenizer_group_prefix_missing_placeholder_raises() -> None:
+def test_text_tokenizer_group_start_missing_placeholder_raises() -> None:
     import pytest
 
-    tok = _group_prefix_tokenizer(group_prefix="label={label}\n")
-    with pytest.raises(KeyError, match="label"):
+    tok = _group_start_tokenizer(prefix_format="label={field}\n", prefix_field="label")
+    with pytest.raises(KeyError, match="Required modality 'label'"):
         tok({"action": 1, "task_index": 0})
 
 
-def test_text_tokenizer_empty_group_prefix_raises() -> None:
-    import pytest
-
-    with pytest.raises(ValueError, match="non-empty"):
-        _group_prefix_tokenizer(group_prefix="")
-
-
-def test_text_tokenizer_group_prefix_without_text_fields_adds_text_modality() -> None:
+def test_text_tokenizer_group_start_const_without_other_text_adds_text_modality() -> None:
     tok = Tokenizer(
         input_fields=[
+            {
+                "type": "text",
+                "output_field": "group_start",
+                "format": "hello\n",
+                "when_group_start": True,
+            },
             {"type": "token", "input_field": "action", "head_output": True},
             {
                 "type": "token",
@@ -925,20 +946,19 @@ def test_text_tokenizer_group_prefix_without_text_fields_adds_text_modality() ->
                 "when_equals": 0,
             },
         ],
-        group_prefix="task={task_index}\n",
         tokenizer=_FakeTokenizer(),
         objective_fields=[],
         grouping_field="task_index",
     )
     assert "__text__" in tok.modality_names
     st = tok({"action": 1, "task_index": 3})
-    assert st.group_prefix_ids is not None
-    assert st.group_prefix_modality_ids is not None
+    assert st.group_start_ids is not None
+    assert st.group_start_modality_ids is not None
     assert st.T == 1
-    assert st.modality_names[int(st.group_prefix_modality_ids[0])] == "__text__"
+    assert st.modality_names[int(st.group_start_modality_ids[0])] == "__text__"
 
 
-def test_token_pack_ignores_missing_group_prefix() -> None:
+def test_token_pack_ignores_missing_group_start() -> None:
     from mouse_core.data import Tokenizer, pack_token_batch
 
     tok = Tokenizer(
@@ -959,7 +979,7 @@ def test_token_pack_ignores_missing_group_prefix() -> None:
     ]
     inputs, _ = pack_token_batch(steps=steps, sequence_ids=[0, 0], batch_size=1)
     assert inputs.L == steps[0].T + steps[1].T
-    assert steps[0].group_prefix_ids is None
+    assert steps[0].group_start_ids is None
 
 
 def test_episode_index_emits_only_on_step_zero() -> None:
@@ -1046,7 +1066,7 @@ def test_token_episode_index_emits_only_on_step_zero() -> None:
 def test_when_field_and_when_equals_are_a_pair() -> None:
     import pytest
 
-    with pytest.raises(TypeError, match="must be set together"):
+    with pytest.raises(TypeError, match="exactly one of"):
         Tokenizer(
             input_fields=[
                 {
@@ -1060,7 +1080,7 @@ def test_when_field_and_when_equals_are_a_pair() -> None:
             tokenizer=_FakeTokenizer(),
             grouping_field="task_index",
         )
-    with pytest.raises(TypeError, match="must be set together"):
+    with pytest.raises(TypeError, match="require when_field"):
         Tokenizer(
             input_fields=[
                 {
@@ -1074,7 +1094,7 @@ def test_when_field_and_when_equals_are_a_pair() -> None:
         )
 
 
-def test_head_output_and_const_reject_when_field() -> None:
+def test_head_output_rejects_when_field() -> None:
     import pytest
 
     with pytest.raises(ValueError, match="head_output"):
@@ -1092,24 +1112,24 @@ def test_head_output_and_const_reject_when_field() -> None:
             tokenizer=_FakeTokenizer(),
             grouping_field="task_index",
         )
-    with pytest.raises(TypeError, match="when_field"):
-        Tokenizer(
-            input_fields=[
-                {
-                    "type": "text",
-                    "output_field": "value",
-                    "format": "\n",
-                    "when_field": "step_index",
-                    "when_equals": 0,
-                    "head_output": True,
-                },
-                {
-                    "type": "token",
-                    "input_field": "episode_index",
-                    "when_field": "step_index",
-                    "when_equals": 0,
-                },
-            ],
-            tokenizer=_FakeTokenizer(),
-            grouping_field="task_index",
-        )
+
+
+def test_const_accepts_when_field() -> None:
+    tok = Tokenizer(
+        input_fields=[
+            {
+                "type": "text",
+                "output_field": "mark",
+                "format": "x",
+                "when_field": "step_index",
+                "when_equals": 0,
+            },
+            {"type": "token", "input_field": "action", "head_output": True},
+        ],
+        tokenizer=_FakeTokenizer(),
+        grouping_field="task_index",
+    )
+    zero = tok({"action": 1, "step_index": 0, "task_index": 0})
+    assert zero.ids.tolist() == _FakeTokenizer()("x")["input_ids"].view(-1).tolist() + [1]
+    later = tok({"action": 1, "step_index": 2, "task_index": 0})
+    assert later.ids.tolist() == [1]
