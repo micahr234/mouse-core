@@ -8,18 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- Tokenizer fields take ``when_not_equals=`` with ``when_field=``
-  (exactly one of ``when_equals=`` / ``when_not_equals=``). The field
-  emits only when that step value does **not** equal the given value.
-  A missing key emits nothing. Text constructions omit reward ``0.0``
-  and done code ``0`` this way (replacing ``skip`` /
-  ``format_skipped=""``).
-- Tokenizer fields take ``when_group_start=True``. Those tokens are
-  carried on the step and inserted by ``pack_token_batch`` at the start
-  of each grouping-field segment (and each packed sequence). Incremental
-  decode still passes ``prev_grouping_ids`` so a cached segment does not
-  re-emit them. Text constructions use a const ``format=`` for the
-  FrozenLake prompt this way (replacing ``Tokenizer(group_prefix=)``).
+- Tokenizer fields take a single ``when=`` dict of emission conditions.
+  Keys: ``equals`` / ``not_equals`` (each a list of ``(field, value)``
+  pairs; multiple allowed) and optional ``group_start`` (bool). All
+  listed conditions are **OR**ed — the field emits if any matches.
+  Omit ``when`` (or ``None`` / empty) and the field always emits. A
+  missing compare key does not match. Value matches prefer the ordinary
+  step token run; ``group_start`` alone rides ``group_start_*`` for
+  ``pack_token_batch`` insertion at each grouping-field segment start
+  (incremental decode still passes ``prev_grouping_ids``). Text
+  constructions omit reward ``0.0`` / done ``0`` via ``not_equals``,
+  emit ``episode_index`` when ``step_index`` is ``0`` **or** at group
+  start, and use a const with ``group_start`` for the FrozenLake prompt
+  (replacing ``skip`` / ``format_skipped`` and ``Tokenizer(group_prefix=)``).
 - ``best_action(q)``: integer action id per row, uniform among finite
   maxima (``-inf`` padding never selected). ``SpObjective`` callers that
   distill from Q* run this outside and pass the ids as ``targets=``.
@@ -32,12 +33,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ``DqnObjective`` metrics ``backup`` and ``backup_weight``: detached
   per-row Bellman target ``G`` and its row weight, the same tensors
   the loss uses. Callers log those instead of rebuilding the backup.
-- Tokenizer fields take ``when_field=`` and ``when_equals=`` together.
-  The field emits only when that step value equals ``when_equals``.
-  Any other value, or a missing key, emits nothing. Fields that leave
-  the pair unset are unchanged. Text and token constructions emit
-  ``episode_index`` only when ``step_index`` is ``0``, including a
-  later episode's zero step in the same task.
 - ``DataLoader`` ``sample_start`` / ``sample_end`` take
   ``SampleBoundary(field=, value=)`` or ``None``. ``None`` (default)
   may start a window at any store offset and never truncates early for
@@ -119,12 +114,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pass ``architecture="qwen3"`` or ``architecture="llama"``.
 
 ### Changed
-- Tokenizer ``when_field=`` pairs with exactly one of ``when_equals=``
-  or ``when_not_equals=`` (was ``when_equals=`` only). Const text
-  fields may use ``when_field=`` / ``when_group_start=``.
+- Tokenizer emission gates are a single ``when=`` dict (``equals`` /
+  ``not_equals`` lists of ``(field, value)``, optional ``group_start``
+  bool). Conditions are **OR**ed. Const text fields may use ``when=``.
 - Examples and ``bench/bench_dataloader.py`` emit the FrozenLake group
-  prompt via an ``input_fields`` const with ``when_group_start=True``,
-  and gate reward / episode_done zeros with ``when_not_equals``.
+  prompt via an ``input_fields`` const with ``when={"group_start": True}``,
+  gate reward / episode_done zeros with ``when={"not_equals": [...]}``,
+  and emit ``episode_index`` with
+  ``when={"equals": [("step_index", 0)], "group_start": True}``.
 - ``SpObjective`` / ``SvObjective`` take supervised labels as call-time
   ``targets=`` (action ids for hard CE; Q vectors for SV), matching DQN
   ``predictions=`` / ``delayed_predictions=``. ``targets_key`` is
@@ -249,11 +246,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 - ``Tokenizer(group_prefix=)``. Use an ``input_fields`` entry with
-  ``when_group_start=True`` (typically a text const). StepTokens /
+  ``when={"group_start": True}`` (typically a text const). StepTokens /
   packing carry ``group_start_*`` arrays (was ``group_prefix_*``).
-- Tokenizer ``skip=`` / ``format_skipped=``. Use ``when_field=`` with
-  ``when_equals=`` or ``when_not_equals=`` (two fields when a zero
-  value still needs a different literal).
+- Tokenizer ``skip=`` / ``format_skipped=`` and the separate
+  ``when_field`` / ``when_equals`` / ``when_not_equals`` /
+  ``when_group_start`` kwargs. Use one ``when=`` dict
+  (``equals`` / ``not_equals`` / ``group_start``).
 - ``scripts/worker.sh``. The Cursor My Machines worker script lives
   only in ``mouse-experiment`` (``scripts/worker.sh`` there still
   registers sibling ``mouse-core`` / ``mouse-experiment`` /

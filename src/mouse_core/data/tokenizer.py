@@ -39,6 +39,7 @@ from mouse_core.data.modality import (
     resolve_tokenizer_modalities,
     unwrap_scalar,
     values_equal,
+    when_has_group_start,
 )
 from mouse_core.data.token_batch import (
     ModalityInfo,
@@ -67,22 +68,22 @@ class Tokenizer:
     Omit ``input_field=`` and the field is a const: ``output_field=``
     names it and ``format=`` is the literal string (no placeholders;
     ``{{`` / ``}}`` for a literal brace, as in every ``format=``).
-    ``when_field=`` pairs with exactly one of ``when_equals=`` or
-    ``when_not_equals=``: the field emits only when that other step
-    value equals / does not equal the given value; any other value, or
-    a missing key, emits nothing (``required`` is not consulted). Leave
-    the when knobs unset and the field emits as before. A
+    Optional ``when=`` is a dict of emission conditions (**OR**ed).
+    ``equals`` / ``not_equals`` are lists of ``(field, value)`` pairs; a
+    missing compare key does not match (``required`` is not consulted).
+    ``group_start=True`` marks tokens for pack-time insertion at each
+    grouping-field segment start by
+    :func:`~mouse_core.data.token_batch.pack_token_batch`. When a value
+    condition and ``group_start`` are both set, a matching value emits on
+    the ordinary step run; otherwise the tokens ride ``group_start_*``.
+    Omit ``when`` (or ``None`` / empty) and the field emits as before. A
     ``required=False`` field whose value is missing / ``None`` emits
     nothing. ``max_tokens=`` (``text`` / ``image``) raises if that run
-    is longer. ``when_group_start=True`` marks a field's tokens for
-    insertion at the start of each grouping-field segment by
-    :func:`~mouse_core.data.token_batch.pack_token_batch` (those tokens
-    are not part of the step's ordinary run). ``objective_fields=`` is
-    a list of ``{input_field}`` dicts (optional ``output_field``;
-    defaults to the input name) copied into
-    ``StepTokens.objective_fields`` (input fields are not auto-copied).
-    ``grouping_field`` names the step key used for attention isolation
-    (typically ``task_index``).
+    is longer. ``objective_fields=`` is a list of ``{input_field}``
+    dicts (optional ``output_field``; defaults to the input name) copied
+    into ``StepTokens.objective_fields`` (input fields are not
+    auto-copied). ``grouping_field`` names the step key used for
+    attention isolation (typically ``task_index``).
 
     TD / PPO / GRPO objectives read ``action``, ``reward``,
     ``episode_done``, and ``task_done`` from that keep-list (plus extras
@@ -205,10 +206,10 @@ class Tokenizer:
 
         ``prev_grouping_ids`` is the last grouping id already cached per
         sequence (length ``len(rows)``, ``None`` entries where nothing is
-        cached), so incremental decode with ``when_group_start`` fields
+        cached), so incremental decode with ``when`` ``group_start`` fields
         does not re-emit a cached grouping segment's prefix. Pass ``None``
         when no sequence has cached steps (fresh sequences / full
-        prefill). Without ``when_group_start`` fields the value has no
+        prefill). Without ``group_start`` fields the value has no
         effect.
         """
         steps: list[StepTokens] = []
@@ -329,6 +330,7 @@ def _tokenize_step(
         *,
         spec: TokenizerModalitySpec,
         name: str,
+        to_group_start: bool,
         token_values: list[float] | None = None,
         head_output: bool = False,
     ) -> None:
@@ -341,7 +343,7 @@ def _tokenize_step(
             raise ValueError(
                 f"token values length {len(vals)} != token id length {len(token_ids)}"
             )
-        if spec.when_group_start:
+        if to_group_start:
             pos = group_next_position.get(mid, 0)
             for tid, val in zip(token_ids, vals, strict=True):
                 group_modality_ids.append(mid)
@@ -363,8 +365,13 @@ def _tokenize_step(
 
     for m in meta:
         spec = m.spec
-        if not _when_emits(spec, row):
+        value_matched = _when_value_matches(spec, row)
+        if not _when_emits(spec, row, value_matched=value_matched):
             continue
+        # Value match prefers the ordinary step run so mid-group equals
+        # still appear; group_start alone (or when the value side of an
+        # OR misses) rides group_start_* for packing.
+        to_group_start = when_has_group_start(spec) and not value_matched
         if m.kind == KIND_TEXT:
             rendered = _field_text_value(spec, row)
             if rendered is None:
@@ -375,6 +382,7 @@ def _tokenize_step(
                 _tokenize_ids(tokenizer, rendered),
                 spec=spec,
                 name=NAME_TEXT,
+                to_group_start=to_group_start,
                 head_output=spec.head_output,
             )
             continue
@@ -393,11 +401,18 @@ def _tokenize_step(
                 [int(unwrap_scalar(value))],
                 spec=spec,
                 name=NAME_TEXT,
+                to_group_start=to_group_start,
                 head_output=spec.head_output,
             )
         elif m.kind == KIND_IMAGE:
             img_ids = _image_token_ids(image_tokenizer, value, in_name=in_name)
-            _emit(img_ids, spec=spec, name=m.name, head_output=spec.head_output)
+            _emit(
+                img_ids,
+                spec=spec,
+                name=m.name,
+                to_group_start=to_group_start,
+                head_output=spec.head_output,
+            )
         else:
             raise ValueError(f"unsupported modality kind {m.kind!r}")
 
@@ -431,21 +446,40 @@ def _tokenize_step(
     )
 
 
-def _when_emits(spec: TokenizerModalitySpec, row: dict) -> bool:
+def _when_value_matches(spec: TokenizerModalitySpec, row: dict) -> bool:
+    """True when any ``equals`` / ``not_equals`` entry in ``when`` matches."""
+    when = spec.when
+    if not when:
+        return False
+    for field, expected in when.get("equals", ()):
+        if field in row and values_equal(row[field], expected):
+            return True
+    for field, expected in when.get("not_equals", ()):
+        if field in row and not values_equal(row[field], expected):
+            return True
+    return False
+
+
+def _when_emits(
+    spec: TokenizerModalitySpec,
+    row: dict,
+    *,
+    value_matched: bool | None = None,
+) -> bool:
     """True when this field should emit on ``row``.
 
-    ``when_field=`` / ``when_equals=`` / ``when_not_equals=`` gate
-    emission. A missing key is not a match, so the field emits nothing.
-    Fields that leave the when knobs unset always pass.
+    Conditions under ``when=`` are **OR**ed: any ``equals`` /
+    ``not_equals`` match and/or ``group_start`` is enough. A missing
+    compare key is not a match. Omit ``when`` and the field always emits.
     """
-    if spec.when_field is None:
+    if not spec.when:
         return True
-    if spec.when_field not in row:
-        return False
-    actual = row[spec.when_field]
-    if spec.when_equals is not None:
-        return values_equal(actual, spec.when_equals)
-    return not values_equal(actual, spec.when_not_equals)
+    matched = (
+        value_matched
+        if value_matched is not None
+        else _when_value_matches(spec, row)
+    )
+    return matched or when_has_group_start(spec)
 
 
 TOKENIZER_FORMAT = "mouse-core-tokenizer-v1"
@@ -453,11 +487,17 @@ TOKENIZER_FILENAME = "tokenizer.json"
 
 
 def _jsonable(value: Any) -> Any:
-    """JSON-safe form of a tokenizer field value (``when_equals=`` especially)."""
+    """JSON-safe form of a tokenizer field value (``when`` pairs especially)."""
     if isinstance(value, np.generic):
         return value.item()
     if isinstance(value, np.ndarray):
         return value.tolist()
+    if isinstance(value, tuple):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, list):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _jsonable(v) for k, v in value.items()}
     return value
 
 
@@ -471,8 +511,6 @@ def tokenizer_config(*, tokenizer: Tokenizer) -> dict[str, Any]:
             if value is None:
                 continue
             if key == "head_output" and value is False:
-                continue
-            if key == "when_group_start" and value is False:
                 continue
             if key == "required" and value is True:
                 continue
@@ -513,7 +551,7 @@ def load_tokenizer(
 ) -> Tokenizer:
     """Load a tokenizer packing spec from a checkpoint directory or Hub repo.
 
-    The JSON is the packing contract (fields, ``when_group_start``,
+    The JSON is the packing contract (fields, ``when``,
     ``objective_fields``, ``pretrained`` name). A live HF tokenizer or
     image tokenizer is an execution choice: pass ``tokenizer=`` /
     ``image_tokenizer=`` when the spec needs them; otherwise

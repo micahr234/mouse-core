@@ -11,8 +11,11 @@ import numpy as np
 import torch
 
 # Shared text stream. ``type="text"`` / ``type="token"`` fields emit here;
-# ``when_group_start=True`` fields are tokenized into the same modality.
+# ``when={"group_start": True}`` fields are tokenized into the same modality.
 NAME_TEXT = "__text__"
+
+# Keys allowed on ``TokenizerModalitySpec.when``.
+WHEN_KEYS = frozenset({"equals", "not_equals", "group_start"})
 
 # Step-backed ``text`` ``format=`` interpolates the field value here.
 # A format spec is allowed (``"{field:.0f}"``). Consts have no placeholders.
@@ -40,28 +43,37 @@ class TokenizerModalitySpec:
     step value into exactly one placeholder ``{field}``; a format spec
     such as ``"{field:.0f}"`` is allowed. Omit ``input_field=`` and the
     field is a const: ``output_field=`` names it and ``format=`` is the
-    literal string to tokenize (no placeholders). ``when_field=`` pairs
-    with exactly one of ``when_equals=`` or ``when_not_equals=``: the
-    field emits only when that other step value equals / does not equal
-    the given value (a missing key does not emit). Otherwise the field
-    emits nothing, and its own ``required`` is not consulted. Unrelated
-    fields leave the when knobs unset and emit as before. ``format=`` /
-    const ``format=`` are ``str.format`` strings: write ``{{`` / ``}}``
-    for a literal brace. ``token`` / ``image`` do not accept ``format=``.
+    literal string to tokenize (no placeholders). ``format=`` / const
+    ``format=`` are ``str.format`` strings: write ``{{`` / ``}}`` for a
+    literal brace. ``token`` / ``image`` do not accept ``format=``.
 
-    ``when_group_start=True`` marks tokens for insertion at the start of
-    each grouping-field segment (and each packed sequence) by
-    :func:`~mouse_core.data.token_batch.pack_token_batch`. Those tokens
-    are not part of the step's ordinary run; incremental decode passes
-    ``prev_grouping_ids`` so a cached segment does not re-emit them.
-    ``head_output`` fields cannot set ``when_group_start`` (they must
-    emit on every step).
+    Optional ``when=`` is a dict of emission conditions. Every listed
+    condition is **OR**ed — the field emits if any matches. Omit
+    ``when`` (or pass ``None`` / an empty dict) and the field always
+    emits (subject to ``required``). Allowed keys:
+
+    * ``equals`` — list of ``(field, value)`` pairs; matches when that
+      step value equals ``value`` (a missing key does not match).
+    * ``not_equals`` — list of ``(field, value)`` pairs; matches when
+      that step value does not equal ``value`` (a missing key does not
+      match).
+    * ``group_start`` — ``True`` marks tokens for insertion at the start
+      of each grouping-field segment (and each packed sequence) by
+      :func:`~mouse_core.data.token_batch.pack_token_batch`. Incremental
+      decode passes ``prev_grouping_ids`` so a cached segment does not
+      re-emit them.
+
+    When a value condition and ``group_start`` are both set, a matching
+    value emits on the step's ordinary token run; otherwise the tokens
+    are carried as ``group_start_*`` for pack-time insertion.
+    ``head_output`` fields cannot set ``when`` (they must emit on every
+    step).
 
     ``required`` (default ``True``) means the step must carry
     ``input_field``; a missing / ``None`` value raises. With
     ``required=False`` a missing value emits nothing. Const text fields
     have no ``input_field``; they reject ``required=False``. Consts may
-    still use ``when_field=`` / ``when_group_start=``.
+    still use ``when=``.
 
     Exactly one input field must set ``head_output=True``: its tokens are
     the step's **head-output tokens** — the positions the model reads Q /
@@ -81,10 +93,7 @@ class TokenizerModalitySpec:
     output_field: str | None = None
     format: str | None = None
     max_tokens: int | None = None
-    when_field: str | None = None
-    when_equals: Any = None
-    when_not_equals: Any = None
-    when_group_start: bool = False
+    when: dict[str, Any] | None = None
     required: bool = True
     head_output: bool = False
 
@@ -107,8 +116,7 @@ class TokenizerModalitySpec:
             _validate_max_tokens(self)
         else:
             self._reject_max_tokens(k)
-        _validate_when_pair(self)
-        _validate_when_group_start(self)
+        _validate_when(self)
 
     def _init_text(self) -> None:
         if self.input_field is None:
@@ -127,8 +135,7 @@ class TokenizerModalitySpec:
                     "a literal string and must not contain placeholders"
                 )
             _validate_max_tokens(self)
-            _validate_when_pair(self)
-            _validate_when_group_start(self)
+            _validate_when(self)
             return
         if not self.output_field:
             object.__setattr__(self, "output_field", self.input_field)
@@ -139,8 +146,7 @@ class TokenizerModalitySpec:
                 f"exactly one placeholder {{{TEXT_FORMAT_KEY}}}"
             )
         _validate_max_tokens(self)
-        _validate_when_pair(self)
-        _validate_when_group_start(self)
+        _validate_when(self)
 
     def _init_named_input(self) -> None:
         if not self.input_field:
@@ -207,45 +213,82 @@ def _validate_max_tokens(spec: TokenizerModalitySpec) -> None:
     object.__setattr__(spec, "max_tokens", n)
 
 
-def _validate_when_pair(spec: TokenizerModalitySpec) -> None:
-    name = spec.output_field or spec.input_field
-    has_field = spec.when_field is not None
-    has_eq = spec.when_equals is not None
-    has_ne = spec.when_not_equals is not None
-    # ``when_equals=0`` / ``when_not_equals=0`` count as set (not None).
-    # A bare ``when_field`` with neither compare value is invalid.
-    if not has_field:
-        if has_eq or has_ne:
+def _normalize_when_pair(
+    value: Any, *, name: str, knob: str
+) -> tuple[str, Any]:
+    """Accept ``(field, value)`` or a length-2 list (JSON round-trip)."""
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise TypeError(
+            f"tokenizer modality {name!r} when[{knob!r}] entries must be "
+            "(field, value) pairs"
+        )
+    field, expected = value[0], value[1]
+    if not isinstance(field, str) or field == "":
+        raise TypeError(
+            f"tokenizer modality {name!r} when[{knob!r}] field must be a "
+            "non-empty string"
+        )
+    return (field, expected)
+
+
+def _normalize_when(
+    when: Any, *, name: str
+) -> dict[str, Any] | None:
+    """Normalize ``when=`` to a dict with only active keys, or ``None``."""
+    if when is None:
+        return None
+    if not isinstance(when, dict):
+        raise TypeError(
+            f"tokenizer modality {name!r} when= must be a dict or None"
+        )
+    unknown = set(when) - WHEN_KEYS
+    if unknown:
+        raise TypeError(
+            f"tokenizer modality {name!r} when= unknown keys "
+            f"{sorted(unknown)}; expected subset of {sorted(WHEN_KEYS)}"
+        )
+    out: dict[str, Any] = {}
+    for knob in ("equals", "not_equals"):
+        if knob not in when or when[knob] is None:
+            continue
+        raw = when[knob]
+        if not isinstance(raw, list):
             raise TypeError(
-                f"tokenizer modality {name!r} when_equals= / when_not_equals= "
-                "require when_field="
+                f"tokenizer modality {name!r} when[{knob!r}] must be a "
+                "list of (field, value) pairs"
             )
-        return
-    if not isinstance(spec.when_field, str) or spec.when_field == "":
-        raise TypeError(
-            f"tokenizer modality {name!r} when_field= must be a non-empty string"
-        )
-    if has_eq == has_ne:
-        raise TypeError(
-            f"tokenizer modality {name!r} when_field= requires exactly one of "
-            "when_equals= or when_not_equals="
-        )
-    if spec.head_output:
-        raise ValueError(
-            f"tokenizer modality {name!r} is head_output and cannot set "
-            "when_field= (that field must emit on every step)"
-        )
+        pairs = [
+            _normalize_when_pair(item, name=name, knob=knob) for item in raw
+        ]
+        if pairs:
+            out[knob] = pairs
+    if "group_start" in when and when["group_start"] is not None:
+        gs = when["group_start"]
+        if not isinstance(gs, bool):
+            raise TypeError(
+                f"tokenizer modality {name!r} when['group_start'] must be a bool"
+            )
+        if gs:
+            out["group_start"] = True
+    return out or None
 
 
-def _validate_when_group_start(spec: TokenizerModalitySpec) -> None:
-    if not spec.when_group_start:
-        return
+def _validate_when(spec: TokenizerModalitySpec) -> None:
     name = spec.output_field or spec.input_field
+    normalized = _normalize_when(spec.when, name=name)
+    object.__setattr__(spec, "when", normalized)
+    if normalized is None:
+        return
     if spec.head_output:
         raise ValueError(
             f"tokenizer modality {name!r} is head_output and cannot set "
-            "when_group_start= (that field must emit on every step)"
+            "when= (that field must emit on every step)"
         )
+
+
+def when_has_group_start(spec: TokenizerModalitySpec) -> bool:
+    """True when ``when`` requests pack-time group-start insertion."""
+    return bool(spec.when and spec.when.get("group_start"))
 
 
 def unwrap_scalar(value: Any) -> Any:

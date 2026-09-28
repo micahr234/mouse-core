@@ -15,8 +15,7 @@ def _tok(**kwargs) -> Tokenizer:
             {
                 "type": "token",
                 "input_field": "episode_index",
-                "when_field": "step_index",
-                "when_equals": 0,
+                "when": {"equals": [("step_index", 0)]},
             },
         ],
         objective_fields=[{"input_field": "reward"}, {"input_field": "action"}],
@@ -96,8 +95,7 @@ def test_objective_vector_column_promotes_dtype() -> None:
             {
                 "type": "token",
                 "input_field": "episode_index",
-                "when_field": "step_index",
-                "when_equals": 0,
+                "when": {"equals": [("step_index", 0)]},
             },
         ],
         objective_fields=[{"input_field": "q"}],
@@ -120,8 +118,7 @@ def test_objective_ragged_float_vectors_pad_with_neg_inf() -> None:
             {
                 "type": "token",
                 "input_field": "episode_index",
-                "when_field": "step_index",
-                "when_equals": 0,
+                "when": {"equals": [("step_index", 0)]},
             },
         ],
         objective_fields=[{"input_field": "q"}],
@@ -146,8 +143,7 @@ def test_objective_ragged_int_vectors_raise() -> None:
             {
                 "type": "token",
                 "input_field": "episode_index",
-                "when_field": "step_index",
-                "when_equals": 0,
+                "when": {"equals": [("step_index", 0)]},
             },
         ],
         objective_fields=[{"input_field": "q"}],
@@ -168,8 +164,7 @@ def test_objective_mixed_rank_raises() -> None:
             {
                 "type": "token",
                 "input_field": "episode_index",
-                "when_field": "step_index",
-                "when_equals": 0,
+                "when": {"equals": [("step_index", 0)]},
             },
         ],
         objective_fields=[{"input_field": "q"}],
@@ -199,8 +194,7 @@ def test_positions_index_tokens_within_modality_per_step() -> None:
             {
                 "type": "token",
                 "input_field": "episode_index",
-                "when_field": "step_index",
-                "when_equals": 0,
+                "when": {"equals": [("step_index", 0)]},
             },
         ],
         tokenizer=_FakeTokenizer(),
