@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- ``DataLoader`` ``sample_end`` finds the first match **strictly after**
+  the chosen start index (search from ``start + 1``). The start row
+  never counts as the end, even when the end predicate is true there —
+  so the same callable may be used for ``sample_start`` and
+  ``sample_end``. Incomplete starts (no later match before
+  ``sequence_length`` / store end) are still skipped and resampled;
+  exhaustion / invariant raises unchanged. Docs and tests follow.
 - ``DataLoader`` with ``sample_end`` set: a chosen start that never
   hits an end match before ``sequence_length`` / store end is
   **skipped** and another start is sampled (no silent truncate). Raises
