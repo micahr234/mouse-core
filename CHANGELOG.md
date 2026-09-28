@@ -105,6 +105,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pass ``architecture="qwen3"`` or ``architecture="llama"``.
 
 ### Changed
+- Example notebooks and ``bench/bench_dataloader.py`` rename the
+  FrozenLake prompt constant ``GROUP_PREFIX`` / ``_GROUP_PREFIX`` to
+  ``group_prefix`` / ``_group_prefix``.
 - ``_packing_plan`` keeps ``max_seqlen`` as a 0-dim on-device tensor.
   ``packed_forward`` materializes a Python int only for ``varlen`` /
   ``padded`` (kernels that need a size); ``flex`` / ``reference`` never
