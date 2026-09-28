@@ -72,7 +72,7 @@ _MAX_ACTIONS = 4
 _MAX_OBS = 64
 _STEPS_PER_EPISODE = 8
 _EPISODES_PER_TASK = 4  # max task = 32 steps; keep ≤ shortest --workloads S
-_GROUP_PREFIX = (
+_group_prefix = (
     "Your job is to predict the future sum of rewards in FrozenLake. "
     "Navigate a grid; reach the goal for reward; a hole ends the "
     "episode with none. You have 20 episodes to solve the task. The "
@@ -159,7 +159,7 @@ def _train_transform() -> Any:
             {
                 "type": "text",
                 "output_field": "group_start",
-                "format": _GROUP_PREFIX,
+                "format": _group_prefix,
                 "when": when_group_start,
             },
             {"type": "text", "input_field": "action", "format": "{field},"},
