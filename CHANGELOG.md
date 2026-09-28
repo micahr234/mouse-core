@@ -26,11 +26,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the pair unset are unchanged. Text and token constructions emit
   ``episode_index`` only when ``step_index`` is ``0``, including a
   later episode's zero step in the same task.
-- ``DataLoader(episode_start=False)`` (default) may start a sampled window
-  mid-episode. ``episode_start=True`` starts every window at an episode
-  start: store index 0, or the step after a non-zero ``episode_done``,
-  including a later episode packed into the same store. Window length
-  stays ``min(sequence_length, steps remaining in the store)``. A short
+- ``DataLoader`` ``sample_start`` / ``sample_end`` take
+  ``SampleBoundary(field=, value=)`` or ``None``. ``None`` (default)
+  may start a window at any store offset and never truncates early for
+  a field. ``sample_start`` restricts starts to store index 0 and every
+  step after a row where ``field != value`` (e.g.
+  ``SampleBoundary(field="episode_done", value=0)`` or
+  ``field="task_done"`` for task starts). ``sample_end`` includes the
+  first such boundary row in the window then stops, even before
+  ``sequence_length``. Without ``sample_end``, length stays
+  ``min(sequence_length, steps remaining in the store)``. A short
   suffix is a shorter window; rows are not padded.
 - ``bootstrap_cutoff`` on ``DqnObjective`` and ``PpoObjective``.
   Required. ``True`` adds the value where the

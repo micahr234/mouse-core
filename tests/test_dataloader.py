@@ -17,6 +17,7 @@ from mouse_core.data import (
     Augmenter,
     DataLoader,
     Datastore,
+    SampleBoundary,
     Tokenizer,
     compose,
 )
@@ -593,11 +594,37 @@ def _packed_episode_store() -> tuple[Datastore, set[int]]:
     return store, {0, 2, 3}
 
 
+def _packed_task_store() -> tuple[Datastore, set[int]]:
+    """Two tasks packed in one store. Returns task-start offsets.
+
+    Layout (action, episode_done, task_done):
+    ``(10, 1, 0), (11, 1, 1) | (12, 0, 0), (13, 2, 2)``.
+    Task starts are 0 and 2. Index 1 and 3 are mid-task.
+    """
+    store = Datastore()
+    rows = (
+        (10, 1, 0),
+        (11, 1, 1),
+        (12, 0, 0),
+        (13, 2, 2),
+    )
+    for action, episode_done, task_done in rows:
+        store.append(
+            data={
+                "action": action,
+                "reward": 0.0,
+                "episode_done": episode_done,
+                "task_done": task_done,
+            }
+        )
+    return store, {0, 2}
+
+
 def _index_transform():
     return compose(
         stages=(
             _stamp_grouping,
-            _tokenizer(objective_fields=_obj("action", "store_index", "episode_done")),
+            _tokenizer(objective_fields=_obj("action", "store_index", "episode_done", "task_done")),
         )
     )
 
@@ -614,14 +641,14 @@ def _sampled_windows(loader: DataLoader, n: int) -> list[list[tuple[int, int]]]:
     return batches
 
 
-def test_dataloader_episode_start_off_can_begin_mid_episode() -> None:
+def test_dataloader_sample_start_none_can_begin_mid_segment() -> None:
     store, episode_starts = _packed_episode_store()
     loader = _loader(
         sequence_length=2,
         batch_size=2,
         num_workers=0,
         seed=0,
-        episode_start=False,
+        sample_start=None,
         stores=store,
         index_field="store_index",
         transform=_index_transform(),
@@ -630,7 +657,7 @@ def test_dataloader_episode_start_off_can_begin_mid_episode() -> None:
     assert starts - episode_starts
 
 
-def test_dataloader_episode_start_defaults_to_mid_episode_sampling() -> None:
+def test_dataloader_sample_start_defaults_to_unrestricted() -> None:
     store, _episode_starts = _packed_episode_store()
     kwargs = dict(
         sequence_length=2,
@@ -642,19 +669,19 @@ def test_dataloader_episode_start_defaults_to_mid_episode_sampling() -> None:
         transform=_index_transform(),
     )
     omitted = _loader(**kwargs)
-    explicit = _loader(episode_start=False, **kwargs)
+    explicit = _loader(sample_start=None, sample_end=None, **kwargs)
     assert _sampled_windows(omitted, 4) == _sampled_windows(explicit, 4)
 
 
-def test_dataloader_episode_start_on_begins_at_episode_start() -> None:
-    """Every packed sequence starts on an episode, including a later one."""
+def test_dataloader_sample_start_begins_after_boundary() -> None:
+    """Every packed sequence starts on a segment, including a later one."""
     store, episode_starts = _packed_episode_store()
     loader = _loader(
         sequence_length=2,
         batch_size=2,
         num_workers=0,
         seed=1,
-        episode_start=True,
+        sample_start=SampleBoundary(field="episode_done", value=0),
         stores=store,
         index_field="store_index",
         transform=_index_transform(),
@@ -666,8 +693,25 @@ def test_dataloader_episode_start_on_begins_at_episode_start() -> None:
     assert starts - {0}
 
 
-def test_dataloader_episode_start_short_suffix_stays_ragged() -> None:
-    """A short episode at the store end is a shorter window, not a padded one."""
+def test_dataloader_sample_start_task_done_uses_task_boundaries() -> None:
+    store, task_starts = _packed_task_store()
+    loader = _loader(
+        sequence_length=2,
+        batch_size=2,
+        num_workers=0,
+        seed=3,
+        sample_start=SampleBoundary(field="task_done", value=0),
+        stores=store,
+        index_field="store_index",
+        transform=_index_transform(),
+    )
+    starts = {start for batch in _sampled_windows(loader, 64) for start, _ in batch}
+    assert starts <= task_starts
+    assert starts == task_starts
+
+
+def test_dataloader_sample_start_short_suffix_stays_ragged() -> None:
+    """A short segment at the store end is a shorter window, not a padded one."""
     store, episode_starts = _packed_episode_store()
     sequence_length = 10
     loader = _loader(
@@ -675,7 +719,7 @@ def test_dataloader_episode_start_short_suffix_stays_ragged() -> None:
         batch_size=1,
         num_workers=0,
         seed=2,
-        episode_start=True,
+        sample_start=SampleBoundary(field="episode_done", value=0),
         stores=store,
         index_field="store_index",
         transform=_index_transform(),
@@ -689,7 +733,57 @@ def test_dataloader_episode_start_short_suffix_stays_ragged() -> None:
         assert length < sequence_length
 
 
-def test_dataloader_episode_start_requires_episode_done() -> None:
+def test_dataloader_sample_end_truncates_on_boundary() -> None:
+    """Windows include the first boundary row then stop before sequence_length."""
+    store, _ = _packed_episode_store()
+    loader = _loader(
+        sequence_length=10,
+        batch_size=1,
+        num_workers=0,
+        seed=0,
+        sample_start=SampleBoundary(field="episode_done", value=0),
+        sample_end=SampleBoundary(field="episode_done", value=0),
+        stores=store,
+        index_field="store_index",
+        transform=_index_transform(),
+    )
+    windows = [window for batch in _sampled_windows(loader, 48) for window in batch]
+    assert windows
+    # Episodes lengths: [2, 1, 3]. Each window is one full episode.
+    by_start = {start: length for start, length in windows}
+    assert by_start.keys() <= {0, 2, 3}
+    if 0 in by_start:
+        assert by_start[0] == 2
+    if 2 in by_start:
+        assert by_start[2] == 1
+    if 3 in by_start:
+        assert by_start[3] == 3
+
+
+def test_dataloader_sample_end_mid_window_without_start_constraint() -> None:
+    store, _ = _packed_episode_store()
+    loader = _loader(
+        sequence_length=10,
+        batch_size=1,
+        num_workers=0,
+        seed=4,
+        sample_start=None,
+        sample_end=SampleBoundary(field="episode_done", value=0),
+        stores=store,
+        index_field="store_index",
+        transform=_index_transform(),
+    )
+    for _ in range(32):
+        _, obj = loader.next_batch()
+        indices = [int(x) for x in obj["store_index"]]
+        dones = [int(x) for x in obj["episode_done"]]
+        assert indices == list(range(indices[0], indices[0] + len(indices)))
+        if indices[-1] < len(store) - 1 or dones[-1] != 0:
+            assert dones[-1] != 0
+            assert all(d == 0 for d in dones[:-1])
+
+
+def test_dataloader_sample_start_requires_field_column() -> None:
     store = Datastore()
     store.append(data={"action": 1, "reward": 0.0, "task_done": 0})
     with pytest.raises(ValueError, match="episode_done"):
@@ -697,6 +791,36 @@ def test_dataloader_episode_start_requires_episode_done() -> None:
             sequence_length=2,
             batch_size=1,
             num_workers=0,
-            episode_start=True,
+            sample_start=SampleBoundary(field="episode_done", value=0),
             stores=store,
+        )
+
+
+def test_dataloader_sample_end_requires_field_column() -> None:
+    store = Datastore()
+    store.append(data={"action": 1, "reward": 0.0, "episode_done": 0})
+    with pytest.raises(ValueError, match="task_done"):
+        _loader(
+            sequence_length=2,
+            batch_size=1,
+            num_workers=0,
+            sample_end=SampleBoundary(field="task_done", value=0),
+            stores=store,
+        )
+
+
+def test_dataloader_sample_boundary_type_errors() -> None:
+    with pytest.raises(TypeError, match="sample_start"):
+        _loader(
+            sequence_length=2,
+            batch_size=1,
+            num_workers=0,
+            sample_start=True,  # type: ignore[arg-type]
+        )
+    with pytest.raises(TypeError, match="sample_end"):
+        _loader(
+            sequence_length=2,
+            batch_size=1,
+            num_workers=0,
+            sample_end="episode_done",  # type: ignore[arg-type]
         )
