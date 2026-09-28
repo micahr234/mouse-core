@@ -9,6 +9,13 @@ import torch
 
 from mouse_core.data import Tokenizer, compose, pack_token_batch
 from mouse_core.data.token_batch import StepTokens, TokenBatch
+from mouse_core.data.conditions import (
+    when_episode_done_nonzero,
+    when_group_start,
+    when_reward_nonzero,
+    when_step_index_zero,
+    when_step_index_zero_or_group_start,
+)
 
 DEFAULT_GROUPING_FIELD = "grouping_id"
 DEFAULT_TOKEN_VOCAB = 32
@@ -43,7 +50,7 @@ def token_tokenizer(
             {
                 "type": "token",
                 "input_field": "episode_index",
-                "when": {"equals": [("step_index", 0)]},
+                "when": when_step_index_zero,
             },
         )
     if objective_fields is None:

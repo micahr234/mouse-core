@@ -12,6 +12,13 @@ from mouse_core.models.backbone import TransformerBackbone
 from mouse_core.models.heads import RegressionHead
 from mouse_core.models.reasoner import _plan_insertions
 from mouse_core.objectives import DqnObjective, affine_reward, affine_value, boundary_discount
+from mouse_core.data.conditions import (
+    when_episode_done_nonzero,
+    when_group_start,
+    when_reward_nonzero,
+    when_step_index_zero,
+    when_step_index_zero_or_group_start,
+)
 from tests._token_batch_helpers import batch_to_packed
 
 
@@ -64,7 +71,7 @@ def _head_output_tokenizer(
         {
             "type": "token",
             "input_field": "episode_index",
-            "when": {"equals": [("step_index", 0)]},
+            "when": when_step_index_zero,
         }
     )
     fields.append(
@@ -140,7 +147,7 @@ def test_tokenizer_requires_exactly_one_head_output_field() -> None:
                 {
                     "type": "token",
                     "input_field": "episode_index",
-                    "when": {"equals": [("step_index", 0)]},
+                    "when": when_step_index_zero,
                 },
             ],
             grouping_field="task_index",
@@ -153,7 +160,7 @@ def test_tokenizer_requires_exactly_one_head_output_field() -> None:
                 {
                     "type": "token",
                     "input_field": "episode_index",
-                    "when": {"equals": [("step_index", 0)]},
+                    "when": when_step_index_zero,
                 },
             ],
             grouping_field="task_index",
@@ -174,7 +181,7 @@ def test_step_without_head_output_token_raises() -> None:
             {
                 "type": "token",
                 "input_field": "episode_index",
-                "when": {"equals": [("step_index", 0)]},
+                "when": when_step_index_zero,
             },
         ],
         tokenizer=_FakeTokenizer(),
@@ -196,7 +203,7 @@ def test_head_output_rejects_when() -> None:
                     "type": "text",
                     "input_field": "reward",
                     "format": "{field}",
-                    "when": {"not_equals": [("reward", 0.0)]},
+                    "when": when_reward_nonzero,
                     "head_output": True,
                 },
             ],
@@ -213,7 +220,7 @@ def test_head_output_rejects_group_start() -> None:
                     "type": "text",
                     "output_field": "value",
                     "format": "\n",
-                    "when": {"group_start": True},
+                    "when": when_group_start,
                     "head_output": True,
                 },
             ],
