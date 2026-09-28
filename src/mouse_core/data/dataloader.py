@@ -20,15 +20,18 @@ set.
 
 ``sample_end=None`` (the default) never truncates early for a field.
 ``sample_end`` may be a callable ``cols → bool ndarray`` over the
-candidate window rows; the window includes the first ``True`` row then
-stops. Notebooks often define a ``full_task_end`` callable inline
-(``task_done != 0``). If ``sample_end`` is set but no matching row
-appears before ``sequence_length`` or the store end for a chosen
-start, that draw is discarded and another start is sampled (not a
-silent truncate). Exhaustion — every candidate start incomplete, or
-too many consecutive misses — raises ``ValueError``. Every yielded
-window with ``sample_end`` set must end on a match; a broken
-invariant raises.
+candidate window rows; the window includes the first ``True`` row
+**strictly after** the start index then stops (search from
+``start + 1``; the start row itself never counts as the end, even when
+the end predicate is true there — so the same callable may be used for
+both ``sample_start`` and ``sample_end``). Notebooks often define a
+``full_task_end`` callable inline (``task_done != 0``). If ``sample_end``
+is set but no matching row appears strictly after the start and before
+``sequence_length`` or the store end for a chosen start, that draw is
+discarded and another start is sampled (not a silent truncate).
+Exhaustion — every candidate start incomplete, or too many consecutive
+misses — raises ``ValueError``. Every yielded window with
+``sample_end`` set must end on a match; a broken invariant raises.
 
 The loader is stage-agnostic: compose augmenter / tokenizer
 (or any ``dict → StepTokens`` callable) outside and pass the result as
@@ -234,19 +237,26 @@ def _window_end(
 ) -> int | None:
     """Exclusive end index for a window starting at ``start``.
 
-    When ``end_fn`` is set, the first matching row must appear at or
-    before ``min(start + s_max, n) - 1``; otherwise return ``None`` so
-    the caller can discard this start and resample.
+    When ``end_fn`` is set, the first matching row must appear strictly
+    after ``start`` and at or before ``min(start + s_max, n) - 1``;
+    otherwise return ``None`` so the caller can discard this start and
+    resample. The start row never counts as the end match.
     """
     end = min(start + s_max, n)
     if end_fn is None or start >= end:
         return end
-    cols = _ColumnView(ds=ds, offset=start, n=end - start)
-    mask = _eval_sample_mask(fn=end_fn, cols=cols, n=end - start, role="end")
+    # Start row is never the end, even when the end predicate is true there.
+    search_from = start + 1
+    if search_from >= end:
+        return None
+    cols = _ColumnView(ds=ds, offset=search_from, n=end - search_from)
+    mask = _eval_sample_mask(
+        fn=end_fn, cols=cols, n=end - search_from, role="end"
+    )
     hits = np.flatnonzero(mask)
     if len(hits) == 0:
         return None
-    return start + int(hits[0]) + 1
+    return search_from + int(hits[0]) + 1
 
 
 def _all_sample_starts_exhausted(
@@ -280,11 +290,16 @@ def _require_window_ends_on_sample_end(
     end: int,
     end_fn: SampleFn,
 ) -> None:
-    """Raise if a yielded ``sample_end`` window does not end on a match."""
+    """Raise if a yielded ``sample_end`` window does not end on a match.
+
+    End must be strictly after start (at least two rows): the start row
+    never counts as the end match.
+    """
     count = end - start
-    if count < 1:
+    if count < 2:
         raise ValueError(
-            "DataLoader invariant violated: empty window with sample_end set "
+            "DataLoader invariant violated: sample_end window must include "
+            f"a row strictly after start "
             f"({_sample_end_label(end_fn)}; start={start}, exclusive_end={end})."
         )
     cols = _ColumnView(ds=ds, offset=start, n=count)
@@ -345,10 +360,10 @@ def _fetch_sequence(
 ) -> list[dict]:
     """Fetch one contiguous window of length ``1 .. sequence_length``.
 
-    With ``sample_end`` set, incomplete starts (no end match within the
-    allowed range) are discarded and another start is drawn. Raises when
-    every candidate start is incomplete or after
-    ``_SAMPLE_END_MAX_RETRIES`` consecutive misses.
+    With ``sample_end`` set, incomplete starts (no end match strictly
+    after the start within the allowed range) are discarded and another
+    start is drawn. Raises when every candidate start is incomplete or
+    after ``_SAMPLE_END_MAX_RETRIES`` consecutive misses.
     """
     if sum(cfg.ns) == 0:
         raise ValueError("Cannot sample batches: all stores are empty.")
@@ -532,12 +547,13 @@ class DataLoader:
     sample_end :
         When ``None`` (default), the window stops only at ``sequence_length``
         or the store end. When a callable ``cols → bool ndarray`` over the
-        candidate window, the window includes the first ``True`` row then
-        stops. Incomplete starts (no match before ``sequence_length`` /
-        store end) are skipped and another start is drawn. Exhaustion or a
-        yielded window that somehow lacks an end match raises
-        ``ValueError``. A short matching segment is a shorter window; rows
-        are not padded.
+        candidate window, the window includes the first ``True`` row
+        strictly after the start index then stops (the start row never
+        counts as the end). Incomplete starts (no match strictly after
+        start and before ``sequence_length`` / store end) are skipped and
+        another start is drawn. Exhaustion or a yielded window that
+        somehow lacks an end match raises ``ValueError``. A short matching
+        segment is a shorter window; rows are not padded.
     batch_size :
         How many such windows per batch.
     transform :

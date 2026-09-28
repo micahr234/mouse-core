@@ -762,7 +762,7 @@ def test_dataloader_sample_start_short_suffix_stays_ragged() -> None:
 
 
 def test_dataloader_sample_end_truncates_on_boundary() -> None:
-    """Windows include the first boundary row then stop before sequence_length."""
+    """Windows include the first end match strictly after start."""
     store, _ = _packed_episode_store()
     loader = _loader(
         sequence_length=10,
@@ -777,13 +777,15 @@ def test_dataloader_sample_end_truncates_on_boundary() -> None:
     )
     windows = [window for batch in _sampled_windows(loader, 48) for window in batch]
     assert windows
-    # Episodes lengths: [2, 1, 3]. Each window is one full episode.
+    # Starts 0, 2, 3. End is first episode_done strictly after start:
+    # start 0 → end at 1 (len 2); start 2 lands on a done row so that
+    # row is skipped and end is at 5 (len 4); start 3 → end at 5 (len 3).
     by_start = {start: length for start, length in windows}
     assert by_start.keys() <= {0, 2, 3}
     if 0 in by_start:
         assert by_start[0] == 2
     if 2 in by_start:
-        assert by_start[2] == 1
+        assert by_start[2] == 4
     if 3 in by_start:
         assert by_start[3] == 3
 
@@ -806,9 +808,60 @@ def test_dataloader_sample_end_mid_window_without_start_constraint() -> None:
         indices = [int(x) for x in obj["store_index"]]
         dones = [int(x) for x in obj["episode_done"]]
         assert indices == list(range(indices[0], indices[0] + len(indices)))
-        if indices[-1] < len(store) - 1 or dones[-1] != 0:
-            assert dones[-1] != 0
-            assert all(d == 0 for d in dones[:-1])
+        assert len(indices) >= 2
+        # End is first match strictly after start (start row may itself match).
+        assert dones[-1] != 0
+        assert all(d == 0 for d in dones[1:-1])
+
+
+def test_dataloader_sample_start_and_end_same_predicate() -> None:
+    """Same callable for start and end → window from start to next later match."""
+    store = Datastore()
+    # Boundary rows at 0, 2, 5 (predicate true). Starts are those rows;
+    # end must be the next later boundary (not the start itself).
+    rows = (
+        (10, 1),
+        (11, 0),
+        (12, 1),
+        (13, 0),
+        (14, 0),
+        (15, 1),
+    )
+    for action, episode_done in rows:
+        store.append(
+            data={
+                "action": action,
+                "reward": 0.0,
+                "episode_done": episode_done,
+                "task_done": 0,
+            }
+        )
+
+    def on_episode_done(cols):
+        return np.asarray(cols["episode_done"]) != 0
+
+    loader = _loader(
+        sequence_length=10,
+        batch_size=1,
+        num_workers=0,
+        seed=0,
+        sample_start=on_episode_done,
+        sample_end=on_episode_done,
+        stores=store,
+        index_field="store_index",
+        transform=_index_transform(),
+    )
+    # Start 0 → end 2 (len 3); start 2 → end 5 (len 4); start 5 incomplete.
+    expected = {0: [0, 1, 2], 2: [2, 3, 4, 5]}
+    seen_starts: set[int] = set()
+    for _ in range(48):
+        _, obj = loader.next_batch()
+        indices = [int(x) for x in obj["store_index"]]
+        start = indices[0]
+        seen_starts.add(start)
+        assert start in expected
+        assert indices == expected[start]
+    assert seen_starts == {0, 2}
 
 
 def test_dataloader_sample_start_requires_field_column() -> None:
@@ -826,7 +879,9 @@ def test_dataloader_sample_start_requires_field_column() -> None:
 
 def test_dataloader_sample_end_requires_field_column() -> None:
     store = Datastore()
-    store.append(data={"action": 1, "reward": 0.0, "episode_done": 0})
+    # Need ≥2 rows so end search runs past the start row.
+    for _ in range(2):
+        store.append(data={"action": 1, "reward": 0.0, "episode_done": 0})
     # Missing end column surfaces when a window is drawn.
     loader = _loader(
         sequence_length=2,
@@ -1036,6 +1091,22 @@ def test_dataloader_sample_end_invariant_rejects_window_without_end() -> None:
         )
 
 
+def test_dataloader_sample_end_invariant_rejects_start_as_end() -> None:
+    """Invariant guard: a one-row window (start counted as end) raises."""
+    from mouse_core.data.dataloader import _require_window_ends_on_sample_end
+
+    store, _ = _packed_episode_store()
+    ds = store.to_dataset()
+    # Index 2 is episode_done; exclusive_end=3 would be the old zero-gap bug.
+    with pytest.raises(ValueError, match=r"strictly after start"):
+        _require_window_ends_on_sample_end(
+            ds=ds,
+            start=2,
+            end=3,
+            end_fn=lambda cols: np.asarray(cols["episode_done"]) != 0,
+        )
+
+
 def test_dataloader_sample_start_match_requires_field_column() -> None:
     store = Datastore()
     store.append(data={"action": 1, "reward": 0.0, "step_index": 0, "task_done": 0})
@@ -1051,7 +1122,8 @@ def test_dataloader_sample_start_match_requires_field_column() -> None:
 
 def test_dataloader_sample_end_match_requires_field_column() -> None:
     store = Datastore()
-    store.append(data={"action": 1, "reward": 0.0, "episode_done": 0})
+    for _ in range(2):
+        store.append(data={"action": 1, "reward": 0.0, "episode_done": 0})
     loader = _loader(
         sequence_length=2,
         batch_size=1,
