@@ -29,7 +29,11 @@ def test_sv_objective_accepts_direct_q_targets() -> None:
 def test_sv_objective_requires_targets() -> None:
     predictions = torch.tensor([[[1.0, 2.0]]])
     try:
-        SvObjective(loss_type="mse")(objective_data={}, predictions=predictions)
+        SvObjective(loss_type="mse")(
+            objective_data={},
+            predictions=predictions,
+            targets=None,  # type: ignore[arg-type]
+        )
     except TypeError as exc:
         assert "targets" in str(exc)
     else:

@@ -44,8 +44,7 @@ def _tok_in(
             {
                 "type": "token",
                 "input_field": "episode_index",
-                "when_field": "step_index",
-                "when_equals": 0,
+                "when": {"equals": [("step_index", 0)]},
             }
         )
     return fields
@@ -95,8 +94,7 @@ def test_tokenizer_renames_input_and_objective_fields() -> None:
             {
                 "type": "token",
                 "input_field": "episode_index",
-                "when_field": "step_index",
-                "when_equals": 0,
+                "when": {"equals": [("step_index", 0)]},
             },
         ],
         objective_fields=_io(("q", "info_q_star")),

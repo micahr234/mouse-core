@@ -58,8 +58,7 @@ def _tokenizer(*, objective_fields: list[dict[str, str]] | None = None) -> Token
             {
                 "type": "token",
                 "input_field": "episode_index",
-                "when_field": "step_index",
-                "when_equals": 0,
+                "when": {"equals": [("step_index", 0)]},
             },
         ],
         objective_fields=keep,
