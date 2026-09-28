@@ -54,8 +54,8 @@ class TokenizerModalitySpec:
     ``group_start_*`` tokens. Write OR in the callable
     (``|`` / ``or``), e.g.
     ``lambda ctx: (ctx.get("step_index") == 0) | ctx["group_start"]``.
-    Named callables round-trip via ``module:qualname``; example
-    helpers live under ``examples.conditions``. Omit ``when``
+    Named callables round-trip via ``module:qualname``; define them
+    inline in the notebook or caller. Omit ``when``
     (``None``) and the field always emits on the ordinary run.
     ``head_output`` fields cannot set ``when`` (they must emit on every
     step).

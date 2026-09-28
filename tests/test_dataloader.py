@@ -23,13 +23,37 @@ from mouse_core.data import (
 from mouse_core.data.augmenter import _stable_hash
 from mouse_core.data.dataloader import _sequence_generation
 from mouse_core.data.token_batch import StepTokens, TokenBatch
-from tests._conditions import (
-    after_field_ne,
-    full_task_end,
-    full_task_start,
-    when_step_index_zero,
-)
 from tests._token_batch_helpers import token_tokenizer
+
+
+def after_field_ne(*, field, value):
+    def _after(cols):
+        codes = np.asarray(cols[field])
+        n = len(codes)
+        mask = np.zeros(n, dtype=bool)
+        if n == 0:
+            return mask
+        mask[0] = True
+        if n > 1:
+            mask[1:] = codes[:-1] != value
+        return mask
+
+    _after.__name__ = f"after_{field}_ne"
+    return _after
+
+
+def full_task_end(cols):
+    return np.asarray(cols["task_done"]) != 0
+
+
+def full_task_start(cols):
+    return (np.asarray(cols["episode_index"]) == 0) & (
+        np.asarray(cols["step_index"]) == 0
+    )
+
+
+def when_step_index_zero(ctx):
+    return "step_index" in ctx and ctx["step_index"] == 0
 
 
 def _store_with_actions() -> Datastore:

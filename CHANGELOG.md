@@ -17,12 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   callables round-trip through ``save_tokenizer`` / ``load_tokenizer``
   as ``module:qualname`` refs. ``sample_start`` / ``sample_end`` are
   ``cols → bool ndarray`` (column name → 1-d array). Notebooks and
-  benches define FrozenLake-shaped helpers in ``examples.conditions``
-  (``when_group_start``, ``when_reward_nonzero``,
-  ``when_episode_done_nonzero``, ``when_step_index_zero``,
-  ``when_step_index_zero_or_group_start``, ``full_task_start``,
-  ``full_task_end``, ``after_field_ne``) — not exported from
-  ``mouse_core``. If ``sample_end`` is set but never met before
+  benches define any FrozenLake-shaped predicates **inline** (not a
+  shared helper module) — e.g. ``when_group_start``,
+  ``when_reward_nonzero``, ``full_task_start`` / ``full_task_end``.
+  If ``sample_end`` is set but never met before
   ``sequence_length`` or the store end, ``next_batch`` raises
   ``ValueError``.
 - ``best_action(q)``: integer action id per row, uniform among finite
@@ -115,20 +113,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   0-dim tensors instead of ``tolist()`` / ``loss.item()`` every call
   (including the data-policy ``SpObjective`` path). Loggers can
   ``.item()`` at log time.
-- Training examples and ``bench/bench_dataloader.py`` pin
-  ``sample_start=full_task_start`` and ``sample_end=full_task_end``
-  (from ``examples.conditions``) so each packed sequence is one full
-  task (episode-0 start through ``task_done != 0`` inclusive). Example
-  ``SEQUENCE_LENGTH`` is ``MAX_TASK_EPISODES * MAX_STEPS_PER_EPISODE``
+- Training examples and ``bench/bench_dataloader.py`` define
+  ``full_task_start`` / ``full_task_end`` inline and pin
+  ``sample_start`` / ``sample_end`` so each packed sequence is one
+  full task (episode-0 start through ``task_done != 0`` inclusive).
+  Example ``SEQUENCE_LENGTH`` is ``MAX_TASK_EPISODES * MAX_STEPS_PER_EPISODE``
   (a safety cap so the end-match wins). If ``sample_end`` is set but no
   matching row appears before ``sequence_length`` or the store end,
   ``next_batch`` raises ``ValueError`` instead of returning a truncated
   segment.
-- Tokenizer fields use condition callables from
-  ``examples.conditions``: FrozenLake prompt via ``when_group_start``,
-  reward / episode_done zeros via ``when_reward_nonzero`` /
-  ``when_episode_done_nonzero``, and ``episode_index`` via
-  ``when_step_index_zero_or_group_start``.
+- Tokenizer fields use inline condition callables in each notebook:
+  FrozenLake prompt via ``when_group_start``, reward / episode_done
+  zeros via ``when_reward_nonzero`` / ``when_episode_done_nonzero``,
+  and ``episode_index`` via ``when_step_index_zero_or_group_start``.
 - ``SpObjective`` / ``SvObjective`` take supervised labels as call-time
   ``targets=`` (action ids for hard CE; Q vectors for SV), matching DQN
   ``predictions=`` / ``delayed_predictions=``. ``targets_key`` is
@@ -257,16 +254,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exports (``when_group_start``, ``when_reward_nonzero``,
   ``when_episode_done_nonzero``, ``when_step_index_zero``,
   ``when_step_index_zero_or_group_start``, ``full_task_start``,
-  ``full_task_end``, ``after_field_ne``). Define them locally or import
-  from ``examples.conditions``. The package keeps only the generic
-  callable hooks and ``when_ref`` / ``resolve_when_ref``.
+  ``full_task_end``, ``after_field_ne``). Define predicates inline in
+  each notebook / caller. The package keeps only the generic callable
+  hooks and ``when_ref`` / ``resolve_when_ref``.
 - ``SampleMatch`` and ``SampleBoundary`` for ``DataLoader``
   ``sample_start`` / ``sample_end``. Pass callables
-  ``cols → bool ndarray`` (or ``None``); see ``examples.conditions``
-  for ``full_task_start`` / ``full_task_end`` / ``after_field_ne``.
+  ``cols → bool ndarray`` (or ``None``); define predicates inline
+  (e.g. full-task start/end in each notebook).
 - Tokenizer ``when=`` dict keys ``equals`` / ``not_equals`` /
-  ``group_start``. Pass a callable ``ctx → bool`` (example helpers in
-  ``examples.conditions``).
+  ``group_start``. Pass a callable ``ctx → bool`` defined by the
+  caller.
 - ``Tokenizer(group_prefix=)``. Use an ``input_fields`` entry with
   ``when=when_group_start`` (typically a text const). StepTokens /
   packing carry ``group_start_*`` arrays (was ``group_prefix_*``).

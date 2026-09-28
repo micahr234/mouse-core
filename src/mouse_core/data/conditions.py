@@ -25,9 +25,9 @@ Omit ``when`` (``None``) and the field always emits on the ordinary run.
 Named module-level functions round-trip through
 :func:`~mouse_core.data.tokenizer.save_tokenizer` /
 :func:`~mouse_core.data.tokenizer.load_tokenizer` via an import path.
-Lambdas work at runtime but cannot be saved. Convenience predicates
-used in the notebooks live under ``examples.conditions`` (not exported
-from this package).
+Lambdas work at runtime but cannot be saved. Define any named
+predicates inline in the notebook or caller module — this package
+does not ship convenience helpers.
 
 DataLoader ``sample_start`` / ``sample_end``
 -------------------------------------------
@@ -39,7 +39,15 @@ never met before ``sequence_length`` / store end, sampling raises.
 ``None`` leaves starts unrestricted / never truncates early.
 
 Example full-task FrozenLake windows (predicates defined by the
-caller or in ``examples.conditions``)::
+caller)::
+
+    def full_task_start(cols):
+        return (np.asarray(cols["episode_index"]) == 0) & (
+            np.asarray(cols["step_index"]) == 0
+        )
+
+    def full_task_end(cols):
+        return np.asarray(cols["task_done"]) != 0
 
     sample_start=full_task_start
     sample_end=full_task_end
@@ -69,8 +77,7 @@ def when_ref(fn: WhenFn) -> str:
         raise TypeError(
             "tokenizer when= must be a named module-level function to "
             "save/load; got "
-            f"{fn!r}. Prefer a def at module scope "
-            "(e.g. examples.conditions)."
+            f"{fn!r}. Prefer a def at module scope in the caller."
         )
     return f"{module}:{qualname}"
 

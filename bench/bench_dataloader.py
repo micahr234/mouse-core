@@ -28,21 +28,32 @@ from typing import Any
 import numpy as np
 from datasets import Dataset
 
-_ROOT = Path(__file__).resolve().parents[1]
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
 
 from mouse_core.data import Augmenter, DataLoader, Datastore, Tokenizer, compose
 from mouse_core.data.token_batch import TokenBatch
-from examples.conditions import (
-    full_task_end,
-    full_task_start,
-    when_episode_done_nonzero,
-    when_group_start,
-    when_reward_nonzero,
-    when_step_index_zero,
-    when_step_index_zero_or_group_start,
-)
+def full_task_end(cols):
+    return np.asarray(cols["task_done"]) != 0
+
+def full_task_start(cols):
+    return (np.asarray(cols["episode_index"]) == 0) & (
+        np.asarray(cols["step_index"]) == 0
+    )
+
+def when_episode_done_nonzero(ctx):
+    return "episode_done" in ctx and ctx["episode_done"] != 0
+
+def when_group_start(ctx):
+    return bool(ctx["group_start"])
+
+def when_reward_nonzero(ctx):
+    return "reward" in ctx and ctx["reward"] != 0.0
+
+def when_step_index_zero(ctx):
+    return "step_index" in ctx and ctx["step_index"] == 0
+
+def when_step_index_zero_or_group_start(ctx):
+    return (ctx.get("step_index") == 0) | bool(ctx["group_start"])
+
 
 _BENCH_DIR = Path(__file__).resolve().parent
 if str(_BENCH_DIR) not in sys.path:

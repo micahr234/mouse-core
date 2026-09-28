@@ -14,12 +14,6 @@ from mouse_core.data import (
 )
 from mouse_core.models import Model, IdentityBackbone
 
-from examples.conditions import (
-    full_task_end,
-    full_task_start,
-    when_group_start,
-)
-
 
 def test_public_data_exports() -> None:
     assert Augmenter is not None
@@ -38,7 +32,7 @@ def test_public_data_exports() -> None:
     assert IdentityBackbone is not None
 
 
-def test_condition_helpers_are_example_local() -> None:
+def test_condition_helpers_not_exported() -> None:
     import mouse_core.data as data
 
     for name in (
@@ -52,6 +46,3 @@ def test_condition_helpers_are_example_local() -> None:
         "after_field_ne",
     ):
         assert not hasattr(data, name)
-    assert full_task_start is not None
-    assert full_task_end is not None
-    assert when_group_start is not None
