@@ -51,7 +51,7 @@ source scripts/install.sh
 
 mouse-core gives you three building blocks for in-context RL. Compose them in your own training loop:
 
-* **Data** (`mouse_core.data`) — stores sequential rows in `Datastore` and batches contiguous windows with `DataLoader`. `episode_start=True` begins each window at an episode start; the default may start mid-episode.
+* **Data** (`mouse_core.data`) — stores sequential rows in `Datastore` and batches contiguous windows with `DataLoader`. `sample_start=SampleBoundary(field=..., value=...)` begins each window after that field boundary (e.g. `episode_done` / `task_done` with `value=0`); `sample_end` truncates a window on the first matching boundary. The default may start at any offset and never truncates early.
 * **Models** (`mouse_core.models`) — backbone (`TransformerBackbone` or `IdentityBackbone`, token embeddings included) + output heads (`ClassificationHead`, `RegressionHead`, …).
 * **Objectives** (`mouse_core.objectives`) — training losses such as DQN, PPO, GRPO, SP, and SV.
 

@@ -7,14 +7,21 @@ A ``Datastore`` is a flat sequence of arbitrary rows. The loader samples
 :class:`~mouse_core.data.token_batch.TokenBatch` plus a CPU
 ``dict[str, Tensor]`` of step-level objective columns.
 
-``episode_start=False`` (the default) may begin a window at any store
-offset, including mid-episode. ``episode_start=True`` begins every window
-at an episode start: index 0, or the step after a non-zero ``episode_done``
-(a later episode packed into the same store counts). The window then runs
-forward for ``min(sequence_length, steps remaining in the store)`` — the
-same ragged suffix as unrestricted sampling. A short episode does not add
-padding or a second cutoff; if the store runs out first, the window is
-shorter.
+``sample_start=None`` (the default) may begin a window at any store
+offset. ``sample_start=SampleBoundary(field=..., value=...)`` begins
+every window at a segment start: store index 0, or the step after a
+row where ``field != value``. For mouse-gym done codes, that is
+``SampleBoundary(field="episode_done", value=0)`` for episode starts
+or ``field="task_done"`` for task starts. The window then runs
+forward for ``min(sequence_length, steps remaining in the store)`` —
+the same ragged suffix as unrestricted sampling — unless
+``sample_end`` is set.
+
+``sample_end=None`` (the default) never truncates early for a field.
+``sample_end=SampleBoundary(field=..., value=...)`` includes the first
+row in the window where ``field != value``, then stops even if
+``sequence_length`` has not been reached. A short store suffix still
+ends the window first; rows are not padded.
 
 The loader is stage-agnostic: compose augmenter / tokenizer
 (or any ``dict → StepTokens`` callable) outside and pass the result as
@@ -88,6 +95,19 @@ _FREE_THREADING_HINT = (
 )
 
 
+@dataclass(frozen=True, kw_only=True)
+class SampleBoundary:
+    """Marks a store row where ``field != value`` as a segment boundary.
+
+    Pass as :class:`DataLoader` ``sample_start`` so legal window starts are
+    store index 0 and every step after such a row. Pass as ``sample_end``
+    so a window includes the first such row then stops.
+    """
+
+    field: str
+    value: object
+
+
 def _require_free_threading() -> None:
     """Raise unless this process can run CPU-bound worker threads in parallel."""
     if not sysconfig.get_config_var("Py_GIL_DISABLED"):
@@ -107,18 +127,19 @@ class _SnapshotConfig:
     sequence_length: int
     batch_size: int
     index_field: str | None
-    episode_starts: tuple[np.ndarray, ...] | None
+    start_indices: tuple[np.ndarray, ...] | None
+    end_boundary: SampleBoundary | None
 
 
-def _done_codes(*, column: Any, n: int) -> np.ndarray:
-    """``episode_done`` as a length-``n`` array. Object columns are unwrapped."""
+def _boundary_codes(*, column: Any, n: int, field: str) -> np.ndarray:
+    """Boundary field as a length-``n`` array. Object columns are unwrapped."""
     values = np.asarray(column)
     if values.dtype != object and values.shape == (n,):
         return values
     raw = list(column)
     if len(raw) != n:
         raise ValueError(
-            f"episode_done length ({len(raw)}) does not match the store ({n})."
+            f"{field} length ({len(raw)}) does not match the store ({n})."
         )
     codes = np.empty(n, dtype=np.int64)
     for i, value in enumerate(raw):
@@ -126,24 +147,45 @@ def _done_codes(*, column: Any, n: int) -> np.ndarray:
     return codes
 
 
-def _episode_start_indices(*, ds: Any) -> np.ndarray:
-    """Offsets where an episode starts, including a later packed episode.
+def _require_boundary_column(*, ds: Any, boundary: SampleBoundary, role: str) -> None:
+    if boundary.field not in ds.column_names:
+        raise ValueError(
+            f"sample_{role} requires a {boundary.field!r} column on every store."
+        )
 
-    Index 0 is a start. So is the step after every non-zero ``episode_done``
-    (terminated ``1`` or truncated ``2``). An empty store has no starts.
+
+def _start_indices(*, ds: Any, boundary: SampleBoundary) -> np.ndarray:
+    """Offsets where a sample may start, including a later packed segment.
+
+    Index 0 is a start. So is the step after every row where
+    ``field != value``. An empty store has no starts.
     """
     n = len(ds)
     if n == 0:
         return np.zeros(0, dtype=np.int64)
-    if "episode_done" not in ds.column_names:
-        raise ValueError(
-            "episode_start=True requires an episode_done column on every store."
-        )
-    done = _done_codes(column=ds["episode_done"], n=n)
+    _require_boundary_column(ds=ds, boundary=boundary, role="start")
+    codes = _boundary_codes(column=ds[boundary.field], n=n, field=boundary.field)
     if n == 1:
         return np.zeros(1, dtype=np.int64)
-    after = np.flatnonzero(done[:-1] != 0).astype(np.int64, copy=False) + 1
+    after = np.flatnonzero(codes[:-1] != boundary.value).astype(np.int64, copy=False) + 1
     return np.concatenate((np.zeros(1, dtype=np.int64), after))
+
+
+def _window_end(*, start: int, n: int, s_max: int, ds: Any, boundary: SampleBoundary | None) -> int:
+    """Exclusive end index for a window starting at ``start``."""
+    end = min(start + s_max, n)
+    if boundary is None or start >= end:
+        return end
+    _require_boundary_column(ds=ds, boundary=boundary, role="end")
+    codes = _boundary_codes(
+        column=ds[start:end][boundary.field],
+        n=end - start,
+        field=boundary.field,
+    )
+    hits = np.flatnonzero(codes != boundary.value)
+    if len(hits) == 0:
+        return end
+    return start + int(hits[0]) + 1
 
 
 def _fetch_sequence(
@@ -161,15 +203,22 @@ def _fetch_sequence(
     if n < 1:
         raise ValueError("Cannot sample from an empty store.")
 
-    if cfg.episode_starts is None:
+    if cfg.start_indices is None:
         start = int(rng.integers(0, n))
     else:
-        starts = cfg.episode_starts[store_idx]
+        starts = cfg.start_indices[store_idx]
         if len(starts) == 0:
-            raise ValueError("Cannot sample episode starts from a store with no episodes.")
+            raise ValueError(
+                "Cannot sample starts from a store with no sample_start boundaries."
+            )
         start = int(starts[int(rng.integers(0, len(starts)))])
-    # Same suffix rule either way: stop at the store end, do not pad.
-    end = min(start + S_max, n)
+    end = _window_end(
+        start=start,
+        n=n,
+        s_max=S_max,
+        ds=ds,
+        boundary=cfg.end_boundary,
+    )
     hf_slice = ds[start:end]
     count = end - start
     rows = [
@@ -299,13 +348,17 @@ class DataLoader:
         at construction (and on :meth:`refresh`) via ``Datastore.to_dataset()``.
     sequence_length :
         Maximum length of each contiguous window (in steps).
-    episode_start :
-        When ``False`` (default), a window may start at any store offset,
-        including mid-episode. When ``True``, every window starts at the
-        first step of an episode (index 0, or the step after a non-zero
-        ``episode_done``). A later episode in the same store is a start.
-        The window still runs forward until ``sequence_length`` or the
-        store ends. A short suffix is a shorter window; rows are not padded.
+    sample_start :
+        When ``None`` (default), a window may start at any store offset.
+        When a :class:`SampleBoundary`, every window starts at store index 0
+        or the step after a row where ``field != value``. A later segment in
+        the same store is a start. Without ``sample_end``, the window still
+        runs forward until ``sequence_length`` or the store ends.
+    sample_end :
+        When ``None`` (default), the window stops only at ``sequence_length``
+        or the store end. When a :class:`SampleBoundary`, the window includes
+        the first row where ``field != value`` then stops. A short suffix is
+        a shorter window; rows are not padded.
     batch_size :
         How many such windows per batch.
     transform :
@@ -330,7 +383,8 @@ class DataLoader:
         sequence_length: int,
         batch_size: int,
         transform: StepTransform,
-        episode_start: bool = False,
+        sample_start: SampleBoundary | None = None,
+        sample_end: SampleBoundary | None = None,
         index_field: str | None = None,
         weights: list[float] | None = None,
         weight_mode: str = "per_store",
@@ -363,9 +417,15 @@ class DataLoader:
             raise ValueError(f"weight_mode must be 'per_store' or 'per_step', got {weight_mode!r}")
         if sequence_length < 1:
             raise ValueError(f"sequence_length must be >= 1, got {sequence_length}.")
-        if not isinstance(episode_start, bool):
+        if sample_start is not None and not isinstance(sample_start, SampleBoundary):
             raise TypeError(
-                f"episode_start must be a bool, got {type(episode_start).__name__}."
+                "sample_start must be SampleBoundary or None, "
+                f"got {type(sample_start).__name__}."
+            )
+        if sample_end is not None and not isinstance(sample_end, SampleBoundary):
+            raise TypeError(
+                "sample_end must be SampleBoundary or None, "
+                f"got {type(sample_end).__name__}."
             )
         if batch_size < 1:
             raise ValueError(f"batch_size must be >= 1, got {batch_size}.")
@@ -386,7 +446,8 @@ class DataLoader:
         self.stores = stores
         self.sequence_length = sequence_length
         self.batch_size = batch_size
-        self.episode_start = episode_start
+        self.sample_start = sample_start
+        self.sample_end = sample_end
         self.weight_mode = weight_mode
         self.seed = seed
         self.transform = transform
@@ -403,7 +464,7 @@ class DataLoader:
         self._datasets: list = []
         self._ns: list[int] = []
         self._probs: np.ndarray = np.empty(0)
-        self._episode_starts: tuple[np.ndarray, ...] | None = None
+        self._start_indices: tuple[np.ndarray, ...] | None = None
         self._resnapshot_stores()
 
         if num_workers > 0:
@@ -476,7 +537,8 @@ class DataLoader:
         )
         return (
             f"DataLoader(stores=[{store_info}], S_max={self.sequence_length}, "
-            f"B={self.batch_size}, episode_start={self.episode_start}, seed={self.seed})"
+            f"B={self.batch_size}, sample_start={self.sample_start!r}, "
+            f"sample_end={self.sample_end!r}, seed={self.seed})"
         )
 
     def _snapshot_config(self) -> _SnapshotConfig:
@@ -487,7 +549,8 @@ class DataLoader:
             sequence_length=self.sequence_length,
             batch_size=self.batch_size,
             index_field=self.index_field,
-            episode_starts=self._episode_starts,
+            start_indices=self._start_indices,
+            end_boundary=self.sample_end,
         )
 
     def _start_workers(self) -> None:
@@ -537,11 +600,15 @@ class DataLoader:
     def _resnapshot_stores(self) -> None:
         self._datasets = [s.to_dataset() for s in self.stores]
         self._ns = [len(ds) for ds in self._datasets]
-        self._episode_starts = (
-            tuple(_episode_start_indices(ds=ds) for ds in self._datasets)
-            if self.episode_start
-            else None
-        )
+        if self.sample_start is None:
+            self._start_indices = None
+        else:
+            self._start_indices = tuple(
+                _start_indices(ds=ds, boundary=self.sample_start) for ds in self._datasets
+            )
+        if self.sample_end is not None:
+            for ds in self._datasets:
+                _require_boundary_column(ds=ds, boundary=self.sample_end, role="end")
 
         w = self._weights.copy()
         ns = np.array(self._ns, dtype=float)
