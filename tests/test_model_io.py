@@ -8,6 +8,13 @@ from mouse_core.models.base import _write_model_card
 from mouse_core.models.backbone import IdentityBackbone, LoRAConfig, TransformerBackbone
 from mouse_core.data import Tokenizer, load_tokenizer, save_tokenizer
 from mouse_core.models.heads import RegressionHead
+from mouse_core.data.conditions import (
+    when_episode_done_nonzero,
+    when_group_start,
+    when_reward_nonzero,
+    when_step_index_zero,
+    when_step_index_zero_or_group_start,
+)
 from tests._token_batch_helpers import batch_to_token_batch, token_tokenizer
 
 _TOK = token_tokenizer("action", "episode_done")
@@ -250,7 +257,7 @@ def test_tokenizer_roundtrip(tmp_path) -> None:
             {
                 "type": "token",
                 "input_field": "episode_index",
-                "when": {"equals": [("step_index", 0)]},
+                "when": when_step_index_zero,
             },
         ],
         grouping_field="task_index",
@@ -280,7 +287,7 @@ def test_tokenizer_roundtrip(tmp_path) -> None:
     ]
     assert loaded.input_fields[1].required is False
     assert loaded.input_fields[2].head_output is True
-    assert loaded.input_fields[3].when == {"equals": [("step_index", 0)]}
+    assert loaded.input_fields[3].when is when_step_index_zero
     assert sum(1 for s in loaded.input_fields if s.head_output) == 1
 
 
@@ -295,13 +302,13 @@ def test_tokenizer_roundtrip_group_start_and_not_equals(tmp_path) -> None:
                 "type": "text",
                 "output_field": "group_start",
                 "format": "hello\n",
-                "when": {"group_start": True},
+                "when": when_group_start,
             },
             {
                 "type": "text",
                 "input_field": "reward",
                 "format": "{field}",
-                "when": {"not_equals": [("reward", 0.0)]},
+                "when": when_reward_nonzero,
             },
             {"type": "token", "input_field": "action", "head_output": True},
         ],
@@ -310,9 +317,9 @@ def test_tokenizer_roundtrip_group_start_and_not_equals(tmp_path) -> None:
     )
     save_tokenizer(tokenizer=tokenizer, path=tmp_path)
     loaded = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizer=_Tok())
-    assert loaded.input_fields[0].when == {"group_start": True}
+    assert loaded.input_fields[0].when is when_group_start
     assert loaded.input_fields[0].output_field == "group_start"
-    assert loaded.input_fields[1].when == {"not_equals": [("reward", 0.0)]}
+    assert loaded.input_fields[1].when is when_reward_nonzero
     st = loaded({"action": 1, "reward": 1.0, "task_index": 0})
     assert st.group_start_ids is not None
     assert st.group_start_ids.tolist() == [1, 2]
@@ -335,7 +342,7 @@ def test_push_model_to_hub_requires_distinct_tokenizer_repo() -> None:
             {
                 "type": "token",
                 "input_field": "episode_index",
-                "when": {"equals": [("step_index", 0)]},
+                "when": when_step_index_zero,
             },
         ],
         grouping_field="task_index",

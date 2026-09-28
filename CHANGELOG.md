@@ -8,32 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- ``SampleMatch(equals=..., not_equals=...)`` for ``DataLoader``
-  ``sample_start`` and ``sample_end``. A row matches when every
-  ``equals`` pair holds (``==``) and every ``not_equals`` pair holds
-  (``!=``), all ANDed; at least one side must be non-empty. As
-  ``sample_start``, the matching row itself is the start (unlike
-  ``SampleBoundary``, which starts at index 0 or the step *after*
-  ``field != value``). As ``sample_end``, the window includes the first
-  matching row then stops. If ``sample_end`` is set but no match appears
-  before ``sequence_length`` or the store end, ``next_batch`` raises
-  ``ValueError``. Examples and ``bench/bench_dataloader.py`` use
-  ``SampleMatch(equals=(("episode_index", 0), ("step_index", 0)), not_equals=())``
-  with
-  ``SampleMatch(equals=(), not_equals=(("task_done", 0),))``.
-- Tokenizer fields take a single ``when=`` dict of emission conditions.
-  Keys: ``equals`` / ``not_equals`` (each a list of ``(field, value)``
-  pairs; multiple allowed) and optional ``group_start`` (bool). All
-  listed conditions are **OR**ed — the field emits if any matches.
-  Omit ``when`` (or ``None`` / empty) and the field always emits. A
-  missing compare key does not match. Value matches prefer the ordinary
-  step token run; ``group_start`` alone rides ``group_start_*`` for
-  ``pack_token_batch`` insertion at each grouping-field segment start
-  (incremental decode still passes ``prev_grouping_ids``). Text
-  constructions omit reward ``0.0`` / done ``0`` via ``not_equals``,
-  emit ``episode_index`` when ``step_index`` is ``0`` **or** at group
-  start, and use a const with ``group_start`` for the FrozenLake prompt
-  (replacing ``skip`` / ``format_skipped`` and ``Tokenizer(group_prefix=)``).
+- Tokenizer ``when=`` and ``DataLoader`` ``sample_start`` /
+  ``sample_end`` take callables. Tokenizer ``when`` is ``ctx → bool``:
+  the step dict plus injected boolean ``group_start``. Ordinary
+  emission uses ``group_start=False``; pack-time ``group_start_*`` uses
+  ``True`` (ordinary wins when both are true). OR of emit reasons is
+  written inside the callable with ``|`` / ``or``. Named helpers live
+  in ``mouse_core.data.conditions`` (``when_group_start``,
+  ``when_reward_nonzero``, ``when_episode_done_nonzero``,
+  ``when_step_index_zero``, ``when_step_index_zero_or_group_start``) and
+  round-trip through ``save_tokenizer`` / ``load_tokenizer`` as
+  ``module:qualname`` refs. ``sample_start`` / ``sample_end`` are
+  ``cols → bool ndarray`` (column name → 1-d array); examples use
+  ``full_task_start`` / ``full_task_end``. If ``sample_end`` is set but
+  never met before ``sequence_length`` or the store end, ``next_batch``
+  raises ``ValueError``.
 - ``best_action(q)``: integer action id per row, uniform among finite
   maxima (``-inf`` padding never selected). ``SpObjective`` callers that
   distill from Q* run this outside and pass the ids as ``targets=``.
@@ -46,17 +35,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ``DqnObjective`` metrics ``backup`` and ``backup_weight``: detached
   per-row Bellman target ``G`` and its row weight, the same tensors
   the loss uses. Callers log those instead of rebuilding the backup.
-- ``DataLoader`` ``sample_start`` / ``sample_end`` take
-  ``SampleBoundary(field=, value=)`` or ``None``. ``None`` (default)
-  may start a window at any store offset and never truncates early for
-  a field. ``sample_start`` restricts starts to store index 0 and every
-  step after a row where ``field != value`` (e.g.
-  ``SampleBoundary(field="episode_done", value=0)`` or
-  ``field="task_done"`` for task starts). ``sample_end`` includes the
-  first such boundary row in the window then stops, even before
-  ``sequence_length``. Without ``sample_end``, length stays
-  ``min(sequence_length, steps remaining in the store)``. A short
-  suffix is a shorter window; rows are not padded.
 - ``bootstrap_cutoff`` on ``DqnObjective`` and ``PpoObjective``.
   Required. ``True`` adds the value where the
   continuation leaves the sampled run (end of the batch, or a
@@ -128,23 +106,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - Training examples and ``bench/bench_dataloader.py`` pin
-  ``sample_start=SampleMatch(equals=(("episode_index", 0), ("step_index", 0)), not_equals=())``
-  and
-  ``sample_end=SampleMatch(equals=(), not_equals=(("task_done", 0),))``
-  so each packed sequence is one full task (episode-0 start through
+  ``sample_start=full_task_start`` and ``sample_end=full_task_end`` so
+  each packed sequence is one full task (episode-0 start through
   ``task_done != 0`` inclusive). Example ``SEQUENCE_LENGTH`` is
   ``MAX_TASK_EPISODES * MAX_STEPS_PER_EPISODE`` (a safety cap so the
   end-match wins). If ``sample_end`` is set but no matching row appears
   before ``sequence_length`` or the store end, ``next_batch`` raises
   ``ValueError`` instead of returning a truncated segment.
-- Tokenizer emission gates are a single ``when=`` dict (``equals`` /
-  ``not_equals`` lists of ``(field, value)``, optional ``group_start``
-  bool). Conditions are **OR**ed. Const text fields may use ``when=``.
-- Examples and ``bench/bench_dataloader.py`` emit the FrozenLake group
-  prompt via an ``input_fields`` const with ``when={"group_start": True}``,
-  gate reward / episode_done zeros with ``when={"not_equals": [...]}``,
-  and emit ``episode_index`` with
-  ``when={"equals": [("step_index", 0)], "group_start": True}``.
+- Tokenizer fields use condition callables (helpers in
+  ``mouse_core.data.conditions``): FrozenLake prompt via
+  ``when_group_start``, reward / episode_done zeros via
+  ``when_reward_nonzero`` / ``when_episode_done_nonzero``, and
+  ``episode_index`` via ``when_step_index_zero_or_group_start``.
 - ``SpObjective`` / ``SvObjective`` take supervised labels as call-time
   ``targets=`` (action ids for hard CE; Q vectors for SV), matching DQN
   ``predictions=`` / ``delayed_predictions=``. ``targets_key`` is
@@ -268,13 +241,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   copied.
 
 ### Removed
+- ``SampleMatch`` and ``SampleBoundary`` for ``DataLoader``
+  ``sample_start`` / ``sample_end``. Pass callables
+  ``cols → bool ndarray`` (or ``None``); see
+  ``full_task_start`` / ``full_task_end`` /
+  ``after_field_ne``.
+- Tokenizer ``when=`` dict keys ``equals`` / ``not_equals`` /
+  ``group_start``. Pass a callable ``ctx → bool`` (helpers in
+  ``mouse_core.data.conditions``).
 - ``Tokenizer(group_prefix=)``. Use an ``input_fields`` entry with
-  ``when={"group_start": True}`` (typically a text const). StepTokens /
+  ``when=when_group_start`` (typically a text const). StepTokens /
   packing carry ``group_start_*`` arrays (was ``group_prefix_*``).
 - Tokenizer ``skip=`` / ``format_skipped=`` and the separate
   ``when_field`` / ``when_equals`` / ``when_not_equals`` /
-  ``when_group_start`` kwargs. Use one ``when=`` dict
-  (``equals`` / ``not_equals`` / ``group_start``).
+  ``when_group_start`` kwargs. Use one ``when=`` callable.
 - ``scripts/worker.sh``. The Cursor My Machines worker script lives
   only in ``mouse-experiment`` (``scripts/worker.sh`` there still
   registers sibling ``mouse-core`` / ``mouse-experiment`` /

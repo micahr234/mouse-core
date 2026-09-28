@@ -28,8 +28,15 @@ from typing import Any
 import numpy as np
 from datasets import Dataset
 
-from mouse_core.data import Augmenter, DataLoader, Datastore, SampleMatch, Tokenizer, compose
+from mouse_core.data import Augmenter, DataLoader, Datastore, Tokenizer, compose, full_task_end, full_task_start
 from mouse_core.data.token_batch import TokenBatch
+from mouse_core.data.conditions import (
+    when_episode_done_nonzero,
+    when_group_start,
+    when_reward_nonzero,
+    when_step_index_zero,
+    when_step_index_zero_or_group_start,
+)
 
 _BENCH_DIR = Path(__file__).resolve().parent
 if str(_BENCH_DIR) not in sys.path:
@@ -136,7 +143,7 @@ def _train_transform() -> Any:
                 "type": "text",
                 "output_field": "group_start",
                 "format": _GROUP_PREFIX,
-                "when": {"group_start": True},
+                "when": when_group_start,
             },
             {"type": "text", "input_field": "action", "format": "{field},"},
             {"type": "text", "input_field": "observation", "format": "{field},"},
@@ -144,19 +151,19 @@ def _train_transform() -> Any:
                 "type": "text",
                 "input_field": "reward",
                 "format": "r={field:g},",
-                "when": {"not_equals": [("reward", 0.0)]},
+                "when": when_reward_nonzero,
             },
             {
                 "type": "text",
                 "input_field": "episode_done",
                 "format": "d={field},",
-                "when": {"not_equals": [("episode_done", 0)]},
+                "when": when_episode_done_nonzero,
             },
             {
                 "type": "text",
                 "input_field": "episode_index",
                 "format": "e={field},",
-                "when": {"equals": [("step_index", 0)], "group_start": True},
+                "when": when_step_index_zero_or_group_start,
             },
             {
                 "type": "text",
@@ -230,8 +237,8 @@ def main() -> None:
                 stores=stores,
                 sequence_length=seq_len,
                 batch_size=batch_size,
-                sample_start=SampleMatch(equals=(("episode_index", 0), ("step_index", 0)), not_equals=()),
-                sample_end=SampleMatch(equals=(), not_equals=(("task_done", 0),)),
+                sample_start=full_task_start,
+                sample_end=full_task_end,
                 transform=transform,
                 prefetch=args.prefetch,
                 num_workers=n_workers,

@@ -12,6 +12,7 @@ from mouse_core.data import (
     Tokenizer,
     pack_token_batch,
 )
+from mouse_core.data.conditions import when_step_index_zero
 
 
 def _io(*pairs: tuple[str, str]) -> list[dict[str, str]]:
@@ -44,7 +45,7 @@ def _tok_in(
             {
                 "type": "token",
                 "input_field": "episode_index",
-                "when": {"equals": [("step_index", 0)]},
+                "when": when_step_index_zero,
             }
         )
     return fields
@@ -94,7 +95,7 @@ def test_tokenizer_renames_input_and_objective_fields() -> None:
             {
                 "type": "token",
                 "input_field": "episode_index",
-                "when": {"equals": [("step_index", 0)]},
+                "when": when_step_index_zero,
             },
         ],
         objective_fields=_io(("q", "info_q_star")),

@@ -531,8 +531,9 @@ def pack_token_batch(
     ``-inf``, the sentinel objectives exclude as "action does not exist".
     Ragged integer columns raise — there is no integer sentinel.
 
-    When a step carries ``group_start_*`` tokens (from input fields with
-    ``when={"group_start": True}``), they are inserted at the start of each
+    When a step carries ``group_start_*`` tokens (from input fields whose
+    ``when`` callable is true with ``group_start=True`` and false with
+    ``group_start=False``), they are inserted at the start of each
     grouping-field segment: the first step of a sequence, or a step whose
     ``grouping_id`` differs from the previous step in that sequence.
     ``prev_grouping_ids`` is length ``B`` (optional ``None`` entries); pass

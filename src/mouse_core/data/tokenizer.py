@@ -38,8 +38,7 @@ from mouse_core.data.modality import (
     copy_keep_fields,
     resolve_tokenizer_modalities,
     unwrap_scalar,
-    values_equal,
-    when_has_group_start,
+    when_as_bool,
 )
 from mouse_core.data.token_batch import (
     ModalityInfo,
@@ -68,15 +67,12 @@ class Tokenizer:
     Omit ``input_field=`` and the field is a const: ``output_field=``
     names it and ``format=`` is the literal string (no placeholders;
     ``{{`` / ``}}`` for a literal brace, as in every ``format=``).
-    Optional ``when=`` is a dict of emission conditions (**OR**ed).
-    ``equals`` / ``not_equals`` are lists of ``(field, value)`` pairs; a
-    missing compare key does not match (``required`` is not consulted).
-    ``group_start=True`` marks tokens for pack-time insertion at each
-    grouping-field segment start by
-    :func:`~mouse_core.data.token_batch.pack_token_batch`. When a value
-    condition and ``group_start`` are both set, a matching value emits on
-    the ordinary step run; otherwise the tokens ride ``group_start_*``.
-    Omit ``when`` (or ``None`` / empty) and the field emits as before. A
+    Optional ``when=`` is a callable ``ctx → bool``. The context is the
+    step dict plus injected boolean ``group_start``. Ordinary emission
+    uses ``group_start=False``; pack-time ``group_start_*`` uses
+    ``True``. Combine reasons with ``|`` / ``or`` inside the callable
+    (helpers in :mod:`mouse_core.data.conditions`). Omit ``when``
+    (``None``) and the field always emits on the ordinary run. A
     ``required=False`` field whose value is missing / ``None`` emits
     nothing. ``max_tokens=`` (``text`` / ``image``) raises if that run
     is longer. ``objective_fields=`` is a list of ``{input_field}``
@@ -365,13 +361,9 @@ def _tokenize_step(
 
     for m in meta:
         spec = m.spec
-        value_matched = _when_value_matches(spec, row)
-        if not _when_emits(spec, row, value_matched=value_matched):
+        ordinary, to_group_start = _when_routes(spec, row)
+        if not ordinary and not to_group_start:
             continue
-        # Value match prefers the ordinary step run so mid-group equals
-        # still appear; group_start alone (or when the value side of an
-        # OR misses) rides group_start_* for packing.
-        to_group_start = when_has_group_start(spec) and not value_matched
         if m.kind == KIND_TEXT:
             rendered = _field_text_value(spec, row)
             if rendered is None:
@@ -446,40 +438,27 @@ def _tokenize_step(
     )
 
 
-def _when_value_matches(spec: TokenizerModalitySpec, row: dict) -> bool:
-    """True when any ``equals`` / ``not_equals`` entry in ``when`` matches."""
-    when = spec.when
-    if not when:
-        return False
-    for field, expected in when.get("equals", ()):
-        if field in row and values_equal(row[field], expected):
-            return True
-    for field, expected in when.get("not_equals", ()):
-        if field in row and not values_equal(row[field], expected):
-            return True
-    return False
+def _when_routes(
+    spec: TokenizerModalitySpec, row: dict
+) -> tuple[bool, bool]:
+    """Return ``(ordinary, to_group_start)`` for one field on ``row``.
 
-
-def _when_emits(
-    spec: TokenizerModalitySpec,
-    row: dict,
-    *,
-    value_matched: bool | None = None,
-) -> bool:
-    """True when this field should emit on ``row``.
-
-    Conditions under ``when=`` are **OR**ed: any ``equals`` /
-    ``not_equals`` match and/or ``group_start`` is enough. A missing
-    compare key is not a match. Omit ``when`` and the field always emits.
+    Omit ``when`` → always ordinary. Otherwise call ``when`` with
+    ``group_start=False`` (ordinary) and ``group_start=True`` (pack
+    path). Ordinary wins when both are true so mid-group equals still
+    appear on the step run; group-start alone rides ``group_start_*``.
     """
-    if not spec.when:
-        return True
-    matched = (
-        value_matched
-        if value_matched is not None
-        else _when_value_matches(spec, row)
-    )
-    return matched or when_has_group_start(spec)
+    when = spec.when
+    if when is None:
+        return True, False
+    from mouse_core.data.conditions import GROUP_START_KEY
+
+    ordinary_ctx = {**row, GROUP_START_KEY: False}
+    group_ctx = {**row, GROUP_START_KEY: True}
+    ordinary = when_as_bool(when(ordinary_ctx))
+    wants_group = when_as_bool(when(group_ctx))
+    to_group_start = wants_group and not ordinary
+    return ordinary, to_group_start
 
 
 TOKENIZER_FORMAT = "mouse-core-tokenizer-v1"
@@ -487,7 +466,7 @@ TOKENIZER_FILENAME = "tokenizer.json"
 
 
 def _jsonable(value: Any) -> Any:
-    """JSON-safe form of a tokenizer field value (``when`` pairs especially)."""
+    """JSON-safe form of a tokenizer field value."""
     if isinstance(value, np.generic):
         return value.item()
     if isinstance(value, np.ndarray):
@@ -499,6 +478,13 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, dict):
         return {k: _jsonable(v) for k, v in value.items()}
     return value
+
+
+def _jsonable_when(when: Any) -> str:
+    """Serialize a ``when`` callable as ``module:qualname``."""
+    from mouse_core.data.conditions import when_ref
+
+    return when_ref(when)
 
 
 def tokenizer_config(*, tokenizer: Tokenizer) -> dict[str, Any]:
@@ -513,6 +499,9 @@ def tokenizer_config(*, tokenizer: Tokenizer) -> dict[str, Any]:
             if key == "head_output" and value is False:
                 continue
             if key == "required" and value is True:
+                continue
+            if key == "when":
+                field[key] = _jsonable_when(value)
                 continue
             field[key] = _jsonable(value)
         input_fields.append(field)
@@ -551,7 +540,7 @@ def load_tokenizer(
 ) -> Tokenizer:
     """Load a tokenizer packing spec from a checkpoint directory or Hub repo.
 
-    The JSON is the packing contract (fields, ``when``,
+    The JSON is the packing contract (fields, ``when`` import refs,
     ``objective_fields``, ``pretrained`` name). A live HF tokenizer or
     image tokenizer is an execution choice: pass ``tokenizer=`` /
     ``image_tokenizer=`` when the spec needs them; otherwise

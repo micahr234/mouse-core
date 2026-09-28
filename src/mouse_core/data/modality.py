@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from string import Formatter
 from typing import Any, ClassVar
@@ -11,11 +11,8 @@ import numpy as np
 import torch
 
 # Shared text stream. ``type="text"`` / ``type="token"`` fields emit here;
-# ``when={"group_start": True}`` fields are tokenized into the same modality.
+# ``when=when_group_start`` fields are tokenized into the same modality.
 NAME_TEXT = "__text__"
-
-# Keys allowed on ``TokenizerModalitySpec.when``.
-WHEN_KEYS = frozenset({"equals", "not_equals", "group_start"})
 
 # Step-backed ``text`` ``format=`` interpolates the field value here.
 # A format spec is allowed (``"{field:.0f}"``). Consts have no placeholders.
@@ -24,6 +21,9 @@ TEXT_FORMAT_KEY = "field"
 KIND_TEXT = "text"
 KIND_TOKEN = "token"
 KIND_IMAGE = "image"
+
+# Per-step emission gate. See ``mouse_core.data.conditions``.
+WhenFn = Callable[[Mapping[str, Any]], bool]
 
 
 @dataclass
@@ -47,25 +47,15 @@ class TokenizerModalitySpec:
     ``format=`` are ``str.format`` strings: write ``{{`` / ``}}`` for a
     literal brace. ``token`` / ``image`` do not accept ``format=``.
 
-    Optional ``when=`` is a dict of emission conditions. Every listed
-    condition is **OR**ed — the field emits if any matches. Omit
-    ``when`` (or pass ``None`` / an empty dict) and the field always
-    emits (subject to ``required``). Allowed keys:
-
-    * ``equals`` — list of ``(field, value)`` pairs; matches when that
-      step value equals ``value`` (a missing key does not match).
-    * ``not_equals`` — list of ``(field, value)`` pairs; matches when
-      that step value does not equal ``value`` (a missing key does not
-      match).
-    * ``group_start`` — ``True`` marks tokens for insertion at the start
-      of each grouping-field segment (and each packed sequence) by
-      :func:`~mouse_core.data.token_batch.pack_token_batch`. Incremental
-      decode passes ``prev_grouping_ids`` so a cached segment does not
-      re-emit them.
-
-    When a value condition and ``group_start`` are both set, a matching
-    value emits on the step's ordinary token run; otherwise the tokens
-    are carried as ``group_start_*`` for pack-time insertion.
+    Optional ``when=`` is a callable ``ctx → bool``. The tokenizer builds
+    ``ctx`` from the step dict and injects boolean ``group_start``. It
+    calls the predicate twice: with ``group_start=False`` for ordinary
+    step tokens, and with ``group_start=True`` for pack-time
+    ``group_start_*`` tokens. Write OR in the callable
+    (``|`` / ``or``), e.g.
+    ``lambda ctx: (ctx.get("step_index") == 0) | ctx["group_start"]``.
+    Helpers live in :mod:`mouse_core.data.conditions`. Omit ``when``
+    (``None``) and the field always emits on the ordinary run.
     ``head_output`` fields cannot set ``when`` (they must emit on every
     step).
 
@@ -93,7 +83,7 @@ class TokenizerModalitySpec:
     output_field: str | None = None
     format: str | None = None
     max_tokens: int | None = None
-    when: dict[str, Any] | None = None
+    when: WhenFn | str | None = None
     required: bool = True
     head_output: bool = False
 
@@ -213,64 +203,26 @@ def _validate_max_tokens(spec: TokenizerModalitySpec) -> None:
     object.__setattr__(spec, "max_tokens", n)
 
 
-def _normalize_when_pair(
-    value: Any, *, name: str, knob: str
-) -> tuple[str, Any]:
-    """Accept ``(field, value)`` or a length-2 list (JSON round-trip)."""
-    if not isinstance(value, (list, tuple)) or len(value) != 2:
-        raise TypeError(
-            f"tokenizer modality {name!r} when[{knob!r}] entries must be "
-            "(field, value) pairs"
-        )
-    field, expected = value[0], value[1]
-    if not isinstance(field, str) or field == "":
-        raise TypeError(
-            f"tokenizer modality {name!r} when[{knob!r}] field must be a "
-            "non-empty string"
-        )
-    return (field, expected)
+def _normalize_when(when: Any, *, name: str) -> WhenFn | None:
+    """Normalize ``when=`` to a callable, or ``None``.
 
-
-def _normalize_when(
-    when: Any, *, name: str
-) -> dict[str, Any] | None:
-    """Normalize ``when=`` to a dict with only active keys, or ``None``."""
+    Accepts a callable, an import-path string (``module:qualname`` from
+    JSON), or ``None``. Dict-style equals / not_equals / group_start
+    gates are rejected.
+    """
     if when is None:
         return None
-    if not isinstance(when, dict):
+    if isinstance(when, str):
+        from mouse_core.data.conditions import resolve_when_ref
+
+        when = resolve_when_ref(when)
+    if not callable(when):
         raise TypeError(
-            f"tokenizer modality {name!r} when= must be a dict or None"
+            f"tokenizer modality {name!r} when= must be a callable "
+            f"(ctx → bool), an import path string, or None; got "
+            f"{type(when).__name__}"
         )
-    unknown = set(when) - WHEN_KEYS
-    if unknown:
-        raise TypeError(
-            f"tokenizer modality {name!r} when= unknown keys "
-            f"{sorted(unknown)}; expected subset of {sorted(WHEN_KEYS)}"
-        )
-    out: dict[str, Any] = {}
-    for knob in ("equals", "not_equals"):
-        if knob not in when or when[knob] is None:
-            continue
-        raw = when[knob]
-        if not isinstance(raw, list):
-            raise TypeError(
-                f"tokenizer modality {name!r} when[{knob!r}] must be a "
-                "list of (field, value) pairs"
-            )
-        pairs = [
-            _normalize_when_pair(item, name=name, knob=knob) for item in raw
-        ]
-        if pairs:
-            out[knob] = pairs
-    if "group_start" in when and when["group_start"] is not None:
-        gs = when["group_start"]
-        if not isinstance(gs, bool):
-            raise TypeError(
-                f"tokenizer modality {name!r} when['group_start'] must be a bool"
-            )
-        if gs:
-            out["group_start"] = True
-    return out or None
+    return when
 
 
 def _validate_when(spec: TokenizerModalitySpec) -> None:
@@ -286,9 +238,23 @@ def _validate_when(spec: TokenizerModalitySpec) -> None:
         )
 
 
-def when_has_group_start(spec: TokenizerModalitySpec) -> bool:
-    """True when ``when`` requests pack-time group-start insertion."""
-    return bool(spec.when and spec.when.get("group_start"))
+def when_as_bool(value: Any) -> bool:
+    """Coerce a ``when`` return value to a Python ``bool``."""
+    if isinstance(value, np.ndarray):
+        if value.shape != ():
+            raise TypeError(
+                "tokenizer when= must return a scalar bool, got array "
+                f"with shape {value.shape}"
+            )
+        return bool(value.item())
+    if isinstance(value, torch.Tensor):
+        if value.ndim != 0:
+            raise TypeError(
+                "tokenizer when= must return a scalar bool, got tensor "
+                f"with shape {tuple(value.shape)}"
+            )
+        return bool(value.item())
+    return bool(value)
 
 
 def unwrap_scalar(value: Any) -> Any:

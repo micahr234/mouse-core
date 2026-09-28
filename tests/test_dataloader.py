@@ -17,12 +17,13 @@ from mouse_core.data import (
     Augmenter,
     DataLoader,
     Datastore,
-    SampleBoundary,
-    SampleMatch,
     Tokenizer,
     compose,
+    full_task_end,
+    full_task_start,
 )
 from mouse_core.data.augmenter import _stable_hash
+from mouse_core.data.conditions import after_field_ne, when_step_index_zero
 from mouse_core.data.dataloader import _sequence_generation
 from mouse_core.data.token_batch import StepTokens, TokenBatch
 from tests._token_batch_helpers import token_tokenizer
@@ -58,7 +59,7 @@ def _tokenizer(*, objective_fields: list[dict[str, str]] | None = None) -> Token
             {
                 "type": "token",
                 "input_field": "episode_index",
-                "when": {"equals": [("step_index", 0)]},
+                "when": when_step_index_zero,
             },
         ],
         objective_fields=keep,
@@ -681,7 +682,7 @@ def test_dataloader_sample_start_begins_after_boundary() -> None:
         batch_size=2,
         num_workers=0,
         seed=1,
-        sample_start=SampleBoundary(field="episode_done", value=0),
+        sample_start=after_field_ne(field="episode_done", value=0),
         stores=store,
         index_field="store_index",
         transform=_index_transform(),
@@ -700,7 +701,7 @@ def test_dataloader_sample_start_task_done_uses_task_boundaries() -> None:
         batch_size=2,
         num_workers=0,
         seed=3,
-        sample_start=SampleBoundary(field="task_done", value=0),
+        sample_start=after_field_ne(field="task_done", value=0),
         stores=store,
         index_field="store_index",
         transform=_index_transform(),
@@ -719,7 +720,7 @@ def test_dataloader_sample_start_short_suffix_stays_ragged() -> None:
         batch_size=1,
         num_workers=0,
         seed=2,
-        sample_start=SampleBoundary(field="episode_done", value=0),
+        sample_start=after_field_ne(field="episode_done", value=0),
         stores=store,
         index_field="store_index",
         transform=_index_transform(),
@@ -741,8 +742,8 @@ def test_dataloader_sample_end_truncates_on_boundary() -> None:
         batch_size=1,
         num_workers=0,
         seed=0,
-        sample_start=SampleBoundary(field="episode_done", value=0),
-        sample_end=SampleBoundary(field="episode_done", value=0),
+        sample_start=after_field_ne(field="episode_done", value=0),
+        sample_end=lambda cols: cols["episode_done"] != 0,
         stores=store,
         index_field="store_index",
         transform=_index_transform(),
@@ -768,7 +769,7 @@ def test_dataloader_sample_end_mid_window_without_start_constraint() -> None:
         num_workers=0,
         seed=4,
         sample_start=None,
-        sample_end=SampleBoundary(field="episode_done", value=0),
+        sample_end=lambda cols: cols["episode_done"] != 0,
         stores=store,
         index_field="store_index",
         transform=_index_transform(),
@@ -786,12 +787,12 @@ def test_dataloader_sample_end_mid_window_without_start_constraint() -> None:
 def test_dataloader_sample_start_requires_field_column() -> None:
     store = Datastore()
     store.append(data={"action": 1, "reward": 0.0, "task_done": 0})
-    with pytest.raises(ValueError, match="episode_done"):
+    with pytest.raises(KeyError, match="episode_done"):
         _loader(
             sequence_length=2,
             batch_size=1,
             num_workers=0,
-            sample_start=SampleBoundary(field="episode_done", value=0),
+            sample_start=after_field_ne(field="episode_done", value=0),
             stores=store,
         )
 
@@ -799,17 +800,20 @@ def test_dataloader_sample_start_requires_field_column() -> None:
 def test_dataloader_sample_end_requires_field_column() -> None:
     store = Datastore()
     store.append(data={"action": 1, "reward": 0.0, "episode_done": 0})
-    with pytest.raises(ValueError, match="task_done"):
-        _loader(
-            sequence_length=2,
-            batch_size=1,
-            num_workers=0,
-            sample_end=SampleBoundary(field="task_done", value=0),
-            stores=store,
-        )
+    # Missing end column surfaces when a window is drawn.
+    loader = _loader(
+        sequence_length=2,
+        batch_size=1,
+        num_workers=0,
+        seed=0,
+        sample_end=lambda cols: cols["task_done"] != 0,
+        stores=store,
+    )
+    with pytest.raises(KeyError, match="task_done"):
+        loader.next_batch()
 
 
-def test_dataloader_sample_boundary_type_errors() -> None:
+def test_dataloader_sample_callable_type_errors() -> None:
     with pytest.raises(TypeError, match="sample_start"):
         _loader(
             sequence_length=2,
@@ -858,11 +862,6 @@ def _packed_episode_index_store() -> tuple[Datastore, set[int]]:
     return store, {0, 4}
 
 
-def test_sample_match_rejects_empty_equals_and_not_equals() -> None:
-    with pytest.raises(ValueError, match="non-empty"):
-        SampleMatch(equals=(), not_equals=())
-
-
 def test_dataloader_sample_start_match_requires_both_fields() -> None:
     """Windows begin only where episode_index==0 and step_index==0."""
     store, match_starts = _packed_episode_index_store()
@@ -871,7 +870,7 @@ def test_dataloader_sample_start_match_requires_both_fields() -> None:
         batch_size=2,
         num_workers=0,
         seed=5,
-        sample_start=SampleMatch(equals=(("episode_index", 0), ("step_index", 0)), not_equals=()),
+        sample_start=full_task_start,
         stores=store,
         index_field="store_index",
         transform=_index_transform(),
@@ -890,8 +889,8 @@ def test_dataloader_sample_start_match_with_task_end() -> None:
         batch_size=1,
         num_workers=0,
         seed=6,
-        sample_start=SampleMatch(equals=(("episode_index", 0), ("step_index", 0)), not_equals=()),
-        sample_end=SampleMatch(equals=(), not_equals=(("task_done", 0),)),
+        sample_start=full_task_start,
+        sample_end=full_task_end,
         stores=store,
         index_field="store_index",
         transform=_index_transform(),
@@ -933,8 +932,8 @@ def test_dataloader_sample_end_missing_raises() -> None:
         batch_size=1,
         num_workers=0,
         seed=0,
-        sample_start=SampleMatch(equals=(("episode_index", 0), ("step_index", 0)), not_equals=()),
-        sample_end=SampleMatch(equals=(), not_equals=(("task_done", 0),)),
+        sample_start=full_task_start,
+        sample_end=full_task_end,
         stores=store,
         index_field="store_index",
         transform=_index_transform(),
@@ -952,8 +951,8 @@ def test_dataloader_sample_end_missing_when_seq_len_too_short_raises() -> None:
         batch_size=1,
         num_workers=0,
         seed=0,
-        sample_start=SampleMatch(equals=(("episode_index", 0), ("step_index", 0)), not_equals=()),
-        sample_end=SampleMatch(equals=(), not_equals=(("task_done", 0),)),
+        sample_start=full_task_start,
+        sample_end=full_task_end,
         stores=store,
         index_field="store_index",
         transform=_index_transform(),
@@ -965,12 +964,12 @@ def test_dataloader_sample_end_missing_when_seq_len_too_short_raises() -> None:
 def test_dataloader_sample_start_match_requires_field_column() -> None:
     store = Datastore()
     store.append(data={"action": 1, "reward": 0.0, "step_index": 0, "task_done": 0})
-    with pytest.raises(ValueError, match="episode_index"):
+    with pytest.raises(KeyError, match="episode_index"):
         _loader(
             sequence_length=2,
             batch_size=1,
             num_workers=0,
-            sample_start=SampleMatch(equals=(("episode_index", 0), ("step_index", 0)), not_equals=()),
+            sample_start=full_task_start,
             stores=store,
         )
 
@@ -978,11 +977,13 @@ def test_dataloader_sample_start_match_requires_field_column() -> None:
 def test_dataloader_sample_end_match_requires_field_column() -> None:
     store = Datastore()
     store.append(data={"action": 1, "reward": 0.0, "episode_done": 0})
-    with pytest.raises(ValueError, match="task_done"):
-        _loader(
-            sequence_length=2,
-            batch_size=1,
-            num_workers=0,
-            sample_end=SampleMatch(equals=(), not_equals=(("task_done", 0),)),
-            stores=store,
-        )
+    loader = _loader(
+        sequence_length=2,
+        batch_size=1,
+        num_workers=0,
+        seed=0,
+        sample_end=full_task_end,
+        stores=store,
+    )
+    with pytest.raises(KeyError, match="task_done"):
+        loader.next_batch()
