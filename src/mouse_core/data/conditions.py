@@ -46,7 +46,7 @@ from __future__ import annotations
 
 import importlib
 from collections.abc import Callable, Mapping
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 
@@ -149,4 +149,4 @@ def resolve_when_ref(ref: str) -> WhenFn:
         obj = getattr(obj, part)
     if not callable(obj):
         raise TypeError(f"tokenizer when ref {ref!r} is not callable")
-    return obj
+    return cast(WhenFn, obj)

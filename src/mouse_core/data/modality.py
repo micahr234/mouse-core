@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from string import Formatter
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 
 import numpy as np
 import torch
@@ -83,7 +83,7 @@ class TokenizerModalitySpec:
     output_field: str | None = None
     format: str | None = None
     max_tokens: int | None = None
-    when: WhenFn | str | None = None
+    when: WhenFn | None = None
     required: bool = True
     head_output: bool = False
 
@@ -222,7 +222,7 @@ def _normalize_when(when: Any, *, name: str) -> WhenFn | None:
             f"(ctx → bool), an import path string, or None; got "
             f"{type(when).__name__}"
         )
-    return when
+    return cast(WhenFn, when)
 
 
 def _validate_when(spec: TokenizerModalitySpec) -> None:
