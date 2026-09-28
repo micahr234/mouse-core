@@ -88,10 +88,10 @@ class StepTokens:
     grouping_field: str
     head_output_mask: np.ndarray  # [T] bool
     objective_fields: dict[str, Any] = field(default_factory=dict)
-    group_prefix_modality_ids: np.ndarray | None = None
-    group_prefix_ids: np.ndarray | None = None
-    group_prefix_values: np.ndarray | None = None
-    group_prefix_positions: np.ndarray | None = None
+    group_start_modality_ids: np.ndarray | None = None
+    group_start_ids: np.ndarray | None = None
+    group_start_values: np.ndarray | None = None
+    group_start_positions: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         if not self.grouping_field:
@@ -131,54 +131,54 @@ class StepTokens:
                 "every step (it must never be skipped)"
             )
         object.__setattr__(self, "head_output_mask", mask)
-        group_prefix_arrays = (
-            self.group_prefix_modality_ids,
-            self.group_prefix_ids,
-            self.group_prefix_values,
-            self.group_prefix_positions,
+        group_start_arrays = (
+            self.group_start_modality_ids,
+            self.group_start_ids,
+            self.group_start_values,
+            self.group_start_positions,
         )
-        if all(a is None for a in group_prefix_arrays):
+        if all(a is None for a in group_start_arrays):
             return
-        if any(a is None for a in group_prefix_arrays):
+        if any(a is None for a in group_start_arrays):
             raise ValueError(
-                "group_prefix_modality_ids / group_prefix_ids / "
-                "group_prefix_values / group_prefix_positions must all be "
+                "group_start_modality_ids / group_start_ids / "
+                "group_start_values / group_start_positions must all be "
                 "set or all None"
             )
-        pt = int(np.asarray(self.group_prefix_ids).shape[0])
+        pt = int(np.asarray(self.group_start_ids).shape[0])
         if pt == 0:
-            raise ValueError("group_prefix token arrays must be non-empty when set")
+            raise ValueError("group_start token arrays must be non-empty when set")
         for name in (
-            "group_prefix_modality_ids",
-            "group_prefix_ids",
-            "group_prefix_values",
-            "group_prefix_positions",
+            "group_start_modality_ids",
+            "group_start_ids",
+            "group_start_values",
+            "group_start_positions",
         ):
             arr = np.asarray(getattr(self, name))
             if arr.shape != (pt,):
                 raise ValueError(f"{name} must have shape [{pt}], got {arr.shape}")
             object.__setattr__(self, name, arr)
-        pmids = np.asarray(self.group_prefix_modality_ids, dtype=np.int64)
+        pmids = np.asarray(self.group_start_modality_ids, dtype=np.int64)
         if pmids.min(initial=0) < 0 or pmids.max(initial=0) >= len(names):
             raise ValueError(
-                f"group_prefix_modality_ids must be in [0, {len(names)}), got "
+                f"group_start_modality_ids must be in [0, {len(names)}), got "
                 f"min={int(pmids.min())} max={int(pmids.max())}"
             )
-        object.__setattr__(self, "group_prefix_modality_ids", pmids)
+        object.__setattr__(self, "group_start_modality_ids", pmids)
         object.__setattr__(
-            self, "group_prefix_ids", np.asarray(self.group_prefix_ids, dtype=np.int64)
+            self, "group_start_ids", np.asarray(self.group_start_ids, dtype=np.int64)
         )
         object.__setattr__(
             self,
-            "group_prefix_values",
-            np.asarray(self.group_prefix_values, dtype=np.float32),
+            "group_start_values",
+            np.asarray(self.group_start_values, dtype=np.float32),
         )
-        ppos = np.asarray(self.group_prefix_positions, dtype=np.int64)
+        ppos = np.asarray(self.group_start_positions, dtype=np.int64)
         if ppos.min(initial=0) < 0:
             raise ValueError(
-                f"group_prefix_positions must be >= 0, got min={int(ppos.min())}"
+                f"group_start_positions must be >= 0, got min={int(ppos.min())}"
             )
-        object.__setattr__(self, "group_prefix_positions", ppos)
+        object.__setattr__(self, "group_start_positions", ppos)
 
     @property
     def T(self) -> int:
@@ -531,13 +531,13 @@ def pack_token_batch(
     ``-inf``, the sentinel objectives exclude as "action does not exist".
     Ragged integer columns raise — there is no integer sentinel.
 
-    When a step carries ``group_prefix_*`` tokens (from
-    :class:`~mouse_core.data.tokenizer.Tokenizer` ``group_prefix=``),
-    they are inserted at the start of each grouping-field segment: the first
-    step of a sequence, or a step whose ``grouping_id`` differs from the
-    previous step in that sequence. ``prev_grouping_ids`` is length ``B``
-    (optional ``None`` entries); pass the last grouping already in a cached
-    sequence so incremental decode does not emit the group prefix again.
+    When a step carries ``group_start_*`` tokens (from input fields with
+    ``when_group_start=True``), they are inserted at the start of each
+    grouping-field segment: the first step of a sequence, or a step whose
+    ``grouping_id`` differs from the previous step in that sequence.
+    ``prev_grouping_ids`` is length ``B`` (optional ``None`` entries); pass
+    the last grouping already in a cached sequence so incremental decode
+    does not emit the group-start tokens again.
     """
     empty_objective: dict[str, torch.Tensor] = {}
     if not steps:
@@ -617,20 +617,20 @@ def pack_token_batch(
 
     offset = 0
     for step_idx, (st, sid) in enumerate(zip(steps, seq_per_step)):
-        emit_group_prefix = (
-            st.group_prefix_ids is not None
+        emit_group_start = (
+            st.group_start_ids is not None
             and last_gid[sid] != st.grouping_id
         )
-        if emit_group_prefix:
-            assert st.group_prefix_modality_ids is not None
-            assert st.group_prefix_ids is not None
-            assert st.group_prefix_values is not None
-            assert st.group_prefix_positions is not None
-            pt = int(st.group_prefix_ids.shape[0])
-            modality_ids.append(st.group_prefix_modality_ids)
-            ids.append(st.group_prefix_ids)
-            values.append(st.group_prefix_values)
-            positions.append(st.group_prefix_positions)
+        if emit_group_start:
+            assert st.group_start_modality_ids is not None
+            assert st.group_start_ids is not None
+            assert st.group_start_values is not None
+            assert st.group_start_positions is not None
+            pt = int(st.group_start_ids.shape[0])
+            modality_ids.append(st.group_start_modality_ids)
+            ids.append(st.group_start_ids)
+            values.append(st.group_start_values)
+            positions.append(st.group_start_positions)
             seq_ids.append(np.full(pt, sid, dtype=np.int64))
             grouping_ids.append(np.full(pt, st.grouping_id, dtype=np.int64))
             offset += pt

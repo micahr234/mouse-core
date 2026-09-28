@@ -132,21 +132,27 @@ def _train_transform() -> Any:
     )
     tokenizer = Tokenizer(
         input_fields=[
+            {
+                "type": "text",
+                "output_field": "group_start",
+                "format": _GROUP_PREFIX,
+                "when_group_start": True,
+            },
             {"type": "text", "input_field": "action", "format": "{field},"},
             {"type": "text", "input_field": "observation", "format": "{field},"},
             {
                 "type": "text",
                 "input_field": "reward",
                 "format": "r={field:g},",
-                "skip": 0.0,
-                "format_skipped": "",
+                "when_field": "reward",
+                "when_not_equals": 0.0,
             },
             {
                 "type": "text",
                 "input_field": "episode_done",
                 "format": "d={field},",
-                "skip": 0,
-                "format_skipped": "",
+                "when_field": "episode_done",
+                "when_not_equals": 0,
             },
             {
                 "type": "text",
@@ -170,7 +176,6 @@ def _train_transform() -> Any:
             {"input_field": "task_done"},
         ],
         grouping_field="task_index",
-        group_prefix=_GROUP_PREFIX,
         pretrained="Qwen/Qwen3-0.6B",
     )
     return compose(stages=(augmenter, tokenizer))
