@@ -21,22 +21,6 @@ source scripts/install.sh
 
 This installs the package in editable mode with the `dev` and `all` extras (`all` bundles every feature extra — currently `examples`). Activate with `source .venv/bin/activate`. The install uses free-threaded CPython (`3.14t`). System packages needed to run the notebooks are documented under **Example dependencies** in the [README](README.md#example-dependencies).
 
-### Self-hosted Cursor worker
-
-On the home server, start a My Machines worker that registers the
-Mouse sibling checkouts (`mouse-core`, `mouse-experiment`, `mouse-gym`):
-
-```bash
-# Clone the three repos as siblings, then from any of them:
-scripts/worker.sh            # name: mouse
-scripts/worker.sh <name>     # override the worker name
-```
-
-Requires `tmux`, the Cursor `agent` CLI (`curl https://cursor.com/install -fsS | bash`),
-and `agent login` once. The worker runs in tmux session `mouse-worker`
-(attach with `tmux attach -t mouse-worker`; Ctrl-C stops it). Outbound
-HTTPS only. Shared assignment is the My Machines default (no `--pool`).
-
 ### Temporary `PYTHON_GIL=0` (remove when possible)
 
 `scripts/install.sh` and CI set `PYTHON_GIL=0` so the free-threaded interpreter **keeps the GIL off** after imports. `tokenizers>=0.23.2` declares `Py_MOD_GIL_NOT_USED`. Triton still does not, so importing `triton._C.libtriton` (pulled in by torch) would otherwise re-enable the GIL.
