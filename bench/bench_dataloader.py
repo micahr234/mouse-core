@@ -28,9 +28,15 @@ from typing import Any
 import numpy as np
 from datasets import Dataset
 
-from mouse_core.data import Augmenter, DataLoader, Datastore, Tokenizer, compose, full_task_end, full_task_start
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from mouse_core.data import Augmenter, DataLoader, Datastore, Tokenizer, compose
 from mouse_core.data.token_batch import TokenBatch
-from mouse_core.data.conditions import (
+from examples.conditions import (
+    full_task_end,
+    full_task_start,
     when_episode_done_nonzero,
     when_group_start,
     when_reward_nonzero,

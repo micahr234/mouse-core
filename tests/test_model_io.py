@@ -8,7 +8,7 @@ from mouse_core.models.base import _write_model_card
 from mouse_core.models.backbone import IdentityBackbone, LoRAConfig, TransformerBackbone
 from mouse_core.data import Tokenizer, load_tokenizer, save_tokenizer
 from mouse_core.models.heads import RegressionHead
-from mouse_core.data.conditions import (
+from tests._conditions import (
     when_episode_done_nonzero,
     when_group_start,
     when_reward_nonzero,

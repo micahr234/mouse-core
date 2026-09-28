@@ -11,7 +11,7 @@ from tests._token_batch_helpers import batch_to_packed, batch_to_token_batch
 from mouse_core.models import Model
 from mouse_core.models.backbone import IdentityBackbone
 from mouse_core.models.heads import RegressionHead
-from mouse_core.data.conditions import (
+from tests._conditions import (
     when_episode_done_nonzero,
     when_group_start,
     when_reward_nonzero,

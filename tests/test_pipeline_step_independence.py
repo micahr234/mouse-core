@@ -12,7 +12,7 @@ from mouse_core.data import (
     Tokenizer,
     pack_token_batch,
 )
-from mouse_core.data.conditions import when_step_index_zero
+from tests._conditions import when_step_index_zero
 
 
 def _io(*pairs: tuple[str, str]) -> list[dict[str, str]]:

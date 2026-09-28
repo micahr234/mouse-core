@@ -9,7 +9,7 @@ import torch
 
 from mouse_core.data import Tokenizer, compose, pack_token_batch
 from mouse_core.data.token_batch import StepTokens, TokenBatch
-from mouse_core.data.conditions import (
+from tests._conditions import (
     when_episode_done_nonzero,
     when_group_start,
     when_reward_nonzero,

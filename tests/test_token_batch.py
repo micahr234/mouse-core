@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from mouse_core.data import Tokenizer, pack_token_batch, to_device
-from mouse_core.data.conditions import (
+from tests._conditions import (
     when_episode_done_nonzero,
     when_group_start,
     when_reward_nonzero,

@@ -12,7 +12,7 @@ from mouse_core.models.backbone import TransformerBackbone
 from mouse_core.models.heads import RegressionHead
 from mouse_core.models.reasoner import _plan_insertions
 from mouse_core.objectives import DqnObjective, affine_reward, affine_value, boundary_discount
-from mouse_core.data.conditions import (
+from tests._conditions import (
     when_episode_done_nonzero,
     when_group_start,
     when_reward_nonzero,

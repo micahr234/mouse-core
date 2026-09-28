@@ -8,14 +8,17 @@ from mouse_core.data import (
     StepTokens,
     TokenBatch,
     compose,
-    full_task_end,
-    full_task_start,
     pack_token_batch,
     empty_token_batch,
     to_device,
-    when_group_start,
 )
 from mouse_core.models import Model, IdentityBackbone
+
+from examples.conditions import (
+    full_task_end,
+    full_task_start,
+    when_group_start,
+)
 
 
 def test_public_data_exports() -> None:
@@ -28,11 +31,27 @@ def test_public_data_exports() -> None:
     assert StepTokens is not None
     assert TokenBatch is not None
     assert compose is not None
-    assert full_task_start is not None
-    assert full_task_end is not None
-    assert when_group_start is not None
     assert pack_token_batch is not None
     assert empty_token_batch is not None
     assert to_device is not None
     assert Model is not None
     assert IdentityBackbone is not None
+
+
+def test_condition_helpers_are_example_local() -> None:
+    import mouse_core.data as data
+
+    for name in (
+        "full_task_start",
+        "full_task_end",
+        "when_group_start",
+        "when_reward_nonzero",
+        "when_episode_done_nonzero",
+        "when_step_index_zero",
+        "when_step_index_zero_or_group_start",
+        "after_field_ne",
+    ):
+        assert not hasattr(data, name)
+    assert full_task_start is not None
+    assert full_task_end is not None
+    assert when_group_start is not None

@@ -19,13 +19,16 @@ from mouse_core.data import (
     Datastore,
     Tokenizer,
     compose,
-    full_task_end,
-    full_task_start,
 )
 from mouse_core.data.augmenter import _stable_hash
-from mouse_core.data.conditions import after_field_ne, when_step_index_zero
 from mouse_core.data.dataloader import _sequence_generation
 from mouse_core.data.token_batch import StepTokens, TokenBatch
+from tests._conditions import (
+    after_field_ne,
+    full_task_end,
+    full_task_start,
+    when_step_index_zero,
+)
 from tests._token_batch_helpers import token_tokenizer
 
 
