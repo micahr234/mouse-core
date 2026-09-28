@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- ``SampleMatch(equals=..., not_equals=...)`` for ``DataLoader``
+  ``sample_start`` and ``sample_end``. A row matches when every
+  ``equals`` pair holds (``==``) and every ``not_equals`` pair holds
+  (``!=``), all ANDed; at least one side must be non-empty. As
+  ``sample_start``, the matching row itself is the start (unlike
+  ``SampleBoundary``, which starts at index 0 or the step *after*
+  ``field != value``). As ``sample_end``, the window includes the first
+  matching row then stops. If ``sample_end`` is set but no match appears
+  before ``sequence_length`` or the store end, ``next_batch`` raises
+  ``ValueError``. Examples and ``bench/bench_dataloader.py`` use
+  ``SampleMatch(equals=(("episode_index", 0), ("step_index", 0)), not_equals=())``
+  with
+  ``SampleMatch(equals=(), not_equals=(("task_done", 0),))``.
 - Tokenizer fields take a single ``when=`` dict of emission conditions.
   Keys: ``equals`` / ``not_equals`` (each a list of ``(field, value)``
   pairs; multiple allowed) and optional ``group_start`` (bool). All
@@ -114,6 +127,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pass ``architecture="qwen3"`` or ``architecture="llama"``.
 
 ### Changed
+- Training examples and ``bench/bench_dataloader.py`` pin
+  ``sample_start=SampleMatch(equals=(("episode_index", 0), ("step_index", 0)), not_equals=())``
+  and
+  ``sample_end=SampleMatch(equals=(), not_equals=(("task_done", 0),))``
+  so each packed sequence is one full task (episode-0 start through
+  ``task_done != 0`` inclusive). Example ``SEQUENCE_LENGTH`` is
+  ``MAX_TASK_EPISODES * MAX_STEPS_PER_EPISODE`` (a safety cap so the
+  end-match wins). If ``sample_end`` is set but no matching row appears
+  before ``sequence_length`` or the store end, ``next_batch`` raises
+  ``ValueError`` instead of returning a truncated segment.
 - Tokenizer emission gates are a single ``when=`` dict (``equals`` /
   ``not_equals`` lists of ``(field, value)``, optional ``group_start``
   bool). Conditions are **OR**ed. Const text fields may use ``when=``.

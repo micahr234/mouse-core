@@ -28,7 +28,7 @@ from typing import Any
 import numpy as np
 from datasets import Dataset
 
-from mouse_core.data import Augmenter, DataLoader, Datastore, Tokenizer, compose
+from mouse_core.data import Augmenter, DataLoader, Datastore, SampleMatch, Tokenizer, compose
 from mouse_core.data.token_batch import TokenBatch
 
 _BENCH_DIR = Path(__file__).resolve().parent
@@ -46,8 +46,8 @@ _WORKLOADS: dict[str, tuple[int, int]] = {
 
 _MAX_ACTIONS = 4
 _MAX_OBS = 64
-_STEPS_PER_EPISODE = 30
-_EPISODES_PER_TASK = 20
+_STEPS_PER_EPISODE = 8
+_EPISODES_PER_TASK = 4  # max task = 32 steps; keep ≤ shortest --workloads S
 _GROUP_PREFIX = (
     "Your job is to predict the future sum of rewards in FrozenLake. "
     "Navigate a grid; reach the goal for reward; a hole ends the "
@@ -230,6 +230,8 @@ def main() -> None:
                 stores=stores,
                 sequence_length=seq_len,
                 batch_size=batch_size,
+                sample_start=SampleMatch(equals=(("episode_index", 0), ("step_index", 0)), not_equals=()),
+                sample_end=SampleMatch(equals=(), not_equals=(("task_done", 0),)),
                 transform=transform,
                 prefetch=args.prefetch,
                 num_workers=n_workers,

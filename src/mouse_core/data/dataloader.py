@@ -12,16 +12,29 @@ offset. ``sample_start=SampleBoundary(field=..., value=...)`` begins
 every window at a segment start: store index 0, or the step after a
 row where ``field != value``. For mouse-gym done codes, that is
 ``SampleBoundary(field="episode_done", value=0)`` for episode starts
-or ``field="task_done"`` for task starts. The window then runs
-forward for ``min(sequence_length, steps remaining in the store)`` —
-the same ragged suffix as unrestricted sampling — unless
-``sample_end`` is set.
+or ``field="task_done"`` for task starts.
+``sample_start=SampleMatch(equals=..., not_equals=...)`` begins every
+window at a row where every ``equals`` pair holds (``==``) and every
+``not_equals`` pair holds (``!=``), all ANDed — the matching row
+itself is the start, not the step after. Examples use
+``SampleMatch(equals=(("episode_index", 0), ("step_index", 0)), not_equals=())``
+so windows open only on the first step of episode 0 in a task. The
+window then runs forward for
+``min(sequence_length, steps remaining in the store)`` — the same
+ragged suffix as unrestricted sampling — unless ``sample_end`` is
+set.
 
 ``sample_end=None`` (the default) never truncates early for a field.
 ``sample_end=SampleBoundary(field=..., value=...)`` includes the first
 row in the window where ``field != value``, then stops even if
-``sequence_length`` has not been reached. A short store suffix still
-ends the window first; rows are not padded.
+``sequence_length`` has not been reached.
+``sample_end=SampleMatch(...)`` includes the first row matching the
+same equals / not_equals rules then stops. Examples use
+``SampleMatch(equals=(), not_equals=(("task_done", 0),))`` so the
+window ends on the first non-zero ``task_done``. If ``sample_end`` is
+set but no matching row appears before ``sequence_length`` or the
+store end, sampling raises ``ValueError`` (incomplete segment —
+not a silent truncate).
 
 The loader is stage-agnostic: compose augmenter / tokenizer
 (or any ``dict → StepTokens`` callable) outside and pass the result as
@@ -108,6 +121,51 @@ class SampleBoundary:
     value: object
 
 
+@dataclass(frozen=True, kw_only=True)
+class SampleMatch:
+    """Rows matching ``equals`` and ``not_equals`` field conditions (AND).
+
+    Every ``(field, value)`` in ``equals`` must hold (``field == value``).
+    Every ``(field, value)`` in ``not_equals`` must hold (``field != value``).
+    At least one of ``equals`` / ``not_equals`` must be non-empty.
+
+    Pass as :class:`DataLoader` ``sample_start`` so legal window starts are
+    exactly those rows (the matching row itself — not the step after a
+    boundary). Pass as ``sample_end`` so a window includes the first
+    matching row then stops.
+    """
+
+    equals: tuple[tuple[str, object], ...]
+    not_equals: tuple[tuple[str, object], ...]
+
+    def __post_init__(self) -> None:
+        self._validate_pairs(pairs=self.equals, name="equals")
+        self._validate_pairs(pairs=self.not_equals, name="not_equals")
+        if not self.equals and not self.not_equals:
+            raise ValueError(
+                "SampleMatch requires a non-empty equals and/or not_equals."
+            )
+
+    @staticmethod
+    def _validate_pairs(
+        *, pairs: tuple[tuple[str, object], ...], name: str
+    ) -> None:
+        if not isinstance(pairs, tuple):
+            raise TypeError(f"SampleMatch.{name} must be a tuple.")
+        for i, pair in enumerate(pairs):
+            if not isinstance(pair, tuple) or len(pair) != 2:
+                raise TypeError(
+                    f"SampleMatch.{name} entries must be (field, value) pairs, "
+                    f"got {pair!r} at index {i}."
+                )
+            field, _value = pair
+            if not isinstance(field, str) or not field:
+                raise TypeError(
+                    f"SampleMatch.{name} field names must be non-empty str, "
+                    f"got {field!r} at index {i}."
+                )
+
+
 def _require_free_threading() -> None:
     """Raise unless this process can run CPU-bound worker threads in parallel."""
     if not sysconfig.get_config_var("Py_GIL_DISABLED"):
@@ -128,7 +186,7 @@ class _SnapshotConfig:
     batch_size: int
     index_field: str | None
     start_indices: tuple[np.ndarray, ...] | None
-    end_boundary: SampleBoundary | None
+    end_spec: SampleBoundary | SampleMatch | None
 
 
 def _boundary_codes(*, column: Any, n: int, field: str) -> np.ndarray:
@@ -147,6 +205,23 @@ def _boundary_codes(*, column: Any, n: int, field: str) -> np.ndarray:
     return codes
 
 
+def _column_equals(*, column: Any, n: int, field: str, value: object) -> np.ndarray:
+    """Boolean mask of length ``n`` where the column equals ``value``."""
+    target = _normalize_value(value)
+    values = np.asarray(column)
+    if values.dtype != object and values.shape == (n,):
+        return values == target
+    raw = list(column)
+    if len(raw) != n:
+        raise ValueError(
+            f"{field} length ({len(raw)}) does not match the store ({n})."
+        )
+    mask = np.empty(n, dtype=bool)
+    for i, item in enumerate(raw):
+        mask[i] = _normalize_value(item) == target
+    return mask
+
+
 def _require_boundary_column(*, ds: Any, boundary: SampleBoundary, role: str) -> None:
     if boundary.field not in ds.column_names:
         raise ValueError(
@@ -154,12 +229,35 @@ def _require_boundary_column(*, ds: Any, boundary: SampleBoundary, role: str) ->
         )
 
 
-def _start_indices(*, ds: Any, boundary: SampleBoundary) -> np.ndarray:
-    """Offsets where a sample may start, including a later packed segment.
+def _require_match_columns(*, ds: Any, match: SampleMatch, role: str) -> None:
+    for field, _value in (*match.equals, *match.not_equals):
+        if field not in ds.column_names:
+            raise ValueError(
+                f"sample_{role} requires a {field!r} column on every store."
+            )
 
-    Index 0 is a start. So is the step after every row where
-    ``field != value``. An empty store has no starts.
-    """
+
+def _match_mask(*, ds: Any, match: SampleMatch, n: int, offset: int = 0) -> np.ndarray:
+    """Boolean mask over ``n`` rows of ``ds`` starting at ``offset``."""
+    mask = np.ones(n, dtype=bool)
+    for field, value in match.equals:
+        column = ds[offset : offset + n][field]
+        mask &= _column_equals(column=column, n=n, field=field, value=value)
+    for field, value in match.not_equals:
+        column = ds[offset : offset + n][field]
+        mask &= ~_column_equals(column=column, n=n, field=field, value=value)
+    return mask
+
+
+def _start_indices(*, ds: Any, sample_start: SampleBoundary | SampleMatch) -> np.ndarray:
+    """Offsets where a sample may start under ``sample_start``."""
+    if isinstance(sample_start, SampleBoundary):
+        return _start_indices_after_boundary(ds=ds, boundary=sample_start)
+    return _start_indices_at_match(ds=ds, match=sample_start)
+
+
+def _start_indices_after_boundary(*, ds: Any, boundary: SampleBoundary) -> np.ndarray:
+    """Index 0, plus the step after every row where ``field != value``."""
     n = len(ds)
     if n == 0:
         return np.zeros(0, dtype=np.int64)
@@ -171,20 +269,62 @@ def _start_indices(*, ds: Any, boundary: SampleBoundary) -> np.ndarray:
     return np.concatenate((np.zeros(1, dtype=np.int64), after))
 
 
-def _window_end(*, start: int, n: int, s_max: int, ds: Any, boundary: SampleBoundary | None) -> int:
-    """Exclusive end index for a window starting at ``start``."""
-    end = min(start + s_max, n)
-    if boundary is None or start >= end:
-        return end
-    _require_boundary_column(ds=ds, boundary=boundary, role="end")
-    codes = _boundary_codes(
-        column=ds[start:end][boundary.field],
-        n=end - start,
-        field=boundary.field,
+def _start_indices_at_match(*, ds: Any, match: SampleMatch) -> np.ndarray:
+    """Offsets of rows matching ``equals`` / ``not_equals``."""
+    n = len(ds)
+    if n == 0:
+        return np.zeros(0, dtype=np.int64)
+    _require_match_columns(ds=ds, match=match, role="start")
+    mask = _match_mask(ds=ds, match=match, n=n)
+    return np.flatnonzero(mask).astype(np.int64, copy=False)
+
+
+def _sample_end_label(end_spec: SampleBoundary | SampleMatch) -> str:
+    if isinstance(end_spec, SampleBoundary):
+        return (
+            f"SampleBoundary(field={end_spec.field!r}, value={end_spec.value!r}) "
+            f"(stop on {end_spec.field!r} != {end_spec.value!r})"
+        )
+    return (
+        f"SampleMatch(equals={end_spec.equals!r}, not_equals={end_spec.not_equals!r})"
     )
-    hits = np.flatnonzero(codes != boundary.value)
-    if len(hits) == 0:
+
+
+def _window_end(
+    *,
+    start: int,
+    n: int,
+    s_max: int,
+    ds: Any,
+    end_spec: SampleBoundary | SampleMatch | None,
+) -> int:
+    """Exclusive end index for a window starting at ``start``.
+
+    When ``end_spec`` is set, the first matching row must appear at or
+    before ``min(start + s_max, n) - 1``; otherwise raise ``ValueError``.
+    """
+    end = min(start + s_max, n)
+    if end_spec is None or start >= end:
         return end
+    if isinstance(end_spec, SampleBoundary):
+        _require_boundary_column(ds=ds, boundary=end_spec, role="end")
+        codes = _boundary_codes(
+            column=ds[start:end][end_spec.field],
+            n=end - start,
+            field=end_spec.field,
+        )
+        hits = np.flatnonzero(codes != end_spec.value)
+    else:
+        _require_match_columns(ds=ds, match=end_spec, role="end")
+        mask = _match_mask(ds=ds, match=end_spec, n=end - start, offset=start)
+        hits = np.flatnonzero(mask)
+    if len(hits) == 0:
+        raise ValueError(
+            "sample_end was not met before sequence_length or the store end: "
+            f"{_sample_end_label(end_spec)}; start={start}, "
+            f"searched={end - start} step(s) through exclusive end={end}, "
+            f"sequence_length={s_max}, store_len={n}."
+        )
     return start + int(hits[0]) + 1
 
 
@@ -217,7 +357,7 @@ def _fetch_sequence(
         n=n,
         s_max=S_max,
         ds=ds,
-        boundary=cfg.end_boundary,
+        end_spec=cfg.end_spec,
     )
     hf_slice = ds[start:end]
     count = end - start
@@ -352,13 +492,19 @@ class DataLoader:
         When ``None`` (default), a window may start at any store offset.
         When a :class:`SampleBoundary`, every window starts at store index 0
         or the step after a row where ``field != value``. A later segment in
-        the same store is a start. Without ``sample_end``, the window still
-        runs forward until ``sequence_length`` or the store ends.
+        the same store is a start. When a :class:`SampleMatch`, every window
+        starts on a row matching ``equals`` / ``not_equals`` (AND); the
+        matching row itself is the start. Without ``sample_end``, the window
+        still runs forward until ``sequence_length`` or the store ends.
     sample_end :
         When ``None`` (default), the window stops only at ``sequence_length``
         or the store end. When a :class:`SampleBoundary`, the window includes
-        the first row where ``field != value`` then stops. A short suffix is
-        a shorter window; rows are not padded.
+        the first row where ``field != value`` then stops. When a
+        :class:`SampleMatch`, the window includes the first matching row then
+        stops. If ``sample_end`` is set but no matching row appears before
+        ``sequence_length`` or the store end, :meth:`next_batch` raises
+        ``ValueError``. A short matching segment is a shorter window; rows
+        are not padded.
     batch_size :
         How many such windows per batch.
     transform :
@@ -383,8 +529,8 @@ class DataLoader:
         sequence_length: int,
         batch_size: int,
         transform: StepTransform,
-        sample_start: SampleBoundary | None = None,
-        sample_end: SampleBoundary | None = None,
+        sample_start: SampleBoundary | SampleMatch | None = None,
+        sample_end: SampleBoundary | SampleMatch | None = None,
         index_field: str | None = None,
         weights: list[float] | None = None,
         weight_mode: str = "per_store",
@@ -417,14 +563,18 @@ class DataLoader:
             raise ValueError(f"weight_mode must be 'per_store' or 'per_step', got {weight_mode!r}")
         if sequence_length < 1:
             raise ValueError(f"sequence_length must be >= 1, got {sequence_length}.")
-        if sample_start is not None and not isinstance(sample_start, SampleBoundary):
+        if sample_start is not None and not isinstance(
+            sample_start, (SampleBoundary, SampleMatch)
+        ):
             raise TypeError(
-                "sample_start must be SampleBoundary or None, "
+                "sample_start must be SampleBoundary, SampleMatch, or None, "
                 f"got {type(sample_start).__name__}."
             )
-        if sample_end is not None and not isinstance(sample_end, SampleBoundary):
+        if sample_end is not None and not isinstance(
+            sample_end, (SampleBoundary, SampleMatch)
+        ):
             raise TypeError(
-                "sample_end must be SampleBoundary or None, "
+                "sample_end must be SampleBoundary, SampleMatch, or None, "
                 f"got {type(sample_end).__name__}."
             )
         if batch_size < 1:
@@ -550,7 +700,7 @@ class DataLoader:
             batch_size=self.batch_size,
             index_field=self.index_field,
             start_indices=self._start_indices,
-            end_boundary=self.sample_end,
+            end_spec=self.sample_end,
         )
 
     def _start_workers(self) -> None:
@@ -604,11 +754,14 @@ class DataLoader:
             self._start_indices = None
         else:
             self._start_indices = tuple(
-                _start_indices(ds=ds, boundary=self.sample_start) for ds in self._datasets
+                _start_indices(ds=ds, sample_start=self.sample_start) for ds in self._datasets
             )
         if self.sample_end is not None:
             for ds in self._datasets:
-                _require_boundary_column(ds=ds, boundary=self.sample_end, role="end")
+                if isinstance(self.sample_end, SampleBoundary):
+                    _require_boundary_column(ds=ds, boundary=self.sample_end, role="end")
+                else:
+                    _require_match_columns(ds=ds, match=self.sample_end, role="end")
 
         w = self._weights.copy()
         ns = np.array(self._ns, dtype=float)

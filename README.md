@@ -51,7 +51,7 @@ source scripts/install.sh
 
 mouse-core gives you three building blocks for in-context RL. Compose them in your own training loop:
 
-* **Data** (`mouse_core.data`) — stores sequential rows in `Datastore` and batches contiguous windows with `DataLoader`. `sample_start=SampleBoundary(field=..., value=...)` begins each window after that field boundary (e.g. `episode_done` / `task_done` with `value=0`); `sample_end` truncates a window on the first matching boundary. The default may start at any offset and never truncates early.
+* **Data** (`mouse_core.data`) — stores sequential rows in `Datastore` and batches contiguous windows with `DataLoader`. `sample_start=SampleBoundary(field=..., value=...)` begins each window at store index 0 or after a `field != value` boundary. `sample_start=SampleMatch(equals=..., not_equals=...)` begins on a row matching those `==` / `!=` pairs (AND); examples use `equals=(("episode_index", 0), ("step_index", 0))`. `sample_end` takes `SampleBoundary` or `SampleMatch` and includes the first matching row then stops; examples use `not_equals=(("task_done", 0),)` so each sequence is one full task. If `sample_end` is set but never met before `sequence_length` / store end, sampling raises. The default may start at any offset and never truncates early.
 * **Models** (`mouse_core.models`) — backbone (`TransformerBackbone` or `IdentityBackbone`, token embeddings included) + output heads (`ClassificationHead`, `RegressionHead`, …).
 * **Objectives** (`mouse_core.objectives`) — training losses such as DQN, PPO, GRPO, SP, and SV.
 

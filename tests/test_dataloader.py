@@ -18,6 +18,7 @@ from mouse_core.data import (
     DataLoader,
     Datastore,
     SampleBoundary,
+    SampleMatch,
     Tokenizer,
     compose,
 )
@@ -822,4 +823,166 @@ def test_dataloader_sample_boundary_type_errors() -> None:
             batch_size=1,
             num_workers=0,
             sample_end="episode_done",  # type: ignore[arg-type]
+        )
+
+
+def _packed_episode_index_store() -> tuple[Datastore, set[int]]:
+    """Two tasks; only episode_index==0 and step_index==0 are match starts.
+
+    Layout (action, episode_index, step_index, task_done):
+    ep0: (10,0,0), (11,0,1) | ep1: (12,1,0) | task-end (13,1,1,task_done=1)
+    | task2 ep0: (14,0,0), (15,0,1,task_done=2)
+
+    Match starts: 0 and 4. Episode-1 start at 2 is not a match start.
+    """
+    store = Datastore()
+    rows = (
+        (10, 0, 0, 0),
+        (11, 0, 1, 0),
+        (12, 1, 0, 0),
+        (13, 1, 1, 1),
+        (14, 0, 0, 0),
+        (15, 0, 1, 2),
+    )
+    for action, episode_index, step_index, task_done in rows:
+        store.append(
+            data={
+                "action": action,
+                "reward": 0.0,
+                "episode_done": 0,
+                "task_done": task_done,
+                "episode_index": episode_index,
+                "step_index": step_index,
+            }
+        )
+    return store, {0, 4}
+
+
+def test_sample_match_rejects_empty_equals_and_not_equals() -> None:
+    with pytest.raises(ValueError, match="non-empty"):
+        SampleMatch(equals=(), not_equals=())
+
+
+def test_dataloader_sample_start_match_requires_both_fields() -> None:
+    """Windows begin only where episode_index==0 and step_index==0."""
+    store, match_starts = _packed_episode_index_store()
+    loader = _loader(
+        sequence_length=2,
+        batch_size=2,
+        num_workers=0,
+        seed=5,
+        sample_start=SampleMatch(equals=(("episode_index", 0), ("step_index", 0)), not_equals=()),
+        stores=store,
+        index_field="store_index",
+        transform=_index_transform(),
+    )
+    starts = {start for batch in _sampled_windows(loader, 64) for start, _ in batch}
+    assert starts == match_starts
+    assert 2 not in starts  # episode_index==1, step_index==0
+
+
+def test_dataloader_sample_start_match_with_task_end() -> None:
+    """Each window is exactly one full task (ep0/step0 .. task_done!=0 inclusive)."""
+    store, match_starts = _packed_episode_index_store()
+    # Task 0: indices 0..3 (task_done at 3); task 1: 4..5 (task_done at 5).
+    loader = _loader(
+        sequence_length=100,
+        batch_size=1,
+        num_workers=0,
+        seed=6,
+        sample_start=SampleMatch(equals=(("episode_index", 0), ("step_index", 0)), not_equals=()),
+        sample_end=SampleMatch(equals=(), not_equals=(("task_done", 0),)),
+        stores=store,
+        index_field="store_index",
+        transform=_index_transform(),
+    )
+    seen_starts: set[int] = set()
+    for _ in range(48):
+        _, obj = loader.next_batch()
+        indices = [int(x) for x in obj["store_index"]]
+        dones = [int(x) for x in obj["task_done"]]
+        start = indices[0]
+        seen_starts.add(start)
+        assert start in match_starts
+        assert indices == list(range(start, start + len(indices)))
+        assert dones[-1] != 0
+        assert all(d == 0 for d in dones[:-1])
+        if start == 0:
+            assert indices == [0, 1, 2, 3]
+        elif start == 4:
+            assert indices == [4, 5]
+    assert seen_starts == match_starts
+
+
+def test_dataloader_sample_end_missing_raises() -> None:
+    """sample_end set but never met before length/store end → ValueError."""
+    store = Datastore()
+    for step_index in range(5):
+        store.append(
+            data={
+                "action": step_index,
+                "reward": 0.0,
+                "episode_done": 0,
+                "task_done": 0,
+                "episode_index": 0,
+                "step_index": step_index,
+            }
+        )
+    loader = _loader(
+        sequence_length=10,
+        batch_size=1,
+        num_workers=0,
+        seed=0,
+        sample_start=SampleMatch(equals=(("episode_index", 0), ("step_index", 0)), not_equals=()),
+        sample_end=SampleMatch(equals=(), not_equals=(("task_done", 0),)),
+        stores=store,
+        index_field="store_index",
+        transform=_index_transform(),
+    )
+    with pytest.raises(ValueError, match=r"sample_end was not met"):
+        loader.next_batch()
+
+
+def test_dataloader_sample_end_missing_when_seq_len_too_short_raises() -> None:
+    """End exists later in the store but beyond sequence_length → ValueError."""
+    store, _ = _packed_episode_index_store()
+    # Task 0 needs 4 steps; sequence_length=2 cannot reach task_done at index 3.
+    loader = _loader(
+        sequence_length=2,
+        batch_size=1,
+        num_workers=0,
+        seed=0,
+        sample_start=SampleMatch(equals=(("episode_index", 0), ("step_index", 0)), not_equals=()),
+        sample_end=SampleMatch(equals=(), not_equals=(("task_done", 0),)),
+        stores=store,
+        index_field="store_index",
+        transform=_index_transform(),
+    )
+    with pytest.raises(ValueError, match=r"sample_end was not met"):
+        loader.next_batch()
+
+
+def test_dataloader_sample_start_match_requires_field_column() -> None:
+    store = Datastore()
+    store.append(data={"action": 1, "reward": 0.0, "step_index": 0, "task_done": 0})
+    with pytest.raises(ValueError, match="episode_index"):
+        _loader(
+            sequence_length=2,
+            batch_size=1,
+            num_workers=0,
+            sample_start=SampleMatch(equals=(("episode_index", 0), ("step_index", 0)), not_equals=()),
+            stores=store,
+        )
+
+
+def test_dataloader_sample_end_match_requires_field_column() -> None:
+    store = Datastore()
+    store.append(data={"action": 1, "reward": 0.0, "episode_done": 0})
+    with pytest.raises(ValueError, match="task_done"):
+        _loader(
+            sequence_length=2,
+            batch_size=1,
+            num_workers=0,
+            sample_end=SampleMatch(equals=(), not_equals=(("task_done", 0),)),
+            stores=store,
         )
