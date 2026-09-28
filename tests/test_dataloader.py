@@ -940,8 +940,8 @@ def test_dataloader_sample_start_match_with_task_end() -> None:
     assert seen_starts == match_starts
 
 
-def test_dataloader_sample_end_missing_raises() -> None:
-    """sample_end set but never met before length/store end → ValueError."""
+def test_dataloader_sample_end_missing_exhausts() -> None:
+    """All starts incomplete under sample_end → exhaustion ValueError."""
     store = Datastore()
     for step_index in range(5):
         store.append(
@@ -965,14 +965,15 @@ def test_dataloader_sample_end_missing_raises() -> None:
         index_field="store_index",
         transform=_index_transform(),
     )
-    with pytest.raises(ValueError, match=r"sample_end was not met"):
+    with pytest.raises(ValueError, match=r"No complete sample_end window"):
         loader.next_batch()
 
 
-def test_dataloader_sample_end_missing_when_seq_len_too_short_raises() -> None:
-    """End exists later in the store but beyond sequence_length → ValueError."""
+def test_dataloader_sample_end_missing_start_is_skipped() -> None:
+    """Incomplete starts are skipped; only complete start→end windows yield."""
     store, _ = _packed_episode_index_store()
     # Task 0 needs 4 steps; sequence_length=2 cannot reach task_done at index 3.
+    # Task 1 (start 4) needs 2 steps and still completes within the cap.
     loader = _loader(
         sequence_length=2,
         batch_size=1,
@@ -984,8 +985,55 @@ def test_dataloader_sample_end_missing_when_seq_len_too_short_raises() -> None:
         index_field="store_index",
         transform=_index_transform(),
     )
-    with pytest.raises(ValueError, match=r"sample_end was not met"):
-        loader.next_batch()
+    for _ in range(32):
+        _, obj = loader.next_batch()
+        indices = [int(x) for x in obj["store_index"]]
+        dones = [int(x) for x in obj["task_done"]]
+        assert indices == [4, 5]
+        assert dones[-1] != 0
+        assert all(d == 0 for d in dones[:-1])
+
+
+def test_dataloader_sample_end_yielded_window_always_includes_end() -> None:
+    """Every yielded window with sample_end ends on a matching row."""
+    store, match_starts = _packed_episode_index_store()
+    loader = _loader(
+        sequence_length=100,
+        batch_size=2,
+        num_workers=0,
+        seed=7,
+        sample_start=full_task_start,
+        sample_end=full_task_end,
+        stores=store,
+        index_field="store_index",
+        transform=_index_transform(),
+    )
+    for _ in range(24):
+        _, obj = loader.next_batch()
+        # batch_size=2 → two windows packed; split by contiguous store runs.
+        indices = [int(x) for x in obj["store_index"]]
+        dones = [int(x) for x in obj["task_done"]]
+        seq_ids = [int(x) for x in obj["sequence_id"]]
+        for b in sorted(set(seq_ids)):
+            mask = [sid == b for sid in seq_ids]
+            win_idx = [i for i, m in zip(indices, mask) if m]
+            win_done = [d for d, m in zip(dones, mask) if m]
+            assert win_idx[0] in match_starts
+            assert win_done[-1] != 0
+            assert all(d == 0 for d in win_done[:-1])
+
+
+def test_dataloader_sample_end_invariant_rejects_window_without_end() -> None:
+    """Invariant guard: a yielded window that lacks an end match raises."""
+    from mouse_core.data.dataloader import _require_window_ends_on_sample_end
+
+    store, _ = _packed_episode_index_store()
+    ds = store.to_dataset()
+    # Indices 0..2 have no task_done match at the last row.
+    with pytest.raises(ValueError, match=r"invariant violated"):
+        _require_window_ends_on_sample_end(
+            ds=ds, start=0, end=3, end_fn=full_task_end
+        )
 
 
 def test_dataloader_sample_start_match_requires_field_column() -> None:

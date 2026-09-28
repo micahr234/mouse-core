@@ -23,8 +23,12 @@ set.
 candidate window rows; the window includes the first ``True`` row then
 stops. Notebooks often define a ``full_task_end`` callable inline
 (``task_done != 0``). If ``sample_end`` is set but no matching row
-appears before ``sequence_length`` or the store end, sampling raises
-``ValueError`` (incomplete segment — not a silent truncate).
+appears before ``sequence_length`` or the store end for a chosen
+start, that draw is discarded and another start is sampled (not a
+silent truncate). Exhaustion — every candidate start incomplete, or
+too many consecutive misses — raises ``ValueError``. Every yielded
+window with ``sample_end`` set must end on a match; a broken
+invariant raises.
 
 The loader is stage-agnostic: compose augmenter / tokenizer
 (or any ``dict → StepTokens`` callable) outside and pass the result as
@@ -208,6 +212,11 @@ def _start_indices(*, ds: Any, sample_start: SampleFn) -> np.ndarray:
     return np.flatnonzero(mask).astype(np.int64, copy=False)
 
 
+# Cap consecutive incomplete ``sample_end`` draws (safety against huge
+# unrestricted start spaces). Distinct-start exhaustion can raise sooner.
+_SAMPLE_END_MAX_RETRIES = 1024
+
+
 def _sample_end_label(end_fn: SampleFn) -> str:
     name = getattr(end_fn, "__qualname__", None) or getattr(
         end_fn, "__name__", repr(end_fn)
@@ -222,11 +231,12 @@ def _window_end(
     s_max: int,
     ds: Any,
     end_fn: SampleFn | None,
-) -> int:
+) -> int | None:
     """Exclusive end index for a window starting at ``start``.
 
     When ``end_fn`` is set, the first matching row must appear at or
-    before ``min(start + s_max, n) - 1``; otherwise raise ``ValueError``.
+    before ``min(start + s_max, n) - 1``; otherwise return ``None`` so
+    the caller can discard this start and resample.
     """
     end = min(start + s_max, n)
     if end_fn is None or start >= end:
@@ -235,30 +245,69 @@ def _window_end(
     mask = _eval_sample_mask(fn=end_fn, cols=cols, n=end - start, role="end")
     hits = np.flatnonzero(mask)
     if len(hits) == 0:
-        raise ValueError(
-            "sample_end was not met before sequence_length or the store end: "
-            f"{_sample_end_label(end_fn)}; start={start}, "
-            f"searched={end - start} step(s) through exclusive end={end}, "
-            f"sequence_length={s_max}, store_len={n}."
-        )
+        return None
     return start + int(hits[0]) + 1
 
 
-def _fetch_sequence(
+def _all_sample_starts_exhausted(
+    *,
+    cfg: _SnapshotConfig,
+    incomplete: set[tuple[int, int]],
+) -> bool:
+    """True when every sampleable ``(store_idx, start)`` is known incomplete."""
+    any_candidate = False
+    for store_idx, n in enumerate(cfg.ns):
+        if n < 1:
+            continue
+        if cfg.start_indices is None:
+            candidates = range(n)
+        else:
+            starts = cfg.start_indices[store_idx]
+            if len(starts) == 0:
+                continue
+            candidates = (int(s) for s in starts)
+        for start in candidates:
+            any_candidate = True
+            if (store_idx, start) not in incomplete:
+                return False
+    return any_candidate
+
+
+def _require_window_ends_on_sample_end(
+    *,
+    ds: Any,
+    start: int,
+    end: int,
+    end_fn: SampleFn,
+) -> None:
+    """Raise if a yielded ``sample_end`` window does not end on a match."""
+    count = end - start
+    if count < 1:
+        raise ValueError(
+            "DataLoader invariant violated: empty window with sample_end set "
+            f"({_sample_end_label(end_fn)}; start={start}, exclusive_end={end})."
+        )
+    cols = _ColumnView(ds=ds, offset=start, n=count)
+    mask = _eval_sample_mask(fn=end_fn, cols=cols, n=count, role="end")
+    if not bool(mask[-1]):
+        raise ValueError(
+            "DataLoader invariant violated: yielded window does not end on "
+            f"a sample_end match ({_sample_end_label(end_fn)}; "
+            f"start={start}, exclusive_end={end})."
+        )
+
+
+def _pick_store_and_start(
+    *,
     cfg: _SnapshotConfig,
     rng: np.random.Generator,
-) -> list[dict]:
-    """Fetch one contiguous window of length ``1 .. sequence_length``."""
-    if sum(cfg.ns) == 0:
-        raise ValueError("Cannot sample batches: all stores are empty.")
-
-    S_max = cfg.sequence_length
+) -> tuple[int, Any, int, int]:
+    """Choose ``(store_idx, ds, n, start)`` for one window draw."""
     store_idx = int(rng.choice(len(cfg.datasets), p=cfg.probs))
     ds = cfg.datasets[store_idx]
     n = cfg.ns[store_idx]
     if n < 1:
         raise ValueError("Cannot sample from an empty store.")
-
     if cfg.start_indices is None:
         start = int(rng.integers(0, n))
     else:
@@ -268,22 +317,91 @@ def _fetch_sequence(
                 "Cannot sample starts from a store with no sample_start boundaries."
             )
         start = int(starts[int(rng.integers(0, len(starts)))])
-    end = _window_end(
-        start=start,
-        n=n,
-        s_max=S_max,
-        ds=ds,
-        end_fn=cfg.end_fn,
-    )
+    return store_idx, ds, n, start
+
+
+def _rows_from_slice(
+    *,
+    ds: Any,
+    start: int,
+    end: int,
+    index_field: str | None,
+) -> list[dict]:
+    """Materialize ``ds[start:end]`` as a list of row dicts."""
     hf_slice = ds[start:end]
     count = end - start
     rows = [
         {k: _normalize_value(hf_slice[k][i]) for k in hf_slice} for i in range(count)
     ]
-    if cfg.index_field is not None:
+    if index_field is not None:
         for i, row in enumerate(rows):
-            row[cfg.index_field] = start + i
+            row[index_field] = start + i
     return rows
+
+
+def _fetch_sequence(
+    cfg: _SnapshotConfig,
+    rng: np.random.Generator,
+) -> list[dict]:
+    """Fetch one contiguous window of length ``1 .. sequence_length``.
+
+    With ``sample_end`` set, incomplete starts (no end match within the
+    allowed range) are discarded and another start is drawn. Raises when
+    every candidate start is incomplete or after
+    ``_SAMPLE_END_MAX_RETRIES`` consecutive misses.
+    """
+    if sum(cfg.ns) == 0:
+        raise ValueError("Cannot sample batches: all stores are empty.")
+
+    S_max = cfg.sequence_length
+    end_fn = cfg.end_fn
+    if end_fn is None:
+        _, ds, n, start = _pick_store_and_start(cfg=cfg, rng=rng)
+        end = _window_end(start=start, n=n, s_max=S_max, ds=ds, end_fn=None)
+        assert end is not None
+        return _rows_from_slice(
+            ds=ds, start=start, end=end, index_field=cfg.index_field
+        )
+
+    incomplete: set[tuple[int, int]] = set()
+    for _ in range(_SAMPLE_END_MAX_RETRIES):
+        store_idx, ds, n, start = _pick_store_and_start(cfg=cfg, rng=rng)
+        key = (store_idx, start)
+        if key in incomplete:
+            if _all_sample_starts_exhausted(cfg=cfg, incomplete=incomplete):
+                break
+            continue
+        end = _window_end(
+            start=start,
+            n=n,
+            s_max=S_max,
+            ds=ds,
+            end_fn=end_fn,
+        )
+        if end is None:
+            incomplete.add(key)
+            if _all_sample_starts_exhausted(cfg=cfg, incomplete=incomplete):
+                break
+            continue
+        _require_window_ends_on_sample_end(
+            ds=ds, start=start, end=end, end_fn=end_fn
+        )
+        return _rows_from_slice(
+            ds=ds, start=start, end=end, index_field=cfg.index_field
+        )
+
+    if incomplete and _all_sample_starts_exhausted(cfg=cfg, incomplete=incomplete):
+        raise ValueError(
+            "No complete sample_end window in the store(s): "
+            f"{_sample_end_label(end_fn)}; "
+            f"tried {len(incomplete)} distinct incomplete start(s); "
+            f"sequence_length={S_max}."
+        )
+    raise ValueError(
+        "Could not sample a complete sample_end window after "
+        f"{_SAMPLE_END_MAX_RETRIES} attempts: {_sample_end_label(end_fn)}; "
+        f"incomplete_starts_seen={len(incomplete)}, sequence_length={S_max}."
+    )
 
 
 def _batch_rng(entropy: int, k: int) -> np.random.Generator:
@@ -415,8 +533,9 @@ class DataLoader:
         When ``None`` (default), the window stops only at ``sequence_length``
         or the store end. When a callable ``cols → bool ndarray`` over the
         candidate window, the window includes the first ``True`` row then
-        stops. If ``sample_end`` is set but no matching row appears before
-        ``sequence_length`` or the store end, :meth:`next_batch` raises
+        stops. Incomplete starts (no match before ``sequence_length`` /
+        store end) are skipped and another start is drawn. Exhaustion or a
+        yielded window that somehow lacks an end match raises
         ``ValueError``. A short matching segment is a shorter window; rows
         are not padded.
     batch_size :
