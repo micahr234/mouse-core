@@ -22,7 +22,7 @@ Example — custom objective::
             targets: torch.Tensor | None = None,
         ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]:
             ...
-            return loss, {"my_objective": loss.item()}
+            return loss, {"my_objective": loss.detach()}
 """
 
 from __future__ import annotations
@@ -96,8 +96,10 @@ class Objective(ABC):
                 look up a ``targets_key`` in ``objective_data``.
 
         Returns:
-            ``(scalar_loss, metrics)`` where ``metrics`` holds scalar floats
-            ready for logging and, when an objective exposes them, detached
-            tensors built during the loss (for example DQN ``backup``).
+            ``(scalar_loss, metrics)`` where ``metrics`` holds detached
+            0-dim tensors (or floats) for logging — prefer tensors so the
+            train step can defer host materialization until log time —
+            and, when an objective exposes them, detached tensors built
+            during the loss (for example DQN ``backup``).
         """
         ...

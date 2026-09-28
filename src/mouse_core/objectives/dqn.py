@@ -940,9 +940,9 @@ class DqnObjective(Objective):
                 row_weight,
             )
 
-        metrics: dict[str, float | torch.Tensor] = dict(
-            zip(named, torch.stack(list(named.values())).tolist())
-        )
+        # Keep scalar stats as 0-dim tensors so the train step does not
+        # host-sync via ``tolist()``; loggers can ``.item()`` at log time.
+        metrics: dict[str, float | torch.Tensor] = dict(named)
         # Same G and row weight the loss used — callers log these
         # instead of rebuilding the backup.
         metrics["backup"] = td_target.detach()

@@ -105,6 +105,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pass ``architecture="qwen3"`` or ``architecture="llama"``.
 
 ### Changed
+- ``_packing_plan`` keeps ``max_seqlen`` as a 0-dim on-device tensor.
+  ``packed_forward`` materializes a Python int only for ``varlen`` /
+  ``padded`` (kernels that need a size); ``flex`` / ``reference`` never
+  host-sync that value on the train step.
+- ``DqnObjective`` and ``SpObjective`` keep scalar metrics as detached
+  0-dim tensors instead of ``tolist()`` / ``loss.item()`` every call
+  (including the data-policy ``SpObjective`` path). Loggers can
+  ``.item()`` at log time.
 - Training examples and ``bench/bench_dataloader.py`` pin
   ``sample_start=full_task_start`` and ``sample_end=full_task_end`` so
   each packed sequence is one full task (episode-0 start through
