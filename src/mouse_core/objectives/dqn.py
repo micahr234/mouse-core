@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import overload
+from typing import Literal, cast, overload
 
 import torch
 import torch.nn.functional as F
@@ -262,6 +262,33 @@ def _affine_scan_backward(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 # rows by the remaining horizon, not a second ``[N, N]`` copy.
 _CONTINUATION_ROWS = 256
 
+CrossGroupBackups = Literal["bootstrap", "ignore", "fault"]
+
+
+def _require_cross_group_backups(value: str) -> CrossGroupBackups:
+    """``"bootstrap"``, ``"ignore"``, or ``"fault"``."""
+    if value not in ("bootstrap", "ignore", "fault"):
+        raise ValueError(
+            "cross_group_backups must be 'bootstrap', 'ignore', or 'fault', "
+            f"got {value!r}."
+        )
+    return cast(CrossGroupBackups, value)
+
+
+def _raise_if_cross_group_backup(
+    *,
+    in_run: torch.Tensor,
+    participate: torch.Tensor,
+) -> None:
+    """Raise when an in-run backup depends on a value past the group boundary."""
+    crossed = in_run & (participate == 0)
+    if bool(crossed.any()):
+        step = int(crossed.nonzero()[0])
+        raise ValueError(
+            "cross-group backup at step "
+            f"{step}: the target depends on a value past the group boundary."
+        )
+
 
 def _run_mask(*, pair_weight: torch.Tensor, N: int) -> torch.Tensor:
     """``[N]`` factor on a continuation stored at that step.
@@ -346,7 +373,7 @@ def _block_returns(
     v_next: torch.Tensor,
     t0: int,
     rows: int,
-    ignore_cross_group_backups: bool,
+    cross_group_backups: CrossGroupBackups,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Returns for starts ``t0 .. t0+rows``, and which starts stay.
 
@@ -355,12 +382,12 @@ def _block_returns(
     the cumprod is unchanged, and their reward term is ``0``.
 
     ``col_mask`` is ``0`` at a group boundary, where the continuation is
-    outside the sampled run. ``ignore_cross_group_backups=True`` leaves
-    that off-data ``V`` out of the target and drops a start when the
-    factor on it is non-zero. A zero factor leaves the value out of the
-    target, so the start stays. ``False`` bootstraps ``V`` on the step
-    before the boundary, and every start stays. A gate ``0`` on a step
-    the mask still keeps bootstraps either way.
+    outside the sampled run. ``"ignore"`` and ``"fault"`` leave that
+    off-data ``V`` out of the target and mark a start when the factor on
+    it is non-zero. A zero factor leaves the value out of the target, so
+    the start stays. ``"bootstrap"`` fills ``V`` on the step before the
+    boundary, and every start stays. A gate ``0`` on a step the mask
+    still keeps bootstraps either way.
 
     The second tensor is ``1`` for a start that stays and ``0`` for a
     start that drops.
@@ -379,7 +406,8 @@ def _block_returns(
     g = discount[t0:]
     alive = col_mask[t0:]
     # ``alive == 0`` is a group boundary whose continuation was not sampled.
-    boot = (1 - step) * alive if ignore_cross_group_backups else (1 - step * alive)
+    leave_out = cross_group_backups != "bootstrap"
+    boot = (1 - step) * alive if leave_out else (1 - step * alive)
     step.mul_(alive)
     term = reward[t0:] + g * boot * v_next[t0:]
     step.mul_(g)
@@ -389,7 +417,7 @@ def _block_returns(
         before = local_col < local_row
         step[:, :rows] = torch.where(before, step.new_ones(()), step[:, :rows])
         term[:, :rows] = torch.where(before, term.new_zeros(()), term[:, :rows])
-    if ignore_cross_group_backups:
+    if leave_out:
         participate = _block_cutoff_factor_is_zero(step=step, alive=alive, discount=g)
     else:
         participate = step.new_ones(rows)
@@ -407,7 +435,7 @@ def _continuation_targets(
     v_step: torch.Tensor,
     pair_weight: torch.Tensor,
     continuation: torch.Tensor,
-    ignore_cross_group_backups: bool,
+    cross_group_backups: CrossGroupBackups,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return for every pair ``(t, t+1)``, and which pairs stay.
 
@@ -417,17 +445,20 @@ def _continuation_targets(
     started at ``t``. Rows are cumprod'd in blocks of
     ``_CONTINUATION_ROWS`` and never read another start's return. The
     in-run mask zeros a continuation that would leave the run.
-    ``ignore_cross_group_backups=True`` leaves that off-data ``V`` out of
-    the target and drops the pair when the factor on it is non-zero,
-    from the loss and from logged metrics. A zero factor leaves the
-    value out of the target, so the pair stays. ``False`` bootstraps
-    ``V`` on the step before that group boundary and keeps the pair. A
-    gate ``0`` on a step still inside the run still bootstraps.
-    Out-of-run pairs return ``0``.
+    ``"ignore"`` leaves that off-data ``V`` out of the target and drops
+    the pair when the factor on it is non-zero, from the loss and from
+    logged metrics. ``"fault"`` raises on that pair instead.
+    ``"bootstrap"`` fills ``V`` on the step before that group boundary
+    and keeps the pair. A zero factor leaves the value out of the
+    target, so the pair stays and ``"fault"`` does not raise. A gate
+    ``0`` on a step still inside the run still bootstraps. Out-of-run
+    pairs return ``0``.
 
     Returns ``(returns [N-1], participate [N-1])``. ``participate`` is
-    ``1`` for a pair that stays.
+    ``1`` for a pair that stays. ``"fault"`` raises when an in-run pair
+    would be dropped.
     """
+    cross_group_backups = _require_cross_group_backups(cross_group_backups)
     r = reward[1:].to(dtype=v_step.dtype)  # [N-1]  r_t (stored at t+1)
     g = discount_all[1:]  # [N-1]  γ_t
     v_next = v_step[1:]  # [N-1]  V(s_{t+1})
@@ -453,9 +484,12 @@ def _continuation_targets(
             v_next=v_next,
             t0=t0,
             rows=rows,
-            ignore_cross_group_backups=ignore_cross_group_backups,
+            cross_group_backups=cross_group_backups,
         )
-    return returns * in_run.to(dtype=returns.dtype), participate
+    in_run_f = in_run.to(dtype=returns.dtype)
+    if cross_group_backups == "fault":
+        _raise_if_cross_group_backup(in_run=in_run, participate=participate)
+    return returns * in_run_f, participate
 
 
 def _read_gate(
@@ -594,13 +628,15 @@ class DqnObjective(Objective):
     The objective then zeros a
     continuation that would leave the run. For any horizon, the last
     step of a task is not updated when its target depends on the next
-    step's value. It is updated when the target does not. ``ignore_cross_group_backups=True``
-    leaves that off-data ``V`` out of the target and leaves the step
-    out of the loss and out of logged metrics when the factor on it is
-    non-zero. ``ignore_cross_group_backups=False`` bootstraps ``V`` on
-    the step before that group boundary (the rest of the episode is not
-    in the sample), so that step is updated from ``V`` and stays.
-    A done-code γ of ``0``, or a horizon that puts no
+    step's value. It is updated when the target does not.
+    ``cross_group_backups="bootstrap"`` fills ``V`` on the step before
+    that group boundary (the rest of the episode is not in the sample),
+    so that step is updated from ``V`` and stays.
+    ``cross_group_backups="ignore"`` leaves that off-data ``V`` out of
+    the target and leaves the step out of the loss and out of logged
+    metrics when the factor on it is non-zero.
+    ``cross_group_backups="fault"`` raises instead. A done-code γ of
+    ``0``, or a horizon that puts no
     weight on that value, does not depend on it, so the step stays. A
     gate cut on a later in-run step still bootstraps. ``V`` is delayed max-Q when
     ``temperature=0``. A
@@ -740,19 +776,21 @@ class DqnObjective(Objective):
             ``True`` is Double DQN: online Q chooses the action and
             delayed Q evaluates it. ``temperature`` selects hard argmax
             or the online Boltzmann policy, as above.
-        ignore_cross_group_backups: Required. For any horizon, the last
-            step of a task is not updated when its target depends on the
-            next step's value. It is updated when the target does not.
-            ``True`` leaves that off-data ``V`` out of the target and
-            leaves the step out of the loss and out of logged metrics
-            when the factor on it is non-zero. ``False`` bootstraps
+        cross_group_backups: Required. ``"bootstrap"``, ``"ignore"``, or
+            ``"fault"``. For any horizon, the last step of a task is not
+            updated when its target depends on the next step's value. It
+            is updated when the target does not. ``"bootstrap"`` fills
             ``V`` on the step before a group boundary (the end of the
             batch, or a ``group_id`` break: a chunk boundary, time
             limit, or truncation whose rest was not sampled), so that
-            step is updated from ``V`` and stays. A done-code γ of
-            ``0``, or a horizon that puts no weight on that value, does
-            not depend on it, so the step stays. An earlier step whose
-            backup stays inside the task stays either way.
+            step is updated from ``V`` and stays. ``"ignore"`` leaves
+            that off-data ``V`` out of the target and leaves the step
+            out of the loss and out of logged metrics when the factor
+            on it is non-zero. ``"fault"`` raises on that step instead.
+            A done-code γ of ``0``, or a horizon that puts no weight on
+            that value, does not depend on it, so the step stays and
+            ``"fault"`` does not raise. An earlier step whose backup
+            stays inside the task stays either way.
     """
 
     def __init__(
@@ -763,7 +801,7 @@ class DqnObjective(Objective):
         value: Value | None,
         temperature: float,
         double: bool,
-        ignore_cross_group_backups: bool,
+        cross_group_backups: CrossGroupBackups,
         action_key: str = "action",
         episode_done_key: str = "episode_done",
         task_done_key: str = "task_done",
@@ -773,7 +811,7 @@ class DqnObjective(Objective):
     ) -> None:
         self.temperature = _require_temperature(temperature)
         self.double = bool(double)
-        self.ignore_cross_group_backups = bool(ignore_cross_group_backups)
+        self.cross_group_backups = _require_cross_group_backups(cross_group_backups)
         self.discount = _require_transform(discount, name="discount")
         self.reward = _require_transform(reward, name="reward")
         self.value = _require_transform(value, name="value")
@@ -951,7 +989,7 @@ class DqnObjective(Objective):
             v_step=v_step,  # [N]  V(s_i)
             pair_weight=pair_weight,
             continuation=continuation,
-            ignore_cross_group_backups=self.ignore_cross_group_backups,
+            cross_group_backups=self.cross_group_backups,
         )
         center_offset: torch.Tensor | None = None
         if center is not None:
@@ -969,7 +1007,7 @@ class DqnObjective(Objective):
                 v_step=torch.zeros_like(v_step),
                 pair_weight=pair_weight,
                 continuation=continuation,
-                ignore_cross_group_backups=self.ignore_cross_group_backups,
+                cross_group_backups=self.cross_group_backups,
             )
             center_offset = _pair_values_to_rows(center_weight, step_of) * center.detach()
         # A non-zero factor on an off-data value drops the step from the loss

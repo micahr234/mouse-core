@@ -317,11 +317,12 @@ class Gate(Protocol):
     (``group_id``). For any horizon, the last step of a task is not
     updated when its target depends on the next step's value. It is
     updated when the target does not.
-    ``ignore_cross_group_backups=True`` leaves that off-data ``V`` out
-    of the target and leaves the step out of the loss and out of logged
+    ``cross_group_backups="bootstrap"`` fills ``V`` on the step before
+    that group boundary, so the step is updated from ``V``.
+    ``cross_group_backups="ignore"`` leaves that off-data ``V`` out of
+    the target and leaves the step out of the loss and out of logged
     metrics when the factor on it is non-zero.
-    ``ignore_cross_group_backups=False`` bootstraps ``V`` on the step
-    before that group boundary, so the step is updated from ``V``. A
+    ``cross_group_backups="fault"`` raises on that step instead. A
     done-code γ of ``0``, or a horizon that puts no
     weight on that value, does not depend on it, so the step stays. A
     gate ``0`` on a step still inside the run still bootstraps. Values

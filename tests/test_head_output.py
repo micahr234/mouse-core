@@ -422,7 +422,7 @@ def test_dqn_duplicated_rows_match_single_head_output() -> None:
     N, A = 5, _ACTIONS
     q = torch.randn(N, A)
     q_target = torch.randn(N, A)
-    objective = DqnObjective( reward=_rew(), value=_val(), discount=_disc(gamma_step=0.9), temperature=0.0, double=False, gate=None, ignore_cross_group_backups=False)
+    objective = DqnObjective( reward=_rew(), value=_val(), discount=_disc(gamma_step=0.9), temperature=0.0, double=False, gate=None, cross_group_backups="bootstrap")
 
     base_data = _objective_data(N)
     base_loss, base_metrics = objective(
@@ -446,7 +446,7 @@ def test_dqn_multi_head_output_shares_step_target() -> None:
     gamma = 0.9
     q = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
     q_target = torch.tensor([[10.0, 20.0], [30.0, 40.0], [50.0, 60.0]])
-    objective = DqnObjective( reward=_rew(), value=_val(), discount=_disc(gamma_step=gamma), temperature=0.0, double=False, gate=None, ignore_cross_group_backups=False)
+    objective = DqnObjective( reward=_rew(), value=_val(), discount=_disc(gamma_step=gamma), temperature=0.0, double=False, gate=None, cross_group_backups="bootstrap")
     data = _objective_data(2, counts=[2, 1], actions=[0, 1])
     data["reward"] = torch.tensor([0.0, 0.5])
     loss, _ = objective(
@@ -460,7 +460,7 @@ def test_dqn_multi_head_output_shares_step_target() -> None:
 def test_dqn_misaligned_head_output_count_raises() -> None:
     N = 3
     q = torch.randn(2 * N, _ACTIONS)
-    objective = DqnObjective( reward=_rew(), value=_val(), discount=_disc(), temperature=0.0, double=False, gate=None, ignore_cross_group_backups=False)
+    objective = DqnObjective( reward=_rew(), value=_val(), discount=_disc(), temperature=0.0, double=False, gate=None, cross_group_backups="bootstrap")
     bad = _objective_data(N, counts=[2, 2, 1])
     with pytest.raises(ValueError, match="misaligned"):
         objective(objective_data=bad, group_id=_group_id(bad), predictions=q,  delayed_predictions=q.clone(), reward_center=None)

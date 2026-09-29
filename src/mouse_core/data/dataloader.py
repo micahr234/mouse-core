@@ -740,14 +740,20 @@ class DataLoader:
             self._result_queue = None
             return
         self._stop.set()
-        if self._result_queue is not None:
-            while True:
-                try:
-                    self._result_queue.get_nowait()
-                except queue.Empty:
-                    break
-        for w in self._workers:
-            w.join(timeout=2.0)
+        # Drain under the queue mutex. ``except queue.Empty`` is unsafe here:
+        # ``__del__`` runs this during interpreter teardown, after ``queue``'s
+        # globals are cleared, so that handler becomes ``except None``.
+        q = self._result_queue
+        if q is not None:
+            with q.mutex:
+                q.queue.clear()
+                q.not_full.notify_all()
+        # ``Thread.join`` raises ``PythonFinalizationError`` once the
+        # interpreter is shutting down. Workers are daemons, so exit
+        # reaps them without a join.
+        if not sys.is_finalizing():
+            for w in self._workers:
+                w.join(timeout=2.0)
         self._workers = []
         self._stop = None
         self._result_queue = None

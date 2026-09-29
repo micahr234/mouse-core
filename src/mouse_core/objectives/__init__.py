@@ -1,5 +1,5 @@
 from mouse_core.objectives.base import Objective
-from mouse_core.objectives.dqn import DqnObjective
+from mouse_core.objectives.dqn import CrossGroupBackups, DqnObjective
 from mouse_core.objectives.transforms import (
     Discount,
     Gate,
@@ -27,6 +27,7 @@ __all__ = [
     "Gate",
     "Reward",
     "Value",
+    "CrossGroupBackups",
     "DqnObjective",
     "affine_reward",
     "affine_value",

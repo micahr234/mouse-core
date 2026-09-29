@@ -99,17 +99,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per-row Bellman target ``G`` and its row weight, the same tensors
   the loss uses. Callers log those instead of rebuilding the backup.
   ``in_run_backup`` is ``backup`` on the rows with ``backup_weight > 0``.
-- ``ignore_cross_group_backups`` on ``DqnObjective`` and ``PpoObjective``.
-  Required. For any horizon, the last step of a task is not updated
-  when its target depends on the next step's value. It is updated when
-  the target does not. ``True`` leaves that off-data value out of the
-  target and leaves the step out of the loss and out of logged metrics
-  when the factor on it is non-zero. ``False`` bootstraps the value on
-  the step before a group boundary (end of the batch, or a ``group_id``
-  break: a chunk boundary, time limit, or truncation whose rest was not
-  sampled), so that step is updated from that value and stays. A
-  done-code γ of ``0``, or a horizon that puts no weight on that value,
-  does not depend on it, so the step stays. An earlier step whose
+- ``cross_group_backups`` on ``DqnObjective`` and ``PpoObjective``.
+  Required: ``"bootstrap"``, ``"ignore"``, or ``"fault"``. For any
+  horizon, the last step of a task is not updated when its target
+  depends on the next step's value. It is updated when the target does
+  not. ``"bootstrap"`` fills the value on the step before a group
+  boundary (end of the batch, or a ``group_id`` break: a chunk
+  boundary, time limit, or truncation whose rest was not sampled), so
+  that step is updated from that value and stays. ``"ignore"`` leaves
+  that off-data value out of the target and leaves the step out of the
+  loss and out of logged metrics when the factor on it is non-zero.
+  ``"fault"`` raises on that step instead. A done-code γ of ``0``, or a
+  horizon that puts no weight on that value, does not depend on it, so
+  the step stays and ``"fault"`` does not raise. An earlier step whose
   backup stays inside the task stays either way.
 - ``general_gate(gates=)`` multiplies DQN continuation matrices. Each
   entry is the product of the gates at that step, so a return continues
@@ -379,6 +381,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still takes head instances, not name strings.
 
 ### Fixed
+- ``DataLoader`` shutdown no longer raises
+  ``TypeError: catching classes that do not inherit from BaseException``
+  when a loader with ``num_workers > 0`` is still alive at interpreter
+  exit. ``__del__`` drains the prefetch queue under its mutex instead of
+  catching ``queue.Empty``, which is already cleared once the ``queue``
+  module is torn down. Worker joins are skipped once the interpreter is
+  finalizing, so ``join`` does not raise ``PythonFinalizationError``
+  from ``__del__``.
 - ``Model`` calls each head as a module. ``head.forward`` had skipped
   forward and backward hooks, so a hook on the head never saw the
   gradient into the pooled hidden state.

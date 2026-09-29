@@ -9,8 +9,11 @@ import torch.nn.functional as F
 
 from mouse_core.objectives.base import Objective, _reject_predictions, _require_prediction
 from mouse_core.objectives.dqn import (
+    CrossGroupBackups,
     _pair_weight,
+    _raise_if_cross_group_backup,
     _require_action_ids,
+    _require_cross_group_backups,
     _require_done_codes,
     _require_step_aligned_predictions,
     _weighted_mean,
@@ -55,7 +58,7 @@ def _gae_advantages(
     discounts: torch.Tensor,
     valid: torch.Tensor,
     gae_lambda: float,
-    ignore_cross_group_backups: bool,
+    cross_group_backups: CrossGroupBackups,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Generalized advantage estimation over valid consecutive pairs.
 
@@ -66,17 +69,19 @@ def _gae_advantages(
         valid: ``[N-1]`` mask — False at run boundaries (different
             ``group_id``).
         gae_lambda: GAE λ.
-        ignore_cross_group_backups: For any horizon, the last step of a
-            task is not updated when its advantage depends on the next
-            step's value. It is updated when the advantage does not.
-            ``True`` leaves that off-data ``V`` out of the advantage and
-            drops the step when the factor on it is non-zero. A zero
+        cross_group_backups: ``"bootstrap"``, ``"ignore"``, or ``"fault"``.
+            For any horizon, the last step of a task is not updated when
+            its advantage depends on the next step's value. It is updated
+            when the advantage does not. ``"bootstrap"`` fills ``V`` on
+            the step before a group boundary (a state whose next step is
+            not an in-run pair: end of the batch, or a run break) and
+            keeps the step. ``"ignore"`` leaves that off-data ``V`` out
+            of the advantage and drops the step when the factor on it is
+            non-zero. ``"fault"`` raises on that step instead. A zero
             factor leaves the value out of the advantage, so the step
-            stays. ``False`` bootstraps ``V`` on the step before a group
-            boundary (a state whose next step is not an in-run pair: end
-            of the batch, or a run break) and keeps the step. ``V`` at a
-            state that still has a later in-run step is unchanged. A
-            ``0`` discount (true terminal) removes the value either way.
+            stays and ``"fault"`` does not raise. ``V`` at a state that
+            still has a later in-run step is unchanged. A ``0`` discount
+            (true terminal) removes the value either way.
 
     Returns:
         ``(advantages, returns, participate)`` each ``[N-1]``. Advantages
@@ -86,6 +91,7 @@ def _gae_advantages(
         zero. ``participate`` is ``1`` for a step that stays in the loss
         and in logged metrics.
     """
+    cross_group_backups = _require_cross_group_backups(cross_group_backups)
     with torch.no_grad():
         values = values.detach()
         T = rewards.shape[0]
@@ -96,7 +102,7 @@ def _gae_advantages(
         sampled = torch.zeros(T, dtype=torch.bool, device=device)
         if T > 1:
             sampled[:-1] = valid[1:]
-        if ignore_cross_group_backups:
+        if cross_group_backups != "bootstrap":
             next_values = torch.where(
                 sampled, next_values, torch.zeros_like(next_values)
             )
@@ -120,6 +126,8 @@ def _gae_advantages(
             gae = torch.where(valid[t], gae, torch.zeros_like(gae))
             advantages[t] = gae
         returns = advantages + values[:-1]
+    if cross_group_backups == "fault":
+        _raise_if_cross_group_backup(in_run=valid, participate=participate)
     return advantages, returns, participate
 
 
@@ -201,19 +209,21 @@ class PpoObjective(Objective):
             any ``value(value=..., **objective_data)`` returning the same
             shape is accepted.
         gae_lambda: GAE λ (``1.0`` = Monte Carlo returns within the discount).
-        ignore_cross_group_backups: Required. For any horizon, the last
-            step of a task is not updated when its advantage depends on
-            the next step's value. It is updated when the advantage does
-            not. ``True`` leaves that off-data ``V`` out of the advantage
-            and leaves the step out of the loss and out of logged
-            metrics when the factor on it is non-zero. ``False``
-            bootstraps ``V`` on the step before a group boundary (the
-            end of the batch, or a ``group_id`` break: a chunk boundary,
-            time limit, or truncation whose rest was not sampled), so
-            that step is updated from ``V`` and stays. A done-code γ of
-            ``0``, or a horizon that puts no weight on that value, does
-            not depend on it, so the step stays. ``V`` at a state that
-            still has a later in-run step is unchanged.
+        cross_group_backups: Required. ``"bootstrap"``, ``"ignore"``, or
+            ``"fault"``. For any horizon, the last step of a task is not
+            updated when its advantage depends on the next step's value.
+            It is updated when the advantage does not. ``"bootstrap"``
+            fills ``V`` on the step before a group boundary (the end of
+            the batch, or a ``group_id`` break: a chunk boundary, time
+            limit, or truncation whose rest was not sampled), so that
+            step is updated from ``V`` and stays. ``"ignore"`` leaves
+            that off-data ``V`` out of the advantage and leaves the step
+            out of the loss and out of logged metrics when the factor on
+            it is non-zero. ``"fault"`` raises on that step instead. A
+            done-code γ of ``0``, or a horizon that puts no weight on
+            that value, does not depend on it, so the step stays and
+            ``"fault"`` does not raise. ``V`` at a state that still has
+            a later in-run step is unchanged.
         clip_eps: PPO ratio clip ε.
         vf_coef: Weight on the value-function MSE term.
         ent_coef: Weight on the policy entropy bonus (subtracted from the loss).
@@ -232,7 +242,7 @@ class PpoObjective(Objective):
         reward: Reward | None,
         value: Value | None,
         gae_lambda: float = 0.95,
-        ignore_cross_group_backups: bool,
+        cross_group_backups: CrossGroupBackups,
         clip_eps: float = 0.2,
         vf_coef: float = 0.5,
         ent_coef: float = 0.01,
@@ -247,7 +257,7 @@ class PpoObjective(Objective):
         self.reward = _require_transform(reward, name="reward")
         self.value = _require_transform(value, name="value")
         self.gae_lambda = gae_lambda
-        self.ignore_cross_group_backups = bool(ignore_cross_group_backups)
+        self.cross_group_backups = _require_cross_group_backups(cross_group_backups)
         self.clip_eps = clip_eps
         self.vf_coef = vf_coef
         self.ent_coef = ent_coef
@@ -407,7 +417,7 @@ class PpoObjective(Objective):
             discounts=discounts,
             valid=valid,
             gae_lambda=self.gae_lambda,
-            ignore_cross_group_backups=self.ignore_cross_group_backups,
+            cross_group_backups=self.cross_group_backups,
         )
         pair_weight = pair_weight * participate
         valid = pair_weight > 0
