@@ -16,6 +16,13 @@ from mouse_core.objectives import (
 )
 
 
+def _group_id(data: dict[str, torch.Tensor]) -> torch.Tensor:
+    if "group_id" in data:
+        return data["group_id"]
+    n = int(next(iter(data.values())).shape[0])
+    return torch.zeros(n, dtype=torch.int64)
+
+
 def _disc(**overrides: float):
     kwargs = dict(
         gamma_step=1.0,
@@ -53,11 +60,10 @@ def _objective() -> DqnObjective:
         reward=_rew(),
         value=_val(),
         discount=_disc(gamma_step=0.0),
-        grouping_field=None,
         temperature=0.0,
         double=False,
         gate=None,
-        bootstrap_cutoff=True,
+        bootstrap_before_group_boundary=True,
     )
 
 
@@ -70,7 +76,7 @@ def test_dqn_requires_reward_center_argument() -> None:
     }
     with pytest.raises(TypeError, match="reward_center"):
         _objective()(  # type: ignore[call-arg]
-            objective_data=step_stream,
+            objective_data=step_stream, group_id=_group_id(step_stream),
             predictions=torch.zeros(3, 2),
             delayed_predictions=torch.zeros(3, 2),
         )
@@ -88,14 +94,14 @@ def test_dqn_rejects_non_scalar_reward_center() -> None:
     delayed = torch.zeros(3, 2)
     with pytest.raises(TypeError, match="reward_center"):
         objective(
-            objective_data=step_stream,
+            objective_data=step_stream, group_id=_group_id(step_stream),
             predictions=online,
             delayed_predictions=delayed,
             reward_center=RewardCentering(),  # type: ignore[arg-type]
         )
     with pytest.raises(TypeError, match="reward_center"):
         objective(
-            objective_data=step_stream,
+            objective_data=step_stream, group_id=_group_id(step_stream),
             predictions=online,
             delayed_predictions=delayed,
             reward_center=torch.zeros(1),
@@ -116,7 +122,7 @@ def test_dqn_reward_centering_centers_td_without_training_constant() -> None:
     delayed = torch.zeros(3, 2)
     center = RewardCentering()
     loss, metrics = _objective()(
-        objective_data=step_stream,
+        objective_data=step_stream, group_id=_group_id(step_stream),
         predictions=online,
         delayed_predictions=delayed,
         reward_center=center.center,
@@ -158,14 +164,13 @@ def test_dqn_centering_subtracts_same_offset_from_every_horizon() -> None:
         reward=_rew(),
         value=_val(),
         discount=_disc(gamma_step=1.0),
-        grouping_field=None,
         temperature=0.0,
         double=False,
         gate=nstep_gate(n=2),
-        bootstrap_cutoff=True,
+        bootstrap_before_group_boundary=True,
     )
     loss, metrics = objective(
-        objective_data=step_stream,
+        objective_data=step_stream, group_id=_group_id(step_stream),
         predictions=online,
         delayed_predictions=delayed,
         reward_center=center,
@@ -200,20 +205,19 @@ def test_dqn_centering_subtracts_nothing_on_undiscounted_bootstrapped_steps() ->
         reward=_rew(),
         value=_val(),
         discount=_disc(gamma_step=1.0),
-        grouping_field=None,
         temperature=0.0,
         double=False,
         gate=nstep_gate(n=2),
-        bootstrap_cutoff=True,
+        bootstrap_before_group_boundary=True,
     )
     with_center, _ = objective(
-        objective_data=step_stream,
+        objective_data=step_stream, group_id=_group_id(step_stream),
         predictions=online,
         delayed_predictions=delayed,
         reward_center=torch.tensor(3.0),
     )
     without, _ = objective(
-        objective_data=step_stream,
+        objective_data=step_stream, group_id=_group_id(step_stream),
         predictions=online,
         delayed_predictions=delayed,
         reward_center=None,
@@ -241,14 +245,13 @@ def test_dqn_centering_matches_classic_reward_centering_when_continuing() -> Non
         reward=_rew(),
         value=_val(),
         discount=_disc(gamma_step=0.9),
-        grouping_field=None,
         temperature=0.0,
         double=False,
         gate=None,
-        bootstrap_cutoff=True,
+        bootstrap_before_group_boundary=True,
     )
     loss, _ = objective(
-        objective_data=step_stream,
+        objective_data=step_stream, group_id=_group_id(step_stream),
         predictions=online,
         delayed_predictions=delayed,
         reward_center=torch.tensor(2.0),
@@ -281,21 +284,20 @@ def test_dqn_centering_is_a_pure_value_shift() -> None:
             gamma_episode_terminal=0.0,
             gamma_episode_truncated=1.0,
         ),
-        grouping_field=None,
         temperature=0.7,
         double=True,
         gate=lambda_gate(td_lambda=0.8),
-        bootstrap_cutoff=True,
+        bootstrap_before_group_boundary=True,
     )
     k = 2.5
     base, _ = objective(
-        objective_data=step_stream,
+        objective_data=step_stream, group_id=_group_id(step_stream),
         predictions=online,
         delayed_predictions=delayed,
         reward_center=torch.tensor(0.0),
     )
     shifted, _ = objective(
-        objective_data=step_stream,
+        objective_data=step_stream, group_id=_group_id(step_stream),
         predictions=online - k,
         delayed_predictions=delayed - k,
         reward_center=torch.tensor(k),
@@ -333,7 +335,7 @@ def test_dqn_reward_center_metric_is_a_snapshot() -> None:
     }
     center = RewardCentering()
     _, metrics = _objective()(
-        objective_data=step_stream,
+        objective_data=step_stream, group_id=_group_id(step_stream),
         predictions=torch.zeros(3, 2),
         delayed_predictions=torch.zeros(3, 2),
         reward_center=center.center,
@@ -353,7 +355,7 @@ def test_dqn_without_centering_omits_center_metrics() -> None:
     online = torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]])
     delayed = torch.zeros(3, 2)
     loss, metrics = _objective()(
-        objective_data=step_stream,
+        objective_data=step_stream, group_id=_group_id(step_stream),
         predictions=online,
         delayed_predictions=delayed,
         reward_center=None,

@@ -4,7 +4,7 @@ from mouse_core.data.token_batch import (
     TokenBatch,
     empty_token_batch,
     pack_token_batch,
-    step_counts_from_sequence_id,
+    step_counts_from_group_id,
 )
 from mouse_core.models.embedding.linear import ScaledEmbedding, ScaledLinear
 
@@ -14,7 +14,7 @@ __all__ = [
     "TokenBatch",
     "empty_token_batch",
     "pack_token_batch",
-    "step_counts_from_sequence_id",
+    "step_counts_from_group_id",
     "ScaledEmbedding",
     "ScaledLinear",
 ]

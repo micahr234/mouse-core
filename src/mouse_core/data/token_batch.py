@@ -21,20 +21,20 @@ class ModalityInfo:
         object.__setattr__(self, "type", str(self.type).lower())
 
 
-def step_counts_from_sequence_id(
+def step_counts_from_group_id(
     *,
-    sequence_id: np.ndarray | None,
+    group_id: np.ndarray | None,
     B: int,
 ) -> np.ndarray:
-    """Per-sequence step counts ``[B]`` from flat ``sequence_id`` ``[N]``.
+    """Per-group step counts ``[B]`` from flat ``group_id`` ``[N]``.
 
     Missing IDs (empty decode rows) become zeros when ``minlength=B``.
     """
     if B <= 0:
         return np.zeros(0, dtype=np.int64)
-    if sequence_id is None:
+    if group_id is None:
         return np.zeros(B, dtype=np.int64)
-    sid = np.asarray(sequence_id, dtype=np.int64).reshape(-1)
+    sid = np.asarray(group_id, dtype=np.int64).reshape(-1)
     if sid.size == 0:
         return np.zeros(B, dtype=np.int64)
     return np.bincount(sid, minlength=B).astype(np.int64)[:B]
@@ -84,8 +84,6 @@ class StepTokens:
     positions: np.ndarray  # [T] index within modality within the step
     modality_names: tuple[str, ...]
     modality_map: dict[str, ModalityInfo]
-    grouping_id: int
-    grouping_field: str
     head_output_mask: np.ndarray  # [T] bool
     objective_fields: dict[str, Any] = field(default_factory=dict)
     group_start_modality_ids: np.ndarray | None = None
@@ -94,8 +92,6 @@ class StepTokens:
     group_start_positions: np.ndarray | None = None
 
     def __post_init__(self) -> None:
-        if not self.grouping_field:
-            raise ValueError("StepTokens requires a non-empty grouping_field")
         names, mmap = _validate_modality_table(self.modality_names, self.modality_map)
         object.__setattr__(self, "modality_names", names)
         object.__setattr__(self, "modality_map", mmap)
@@ -118,7 +114,6 @@ class StepTokens:
                 f"min={int(mids.min())} max={int(mids.max())}"
             )
         object.__setattr__(self, "modality_ids", mids)
-        object.__setattr__(self, "grouping_id", int(self.grouping_id))
         mask = np.asarray(self.head_output_mask, dtype=bool)
         if mask.shape != (t,):
             raise ValueError(
@@ -210,14 +205,13 @@ class TokenBatch:
         values: ``[L]`` float32 — unused (0).
         positions: ``[L]`` int64 — index of the token among its modality's
             tokens within its step (see :class:`StepTokens`).
-        sequence_ids: ``[L]`` int64 — which of the ``B`` sequences each token belongs to.
-        grouping_ids: ``[L]`` int64 — attention group within the sequence.
+        group_ids: ``[L]`` int64 — which of the ``B`` groups each token belongs to.
+            One group is one sample. Attention and loss do not cross it.
         head_output_indices: ``[P]`` int64 — token index of every head-output
             token, strictly increasing.
         head_output_steps: ``[P]`` int64 — step id ``0..N-1`` of each
             head-output token (dense, non-decreasing).
-        B: Number of sequences.
-        grouping_field: Name of the grouping column.
+        B: Number of groups.
     """
 
     modality_ids: np.ndarray
@@ -226,16 +220,12 @@ class TokenBatch:
     positions: np.ndarray
     modality_names: tuple[str, ...]
     modality_map: dict[str, ModalityInfo]
-    sequence_ids: np.ndarray
-    grouping_ids: np.ndarray
+    group_ids: np.ndarray
     head_output_indices: np.ndarray
     head_output_steps: np.ndarray
-    grouping_field: str
     B: int = 0
 
     def __post_init__(self) -> None:
-        if not self.grouping_field:
-            raise ValueError("TokenBatch requires a non-empty grouping_field")
         names, mmap = _validate_modality_table(self.modality_names, self.modality_map)
         object.__setattr__(self, "modality_names", names)
         object.__setattr__(self, "modality_map", mmap)
@@ -245,8 +235,7 @@ class TokenBatch:
             "ids",
             "values",
             "positions",
-            "sequence_ids",
-            "grouping_ids",
+            "group_ids",
         ):
             arr = np.asarray(getattr(self, name))
             if arr.shape != (L,):
@@ -263,16 +252,16 @@ class TokenBatch:
                     f"min={int(mids.min())} max={int(mids.max())}"
                 )
         if L > 0:
-            sids = np.asarray(self.sequence_ids, dtype=np.int64)
+            sids = np.asarray(self.group_ids, dtype=np.int64)
             if int(sids.min()) < 0 or int(sids.max()) >= self.B:
                 raise ValueError(
-                    f"sequence_ids must be in [0, {self.B}), got "
+                    f"group_ids must be in [0, {self.B}), got "
                     f"min={int(sids.min())} max={int(sids.max())}"
                 )
             if bool(np.any(sids[1:] < sids[:-1])):
                 raise ValueError(
-                    "sequence_ids must be non-decreasing: every sequence's tokens "
-                    "must form one contiguous block, in sequence order (the model "
+                    "group_ids must be non-decreasing: every group's tokens "
+                    "must form one contiguous block, in group order (the model "
                     "walks head_output_indices row by row and pads per block)."
                 )
         pred = np.asarray(self.head_output_indices, dtype=np.int64).reshape(-1)
@@ -305,7 +294,7 @@ class TokenBatch:
         if int(counts.sum()) != self.N:
             raise ValueError(
                 f"step count [{self.N}] must equal sum of per-sequence step "
-                f"counts from sequence_ids [{int(counts.sum())}] (B={self.B})"
+                f"counts from group_ids [{int(counts.sum())}] (B={self.B})"
             )
 
     @property
@@ -333,13 +322,13 @@ class TokenBatch:
         return int(counts.max()) if counts.size else 0
 
     def step_counts(self) -> np.ndarray:
-        """Steps per sequence ``[B]``, from each step's first head-output token."""
+        """Steps per group ``[B]``, from each step's first head-output token."""
         if self.P == 0:
             return np.zeros(self.B, dtype=np.int64)
         first = np.ones(self.P, dtype=bool)
         first[1:] = self.head_output_steps[1:] != self.head_output_steps[:-1]
-        return step_counts_from_sequence_id(
-            sequence_id=np.asarray(self.sequence_ids, dtype=np.int64)[
+        return step_counts_from_group_id(
+            group_id=np.asarray(self.group_ids, dtype=np.int64)[
                 self.head_output_indices[first]
             ],
             B=self.B,
@@ -362,19 +351,16 @@ class TokenBatch:
             "positions": _long(self.positions),
             "modality_names": self.modality_names,
             "modality_map": self.modality_map,
-            "sequence_ids": _long(self.sequence_ids),
-            "grouping_ids": _long(self.grouping_ids),
+            "group_ids": _long(self.group_ids),
             "head_output_indices": _long(self.head_output_indices),
             "head_output_steps": _long(self.head_output_steps),
             "B": self.B,
-            "grouping_field": self.grouping_field,
         }
 
 
 def empty_token_batch(
     *,
     B: int = 0,
-    grouping_field: str,
     modality_names: Sequence[str] = (),
     modality_map: Mapping[str, ModalityInfo] | None = None,
 ) -> TokenBatch:
@@ -389,11 +375,9 @@ def empty_token_batch(
         positions=np.zeros(0, dtype=np.int64),
         modality_names=names,
         modality_map=mmap,
-        sequence_ids=np.zeros(0, dtype=np.int64),
-        grouping_ids=np.zeros(0, dtype=np.int64),
+        group_ids=np.zeros(0, dtype=np.int64),
         head_output_indices=np.zeros(0, dtype=np.int64),
         head_output_steps=np.zeros(0, dtype=np.int64),
-        grouping_field=grouping_field,
         B=B,
     )
 
@@ -414,26 +398,25 @@ def _as_field_array(value: Any) -> np.ndarray:
     return arr
 
 
-def _stack_objective_fields(
-    steps: Sequence[StepTokens],
-    *,
-    sequence_ids: Sequence[int],
-    grouping_field: str,
-) -> dict[str, np.ndarray]:
+def _stack_objective_fields(steps: Sequence[StepTokens]) -> dict[str, np.ndarray]:
     """Stack per-step ``objective_fields`` into ``[N]`` / ``[N, ...]`` arrays.
 
     Ragged float vector columns are right-padded with ``-inf`` — the sentinel
     for actions that do not exist, which objectives exclude. Ragged integer
     columns raise: there is no integer sentinel, so the caller must pad them
-    explicitly or store the field as float.
+    explicitly or store the field as float. ``group_id`` is not a column:
+    packing returns that tensor beside this dict.
     """
     n = len(steps)
     keys: set[str] = set()
     for st in steps:
         keys.update(st.objective_fields)
-    keys.discard("sequence_id")
+    if "group_id" in keys:
+        raise ValueError(
+            "group_id is not an objective column; pack_token_batch returns "
+            "it beside objective_data."
+        )
     keys.discard("head_output_count")
-    keys.discard(grouping_field)
 
     out: dict[str, np.ndarray] = {}
     for key in sorted(keys):
@@ -487,8 +470,6 @@ def _stack_objective_fields(
                 buf[i][slicer] = a
             out[key] = buf
 
-    out["sequence_id"] = np.asarray(list(sequence_ids), dtype=np.int64)
-    out[grouping_field] = np.asarray([st.grouping_id for st in steps], dtype=np.int64)
     return out
 
 
@@ -516,16 +497,17 @@ def _fields_to_tensors(fields: dict[str, np.ndarray]) -> dict[str, torch.Tensor]
 def pack_token_batch(
     *,
     steps: Sequence[StepTokens],
-    sequence_ids: Sequence[int] | None = None,
+    group_ids: Sequence[int] | None = None,
     batch_size: int | None = None,
-    grouping_field: str | None = None,
-    prev_grouping_ids: Sequence[int | None] | None = None,
-) -> tuple[TokenBatch, dict[str, torch.Tensor]]:
+    continuing: Sequence[bool] | None,
+) -> tuple[TokenBatch, dict[str, torch.Tensor], torch.Tensor]:
     """Pack per-step :class:`StepTokens` into model and objective inputs.
 
-    All steps must share the same ``modality_names``, ``modality_map``, and
-    ``grouping_field``. Returns ``(inputs, objective_data)``. Move
-    ``objective_data`` with :func:`to_device`.
+    All steps must share the same ``modality_names`` and ``modality_map``.
+    Returns ``(inputs, objective_data, group_id)``. ``group_id`` is
+    int64 ``[N]``, one id per step. It is not a key in ``objective_data``.
+    Move ``objective_data`` with :func:`to_device` and ``group_id`` with
+    ``Tensor.to``.
 
     Ragged float vector columns in ``objective_data`` are right-padded with
     ``-inf``, the sentinel objectives exclude as "action does not exist".
@@ -533,35 +515,22 @@ def pack_token_batch(
 
     When a step carries ``group_start_*`` tokens (from input fields whose
     ``when`` callable is true with ``group_start=True`` and false with
-    ``group_start=False``), they are inserted at the start of each
-    grouping-field segment: the first step of a sequence, or a step whose
-    ``grouping_id`` differs from the previous step in that sequence.
-    ``prev_grouping_ids`` is length ``B`` (optional ``None`` entries); pass
-    the last grouping already in a cached sequence so incremental decode
-    does not emit the group-start tokens again.
+    ``group_start=False``), they are inserted once, on the first step of
+    each sequence. ``continuing`` is length ``B``: ``True`` means that
+    sequence already has cached tokens, so this pack does not emit the
+    sample-start prefix again. Pass ``None`` when no sequence is a
+    continuation (a fresh pack, including an empty batch).
     """
     empty_objective: dict[str, torch.Tensor] = {}
+    empty_group_id = torch.zeros(0, dtype=torch.int64)
     if not steps:
-        if grouping_field is None:
-            raise ValueError(
-                "pack_token_batch of empty steps requires grouping_field="
-            )
         if batch_size is None:
-            return empty_token_batch(B=0, grouping_field=grouping_field), empty_objective
-        return empty_token_batch(B=batch_size, grouping_field=grouping_field), empty_objective
+            return empty_token_batch(B=0), empty_objective, empty_group_id
+        return empty_token_batch(B=batch_size), empty_objective, empty_group_id
 
-    gf = steps[0].grouping_field
     names = steps[0].modality_names
     mmap = steps[0].modality_map
-    if grouping_field is not None and grouping_field != gf:
-        raise ValueError(
-            f"grouping_field mismatch: arg {grouping_field!r} vs step {gf!r}"
-        )
     for i, st in enumerate(steps):
-        if st.grouping_field != gf:
-            raise ValueError(
-                f"steps[{i}].grouping_field {st.grouping_field!r} != {gf!r}"
-            )
         if st.modality_names != names:
             raise ValueError(
                 f"steps[{i}].modality_names {st.modality_names!r} != {names!r}"
@@ -569,18 +538,18 @@ def pack_token_batch(
         if st.modality_map != mmap:
             raise ValueError(f"steps[{i}].modality_map does not match steps[0]")
 
-    if sequence_ids is None:
+    if group_ids is None:
         seq_per_step = [0] * len(steps)
     else:
-        if len(sequence_ids) != len(steps):
+        if len(group_ids) != len(steps):
             raise ValueError(
-                f"sequence_ids length ({len(sequence_ids)}) must match "
+                f"group_ids length ({len(group_ids)}) must match "
                 f"steps ({len(steps)})"
             )
-        seq_per_step = [int(s) for s in sequence_ids]
+        seq_per_step = [int(s) for s in group_ids]
         if any(s < 0 for s in seq_per_step):
             raise ValueError(
-                f"sequence_ids must be >= 0, got min={min(seq_per_step)}"
+                f"group_ids must be >= 0, got min={min(seq_per_step)}"
             )
 
     modality_ids: list[np.ndarray] = []
@@ -588,7 +557,6 @@ def pack_token_batch(
     values: list[np.ndarray] = []
     positions: list[np.ndarray] = []
     seq_ids: list[np.ndarray] = []
-    grouping_ids: list[np.ndarray] = []
     head_output_indices: list[int] = []
     head_output_steps: list[int] = []
     head_output_counts: list[int] = []
@@ -603,25 +571,18 @@ def pack_token_batch(
             )
         B = int(batch_size)
 
-    last_gid: list[int | None]
-    if prev_grouping_ids is None:
-        last_gid = [None] * B
+    if continuing is None:
+        started = [False] * B
     else:
-        if len(prev_grouping_ids) != B:
+        if len(continuing) != B:
             raise ValueError(
-                f"prev_grouping_ids length ({len(prev_grouping_ids)}) must "
-                f"match batch_size ({B})"
+                f"continuing length ({len(continuing)}) must match batch_size ({B})"
             )
-        last_gid = [
-            None if g is None else int(g) for g in prev_grouping_ids
-        ]
+        started = [bool(flag) for flag in continuing]
 
     offset = 0
     for step_idx, (st, sid) in enumerate(zip(steps, seq_per_step)):
-        emit_group_start = (
-            st.group_start_ids is not None
-            and last_gid[sid] != st.grouping_id
-        )
+        emit_group_start = st.group_start_ids is not None and not started[sid]
         if emit_group_start:
             assert st.group_start_modality_ids is not None
             assert st.group_start_ids is not None
@@ -633,7 +594,6 @@ def pack_token_batch(
             values.append(st.group_start_values)
             positions.append(st.group_start_positions)
             seq_ids.append(np.full(pt, sid, dtype=np.int64))
-            grouping_ids.append(np.full(pt, st.grouping_id, dtype=np.int64))
             offset += pt
         t = st.T
         modality_ids.append(st.modality_ids)
@@ -641,18 +601,16 @@ def pack_token_batch(
         values.append(st.values)
         positions.append(st.positions)
         seq_ids.append(np.full(t, sid, dtype=np.int64))
-        grouping_ids.append(np.full(t, st.grouping_id, dtype=np.int64))
         ho = np.flatnonzero(st.head_output_mask)
         head_output_indices.extend((offset + ho).tolist())
         head_output_steps.extend([step_idx] * int(ho.size))
         head_output_counts.append(int(ho.size))
         offset += t
-        last_gid[sid] = st.grouping_id
+        started[sid] = True
 
-    fields = _stack_objective_fields(
-        steps, sequence_ids=seq_per_step, grouping_field=gf
-    )
+    fields = _stack_objective_fields(steps)
     fields["head_output_count"] = np.asarray(head_output_counts, dtype=np.int64)
+    group_id = torch.tensor(seq_per_step, dtype=torch.int64)
     inputs = TokenBatch(
         modality_ids=np.concatenate(modality_ids),
         ids=np.concatenate(ids),
@@ -660,11 +618,9 @@ def pack_token_batch(
         positions=np.concatenate(positions),
         modality_names=names,
         modality_map=dict(mmap),
-        sequence_ids=np.concatenate(seq_ids),
-        grouping_ids=np.concatenate(grouping_ids),
+        group_ids=np.concatenate(seq_ids),
         head_output_indices=np.asarray(head_output_indices, dtype=np.int64),
         head_output_steps=np.asarray(head_output_steps, dtype=np.int64),
-        grouping_field=gf,
         B=B,
     )
-    return inputs, _fields_to_tensors(fields)
+    return inputs, _fields_to_tensors(fields), group_id

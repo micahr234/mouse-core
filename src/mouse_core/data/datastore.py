@@ -87,7 +87,7 @@ class Datastore:
 
     No encoding or tensorisation happens here. ``DataLoader.next_batch()``
     samples windows, applies ``transform``, and returns
-    ``(inputs, objective_data)``.
+    ``(inputs, objective_data, group_id)``.
     """
 
     def __init__(self, *, name: str | None = None) -> None:

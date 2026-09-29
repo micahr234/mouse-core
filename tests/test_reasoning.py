@@ -110,11 +110,10 @@ def test_plan_insertions_bookkeeping() -> None:
     expected_tokens = [i if i < 5 else i + 2 for i in range(batch.L)]
     assert plan.token_positions.tolist() == expected_tokens
     assert plan.ext_head_output_indices.tolist() == [2, 7, 10, 13, 16, 19, 22]
-    assert plan.ext_sequence_ids[5:7].tolist() == [0, 0]
-    assert plan.ext_grouping_ids[5:7].tolist() == [0, 0]
+    assert plan.ext_group_ids[5:7].tolist() == [0, 0]
     # Original ids land at their shifted positions.
-    assert plan.ext_sequence_ids[plan.token_positions].tolist() == (
-        batch.sequence_ids.tolist()
+    assert plan.ext_group_ids[plan.token_positions].tolist() == (
+        batch.group_ids.tolist()
     )
 
 
@@ -177,21 +176,18 @@ def test_pre_burst_loss_gives_no_reasoner_gradient() -> None:
 
 def test_sample_reasoning_splits_eligibility() -> None:
     model = _tiny_model()
-    # Sequence 0 has a grouping change after step 1: eligible bursts are the
-    # steps whose next step shares the grouping, i.e. {0, 2}. Sequence 1 has
-    # a single step: no eligible burst.
-    batch = _token_batch(
-        model, [_rows(4, groups=[0, 0, 1, 1]), _rows(1, offset=1)]
-    )
+    # Every step but the last of a sequence can host a burst. Sequence 1
+    # has a single step, so it has none.
+    batch = _token_batch(model, [_rows(4), _rows(1, offset=1)])
     rng = np.random.default_rng(0)
     seen: set[int] = set()
     for _ in range(50):
         splits = sample_reasoning_splits(batch=batch, generator=rng)
         assert splits.shape == (2,)
         assert splits[1] == -1
-        assert int(splits[0]) in (0, 2)
+        assert int(splits[0]) in (0, 1, 2)
         seen.add(int(splits[0]))
-    assert seen == {0, 2}
+    assert seen == {0, 1, 2}
 
 
 def test_reasoning_errors() -> None:

@@ -41,26 +41,22 @@ if str(_BENCH_DIR) not in sys.path:
 from bench_profile import add_profile_args, profile_call, wants_profile
 
 
-def _workload(name: str) -> tuple[list[int], str | None]:
-    """Return ``(lengths, grouping_pattern)``.
-
-    ``grouping_pattern`` is ``None`` (one group) or a per-token pattern
-    broadcast across rows: ``"recurring"`` or ``"manysmall"``.
-    """
+def _workload(name: str) -> list[int]:
+    """Per-row context lengths. One row is one sequence."""
     if name == "short":
-        return [512] * 4, None
+        return [512] * 4
     if name == "mid":
-        return [4096] * 8, None
+        return [4096] * 8
     if name == "mid_recurring":
-        return [4096] * 4, "recurring"
+        return [4096] * 4
     if name == "long":
-        return [16384] * 4, None
+        return [16384] * 4
     if name == "long_recurring":
-        return [16384] * 4, "recurring"
+        return [16384] * 4
     if name == "long_manysmall":
-        return [16384] * 8, "manysmall"
+        return [16384] * 8
     if name == "high_variance":
-        return [17, 3000, 5, 900, 4000, 61, 2400, 1], None
+        return [17, 3000, 5, 900, 4000, 61, 2400, 1]
     raise ValueError(f"unknown workload {name!r}")
 
 
@@ -69,23 +65,17 @@ def _left_pad(
     hidden: int,
     device: torch.device,
     dtype: torch.dtype,
-    grouping: str | None,
-) -> tuple[torch.Tensor, list[int], torch.Tensor]:
-    """Random left-padded embeds ``[B, S, D]`` and matching grouping ids."""
+) -> tuple[torch.Tensor, list[int]]:
+    """Random left-padded embeds ``[B, S, D]``."""
     B = len(lengths)
     S = max(lengths)
     g = torch.Generator(device=device).manual_seed(0)
     embeds = torch.zeros(B, S, hidden, device=device, dtype=dtype)
-    grouping_ids = torch.zeros(B, S, dtype=torch.long, device=device)
     for b, n in enumerate(lengths):
         if n == 0:
             continue
         embeds[b, S - n :] = torch.randn(n, hidden, device=device, dtype=dtype, generator=g)
-        if grouping == "recurring":
-            grouping_ids[b, S - n :] = torch.randint(0, 3, (n,), device=device, generator=g)
-        elif grouping == "manysmall":
-            grouping_ids[b, S - n :] = (torch.arange(n, device=device) // 32) % 64
-    return embeds, lengths, grouping_ids
+    return embeds, lengths
 
 
 def _timed(fn: Callable[[], Any], iters: int) -> tuple[float, float, float, float, float]:
@@ -173,31 +163,28 @@ def main() -> None:
 
     step_s = args.step
     for wname in args.workloads:
-        lengths, grouping = _workload(wname)
+        lengths = _workload(wname)
         B = len(lengths)
-        prefill_embeds, prefill_lens, prefill_grp = _left_pad(
-            lengths, args.hidden, device, dtype, grouping
-        )
+        prefill_embeds, prefill_lens = _left_pad(lengths, args.hidden, device, dtype)
         tokens = sum(prefill_lens)
         S = prefill_embeds.shape[1]
         step_embeds = torch.randn(B, step_s, args.hidden, device=device, dtype=dtype)
-        step_grp = torch.zeros(B, step_s, dtype=torch.long, device=device)
         step_lens = [step_s] * B
         session = backbone.decode_session(batch_size=B)
 
         def prefill() -> None:
             session.reset_rows()
-            session.forward(embeds=prefill_embeds, lengths=prefill_lens, grouping_ids=prefill_grp)
+            session.forward(embeds=prefill_embeds, lengths=prefill_lens)
 
         def decode_step() -> None:
-            session.forward(embeds=step_embeds, lengths=step_lens, grouping_ids=step_grp)
+            session.forward(embeds=step_embeds, lengths=step_lens)
 
         iters = args.iters if tokens <= 4096 * 4 else max(3, args.iters // 2)
         first_p, med_p, lo_p, hi_p, peak_p = _timed(prefill, iters)
         # Prefill left the cache empty (last timed call resets then fills).
         # Grow once so decode-step timings are against a full context, not an empty pool.
         session.reset_rows()
-        session.forward(embeds=prefill_embeds, lengths=prefill_lens, grouping_ids=prefill_grp)
+        session.forward(embeds=prefill_embeds, lengths=prefill_lens)
         first_d, med_d, lo_d, hi_d, peak_d = _timed(decode_step, iters)
         print(
             f"  {wname:15s} B={B} S={S:5d} tokens={tokens:6d} step={step_s} | "
@@ -213,7 +200,7 @@ def main() -> None:
                 cuda=True, trace_dir=args.profile_trace,
             )
             session.reset_rows()
-            session.forward(embeds=prefill_embeds, lengths=prefill_lens, grouping_ids=prefill_grp)
+            session.forward(embeds=prefill_embeds, lengths=prefill_lens)
             profile_call(
                 decode_step, label=f"{wname} decode S={step_s}", steps=iters,
                 cuda=True, trace_dir=args.profile_trace,

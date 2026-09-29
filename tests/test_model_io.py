@@ -273,7 +273,6 @@ def test_tokenizer_roundtrip(tmp_path) -> None:
                 "when": when_step_index_zero,
             },
         ],
-        grouping_field="task_index",
         objective_fields=[
             {"input_field": "action"},
             {"input_field": "reward", "output_field": "r"},
@@ -284,7 +283,6 @@ def test_tokenizer_roundtrip(tmp_path) -> None:
     save_tokenizer(tokenizer=tokenizer, path=tmp_path)
     assert (tmp_path / "tokenizer.json").is_file()
     loaded = load_tokenizer(repo_id_or_path=str(tmp_path))
-    assert loaded.grouping_field == "task_index"
     assert loaded.pretrained is None
     assert loaded.objective_fields == (
         ("action", "action"),
@@ -325,7 +323,6 @@ def test_tokenizer_roundtrip_group_start_and_not_equals(tmp_path) -> None:
             },
             {"type": "token", "input_field": "action", "head_output": True},
         ],
-        grouping_field="task_index",
         tokenizer=_Tok(),
     )
     save_tokenizer(tokenizer=tokenizer, path=tmp_path)
@@ -358,7 +355,6 @@ def test_push_model_to_hub_requires_distinct_tokenizer_repo() -> None:
                 "when": when_step_index_zero,
             },
         ],
-        grouping_field="task_index",
         objective_fields=[],
     )
     with pytest.raises(ValueError, match="tokenizer_repo_id"):

@@ -31,14 +31,6 @@ from datasets import Dataset
 
 from mouse_core.data import Augmenter, DataLoader, Datastore, Tokenizer, compose
 from mouse_core.data.token_batch import TokenBatch
-def full_task_end(cols):
-    return np.asarray(cols["task_done"]) != 0
-
-def full_task_start(cols):
-    return (np.asarray(cols["episode_index"]) == 0) & (
-        np.asarray(cols["step_index"]) == 0
-    )
-
 def when_episode_done_nonzero(ctx):
     return "episode_done" in ctx and ctx["episode_done"] != 0
 
@@ -196,7 +188,6 @@ def _train_transform() -> Any:
             {"input_field": "episode_done"},
             {"input_field": "task_done"},
         ],
-        grouping_field="task_index",
         pretrained="Qwen/Qwen3-0.6B",
     )
     return compose(stages=(augmenter, tokenizer))
@@ -252,10 +243,9 @@ def main() -> None:
         for n_workers in args.workers:
             loader = DataLoader(
                 stores=stores,
-                sequence_length=seq_len,
+                samples_budget=seq_len,
                 batch_size=batch_size,
-                sample_start=full_task_start,
-                sample_end=full_task_end,
+                sample_field="task_index",
                 transform=transform,
                 prefetch=args.prefetch,
                 num_workers=n_workers,
@@ -265,7 +255,7 @@ def main() -> None:
 
             def next_batch() -> None:
                 nonlocal sample
-                sample, _ = loader.next_batch()
+                sample, _, _sid = loader.next_batch()
 
             first, avg_wait, max_wait = _timed(next_batch, args.iters)
             assert sample is not None

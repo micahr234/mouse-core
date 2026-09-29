@@ -81,7 +81,8 @@ class Objective(ABC):
         Args:
             objective_data: ``dict[str, Tensor]`` of tokenizer ``objective_fields``
                 (``action``, ``reward``, ``episode_done``, ``task_done``, …),
-                keyed by flat step index with ``sequence_id``.
+                keyed by flat step index. DQN, PPO, and GRPO also take
+                ``group_id`` (int64 ``[N]``) beside this dict.
             predictions: Tensor for the head this objective trains, taken
                 from :meth:`~mouse_core.models.base.Model.forward` (index
                 ``ModelOutput.predictions`` with

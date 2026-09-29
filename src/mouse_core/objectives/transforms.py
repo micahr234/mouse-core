@@ -314,11 +314,16 @@ class Gate(Protocol):
     same place the reward and γ of that transition are stored. Entries
     with ``s <= t`` are ignored. A ``0`` bootstraps ``V`` at that step.
     The objective then zeros any continuation that would leave the run
-    (``sequence_id`` / ``grouping_field``). ``bootstrap_cutoff=False`` drops
-    a start from the loss and from logged metrics when the factor on the
-    off-data value at that cutoff is non-zero. A zero factor leaves the
-    value out of the target, so the start stays. A gate ``0`` on a step
-    still inside the run still bootstraps. Values must lie in
+    (``group_id``). For any horizon, the last step of a task is not
+    updated when its target depends on the next step's value. It is
+    updated when the target does not.
+    ``bootstrap_before_group_boundary=True`` bootstraps ``V`` on the
+    step before that group boundary, so the step is updated from ``V``.
+    ``False`` does not, and leaves the step out of the loss and out of
+    logged metrics. A done-code γ of ``0``, or a horizon that puts no
+    weight on that value, does not depend on it, so the step stays. A
+    gate ``0`` on a step still inside the run still bootstraps. Values
+    must lie in
     ``[0, 1]``. One row cumprod.
     """
 

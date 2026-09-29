@@ -63,23 +63,18 @@ def sample_reasoning_splits(
     """Pick one burst step per sequence for ``Model.forward(reasoning=...)``.
 
     Returns ``[B]`` int64 local step indices; ``-1`` skips the burst for that
-    sequence. A step is eligible when the *next* step exists and shares its
-    grouping (same run), so the TD pair out of the burst step carries loss
-    weight and the latents receive gradient.
+    sequence.     A step is eligible when the next step exists in the same sequence, so
+    the TD pair out of the burst step carries loss weight and the latents
+    receive gradient.
     """
     rng = generator if generator is not None else np.random.default_rng()
     counts = batch.step_counts()
-    first_rows = _first_head_output_rows(batch)
-    step_groups = np.asarray(batch.grouping_ids, dtype=np.int64)[
-        np.asarray(batch.head_output_indices, dtype=np.int64)[first_rows]
-    ]
-    offsets = np.concatenate([np.zeros(1, dtype=np.int64), np.cumsum(counts)])
     splits = np.full(batch.B, -1, dtype=np.int64)
     for b in range(batch.B):
-        groups = step_groups[offsets[b] : offsets[b + 1]]
-        eligible = np.flatnonzero(groups[:-1] == groups[1:])
-        if eligible.size:
-            splits[b] = int(eligible[int(rng.integers(0, eligible.size))])
+        n = int(counts[b])
+        # Every step but the last has a next step in the same sample.
+        if n >= 2:
+            splits[b] = int(rng.integers(0, n - 1))
     return splits
 
 
@@ -107,11 +102,9 @@ class _InsertionPlan:
     burst_rows: np.ndarray  # [nb] sequence indices with a burst
     prefix_starts: np.ndarray  # [nb] first token index of each burst sequence
     anchors: np.ndarray  # [nb] token index of each burst step's first head-output token
-    latent_groups: np.ndarray  # [nb] grouping id assigned to the latents
     token_positions: np.ndarray  # [L] extended position of each original token
     latent_positions: np.ndarray  # [nb * R] extended positions of the latents
-    ext_sequence_ids: np.ndarray  # [L_ext]
-    ext_grouping_ids: np.ndarray  # [L_ext]
+    ext_group_ids: np.ndarray  # [L_ext]
     ext_head_output_indices: np.ndarray  # [P]
     ext_length: int
 
@@ -151,8 +144,7 @@ def _plan_insertions(
     R = int(num_thoughts)
     L = batch.L
     pred = np.asarray(batch.head_output_indices, dtype=np.int64)
-    seq = np.asarray(batch.sequence_ids, dtype=np.int64)
-    group = np.asarray(batch.grouping_ids, dtype=np.int64)
+    seq = np.asarray(batch.group_ids, dtype=np.int64)
     offsets = np.concatenate([np.zeros(1, dtype=np.int64), np.cumsum(counts)])
 
     # Anchor = the burst step's *first* head-output token (its action prompt),
@@ -178,14 +170,10 @@ def _plan_insertions(
         (anchors + R * np.arange(nb, dtype=np.int64))[:, None]
         + np.arange(R, dtype=np.int64)[None, :]
     ).reshape(-1)
-    latent_groups = group[anchors]
 
-    ext_sequence_ids = np.zeros(ext_length, dtype=np.int64)
-    ext_sequence_ids[token_positions] = seq
-    ext_sequence_ids[latent_positions] = np.repeat(burst_rows, R)
-    ext_grouping_ids = np.zeros(ext_length, dtype=np.int64)
-    ext_grouping_ids[token_positions] = group
-    ext_grouping_ids[latent_positions] = np.repeat(latent_groups, R)
+    ext_group_ids = np.zeros(ext_length, dtype=np.int64)
+    ext_group_ids[token_positions] = seq
+    ext_group_ids[latent_positions] = np.repeat(burst_rows, R)
     ext_head_output_indices = pred + R * np.searchsorted(anchors, pred, side="right")
 
     return _InsertionPlan(
@@ -193,11 +181,9 @@ def _plan_insertions(
         burst_rows=burst_rows,
         prefix_starts=prefix_starts,
         anchors=anchors,
-        latent_groups=latent_groups,
         token_positions=token_positions,
         latent_positions=latent_positions,
-        ext_sequence_ids=ext_sequence_ids,
-        ext_grouping_ids=ext_grouping_ids,
+        ext_group_ids=ext_group_ids,
         ext_head_output_indices=ext_head_output_indices,
         ext_length=ext_length,
     )

@@ -54,7 +54,8 @@ class GrpoObjective(Objective):
     """Clipped GRPO policy objective (no value / critic head).
 
     Instantiate with hyperparameters, then call with
-    ``objective_data=`` and ``predictions=``.
+    ``objective_data=``, ``group_id=`` (int64 ``[N]``, one id per step,
+    returned beside ``objective_data``), and ``predictions=``.
 
     Call with the policy logits as ``predictions=``:
 
@@ -81,10 +82,11 @@ class GrpoObjective(Objective):
         )
         from mouse_core.data import to_device
         from mouse_core.models import prediction_key
-        inputs, objective_data = loader.next_batch()
+        inputs, objective_data, group_id = loader.next_batch()
         out = model(inputs)
         loss, metrics = objective(
             objective_data=to_device(data=objective_data, device=device),
+            group_id=group_id.to(device),
             predictions=out.predictions[prediction_key(head=policy_head)],
         )
 
@@ -93,8 +95,8 @@ class GrpoObjective(Objective):
 
     Timing matches :class:`~mouse_core.objectives.dqn.DqnObjective`: token
     ``i`` is state ``s_i``; action / behavior log-prob / advantage at ``i+1``
-    describe the transition out of ``s_i``. A run is the same ``sequence_id``
-    and, when ``grouping_field=`` is set, the same grouping column. Neighbor
+    describe the transition out of ``s_i``. A run is the same ``group_id``
+    (one dataloader sample). Neighbor
     reads must stay in-run: out-of-run pairs are multiplied by ``0``
     (all-zero weights → loss ``0``).
 
@@ -105,10 +107,6 @@ class GrpoObjective(Objective):
         old_log_prob_key: Key in ``objective_data`` for behavior log-probs.
         advantage_key: Key in ``objective_data`` for group-relative advantages.
         num_actions: If set, only the first ``num_actions`` logits participate.
-        grouping_field: Step column that isolates runs (typically
-            ``task_index``). Required. Pass ``None`` only when the batch
-            has no grouping isolation — omitting it is an error, not a
-            silent skip.
     """
 
     def __init__(
@@ -120,7 +118,6 @@ class GrpoObjective(Objective):
         old_log_prob_key: str = "old_log_prob",
         advantage_key: str = "advantage",
         num_actions: int | None = None,
-        grouping_field: str | None,
     ) -> None:
         self.clip_eps = clip_eps
         self.ent_coef = ent_coef
@@ -128,13 +125,13 @@ class GrpoObjective(Objective):
         self.old_log_prob_key = old_log_prob_key
         self.advantage_key = advantage_key
         self.num_actions = num_actions
-        self.grouping_field = grouping_field
 
     @overload
     def __call__(
         self,
         *,
         objective_data: dict[str, torch.Tensor],
+        group_id: torch.Tensor,
         predictions: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]: ...
 
@@ -143,6 +140,7 @@ class GrpoObjective(Objective):
         self,
         *,
         objective_data: dict[str, torch.Tensor],
+        group_id: torch.Tensor,
         predictions: torch.Tensor,
         delayed_predictions: None = None,
         value_predictions: None = None,
@@ -153,6 +151,7 @@ class GrpoObjective(Objective):
         self,
         *,
         objective_data: dict[str, torch.Tensor],
+        group_id: torch.Tensor,
         predictions: torch.Tensor,
         delayed_predictions: torch.Tensor | None = None,
         value_predictions: torch.Tensor | None = None,
@@ -219,10 +218,9 @@ class GrpoObjective(Objective):
         advantage = advantage_full[1:].to(dtype=dtype)
 
         pair_weight = _pair_weight(
-            objective_data,
-            N,
-            device,
-            grouping_field=self.grouping_field,
+            group_id=group_id,
+            N=N,
+            device=device,
             dtype=dtype,
         )
 

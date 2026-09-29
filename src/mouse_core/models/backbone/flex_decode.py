@@ -23,19 +23,17 @@ How it works:
   :meth:`reset_rows` returns a row's pages to the pool. :meth:`close`
   unmaps the VMM stores and drops the CUDA graph.
 * Attention runs through :func:`torch.nn.attention.flex_attention` with a
-  BlockMask that keeps each query inside its own sequence's causal prefix
-  **and** the same grouping-id run (``grouping_ids``). The mask is built in
-  logical coordinates (cheap: ``[B, S, max_len]``) and its block indices are
-  remapped through the page table, so the kernel only visits the pages a row
-  owns; masked blocks are *skipped*, not computed-and-discarded, and each
-  sequence's decode cost scales with its own history rather than the batch
-  maximum.
-* RoPE positions are per-``(sequence, grouping_id)`` token counters, so a new
-  grouping id starts at position 0 even if other-id KV slots remain (those
-  slots are masked out), and an id that recurs later continues its own
-  counter. This is the same rule the uncached train paths use
-  (:func:`packed_rope_positions`), so decode matches a full forward
-  (pinned by ``tests/test_kv_cache.py``).
+  BlockMask that keeps each query inside its own sequence's causal prefix.
+  One sequence is one sample, so a task change is a new sequence (or
+  :meth:`reset_rows`), not a second id inside the cache. The mask is built
+  in logical coordinates (cheap: ``[B, S, max_len]``) and its block indices
+  are remapped through the page table, so the kernel only visits the pages
+  a row owns; masked blocks are *skipped*, not computed-and-discarded, and
+  each sequence's decode cost scales with its own history rather than the
+  batch maximum.
+* RoPE positions are the token's index in its sequence. This is the same
+  rule the uncached train paths use (:func:`packed_rope_positions`), so
+  decode matches a full forward (pinned by ``tests/test_kv_cache.py``).
 * :meth:`reset_rows` zeros selected ``lengths`` and frees their pages so a
   cleared stream (e.g. task boundary) can restart at position 0 without
   rebuilding the rest of the batch.
@@ -188,34 +186,26 @@ def flex_block_mask(
     )
 
 
-def packed_rope_positions(
-    *,
-    sequence_ids: torch.Tensor,
-    grouping_ids: torch.Tensor,
-) -> torch.Tensor:
+def packed_rope_positions(*, group_ids: torch.Tensor) -> torch.Tensor:
     """RoPE position of every token in a flat packed stream ``[L]``.
 
-    Position = number of earlier tokens with the same ``(sequence_id,
-    grouping_id)``. This is the counting rule cached decode uses
-    (:func:`_decode_rope_positions`) and the same neighbourhood the attention
-    masks allow (causal within the same sequence and grouping id, regardless
-    of contiguity), so a grouping id that recurs after another id continues
+    Position = number of earlier tokens with the same ``group_id``.
+    This is the counting rule cached decode uses and the same neighbourhood
+    the attention masks allow (causal within one group, regardless of
+    contiguity), so a sequence id that recurs after another id continues
     its own position counter instead of restarting at 0. Sync-free: one
     stable sort plus a cummax, no host ``.item()``.
     """
-    L = sequence_ids.shape[0]
-    device = sequence_ids.device
+    L = group_ids.shape[0]
+    device = group_ids.device
     if L == 0:
         return torch.zeros(0, dtype=torch.long, device=device)
-    seq = sequence_ids.to(device=device, dtype=torch.long)
-    grp = grouping_ids.to(device=device, dtype=torch.long)
-    grp = grp - grp.min()
-    key = seq * (grp.max() + 1) + grp  # unique per (sequence, grouping) pair
-    order = torch.argsort(key, stable=True)
-    sorted_key = key[order]
+    seq = group_ids.to(device=device, dtype=torch.long)
+    order = torch.argsort(seq, stable=True)
+    sorted_seq = seq[order]
     arange = torch.arange(L, device=device)
     new_run = torch.ones(L, dtype=torch.bool, device=device)
-    new_run[1:] = sorted_key[1:] != sorted_key[:-1]
+    new_run[1:] = sorted_seq[1:] != sorted_seq[:-1]
     markers = torch.where(new_run, arange, torch.full_like(arange, -1))
     sorted_pos = arange - torch.cummax(markers, dim=0).values
     positions = torch.empty(L, dtype=torch.long, device=device)
@@ -235,19 +225,16 @@ def _bind_decode_mask_holder(holder: dict[str, torch.Tensor]) -> None:
     """Point the module-level mask_mod tables at ``holder``'s tensors."""
     dst = _decode_mask_holder
     dst["t"] = holder["t"]
-    dst["q_mask"] = holder["q_mask"]
-    dst["kv_mask"] = holder["kv_mask"]
+    dst["q_real"] = holder["q_real"]
     dst["page_logical"] = holder["page_logical"]
     dst["page_row"] = holder["page_row"]
 
 
 def _logical_mask_mod(b, h, q_idx, kv_idx):
-    """Causal + same-grouping-id in logical cache coordinates."""
+    """Causal within one sequence, in logical cache coordinates."""
     holder = _decode_mask_holder
     q_pos = holder["t"][b, q_idx]
-    return (kv_idx <= q_pos) & (
-        holder["kv_mask"][b, kv_idx] == holder["q_mask"][b, q_idx]
-    )
+    return (holder["q_real"][b, q_idx] != 0) & (kv_idx <= q_pos)
 
 
 def _physical_mask_mod(b, h, q_idx, kv_idx):
@@ -260,51 +247,8 @@ def _physical_mask_mod(b, h, q_idx, kv_idx):
     return (
         (holder["page_row"][blk] == b)
         & (logical_kv <= q_pos)
-        & (holder["kv_mask"][b, logical_kv] == holder["q_mask"][b, q_idx])
+        & (holder["q_real"][b, q_idx] != 0)
     )
-
-
-def _decode_rope_positions(
-    *,
-    chunk_grouping_ids: torch.Tensor,
-    real: torch.Tensor,
-    cached_grouping_ids: torch.Tensor,
-    prior_lengths: torch.Tensor,
-) -> torch.Tensor:
-    """Per-token RoPE positions for a left-padded decode chunk.
-
-    Position = (same-``grouping_id`` count in the cache prefix) + (earlier
-    real tokens in this chunk with the same id). Pad columns stay 0. Matches
-    :func:`packed_rope_positions` on the equivalent flat stream.
-
-    Built by flattening each row's cache prefix plus this chunk's real tokens
-    and calling :func:`packed_rope_positions` (stable sort + cummax). The old
-    pairwise form allocated ``[B, S, S]`` and ``[B, S, cache]`` bool tables —
-    16 GiB at ``B=8, S=16384`` — and OOMed on long prefills.
-    """
-    B, S = chunk_grouping_ids.shape
-    cap = cached_grouping_ids.shape[-1]
-    device = chunk_grouping_ids.device
-    out = torch.zeros(B, S, dtype=torch.long, device=device)
-    if B == 0 or S == 0:
-        return out
-
-    row = torch.arange(B, device=device)
-    cache_ok = torch.arange(cap, device=device).unsqueeze(0) < prior_lengths.unsqueeze(1)
-    cache_seq = row.unsqueeze(1).expand(B, cap)[cache_ok]
-    cache_grp = cached_grouping_ids[cache_ok]
-    chunk_seq = row.unsqueeze(1).expand(B, S)[real]
-    chunk_grp = chunk_grouping_ids[real]
-    if cache_seq.numel() == 0 and chunk_seq.numel() == 0:
-        return out
-
-    pos = packed_rope_positions(
-        sequence_ids=torch.cat([cache_seq, chunk_seq]),
-        grouping_ids=torch.cat([cache_grp, chunk_grp]),
-    )
-    n_cache = cache_seq.numel()
-    out[real] = pos[n_cache:]
-    return out
 
 
 def _inductor_rejected(exc: BaseException) -> bool:
@@ -529,7 +473,6 @@ class FlexDecodeSession:
 
         # Logical (per-row) tables, ``logical_cap`` slots wide.
         self.logical_cap = self.page
-        self.grouping_ids = torch.zeros(self.B, self.logical_cap, dtype=torch.long, device=self.device)
         self.lengths = torch.zeros(self.B, dtype=torch.long, device=self.device)
         self._lengths_host: list[int] = [0] * self.B
 
@@ -556,8 +499,7 @@ class FlexDecodeSession:
         # → session) and pin KV buffers until cyclic GC.
         self._mask_holder: dict[str, torch.Tensor] = {
             "t": torch.zeros(0, 0, dtype=torch.long, device=self.device),
-            "q_mask": torch.zeros(0, 0, dtype=torch.long, device=self.device),
-            "kv_mask": self.grouping_ids,
+            "q_real": torch.zeros(0, 0, dtype=torch.long, device=self.device),
             "page_logical": page_logical,
             "page_row": page_row,
         }
@@ -628,11 +570,6 @@ class FlexDecodeSession:
 
     def _grow_logical(self, needed: int) -> None:
         new_cap = _round_up(max(needed, 2 * self.logical_cap), self.page)
-        new_ids = torch.zeros(self.B, new_cap, dtype=torch.long, device=self.device)
-        new_ids[:, : self.logical_cap] = self.grouping_ids
-        self.grouping_ids = new_ids
-        self._mask_holder["kv_mask"] = new_ids
-        _bind_decode_mask_holder(self._mask_holder)
         new_table = torch.full((self.B, new_cap // self.page), -1, dtype=torch.long, device=self.device)
         new_table[:, : self.page_table.shape[1]] = self.page_table
         self.page_table = new_table
@@ -733,31 +670,30 @@ class FlexDecodeSession:
                 stacklevel=3,
             )
 
-    def _update_mask_tables(self, t: torch.Tensor, q_mask: torch.Tensor) -> None:
+    def _update_mask_tables(self, t: torch.Tensor, q_real: torch.Tensor) -> None:
         """Write query tables; copy in-place when the CUDA graph closed over them.
 
         A shape/dtype/device change replaces the tensors and drops any
         captured graph, which read the old ones by device address.
         """
         ht = self._mask_holder["t"]
-        hq = self._mask_holder["q_mask"]
+        hq = self._mask_holder["q_real"]
         if (
             ht.shape == t.shape
-            and hq.shape == q_mask.shape
+            and hq.shape == q_real.shape
             and ht.dtype == t.dtype
-            and hq.dtype == q_mask.dtype
+            and hq.dtype == q_real.dtype
             and ht.device == t.device
         ):
             ht.copy_(t)
-            hq.copy_(q_mask)
+            hq.copy_(q_real)
         else:
             # A captured step graph closed over the previous tensors by device
             # address; after replacing them its kernels would keep reading the
             # old (freed / stale) memory on replay. Drop it and recapture.
             self._mask_holder["t"] = t.contiguous()
-            self._mask_holder["q_mask"] = q_mask.contiguous()
+            self._mask_holder["q_real"] = q_real.contiguous()
             self._invalidate_graph()
-        self._mask_holder["kv_mask"] = self.grouping_ids
         _bind_decode_mask_holder(self._mask_holder)
 
     def _autocast(self) -> ContextManager[Any]:
@@ -1026,10 +962,10 @@ class FlexDecodeSession:
 
         Sets ``lengths[b] = 0`` so the next tokens for those rows write at
         position 0 and attend only to the new prefix, and returns all but the
-        row's first page to the pool. Other rows are unchanged. Stale K/V /
-        grouping-id slots in the kept page are ignored by the attention mask
-        and overwritten as the row grows again. Use this when a stream's
-        context is cleared (e.g. task boundary) without rebuilding the batch.
+        row's first page to the pool. Other rows are unchanged. Stale K/V
+        slots past the new length are ignored by the causal mask and
+        overwritten as the row grows again. Use this when a stream's
+        context is cleared (e.g. a new sample) without rebuilding the batch.
         """
         idx = list(range(self.B)) if rows is None else list(rows)
         if not idx:
@@ -1059,7 +995,6 @@ class FlexDecodeSession:
         *,
         embeds: torch.Tensor,
         lengths: list[int],
-        grouping_ids: torch.Tensor,
         output_hidden_states: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
         """Decode one chunk per sequence.
@@ -1069,9 +1004,6 @@ class FlexDecodeSession:
                 real tokens are the trailing ``lengths[b]`` positions. ``S``
                 is this call's longest row — unrelated to any other call.
             lengths: Real token count per row, ``0 <= lengths[b] <= S``.
-            grouping_ids: Left-padded **absolute** per-token grouping ids
-                ``[B, S]`` matching ``embeds`` (from the data pipeline
-                ``grouping_id`` field; pad columns ignored).
             output_hidden_states: Also return every layer's hidden states.
 
         Returns:
@@ -1094,10 +1026,6 @@ class FlexDecodeSession:
             raise ValueError(f"Session was created for batch_size={self.B}, got {B}.")
         if self.device.type == "cuda":
             install_compiled_decode_layer()
-        if grouping_ids.shape != (B, S):
-            raise ValueError(
-                f"grouping_ids must have shape [{B}, {S}], got {tuple(grouping_ids.shape)}."
-            )
         if len(lengths) != B:
             raise ValueError(f"lengths has {len(lengths)} entries for batch_size={B}.")
         needed = [prior + int(c) for prior, c in zip(self._lengths_host, lengths)]
@@ -1107,7 +1035,6 @@ class FlexDecodeSession:
         n = torch.tensor(lengths, dtype=torch.long, device=self.device)
 
         x = embeds.to(self.device, self.dtype)
-        mid = grouping_ids.to(device=self.device, dtype=torch.long)
         pad = (S - n)[:, None]  # leading pad tokens per row
         col = torch.arange(S, device=self.device)[None]
 
@@ -1115,32 +1042,21 @@ class FlexDecodeSession:
         # Pad columns get earlier/negative values; clamp keeps the causal mask
         # finite (pad outputs are discarded by the caller either way).
         cache_pos = self.lengths[:, None] + col - pad
-        real_rows, real_cols = (col >= pad).nonzero(as_tuple=True)
+        real = col >= pad
+        real_rows, real_cols = real.nonzero(as_tuple=True)
         cache_slots = cache_pos[real_rows, real_cols]
         # Pool address of each real token's slot: its row's page for that block.
         phys_page = self.page_table[real_rows, cache_slots // self.page]
         addr = phys_page * self.page + cache_slots % self.page
 
-        # Write mask ids before building the mask so same-mask KV checks see
-        # this chunk's slots (queries may attend within the new prefix).
-        self.grouping_ids[real_rows, cache_slots] = mid[real_rows, real_cols]
-
-        # RoPE is per (sequence, mask) run: same-id count in the cache prefix
-        # plus earlier same-id tokens in this chunk. Vectorized — no per-row
-        # host sync. ``grouping_ids`` already includes this chunk's writes;
-        # ``self.lengths`` is still the prior length, so new slots are not
-        # double-counted (they appear in the in-chunk term instead).
-        rope_pos = _decode_rope_positions(
-            chunk_grouping_ids=mid,
-            real=col >= pad,
-            cached_grouping_ids=self.grouping_ids,
-            prior_lengths=self.lengths,
-        )
+        # Position is the index in the sequence. Pad columns stay 0.
+        rope_pos = cache_pos.clamp_min(0)
+        q_real = real.to(dtype=torch.long)
 
         # Global mask_mod tables: hold the lock across bind + create_block_mask
         # so two sessions cannot interleave holder updates.
         with _decode_mask_lock:
-            self._update_mask_tables(cache_pos.clamp_min(0), mid)
+            self._update_mask_tables(cache_pos.clamp_min(0), q_real)
             logical_mask = flex_block_mask(
                 _logical_mask_mod,
                 B=B,

@@ -88,45 +88,29 @@ def _head_output_layout(
 
 
 def _pair_weight(
-    objective_data: dict[str, torch.Tensor],
+    *,
+    group_id: torch.Tensor,
     N: int,
     device: torch.device | str | None,
-    *,
-    grouping_field: str | None,
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    """``[N-1]`` weights: ``1.0`` when ``(i, i+1)`` share a run, else ``0.0``.
+    """``[N-1]`` weights: ``1.0`` when ``(i, i+1)`` share a sample, else ``0.0``.
 
-    A run is the same ``sequence_id`` (when that column is present) and, when
-    ``grouping_field`` is set, the same grouping column. ``grouping_field``
-    set but missing from ``objective_data`` is an error — it must not silently
-    train across task boundaries. ``N < 2`` raises.
+    A sample is one ``group_id``. The dataloader gives each sample it
+    keeps in a batch a distinct id, so a group change is the sample
+    boundary. ``group_id`` is int64 ``[N]``, one id per step, passed
+    beside ``objective_data``. ``N < 2`` raises.
     """
     if device is None:
         device = torch.device("cpu")
     if N < 2:
         raise ValueError(f"pair weight needs at least 2 steps, got {N}.")
-    same_run = torch.ones(N - 1, dtype=torch.bool, device=device)
-    if "sequence_id" in objective_data.keys():
-        sequence_id = objective_data["sequence_id"]
-        if sequence_id.shape != torch.Size([N]):
-            raise ValueError(
-                f"sequence_id must have shape [{N}], got {tuple(sequence_id.shape)}."
-            )
-        same_run &= sequence_id[1:] == sequence_id[:-1]
-    if grouping_field is not None:
-        if grouping_field not in objective_data.keys():
-            raise KeyError(
-                f"grouping_field={grouping_field!r} is not a column in "
-                "objective_data; include it in tokenizer objective_fields."
-            )
-        grouping = objective_data[grouping_field]
-        if grouping.shape != torch.Size([N]):
-            raise ValueError(
-                f"{grouping_field} must have shape [{N}], got {tuple(grouping.shape)}."
-            )
-        same_run &= grouping[1:] == grouping[:-1]
-    return same_run.to(dtype=dtype)
+    if group_id.shape != torch.Size([N]):
+        raise ValueError(
+            f"group_id must have shape [{N}], got {tuple(group_id.shape)}."
+        )
+    same_run = group_id[1:] == group_id[:-1]
+    return same_run.to(device=device, dtype=dtype)
 
 
 def _require_action_ids(action: torch.Tensor, A: int) -> None:
@@ -362,7 +346,7 @@ def _block_returns(
     v_next: torch.Tensor,
     t0: int,
     rows: int,
-    bootstrap_cutoff: bool,
+    bootstrap_before_group_boundary: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Returns for starts ``t0 .. t0+rows``, and which starts stay.
 
@@ -370,12 +354,14 @@ def _block_returns(
     each start are outside that start's return: their step is ``1`` so
     the cumprod is unchanged, and their reward term is ``0``.
 
-    ``col_mask`` is ``0`` where the continuation is outside the sampled
-    run. ``bootstrap_cutoff=True`` still adds ``V`` there, and every
-    start stays. ``bootstrap_cutoff=False`` drops a start when the factor
-    on that off-data ``V`` is non-zero. A zero factor leaves the value
-    out of the target, so the start stays. A gate ``0`` on a step the
-    mask still keeps bootstraps either way.
+    ``col_mask`` is ``0`` at a group boundary, where the continuation is
+    outside the sampled run. ``bootstrap_before_group_boundary=True``
+    bootstraps ``V`` on the step before that boundary, and every start
+    stays.
+    ``bootstrap_before_group_boundary=False`` does not, and drops a start
+    when the factor on that off-data ``V`` is non-zero. A zero factor
+    leaves the value out of the target, so the start stays. A gate
+    ``0`` on a step the mask still keeps bootstraps either way.
 
     The second tensor is ``1`` for a start that stays and ``0`` for a
     start that drops.
@@ -393,8 +379,8 @@ def _block_returns(
     )
     g = discount[t0:]
     alive = col_mask[t0:]
-    # ``alive == 0`` is a cutoff whose continuation was not sampled.
-    boot = (1 - step * alive) if bootstrap_cutoff else (1 - step) * alive
+    # ``alive == 0`` is a group boundary whose continuation was not sampled.
+    boot = (1 - step * alive) if bootstrap_before_group_boundary else (1 - step) * alive
     step.mul_(alive)
     term = reward[t0:] + g * boot * v_next[t0:]
     step.mul_(g)
@@ -404,7 +390,7 @@ def _block_returns(
         before = local_col < local_row
         step[:, :rows] = torch.where(before, step.new_ones(()), step[:, :rows])
         term[:, :rows] = torch.where(before, term.new_zeros(()), term[:, :rows])
-    if bootstrap_cutoff:
+    if bootstrap_before_group_boundary:
         participate = step.new_ones(rows)
     else:
         participate = _block_cutoff_factor_is_zero(step=step, alive=alive, discount=g)
@@ -422,7 +408,7 @@ def _continuation_targets(
     v_step: torch.Tensor,
     pair_weight: torch.Tensor,
     continuation: torch.Tensor,
-    bootstrap_cutoff: bool,
+    bootstrap_before_group_boundary: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return for every pair ``(t, t+1)``, and which pairs stay.
 
@@ -432,12 +418,13 @@ def _continuation_targets(
     started at ``t``. Rows are cumprod'd in blocks of
     ``_CONTINUATION_ROWS`` and never read another start's return. The
     in-run mask zeros a continuation that would leave the run.
-    ``bootstrap_cutoff=True`` adds ``V`` at that masked cutoff and keeps
-    the pair. ``bootstrap_cutoff=False`` drops the pair when the factor
-    on that off-data ``V`` is non-zero, from the loss and from logged
-    metrics. A zero factor leaves the value out of the target, so the
-    pair stays. A gate ``0`` on a step still inside the run still
-    bootstraps. Out-of-run pairs return ``0``.
+    ``bootstrap_before_group_boundary=True`` bootstraps ``V`` on the step
+    before that group boundary and keeps the pair.
+    ``bootstrap_before_group_boundary=False`` does not, and drops the pair
+    when the factor on that off-data ``V`` is non-zero, from the loss
+    and from logged metrics. A zero factor leaves the value out of the
+    target, so the pair stays. A gate ``0`` on a step still inside the
+    run still bootstraps. Out-of-run pairs return ``0``.
 
     Returns ``(returns [N-1], participate [N-1])``. ``participate`` is
     ``1`` for a pair that stays.
@@ -467,7 +454,7 @@ def _continuation_targets(
             v_next=v_next,
             t0=t0,
             rows=rows,
-            bootstrap_cutoff=bootstrap_cutoff,
+            bootstrap_before_group_boundary=bootstrap_before_group_boundary,
         )
     return returns * in_run.to(dtype=returns.dtype), participate
 
@@ -542,7 +529,8 @@ class DqnObjective(Objective):
     """Bellman TD(λ) objective with a delayed target network.
 
     Instantiate with hyperparameters, then call with
-    ``objective_data=``, the online Q tensor as ``predictions=``, the
+    ``objective_data=``, ``group_id=`` (int64 ``[N]``, one id per step,
+    returned beside ``objective_data``), the online Q tensor as ``predictions=``, the
     delayed Q tensor as ``delayed_predictions=``, and ``reward_center=``
     (a 0-dim float32 tensor, or ``None``). Both Q tensors come
     from the matching head on
@@ -560,8 +548,7 @@ class DqnObjective(Objective):
     bootstrap reads the *last* head-output row of step ``i+1`` (the most
     informed one).
 
-    A **run** is the same ``sequence_id`` and, when ``grouping_field`` is set
-    and present, the same grouping column (typically ``task_index``). Neighbor
+    A **run** is one ``group_id`` (one dataloader sample). Neighbor
     reads (action / reward / done / next Q at ``i+1``) must stay in-run: an
     out-of-run pair still has a loss term, but it is multiplied by ``0`` so
     output ``i`` does not affect the scalar loss or the gradient. If every
@@ -603,13 +590,16 @@ class DqnObjective(Objective):
     column ``s`` is the continuation at absolute step ``s`` for the
     return that started at ``t``, and that row is unrolled on its own.
     The objective then zeros a
-    continuation that would leave the run. ``bootstrap_cutoff=True`` adds ``V``
-    at that cutoff (the rest of the episode is not in the sample) and the
-    step stays in the loss and in logged metrics.
-    ``bootstrap_cutoff=False`` drops the step from both when the factor on
-    that off-data ``V`` is non-zero. A zero factor leaves the value out of
-    the target, so the step stays. A gate cut on a later in-run step still
-    bootstraps. ``V`` is delayed max-Q when
+    continuation that would leave the run. For any horizon, the last
+    step of a task is not updated when its target depends on the next
+    step's value. It is updated when the target does not. ``bootstrap_before_group_boundary=True``
+    bootstraps ``V`` on the step before that group boundary (the rest of
+    the episode is not in the sample), so that step is updated from
+    ``V`` and stays in the loss and in logged metrics.
+    ``bootstrap_before_group_boundary=False`` does not, and leaves the
+    step out of both. A done-code γ of ``0``, or a horizon that puts no
+    weight on that value, does not depend on it, so the step stays. A
+    gate cut on a later in-run step still bootstraps. ``V`` is delayed max-Q when
     ``temperature=0``. A
     positive ``temperature`` (SAC / soft Q-learning ``α``) replaces that
     with the soft value ``α log Σ_a exp(Q / α)``, equal to
@@ -716,10 +706,6 @@ class DqnObjective(Objective):
         action_key: Key in ``objective_data`` that holds the integer action.
         episode_done_key: Key in ``objective_data`` for the episode-done code.
         task_done_key: Key in ``objective_data`` for the task-done code.
-        grouping_field: Step column that isolates runs (typically
-            ``task_index``). Required. Pass ``None`` only when the batch
-            has no grouping isolation — omitting it is an error, not a
-            silent skip.
         cql_weight: Alpha coefficient for the Conservative Q-Learning penalty.
             ``0.0`` disables CQL.
         cql_scale_q_eps: Additive floor used when scaling the CQL penalty.
@@ -751,17 +737,18 @@ class DqnObjective(Objective):
             ``True`` is Double DQN: online Q chooses the action and
             delayed Q evaluates it. ``temperature`` selects hard argmax
             or the online Boltzmann policy, as above.
-        bootstrap_cutoff: Required. ``True`` adds ``V`` where the continuation
-            leaves the sampled run (end of the batch, or a
-            ``sequence_id`` / ``grouping_field`` break): a chunk
-            boundary, time limit, or truncation whose rest was not
-            sampled. That step stays in the loss and in logged metrics.
-            ``False`` drops the step from both when the factor on that
-            off-data value is non-zero. A zero factor leaves the value
-            out of the target, so the step stays. Reaching past the
-            sample is not enough. An in-run backup stays. A true terminal
-            stays either way: its γ is ``0``, so the factor is already
-            ``0``.
+        bootstrap_before_group_boundary: Required. For any horizon, the
+            last step of a task is not updated when its target depends
+            on the next step's value. It is updated when the target does
+            not. ``True`` bootstraps ``V`` on the step before a group
+            boundary (the end of the batch, or a ``group_id`` break:
+            a chunk boundary, time limit, or truncation whose rest was
+            not sampled), so that step is updated from ``V`` and stays
+            in the loss and in logged metrics. ``False`` does not, and
+            leaves the step out of both. A done-code γ of ``0``, or a
+            horizon that puts no weight on that value, does not depend
+            on it, so the step stays. An earlier step whose backup stays
+            inside the task stays either way.
     """
 
     def __init__(
@@ -772,25 +759,23 @@ class DqnObjective(Objective):
         value: Value | None,
         temperature: float,
         double: bool,
-        bootstrap_cutoff: bool,
+        bootstrap_before_group_boundary: bool,
         action_key: str = "action",
         episode_done_key: str = "episode_done",
         task_done_key: str = "task_done",
-        grouping_field: str | None,
         gate: Gate | None,
         cql_weight: float = 0.0,
         cql_scale_q_eps: float = 1.0,
     ) -> None:
         self.temperature = _require_temperature(temperature)
         self.double = bool(double)
-        self.bootstrap_cutoff = bool(bootstrap_cutoff)
+        self.bootstrap_before_group_boundary = bool(bootstrap_before_group_boundary)
         self.discount = _require_transform(discount, name="discount")
         self.reward = _require_transform(reward, name="reward")
         self.value = _require_transform(value, name="value")
         self.action_key = action_key
         self.episode_done_key = episode_done_key
         self.task_done_key = task_done_key
-        self.grouping_field = grouping_field
         self.cql_weight = cql_weight
         self.cql_scale_q_eps = cql_scale_q_eps
         self.gate = _require_transform(gate, name="gate")
@@ -800,6 +785,7 @@ class DqnObjective(Objective):
         self,
         *,
         objective_data: dict[str, torch.Tensor],
+        group_id: torch.Tensor,
         predictions: torch.Tensor,
         delayed_predictions: torch.Tensor,
         reward_center: torch.Tensor | None,
@@ -810,6 +796,7 @@ class DqnObjective(Objective):
         self,
         *,
         objective_data: dict[str, torch.Tensor],
+        group_id: torch.Tensor,
         predictions: torch.Tensor,
         delayed_predictions: torch.Tensor,
         reward_center: torch.Tensor | None,
@@ -821,6 +808,7 @@ class DqnObjective(Objective):
         self,
         *,
         objective_data: dict[str, torch.Tensor],
+        group_id: torch.Tensor,
         predictions: torch.Tensor,
         delayed_predictions: torch.Tensor | None = None,
         reward_center: torch.Tensor | None,
@@ -910,10 +898,9 @@ class DqnObjective(Objective):
         )
 
         pair_weight = _pair_weight(
-            objective_data,
-            N,
-            device,
-            grouping_field=self.grouping_field,
+            group_id=group_id,
+            N=N,
+            device=device,
             dtype=value_dtype,
         )
 
@@ -960,7 +947,7 @@ class DqnObjective(Objective):
             v_step=v_step,  # [N]  V(s_i)
             pair_weight=pair_weight,
             continuation=continuation,
-            bootstrap_cutoff=self.bootstrap_cutoff,
+            bootstrap_before_group_boundary=self.bootstrap_before_group_boundary,
         )
         center_offset: torch.Tensor | None = None
         if center is not None:
@@ -978,7 +965,7 @@ class DqnObjective(Objective):
                 v_step=torch.zeros_like(v_step),
                 pair_weight=pair_weight,
                 continuation=continuation,
-                bootstrap_cutoff=self.bootstrap_cutoff,
+                bootstrap_before_group_boundary=self.bootstrap_before_group_boundary,
             )
             center_offset = _pair_values_to_rows(center_weight, step_of) * center.detach()
         # A non-zero factor on an off-data value drops the step from the loss

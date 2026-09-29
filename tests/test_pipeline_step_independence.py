@@ -69,7 +69,6 @@ def test_missing_objective_fields_key_raises() -> None:
     tokenizer = Tokenizer(
         input_fields=_tok_in("action", head_output="action"),
         objective_fields=_io(("action", "action"), ("old_log_prob", "old_log_prob")),
-        grouping_field="task_index",
     )
     with pytest.raises(KeyError, match="old_log_prob"):
         tokenizer({"action": 1, "task_index": 0})
@@ -79,7 +78,6 @@ def test_tokenizer_output_defaults_to_input() -> None:
     tokenizer = Tokenizer(
         input_fields=_tok_in("action", head_output="action"),
         objective_fields=_io(("reward", "reward")),
-        grouping_field="task_index",
     )
     tokens = tokenizer({"action": 2, "reward": 0.5, "task_index": 0})
     assert tokens.modality_names == ("__text__",)
@@ -102,7 +100,6 @@ def test_tokenizer_renames_input_and_objective_fields() -> None:
             },
         ],
         objective_fields=_io(("q", "info_q_star")),
-        grouping_field="task_index",
     )
     tokens = tokenizer({"act": 3, "q": 1.5, "task_index": 0})
     assert tokens.modality_names == ("__text__",)
@@ -122,17 +119,16 @@ def test_tokenizer_full_matches_per_step_concat() -> None:
             ("episode_done", "episode_done"),
             ("task_done", "task_done"),
         ),
-        grouping_field="task_index",
     )
     rows = _rows()
-    full, full_obj = pack_token_batch(steps=[tokenizer(step) for step in rows])
+    full, full_obj, _sid = pack_token_batch(steps=[tokenizer(step) for step in rows], continuing=None)
     head = [tokenizer(s) for s in rows[:3]]
     tail = [tokenizer(s) for s in rows[3:]]
-    cat, cat_obj = pack_token_batch(steps=head + tail)
+    cat, cat_obj, _sid = pack_token_batch(steps=head + tail, continuing=None)
     assert np.array_equal(full.modality_ids, cat.modality_ids)
     assert np.array_equal(full.ids, cat.ids)
     assert np.allclose(full.values, cat.values)
-    assert np.array_equal(full.grouping_ids, cat.grouping_ids)
+    assert np.array_equal(full.group_ids, cat.group_ids)
     assert np.array_equal(full.head_output_indices, cat.head_output_indices)
-    for key in ("action", "observation", "reward", "episode_done", "task_done", "task_index"):
+    for key in ("action", "observation", "reward", "episode_done", "task_done"):
         assert torch.equal(full_obj[key], cat_obj[key])

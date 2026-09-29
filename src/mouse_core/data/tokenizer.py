@@ -2,7 +2,7 @@
 
 I/O
 ---
-* **in:** ``dict`` (one step; must include ``grouping_field``)
+* **in:** ``dict`` (one step)
 * **out:** :class:`~mouse_core.data.token_batch.StepTokens`
 
 ``text`` / ``token`` fields share the ``__text__`` stream. Every other
@@ -79,8 +79,8 @@ class Tokenizer:
     is longer. ``objective_fields=`` is a list of ``{input_field}``
     dicts (optional ``output_field``; defaults to the input name) copied
     into ``StepTokens.objective_fields`` (input fields are not
-    auto-copied). ``grouping_field`` names the step key used for
-    attention isolation (typically ``task_index``).
+    auto-copied). Sample boundaries are a dataloader concern
+    (``sample_field``); this tokenizer does not read them.
 
     TD / PPO / GRPO objectives read ``action``, ``reward``,
     ``episode_done``, and ``task_done`` from that keep-list (plus extras
@@ -93,15 +93,12 @@ class Tokenizer:
         self,
         *,
         input_fields: Sequence[dict[str, Any] | TokenizerModalitySpec] | None = None,
-        grouping_field: str,
         tokenizer=None,
         image_tokenizer=None,
         objective_fields: Sequence[dict[str, Any]] | None = None,
         pretrained: str | Path | None = None,
         hub_kwargs: dict | None = None,
     ) -> None:
-        if not grouping_field:
-            raise ValueError("Tokenizer requires a non-empty grouping_field")
         specs, meta = resolve_tokenizer_modalities(input_fields)
         has_text = any(m.kind == KIND_TEXT for m in meta)
         has_token = any(m.kind == KIND_TOKEN for m in meta)
@@ -155,7 +152,6 @@ class Tokenizer:
         self.pretrained = None if pretrained is None else str(pretrained)
         self.input_fields: tuple[TokenizerModalitySpec, ...] = tuple(specs)
         self._meta: tuple[TokenizerModalityMeta, ...] = tuple(meta)
-        self.grouping_field = grouping_field
         self.tokenizer = tok
         self.image_tokenizer = image_tokenizer
         self.objective_fields: tuple[tuple[str, str], ...] = coerce_io_fields(
@@ -178,7 +174,6 @@ class Tokenizer:
             tokenizer=self.tokenizer,
             image_tokenizer=self.image_tokenizer,
             objective_fields_keep=self.objective_fields,
-            grouping_field=self.grouping_field,
             name_to_index=self._name_to_index,
             modality_names=self.modality_names,
             modality_map=self.modality_map,
@@ -188,7 +183,7 @@ class Tokenizer:
         self,
         *,
         rows: Sequence[Sequence[dict]],
-        prev_grouping_ids: Sequence[int | None] | None,
+        continuing: Sequence[bool] | None,
     ) -> TokenBatch:
         """Tokenize ragged per-sequence rows into packed model inputs.
 
@@ -196,18 +191,16 @@ class Tokenizer:
         empty (incremental decode where a sequence contributes no new
         steps). Each step goes through this tokenizer, then
         :func:`~mouse_core.data.token_batch.pack_token_batch` with
-        ``batch_size=len(rows)`` — empty sequences keep their batch slot —
-        and this tokenizer's ``grouping_field``. Returns the
-        :class:`~mouse_core.data.token_batch.TokenBatch` only; objective
-        columns are for training, which packs via ``DataLoader``.
+        ``batch_size=len(rows)`` — empty sequences keep their batch slot.
+        Returns the :class:`~mouse_core.data.token_batch.TokenBatch` only;
+        objective columns are for training, which packs via ``DataLoader``.
 
-        ``prev_grouping_ids`` is the last grouping id already cached per
-        sequence (length ``len(rows)``, ``None`` entries where nothing is
-        cached), so incremental decode with ``when`` ``group_start`` fields
-        does not re-emit a cached grouping segment's prefix. Pass ``None``
-        when no sequence has cached steps (fresh sequences / full
-        prefill). Without ``group_start`` fields the value has no
-        effect.
+        ``continuing`` is length ``len(rows)``. ``True`` means that
+        sequence already has cached tokens, so ``group_start`` fields are
+        not emitted again. Pass ``None`` when no sequence has cached steps
+        (fresh sequences / full prefill). Without ``group_start`` fields
+        the value has no effect. Each row list must be one sample: do not
+        mix transitions that a dataloader ``sample_field`` would split.
         """
         steps: list[StepTokens] = []
         sids: list[int] = []
@@ -215,12 +208,11 @@ class Tokenizer:
             for step in row_steps:
                 steps.append(self(step))
                 sids.append(i)
-        inputs, _ = pack_token_batch(
+        inputs, _, _ = pack_token_batch(
             steps=steps,
-            sequence_ids=sids if steps else None,
+            group_ids=sids if steps else None,
             batch_size=len(rows),
-            grouping_field=self.grouping_field,
-            prev_grouping_ids=prev_grouping_ids,
+            continuing=continuing,
         )
         return inputs
 
@@ -295,18 +287,10 @@ def _tokenize_step(
     tokenizer: Any,
     image_tokenizer: Any,
     objective_fields_keep: Sequence[tuple[str, str]],
-    grouping_field: str,
     name_to_index: dict[str, int],
     modality_names: tuple[str, ...],
     modality_map: dict[str, ModalityInfo],
 ) -> StepTokens:
-    if grouping_field not in row:
-        raise KeyError(
-            f"grouping_field {grouping_field!r} missing from step "
-            f"(have {sorted(row)})"
-        )
-    gid = int(unwrap_scalar(row[grouping_field]))
-
     modality_ids: list[int] = []
     ids: list[int] = []
     values: list[float] = []
@@ -431,8 +415,6 @@ def _tokenize_step(
         positions=np.asarray(positions, dtype=np.int64),
         modality_names=modality_names,
         modality_map=dict(modality_map),
-        grouping_id=gid,
-        grouping_field=grouping_field,
         head_output_mask=np.asarray(head_output_mask, dtype=bool),
         objective_fields=copy_keep_fields(row, objective_fields_keep),
         **group_start_kwargs,
@@ -514,7 +496,6 @@ def tokenizer_config(*, tokenizer: Tokenizer) -> dict[str, Any]:
         objective_fields.append(entry)
     return {
         "format": TOKENIZER_FORMAT,
-        "grouping_field": tokenizer.grouping_field,
         "pretrained": tokenizer.pretrained,
         "input_fields": input_fields,
         "objective_fields": objective_fields,
@@ -591,7 +572,6 @@ def load_tokenizer(
         )
     return Tokenizer(
         input_fields=config["input_fields"],
-        grouping_field=config["grouping_field"],
         objective_fields=config.get("objective_fields") or (),
         pretrained=config.get("pretrained"),
         tokenizer=tokenizer,

@@ -2,18 +2,18 @@
 
 :func:`packed_forward` runs a full (uncached) forward over the flat
 concatenated token stream ``embeds [L, D]``. Attention is causal within
-positions that share both ``sequence_ids`` and ``grouping_ids``::
+one ``group_id`` (one dataloader sample)::
 
-    allowed(q, k) = k <= q and sequence_ids[k] == sequence_ids[q]
-                           and grouping_ids[k] == grouping_ids[q]
+    allowed(q, k) = k <= q and group_ids[k] == group_ids[q]
 
-Groups are equality classes of ``(sequence_id, grouping_id)``, not contiguous
-runs: an id that recurs later in the stream attends back to its earlier
-occurrence and continues its RoPE counter. The stream is stably regrouped
-so every class is one contiguous packed segment (original order preserved
-inside each class), all decoder layers run in that order, and the outputs
-are restored to the original order before returning. Causal attention over
-the packed segments is then exactly the predicate above.
+Groups are equality classes of ``group_id``, not necessarily
+contiguous runs: an id that recurs later in the stream attends back to
+its earlier occurrence and continues its RoPE counter. The stream is
+stably regrouped so every class is one contiguous packed segment
+(original order preserved inside each class), all decoder layers run in
+that order, and the outputs are restored to the original order before
+returning. Causal attention over the packed segments is then exactly
+the predicate above.
 
 Four attention kernels run the same packed segments; ``train_kernel``
 (``Backbone.train_kernel``, a required constructor argument, / the
@@ -106,7 +106,7 @@ _flex_kernels: dict[tuple[str, int | None], _FlexKernel] = {}
 
 @dataclass(frozen=True)
 class _PackingPlan:
-    """Stable regrouping of a flat stream by ``(sequence_id, grouping_id)``.
+    """Stable regrouping of a flat stream by ``group_id``.
 
     Packed token ``i`` is original token ``order[i]``;
     ``original = packed[inverse]``. ``cu_seqlens`` are the int32 segment
@@ -122,20 +122,15 @@ class _PackingPlan:
     position_ids: torch.Tensor
 
 
-def _packing_plan(sequence_ids: torch.Tensor, grouping_ids: torch.Tensor) -> _PackingPlan:
-    L = sequence_ids.shape[0]
-    device = sequence_ids.device
-    seq = sequence_ids.to(torch.long)
-    grp = grouping_ids.to(torch.long)
-    # Lexicographic stable sort by (sequence, grouping) as two stable
-    # argsorts: collision-free for any id values, no composite key to overflow.
-    by_group = torch.argsort(grp, stable=True)
-    order = by_group[torch.argsort(seq[by_group], stable=True)]
+def _packing_plan(group_ids: torch.Tensor) -> _PackingPlan:
+    L = group_ids.shape[0]
+    device = group_ids.device
+    seq = group_ids.to(torch.long)
+    order = torch.argsort(seq, stable=True)
     packed_seq = seq[order]
-    packed_grp = grp[order]
     arange = torch.arange(L, device=device)
     is_start = torch.ones(L, dtype=torch.bool, device=device)
-    is_start[1:] = (packed_seq[1:] != packed_seq[:-1]) | (packed_grp[1:] != packed_grp[:-1])
+    is_start[1:] = packed_seq[1:] != packed_seq[:-1]
     # Longest segment stays on-device. ``varlen`` / ``padded`` materialize a
     # Python int once when those kernels need a size; ``flex`` / ``reference``
     # never read it as a host int.
@@ -451,8 +446,7 @@ def packed_forward(
     *,
     model: _PackedModel,
     embeds: torch.Tensor,
-    sequence_ids: torch.Tensor,
-    grouping_ids: torch.Tensor,
+    group_ids: torch.Tensor,
     train_kernel: TrainKernel,
     autocast_dtype: torch.dtype | None = None,
     output_hidden_states: Literal[False] = False,
@@ -465,8 +459,7 @@ def packed_forward(
     *,
     model: _PackedModel,
     embeds: torch.Tensor,
-    sequence_ids: torch.Tensor,
-    grouping_ids: torch.Tensor,
+    group_ids: torch.Tensor,
     train_kernel: TrainKernel,
     autocast_dtype: torch.dtype | None = None,
     output_hidden_states: Literal[True],
@@ -479,8 +472,7 @@ def packed_forward(
     *,
     model: _PackedModel,
     embeds: torch.Tensor,
-    sequence_ids: torch.Tensor,
-    grouping_ids: torch.Tensor,
+    group_ids: torch.Tensor,
     train_kernel: TrainKernel,
     autocast_dtype: torch.dtype | None = None,
     output_hidden_states: bool,
@@ -492,8 +484,7 @@ def packed_forward(
     *,
     model: _PackedModel,
     embeds: torch.Tensor,
-    sequence_ids: torch.Tensor,
-    grouping_ids: torch.Tensor,
+    group_ids: torch.Tensor,
     train_kernel: TrainKernel,
     autocast_dtype: torch.dtype | None = None,
     output_hidden_states: bool = False,
@@ -506,8 +497,7 @@ def packed_forward(
             ``LlamaModel``) with ``layers``, ``rotary_emb``, ``norm``.
         embeds: Token embeddings ``[L, D]`` in stream order; cast to the
             model's base dtype.
-        sequence_ids: ``[L]`` sequence id per token.
-        grouping_ids: ``[L]`` grouping id per token (any integer values).
+        group_ids: ``[L]`` group id per token. One group is one sample.
         train_kernel: ``"varlen"`` (flash varlen; requires CUDA with bf16/fp16
             q/k/v — a bf16/fp16 backbone or ``train_autocast_dtype`` — and raises
             otherwise), ``"padded"`` (dense causal SDPA on segments padded to
@@ -534,10 +524,8 @@ def packed_forward(
     if embeds.ndim != 2:
         raise ValueError(f"embeds must be [L, D], got shape {tuple(embeds.shape)}")
     L, _D = embeds.shape
-    if sequence_ids.shape != (L,):
-        raise ValueError("sequence_ids must have shape [L]")
-    if grouping_ids.shape != (L,):
-        raise ValueError("grouping_ids must have shape [L]")
+    if group_ids.shape != (L,):
+        raise ValueError("group_ids must have shape [L]")
     check_train_kernel(train_kernel)
 
     hf = cast(Any, model)  # HF stacks are nn.Module; pyright sees children as Tensor|Module
@@ -569,7 +557,7 @@ def packed_forward(
         out = hf.norm(x)
         return (out, (x,) * n_layers) if output_hidden_states else out
 
-    plan = _packing_plan(sequence_ids.to(device), grouping_ids.to(device))
+    plan = _packing_plan(group_ids.to(device))
     attn_mask: torch.Tensor | None = None
     block_mask: BlockMask | None = None
     flex_fn: Callable[..., torch.Tensor] | None = None

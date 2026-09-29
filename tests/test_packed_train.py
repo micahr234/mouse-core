@@ -60,8 +60,8 @@ def _reference_with_layers(
     backbone, embeds: torch.Tensor, seq: torch.Tensor, grp: torch.Tensor
 ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
     """Independent dense reference: HF SDPA with the original predicate and original-order RoPE."""
-    mask = _flat_sequence_causal_mask(dtype=embeds.dtype, sequence_ids=seq, grouping_ids=grp)
-    pos = _flat_sequence_position_ids(sequence_ids=seq, grouping_ids=grp)
+    mask = _flat_sequence_causal_mask(dtype=embeds.dtype, group_ids=seq)
+    pos = _flat_sequence_position_ids(group_ids=seq)
     h, layers = backbone(embeds.unsqueeze(0), attention_mask=mask, position_ids=pos, output_hidden_states=True)
     return h.squeeze(0), tuple(x.squeeze(0) for x in layers)
 
@@ -81,9 +81,8 @@ def _stream(L: int, *, n_seq: int, n_grp: int, seed: int, device: str = "cpu") -
 
 
 def test_packing_plan_matches_handoff_example() -> None:
-    seq = torch.zeros(6, dtype=torch.long)
-    grp = torch.tensor([0, 0, 1, 1, 0, 0])
-    plan = _packing_plan(seq, grp)
+    seq = torch.tensor([0, 0, 1, 1, 0, 0])
+    plan = _packing_plan(seq)
     assert plan.order.tolist() == [0, 1, 4, 5, 2, 3]
     assert plan.inverse.tolist() == [0, 1, 4, 5, 2, 3]
     assert plan.cu_seqlens.tolist() == [0, 4, 6]
@@ -97,45 +96,41 @@ def test_packing_plan_matches_handoff_example() -> None:
 
 def test_packing_plan_non_self_inverse_permutation() -> None:
     seq = torch.tensor([0, 1, 0, 1, 0])
-    grp = torch.tensor([0, 0, 1, 0, 0])
-    plan = _packing_plan(seq, grp)
-    # classes: (0,0)->[0,4], (0,1)->[2], (1,0)->[1,3]
-    assert plan.order.tolist() == [0, 4, 2, 1, 3]
-    assert plan.inverse.tolist() == [0, 3, 2, 4, 1]
+    plan = _packing_plan(seq)
+    # sequence 0 -> [0, 2, 4], sequence 1 -> [1, 3]
+    assert plan.order.tolist() == [0, 2, 4, 1, 3]
+    assert plan.inverse.tolist() == [0, 3, 1, 4, 2]
     assert plan.order.tolist() != plan.inverse.tolist()
-    assert plan.cu_seqlens.tolist() == [0, 2, 3, 5]
-    assert int(plan.max_seqlen.item()) == 2
+    assert plan.cu_seqlens.tolist() == [0, 3, 5]
+    assert int(plan.max_seqlen.item()) == 3
 
 
 @pytest.mark.parametrize("device", _DEVICES)
 @pytest.mark.parametrize("L", [1, 3, 7, 50, 129, 300])
 def test_packing_plan_invariants(device: str, L: int) -> None:
-    seq, grp = _stream(L, n_seq=4, n_grp=4, seed=L, device=device)
-    plan = _packing_plan(seq, grp)
+    seq, _grp = _stream(L, n_seq=4, n_grp=4, seed=L, device=device)
+    plan = _packing_plan(seq)
     arange = torch.arange(L, device=device)
     assert torch.equal(plan.inverse[plan.order], arange)
     assert torch.equal(plan.order[plan.inverse], arange)
-    packed_seq, packed_grp = seq[plan.order], grp[plan.order]
+    packed_seq = seq[plan.order]
     lengths = (plan.cu_seqlens[1:] - plan.cu_seqlens[:-1]).tolist()
     assert all(n > 0 for n in lengths) and sum(lengths) == L
     assert isinstance(plan.max_seqlen, torch.Tensor)
     assert int(plan.max_seqlen.item()) == max(lengths)
-    pairs = {(int(s), int(g)) for s, g in zip(seq.tolist(), grp.tolist())}
-    assert len(lengths) == len(pairs)
+    assert len(lengths) == len(set(int(s) for s in seq.tolist()))
     for start, end in zip(plan.cu_seqlens[:-1].tolist(), plan.cu_seqlens[1:].tolist()):
         assert packed_seq[start:end].unique().numel() == 1
-        assert packed_grp[start:end].unique().numel() == 1
         # original order preserved inside a class
         assert torch.equal(plan.order[start:end], plan.order[start:end].sort().values)
     assert torch.equal(
-        plan.position_ids[plan.inverse], packed_rope_positions(sequence_ids=seq, grouping_ids=grp)
+        plan.position_ids[plan.inverse], packed_rope_positions(group_ids=seq)
     )
 
 
 def test_packing_plan_ids_shared_across_sequences_stay_separate() -> None:
     seq = torch.tensor([0, 0, 1, 1])
-    grp = torch.tensor([5, 5, 5, 5])
-    plan = _packing_plan(seq, grp)
+    plan = _packing_plan(seq)
     assert plan.cu_seqlens.tolist() == [0, 2, 4]
 
 
@@ -152,8 +147,7 @@ def test_pad_unpad_roundtrip_and_right_padding() -> None:
 
 def test_packing_plan_large_sparse_ids_do_not_collide() -> None:
     seq = torch.tensor([0, 2**40, 0, 2**40])
-    grp = torch.tensor([-(2**50), 7, -(2**50), 7])
-    plan = _packing_plan(seq, grp)
+    plan = _packing_plan(seq)
     assert plan.cu_seqlens.tolist() == [0, 2, 4]
     assert plan.order.tolist() == [0, 2, 1, 3]
 
@@ -163,15 +157,15 @@ def test_packing_plan_large_sparse_ids_do_not_collide() -> None:
 
 @pytest.mark.parametrize("device", _DEVICES)
 def test_packed_rope_positions_match_brute_force_with_recurring_ids(device: str) -> None:
-    """Shared rule == count of earlier same-(sequence, grouping) tokens."""
+    """Shared rule == count of earlier tokens with the same sequence id."""
     for L in (1, 50, 200, 300):
-        seq, grp = _stream(L, n_seq=4, n_grp=3, seed=L + 1, device=device)
-        got = packed_rope_positions(sequence_ids=seq, grouping_ids=grp)
-        same = (seq[:, None] == seq[None, :]) & (grp[:, None] == grp[None, :])
+        seq, _grp = _stream(L, n_seq=4, n_grp=3, seed=L + 1, device=device)
+        got = packed_rope_positions(group_ids=seq)
+        same = seq[:, None] == seq[None, :]
         earlier = torch.arange(L, device=device)[None, :] < torch.arange(L, device=device)[:, None]
         ref = (same & earlier).sum(-1)
         assert torch.equal(got, ref), f"mismatch at L={L} device={device}"
-        assert torch.equal(_flat_sequence_position_ids(sequence_ids=seq, grouping_ids=grp).squeeze(0), ref)
+        assert torch.equal(_flat_sequence_position_ids(group_ids=seq).squeeze(0), ref)
 
 
 # ---- forward parity against the dense reference --------------------------------
@@ -192,7 +186,7 @@ def test_cpu_fp32_forward_matches_dense_reference(no_compiled_decoder: None, cls
     embeds = torch.randn(L, 64)
     with torch.no_grad():
         got, layers = packed_forward(
-            model=bb.model, embeds=embeds, sequence_ids=seq, grouping_ids=grp, output_hidden_states=True, train_kernel=kernel
+            model=bb.model, embeds=embeds, group_ids=seq, output_hidden_states=True, train_kernel=kernel
         )
         ref, ref_layers = _reference_with_layers(bb, embeds, seq, grp)
     torch.testing.assert_close(got, ref, atol=1e-4, rtol=1e-4)
@@ -228,7 +222,7 @@ def test_cuda_fused_forward_matches_fp32_reference_within_half_precision_noise(
     embeds = torch.randn(L, 64, device=device)
     with torch.no_grad():
         got = packed_forward(
-            model=bb16.model, embeds=embeds.to(dtype), sequence_ids=seq, grouping_ids=grp, train_kernel=kernel
+            model=bb16.model, embeds=embeds.to(dtype), group_ids=seq, train_kernel=kernel
         ).float()
         ref32 = _reference(bb32, embeds, seq, grp)
         ref16 = _reference(bb16, embeds.to(dtype), seq, grp).float()
@@ -251,7 +245,7 @@ def test_cuda_fp32_matches_dense_reference(no_compiled_decoder: None, kernel: Tr
     seq, grp = _stream(L, n_seq=2, n_grp=3, seed=9, device="cuda")
     embeds = torch.randn(L, 64, device=device)
     with torch.no_grad():
-        got = packed_forward(model=bb.model, embeds=embeds, sequence_ids=seq, grouping_ids=grp, train_kernel=kernel)
+        got = packed_forward(model=bb.model, embeds=embeds, group_ids=seq, train_kernel=kernel)
         ref = _reference(bb, embeds, seq, grp)
     torch.testing.assert_close(got, ref, atol=1e-4, rtol=1e-4)
 
@@ -275,7 +269,7 @@ def test_cuda_fp32_autocast_fused_matches_fp32_reference(
     embeds = torch.randn(L, 64, device=device)
     with torch.no_grad():
         got = packed_forward(
-            model=bb32.model, embeds=embeds, sequence_ids=seq, grouping_ids=grp,
+            model=bb32.model, embeds=embeds, group_ids=seq,
             train_kernel=kernel, autocast_dtype=dtype,
         ).float()
         ref32 = _reference(bb32, embeds, seq, grp)
@@ -300,7 +294,7 @@ def test_cuda_fp32_autocast_gradients_flow(no_compiled_decoder: None, kernel: Tr
     seq, grp = _stream(L, n_seq=2, n_grp=2, seed=7, device="cuda")
     embeds = torch.randn(L, 64, device=device, requires_grad=True)
     out = packed_forward(
-        model=bb.model, embeds=embeds, sequence_ids=seq, grouping_ids=grp,
+        model=bb.model, embeds=embeds, group_ids=seq,
         train_kernel=kernel, autocast_dtype=torch.bfloat16,
     )
     out.float().pow(2).sum().backward()
@@ -320,11 +314,11 @@ def test_varlen_is_strict_no_fallback(no_compiled_decoder: None) -> None:
     ids = torch.zeros(4, dtype=torch.long)
     embeds = torch.randn(4, 64)
     with pytest.raises(ValueError, match="no fallback"):
-        packed_forward(model=bb.model, embeds=embeds, sequence_ids=ids, grouping_ids=ids, train_kernel="varlen")
+        packed_forward(model=bb.model, embeds=embeds, group_ids=ids, train_kernel="varlen")
     if torch.cuda.is_available():
         bb = bb.to("cuda")
         with pytest.raises(ValueError, match="no fallback"):
-            packed_forward(model=bb.model, embeds=embeds, sequence_ids=ids, grouping_ids=ids, train_kernel="varlen")
+            packed_forward(model=bb.model, embeds=embeds, group_ids=ids, train_kernel="varlen")
 
 
 def test_varlen_rejects_bf16_base_on_cpu(no_compiled_decoder: None) -> None:
@@ -332,7 +326,7 @@ def test_varlen_rejects_bf16_base_on_cpu(no_compiled_decoder: None) -> None:
     bb = _backbone("qwen3", dtype=torch.bfloat16)
     ids = torch.zeros(4, dtype=torch.long)
     with pytest.raises(ValueError, match="no fallback"):
-        packed_forward(model=bb.model, embeds=torch.zeros(4, 64), sequence_ids=ids, grouping_ids=ids, train_kernel="varlen")
+        packed_forward(model=bb.model, embeds=torch.zeros(4, 64), group_ids=ids, train_kernel="varlen")
 
 
 def test_ambient_autocast_is_rejected(no_compiled_decoder: None) -> None:
@@ -341,13 +335,12 @@ def test_ambient_autocast_is_rejected(no_compiled_decoder: None) -> None:
     ids = torch.zeros(4, dtype=torch.long)
     embeds = torch.randn(4, 64)
     with torch.autocast("cpu", dtype=torch.bfloat16), pytest.raises(RuntimeError, match="torch.autocast"):
-        packed_forward(model=bb.model, embeds=embeds, sequence_ids=ids, grouping_ids=ids, train_kernel="reference")
+        packed_forward(model=bb.model, embeds=embeds, group_ids=ids, train_kernel="reference")
     if torch.cuda.is_available():
         bb = bb.to("cuda")
         with torch.autocast("cuda", dtype=torch.bfloat16), pytest.raises(RuntimeError, match="torch.autocast"):
             packed_forward(
-                model=bb.model, embeds=embeds.to("cuda"), sequence_ids=ids.to("cuda"),
-                grouping_ids=ids.to("cuda"), train_kernel="flex",
+                model=bb.model, embeds=embeds.to("cuda"), group_ids=ids.to("cuda"), train_kernel="flex",
             )
 
 
@@ -366,7 +359,7 @@ def test_autocast_dtype_is_validated(no_compiled_decoder: None) -> None:
     ids = torch.zeros(4, dtype=torch.long)
     with pytest.raises(ValueError, match="autocast_dtype must be"):
         packed_forward(
-            model=bb.model, embeds=torch.zeros(4, 64), sequence_ids=ids, grouping_ids=ids,
+            model=bb.model, embeds=torch.zeros(4, 64), group_ids=ids,
             train_kernel="reference", autocast_dtype=torch.float32,
         )
 
@@ -376,21 +369,19 @@ def test_autocast_dtype_is_validated(no_compiled_decoder: None) -> None:
 
 @pytest.mark.parametrize("device", _DEVICES)
 @pytest.mark.parametrize("kernel", _KERNELS)
-def test_isolation_and_recurring_group_causality(no_compiled_decoder: None, device: str, kernel: TrainKernel) -> None:
+def test_isolation_and_sequence_causality(no_compiled_decoder: None, device: str, kernel: TrainKernel) -> None:
     if device == "cpu" and kernel == "varlen":
         pytest.skip("varlen is strict: CUDA with bf16/fp16 q/k/v only")
     torch.manual_seed(1)
     dtype = torch.bfloat16 if device == "cuda" else torch.float32
     bb = cast(Any, _backbone("qwen3", kv_heads=2, dtype=dtype).to(device))
     _scale_up(bb)
-    # seq 0: groups 0 0 1 1 0 0 ; seq 1: group 0 0 0
     seq = torch.tensor([0, 0, 0, 0, 0, 0, 1, 1, 1], device=device)
-    grp = torch.tensor([0, 0, 1, 1, 0, 0, 0, 0, 0], device=device)
     embeds = torch.randn(9, 64, device=device, dtype=dtype)
 
     def run(e: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
-            return packed_forward(model=bb.model, embeds=e, sequence_ids=seq, grouping_ids=grp, train_kernel=kernel).float()
+            return packed_forward(model=bb.model, embeds=e, group_ids=seq, train_kernel=kernel).float()
 
     base = run(embeds)
     changed = lambda a, b: (a - b).abs().amax(dim=1).gt(0)  # noqa: E731
@@ -400,15 +391,15 @@ def test_isolation_and_recurring_group_causality(no_compiled_decoder: None, devi
     delta = changed(run(other_seq), base)
     assert not delta[:6].any() and not delta[6].item() and delta[7].item() and delta[8].item()
 
-    other_group = embeds.clone()
-    other_group[2] += 3.0  # seq 0, group 1 first occurrence
-    delta = changed(run(other_group), base)
-    assert delta.tolist() == [False, False, True, True, False, False, False, False, False]
+    later_in_sequence = embeds.clone()
+    later_in_sequence[2] += 3.0
+    delta = changed(run(later_in_sequence), base)
+    assert delta.tolist() == [False, False, True, True, True, True, False, False, False]
 
-    earlier_occurrence = embeds.clone()
-    earlier_occurrence[1] += 3.0  # seq 0, group 0 first run -> its later run (4, 5) must see it
-    delta = changed(run(earlier_occurrence), base)
-    assert delta.tolist() == [False, True, False, False, True, True, False, False, False]
+    earlier_in_sequence = embeds.clone()
+    earlier_in_sequence[1] += 3.0
+    delta = changed(run(earlier_in_sequence), base)
+    assert delta.tolist() == [False, True, True, True, True, True, False, False, False]
 
     future = embeds.clone()
     future[5] += 3.0  # last token of seq 0 group 0: nothing earlier moves
@@ -429,7 +420,7 @@ def test_cpu_fp32_gradients_match_dense_reference(no_compiled_decoder: None, ker
     embeds = torch.randn(L, 64, requires_grad=True)
     weight = torch.randn(L, 64)
 
-    got = packed_forward(model=bb.model, embeds=embeds, sequence_ids=seq, grouping_ids=grp, train_kernel=kernel)
+    got = packed_forward(model=bb.model, embeds=embeds, group_ids=seq, train_kernel=kernel)
     (got * weight).sum().backward()
     got_grads = {n: p.grad.clone() for n, p in bb.named_parameters() if p.grad is not None}
     assert embeds.grad is not None
@@ -457,7 +448,7 @@ def test_gradient_checkpointing_matches_plain_backward(no_compiled_decoder: None
     embeds = torch.randn(L, 64, requires_grad=True)
 
     def grads(checkpoint: bool) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        out = packed_forward(model=bb.model, embeds=embeds, sequence_ids=seq, grouping_ids=grp, train_kernel=kernel, checkpoint=checkpoint)
+        out = packed_forward(model=bb.model, embeds=embeds, group_ids=seq, train_kernel=kernel, checkpoint=checkpoint)
         out.square().sum().backward()
         assert embeds.grad is not None
         result = (out.detach(), [embeds.grad.clone()] + [p.grad.clone() for p in bb.parameters() if p.grad is not None])
@@ -491,13 +482,13 @@ def test_gradient_checkpointing_flex_survives_interleaved_forward(no_compiled_de
     embeds = torch.randn(L, 64, device=device, requires_grad=True)
 
     def grads(checkpoint: bool) -> list[torch.Tensor]:
-        out = packed_forward(model=bb.model, embeds=embeds, sequence_ids=seq, grouping_ids=grp, train_kernel="flex", checkpoint=checkpoint)
+        out = packed_forward(model=bb.model, embeds=embeds, group_ids=seq, train_kernel="flex", checkpoint=checkpoint)
         loss = out.square().sum()
         # A single-segment stream between forward and backward: without the
         # rebind, the recompute would attend across sequence boundaries.
         flat = torch.zeros(57, dtype=torch.long, device=device)
         with torch.no_grad():
-            packed_forward(model=bb.model, embeds=torch.randn(57, 64, device=device), sequence_ids=flat, grouping_ids=flat, train_kernel="flex")
+            packed_forward(model=bb.model, embeds=torch.randn(57, 64, device=device), group_ids=flat, train_kernel="flex")
         loss.backward()
         assert embeds.grad is not None
         result = [embeds.grad.clone()] + [p.grad.clone() for p in bb.parameters() if p.grad is not None]
@@ -528,7 +519,7 @@ def test_cuda_bf16_lora_gradients_on_frozen_base(no_compiled_decoder: None, kern
     embeds = torch.randn(L, 64, device=device, dtype=torch.bfloat16, requires_grad=True)
     weight = torch.randn(L, 64, device=device)
 
-    got = packed_forward(model=bb.model, embeds=embeds, sequence_ids=seq, grouping_ids=grp, train_kernel=kernel)
+    got = packed_forward(model=bb.model, embeds=embeds, group_ids=seq, train_kernel=kernel)
     (got.float() * weight).sum().backward()
     assert embeds.grad is not None and torch.isfinite(embeds.grad).all()
     got_embed_grad = embeds.grad.float().clone()
@@ -576,14 +567,14 @@ def test_cpu_compiled_body_matches_eager_across_layouts(no_compiled_decoder: Non
         embeds = torch.randn(L, 32)
         with torch.no_grad():
             eager = packed_forward(
-                model=bb.model, embeds=embeds, sequence_ids=seq, grouping_ids=grp, output_hidden_states=True, train_kernel=kernel
+                model=bb.model, embeds=embeds, group_ids=seq, output_hidden_states=True, train_kernel=kernel
             )
         outs.append((seq, grp, embeds, eager))
     install_compiled_decoder()
     for seq, grp, embeds, (eager_h, eager_layers) in outs:
         with torch.no_grad():
             h, layers = packed_forward(
-                model=bb.model, embeds=embeds, sequence_ids=seq, grouping_ids=grp, output_hidden_states=True, train_kernel=kernel
+                model=bb.model, embeds=embeds, group_ids=seq, output_hidden_states=True, train_kernel=kernel
             )
         torch.testing.assert_close(h, eager_h, atol=1e-4, rtol=1e-4)
         for a, b in zip(layers, eager_layers):
@@ -607,7 +598,7 @@ def test_cuda_bf16_lora_compiled_body_matches_eager_and_trains(no_compiled_decod
     seq, grp = _stream(L, n_seq=3, n_grp=2, seed=L, device="cuda")
 
     def run() -> tuple[torch.Tensor, list[torch.Tensor]]:
-        out = packed_forward(model=bb.model, embeds=embeds, sequence_ids=seq, grouping_ids=grp, train_kernel=kernel)
+        out = packed_forward(model=bb.model, embeds=embeds, group_ids=seq, train_kernel=kernel)
         out.float().sum().backward()
         assert embeds.grad is not None
         grads = [embeds.grad.float().clone()] + [cast(torch.Tensor, p.grad).clone() for p in bb.parameters() if p.requires_grad]
@@ -641,7 +632,7 @@ def test_cuda_fp32_autocast_compiled_body_matches_eager(no_compiled_decoder: Non
 
     def run() -> tuple[torch.Tensor, list[torch.Tensor]]:
         out = packed_forward(
-            model=bb.model, embeds=embeds, sequence_ids=seq, grouping_ids=grp,
+            model=bb.model, embeds=embeds, group_ids=seq,
             train_kernel=kernel, autocast_dtype=torch.bfloat16,
         )
         out.float().sum().backward()
@@ -666,7 +657,7 @@ def test_cuda_fp32_autocast_compiled_body_matches_eager(no_compiled_decoder: Non
 def test_empty_stream(no_compiled_decoder: None) -> None:
     bb = _backbone("qwen3")
     empty = torch.zeros(0, dtype=torch.long)
-    out, layers = packed_forward(model=bb.model, embeds=torch.zeros(0, 64), sequence_ids=empty, grouping_ids=empty, train_kernel="reference", output_hidden_states=True)
+    out, layers = packed_forward(model=bb.model, embeds=torch.zeros(0, 64), group_ids=empty, train_kernel="reference", output_hidden_states=True)
     assert out.shape == (0, 64)
     assert len(layers) == 2 and all(x.shape == (0, 64) for x in layers)
 
@@ -675,23 +666,28 @@ def test_shape_validation(no_compiled_decoder: None) -> None:
     bb = _backbone("qwen3")
     ids = torch.zeros(4, dtype=torch.long)
     with pytest.raises(ValueError, match=r"\[L, D\]"):
-        packed_forward(model=bb.model, embeds=torch.zeros(1, 4, 64), sequence_ids=ids, grouping_ids=ids, train_kernel="reference")
-    with pytest.raises(ValueError, match="grouping_ids"):
-        packed_forward(model=bb.model, embeds=torch.zeros(4, 64), sequence_ids=ids, grouping_ids=ids[:3], train_kernel="reference")
+        packed_forward(model=bb.model, embeds=torch.zeros(1, 4, 64), group_ids=ids, train_kernel="reference")
+    with pytest.raises(ValueError, match="group_ids"):
+        packed_forward(
+            model=bb.model,
+            embeds=torch.zeros(4, 64),
+            group_ids=torch.zeros(3, dtype=torch.long),
+            train_kernel="reference",
+        )
 
 
 def test_sliding_window_config_is_rejected(no_compiled_decoder: None) -> None:
     bb = TransformerBackbone(architecture="qwen3", train_kernel="reference", decode_kernel="flex", dtype=torch.float32, use_norm=True, hidden_dim=64, num_layers=1, num_heads=4, use_sliding_window=True)
     ids = torch.zeros(4, dtype=torch.long)
     with pytest.raises(ValueError, match="sliding-window"):
-        packed_forward(model=bb.model, embeds=torch.zeros(4, 64), sequence_ids=ids, grouping_ids=ids, train_kernel="reference")
+        packed_forward(model=bb.model, embeds=torch.zeros(4, 64), group_ids=ids, train_kernel="reference")
 
 
 def test_unknown_train_kernel_is_rejected(no_compiled_decoder: None) -> None:
     bb = _backbone("qwen3")
     ids = torch.zeros(4, dtype=torch.long)
     with pytest.raises(ValueError, match="train_kernel"):
-        packed_forward(model=bb.model, embeds=torch.zeros(4, 64), sequence_ids=ids, grouping_ids=ids, train_kernel=cast(Any, "sdpa"))
+        packed_forward(model=bb.model, embeds=torch.zeros(4, 64), group_ids=ids, train_kernel=cast(Any, "sdpa"))
 
 
 def test_flex_kernel_is_forward_only_on_cpu(no_compiled_decoder: None) -> None:
@@ -700,24 +696,24 @@ def test_flex_kernel_is_forward_only_on_cpu(no_compiled_decoder: None) -> None:
     ids = torch.zeros(4, dtype=torch.long)
     embeds = torch.randn(4, 64, requires_grad=True)
     with pytest.raises(NotImplementedError, match="CPU"):
-        packed_forward(model=bb.model, embeds=embeds, sequence_ids=ids, grouping_ids=ids, train_kernel="flex")
+        packed_forward(model=bb.model, embeds=embeds, group_ids=ids, train_kernel="flex")
     with torch.no_grad():
-        out = packed_forward(model=bb.model, embeds=embeds, sequence_ids=ids, grouping_ids=ids, train_kernel="flex")
+        out = packed_forward(model=bb.model, embeds=embeds, group_ids=ids, train_kernel="flex")
     assert out.shape == (4, 64)
 
 
 # ---- Model integration -------------------------------------------------------------
 
 
-def test_prepare_sequence_id_col_matches_step_counts() -> None:
+def test_prepare_group_id_col_matches_step_counts() -> None:
     batch = [[{"action": s % 4, "reward": float(s)} for s in range(5)], [{"action": 1, "reward": 0.0}, {"action": 2, "reward": 1.0}, {"action": 3, "reward": 2.0}]]
-    tb, objective_data = batch_to_packed(token_tokenizer("action"), batch)
+    tb, objective_data, group_id = batch_to_packed(token_tokenizer("action"), batch)
     assert list(tb.step_counts()) == [5, 3]
-    assert objective_data["sequence_id"].tolist() == [0, 0, 0, 0, 0, 1, 1, 1]
-    assert objective_data["grouping_id"].tolist() == [0] * 8
+    assert "group_id" not in objective_data.keys()
+    assert group_id.tolist() == [0, 0, 0, 0, 0, 1, 1, 1]
     assert tb.head_output_indices.shape == (8,)
-    assert list(tb.sequence_ids[tb.head_output_indices]).count(0) == 5
-    assert list(tb.sequence_ids[tb.head_output_indices]).count(1) == 3
+    assert list(tb.group_ids[tb.head_output_indices]).count(0) == 5
+    assert list(tb.group_ids[tb.head_output_indices]).count(1) == 3
 
 
 @pytest.mark.parametrize("device", _DEVICES)
@@ -739,11 +735,11 @@ def test_model_forward_isolates_sequences(no_compiled_decoder: None, device: str
     assert torch.allclose(q0[3:], q1[3:], atol=1e-05, rtol=1e-05)
     assert not torch.allclose(q0[:3], q1[:3], atol=1e-05, rtol=1e-05)
     assert tb.N == 6
-    assert list(tb.sequence_ids[tb.head_output_indices]) == [0, 0, 0, 1, 1, 1]
+    assert list(tb.group_ids[tb.head_output_indices]) == [0, 0, 0, 1, 1, 1]
 
 
-def test_model_train_isolates_tasks_within_sequence(no_compiled_decoder: None) -> None:
-    """Packed train forward on a two-task window matches a single-task suffix forward."""
+def test_model_train_isolates_samples_as_sequences(no_compiled_decoder: None) -> None:
+    """Two samples packed as two sequences match a forward of the second sample alone."""
     torch.manual_seed(11)
     backbone = TransformerBackbone(architecture="qwen3", train_kernel="reference", decode_kernel="flex", dtype=torch.float32, use_norm=True, hidden_dim=32, num_layers=2, num_heads=4, num_key_value_heads=4, vocab_size=32)
     head = RegressionHead(in_features=backbone.hidden_dim, out_features=4, hidden_dim=backbone.hidden_dim, num_layers=1, use_norm=True, propagate_gradient=1.0)
@@ -758,12 +754,11 @@ def test_model_train_isolates_tasks_within_sequence(no_compiled_decoder: None) -
         {"action": 1, "episode_done": 0, "task_done": 0, "task_index": 1},
     ]
     with torch.no_grad():
-        tok = token_tokenizer("action", "episode_done", grouping_field="task_index")
-        tb_both, od = batch_to_packed(tok, [task0 + task1], grouping_field="task_index")
-        tb_t1 = batch_to_token_batch(tok, [task1], grouping_field="task_index")
+        tok = token_tokenizer("action", "episode_done")
+        tb_both = batch_to_token_batch(tok, [task0, task1])
+        tb_t1 = batch_to_token_batch(tok, [task1])
         preds_both = model(tb_both).predictions
         preds_t1 = model(tb_t1).predictions
-    assert od["task_index"].tolist() == [0, 0, 0, 1, 1]
     assert torch.allclose(preds_both["action_value"][3:], preds_t1["action_value"], atol=1e-05, rtol=1e-05)
 
 

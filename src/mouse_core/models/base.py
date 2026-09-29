@@ -288,15 +288,16 @@ separate Hub repo — `load_tokenizer` on `{tokenizer_repo_id}`.
 
 with torch.no_grad():
     steps = [eval_transform(step) for step in batch[0]]
-    inputs, _ = pack_token_batch(steps=steps, sequence_ids=[0] * len(steps))
+    inputs, _, _ = pack_token_batch(steps=steps, group_ids=[0] * len(steps), continuing=None)
     out = model(inputs, use_cache=True)
     action = model.get_action(out=out, temperature=0.0)
 ```
 
 `model()` returns a `ModelOutput` with `predictions` and
 `last_hidden_state`. `pack_token_batch` /
-`DataLoader.next_batch()` return `(inputs, objective_data)`; pass
-`objective_data` to objectives during training. For cached incremental
+`DataLoader.next_batch()` return `(inputs, objective_data, group_id)`;
+pass `objective_data` and `group_id` to DQN, PPO, and GRPO during
+training. For cached incremental
 rollout, pass ``out.cache`` back as ``cache=`` with `use_cache=True`.
 Cached batch rows may have different
 lengths on every call (e.g. envs emitting different numbers of steps between
@@ -1090,8 +1091,7 @@ class Model(nn.Module):
         self,
         backbone: Backbone,
         embeds: torch.Tensor,
-        sequence_ids: torch.Tensor,
-        grouping_ids: torch.Tensor,
+        group_ids: torch.Tensor,
     ) -> torch.Tensor:
         """Uncached backbone pass over the flat packed stream.
 
@@ -1102,8 +1102,8 @@ class Model(nn.Module):
         masked SDPA, O(L^2)) and ``train_autocast_dtype`` (bf16/fp16 mixed
         precision over fp32 weights, ``None`` for the base dtype). Backbones
         without packed kernels (``IdentityBackbone``, generic HuggingFace
-        stacks) take the rectangular route with a dense sequence/grouping
-        mask. ``embeds`` come from ``backbone.embed`` (fp32 tables /
+        stacks) take the rectangular route with a dense per-sequence
+        causal mask. ``embeds`` come from ``backbone.embed`` (fp32 tables /
         adapters) and are cast to the backbone's base dtype here.
         """
         embeds = embeds.to(dtype=backbone.dtype)
@@ -1116,8 +1116,7 @@ class Model(nn.Module):
             return packed_forward(
                 model=cast(nn.Module, transformer),
                 embeds=embeds,
-                sequence_ids=sequence_ids,
-                grouping_ids=grouping_ids,
+                group_ids=group_ids,
                 output_hidden_states=False,
                 checkpoint=backbone.gradient_checkpointing,
                 train_kernel=backbone.train_kernel,
@@ -1125,13 +1124,9 @@ class Model(nn.Module):
             )
         attention_mask = _flat_sequence_causal_mask(
             dtype=embeds.dtype,
-            sequence_ids=sequence_ids,
-            grouping_ids=grouping_ids,
+            group_ids=group_ids,
         )
-        position_ids = _flat_sequence_position_ids(
-            sequence_ids=sequence_ids,
-            grouping_ids=grouping_ids,
-        )
+        position_ids = _flat_sequence_position_ids(group_ids=group_ids)
         session_out = backbone(
             embeds.unsqueeze(0),
             output_hidden_states=False,
@@ -1154,8 +1149,7 @@ class Model(nn.Module):
         self,
         *,
         embeds: torch.Tensor,
-        sequence_ids: torch.Tensor,
-        grouping_ids: torch.Tensor,
+        group_ids: torch.Tensor,
         plan: _InsertionPlan,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Generate latent thoughts on the autograd tape and assemble the extended stream.
@@ -1165,8 +1159,8 @@ class Model(nn.Module):
         sequences exact). Thought ``r``'s input embedding is the reasoner
         adapter applied to the backbone output at the previous position, so
         gradients flow through the whole latent chain. Returns
-        ``(ext_embeds, ext_sequence_ids, ext_grouping_ids,
-        ext_head_output_indices, token_indices)`` where ``token_indices`` maps
+        ``(ext_embeds, ext_group_ids, ext_head_output_indices,
+        token_indices)`` where ``token_indices`` maps
         each original token to its extended-stream position.
         """
         reasoner = self.reasoner
@@ -1182,20 +1176,15 @@ class Model(nn.Module):
         for r in range(R):
             parts: list[torch.Tensor] = []
             seq_parts: list[torch.Tensor] = []
-            group_parts: list[torch.Tensor] = []
             last_positions: list[int] = []
             offset = 0
             for j, (start, anchor) in enumerate(prefix_bounds):
                 parts.append(embeds[start:anchor])
-                seq_parts.append(sequence_ids[start:anchor])
-                group_parts.append(grouping_ids[start:anchor])
+                seq_parts.append(group_ids[start:anchor])
                 if r > 0:
                     parts.append(torch.stack([thoughts[q][j] for q in range(r)]))
                     seq_parts.append(
-                        sequence_ids.new_full((r,), int(plan.burst_rows[j]))
-                    )
-                    group_parts.append(
-                        grouping_ids.new_full((r,), int(plan.latent_groups[j]))
+                        group_ids.new_full((r,), int(plan.burst_rows[j]))
                     )
                 block = (anchor - start) + r
                 last_positions.append(offset + block - 1)
@@ -1204,7 +1193,6 @@ class Model(nn.Module):
                 self.backbone,
                 torch.cat(parts),
                 torch.cat(seq_parts),
-                torch.cat(group_parts),
             )
             h_last = cast(torch.Tensor, gen_out)[
                 torch.as_tensor(last_positions, device=device)
@@ -1219,15 +1207,13 @@ class Model(nn.Module):
             .index_copy(0, token_indices, embeds)
             .index_copy(0, latent_indices, latent_embeds)
         )
-        ext_sequence_ids = torch.as_tensor(plan.ext_sequence_ids, device=device)
-        ext_grouping_ids = torch.as_tensor(plan.ext_grouping_ids, device=device)
+        ext_group_ids = torch.as_tensor(plan.ext_group_ids, device=device)
         ext_head_output_indices = torch.as_tensor(
             plan.ext_head_output_indices, device=device
         )
         return (
             ext_embeds,
-            ext_sequence_ids,
-            ext_grouping_ids,
+            ext_group_ids,
             ext_head_output_indices,
             token_indices,
         )
@@ -1246,7 +1232,7 @@ class Model(nn.Module):
     ) -> ModelOutput:
         """Run a forward pass over a :class:`TokenBatch`.
 
-        Training: ``inputs, objective_data = loader.next_batch()`` then
+        Training: ``inputs, objective_data, group_id = loader.next_batch()`` then
         ``out = model(inputs)``. Delayed DQN: ``delayed_model =
         model.copy(heads=True, backbone=True, reasoner=False)`` then
         ``delayed_model(inputs)`` under ``torch.no_grad()`` (same
@@ -1256,8 +1242,8 @@ class Model(nn.Module):
         under ``torch.no_grad()``. Interpolate with
         ``model_polyak(online=model, delayed=delayed_model, ...)`` with a
         ``tau`` for each copied section.
-        Online / inference: ``inputs, _ = pack_token_batch(steps=[eval_transform(step)],
-        sequence_ids=[0])`` then ``model(inputs, use_cache=True)``
+        Online / inference: ``inputs, _, _ = pack_token_batch(steps=[eval_transform(step)],
+        group_ids=[0], continuing=None)`` then ``model(inputs, use_cache=True)``
         (optionally ragged; empty-only batches raise). Pass ``out.cache``
         back as ``cache=``.
 
@@ -1274,11 +1260,10 @@ class Model(nn.Module):
         ``head_output_indices`` describe the extended stream.
 
         Training attention runs the packed stream forward over the flat
-        concatenated token stream (causal within the same ``(sequence_id,
-        grouping_id)`` class; kernel chosen by ``backbone.train_kernel``). Cached
+        concatenated token stream (causal within one ``group_id``;
+        kernel chosen by ``backbone.train_kernel``). Cached
         decode keeps one ``FlexDecodeSession``, a paged KV pool in which each
-        sequence owns only the pages its own history needs, with the same
-        grouping-id isolation. On CUDA the pool grows by mapping more physical
+        sequence owns only the pages its own history needs. On CUDA the pool grows by mapping more physical
         pages (no copy of existing K/V). Call ``out.cache.close()`` when the
         rollout ends.
 
@@ -1294,7 +1279,7 @@ class Model(nn.Module):
         if not isinstance(batch, _TokenBatch):
             raise TypeError(
                 f"Model.forward expects a TokenBatch, got {type(batch).__name__}. "
-                "Use pack_token_batch(steps=[transform(step)], ...) "
+                "Use pack_token_batch(steps=[transform(step)], ..., continuing=None) "
                 "or DataLoader(transform=...)."
             )
 
@@ -1325,8 +1310,7 @@ class Model(nn.Module):
         embeds, resolved_indices = self.backbone.embed(token_batch)
         # embeds: [L, D]; resolved_indices: [P]
         t = token_batch.to_tensors(embeds.device)
-        sequence_ids = t["sequence_ids"]
-        grouping_ids = t["grouping_ids"]
+        group_ids = t["group_ids"]
 
         new_cache: DecodeCache | None
 
@@ -1340,16 +1324,13 @@ class Model(nn.Module):
                 psteps.shape[0], dtype=torch.bool, device=psteps.device
             )
             last_of_step[:-1] = psteps[1:] != psteps[:-1]
-            batched_embeds, token_lengths, local_indices, batched_grouping_ids = (
-                _flat_to_batched_left_pad(
-                    embeds,
-                    sequence_ids,
-                    resolved_indices[last_of_step],
-                    B,
-                    S_max,
-                    step_counts_np.tolist(),
-                    grouping_ids=grouping_ids,
-                )
+            batched_embeds, token_lengths, local_indices = _flat_to_batched_left_pad(
+                embeds,
+                group_ids,
+                resolved_indices[last_of_step],
+                B,
+                S_max,
+                step_counts_np.tolist(),
             )
             session = (
                 cache.session
@@ -1359,20 +1340,12 @@ class Model(nn.Module):
             flex_embeds, resolved_indices = left_align_content(
                 batched_embeds, local_indices, token_lengths
             )
-            # Left-align mask ids to the same trailing-column layout as embeds.
-            Lmax = batched_grouping_ids.shape[1]
-            flex_grouping_ids = batched_grouping_ids.new_zeros(B, Lmax)
-            for b, rl in enumerate(token_lengths):
-                if rl == 0:
-                    continue
-                flex_grouping_ids[b, Lmax - rl :] = batched_grouping_ids[b, :rl]
             # ``token_lengths`` already counts only real tokens (tokenize is ragged;
             # empty rows contribute 0). Do not re-derive from left-padded step indices.
             session_out = session.forward(
                 output_hidden_states=False,
                 embeds=flex_embeds,
                 lengths=token_lengths,
-                grouping_ids=flex_grouping_ids,
             )
             new_cache = DecodeCache(session=session)
             counts = torch.as_tensor(
@@ -1387,23 +1360,15 @@ class Model(nn.Module):
         else:
             if plan is not None:
                 # Gradient-taped latent generation; swaps in the extended stream.
-                (
-                    embeds,
-                    sequence_ids,
-                    grouping_ids,
-                    resolved_indices,
-                    _,
-                ) = self._generate_latents(
+                embeds, group_ids, resolved_indices, _ = self._generate_latents(
                     embeds=embeds,
-                    sequence_ids=sequence_ids,
-                    grouping_ids=grouping_ids,
+                    group_ids=group_ids,
                     plan=plan,
                 )
             session_out = self._train_backbone_forward(
                 self.backbone,
                 embeds,
-                sequence_ids,
-                grouping_ids,
+                group_ids,
             )
             new_cache = None
             head_output_valid = None
@@ -1544,39 +1509,32 @@ def preferred_dtype(*, device: torch.device | str | None = None) -> torch.dtype:
 
 def _flat_to_batched_left_pad(
     embeds: torch.Tensor,
-    sequence_ids: torch.Tensor,
+    group_ids: torch.Tensor,
     head_output_indices: torch.Tensor,
     B: int,
     S: int,
     step_counts: list[int],
-    *,
-    grouping_ids: torch.Tensor,
-) -> tuple[torch.Tensor, list[int], torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, list[int], torch.Tensor]:
     """Scatter flat ``[L, D]`` embeds into a rectangular ``[B, Lmax, D]`` layout.
 
     Content is packed from index 0 within each row (right-padded).
     ``head_output_indices`` is flat ``[N]`` (one index per step — the caller
     passes each step's last head-output token). Returns local rectangular
     ``head_output_indices`` ``[B, S]`` with real steps in trailing columns
-    (left-padded in the step dimension for decode), plus right-padded
-    ``grouping_ids`` ``[B, Lmax]`` aligned with the embed rows.
+    (left-padded in the step dimension for decode).
     """
     L, D = embeds.shape
-    if grouping_ids.shape != (L,):
-        raise ValueError(f"grouping_ids must have shape [{L}], got {tuple(grouping_ids.shape)}")
-    token_lengths = [int((sequence_ids == b).sum().item()) for b in range(B)]
+    token_lengths = [int((group_ids == b).sum().item()) for b in range(B)]
     Lmax = max(token_lengths) if token_lengths else 0
     out = embeds.new_zeros(B, Lmax, D)
-    out_mask = grouping_ids.new_zeros(B, Lmax)
     local_indices = torch.zeros(B, S, device=embeds.device, dtype=torch.long)
 
     # Map absolute token index → local index within its sequence.
     local_of_abs = torch.full((L,), -1, device=embeds.device, dtype=torch.long)
     for b in range(B):
-        mask = sequence_ids == b
+        mask = group_ids == b
         toks = embeds[mask]
         out[b, : toks.shape[0]] = toks
-        out_mask[b, : toks.shape[0]] = grouping_ids[mask]
         abs_idx = torch.where(mask)[0]
         local_of_abs[abs_idx] = torch.arange(toks.shape[0], device=embeds.device)
 
@@ -1588,24 +1546,22 @@ def _flat_to_batched_left_pad(
             # Place into trailing step columns.
             local_indices[b, S - n + s_local] = int(local_of_abs[abs_i].item())
         flat_offset += n
-    return out, token_lengths, local_indices, out_mask
+    return out, token_lengths, local_indices
 
 
 def _flat_sequence_causal_mask(
     *,
-    sequence_ids: torch.Tensor,
-    grouping_ids: torch.Tensor,
+    group_ids: torch.Tensor,
     dtype: torch.dtype,
 ) -> torch.Tensor:
     """Additive attention mask ``[1, 1, L, L]`` for a packed flat sequence."""
-    L = sequence_ids.shape[0]
-    device = sequence_ids.device
+    L = group_ids.shape[0]
+    device = group_ids.device
     q = torch.arange(L, device=device)
     kv = torch.arange(L, device=device)
     causal = kv.unsqueeze(0) <= q.unsqueeze(1)
-    same_seq = sequence_ids.unsqueeze(1) == sequence_ids.unsqueeze(0)
-    same_mask = grouping_ids.unsqueeze(1) == grouping_ids.unsqueeze(0)
-    allow = causal & same_seq & same_mask
+    same_seq = group_ids.unsqueeze(1) == group_ids.unsqueeze(0)
+    allow = causal & same_seq
     neg = torch.finfo(dtype).min
     mask = torch.where(
         allow,
@@ -1615,16 +1571,9 @@ def _flat_sequence_causal_mask(
     return mask.view(1, 1, L, L)
 
 
-def _flat_sequence_position_ids(
-    *,
-    sequence_ids: torch.Tensor,
-    grouping_ids: torch.Tensor,
-) -> torch.Tensor:
-    """RoPE positions ``[1, L]``: count of earlier same-``(sequence, grouping_id)`` tokens.
+def _flat_sequence_position_ids(*, group_ids: torch.Tensor) -> torch.Tensor:
+    """RoPE positions ``[1, L]``: count of earlier same-sequence tokens.
 
-    Same rule as the packed train forward and cached decode, so all three
-    agree even when a grouping id recurs after a different one.
+    Same rule as the packed train forward and cached decode.
     """
-    return packed_rope_positions(
-        sequence_ids=sequence_ids, grouping_ids=grouping_ids
-    ).unsqueeze(0)
+    return packed_rope_positions(group_ids=group_ids).unsqueeze(0)

@@ -1,7 +1,8 @@
-"""Callable emission / sample-window condition types and save/load refs.
+"""Callable emission condition types and save/load refs.
 
-Tokenizer ``when=`` and ``DataLoader`` ``sample_start`` / ``sample_end``
-take callables — not equals / not_equals / group_start dicts.
+Tokenizer ``when=`` takes a callable — not an equals / not_equals dict.
+DataLoader samples are not callables: ``sample_field`` names the column
+whose contiguous equal values are one sample.
 
 Tokenizer ``when``
 -----------------
@@ -29,36 +30,13 @@ Lambdas work at runtime but cannot be saved. Define any named
 predicates inline in the notebook or caller module — this package
 does not ship convenience helpers.
 
-DataLoader ``sample_start`` / ``sample_end``
--------------------------------------------
-Each callable receives a column mapping ``name → 1-d array`` over the
-rows being considered and must return a boolean numpy array of the
-same length. ``sample_start`` marks legal window starts (the matching
-row itself). ``sample_end`` marks the inclusive end row: the first
-match **strictly after** the chosen start (the start row never counts
-as the end, even when the end predicate is true there). If set but
-never met before ``sequence_length`` / store end for a chosen start,
-that draw is skipped and another start is sampled. Token-budget mode
-has no step cap, so that search runs to the store end, and
-``sample_end`` is required: each of ``batch_size`` fills adds those
-whole segments until the next one would pass ``token_budget``. A
-segment that does not fit is left out. Examples pass ``batch_size=1``. Exhaustion or a candidate window that
-lacks an end match raises. ``None`` leaves starts unrestricted / never
-truncates early (``sequence_length`` only).
-
-Example full-task FrozenLake windows (predicates defined by the
-caller)::
-
-    def full_task_start(cols):
-        return (np.asarray(cols["episode_index"]) == 0) & (
-            np.asarray(cols["step_index"]) == 0
-        )
-
-    def full_task_end(cols):
-        return np.asarray(cols["task_done"]) != 0
-
-    sample_start=full_task_start
-    sample_end=full_task_end
+DataLoader ``sample_field``
+--------------------------
+A sample is every contiguous row that shares one value in
+``sample_field``. Each sample is one group. Attention and loss stop
+where ``group_id`` changes. Pass exactly one of ``samples_budget`` (steps) or
+``token_budget`` (packed tokens). A sample that does not fit is left
+out. Examples pass ``batch_size=1`` and ``sample_field="task_index"``.
 """
 
 from __future__ import annotations
@@ -67,12 +45,8 @@ import importlib
 from collections.abc import Callable, Mapping
 from typing import Any, cast
 
-import numpy as np
-
 # Per-step tokenizer gate: ctx → bool.
 WhenFn = Callable[[Mapping[str, Any]], bool]
-# DataLoader window predicate: column arrays → bool mask.
-SampleFn = Callable[[Mapping[str, Any]], np.ndarray]
 
 GROUP_START_KEY = "group_start"
 

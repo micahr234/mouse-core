@@ -32,15 +32,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   calls it at ``POLYAK_TAU_REWARD_CENTERING``.
 
 ### Changed
-- ``DataLoader`` takes exactly one of ``sequence_length`` or
-  ``token_budget``, plus ``batch_size``. ``sequence_length`` is that
-  many steps per example (unless ``sample_end`` or the store ends the
-  window first) across ``batch_size`` examples. ``token_budget`` fills
-  ``batch_size`` times with whole ``sample_start`` / ``sample_end``
-  segments until the next segment would pass that many packed tokens.
-  A segment that does not fit is left out, including a first segment
-  that alone is over the budget (that raises). Each segment is its own
-  sequence. Training examples pass ``token_budget`` and ``batch_size=1``.
+- ``pack_token_batch`` and ``DataLoader.next_batch`` return
+  ``(inputs, objective_data, group_id)``. ``group_id`` is int64
+  ``[N]``, one id per step. It is not a key in ``objective_data``.
+  Each sample the loader keeps in a batch gets a distinct id, and
+  every step of that sample shares it. ``DqnObjective``,
+  ``PpoObjective``, and ``GrpoObjective`` take it as required
+  ``group_id=``. Packed attention and pair weights stop where the
+  id changes. Token ``group_ids`` carry the same id.
+- A sample is one group. ``DataLoader`` requires ``sample_field``:
+  a sample is every contiguous row that shares one scalar value in
+  that column. Pass exactly one of ``samples_budget`` (steps) or
+  ``token_budget`` (packed tokens), plus ``batch_size``. Each fill
+  adds whole samples until the next sample would pass the budget. A
+  sample that does not fit is left out, including a first sample that
+  alone is over the budget (that raises). Each kept sample gets a
+  unique ``group_id``. Attention and TD / PPO / GRPO pair weights stop
+  where that id changes. Training examples pass ``sample_field="task_index"``,
+  ``token_budget``, and ``batch_size=1``.
+- ``pack_token_batch`` and ``Tokenizer.pack_rows`` take required
+  ``continuing``. ``None`` emits ``group_start`` tokens on the first
+  step of each sequence. ``True`` for a sequence means that sequence
+  already has cached tokens, so the prefix is not emitted again.
+  Online rollouts reset the context and ``DecodeCache.reset_rows``
+  when ``sample_field`` changes, then pack the new sample with
+  ``continuing`` false.
 - ``Polyak`` is the function ``model_polyak(online=, delayed=,
   tau_heads=, tau_backbone=)``. It keeps no state; the delayed weights
   stay on the delayed model.
@@ -50,35 +66,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ``AdamW`` ``params`` may be a list of param-group dicts. A group
   requires ``params`` and may set ``lr`` and ``weight_decay``; omitted
   keys use the constructor values. A flat parameter list is unchanged.
-- ``DataLoader`` ``sample_end`` finds the first match **strictly after**
-  the chosen start index (search from ``start + 1``). The start row
-  never counts as the end, even when the end predicate is true there —
-  so the same callable may be used for ``sample_start`` and
-  ``sample_end``. Incomplete starts (no later match before
-  ``sequence_length`` / store end) are still skipped and resampled;
-  exhaustion / invariant raises unchanged. Docs and tests follow.
-- ``DataLoader`` with ``sample_end`` set: a chosen start that never
-  hits an end match before ``sequence_length`` / store end is
-  **skipped** and another start is sampled (no silent truncate). Raises
-  ``ValueError`` only when every candidate start is incomplete, after
-  too many consecutive misses (``_SAMPLE_END_MAX_RETRIES``), or if a
-  yielded window somehow lacks an end match (invariant guard). Docs,
-  examples, and tests follow.
+
+### Removed
+- ``DataLoader`` ``sample_start`` and ``sample_end``. A sample is a
+  contiguous ``sample_field`` run.
+- ``grouping_field`` on ``Tokenizer``, ``StepTokens``, ``TokenBatch``,
+  and the TD / PPO / GRPO objectives. ``grouping_ids`` no longer cut
+  packed attention, cached decode, or RoPE. ``prev_grouping_ids`` is
+  replaced by ``continuing``.
+- ``DataLoader`` ``sequence_length`` and ``total_batches``. A batch is
+  one of ``samples_budget`` (steps) or ``token_budget`` (packed tokens).
 
 ### Added
-- Tokenizer ``when=`` and ``DataLoader`` ``sample_start`` /
-  ``sample_end`` take callables. Tokenizer ``when`` is ``ctx → bool``:
-  the step dict plus injected boolean ``group_start``. Ordinary
-  emission uses ``group_start=False``; pack-time ``group_start_*`` uses
-  ``True`` (ordinary wins when both are true). OR of emit reasons is
-  written inside the callable with ``|`` / ``or``. Named module-level
+- Tokenizer ``when=`` is a callable ``ctx → bool``: the step dict plus
+  injected boolean ``group_start``. Ordinary emission uses
+  ``group_start=False``; pack-time ``group_start_*`` uses ``True``
+  (ordinary wins when both are true). OR of emit reasons is written
+  inside the callable with ``|`` / ``or``. Named module-level
   callables round-trip through ``save_tokenizer`` / ``load_tokenizer``
-  as ``module:qualname`` refs. ``sample_start`` / ``sample_end`` are
-  ``cols → bool ndarray`` (column name → 1-d array). Notebooks and
-  benches define any FrozenLake-shaped predicates **inline** (not a
-  shared helper module) — e.g. ``when_group_start``,
-  ``when_reward_nonzero``, ``full_task_start`` / ``full_task_end``.
-  Incomplete ``sample_end`` starts are skipped (see Changed).
+  as ``module:qualname`` refs. Notebooks define those predicates
+  inline (``when_group_start``, ``when_reward_nonzero``).
 - ``best_action(q)``: integer action id per row, uniform among finite
   maxima (``-inf`` padding never selected). ``SpObjective`` callers that
   distill from Q* run this outside and pass the ids as ``targets=``.
@@ -92,17 +99,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per-row Bellman target ``G`` and its row weight, the same tensors
   the loss uses. Callers log those instead of rebuilding the backup.
   ``in_run_backup`` is ``backup`` on the rows with ``backup_weight > 0``.
-- ``bootstrap_cutoff`` on ``DqnObjective`` and ``PpoObjective``.
-  Required. ``True`` adds the value where the
-  continuation leaves the sampled run (end of the batch, or a
-  ``sequence_id`` / ``grouping_field`` break): a chunk boundary, time
-  limit, or truncation whose rest was not sampled, and that step stays
-  in the loss and in logged metrics. ``False`` drops the step from both
-  when the factor on that off-data value is non-zero. A zero factor
-  leaves the value out of the target, so the step stays in the loss and
-  in the logs. Reaching past the sample is not enough. An in-run backup
-  stays. A true terminal stays either way, because its done-code γ is
-  ``0`` and that factor is already ``0``.
+- ``bootstrap_before_group_boundary`` on ``DqnObjective`` and ``PpoObjective``.
+  Required. For any horizon, the last step of a task is not updated
+  when its target depends on the next step's value. It is updated when
+  the target does not. ``True`` bootstraps the value on the step before
+  a group boundary (end of the batch, or a ``group_id`` break: a
+  chunk boundary, time limit, or truncation whose rest was not
+  sampled), so that step is updated from that value and stays in the
+  loss and in logged metrics. ``False`` does not, and leaves the step
+  out of both. A done-code γ of ``0``, or a horizon that puts no weight
+  on that value, does not depend on it, so the step stays. An earlier
+  step whose backup stays inside the task stays either way.
 - ``general_gate(gates=)`` multiplies DQN continuation matrices. Each
   entry is the product of the gates at that step, so a return continues
   only where every gate continues.

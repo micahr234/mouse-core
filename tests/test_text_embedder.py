@@ -121,7 +121,6 @@ def _text_pair(hidden_dim: int = 8, **kwargs):
         tokenizer=hf_tok,
         image_tokenizer=image_tokenizer,
         objective_fields=objective_fields,
-        grouping_field="grouping_id",
     )
     backbone = IdentityBackbone(hidden_dim=hidden_dim, vocab_size=vocab)
     if emb is not None:
@@ -148,7 +147,7 @@ def test_text_tokenizer_when_not_equals_omits_value() -> None:
             {"observation": 2, "action": 1, "reward": 1.0, "episode_done": 1, "task_done": 0},
         ]
     ]
-    tb, obj = batch_to_packed(tokenizer, batch)
+    tb, obj, _sid = batch_to_packed(tokenizer, batch)
     embeds, indices = backbone.embed(tb)
     assert obj["reward"].dtype == torch.float32
     assert obj["action"].dtype == torch.int64
@@ -203,7 +202,6 @@ def test_text_tokenizer_field_format_uses_str() -> None:
             },
         ],
         tokenizer=_FakeTokenizer(),
-        grouping_field="grouping_id",
     )
     step = tokenizer({"reward": 1.0, "grouping_id": 0})
     assert step.ids.tolist() == [ord(c) % 20 + 1 for c in "1.0"]
@@ -225,7 +223,6 @@ def test_text_tokenizer_field_format_spec() -> None:
             },
         ],
         tokenizer=_FakeTokenizer(),
-        grouping_field="grouping_id",
     )
     step = tokenizer({"reward": 1.0, "grouping_id": 0})
     assert step.ids.tolist() == [ord("1") % 20 + 1]
@@ -248,7 +245,6 @@ def test_text_tokenizer_omitted_input_field_is_const() -> None:
             },
         ],
         tokenizer=_FakeTokenizer(),
-        grouping_field="grouping_id",
     )
     spec = next(field for field in tokenizer.input_fields if field.output_field == "value")
     assert spec.input_field is None
@@ -280,7 +276,6 @@ def test_text_tokenizer_const_format_rejects_placeholder() -> None:
                 },
             ],
             tokenizer=_FakeTokenizer(),
-            grouping_field="grouping_id",
         )
 
 
@@ -301,7 +296,6 @@ def test_text_tokenizer_max_tokens_allows_at_limit() -> None:
             },
         ],
         tokenizer=_FakeTokenizer(),
-        grouping_field="grouping_id",
     )
     step = tokenizer({"grouping_id": 0})
     assert len(step.ids) == 1
@@ -326,7 +320,6 @@ def test_text_tokenizer_max_tokens_raises_when_exceeded() -> None:
             },
         ],
         tokenizer=_FakeTokenizer(),
-        grouping_field="grouping_id",
     )
     with pytest.raises(ValueError, match="tokenized to 2 tokens"):
         tokenizer({"grouping_id": 0})
@@ -352,7 +345,6 @@ def test_text_tokenizer_max_tokens_must_be_positive() -> None:
                 },
             ],
             tokenizer=_FakeTokenizer(),
-            grouping_field="grouping_id",
         )
 
 
@@ -370,7 +362,6 @@ def test_text_tokenizer_const_requires_output_field() -> None:
                 },
             ],
             tokenizer=_FakeTokenizer(),
-            grouping_field="grouping_id",
         )
 
 
@@ -409,7 +400,6 @@ def test_text_tokenizer_when_gates_cover_skip_literal_pattern() -> None:
             },
         ],
         tokenizer=_CaptureTok(),
-        grouping_field="grouping_id",
     )
     tokenizer({"action": 1, "reward": 0.0, "grouping_id": 0})
     tokenizer({"action": 1, "reward": 2.0, "grouping_id": 0})
@@ -431,7 +421,6 @@ def test_text_tokenizer_when_rejects_non_callable() -> None:
                 },
             ],
             tokenizer=_FakeTokenizer(),
-            grouping_field="grouping_id",
         )
 
 
@@ -454,7 +443,6 @@ def test_text_tokenizer_when_or_in_callable() -> None:
             {"type": "token", "input_field": "action", "head_output": True},
         ],
         tokenizer=_FakeTokenizer(),
-        grouping_field="grouping_id",
     )
     zero = tok({"action": 1, "reward": 0.0, "grouping_id": 0})
     assert zero.ids.tolist() == (
@@ -480,7 +468,6 @@ def test_text_tokenizer_requires_field_format() -> None:
                 },
             ],
             tokenizer=_FakeTokenizer(),
-            grouping_field="grouping_id",
         )
 
 
@@ -503,7 +490,6 @@ def test_text_tokenizer_field_format_must_use_field_placeholder() -> None:
                 },
             ],
             tokenizer=_FakeTokenizer(),
-            grouping_field="grouping_id",
         )
 
 
@@ -529,7 +515,6 @@ def test_text_tokenizer_const_and_when_gated_unescape_braces() -> None:
             },
         ],
         tokenizer=_FakeTokenizer(),
-        grouping_field="grouping_id",
     )
     step = tokenizer({"a": 1, "r": 0, "grouping_id": 0})
     assert step.ids.tolist() == _enc("{1}") + _enc("{-}") + _enc("{c}")
@@ -560,7 +545,6 @@ def test_text_tokenizer_optional_missing_value_emits_nothing() -> None:
             },
         ],
         tokenizer=_FakeTokenizer(),
-        grouping_field="grouping_id",
     )
     assert tokenizer({"a": 1, "r": 0.0, "grouping_id": 0}).ids.tolist() == _enc("1,,\n")
     assert tokenizer({"a": 1, "r": None, "grouping_id": 0}).ids.tolist() == _enc("1,\n")
@@ -585,7 +569,6 @@ def test_text_tokenizer_required_defaults_true() -> None:
             },
         ],
         tokenizer=_FakeTokenizer(),
-        grouping_field="grouping_id",
     )
     with pytest.raises(KeyError, match="Required modality 'a'"):
         tokenizer({"grouping_id": 0})
@@ -642,7 +625,6 @@ def test_text_tokenizer_rejects_duplicate_field_names_across_types() -> None:
                 },
             ],
             tokenizer=_FakeTokenizer(),
-            grouping_field="grouping_id",
         )
     with pytest.raises(ValueError, match="duplicate tokenizer field name 'a'"):
         Tokenizer(
@@ -656,7 +638,6 @@ def test_text_tokenizer_rejects_duplicate_field_names_across_types() -> None:
                 },
             ],
             tokenizer=_FakeTokenizer(),
-            grouping_field="grouping_id",
         )
 
 
@@ -739,7 +720,7 @@ def test_identity_embed_image_token_ids() -> None:
         head_output="pixels",
     )
     batch = [[{"observation": 3, "pixels": [1, 2, 3]}]]
-    tb, obj = batch_to_packed(tokenizer, batch)
+    tb, obj, _sid = batch_to_packed(tokenizer, batch)
     embeds, indices = backbone.embed(tb)
     assert "pixels" in obj.keys()
     assert embeds.ndim == 2 and embeds.shape[1] == D
@@ -820,7 +801,6 @@ def _group_start_tokenizer(**kwargs):
         input_fields=fields,
         tokenizer=kwargs.pop("tokenizer", _FakeTokenizer()),
         objective_fields=_obj("action"),
-        grouping_field="task_index",
         **kwargs,
     )
 
@@ -836,7 +816,7 @@ def test_text_tokenizer_group_start_carried_on_step() -> None:
     assert st.head_output_mask.tolist() == [True]
 
 
-def test_pack_emits_group_start_once_per_grouping_segment() -> None:
+def test_pack_emits_group_start_once_per_sequence() -> None:
     from mouse_core.data import pack_token_batch
 
     tok = _group_start_tokenizer()
@@ -845,16 +825,16 @@ def test_pack_emits_group_start_once_per_grouping_segment() -> None:
         tok({"action": 2, "task_index": 0}),
         tok({"action": 3, "task_index": 1}),
     ]
-    inputs, obj = pack_token_batch(steps=steps, sequence_ids=[0, 0, 0], batch_size=1)
+    inputs, obj, _sid = pack_token_batch(steps=steps, group_ids=[0, 0, 0], batch_size=1, continuing=None)
     prefix = steps[0].group_start_ids
     assert prefix is not None
     p = int(prefix.shape[0])
-    assert inputs.L == p + steps[0].T + steps[1].T + p + steps[2].T
+    assert inputs.L == p + steps[0].T + steps[1].T + steps[2].T
     assert obj["action"].tolist() == [1, 2, 3]
     assert inputs.head_output_indices.tolist() == [
         p + int(steps[0].head_output_mask.nonzero()[0][0]),
         p + steps[0].T + int(steps[1].head_output_mask.nonzero()[0][0]),
-        p + steps[0].T + steps[1].T + p + int(steps[2].head_output_mask.nonzero()[0][0]),
+        p + steps[0].T + steps[1].T + int(steps[2].head_output_mask.nonzero()[0][0]),
     ]
     # Group-start tokens are __text__ and never head-output.
     assert not any(
@@ -871,66 +851,62 @@ def test_pack_group_start_is_per_sequence() -> None:
         tok({"action": 1, "task_index": 0}),
         tok({"action": 2, "task_index": 0}),
     ]
-    inputs, _ = pack_token_batch(steps=steps, sequence_ids=[0, 1], batch_size=2)
+    inputs, _, _sid = pack_token_batch(steps=steps, group_ids=[0, 1], batch_size=2, continuing=None)
     prefix = steps[0].group_start_ids
     assert prefix is not None
     p = int(prefix.shape[0])
     assert inputs.L == (p + steps[0].T) + (p + steps[1].T)
-    assert inputs.sequence_ids.tolist() == (
+    assert inputs.group_ids.tolist() == (
         [0] * (p + steps[0].T) + [1] * (p + steps[1].T)
     )
 
 
-def test_pack_prev_grouping_ids_suppresses_and_reemits_group_start() -> None:
+def test_pack_continuing_suppresses_group_start() -> None:
     from mouse_core.data import pack_token_batch
 
     tok = _group_start_tokenizer()
-    continue_step = tok({"action": 1, "task_index": 5})
-    change_step = tok({"action": 2, "task_index": 6})
-    prefix = continue_step.group_start_ids
+    step = tok({"action": 1, "task_index": 5})
+    prefix = step.group_start_ids
     assert prefix is not None
     p = int(prefix.shape[0])
 
-    same, _ = pack_token_batch(
-        steps=[continue_step],
-        sequence_ids=[0],
+    cached, _, _sid = pack_token_batch(
+        steps=[step],
+        group_ids=[0],
         batch_size=1,
-        prev_grouping_ids=[5],
+        continuing=[True],
     )
-    assert same.L == continue_step.T
+    assert cached.L == step.T
 
-    changed, _ = pack_token_batch(
-        steps=[change_step],
-        sequence_ids=[0],
+    fresh, _, _sid = pack_token_batch(
+        steps=[step],
+        group_ids=[0],
         batch_size=1,
-        prev_grouping_ids=[5],
+        continuing=None,
     )
-    assert changed.L == p + change_step.T
+    assert fresh.L == p + step.T
 
-    fresh, _ = pack_token_batch(
-        steps=[continue_step],
-        sequence_ids=[0],
+    restarted, _, _sid = pack_token_batch(
+        steps=[step],
+        group_ids=[0],
         batch_size=1,
-        prev_grouping_ids=[None],
+        continuing=[False],
     )
-    assert fresh.L == p + continue_step.T
+    assert restarted.L == p + step.T
 
 
-def test_tokenizer_pack_rows_forwards_prev_grouping_ids() -> None:
+def test_tokenizer_pack_rows_forwards_continuing() -> None:
     tok = _group_start_tokenizer()
     row = {"action": 1, "task_index": 5}
     st = tok(row)
     assert st.group_start_ids is not None
     p = int(st.group_start_ids.shape[0])
 
-    fresh = tok.pack_rows(rows=[[row]], prev_grouping_ids=None)
+    fresh = tok.pack_rows(rows=[[row]], continuing=None)
     assert fresh.L == p + st.T
 
-    same_task_cached = tok.pack_rows(rows=[[row]], prev_grouping_ids=[5])
-    assert same_task_cached.L == st.T
-
-    changed_task = tok.pack_rows(rows=[[row]], prev_grouping_ids=[4])
-    assert changed_task.L == p + st.T
+    cached = tok.pack_rows(rows=[[row]], continuing=[True])
+    assert cached.L == st.T
 
 
 def test_text_tokenizer_group_start_missing_placeholder_raises() -> None:
@@ -959,7 +935,6 @@ def test_text_tokenizer_group_start_const_without_other_text_adds_text_modality(
         ],
         tokenizer=_FakeTokenizer(),
         objective_fields=[],
-        grouping_field="task_index",
     )
     assert "__text__" in tok.modality_names
     st = tok({"action": 1, "task_index": 3})
@@ -981,13 +956,12 @@ def test_token_pack_ignores_missing_group_start() -> None:
             },
         ],
         objective_fields=_obj("action"),
-        grouping_field="task_index",
     )
     steps = [
         tok({"action": 1, "task_index": 0}),
         tok({"action": 2, "task_index": 0}),
     ]
-    inputs, _ = pack_token_batch(steps=steps, sequence_ids=[0, 0], batch_size=1)
+    inputs, _, _sid = pack_token_batch(steps=steps, group_ids=[0, 0], batch_size=1, continuing=None)
     assert inputs.L == steps[0].T + steps[1].T
     assert steps[0].group_start_ids is None
 
@@ -1023,7 +997,6 @@ def test_episode_index_emits_only_on_step_zero() -> None:
             },
         ],
         tokenizer=_CaptureTok(),
-        grouping_field="task_index",
     )
 
     def rendered(*, episode_index: int, step_index: Any) -> list[str]:
@@ -1060,7 +1033,6 @@ def test_token_episode_index_emits_only_on_step_zero() -> None:
                 "when": when_step_index_zero,
             },
         ],
-        grouping_field="task_index",
     )
     zero = tok({"action": 1, "episode_index": 4, "step_index": 0, "task_index": 0})
     assert zero.ids.tolist() == [1, 4]
@@ -1084,7 +1056,6 @@ def test_when_rejects_non_callable_scalar() -> None:
                     "head_output": True,
                 }
             ],
-            grouping_field="task_index",
         )
 
 
@@ -1103,7 +1074,6 @@ def test_head_output_rejects_when() -> None:
                 }
             ],
             tokenizer=_FakeTokenizer(),
-            grouping_field="task_index",
         )
 
 
@@ -1119,7 +1089,6 @@ def test_const_accepts_when() -> None:
             {"type": "token", "input_field": "action", "head_output": True},
         ],
         tokenizer=_FakeTokenizer(),
-        grouping_field="task_index",
     )
     zero = tok({"action": 1, "step_index": 0, "task_index": 0})
     assert zero.ids.tolist() == _FakeTokenizer()("x")["input_ids"].view(-1).tolist() + [1]
@@ -1138,7 +1107,6 @@ def test_when_equals_or_group_start_routes_value_to_ordinary() -> None:
             },
             {"type": "token", "input_field": "action", "head_output": True},
         ],
-        grouping_field="task_index",
     )
     # step_index==0 → ordinary emit (not group_start_*), even with group_start set.
     zero = tok({"action": 1, "episode_index": 4, "step_index": 0, "task_index": 0})

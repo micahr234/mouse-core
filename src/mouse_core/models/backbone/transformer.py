@@ -61,7 +61,7 @@ def _text_cfg(cfg: Any) -> Any:
 
 
 def grouping_unsupported_reason(cfg: Any) -> str | None:
-    """Why this config cannot guarantee ``(sequence_id, grouping_id)`` isolation.
+    """Why this config cannot guarantee ``(group_id, grouping_id)`` isolation.
 
     Returns ``None`` when the stack is either packed-compatible or a maskable
     softmax decoder. Hybrid / linear / sliding-window / encoder-decoder

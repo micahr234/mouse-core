@@ -17,42 +17,10 @@ import torch.nn as nn
 from mouse_core.models import Model
 from mouse_core.models.backbone import TransformerBackbone
 from mouse_core.models.backbone import packed_train as packed_train_mod
-from mouse_core.models.backbone.flex_decode import _decode_rope_positions
 from mouse_core.models.backbone.packed_train import TrainKernel, install_compiled_decoder
 from mouse_core.models.lora import LoRAConfig
 from mouse_core.models.heads import RegressionHead
 from tests._token_batch_helpers import batch_to_token_batch, token_tokenizer
-
-
-def _loop_decode_rope_positions(
-    chunk_grouping_ids: torch.Tensor,
-    real: torch.Tensor,
-    cached_grouping_ids: torch.Tensor,
-    prior_lengths: torch.Tensor,
-) -> torch.Tensor:
-    """Reference: the previous per-row / per-token Python loop."""
-    B, S = chunk_grouping_ids.shape
-    rope_pos = torch.zeros(B, S, dtype=torch.long, device=chunk_grouping_ids.device)
-    n = real.sum(dim=1)
-    for b in range(B):
-        nb = int(n[b].item())
-        if nb == 0:
-            continue
-        start = S - nb
-        row_mids = chunk_grouping_ids[b, start:S]
-        pl = int(prior_lengths[b].item())
-        if pl > 0:
-            cached = cached_grouping_ids[b, :pl]
-            bases = torch.zeros(nb, dtype=torch.long, device=chunk_grouping_ids.device)
-            for i in range(nb):
-                bases[i] = (cached == row_mids[i]).sum()
-        else:
-            bases = torch.zeros(nb, dtype=torch.long, device=chunk_grouping_ids.device)
-        local = torch.zeros(nb, dtype=torch.long, device=chunk_grouping_ids.device)
-        for i in range(nb):
-            local[i] = (row_mids[:i] == row_mids[i]).sum()
-        rope_pos[b, start:S] = bases + local
-    return rope_pos
 
 
 def _as_rect(preds: torch.Tensor) -> torch.Tensor:
@@ -61,7 +29,7 @@ def _as_rect(preds: torch.Tensor) -> torch.Tensor:
         return preds.unsqueeze(0)
     return preds
 
-_TOK = token_tokenizer("action", "episode_done", grouping_field="task_index")
+_TOK = token_tokenizer("action", "episode_done")
 
 def _tiny_model(architecture: Literal["llama", "qwen3"] = "qwen3", tokens: int=1, dtype: torch.dtype = torch.float32, train_kernel: TrainKernel = "reference", **backbone_kwargs) -> Model:
     hidden_dim = 16
@@ -81,7 +49,6 @@ def _fwd(model: Model, rows: list[list[dict]], **kwargs):
     tb = batch_to_token_batch(
         _TOK,
         patched,
-        grouping_field="task_index",
     )
     out = model(tb, **kwargs)
     return out.predictions, out.cache
@@ -105,7 +72,7 @@ def test_chunked_cached_forward_matches_full_forward(backbone_cls: Literal["llam
 
 @pytest.mark.parametrize('backbone_cls', ["qwen3", "llama"])
 def test_recurring_grouping_id_matches_between_full_and_cached(backbone_cls: Literal["llama", "qwen3"]) -> None:
-    """A grouping id that reappears after another id must use one position rule everywhere."""
+    """One sequence, cached step by step, matches a full forward of that sequence."""
     torch.manual_seed(3)
     model = _tiny_model(backbone_cls)
     steps = _steps(6)
@@ -292,10 +259,10 @@ def test_cuda_step_cudagraph_matches_eager_decode(S: int) -> None:
             session._graph_disabled = True
         outs: list[torch.Tensor] = []
         with torch.no_grad():
-            session.forward(embeds=pre, lengths=[8, 8], grouping_ids=preg)
+            session.forward(embeds=pre, lengths=[8, 8])
             for embeds in steps:
                 hidden = session.forward(
-                    embeds=embeds, lengths=step_lens, grouping_ids=stepg
+                    embeds=embeds, lengths=step_lens
                 )
                 assert isinstance(hidden, torch.Tensor)
                 outs.append(hidden.clone())
@@ -342,12 +309,11 @@ def test_cuda_step_graph_survives_chunk_shape_change() -> None:
             session._graph_disabled = True
         outs: list[torch.Tensor] = []
         with torch.no_grad():
-            session.forward(embeds=pre, lengths=[8, 8], grouping_ids=preg)
+            session.forward(embeds=pre, lengths=[8, 8])
             for embeds in chunks:
                 s = embeds.shape[1]
                 hidden = session.forward(
                     embeds=embeds, lengths=[s, s],
-                    grouping_ids=torch.zeros(B, s, dtype=torch.long, device=device),
                 )
                 assert isinstance(hidden, torch.Tensor)
                 outs.append(hidden.clone())
@@ -385,11 +351,11 @@ def test_cuda_identical_incremental_steps_capture() -> None:
     step = torch.randn(B, S, D, device=device, dtype=torch.bfloat16)
     stepg = torch.zeros(B, S, dtype=torch.long, device=device)
     with torch.no_grad():
-        session.forward(embeds=pre, lengths=[8, 8], grouping_ids=preg)
-        session.forward(embeds=step, lengths=[S, S], grouping_ids=stepg)
+        session.forward(embeds=pre, lengths=[8, 8])
+        session.forward(embeds=step, lengths=[S, S])
         assert session._graph is None
         assert not session._graph_disabled
-        session.forward(embeds=step, lengths=[S, S], grouping_ids=stepg)
+        session.forward(embeds=step, lengths=[S, S])
     assert session._graph is not None
     assert not session._graph_disabled
 
@@ -406,20 +372,20 @@ def test_cuda_page_grow_skips_capture_then_recaptures() -> None:
     step = torch.randn(B, S, D, device=device, dtype=torch.bfloat16)
     stepg = torch.zeros(B, S, dtype=torch.long, device=device)
     with torch.no_grad():
-        session.forward(embeds=pre, lengths=[pre_len, pre_len], grouping_ids=preg)
-        session.forward(embeds=step, lengths=[S, S], grouping_ids=stepg)
-        session.forward(embeds=step, lengths=[S, S], grouping_ids=stepg)
+        session.forward(embeds=pre, lengths=[pre_len, pre_len])
+        session.forward(embeds=step, lengths=[S, S])
+        session.forward(embeds=step, lengths=[S, S])
         assert session._graph is not None
         assert not session._graph_disabled
         n_pages = session.n_pages
-        session.forward(embeds=step, lengths=[S, S], grouping_ids=stepg)
+        session.forward(embeds=step, lengths=[S, S])
         assert session.n_pages > n_pages
         assert session._graph is None
         assert not session._graph_disabled
-        session.forward(embeds=step, lengths=[S, S], grouping_ids=stepg)
+        session.forward(embeds=step, lengths=[S, S])
         assert session._graph is not None
         assert not session._graph_disabled
-        session.forward(embeds=step, lengths=[S, S], grouping_ids=stepg)
+        session.forward(embeds=step, lengths=[S, S])
     assert session._graph is not None
     assert not session._graph_disabled
 
@@ -435,23 +401,21 @@ def test_cuda_eager_flex_skips_capture_without_disabling() -> None:
     step = torch.randn(B, S, D, device=device, dtype=torch.bfloat16)
     stepg = torch.zeros(B, S, dtype=torch.long, device=device)
     with torch.no_grad():
-        session.forward(embeds=pre, lengths=[8, 8], grouping_ids=preg)
+        session.forward(embeds=pre, lengths=[8, 8])
         for _ in range(4):
-            session.forward(embeds=step, lengths=[S, S], grouping_ids=stepg)
+            session.forward(embeds=step, lengths=[S, S])
     assert session._graph is None
     assert not session._graph_disabled
 
 
-def test_packed_rope_positions_count_same_group_tokens() -> None:
+def test_packed_rope_positions_count_same_sequence_tokens() -> None:
     from mouse_core.models.backbone.flex_decode import packed_rope_positions
 
     seq = torch.tensor([0, 0, 0, 0, 0, 0, 1, 1, 1])
-    grp = torch.tensor([0, 0, 1, 1, 0, 0, 5, 5, 3])
-    pos = packed_rope_positions(sequence_ids=seq, grouping_ids=grp)
-    assert pos.tolist() == [0, 1, 0, 1, 2, 3, 0, 1, 0]
+    pos = packed_rope_positions(group_ids=seq)
+    assert pos.tolist() == [0, 1, 2, 3, 4, 5, 0, 1, 2]
     assert packed_rope_positions(
-        sequence_ids=torch.zeros(0, dtype=torch.long),
-        grouping_ids=torch.zeros(0, dtype=torch.long),
+        group_ids=torch.zeros(0, dtype=torch.long),
     ).shape == (0,)
 
 
@@ -522,7 +486,6 @@ def test_eval_loop_get_action_model_output_matches_full_forward() -> None:
             tb = batch_to_token_batch(
                 _TOK,
                 patched,
-                grouping_field="task_index",
             )
             out = model(tb, cache=cache, use_cache=True)
             cache = out.cache
@@ -825,7 +788,7 @@ def _decode(session, counts: list[int], hidden: int) -> torch.Tensor:
     S = max(max(counts), 1)
     embeds = torch.randn(len(counts), S, hidden)
     gids = torch.zeros(len(counts), S, dtype=torch.long)
-    return session.forward(embeds=embeds, lengths=counts, grouping_ids=gids)
+    return session.forward(embeds=embeds, lengths=counts)
 
 
 def test_paged_cache_footprint_tracks_row_lengths_not_batch_max() -> None:
@@ -888,13 +851,8 @@ def test_reset_rows_returns_pages_to_pool() -> None:
 
 
 @pytest.mark.parametrize('backbone_cls', ["qwen3", "llama"])
-def test_decode_task_mask_isolates_without_reset(backbone_cls: Literal["llama", "qwen3"]) -> None:
-    """Continuing past a task boundary without reset_rows matches a fresh task forward.
-
-    Older grouping-id-run KV slots remain in the shared session; grouping-id masking + per-run
-    RoPE make the new-task predictions match an unbatched forward of only that
-    task (no full-batch rebuild).
-    """
+def test_decode_new_sample_matches_fresh_forward_after_reset(backbone_cls: Literal["llama", "qwen3"]) -> None:
+    """A new sample starts after ``reset_rows``. Its predictions match a fresh forward."""
     torch.manual_seed(8)
     model = _tiny_model(backbone_cls)
     task0 = [
@@ -912,54 +870,13 @@ def test_decode_task_mask_isolates_without_reset(backbone_cls: Literal["llama", 
         cache = None
         _, cache = _fwd(model, [task0], use_cache=True)
         assert cache is not None
-        # Deliberately do NOT call reset_rows — isolation comes from the mask.
+        cache.reset_rows(rows=[0])
         collected: list[torch.Tensor] = []
         for step in task1:
             preds, cache = _fwd(model, [[step]], cache=cache, use_cache=True)
             collected.append(preds['action_value'][:, -1])
         got = torch.stack(collected, dim=1)
     assert torch.allclose(got, _as_rect(ref), atol=1e-05)
-
-
-def test_decode_rope_positions_matches_loop_and_ignores_pads() -> None:
-    """Vectorized RoPE positions must match the old loop, including empty rows
-    and pad columns whose grouping id collides with a real token (must not count)."""
-    cached = torch.tensor(
-        [
-            [0, 0, 1, 1, 0, 0],
-            [2, 2, 2, 0, 0, 0],
-            [0, 0, 0, 0, 0, 0],
-        ],
-        dtype=torch.long,
-    )
-    prior = torch.tensor([4, 3, 0], dtype=torch.long)
-    # Left-padded chunk: row0 two new gid-1 tokens; row1 one gid-2; row2 empty.
-    chunk = torch.tensor(
-        [
-            [0, 1, 1],
-            [0, 0, 2],
-            [0, 0, 0],
-        ],
-        dtype=torch.long,
-    )
-    real = torch.tensor(
-        [
-            [False, True, True],
-            [False, False, True],
-            [False, False, False],
-        ]
-    )
-    got = _decode_rope_positions(
-        chunk_grouping_ids=chunk,
-        real=real,
-        cached_grouping_ids=cached,
-        prior_lengths=prior,
-    )
-    ref = _loop_decode_rope_positions(chunk, real, cached, prior)
-    assert torch.equal(got, ref)
-    # row0: cache has two gid-1 slots; chunk adds 0 then 1 → positions 2, 3.
-    # Pad gid 0 must not contribute. row1: three cached gid-2 → position 3.
-    assert got.tolist() == [[0, 2, 3], [0, 0, 3], [0, 0, 0]]
 
 
 def test_expandable_kv_cpu_grow_keeps_prefix() -> None:

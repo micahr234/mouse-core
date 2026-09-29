@@ -7,7 +7,7 @@ from typing import Any, cast
 
 import torch
 
-from mouse_core.data import Tokenizer, compose, pack_token_batch
+from mouse_core.data import Tokenizer, pack_token_batch
 from mouse_core.data.token_batch import StepTokens, TokenBatch
 
 def when_episode_done_nonzero(ctx):
@@ -30,13 +30,11 @@ def when_step_index_zero_or_group_start(ctx):
     return (ctx.get("step_index") == 0) | bool(ctx["group_start"])
 
 
-DEFAULT_GROUPING_FIELD = "grouping_id"
 DEFAULT_TOKEN_VOCAB = 32
 
 
 def token_tokenizer(
     *fields: str,
-    grouping_field: str = DEFAULT_GROUPING_FIELD,
     objective_fields: list[dict[str, Any]] | list[str] | None = None,
     **kwargs: Any,
 ) -> Tokenizer:
@@ -75,52 +73,33 @@ def token_tokenizer(
     return Tokenizer(
         input_fields=input_fields,
         objective_fields=resolved,
-        grouping_field=grouping_field,
         **kwargs,
     )
-
-
-def _ensure_grouping_field(step: dict, grouping_field: str) -> dict:
-    """Stamp a constant grouping value when the step has no isolation column."""
-    if grouping_field in step:
-        return step
-    out = dict(step)
-    out[grouping_field] = 0
-    return out
 
 
 def batch_to_packed(
     tokenizer: Callable[[dict], StepTokens],
     batch: list[list[dict]],
-    *,
-    grouping_field: str = DEFAULT_GROUPING_FIELD,
-) -> tuple[TokenBatch, dict[str, torch.Tensor]]:
-    """Tokenize a ragged ``list[list[dict]]`` into ``(inputs, objective_data)``."""
-    transform = compose(
-        stages=(lambda step: _ensure_grouping_field(step, grouping_field), tokenizer),
-    )
+) -> tuple[TokenBatch, dict[str, torch.Tensor], torch.Tensor]:
+    """Tokenize a ragged ``list[list[dict]]`` into ``(inputs, objective_data, group_id)``."""
     steps: list[StepTokens] = []
     sids: list[int] = []
     for b, seq in enumerate(batch):
         for step in seq:
-            steps.append(transform(step))
+            steps.append(tokenizer(step))
             sids.append(b)
     return pack_token_batch(
         steps=steps,
-        sequence_ids=sids if steps else None,
+        group_ids=sids if steps else None,
         batch_size=len(batch),
-        grouping_field=grouping_field,
+        continuing=None,
     )
 
 
 def batch_to_token_batch(
     tokenizer: Callable[[dict], StepTokens],
     batch: list[list[dict]],
-    *,
-    grouping_field: str = DEFAULT_GROUPING_FIELD,
 ) -> TokenBatch:
     """Tokenize a ragged ``list[list[dict]]`` to model inputs only."""
-    inputs, _ = batch_to_packed(
-        tokenizer, batch, grouping_field=grouping_field
-    )
+    inputs, _, _ = batch_to_packed(tokenizer, batch)
     return inputs

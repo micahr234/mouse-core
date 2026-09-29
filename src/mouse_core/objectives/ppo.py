@@ -55,7 +55,7 @@ def _gae_advantages(
     discounts: torch.Tensor,
     valid: torch.Tensor,
     gae_lambda: float,
-    bootstrap_cutoff: bool,
+    bootstrap_before_group_boundary: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Generalized advantage estimation over valid consecutive pairs.
 
@@ -64,16 +64,18 @@ def _gae_advantages(
         values: ``[N]`` value predictions ``V(s_i)``.
         discounts: ``[N-1]`` per-transition discount (from episode/task done codes).
         valid: ``[N-1]`` mask — False at run boundaries (different
-            ``sequence_id`` or grouping).
+            ``group_id``).
         gae_lambda: GAE λ.
-        bootstrap_cutoff: ``True`` adds ``V`` at a state whose next step is not an
-            in-run pair (end of the batch, or a run break) and keeps the
-            step. ``False`` drops the step when the factor on that off-data
-            ``V`` is non-zero. A zero factor leaves the value out of the
-            advantage, so the step stays. Reaching past the sample is not
-            enough. ``V`` at a state that still has a later in-run step is
-            unchanged. A ``0`` discount (true terminal) removes the value
-            either way.
+        bootstrap_before_group_boundary: For any horizon, the last step
+            of a task is not updated when its advantage depends on the
+            next step's value. It is updated when the advantage does not.
+            ``True`` bootstraps ``V`` on the step before a group boundary
+            (a state whose next step is not an in-run pair: end of the
+            batch, or a run break), so that step is updated from ``V``.
+            ``False`` does not, and leaves the step out. A ``0`` discount,
+            or a horizon that puts no weight on that value, does not
+            depend on it, so the step stays. ``V`` at a state that still
+            has a later in-run step is unchanged.
 
     Returns:
         ``(advantages, returns, participate)`` each ``[N-1]``. Advantages
@@ -93,7 +95,7 @@ def _gae_advantages(
         sampled = torch.zeros(T, dtype=torch.bool, device=device)
         if T > 1:
             sampled[:-1] = valid[1:]
-        if bootstrap_cutoff:
+        if bootstrap_before_group_boundary:
             participate = torch.ones(T, dtype=dtype, device=device)
         else:
             next_values = torch.where(
@@ -124,7 +126,8 @@ class PpoObjective(Objective):
     """Clipped PPO policy+value objective with GAE.
 
     Instantiate with hyperparameters, then call with
-    ``objective_data=`` and ``predictions=`` to compute the loss.
+    ``objective_data=``, ``group_id=`` (int64 ``[N]``, one id per step,
+    returned beside ``objective_data``), and ``predictions=`` to compute the loss.
 
     Call with the policy logits as ``predictions=`` and the value
     tensor as ``value_predictions=``:
@@ -132,8 +135,7 @@ class PpoObjective(Objective):
     * ``predictions`` — ``[N, A]`` discrete policy logits
     * ``value_predictions`` — ``[N, 1]`` or ``[N]`` scalar state values
 
-    A run is the same ``sequence_id`` and, when ``grouping_field=`` is set,
-    the same grouping column. Neighbor reads must stay in-run: out-of-run
+    A run is one ``group_id`` (one dataloader sample). Neighbor reads must stay in-run: out-of-run
     pairs are multiplied by ``0`` (all-zero weights → loss ``0``). Timing
     matches :class:`~mouse_core.objectives.dqn.DqnObjective`: token ``i``
     encodes state ``s_i``, and the action / reward / episode-done /
@@ -166,10 +168,11 @@ class PpoObjective(Objective):
         )
         from mouse_core.data import to_device
         from mouse_core.models import prediction_key
-        inputs, objective_data = loader.next_batch()
+        inputs, objective_data, group_id = loader.next_batch()
         out = model(inputs)
         loss, metrics = objective(
             objective_data=to_device(data=objective_data, device=device),
+            group_id=group_id.to(device),
             predictions=out.predictions[prediction_key(head=policy_head)],
             value_predictions=out.predictions[prediction_key(head=value_head)],
         )
@@ -195,17 +198,18 @@ class PpoObjective(Objective):
             any ``value(value=..., **objective_data)`` returning the same
             shape is accepted.
         gae_lambda: GAE λ (``1.0`` = Monte Carlo returns within the discount).
-        bootstrap_cutoff: Required. ``True`` adds ``V`` where the continuation
-            leaves the sampled run (end of the batch, or a
-            ``sequence_id`` / ``grouping_field`` break): a chunk
-            boundary, time limit, or truncation whose rest was not
-            sampled. That step stays in the loss and in logged metrics.
-            ``False`` drops the step from both when the factor on that
-            off-data value is non-zero. A zero factor leaves the value
-            out of the target, so the step stays. Reaching past the
-            sample is not enough. ``V`` at a state that still has a
-            later in-run step is unchanged. A true terminal is unchanged
-            either way: its γ is ``0``, so the factor is already ``0``.
+        bootstrap_before_group_boundary: Required. For any horizon, the
+            last step of a task is not updated when its advantage depends
+            on the next step's value. It is updated when the advantage
+            does not. ``True`` bootstraps ``V`` on the step before a group
+            boundary (the end of the batch, or a ``group_id`` break:
+            a chunk boundary, time limit, or truncation whose rest was
+            not sampled), so that step is updated from ``V`` and stays
+            in the loss and in logged metrics. ``False`` does not, and
+            leaves the step out of both. A done-code γ of ``0``, or a
+            horizon that puts no weight on that value, does not depend
+            on it, so the step stays. ``V`` at a state that still has a
+            later in-run step is unchanged.
         clip_eps: PPO ratio clip ε.
         vf_coef: Weight on the value-function MSE term.
         ent_coef: Weight on the policy entropy bonus (subtracted from the loss).
@@ -215,10 +219,6 @@ class PpoObjective(Objective):
         task_done_key: Key in ``objective_data`` for task-done codes.
         old_log_prob_key: Key in ``objective_data`` for behavior log-probs.
         num_actions: If set, only the first ``num_actions`` logits participate.
-        grouping_field: Step column that isolates runs (typically
-            ``task_index``). Required. Pass ``None`` only when the batch
-            has no grouping isolation — omitting it is an error, not a
-            silent skip.
     """
 
     def __init__(
@@ -228,7 +228,7 @@ class PpoObjective(Objective):
         reward: Reward | None,
         value: Value | None,
         gae_lambda: float = 0.95,
-        bootstrap_cutoff: bool,
+        bootstrap_before_group_boundary: bool,
         clip_eps: float = 0.2,
         vf_coef: float = 0.5,
         ent_coef: float = 0.01,
@@ -238,13 +238,12 @@ class PpoObjective(Objective):
         task_done_key: str = "task_done",
         old_log_prob_key: str = "old_log_prob",
         num_actions: int | None = None,
-        grouping_field: str | None,
     ) -> None:
         self.discount = _require_transform(discount, name="discount")
         self.reward = _require_transform(reward, name="reward")
         self.value = _require_transform(value, name="value")
         self.gae_lambda = gae_lambda
-        self.bootstrap_cutoff = bool(bootstrap_cutoff)
+        self.bootstrap_before_group_boundary = bool(bootstrap_before_group_boundary)
         self.clip_eps = clip_eps
         self.vf_coef = vf_coef
         self.ent_coef = ent_coef
@@ -254,13 +253,13 @@ class PpoObjective(Objective):
         self.task_done_key = task_done_key
         self.old_log_prob_key = old_log_prob_key
         self.num_actions = num_actions
-        self.grouping_field = grouping_field
 
     @overload
     def __call__(
         self,
         *,
         objective_data: dict[str, torch.Tensor],
+        group_id: torch.Tensor,
         predictions: torch.Tensor,
         value_predictions: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]: ...
@@ -270,6 +269,7 @@ class PpoObjective(Objective):
         self,
         *,
         objective_data: dict[str, torch.Tensor],
+        group_id: torch.Tensor,
         predictions: torch.Tensor,
         value_predictions: torch.Tensor,
         delayed_predictions: None = None,
@@ -280,6 +280,7 @@ class PpoObjective(Objective):
         self,
         *,
         objective_data: dict[str, torch.Tensor],
+        group_id: torch.Tensor,
         predictions: torch.Tensor,
         delayed_predictions: torch.Tensor | None = None,
         value_predictions: torch.Tensor | None = None,
@@ -373,10 +374,9 @@ class PpoObjective(Objective):
         )
 
         pair_weight = _pair_weight(
-            objective_data,
-            N,
-            device,
-            grouping_field=self.grouping_field,
+            group_id=group_id,
+            N=N,
+            device=device,
             dtype=dtype,
         )
         valid = pair_weight > 0
@@ -403,7 +403,7 @@ class PpoObjective(Objective):
             discounts=discounts,
             valid=valid,
             gae_lambda=self.gae_lambda,
-            bootstrap_cutoff=self.bootstrap_cutoff,
+            bootstrap_before_group_boundary=self.bootstrap_before_group_boundary,
         )
         pair_weight = pair_weight * participate
         valid = pair_weight > 0

@@ -14,6 +14,14 @@ from mouse_core.objectives import (
 )
 from mouse_core.objectives.dqn import _continuation_targets
 
+def _group_id(data: dict[str, torch.Tensor]) -> torch.Tensor:
+    if "group_id" in data:
+        return data["group_id"]
+    n = int(next(iter(data.values())).shape[0])
+    return torch.zeros(n, dtype=torch.int64)
+
+
+
 
 def _disc(**overrides: float):
     kwargs = dict(
@@ -50,7 +58,7 @@ def _nstep(**overrides: object) -> DqnObjective:
     n = overrides.pop("n", 1)
     kwargs: dict[str, object] = dict(
         gate=nstep_gate(n=n),  # type: ignore[arg-type]
-        grouping_field=None, temperature=0.0, double=False, bootstrap_cutoff=True, discount=_disc(), reward=_rew(), value=_val(),
+        temperature=0.0, double=False, bootstrap_before_group_boundary=True, discount=_disc(), reward=_rew(), value=_val(),
     )
     kwargs.update(overrides)
     return DqnObjective(**kwargs)  # type: ignore[arg-type]
@@ -67,7 +75,7 @@ def _lambda_fixture() -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tens
             "reward": torch.tensor([0.0, 1.0, 10.0]),
             "episode_done": torch.zeros(3, dtype=torch.int64),
             "task_done": torch.zeros(3, dtype=torch.int64),
-            "sequence_id": torch.zeros(3, dtype=torch.int64),
+            "group_id": torch.zeros(3, dtype=torch.int64),
         }
     online = torch.tensor([[5.0, 0.0], [0.0, 0.0], [0.0, 0.0]])
     delayed = torch.tensor([[0.0, 0.0], [3.0, 0.0], [0.0, 100.0]])
@@ -83,15 +91,14 @@ _TWO_STEP = 11668.0
 def test_nstep_requires_gate_and_double() -> None:
     with pytest.raises(TypeError, match="gate"):
         DqnObjective(  # type: ignore[call-arg]
-            grouping_field=None, temperature=0.0, double=False,
+            temperature=0.0, double=False,
             discount=_disc(), reward=_rew(), value=_val(),
-         bootstrap_cutoff=True)
+         bootstrap_before_group_boundary=True)
     with pytest.raises(TypeError, match="double"):
         DqnObjective(  # type: ignore[call-arg]
-            gate=nstep_gate(n=1),
-            grouping_field=None, temperature=0.0,
+            gate=nstep_gate(n=1), temperature=0.0,
             discount=_disc(), reward=_rew(), value=_val(),
-         bootstrap_cutoff=True)
+         bootstrap_before_group_boundary=True)
 
 
 def test_nstep_gate_rejects_non_positive_n() -> None:
@@ -107,7 +114,7 @@ def test_nstep_requires_delayed_predictions() -> None:
     step_stream, predictions, _ = _lambda_fixture()
     with pytest.raises(TypeError, match="delayed_predictions"):
         _nstep()(  # type: ignore[call-arg]
-            objective_data=step_stream,
+            objective_data=step_stream, group_id=_group_id(step_stream),
             predictions=predictions,
             reward_center=None,
         )
@@ -115,9 +122,9 @@ def test_nstep_requires_delayed_predictions() -> None:
 
 def test_nstep_one_matches_dqn() -> None:
     step_stream, predictions, delayed = _lambda_fixture()
-    nstep, metrics = _nstep(n=1)(objective_data=step_stream, predictions=predictions,  delayed_predictions=delayed, reward_center=None)
-    dqn, _ = DqnObjective( grouping_field=None, temperature=0.0, double=False, gate=None, discount=_disc(), reward=_rew(), value=_val(), bootstrap_cutoff=True)(
-        objective_data=step_stream, predictions=predictions,  delayed_predictions=delayed, reward_center=None
+    nstep, metrics = _nstep(n=1)(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  delayed_predictions=delayed, reward_center=None)
+    dqn, _ = DqnObjective(temperature=0.0, double=False, gate=None, discount=_disc(), reward=_rew(), value=_val(), bootstrap_before_group_boundary=True)(
+        objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  delayed_predictions=delayed, reward_center=None
     )
     assert abs(nstep.item() - dqn.item()) < 1e-05
     assert abs(nstep.item() - _ONE_STEP) < 1e-03
@@ -127,15 +134,15 @@ def test_nstep_one_matches_dqn() -> None:
 
 def test_nstep_two_is_the_two_step_return() -> None:
     step_stream, predictions, delayed = _lambda_fixture()
-    loss, _ = _nstep(n=2)(objective_data=step_stream, predictions=predictions,  delayed_predictions=delayed, reward_center=None)
+    loss, _ = _nstep(n=2)(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  delayed_predictions=delayed, reward_center=None)
     assert abs(loss.item() - _TWO_STEP) < 1e-03
 
 
 def test_nstep_past_batch_end_truncates_to_available_steps() -> None:
     """n larger than the remaining run is the same as the longest available."""
     step_stream, predictions, delayed = _lambda_fixture()
-    two, _ = _nstep(n=2)(objective_data=step_stream, predictions=predictions,  delayed_predictions=delayed, reward_center=None)
-    ten, _ = _nstep(n=10)(objective_data=step_stream, predictions=predictions,  delayed_predictions=delayed, reward_center=None)
+    two, _ = _nstep(n=2)(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  delayed_predictions=delayed, reward_center=None)
+    ten, _ = _nstep(n=10)(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  delayed_predictions=delayed, reward_center=None)
     assert abs(two.item() - ten.item()) < 1e-05
 
 
@@ -152,13 +159,13 @@ def test_n_step_targets_window() -> None:
     got, _ = _continuation_targets(
         reward=reward, discount_all=discount, v_step=v, pair_weight=pair_weight,
         continuation=nstep_gate(n=2)(q=q, action=action),
-     bootstrap_cutoff=True)
+     bootstrap_before_group_boundary=True)
     # G0 = 1 + 10 + 7 = 18; G1 = 10 + 100 + 11 = 121; G2 = 100 + 11 = 111.
     assert torch.allclose(got, torch.tensor([18.0, 121.0, 111.0]))
     full, _ = _continuation_targets(
         reward=reward, discount_all=discount, v_step=v, pair_weight=pair_weight,
         continuation=lambda_gate(td_lambda=1.0)(q=q, action=action),
-     bootstrap_cutoff=True)
+     bootstrap_before_group_boundary=True)
     # λ = 1 out to the run break keeps going: G0 = 1 + 10 + 100 + 11 = 122.
     assert torch.allclose(full, torch.tensor([122.0, 121.0, 111.0]))
 
@@ -181,7 +188,7 @@ def test_nstep_gate_returns_a_square_matrix() -> None:
     targets, _ = _continuation_targets(
         reward=reward, discount_all=discount, v_step=v, pair_weight=pair_weight,
         continuation=got,
-     bootstrap_cutoff=True)
+     bootstrap_before_group_boundary=True)
     assert torch.allclose(targets, torch.tensor([18.0, 121.0, 111.0]))
 
 
@@ -189,7 +196,7 @@ def test_nstep_terminal_gamma_zero_ends_the_sum() -> None:
     step_stream, predictions, delayed = _lambda_fixture()
     step_stream = {key: value.clone() for key, value in step_stream.items()}
     step_stream["episode_done"] = torch.tensor([0, 1, 0])
-    loss, _ = _nstep(n=2)(objective_data=step_stream, predictions=predictions,  delayed_predictions=delayed, reward_center=None)
+    loss, _ = _nstep(n=2)(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  delayed_predictions=delayed, reward_center=None)
     # s0: (5 - 1)^2 = 16 — neither V(s1) nor the next episode's return; s1: 12100.
     assert abs(loss.item() - (16.0 + 12100.0) / 2) < 1e-03
 
@@ -200,7 +207,7 @@ def test_nstep_truncation_gamma_carries_the_sum_discounted() -> None:
     step_stream["episode_done"] = torch.tensor([0, 2, 0])
     loss, _ = _nstep(
         n=2, discount=_disc(gamma_episode_truncated=0.5)
-    )(objective_data=step_stream, predictions=predictions,  delayed_predictions=delayed, reward_center=None)
+    )(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  delayed_predictions=delayed, reward_center=None)
     # s0: 1 + 0.5 * 10 + 0.5 * 100 = 56 → (5 - 56)^2 = 2601; s1: 12100.
     assert abs(loss.item() - (2601.0 + 12100.0) / 2) < 1e-03
 
@@ -208,9 +215,9 @@ def test_nstep_truncation_gamma_carries_the_sum_discounted() -> None:
 def test_nstep_does_not_cross_sequence_boundary() -> None:
     step_stream, predictions, delayed = _lambda_fixture()
     step_stream = {key: value.clone() for key, value in step_stream.items()}
-    step_stream["sequence_id"] = torch.tensor([0, 0, 1])
-    two, _ = _nstep(n=2)(objective_data=step_stream, predictions=predictions,  delayed_predictions=delayed, reward_center=None)
-    one, _ = _nstep(n=1)(objective_data=step_stream, predictions=predictions,  delayed_predictions=delayed, reward_center=None)
+    step_stream["group_id"] = torch.tensor([0, 0, 1])
+    two, _ = _nstep(n=2)(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  delayed_predictions=delayed, reward_center=None)
+    one, _ = _nstep(n=1)(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  delayed_predictions=delayed, reward_center=None)
     assert abs(two.item() - one.item()) < 1e-04
 
 
@@ -220,10 +227,10 @@ def test_nstep_all_out_of_run_pairs_yield_zero_loss() -> None:
             "reward": torch.tensor([0.0, 1.0, 5.0]),
             "episode_done": torch.zeros(3, dtype=torch.int64),
             "task_done": torch.zeros(3, dtype=torch.int64),
-            "sequence_id": torch.tensor([0, 1, 2]),
+            "group_id": torch.tensor([0, 1, 2]),
         }
     predictions, delayed = _q(torch.ones(3, 2), torch.ones(3, 2))
-    loss, metrics = _nstep(n=2)(objective_data=step_stream, predictions=predictions,  delayed_predictions=delayed, reward_center=None)
+    loss, metrics = _nstep(n=2)(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  delayed_predictions=delayed, reward_center=None)
     assert abs(loss.item()) < 1e-05
     assert abs(metrics["q_values_mean"]) < 1e-05
 
@@ -235,10 +242,10 @@ def test_nstep_trains_multiple_heads_independently() -> None:
     q3 = pred_1.detach().clone().requires_grad_(True)
     delayed_q = delayed_1
     loss_1, m1 = _nstep(n=1)(
-        objective_data=step_stream, predictions=q1,  delayed_predictions=delayed_q, reward_center=None
+        objective_data=step_stream, group_id=_group_id(step_stream), predictions=q1,  delayed_predictions=delayed_q, reward_center=None
     )
     loss_3, m3 = _nstep(n=3)(
-        objective_data=step_stream, predictions=q3,  delayed_predictions=delayed_q, reward_center=None
+        objective_data=step_stream, group_id=_group_id(step_stream), predictions=q3,  delayed_predictions=delayed_q, reward_center=None
     )
     assert abs(loss_1.item() - _ONE_STEP) < 1e-03
     assert abs(loss_3.item() - _TWO_STEP) < 1e-03
@@ -262,7 +269,7 @@ def test_nstep_does_not_backprop_through_delayed_q() -> None:
     online = torch.randn(n, a, requires_grad=True)
     delayed_q = torch.randn(n, a, requires_grad=True)
     predictions, delayed = _q(online, delayed_q)
-    loss, _ = _nstep(n=2)(objective_data=step_stream, predictions=predictions,  delayed_predictions=delayed, reward_center=None)
+    loss, _ = _nstep(n=2)(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  delayed_predictions=delayed, reward_center=None)
     loss.backward()
     assert online.grad is not None
     assert delayed_q.grad is None
@@ -280,14 +287,14 @@ def test_nstep_with_multiple_head_output_rows_per_step() -> None:
         [[0.0, 0.0], [0.0, 0.0], [3.0, 0.0], [-9.0, -9.0], [0.0, 100.0]]
     )
     predictions, delayed = _q(online, delayed_q)
-    loss, _ = _nstep(n=2)(objective_data=step_stream, predictions=predictions,  delayed_predictions=delayed, reward_center=None)
+    loss, _ = _nstep(n=2)(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  delayed_predictions=delayed, reward_center=None)
     # s0 rows: (5-111)^2 = 11236, (7-111)^2 = 10816; s1 row: (0-110)^2 = 12100.
     assert abs(loss.item() - (11236.0 + 10816.0 + 12100.0) / 3) < 1e-02
 
 
 def test_nstep_q_affine_applies_to_online_and_delayed() -> None:
     step_stream, predictions, delayed = _lambda_fixture()
-    loss, _ = _nstep(n=1, value=_val(scale=2.0))(objective_data=step_stream, predictions=predictions,  delayed_predictions=delayed, reward_center=None)
+    loss, _ = _nstep(n=1, value=_val(scale=2.0))(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  delayed_predictions=delayed, reward_center=None)
     expected = (9.0 + 44100.0) / 2
     assert abs(loss.item() - expected) < 1e-03
 
@@ -301,14 +308,14 @@ def test_nstep_requires_min_sequence() -> None:
         }
     predictions, delayed = _q(torch.zeros(1, 2), torch.zeros(1, 2))
     with pytest.raises(ValueError, match="Not enough"):
-        _nstep()(objective_data=step_stream, predictions=predictions,  delayed_predictions=delayed, reward_center=None)
+        _nstep()(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  delayed_predictions=delayed, reward_center=None)
 
 
 def test_nstep_rejects_non_fp32_q() -> None:
     step_stream, predictions, delayed = _lambda_fixture()
     predictions = predictions.to(torch.bfloat16)
     with pytest.raises(TypeError, match="float32"):
-        _nstep()(objective_data=step_stream, predictions=predictions,  delayed_predictions=delayed, reward_center=None)
+        _nstep()(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  delayed_predictions=delayed, reward_center=None)
 
 
 def test_nstep_temperature_matches_dqn_one_step() -> None:
@@ -320,9 +327,9 @@ def test_nstep_temperature_matches_dqn_one_step() -> None:
             "task_done": torch.zeros(2, dtype=torch.int64),
         }
     predictions, delayed = _q(torch.zeros(2, 2), torch.zeros(2, 2))
-    nstep_loss, nstep_m = _nstep(temperature=1.0)(objective_data=step_stream, predictions=predictions,  delayed_predictions=delayed, reward_center=None)
-    dqn_loss, dqn_m = DqnObjective( temperature=1.0, double=False, gate=None, grouping_field=None, discount=_disc(), reward=_rew(), value=_val(), bootstrap_cutoff=True)(
-        objective_data=step_stream, predictions=predictions,  delayed_predictions=delayed, reward_center=None
+    nstep_loss, nstep_m = _nstep(temperature=1.0)(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  delayed_predictions=delayed, reward_center=None)
+    dqn_loss, dqn_m = DqnObjective( temperature=1.0, double=False, gate=None, discount=_disc(), reward=_rew(), value=_val(), bootstrap_before_group_boundary=True)(
+        objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  delayed_predictions=delayed, reward_center=None
     )
     assert abs(nstep_loss.item() - dqn_loss.item()) < 1e-06
     assert abs(nstep_m["entropy"] - dqn_m["entropy"]) < 1e-06
@@ -330,7 +337,7 @@ def test_nstep_temperature_matches_dqn_one_step() -> None:
 
 def test_nstep_temperature_zero_omits_metric() -> None:
     step_stream, predictions, delayed = _lambda_fixture()
-    _, metrics = _nstep()(objective_data=step_stream, predictions=predictions,  delayed_predictions=delayed, reward_center=None)
+    _, metrics = _nstep()(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  delayed_predictions=delayed, reward_center=None)
     assert "entropy" not in metrics
 
 

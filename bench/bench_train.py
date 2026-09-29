@@ -61,33 +61,30 @@ if str(_BENCH_DIR) not in sys.path:
 from bench_profile import add_profile_args, profile_call, wants_profile
 
 
-def _workload(name: str, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+def _workload(name: str, device: torch.device) -> torch.Tensor:
+    """Flat sequence ids. Recurring names are many short sequences."""
     g = torch.Generator().manual_seed(0)
     if name == "short":
-        L, seqs, grp = 512, 4, None
+        L, seqs = 512, 4
+        seq = torch.arange(L) // (L // seqs)
     elif name == "mid":
-        L, seqs, grp = 4096, 8, None
+        L, seqs = 4096, 8
+        seq = torch.arange(L) // (L // seqs)
     elif name == "mid_recurring":
-        L, seqs = 4096, 4
-        grp = torch.randint(0, 3, (L,), generator=g)
+        seq = torch.randint(0, 3, (4096,), generator=g)
     elif name == "long":
-        L, seqs, grp = 16384, 4, None
-    elif name == "long_recurring":
         L, seqs = 16384, 4
-        grp = torch.randint(0, 4, (L,), generator=g)
+        seq = torch.arange(L) // (L // seqs)
+    elif name == "long_recurring":
+        seq = torch.randint(0, 4, (16384,), generator=g)
     elif name == "long_manysmall":
-        L, seqs = 16384, 8
-        grp = (torch.arange(L) // 32) % 64
+        seq = (torch.arange(16384) // 32) % 64
     elif name == "high_variance":
         lens = [17, 3000, 5, 900, 4000, 61, 2400, 1]
         seq = torch.cat([torch.full((n,), i) for i, n in enumerate(lens)])
-        return seq.to(device), torch.zeros(seq.shape[0], dtype=torch.long, device=device)
     else:
         raise ValueError(f"unknown workload {name!r}")
-    seq = torch.arange(L) // (L // seqs)
-    if grp is None:
-        grp = torch.zeros(L, dtype=torch.long)
-    return seq.to(device), grp.to(device)
+    return seq.to(device)
 
 
 def _timed(fn: Callable[[], Any], iters: int) -> tuple[float, float, float, float, float]:
@@ -179,20 +176,20 @@ def main() -> None:
             )
             print(f"\n### mode: {mode} | train_kernel: {kernel}")
             for wname in args.workloads:
-                seq, grp = _workload(wname, device)
+                seq = _workload(wname, device)
                 L = seq.shape[0]
                 embeds = torch.randn(L, args.hidden, device=device, dtype=dtype, requires_grad=True)
 
                 def fwd(kernel: TrainKernel = kernel) -> torch.Tensor:
                     with torch.no_grad():
                         return packed_forward(
-                            model=backbone.model, embeds=embeds, sequence_ids=seq, grouping_ids=grp,
+                            model=backbone.model, embeds=embeds, group_ids=seq,
                             train_kernel=kernel,
                         )
 
                 def fwd_bwd(kernel: TrainKernel = kernel) -> None:
                     out = packed_forward(
-                        model=backbone.model, embeds=embeds, sequence_ids=seq, grouping_ids=grp,
+                        model=backbone.model, embeds=embeds, group_ids=seq,
                         checkpoint=backbone.gradient_checkpointing, train_kernel=kernel,
                     )
                     out.float().square().mean().backward()
@@ -202,7 +199,7 @@ def main() -> None:
 
                 def train_step(kernel: TrainKernel = kernel) -> None:
                     out = packed_forward(
-                        model=backbone.model, embeds=embeds, sequence_ids=seq, grouping_ids=grp,
+                        model=backbone.model, embeds=embeds, group_ids=seq,
                         checkpoint=backbone.gradient_checkpointing, train_kernel=kernel,
                     )
                     out.float().square().mean().backward()
@@ -216,7 +213,7 @@ def main() -> None:
                 _, med_s, _, _, peak_s = _timed(train_step, iters)
                 diff = (fwd().float() - fwd(other).float()).abs().max().item()
                 print(
-                    f"  {wname:15s} L={L:6d} groups={int(torch.unique(seq * 2**20 + grp - grp.min()).numel()):4d} | "
+                    f"  {wname:15s} L={L:6d} sequences={int(seq.unique().numel()):4d} | "
                     f"fwd {med_f:8.2f} ms (+{peak_f:6.0f} MB) | fwd+bwd {med_b:8.2f} ms [{lo_b:.1f},{hi_b:.1f}] "
                     f"(+{peak_b:6.0f} MB) | step {med_s:8.2f} ms (+{peak_s:6.0f} MB) | "
                     f"{L / med_b * 1e3:>9,.0f} tok/s | first fwd {first_f:.0f} ms, first fwd+bwd {first_b:.0f} ms | "

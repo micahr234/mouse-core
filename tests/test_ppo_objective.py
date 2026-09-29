@@ -34,8 +34,13 @@ class _PpoCall:
         self.objective = objective
 
     def __call__(self, *, objective_data: dict[str, torch.Tensor], predictions: dict[str, torch.Tensor]):
+        group_id = objective_data["group_id"] if "group_id" in objective_data else torch.zeros(
+            int(objective_data["action"].shape[0]), dtype=torch.int64
+        )
+        data = {key: value for key, value in objective_data.items() if key != "group_id"}
         return self.objective(
-            objective_data=objective_data,
+            objective_data=data,
+            group_id=group_id,
             predictions=predictions["action"],
             value_predictions=predictions["value"],
         )
@@ -46,19 +51,18 @@ def _ppo(**overrides: object) -> _PpoCall:
         discount=_disc(gamma_step=0.99),
         reward=_rew(),
         value=_val(),
-        grouping_field=None,
-        bootstrap_cutoff=True,
+        bootstrap_before_group_boundary=True,
     )
     kwargs.update(overrides)
     return _PpoCall(PpoObjective(**kwargs))  # type: ignore[arg-type]
 
 
-def _ppo_batch(*, n: int=8, a: int=3, with_old_log_prob: bool=True, sequence_id: list[int] | None=None) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+def _ppo_batch(*, n: int=8, a: int=3, with_old_log_prob: bool=True, group_id: list[int] | None=None) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     action = torch.randint(0, a, (n,))
     reward = torch.randn(n)
     episode_done = torch.zeros(n, dtype=torch.long)
     task_done = torch.zeros(n, dtype=torch.long)
-    data: dict[str, torch.Tensor] = {'action': action, 'reward': reward, 'episode_done': episode_done, 'task_done': task_done, 'sequence_id': torch.tensor(sequence_id if sequence_id is not None else [0] * (n // 2) + [1] * (n - n // 2))}
+    data: dict[str, torch.Tensor] = {'action': action, 'reward': reward, 'episode_done': episode_done, 'task_done': task_done, 'group_id': torch.tensor(group_id if group_id is not None else [0] * (n // 2) + [1] * (n - n // 2))}
     if with_old_log_prob:
         data['old_log_prob'] = torch.randn(n)
     objective_data = data
@@ -107,46 +111,14 @@ def test_ppo_objective_closed_form_single_transition() -> None:
     assert abs(metrics['policy_loss'] - -3.0) < 0.001
     assert abs(metrics['value_loss'] - 9.0) < 0.001
 
-def test_ppo_masks_cross_task_pairs_only_when_grouping_field_set() -> None:
-    """Same sequence_id + a task change: grouping_field is the only cut.
-
-    ``task_done`` on the last row of task A discounts the *incoming* pair,
-    not the outgoing (A, B) pair. ``grouping_field=None`` trains that pair
-    (wrong action/reward from the new task). Omitting the argument is an
-    error — it must not silently default to no isolation.
-    """
-    objective_data = {
-            "action": torch.tensor([0, 0, 0]),
-            "reward": torch.tensor([0.0, 1.0, 5.0]),
-            "episode_done": torch.tensor([0, 0, 0]),
-            "task_done": torch.tensor([0, 0, 0]),
-            "old_log_prob": torch.tensor([0.0, 0.0, 0.0]),
-            "sequence_id": torch.tensor([0, 0, 0]),
-            "task_index": torch.tensor([0, 1, 1]),
-        }
-    predictions = {
-            "action": torch.tensor([[20.0, -20.0], [20.0, -20.0], [20.0, -20.0]]),
-            "value": torch.tensor([[0.0], [2.0], [0.0]]),
-        }
-    kwargs = dict(
-        discount=_disc(gamma_step=0.0), gae_lambda=1.0, vf_coef=1.0, ent_coef=0.0, normalize_advantage=False
-    )
-    loss_cut, _ = _ppo(grouping_field="task_index", **kwargs)(
-        objective_data=objective_data, predictions=predictions
-    )
-    assert abs(loss_cut.item() - 6.0) < 0.001
-    loss_leak, _ = _ppo(grouping_field=None, **kwargs)(objective_data=objective_data, predictions=predictions)
-    assert abs(loss_leak.item() - 6.0) > 0.1
-
-
 def test_ppo_objective_skips_transitions_across_sequences() -> None:
-    objective_data = {'action': torch.tensor([0, 0, 0]), 'reward': torch.tensor([0.0, 1.0, 5.0]), 'episode_done': torch.tensor([0, 0, 0]), 'task_done': torch.tensor([0, 0, 0]), 'old_log_prob': torch.tensor([0.0, 0.0, 0.0]), 'sequence_id': torch.tensor([0, 1, 1])}
+    objective_data = {'action': torch.tensor([0, 0, 0]), 'reward': torch.tensor([0.0, 1.0, 5.0]), 'episode_done': torch.tensor([0, 0, 0]), 'task_done': torch.tensor([0, 0, 0]), 'old_log_prob': torch.tensor([0.0, 0.0, 0.0]), 'group_id': torch.tensor([0, 1, 1])}
     predictions = {'action': torch.tensor([[20.0, -20.0], [20.0, -20.0], [20.0, -20.0]]), 'value': torch.tensor([[0.0], [2.0], [0.0]])}
     loss, _ = _ppo(discount=_disc(gamma_step=0.0), gae_lambda=1.0, vf_coef=1.0, ent_coef=0.0, normalize_advantage=False)(objective_data=objective_data, predictions=predictions)
     assert abs(loss.item() - 6.0) < 0.001
 
 def test_ppo_objective_all_out_of_run_pairs_yield_zero_loss() -> None:
-    objective_data = {'action': torch.tensor([0, 1, 0]), 'reward': torch.tensor([0.0, 1.0, 5.0]), 'episode_done': torch.tensor([0, 0, 0]), 'task_done': torch.tensor([0, 0, 0]), 'sequence_id': torch.tensor([0, 1, 2])}
+    objective_data = {'action': torch.tensor([0, 1, 0]), 'reward': torch.tensor([0.0, 1.0, 5.0]), 'episode_done': torch.tensor([0, 0, 0]), 'task_done': torch.tensor([0, 0, 0]), 'group_id': torch.tensor([0, 1, 2])}
     predictions = {'action': torch.zeros(3, 2), 'value': torch.zeros(3, 1)}
     loss, metrics = _ppo()(objective_data=objective_data, predictions=predictions)
     assert abs(loss.item()) < 1e-05
@@ -172,12 +144,7 @@ def test_sample_discrete_action_shapes() -> None:
     assert log_probs.shape == (4,)
 
 
-def test_ppo_requires_grouping_field_argument() -> None:
-    with pytest.raises(TypeError, match="grouping_field"):
-        PpoObjective(discount=_disc(), reward=_rew(), value=_val(), bootstrap_cutoff=True)  # type: ignore[call-arg]
-
-
-def test_ppo_bootstrap_cutoff_is_switchable() -> None:
+def test_ppo_bootstrap_before_group_boundary_is_switchable() -> None:
     """GAE bootstraps at the batch end when the flag is on. A non-zero factor drops the step when it is off."""
     predictions = {
         "action": torch.tensor([[20.0, -20.0], [20.0, -20.0]]),
@@ -191,7 +158,7 @@ def test_ppo_bootstrap_cutoff_is_switchable() -> None:
         normalize_advantage=False,
     )
 
-    def run(*, bootstrap_cutoff: bool, episode_done: torch.Tensor) -> tuple[float, dict[str, float | torch.Tensor]]:
+    def run(*, bootstrap_before_group_boundary: bool, episode_done: torch.Tensor) -> tuple[float, dict[str, float | torch.Tensor]]:
         objective_data = {
             "action": torch.tensor([0, 0]),
             "reward": torch.tensor([0.0, 4.0]),
@@ -199,22 +166,22 @@ def test_ppo_bootstrap_cutoff_is_switchable() -> None:
             "task_done": torch.tensor([0, 0]),
             "old_log_prob": torch.tensor([0.0, 0.0]),
         }
-        loss, metrics = _ppo(bootstrap_cutoff=bootstrap_cutoff, **common)(
+        loss, metrics = _ppo(bootstrap_before_group_boundary=bootstrap_before_group_boundary, **common)(
             objective_data=objective_data, predictions=predictions,
         )
         return float(loss.item()), metrics
 
     # δ = 4 + V(s') - 1 = 8; value loss 64; policy loss -8.
-    on_loss, on_metrics = run(bootstrap_cutoff=True, episode_done=torch.tensor([0, 0]))
+    on_loss, on_metrics = run(bootstrap_before_group_boundary=True, episode_done=torch.tensor([0, 0]))
     assert abs(on_loss - 56.0) < 0.001
     assert abs(on_metrics["value_mean"] - 1.0) < 0.001
     # The only step's factor on V(s') is non-zero, so it leaves the loss and the logs.
-    off_loss, off_metrics = run(bootstrap_cutoff=False, episode_done=torch.tensor([0, 0]))
+    off_loss, off_metrics = run(bootstrap_before_group_boundary=False, episode_done=torch.tensor([0, 0]))
     assert abs(off_loss) < 0.001
     assert abs(off_metrics["value_mean"]) < 0.001
     assert abs(off_metrics["policy_loss"]) < 0.001
     truncated = _disc(gamma_step=1.0, gamma_episode_truncated=1.0)
-    on, on_logs = _ppo(bootstrap_cutoff=True, discount=truncated, gae_lambda=1.0, vf_coef=1.0, ent_coef=0.0, normalize_advantage=False)(
+    on, on_logs = _ppo(bootstrap_before_group_boundary=True, discount=truncated, gae_lambda=1.0, vf_coef=1.0, ent_coef=0.0, normalize_advantage=False)(
         objective_data={
             "action": torch.tensor([0, 0]),
             "reward": torch.tensor([0.0, 4.0]),
@@ -224,7 +191,7 @@ def test_ppo_bootstrap_cutoff_is_switchable() -> None:
         },
         predictions=predictions,
     )
-    off, off_logs = _ppo(bootstrap_cutoff=False, discount=truncated, gae_lambda=1.0, vf_coef=1.0, ent_coef=0.0, normalize_advantage=False)(
+    off, off_logs = _ppo(bootstrap_before_group_boundary=False, discount=truncated, gae_lambda=1.0, vf_coef=1.0, ent_coef=0.0, normalize_advantage=False)(
         objective_data={
             "action": torch.tensor([0, 0]),
             "reward": torch.tensor([0.0, 4.0]),
@@ -238,8 +205,8 @@ def test_ppo_bootstrap_cutoff_is_switchable() -> None:
     assert abs(on_logs["value_mean"] - 1.0) < 0.001
     assert abs(off.item()) < 0.001
     assert abs(off_logs["value_mean"]) < 0.001
-    terminal_on, terminal_on_logs = run(bootstrap_cutoff=True, episode_done=torch.tensor([0, 1]))
-    terminal_off, terminal_off_logs = run(bootstrap_cutoff=False, episode_done=torch.tensor([0, 1]))
+    terminal_on, terminal_on_logs = run(bootstrap_before_group_boundary=True, episode_done=torch.tensor([0, 1]))
+    terminal_off, terminal_off_logs = run(bootstrap_before_group_boundary=False, episode_done=torch.tensor([0, 1]))
     assert abs(terminal_on - 6.0) < 0.001
     assert abs(terminal_off - terminal_on) < 1e-05
     assert abs(terminal_off_logs["value_mean"] - terminal_on_logs["value_mean"]) < 1e-05
@@ -259,9 +226,9 @@ def test_ppo_zero_lambda_keeps_the_in_sample_step() -> None:
         "old_log_prob": torch.zeros(3),
     }
 
-    def run(*, bootstrap_cutoff: bool, gae_lambda: float) -> tuple[float, dict[str, float | torch.Tensor]]:
+    def run(*, bootstrap_before_group_boundary: bool, gae_lambda: float) -> tuple[float, dict[str, float | torch.Tensor]]:
         loss, metrics = _ppo(
-            bootstrap_cutoff=bootstrap_cutoff,
+            bootstrap_before_group_boundary=bootstrap_before_group_boundary,
             discount=_disc(gamma_step=1.0),
             gae_lambda=gae_lambda,
             vf_coef=1.0,
@@ -271,25 +238,25 @@ def test_ppo_zero_lambda_keeps_the_in_sample_step() -> None:
         return float(loss.item()), metrics
 
     # t0 uses V(s1)=2 inside the run. δ = 5, return = 6, value loss 25, policy -5.
-    off, off_logs = run(bootstrap_cutoff=False, gae_lambda=0.0)
+    off, off_logs = run(bootstrap_before_group_boundary=False, gae_lambda=0.0)
     assert abs(off - 20.0) < 0.001
     assert abs(off_logs["value_mean"] - 1.0) < 0.001
-    on, on_logs = run(bootstrap_cutoff=True, gae_lambda=0.0)
+    on, on_logs = run(bootstrap_before_group_boundary=True, gae_lambda=0.0)
     assert abs(on - 65.0) < 0.001
     assert abs(on_logs["value_mean"] - 1.5) < 0.001
     # λ = 1 carries V(s2) into both steps. The factor is non-zero, so both drop.
-    carried_off, carried_logs = run(bootstrap_cutoff=False, gae_lambda=1.0)
+    carried_off, carried_logs = run(bootstrap_before_group_boundary=False, gae_lambda=1.0)
     assert abs(carried_off) < 0.001
     assert abs(carried_logs["value_mean"]) < 0.001
-    carried_on, carried_on_logs = run(bootstrap_cutoff=True, gae_lambda=1.0)
+    carried_on, carried_on_logs = run(bootstrap_before_group_boundary=True, gae_lambda=1.0)
     assert abs(carried_on - 175.0) < 0.001
     assert abs(carried_on_logs["value_mean"] - 1.5) < 0.001
 
 
-def test_ppo_requires_bootstrap_cutoff_argument() -> None:
-    with pytest.raises(TypeError, match="bootstrap_cutoff"):
+def test_ppo_requires_bootstrap_before_group_boundary_argument() -> None:
+    with pytest.raises(TypeError, match="bootstrap_before_group_boundary"):
         PpoObjective(  # type: ignore[call-arg]
-            discount=_disc(), reward=_rew(), value=_val(), grouping_field=None,
+            discount=_disc(), reward=_rew(), value=_val(),
         )
 
 
