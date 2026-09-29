@@ -603,7 +603,8 @@ def general_gate(*, gates: Sequence[Gate]) -> Gate:
 
         acc = matrix_of(chosen[0])
         for item in chosen[1:]:
-            acc.mul_(matrix_of(item))
+            # Out-of-place: a gate may return a cached tensor it owns.
+            acc = acc * matrix_of(item)
         return acc
 
     return gate

@@ -17,8 +17,8 @@ from mouse_core.models.heads import (
     prediction_key,
 )
 from mouse_core.models.reasoner import LatentReasoner, sample_reasoning_splits
-from mouse_core.models.reward_centering import RewardCentering
-from mouse_core.polyak import Polyak
+from mouse_core.models.reward_centering import RewardCentering, reward_centering_polyak
+from mouse_core.polyak import model_polyak
 from mouse_core.data.token_batch import TokenBatch
 from mouse_core.models.kv_policy import cache_needs_rebuild, rebuild_starts, resolve_cache_bounds
 
@@ -37,8 +37,9 @@ __all__ = [
     "HeadSpec",
     "LatentReasoner",
     "LoRAConfig",
-    "Polyak",
+    "model_polyak",
     "RewardCentering",
+    "reward_centering_polyak",
     "sample_reasoning_splits",
     "ClassificationHead",
     "RegressionHead",

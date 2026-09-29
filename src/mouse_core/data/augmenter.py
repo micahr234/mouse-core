@@ -17,8 +17,8 @@ id share draws within one :meth:`Augmenter.reseed` generation. Mask decisions
 Discrete permute specs remap ``input_field`` ids; optional
 ``input_vector_field`` / ``output_vector_field`` vectors share that
 permutation (inverse-permuted along the last axis).
-``DataLoader`` calls ``train_transform.reseed(generation=k * B + b)`` before
-each sampled sequence ``b`` of batch ``k``, so every draw is a pure function
+``DataLoader`` calls ``train_transform.reseed`` with a generation unique to
+each sampled sequence, so every draw is a pure function
 of ``(seed, sequence generation, seed_field value)`` no matter which worker
 thread builds the batch. Two windows that share a ``seed_field`` value still
 get independent starting seeds; steps inside one window that share the value
@@ -345,9 +345,11 @@ class Augmenter:
         on this thread (a thread on an older pin is not disturbed).
         ``generation=k`` pins ``k`` on this thread without touching the
         counter — ``DataLoader`` passes a unique generation per sampled
-        sequence (``batch_index * batch_size + sequence_index``) so two
-        windows that share a ``seed_field`` value get different starting
-        seeds. Either way the calling thread's draw cache is dropped.
+        sequence (``batch_index * stride + sequence_index``). The stride
+        covers every generation that batch draws, so the next batch does not
+        collide, and two sequences that share a ``seed_field`` value get
+        different starting seeds. Either way the calling thread's draw
+        cache is dropped.
         """
         if generation is None:
             with self._lock:

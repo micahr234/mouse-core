@@ -1,11 +1,21 @@
 """DataLoader — sample ragged windows, apply a per-step transform, pack.
 
-A ``Datastore`` is a flat sequence of arbitrary rows. The loader samples
-``B`` sequences, each a contiguous store window of length ``1 .. sequence_length``
-(a max), runs ``transform(step)`` on every step, and packs the resulting
-:class:`~mouse_core.data.token_batch.StepTokens` into a
-:class:`~mouse_core.data.token_batch.TokenBatch` plus a CPU
-``dict[str, Tensor]`` of step-level objective columns.
+A ``Datastore`` is a flat sequence of arbitrary rows. Pass exactly one
+of ``sequence_length`` or ``token_budget``:
+
+* ``sequence_length`` — ``batch_size`` examples. That count does not
+  depend on length. Each example is that many steps (fewer only when
+  ``sample_end`` or the store ends the window first).
+* ``token_budget`` — ``batch_size`` fills. That count does not depend
+  on the budget. Each fill adds whole segments until the next one would
+  pass that many packed tokens. A segment is one ``sample_start`` /
+  ``sample_end`` window (``sample_end`` is required). A segment that
+  does not fit is left out. The first segment of a fill is left out too
+  when it alone is over the budget, and that raises. Each segment is
+  its own sequence. Examples pass ``batch_size=1`` (one fill).
+
+Each segment stays its own sequence. Token ``sequence_ids`` and
+objective ``sequence_id`` are ``0 .. B - 1``, one contiguous block each.
 
 ``sample_start=None`` (the default) may begin a window at any store
 offset. ``sample_start`` may also be a callable
@@ -13,10 +23,10 @@ offset. ``sample_start`` may also be a callable
 whole store, and ``True`` marks legal start rows (the matching row
 itself). Notebooks often define a ``full_task_start`` callable inline
 so windows open only on ``episode_index == 0`` and ``step_index == 0``.
-The window then runs forward for
-``min(sequence_length, steps remaining in the store)`` — the same
-ragged suffix as unrestricted sampling — unless ``sample_end`` is
-set.
+With ``sequence_length``, the window then runs forward for that many
+steps, or fewer when the store ends. With ``token_budget``, there is
+no step cap: the window runs to ``sample_end`` (searching to the store
+end). The packed batch keeps that whole segment or leaves it out.
 
 ``sample_end=None`` (the default) never truncates early for a field.
 ``sample_end`` may be a callable ``cols → bool ndarray`` over the
@@ -30,25 +40,30 @@ is set but no matching row appears strictly after the start and before
 ``sequence_length`` or the store end for a chosen start, that draw is
 discarded and another start is sampled (not a silent truncate).
 Exhaustion — every candidate start incomplete, or too many consecutive
-misses — raises ``ValueError``. Every yielded window with
+misses — raises ``ValueError``. Every candidate window with
 ``sample_end`` set must end on a match; a broken invariant raises.
+``token_budget`` packs that whole window or leaves it out.
 
 The loader is stage-agnostic: compose augmenter / tokenizer
 (or any ``dict → StepTokens`` callable) outside and pass the result as
 ``transform=``. Before each sampled sequence ``b`` of batch ``k``, if
-``transform`` defines ``reseed()``, it is called as
-``reseed(generation=k * batch_size + b)`` so an
+``transform`` defines ``reseed()``, it is called with a generation
+unique to that sequence. ``sequence_length`` uses
+``k * batch_size + b``. ``token_budget`` uses
+``k * batch_size * (token_budget + 1) + fill * (token_budget + 1) + attempt``
+(one attempt past the segments that fit in that fill, so the stride
+does not collide). An
 :class:`~mouse_core.data.augmenter.Augmenter` in the compose pipeline
-draws a starting seed unique to that window. Steps that share a
-``seed_field`` value inside one window still share permute/scale/shift
-draws; the same index on two windows does not.
+draws a starting seed unique to that sequence.
+Steps that share a ``seed_field`` value inside one window still share
+permute/scale/shift draws; the same index on two windows does not.
 
 Determinism
 -----------
 Batches are numbered ``k = 0, 1, 2, ...`` in the order :meth:`DataLoader.next_batch`
 returns them. Batch ``k`` samples its windows from
 ``SeedSequence(seed, spawn_key=(k,))`` and reseeds the transform once per
-sequence with ``generation=k * batch_size + b``, so it is a pure function
+sequence with a generation unique to ``(k, sequence)``, so it is a pure function
 of ``(seed, k, store snapshot)``:
 ``num_workers`` changes only throughput, never the stream. Workers claim
 indices from a shared counter and the consumer hands batches out in index
@@ -132,8 +147,9 @@ class _SnapshotConfig:
     datasets: tuple[Any, ...]
     ns: tuple[int, ...]
     probs: np.ndarray
-    sequence_length: int
-    batch_size: int
+    sequence_length: int | None
+    batch_size: int | None
+    token_budget: int | None
     index_field: str | None
     start_indices: tuple[np.ndarray, ...] | None
     end_fn: SampleFn | None
@@ -354,11 +370,28 @@ def _rows_from_slice(
     return rows
 
 
+def _span_steps(cfg: _SnapshotConfig, n: int, start: int) -> int:
+    """How far past ``start`` a candidate window may look.
+
+    ``sequence_length`` is a step cap. ``token_budget`` has no step cap,
+    so the look-ahead runs to the store end (``sample_end`` may stop it).
+    """
+    if cfg.sequence_length is not None:
+        return cfg.sequence_length
+    return n - start
+
+
+def _limit_label(cfg: _SnapshotConfig) -> str:
+    if cfg.sequence_length is not None:
+        return f"sequence_length={cfg.sequence_length}"
+    return "token_budget (search runs to the store end)"
+
+
 def _fetch_sequence(
     cfg: _SnapshotConfig,
     rng: np.random.Generator,
-) -> list[dict]:
-    """Fetch one contiguous window of length ``1 .. sequence_length``.
+) -> tuple[Any, int, int]:
+    """Choose one window. Return ``(dataset, start, exclusive_end)``.
 
     With ``sample_end`` set, incomplete starts (no end match strictly
     after the start within the allowed range) are discarded and another
@@ -368,15 +401,14 @@ def _fetch_sequence(
     if sum(cfg.ns) == 0:
         raise ValueError("Cannot sample batches: all stores are empty.")
 
-    S_max = cfg.sequence_length
     end_fn = cfg.end_fn
     if end_fn is None:
         _, ds, n, start = _pick_store_and_start(cfg=cfg, rng=rng)
-        end = _window_end(start=start, n=n, s_max=S_max, ds=ds, end_fn=None)
-        assert end is not None
-        return _rows_from_slice(
-            ds=ds, start=start, end=end, index_field=cfg.index_field
+        end = _window_end(
+            start=start, n=n, s_max=_span_steps(cfg, n, start), ds=ds, end_fn=None
         )
+        assert end is not None
+        return ds, start, end
 
     incomplete: set[tuple[int, int]] = set()
     for _ in range(_SAMPLE_END_MAX_RETRIES):
@@ -389,7 +421,7 @@ def _fetch_sequence(
         end = _window_end(
             start=start,
             n=n,
-            s_max=S_max,
+            s_max=_span_steps(cfg, n, start),
             ds=ds,
             end_fn=end_fn,
         )
@@ -401,21 +433,20 @@ def _fetch_sequence(
         _require_window_ends_on_sample_end(
             ds=ds, start=start, end=end, end_fn=end_fn
         )
-        return _rows_from_slice(
-            ds=ds, start=start, end=end, index_field=cfg.index_field
-        )
+        return ds, start, end
 
+    limit = _limit_label(cfg)
     if incomplete and _all_sample_starts_exhausted(cfg=cfg, incomplete=incomplete):
         raise ValueError(
             "No complete sample_end window in the store(s): "
             f"{_sample_end_label(end_fn)}; "
             f"tried {len(incomplete)} distinct incomplete start(s); "
-            f"sequence_length={S_max}."
+            f"{limit}."
         )
     raise ValueError(
         "Could not sample a complete sample_end window after "
         f"{_SAMPLE_END_MAX_RETRIES} attempts: {_sample_end_label(end_fn)}; "
-        f"incomplete_starts_seen={len(incomplete)}, sequence_length={S_max}."
+        f"incomplete_starts_seen={len(incomplete)}, {limit}."
     )
 
 
@@ -424,9 +455,196 @@ def _batch_rng(entropy: int, k: int) -> np.random.Generator:
     return np.random.default_rng(np.random.SeedSequence(entropy, spawn_key=(k,)))
 
 
-def _sequence_generation(*, batch_index: int, sequence_index: int, batch_size: int) -> int:
-    """Unique augmenter generation for sequence ``b`` of batch ``k``."""
-    return batch_index * batch_size + sequence_index
+def _sequence_generation(*, batch_index: int, sequence_index: int, stride: int) -> int:
+    """Unique augmenter generation for sequence ``sequence_index`` of batch ``k``.
+
+    ``stride`` is ``batch_size`` or ``token_budget + 1``. Either is at least
+    the number of generations that batch draws, so the next batch does not collide.
+    """
+    return batch_index * stride + sequence_index
+
+
+def _step_token_count(step: StepTokens, last_gid: int | None) -> int:
+    """Packed tokens this step adds inside its own example.
+
+    Includes group-start tokens when ``grouping_id`` changes, matching
+    :func:`~mouse_core.data.token_batch.pack_token_batch` for a fresh
+    sequence. The step and those group-start tokens are one unit.
+    """
+    extra = 0
+    if step.group_start_ids is not None and last_gid != step.grouping_id:
+        extra = int(step.group_start_ids.shape[0])
+    return extra + int(step.T)
+
+
+def _take_window_steps(
+    *,
+    ds: Any,
+    start: int,
+    end: int,
+    index_field: str | None,
+    transform: StepTransform,
+) -> list[StepTokens]:
+    """Every step of ``[start, end)``. The window is not trimmed."""
+    kept: list[StepTokens] = []
+    i = start
+    while i < end:
+        chunk_end = min(end, i + 32)
+        chunk = _rows_from_slice(
+            ds=ds, start=i, end=chunk_end, index_field=index_field
+        )
+        kept.extend(transform(row) for row in chunk)
+        i = chunk_end
+    return kept
+
+
+def _segment_token_count(steps: list[StepTokens]) -> int:
+    """Packed tokens of one segment, including its group-start tokens."""
+    tokens = 0
+    last_gid: int | None = None
+    for step in steps:
+        tokens += _step_token_count(step, last_gid)
+        last_gid = int(step.grouping_id)
+    return tokens
+
+
+def _append_window(
+    *,
+    steps: list[StepTokens],
+    sequence_ids: list[int],
+    window: list[StepTokens],
+    sequence_id: int,
+) -> str | None:
+    if not window:
+        return None
+    steps.extend(window)
+    sequence_ids.extend([sequence_id] * len(window))
+    return window[0].grouping_field
+
+
+def _fetch_sequence_length_batch(
+    cfg: _SnapshotConfig,
+    entropy: int,
+    k: int,
+    transform: StepTransform,
+) -> tuple[TokenBatch, dict[str, torch.Tensor]]:
+    """Build batch ``k``: exactly ``batch_size`` windows of ``sequence_length``."""
+    assert cfg.batch_size is not None
+    rng = _batch_rng(entropy, k)
+    reseed = getattr(transform, "reseed", None)
+    steps: list[StepTokens] = []
+    sequence_ids: list[int] = []
+    grouping_field: str | None = None
+    for b in range(cfg.batch_size):
+        ds, start, end = _fetch_sequence(cfg, rng)
+        if callable(reseed):
+            reseed(
+                generation=_sequence_generation(
+                    batch_index=k,
+                    sequence_index=b,
+                    stride=cfg.batch_size,
+                )
+            )
+        window = _take_window_steps(
+            ds=ds,
+            start=start,
+            end=end,
+            index_field=cfg.index_field,
+            transform=transform,
+        )
+        field = _append_window(
+            steps=steps,
+            sequence_ids=sequence_ids,
+            window=window,
+            sequence_id=b,
+        )
+        if grouping_field is None:
+            grouping_field = field
+    return pack_token_batch(
+        steps=steps,
+        sequence_ids=sequence_ids,
+        batch_size=cfg.batch_size,
+        grouping_field=grouping_field,
+    )
+
+
+def _fetch_token_budget_batch(
+    cfg: _SnapshotConfig,
+    entropy: int,
+    k: int,
+    transform: StepTransform,
+) -> tuple[TokenBatch, dict[str, torch.Tensor]]:
+    """Fill batch ``k`` ``batch_size`` times up to ``token_budget``.
+
+    Each fill samples whole segments. The next segment is measured, and
+    if it does not fit entirely it is left out and that fill stops. A
+    fill whose first segment does not fit raises. Each kept segment is
+    its own sequence.
+    """
+    assert cfg.token_budget is not None and cfg.batch_size is not None
+    budget = cfg.token_budget
+    rng = _batch_rng(entropy, k)
+    reseed = getattr(transform, "reseed", None)
+    steps: list[StepTokens] = []
+    sequence_ids: list[int] = []
+    grouping_field: str | None = None
+    n_seq = 0
+    # One rejected segment after the ones that fit in a fill. Each
+    # segment is at least one token, so a fill stays within this width.
+    per_fill = budget + 1
+    stride = cfg.batch_size * per_fill
+    for fill in range(cfg.batch_size):
+        tokens = 0
+        added = 0
+        attempt = 0
+        while True:
+            ds, start, end = _fetch_sequence(cfg, rng)
+            if callable(reseed):
+                reseed(
+                    generation=_sequence_generation(
+                        batch_index=k,
+                        sequence_index=fill * per_fill + attempt,
+                        stride=stride,
+                    )
+                )
+            attempt += 1
+            window = _take_window_steps(
+                ds=ds,
+                start=start,
+                end=end,
+                index_field=cfg.index_field,
+                transform=transform,
+            )
+            cost = _segment_token_count(window)
+            if cost < 1:
+                raise ValueError(
+                    "Sampled segment produced no packed tokens "
+                    f"(start={start}, exclusive_end={end})."
+                )
+            if tokens + cost > budget:
+                if added == 0:
+                    raise ValueError(
+                        f"Sampled segment is {cost} packed tokens and does not fit "
+                        f"in token_budget={budget}."
+                    )
+                break
+            field = _append_window(
+                steps=steps,
+                sequence_ids=sequence_ids,
+                window=window,
+                sequence_id=n_seq,
+            )
+            if grouping_field is None:
+                grouping_field = field
+            tokens += cost
+            n_seq += 1
+            added += 1
+    return pack_token_batch(
+        steps=steps,
+        sequence_ids=sequence_ids,
+        batch_size=n_seq,
+        grouping_field=grouping_field,
+    )
 
 
 def _fetch_one_batch(
@@ -435,34 +653,10 @@ def _fetch_one_batch(
     k: int,
     transform: StepTransform,
 ) -> tuple[TokenBatch, dict[str, torch.Tensor]]:
-    """Build batch ``k``: sample windows, reseed each sequence, pack."""
-    rng = _batch_rng(entropy, k)
-    sequences = [_fetch_sequence(cfg, rng) for _ in range(cfg.batch_size)]
-    reseed = getattr(transform, "reseed", None)
-    steps: list[StepTokens] = []
-    sequence_ids: list[int] = []
-    grouping_field: str | None = None
-    for b, seq in enumerate(sequences):
-        if callable(reseed):
-            reseed(
-                generation=_sequence_generation(
-                    batch_index=k,
-                    sequence_index=b,
-                    batch_size=cfg.batch_size,
-                )
-            )
-        for step in seq:
-            packed = transform(step)
-            if grouping_field is None:
-                grouping_field = packed.grouping_field
-            steps.append(packed)
-            sequence_ids.append(b)
-    return pack_token_batch(
-        steps=steps,
-        sequence_ids=sequence_ids,
-        batch_size=cfg.batch_size,
-        grouping_field=grouping_field,
-    )
+    """Build batch ``k``."""
+    if cfg.token_budget is not None:
+        return _fetch_token_budget_batch(cfg, entropy, k, transform)
+    return _fetch_sequence_length_batch(cfg, entropy, k, transform)
 
 
 class _WorkerFailure:
@@ -536,26 +730,39 @@ class DataLoader:
         A single ``Datastore`` or a list of them. Each store is snapshotted
         at construction (and on :meth:`refresh`) via ``Datastore.to_dataset()``.
     sequence_length :
-        Maximum length of each contiguous window (in steps).
+        Steps in each example. Fewer only when ``sample_end`` or the store
+        ends the window first. Requires ``batch_size``. Pass this or
+        ``token_budget``, not both.
     sample_start :
         When ``None`` (default), a window may start at any store offset.
         When a callable ``cols → bool ndarray``, every window starts on a
         row where the mask is ``True`` (the matching row itself).
         ``cols`` maps column name → 1-d array over the store. Without
-        ``sample_end``, the window still runs forward until
-        ``sequence_length`` or the store ends.
+        ``sample_end``, a ``sequence_length`` window runs forward that
+        many steps or to the store end. A ``token_budget`` segment runs
+        from that start through ``sample_end``.
     sample_end :
-        When ``None`` (default), the window stops only at ``sequence_length``
-        or the store end. When a callable ``cols → bool ndarray`` over the
-        candidate window, the window includes the first ``True`` row
-        strictly after the start index then stops (the start row never
-        counts as the end). Incomplete starts (no match strictly after
-        start and before ``sequence_length`` / store end) are skipped and
-        another start is drawn. Exhaustion or a yielded window that
-        somehow lacks an end match raises ``ValueError``. A short matching
-        segment is a shorter window; rows are not padded.
+        When ``None`` (default), a ``sequence_length`` window stops at
+        ``sequence_length`` or the store end. ``token_budget`` requires
+        this callable: the segment is the start row through the first
+        ``True`` row strictly after the start. Incomplete starts are
+        skipped and another start is drawn. Exhaustion or a candidate
+        window that somehow lacks an end match raises ``ValueError``.
+        A short matching segment is a shorter example; rows are not padded.
+        ``token_budget`` keeps the whole segment or leaves it out.
     batch_size :
-        How many such windows per batch.
+        With ``sequence_length``, the number of examples. With
+        ``token_budget``, how many times that budget is filled in the
+        returned batch. Independent of either length. Examples that use
+        ``token_budget`` pass ``1``.
+    token_budget :
+        Packed tokens per fill (step tokens plus each segment's
+        group-start tokens). Whole ``sample_start`` / ``sample_end``
+        segments are added until the next segment would pass the budget.
+        A segment that does not fit is left out. The first segment of a
+        fill is left out too when it alone is over the budget, and that
+        raises. Pass this or ``sequence_length``, not both. Requires
+        ``sample_end`` and ``batch_size``.
     transform :
         Required ``dict → StepTokens`` callable applied to every step.
         Compose pipeline stages outside the loader; packing is loader-owned.
@@ -575,9 +782,10 @@ class DataLoader:
         self,
         *,
         stores: Datastore | list[Datastore],
-        sequence_length: int,
-        batch_size: int,
         transform: StepTransform,
+        sequence_length: int | None = None,
+        token_budget: int | None = None,
+        batch_size: int | None = None,
         sample_start: SampleFn | None = None,
         sample_end: SampleFn | None = None,
         index_field: str | None = None,
@@ -610,8 +818,22 @@ class DataLoader:
             )
         if weight_mode not in ("per_store", "per_step"):
             raise ValueError(f"weight_mode must be 'per_store' or 'per_step', got {weight_mode!r}")
-        if sequence_length < 1:
+        if (sequence_length is None) == (token_budget is None):
+            raise ValueError(
+                "Pass exactly one of sequence_length or token_budget."
+            )
+        if sequence_length is not None and sequence_length < 1:
             raise ValueError(f"sequence_length must be >= 1, got {sequence_length}.")
+        if token_budget is not None and token_budget < 1:
+            raise ValueError(f"token_budget must be >= 1, got {token_budget}.")
+        if batch_size is None:
+            raise ValueError("batch_size is required.")
+        if batch_size < 1:
+            raise ValueError(f"batch_size must be >= 1, got {batch_size}.")
+        if token_budget is not None and sample_end is None:
+            raise ValueError(
+                "token_budget requires sample_end to define each segment."
+            )
         if sample_start is not None and not callable(sample_start):
             raise TypeError(
                 "sample_start must be a callable cols → bool ndarray, or None, "
@@ -622,8 +844,6 @@ class DataLoader:
                 "sample_end must be a callable cols → bool ndarray, or None, "
                 f"got {type(sample_end).__name__}."
             )
-        if batch_size < 1:
-            raise ValueError(f"batch_size must be >= 1, got {batch_size}.")
         if prefetch < 1:
             raise ValueError(f"prefetch must be >= 1, got {prefetch}.")
         if weights is not None:
@@ -641,6 +861,7 @@ class DataLoader:
         self.stores = stores
         self.sequence_length = sequence_length
         self.batch_size = batch_size
+        self.token_budget = token_budget
         self.sample_start = sample_start
         self.sample_end = sample_end
         self.weight_mode = weight_mode
@@ -667,7 +888,16 @@ class DataLoader:
 
     @property
     def total_batches(self) -> int:
-        """Approximate total non-overlapping max-windows across all stores."""
+        """Approximate batches of ``batch_size`` non-overlapping windows.
+
+        Defined for ``sequence_length``. ``token_budget`` batches have no
+        fixed width.
+        """
+        if self.sequence_length is None or self.batch_size is None:
+            raise ValueError(
+                "total_batches counts sequence_length windows; "
+                "token_budget batches have no fixed width."
+            )
         total_windows = sum(n // self.sequence_length for n in self._ns)
         return max(0, (total_windows + self.batch_size - 1) // self.batch_size)
 
@@ -731,8 +961,9 @@ class DataLoader:
             f"{s.name or '?'}({n})" for s, n in zip(self.stores, self._ns)
         )
         return (
-            f"DataLoader(stores=[{store_info}], S_max={self.sequence_length}, "
-            f"B={self.batch_size}, sample_start={self.sample_start!r}, "
+            f"DataLoader(stores=[{store_info}], sequence_length={self.sequence_length}, "
+            f"token_budget={self.token_budget}, B={self.batch_size}, "
+            f"sample_start={self.sample_start!r}, "
             f"sample_end={self.sample_end!r}, seed={self.seed})"
         )
 
@@ -743,6 +974,7 @@ class DataLoader:
             probs=self._probs.copy(),
             sequence_length=self.sequence_length,
             batch_size=self.batch_size,
+            token_budget=self.token_budget,
             index_field=self.index_field,
             start_indices=self._start_indices,
             end_fn=self.sample_end,

@@ -88,6 +88,35 @@ def test_zero_grad_zeros_in_place() -> None:
     assert torch.equal(p.grad, torch.zeros_like(p))
 
 
+def test_adamw_param_group_learning_rates_step_independently() -> None:
+    slow = torch.nn.Parameter(torch.zeros(1))
+    fast = torch.nn.Parameter(torch.zeros(1))
+    opt = AdamW(
+        params=[
+            {"params": [slow], "lr": 1e-3},
+            {"params": [fast], "lr": 1e-1},
+        ],
+        lr=1e-3,
+        weight_decay=0.0,
+        fused=False,
+    )
+    assert [group["lr"] for group in opt.param_groups] == [1e-3, 1e-1]
+    slow.grad = torch.ones_like(slow)
+    fast.grad = torch.ones_like(fast)
+    opt.step()
+    assert fast.abs().item() > slow.abs().item() > 0.0
+
+
+def test_adamw_param_group_rejects_a_mix_and_unknown_keys() -> None:
+    p = torch.nn.Parameter(torch.ones(1))
+    with pytest.raises(TypeError, match="not a mix"):
+        AdamW(params=[p, {"params": [p], "lr": 1e-3}], lr=1e-3, fused=False)
+    with pytest.raises(TypeError, match="missing 'params'"):
+        AdamW(params=[{"lr": 1e-3}], lr=1e-3, fused=False)
+    with pytest.raises(TypeError, match="unsupported keys"):
+        AdamW(params=[{"params": [p], "momentum": 0.9}], lr=1e-3, fused=False)
+
+
 def test_zero_grad_default_drops_grad() -> None:
     p = torch.nn.Parameter(torch.ones(4))
     opt = AdamW(params=[p], lr=1e-2, fused=False)

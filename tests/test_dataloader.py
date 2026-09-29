@@ -246,7 +246,7 @@ def test_dataloader_same_seed_field_on_two_sequences_uses_two_seeds() -> None:
         generation = _sequence_generation(
             batch_index=0,
             sequence_index=sequence_index,
-            batch_size=2,
+            stride=2,
         )
         rng = np.random.default_rng(
             np.random.SeedSequence([0, generation, _stable_hash("task_index", 7)])
@@ -334,10 +334,35 @@ def test_dataloader_worker_error_surfaces_even_with_full_prefetch_queue() -> Non
         loader.close()
 
 
-def test_dataloader_validates_batch_size_and_prefetch() -> None:
+def test_dataloader_validates_batch_size_length_and_prefetch() -> None:
     store = _store_with_actions()
     with pytest.raises(ValueError, match="batch_size must be >= 1"):
         _loader(sequence_length=3, batch_size=0, num_workers=0, stores=store)
+    with pytest.raises(ValueError, match="exactly one"):
+        _loader(batch_size=1, num_workers=0, stores=store)
+    with pytest.raises(ValueError, match="batch_size is required"):
+        _loader(sequence_length=3, num_workers=0, stores=store)
+    with pytest.raises(ValueError, match="batch_size is required"):
+        _loader(token_budget=4, num_workers=0, sample_end=full_task_end, stores=store)
+    with pytest.raises(ValueError, match="exactly one"):
+        _loader(
+            sequence_length=3,
+            token_budget=8,
+            batch_size=1,
+            num_workers=0,
+            stores=store,
+        )
+    with pytest.raises(ValueError, match="requires sample_end"):
+        _loader(token_budget=4, batch_size=1, num_workers=0, stores=store)
+    with pytest.raises(ValueError, match="token_budget must be >= 1"):
+        _loader(
+            token_budget=0,
+            num_workers=0,
+            sample_end=full_task_end,
+            stores=store,
+        )
+    with pytest.raises(ValueError, match="sequence_length must be >= 1"):
+        _loader(sequence_length=0, batch_size=1, num_workers=0, stores=store)
     with pytest.raises(ValueError, match="prefetch must be >= 1"):
         _loader(sequence_length=3, batch_size=1, num_workers=0, prefetch=0, stores=store)
 
@@ -1133,4 +1158,234 @@ def test_dataloader_sample_end_match_requires_field_column() -> None:
         stores=store,
     )
     with pytest.raises(KeyError, match="task_done"):
+        loader.next_batch()
+
+
+def when_group_start(ctx):
+    return bool(ctx["group_start"])
+
+
+def _task_transform(*, group_start: bool):
+    fields: list[dict] = [
+        {"type": "token", "input_field": "action", "head_output": True},
+    ]
+    if group_start:
+        fields.append(
+            {"type": "token", "input_field": "mark", "when": when_group_start}
+        )
+    tokenizer = Tokenizer(
+        input_fields=fields,
+        objective_fields=_obj("action", "store_index", "task_done"),
+        grouping_field="grouping_id",
+    )
+    return compose(stages=(_stamp_grouping, tokenizer))
+
+
+def _long_store(*, n: int) -> Datastore:
+    store = Datastore()
+    for action in range(n):
+        store.append(
+            data={
+                "action": action + 1,
+                "reward": 0.0,
+                "episode_done": 0,
+                "task_done": 0,
+                "mark": 7,
+            }
+        )
+    return store
+
+
+def _starts_with_room(steps: int):
+    def _start(cols):
+        n = len(cols["action"])
+        idx = np.arange(n)
+        return idx <= n - steps
+
+    return _start
+
+
+def _assert_examples_separate(
+    tb: TokenBatch, obj: dict[str, torch.Tensor], *, steps_per_example: int
+) -> None:
+    """``batch_size`` examples, each a contiguous block of steps."""
+    seq = [int(x) for x in obj["sequence_id"]]
+    expected: list[int] = []
+    for b in range(tb.B):
+        expected.extend([b] * steps_per_example)
+    assert seq == expected
+    assert [int(c) for c in tb.step_counts()] == [steps_per_example] * tb.B
+    indices = [int(x) for x in obj["store_index"]]
+    for b in range(tb.B):
+        start = b * steps_per_example
+        win = indices[start : start + steps_per_example]
+        assert win == list(range(win[0], win[0] + steps_per_example))
+    at_steps = [int(tb.sequence_ids[i]) for i in tb.head_output_indices]
+    assert at_steps == seq
+    token_seq = [int(x) for x in tb.sequence_ids]
+    assert token_seq == sorted(token_seq)
+    assert set(token_seq) == set(range(tb.B))
+
+
+def test_dataloader_sequence_length_is_steps_per_example() -> None:
+    """``batch_size`` examples, each exactly ``sequence_length`` steps."""
+    store = _long_store(n=40)
+    loader = _loader(
+        sequence_length=4,
+        batch_size=3,
+        num_workers=0,
+        seed=0,
+        sample_start=_starts_with_room(4),
+        stores=store,
+        index_field="store_index",
+        transform=_task_transform(group_start=False),
+    )
+    tb, obj = loader.next_batch()
+    assert tb.B == 3
+    assert tb.L == 12
+    _assert_examples_separate(tb, obj, steps_per_example=4)
+
+
+def _task_store(*, n_tasks: int, steps: int) -> Datastore:
+    """``n_tasks`` tasks of ``steps`` rows. Each task is one sample_end segment."""
+    store = Datastore()
+    for task in range(n_tasks):
+        for step in range(steps):
+            store.append(
+                data={
+                    "action": task * steps + step + 1,
+                    "reward": 0.0,
+                    "episode_done": 0,
+                    "task_done": 1 if step == steps - 1 else 0,
+                    "episode_index": 0,
+                    "step_index": step,
+                    "mark": 7,
+                }
+            )
+    return store
+
+
+def _assert_whole_segments(
+    tb: TokenBatch, obj: dict[str, torch.Tensor], *, steps_per_segment: int
+) -> None:
+    """Each sequence is one full task and ends on ``task_done``."""
+    assert tb.B >= 1
+    seq = [int(x) for x in obj["sequence_id"]]
+    expected: list[int] = []
+    for b in range(tb.B):
+        expected.extend([b] * steps_per_segment)
+    assert seq == expected
+    assert [int(c) for c in tb.step_counts()] == [steps_per_segment] * tb.B
+    indices = [int(x) for x in obj["store_index"]]
+    dones = [int(x) for x in obj["task_done"]]
+    for b in range(tb.B):
+        start = b * steps_per_segment
+        win = indices[start : start + steps_per_segment]
+        done = dones[start : start + steps_per_segment]
+        assert win == list(range(win[0], win[0] + steps_per_segment))
+        assert done[-1] != 0
+        assert all(d == 0 for d in done[:-1])
+    token_seq = [int(x) for x in tb.sequence_ids]
+    assert token_seq == sorted(token_seq)
+    assert set(token_seq) == set(range(tb.B))
+
+
+def test_dataloader_token_budget_fills_the_batch_with_segments() -> None:
+    """Whole tasks are packed until the next task would pass the budget."""
+    store = _task_store(n_tasks=8, steps=2)
+    loader = _loader(
+        token_budget=4,
+        batch_size=1,
+        num_workers=0,
+        seed=1,
+        sample_start=full_task_start,
+        sample_end=full_task_end,
+        stores=store,
+        index_field="store_index",
+        transform=_task_transform(group_start=False),
+    )
+    tb, obj = loader.next_batch()
+    assert tb.B == 2
+    assert tb.L == 4
+    _assert_whole_segments(tb, obj, steps_per_segment=2)
+
+    short = _loader(
+        token_budget=5,
+        batch_size=1,
+        num_workers=0,
+        seed=1,
+        sample_start=full_task_start,
+        sample_end=full_task_end,
+        stores=store,
+        index_field="store_index",
+        transform=_task_transform(group_start=False),
+    )
+    tb, obj = short.next_batch()
+    # Each task is 2 tokens. Two fit in 5; the third does not, so it is left out.
+    assert tb.B == 2
+    assert tb.L == 4
+    _assert_whole_segments(tb, obj, steps_per_segment=2)
+
+    two = _loader(
+        token_budget=4,
+        batch_size=2,
+        num_workers=0,
+        seed=1,
+        sample_start=full_task_start,
+        sample_end=full_task_end,
+        stores=store,
+        index_field="store_index",
+        transform=_task_transform(group_start=False),
+    )
+    tb, obj = two.next_batch()
+    assert tb.B == 4
+    assert tb.L == 8
+    _assert_whole_segments(tb, obj, steps_per_segment=2)
+
+
+def test_dataloader_token_budget_does_not_split_a_segment() -> None:
+    """A segment that does not fit is left out, group-start tokens included.
+
+    Each task is two steps. The first step emits one group-start token plus
+    one action token; the second emits one action token. A segment costs 3.
+    Budget 5 keeps one whole segment and drops the next.
+    """
+    store = _task_store(n_tasks=6, steps=2)
+    loader = _loader(
+        token_budget=5,
+        batch_size=1,
+        num_workers=0,
+        seed=2,
+        sample_start=full_task_start,
+        sample_end=full_task_end,
+        stores=store,
+        index_field="store_index",
+        transform=_task_transform(group_start=True),
+    )
+    tb, obj = loader.next_batch()
+    assert tb.B == 1
+    _assert_whole_segments(tb, obj, steps_per_segment=2)
+    token_seq = [int(x) for x in tb.sequence_ids]
+    assert token_seq == [0, 0, 0]
+    assert tb.L == 3
+    step_positions = {int(i) for i in tb.head_output_indices}
+    prefix_ids = [sid for i, sid in enumerate(token_seq) if i not in step_positions]
+    assert prefix_ids == [0]
+
+
+def test_dataloader_token_budget_rejects_an_oversized_segment() -> None:
+    """A segment larger than the budget is not added, and an empty batch raises."""
+    store = _task_store(n_tasks=4, steps=2)
+    loader = _loader(
+        token_budget=1,
+        batch_size=1,
+        num_workers=0,
+        seed=3,
+        sample_start=full_task_start,
+        sample_end=full_task_end,
+        stores=store,
+        index_field="store_index",
+        transform=_task_transform(group_start=False),
+    )
+    with pytest.raises(ValueError, match="does not fit"):
         loader.next_batch()

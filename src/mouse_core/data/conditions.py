@@ -38,9 +38,13 @@ row itself). ``sample_end`` marks the inclusive end row: the first
 match **strictly after** the chosen start (the start row never counts
 as the end, even when the end predicate is true there). If set but
 never met before ``sequence_length`` / store end for a chosen start,
-that draw is skipped and another start is sampled. Exhaustion or a
-yielded window that lacks an end match raises. ``None`` leaves starts
-unrestricted / never truncates early.
+that draw is skipped and another start is sampled. Token-budget mode
+has no step cap, so that search runs to the store end, and
+``sample_end`` is required: each of ``batch_size`` fills adds those
+whole segments until the next one would pass ``token_budget``. A
+segment that does not fit is left out. Examples pass ``batch_size=1``. Exhaustion or a candidate window that
+lacks an end match raises. ``None`` leaves starts unrestricted / never
+truncates early (``sequence_length`` only).
 
 Example full-task FrozenLake windows (predicates defined by the
 caller)::

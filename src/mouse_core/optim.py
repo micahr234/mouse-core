@@ -28,21 +28,66 @@ def _trainable(params: Iterable[nn.Parameter]) -> list[nn.Parameter]:
     return trainable
 
 
-def _torch_adamw(
-    params: list[nn.Parameter],
+def _param_groups(
+    params: Iterable[Any],
     *,
     lr: float,
     weight_decay: float,
+) -> tuple[list[dict[str, Any]], list[nn.Parameter]]:
+    """One group per learning rate.
+
+    A flat parameter list uses ``lr`` and ``weight_decay``. A list of
+    dicts is one group each: ``params`` is required, and ``lr`` /
+    ``weight_decay`` override the constructor values when present.
+    """
+    raw = list(params)
+    grouped = any(isinstance(item, dict) for item in raw)
+    if grouped and not all(isinstance(item, dict) for item in raw):
+        raise TypeError(
+            "AdamW params must be parameters or param-group dicts, not a mix."
+        )
+    if not grouped:
+        trainable = _trainable(raw)
+        return [{"params": trainable, "lr": lr, "weight_decay": weight_decay}], trainable
+
+    groups: list[dict[str, Any]] = []
+    flat: list[nn.Parameter] = []
+    for i, group in enumerate(raw):
+        if "params" not in group:
+            raise TypeError(f"AdamW param group {i} is missing 'params'.")
+        unknown = set(group) - {"params", "lr", "weight_decay"}
+        if unknown:
+            raise TypeError(
+                f"AdamW param group {i} has unsupported keys {sorted(unknown)}."
+            )
+        trainable = _trainable(group["params"])
+        if not trainable:
+            continue
+        groups.append({
+            "params": trainable,
+            "lr": group["lr"] if "lr" in group else lr,
+            "weight_decay": group["weight_decay"] if "weight_decay" in group else weight_decay,
+        })
+        flat.extend(trainable)
+    if not groups:
+        groups = [{"params": [], "lr": lr, "weight_decay": weight_decay}]
+    return groups, flat
+
+
+def _torch_adamw(
+    groups: list[dict[str, Any]],
+    *,
+    lr: float,
     betas: tuple[float, float],
     eps: float,
     fused: bool | None,
 ) -> torch.optim.AdamW:
+    flat = [p for group in groups for p in group["params"]]
     if fused is None:
-        fused = bool(params) and params[0].device.type == "cuda"
+        fused = bool(flat) and flat[0].device.type == "cuda"
     return torch.optim.AdamW(
-        params,
+        groups,
         lr=lr,
-        weight_decay=weight_decay,
         betas=betas,
         eps=eps,
         fused=fused,
@@ -70,23 +115,28 @@ class AdamW:
     Rejects a trainable non-fp32 parameter: bf16 weights re-round every step,
     so updates below half a bf16 ULP (~``|w| / 512``) would never land.
     ``fused`` defaults to CUDA from the first trainable parameter.
+
+    ``params`` is either a flat list, all stepped at ``lr``, or a list of
+    param-group dicts. A group requires ``params`` and may set ``lr`` and
+    ``weight_decay``; omitted keys use the constructor values. One group
+    per learning rate — for example the backbone at one ``lr`` and
+    the heads at another.
     """
 
     def __init__(
         self,
         *,
-        params: Iterable[nn.Parameter],
+        params: Iterable[nn.Parameter | dict[str, Any]],
         lr: float,
         weight_decay: float = 0.0,
         betas: tuple[float, float] = (0.9, 0.95),
         eps: float = 1e-8,
         fused: bool | None = None,
     ) -> None:
-        self._params = _trainable(params)
+        groups, self._params = _param_groups(params, lr=lr, weight_decay=weight_decay)
         self._inner = _torch_adamw(
-            self._params,
+            groups,
             lr=lr,
-            weight_decay=weight_decay,
             betas=betas,
             eps=eps,
             fused=fused,

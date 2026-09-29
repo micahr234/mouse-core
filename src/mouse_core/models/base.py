@@ -768,7 +768,7 @@ class Model(nn.Module):
     The delayed DQN model comes from :meth:`copy`, which names every
     section (``heads``, ``backbone``, ``reasoner``). Copied sections are
     frozen; uncopied sections stay this model's modules.
-    :class:`~mouse_core.polyak.Polyak` interpolates only copied sections.
+    :func:`~mouse_core.polyak.model_polyak` interpolates only copied sections.
     """
 
     @staticmethod
@@ -964,7 +964,7 @@ class Model(nn.Module):
 
         Copied modules are frozen and left in ``train()``. Shared
         modules are not frozen (they belong to this model).
-        :class:`~mouse_core.polyak.Polyak` interpolates only copied
+        :func:`~mouse_core.polyak.model_polyak` interpolates only copied
         sections. Construct after ``model.to(...)``. Do not call
         ``requires_grad_`` / ``to`` on the copy: shared frozen
         parameters (and a shared backbone / reasoner) belong to this
@@ -1066,7 +1066,7 @@ class Model(nn.Module):
         ``preferred_dtype(device=device)`` for a frozen LoRA base or inference) and
         every other section — LoRA adapters, Identity ``embed_tokens``,
         reasoner, heads — is float32, which ``AdamW`` and
-        ``Polyak`` require of every
+        ``model_polyak`` require of every
         trainable parameter. Inputs are cast to the backbone dtype at the
         backbone boundary and its output back to fp32 for the heads. Passing
         a dtype here raises ``TypeError``.
@@ -1254,8 +1254,8 @@ class Model(nn.Module):
         ``backbone=False`` (and ``reasoner=False``), skip the second
         backbone pass: ``delayed_model.head(h=delayed_model.pool(output=out))``
         under ``torch.no_grad()``. Interpolate with
-        ``Polyak(online=model, delayed=delayed_model)`` and
-        ``polyak.update(...)`` with a ``tau`` for each copied section.
+        ``model_polyak(online=model, delayed=delayed_model, ...)`` with a
+        ``tau`` for each copied section.
         Online / inference: ``inputs, _ = pack_token_batch(steps=[eval_transform(step)],
         sequence_ids=[0])`` then ``model(inputs, use_cache=True)``
         (optionally ragged; empty-only batches raise). Pass ``out.cache``

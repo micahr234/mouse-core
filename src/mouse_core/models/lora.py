@@ -4,7 +4,7 @@ The alternative to fine-tuning the whole backbone in fp32: the base weights
 are frozen and, on CUDA, bf16, and the only trainable backbone parameters
 are the LoRA factors, which are always fp32. Their rank-``r`` matmuls run
 in fp32 and the delta is cast back onto the base output, so updates land
-in fp32 tensors and nothing needs fp32 master weights or Polyak shadows.
+in fp32 tensors and nothing needs fp32 master weights or polyak shadows.
 """
 
 from __future__ import annotations

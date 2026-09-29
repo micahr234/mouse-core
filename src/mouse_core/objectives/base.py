@@ -62,7 +62,8 @@ class Objective(ABC):
     and PPO takes ``value_predictions=``. Supervised objectives take
     ``targets=`` (action ids for SP, Q vectors for SV). A custom subclass
     must accept the same optional parameters (pass ``None`` for a tensor
-    it does not read).
+    it does not read). ``DqnObjective`` also takes ``reward_center=`` on
+    that call: a 0-dim float32 tensor, or ``None``.
     """
 
     @abstractmethod

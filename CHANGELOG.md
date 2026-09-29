@@ -8,19 +8,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- ``RewardCentering``: one-parameter module (not a head) that learns
-  mean TD error by MSE with real gradients. ``DqnObjective`` takes
-  required ``reward_centering`` (``None`` disables). When set, the Q
-  residual is ``(δ - c.detach())²`` and the loss also includes
-  ``loss_scale * (c - δ.detach())²`` so only the constant trains from
-  the centering term. Metrics ``reward_center`` /
-  ``reward_center_loss`` when enabled. Step the constant with its own
-  AdamW learning rate (separate optimizer / param group) — not Polyak
-  or EMA. ``examples/16_train_offline_reward_centering_dqn.ipynb``
-  wires the knobs (``REWARD_CENTERING``, init, ``loss_scale``,
-  ``LR_REWARD_CENTERING``).
+- ``RewardCentering``: one-buffer module (not a head, not a
+  parameter). The scalar starts at 0. Pass ``center`` as required
+  ``reward_center=`` on the ``DqnObjective`` call (``None`` disables),
+  with ``objective_data`` and the Q tensors. When set, every reward
+  slot in the backup is shaped by the constant potential ``c``: a slot
+  whose discount is ``γ`` subtracts ``(1 - γ) c``, which telescopes to
+  the same offset ``c`` on every action value — the head learns
+  ``Q - c`` and the policy ordering never changes, episodic or
+  continuing. The TD loss is ``(δ - K c)²`` with ``δ = G - Q(s, a)``
+  and ``K`` the target recursion run on reward ``1 - γ`` and value
+  ``0``; a constant ``γ < 1`` one-step target recovers classic reward
+  centering with average-reward estimate ``(1 - γ) c``, a ``γ = 1``
+  slot subtracts nothing, and a terminal subtracts the full ``c``.
+  ``c`` is detached, so the loss trains Q only. The buffer and the
+  copy step are separate, same as the delayed model and ``model_polyak``:
+  ``reward_centering_polyak(center=, tau=, values=)`` keeps no state
+  and sets ``c ← τ·mean(values) + (1−τ)·c`` (``τ = 0`` keeps it,
+  ``τ = 1`` copies the mean) — feed ``metrics["in_run_backup"]``
+  (``backup`` where ``backup_weight > 0``) so
+  ``c`` tracks the mean action value. Metric ``reward_center`` when
+  enabled. ``examples/16_train_offline_reward_centering_dqn.ipynb``
+  calls it at ``POLYAK_TAU_REWARD_CENTERING``.
 
 ### Changed
+- ``DataLoader`` takes exactly one of ``sequence_length`` or
+  ``token_budget``, plus ``batch_size``. ``sequence_length`` is that
+  many steps per example (unless ``sample_end`` or the store ends the
+  window first) across ``batch_size`` examples. ``token_budget`` fills
+  ``batch_size`` times with whole ``sample_start`` / ``sample_end``
+  segments until the next segment would pass that many packed tokens.
+  A segment that does not fit is left out, including a first segment
+  that alone is over the budget (that raises). Each segment is its own
+  sequence. Training examples pass ``token_budget`` and ``batch_size=1``.
+- ``Polyak`` is the function ``model_polyak(online=, delayed=,
+  tau_heads=, tau_backbone=)``. It keeps no state; the delayed weights
+  stay on the delayed model.
+- Training notebooks step the heads and the backbone in separate
+  ``AdamW`` groups (``LR_HEADS``, ``LR_BACKBONE``). The reasoning
+  notebook's reasoner uses ``LR_BACKBONE``.
+- ``AdamW`` ``params`` may be a list of param-group dicts. A group
+  requires ``params`` and may set ``lr`` and ``weight_decay``; omitted
+  keys use the constructor values. A flat parameter list is unchanged.
 - ``DataLoader`` ``sample_end`` finds the first match **strictly after**
   the chosen start index (search from ``start + 1``). The start row
   never counts as the end, even when the end predicate is true there —
@@ -62,6 +91,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ``DqnObjective`` metrics ``backup`` and ``backup_weight``: detached
   per-row Bellman target ``G`` and its row weight, the same tensors
   the loss uses. Callers log those instead of rebuilding the backup.
+  ``in_run_backup`` is ``backup`` on the rows with ``backup_weight > 0``.
 - ``bootstrap_cutoff`` on ``DqnObjective`` and ``PpoObjective``.
   Required. ``True`` adds the value where the
   continuation leaves the sampled run (end of the batch, or a
