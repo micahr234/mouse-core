@@ -99,17 +99,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per-row Bellman target ``G`` and its row weight, the same tensors
   the loss uses. Callers log those instead of rebuilding the backup.
   ``in_run_backup`` is ``backup`` on the rows with ``backup_weight > 0``.
-- ``bootstrap_before_group_boundary`` on ``DqnObjective`` and ``PpoObjective``.
+- ``ignore_cross_group_backups`` on ``DqnObjective`` and ``PpoObjective``.
   Required. For any horizon, the last step of a task is not updated
   when its target depends on the next step's value. It is updated when
-  the target does not. ``True`` bootstraps the value on the step before
-  a group boundary (end of the batch, or a ``group_id`` break: a
-  chunk boundary, time limit, or truncation whose rest was not
-  sampled), so that step is updated from that value and stays in the
-  loss and in logged metrics. ``False`` does not, and leaves the step
-  out of both. A done-code γ of ``0``, or a horizon that puts no weight
-  on that value, does not depend on it, so the step stays. An earlier
-  step whose backup stays inside the task stays either way.
+  the target does not. ``True`` leaves that off-data value out of the
+  target and leaves the step out of the loss and out of logged metrics
+  when the factor on it is non-zero. ``False`` bootstraps the value on
+  the step before a group boundary (end of the batch, or a ``group_id``
+  break: a chunk boundary, time limit, or truncation whose rest was not
+  sampled), so that step is updated from that value and stays. A
+  done-code γ of ``0``, or a horizon that puts no weight on that value,
+  does not depend on it, so the step stays. An earlier step whose
+  backup stays inside the task stays either way.
 - ``general_gate(gates=)`` multiplies DQN continuation matrices. Each
   entry is the product of the gates at that step, so a return continues
   only where every gate continues.

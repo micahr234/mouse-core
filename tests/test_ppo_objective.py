@@ -3,6 +3,8 @@ from __future__ import annotations
 import pytest
 import torch
 from mouse_core.objectives import PpoObjective, affine_reward, affine_value, boundary_discount, sample_discrete_action
+from mouse_core.objectives.dqn import _pair_weight
+from mouse_core.objectives.ppo import _gae_advantages
 
 
 def _disc(**overrides: float):
@@ -51,7 +53,7 @@ def _ppo(**overrides: object) -> _PpoCall:
         discount=_disc(gamma_step=0.99),
         reward=_rew(),
         value=_val(),
-        bootstrap_before_group_boundary=True,
+        ignore_cross_group_backups=False,
     )
     kwargs.update(overrides)
     return _PpoCall(PpoObjective(**kwargs))  # type: ignore[arg-type]
@@ -144,8 +146,8 @@ def test_sample_discrete_action_shapes() -> None:
     assert log_probs.shape == (4,)
 
 
-def test_ppo_bootstrap_before_group_boundary_is_switchable() -> None:
-    """GAE bootstraps at the batch end when the flag is on. A non-zero factor drops the step when it is off."""
+def test_ppo_ignore_cross_group_backups_is_switchable() -> None:
+    """GAE bootstraps at the batch end unless the backup is ignored. A non-zero factor drops the step when it is ignored."""
     predictions = {
         "action": torch.tensor([[20.0, -20.0], [20.0, -20.0]]),
         "value": torch.tensor([[1.0], [5.0]]),
@@ -158,7 +160,7 @@ def test_ppo_bootstrap_before_group_boundary_is_switchable() -> None:
         normalize_advantage=False,
     )
 
-    def run(*, bootstrap_before_group_boundary: bool, episode_done: torch.Tensor) -> tuple[float, dict[str, float | torch.Tensor]]:
+    def run(*, ignore_cross_group_backups: bool, episode_done: torch.Tensor) -> tuple[float, dict[str, float | torch.Tensor]]:
         objective_data = {
             "action": torch.tensor([0, 0]),
             "reward": torch.tensor([0.0, 4.0]),
@@ -166,22 +168,22 @@ def test_ppo_bootstrap_before_group_boundary_is_switchable() -> None:
             "task_done": torch.tensor([0, 0]),
             "old_log_prob": torch.tensor([0.0, 0.0]),
         }
-        loss, metrics = _ppo(bootstrap_before_group_boundary=bootstrap_before_group_boundary, **common)(
+        loss, metrics = _ppo(ignore_cross_group_backups=ignore_cross_group_backups, **common)(
             objective_data=objective_data, predictions=predictions,
         )
         return float(loss.item()), metrics
 
     # δ = 4 + V(s') - 1 = 8; value loss 64; policy loss -8.
-    on_loss, on_metrics = run(bootstrap_before_group_boundary=True, episode_done=torch.tensor([0, 0]))
+    on_loss, on_metrics = run(ignore_cross_group_backups=False, episode_done=torch.tensor([0, 0]))
     assert abs(on_loss - 56.0) < 0.001
     assert abs(on_metrics["value_mean"] - 1.0) < 0.001
     # The only step's factor on V(s') is non-zero, so it leaves the loss and the logs.
-    off_loss, off_metrics = run(bootstrap_before_group_boundary=False, episode_done=torch.tensor([0, 0]))
+    off_loss, off_metrics = run(ignore_cross_group_backups=True, episode_done=torch.tensor([0, 0]))
     assert abs(off_loss) < 0.001
     assert abs(off_metrics["value_mean"]) < 0.001
     assert abs(off_metrics["policy_loss"]) < 0.001
     truncated = _disc(gamma_step=1.0, gamma_episode_truncated=1.0)
-    on, on_logs = _ppo(bootstrap_before_group_boundary=True, discount=truncated, gae_lambda=1.0, vf_coef=1.0, ent_coef=0.0, normalize_advantage=False)(
+    on, on_logs = _ppo(ignore_cross_group_backups=False, discount=truncated, gae_lambda=1.0, vf_coef=1.0, ent_coef=0.0, normalize_advantage=False)(
         objective_data={
             "action": torch.tensor([0, 0]),
             "reward": torch.tensor([0.0, 4.0]),
@@ -191,7 +193,7 @@ def test_ppo_bootstrap_before_group_boundary_is_switchable() -> None:
         },
         predictions=predictions,
     )
-    off, off_logs = _ppo(bootstrap_before_group_boundary=False, discount=truncated, gae_lambda=1.0, vf_coef=1.0, ent_coef=0.0, normalize_advantage=False)(
+    off, off_logs = _ppo(ignore_cross_group_backups=True, discount=truncated, gae_lambda=1.0, vf_coef=1.0, ent_coef=0.0, normalize_advantage=False)(
         objective_data={
             "action": torch.tensor([0, 0]),
             "reward": torch.tensor([0.0, 4.0]),
@@ -205,8 +207,8 @@ def test_ppo_bootstrap_before_group_boundary_is_switchable() -> None:
     assert abs(on_logs["value_mean"] - 1.0) < 0.001
     assert abs(off.item()) < 0.001
     assert abs(off_logs["value_mean"]) < 0.001
-    terminal_on, terminal_on_logs = run(bootstrap_before_group_boundary=True, episode_done=torch.tensor([0, 1]))
-    terminal_off, terminal_off_logs = run(bootstrap_before_group_boundary=False, episode_done=torch.tensor([0, 1]))
+    terminal_on, terminal_on_logs = run(ignore_cross_group_backups=False, episode_done=torch.tensor([0, 1]))
+    terminal_off, terminal_off_logs = run(ignore_cross_group_backups=True, episode_done=torch.tensor([0, 1]))
     assert abs(terminal_on - 6.0) < 0.001
     assert abs(terminal_off - terminal_on) < 1e-05
     assert abs(terminal_off_logs["value_mean"] - terminal_on_logs["value_mean"]) < 1e-05
@@ -226,9 +228,9 @@ def test_ppo_zero_lambda_keeps_the_in_sample_step() -> None:
         "old_log_prob": torch.zeros(3),
     }
 
-    def run(*, bootstrap_before_group_boundary: bool, gae_lambda: float) -> tuple[float, dict[str, float | torch.Tensor]]:
+    def run(*, ignore_cross_group_backups: bool, gae_lambda: float) -> tuple[float, dict[str, float | torch.Tensor]]:
         loss, metrics = _ppo(
-            bootstrap_before_group_boundary=bootstrap_before_group_boundary,
+            ignore_cross_group_backups=ignore_cross_group_backups,
             discount=_disc(gamma_step=1.0),
             gae_lambda=gae_lambda,
             vf_coef=1.0,
@@ -238,23 +240,76 @@ def test_ppo_zero_lambda_keeps_the_in_sample_step() -> None:
         return float(loss.item()), metrics
 
     # t0 uses V(s1)=2 inside the run. δ = 5, return = 6, value loss 25, policy -5.
-    off, off_logs = run(bootstrap_before_group_boundary=False, gae_lambda=0.0)
+    off, off_logs = run(ignore_cross_group_backups=True, gae_lambda=0.0)
     assert abs(off - 20.0) < 0.001
     assert abs(off_logs["value_mean"] - 1.0) < 0.001
-    on, on_logs = run(bootstrap_before_group_boundary=True, gae_lambda=0.0)
+    on, on_logs = run(ignore_cross_group_backups=False, gae_lambda=0.0)
     assert abs(on - 65.0) < 0.001
     assert abs(on_logs["value_mean"] - 1.5) < 0.001
     # λ = 1 carries V(s2) into both steps. The factor is non-zero, so both drop.
-    carried_off, carried_logs = run(bootstrap_before_group_boundary=False, gae_lambda=1.0)
+    carried_off, carried_logs = run(ignore_cross_group_backups=True, gae_lambda=1.0)
     assert abs(carried_off) < 0.001
     assert abs(carried_logs["value_mean"]) < 0.001
-    carried_on, carried_on_logs = run(bootstrap_before_group_boundary=True, gae_lambda=1.0)
+    carried_on, carried_on_logs = run(ignore_cross_group_backups=False, gae_lambda=1.0)
     assert abs(carried_on - 175.0) < 0.001
     assert abs(carried_on_logs["value_mean"] - 1.5) < 0.001
 
 
-def test_ppo_requires_bootstrap_before_group_boundary_argument() -> None:
-    with pytest.raises(TypeError, match="bootstrap_before_group_boundary"):
+def test_concatenated_groups_match_independent_gae() -> None:
+    """GAE for A and for B is unchanged when the batch is the concatenation AB."""
+    torch.manual_seed(0)
+
+    def group(*, n: int, group_id: int, shift: float) -> dict[str, torch.Tensor]:
+        return {
+            "reward": torch.randn(n) + shift,
+            "value": torch.randn(n) + shift,
+            "episode_done": torch.zeros(n, dtype=torch.long),
+            "group_id": torch.full((n,), group_id, dtype=torch.int64),
+        }
+
+    def cat(left: dict[str, torch.Tensor], right: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        return {key: torch.cat([left[key], right[key]]) for key in left}
+
+    def gae(
+        data: dict[str, torch.Tensor], *, ignore_cross_group_backups: bool, gae_lambda: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        n = int(data["reward"].shape[0])
+        discounts = torch.full((n,), 0.99)
+        discounts = torch.where(data["episode_done"] == 1, torch.zeros(n), discounts)
+        pair = _pair_weight(group_id=data["group_id"], N=n, device="cpu")
+        return _gae_advantages(
+            rewards=data["reward"][1:],
+            values=data["value"],
+            discounts=discounts[1:],
+            valid=pair > 0,
+            gae_lambda=gae_lambda,
+            ignore_cross_group_backups=ignore_cross_group_backups,
+        )
+
+    left = group(n=6, group_id=0, shift=0.0)
+    right = group(n=5, group_id=1, shift=40.0)
+    both = cat(left, right)
+    n_left = 6
+    n_right = 5
+    for ignore_cross_group_backups in (False, True):
+        for gae_lambda in (0.0, 1.0):
+            alone_l = gae(
+                left, ignore_cross_group_backups=ignore_cross_group_backups, gae_lambda=gae_lambda,
+            )
+            alone_r = gae(
+                right, ignore_cross_group_backups=ignore_cross_group_backups, gae_lambda=gae_lambda,
+            )
+            joined = gae(
+                both, ignore_cross_group_backups=ignore_cross_group_backups, gae_lambda=gae_lambda,
+            )
+            for part, whole in zip(alone_l, joined, strict=True):
+                assert torch.allclose(whole[: n_left - 1], part)
+            for part, whole in zip(alone_r, joined, strict=True):
+                assert torch.allclose(whole[n_left : n_left + n_right - 1], part)
+
+
+def test_ppo_requires_ignore_cross_group_backups_argument() -> None:
+    with pytest.raises(TypeError, match="ignore_cross_group_backups"):
         PpoObjective(  # type: ignore[call-arg]
             discount=_disc(), reward=_rew(), value=_val(),
         )

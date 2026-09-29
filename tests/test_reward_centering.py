@@ -63,7 +63,7 @@ def _objective() -> DqnObjective:
         temperature=0.0,
         double=False,
         gate=None,
-        bootstrap_before_group_boundary=True,
+        ignore_cross_group_backups=False,
     )
 
 
@@ -167,7 +167,7 @@ def test_dqn_centering_subtracts_same_offset_from_every_horizon() -> None:
         temperature=0.0,
         double=False,
         gate=nstep_gate(n=2),
-        bootstrap_before_group_boundary=True,
+        ignore_cross_group_backups=False,
     )
     loss, metrics = objective(
         objective_data=step_stream, group_id=_group_id(step_stream),
@@ -208,7 +208,7 @@ def test_dqn_centering_subtracts_nothing_on_undiscounted_bootstrapped_steps() ->
         temperature=0.0,
         double=False,
         gate=nstep_gate(n=2),
-        bootstrap_before_group_boundary=True,
+        ignore_cross_group_backups=False,
     )
     with_center, _ = objective(
         objective_data=step_stream, group_id=_group_id(step_stream),
@@ -248,7 +248,7 @@ def test_dqn_centering_matches_classic_reward_centering_when_continuing() -> Non
         temperature=0.0,
         double=False,
         gate=None,
-        bootstrap_before_group_boundary=True,
+        ignore_cross_group_backups=False,
     )
     loss, _ = objective(
         objective_data=step_stream, group_id=_group_id(step_stream),
@@ -287,7 +287,7 @@ def test_dqn_centering_is_a_pure_value_shift() -> None:
         temperature=0.7,
         double=True,
         gate=lambda_gate(td_lambda=0.8),
-        bootstrap_before_group_boundary=True,
+        ignore_cross_group_backups=False,
     )
     k = 2.5
     base, _ = objective(

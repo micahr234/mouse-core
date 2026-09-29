@@ -55,7 +55,7 @@ def _gae_advantages(
     discounts: torch.Tensor,
     valid: torch.Tensor,
     gae_lambda: float,
-    bootstrap_before_group_boundary: bool,
+    ignore_cross_group_backups: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Generalized advantage estimation over valid consecutive pairs.
 
@@ -66,16 +66,17 @@ def _gae_advantages(
         valid: ``[N-1]`` mask — False at run boundaries (different
             ``group_id``).
         gae_lambda: GAE λ.
-        bootstrap_before_group_boundary: For any horizon, the last step
-            of a task is not updated when its advantage depends on the
-            next step's value. It is updated when the advantage does not.
-            ``True`` bootstraps ``V`` on the step before a group boundary
-            (a state whose next step is not an in-run pair: end of the
-            batch, or a run break), so that step is updated from ``V``.
-            ``False`` does not, and leaves the step out. A ``0`` discount,
-            or a horizon that puts no weight on that value, does not
-            depend on it, so the step stays. ``V`` at a state that still
-            has a later in-run step is unchanged.
+        ignore_cross_group_backups: For any horizon, the last step of a
+            task is not updated when its advantage depends on the next
+            step's value. It is updated when the advantage does not.
+            ``True`` leaves that off-data ``V`` out of the advantage and
+            drops the step when the factor on it is non-zero. A zero
+            factor leaves the value out of the advantage, so the step
+            stays. ``False`` bootstraps ``V`` on the step before a group
+            boundary (a state whose next step is not an in-run pair: end
+            of the batch, or a run break) and keeps the step. ``V`` at a
+            state that still has a later in-run step is unchanged. A
+            ``0`` discount (true terminal) removes the value either way.
 
     Returns:
         ``(advantages, returns, participate)`` each ``[N-1]``. Advantages
@@ -95,9 +96,7 @@ def _gae_advantages(
         sampled = torch.zeros(T, dtype=torch.bool, device=device)
         if T > 1:
             sampled[:-1] = valid[1:]
-        if bootstrap_before_group_boundary:
-            participate = torch.ones(T, dtype=dtype, device=device)
-        else:
+        if ignore_cross_group_backups:
             next_values = torch.where(
                 sampled, next_values, torch.zeros_like(next_values)
             )
@@ -111,6 +110,8 @@ def _gae_advantages(
                 in_sample=sampled,
                 carries=carries,
             )
+        else:
+            participate = torch.ones(T, dtype=dtype, device=device)
         advantages = torch.zeros(T, device=device, dtype=dtype)
         gae = torch.zeros((), device=device, dtype=dtype)
         for t in range(T - 1, -1, -1):
@@ -136,8 +137,10 @@ class PpoObjective(Objective):
     * ``value_predictions`` — ``[N, 1]`` or ``[N]`` scalar state values
 
     A run is one ``group_id`` (one dataloader sample). Neighbor reads must stay in-run: out-of-run
-    pairs are multiplied by ``0`` (all-zero weights → loss ``0``). Timing
-    matches :class:`~mouse_core.objectives.dqn.DqnObjective`: token ``i``
+    pairs are multiplied by ``0`` (all-zero weights → loss ``0``). GAE
+    advantages and returns for a group are the same in a batch that also
+    holds other groups as they are when that group is the whole batch.
+    Timing matches :class:`~mouse_core.objectives.dqn.DqnObjective`: token ``i``
     encodes state ``s_i``, and the action / reward / episode-done /
     task-done / behavior log-prob stored at ``i+1`` describe the transition
     out of ``s_i``.
@@ -198,18 +201,19 @@ class PpoObjective(Objective):
             any ``value(value=..., **objective_data)`` returning the same
             shape is accepted.
         gae_lambda: GAE λ (``1.0`` = Monte Carlo returns within the discount).
-        bootstrap_before_group_boundary: Required. For any horizon, the
-            last step of a task is not updated when its advantage depends
-            on the next step's value. It is updated when the advantage
-            does not. ``True`` bootstraps ``V`` on the step before a group
-            boundary (the end of the batch, or a ``group_id`` break:
-            a chunk boundary, time limit, or truncation whose rest was
-            not sampled), so that step is updated from ``V`` and stays
-            in the loss and in logged metrics. ``False`` does not, and
-            leaves the step out of both. A done-code γ of ``0``, or a
-            horizon that puts no weight on that value, does not depend
-            on it, so the step stays. ``V`` at a state that still has a
-            later in-run step is unchanged.
+        ignore_cross_group_backups: Required. For any horizon, the last
+            step of a task is not updated when its advantage depends on
+            the next step's value. It is updated when the advantage does
+            not. ``True`` leaves that off-data ``V`` out of the advantage
+            and leaves the step out of the loss and out of logged
+            metrics when the factor on it is non-zero. ``False``
+            bootstraps ``V`` on the step before a group boundary (the
+            end of the batch, or a ``group_id`` break: a chunk boundary,
+            time limit, or truncation whose rest was not sampled), so
+            that step is updated from ``V`` and stays. A done-code γ of
+            ``0``, or a horizon that puts no weight on that value, does
+            not depend on it, so the step stays. ``V`` at a state that
+            still has a later in-run step is unchanged.
         clip_eps: PPO ratio clip ε.
         vf_coef: Weight on the value-function MSE term.
         ent_coef: Weight on the policy entropy bonus (subtracted from the loss).
@@ -228,7 +232,7 @@ class PpoObjective(Objective):
         reward: Reward | None,
         value: Value | None,
         gae_lambda: float = 0.95,
-        bootstrap_before_group_boundary: bool,
+        ignore_cross_group_backups: bool,
         clip_eps: float = 0.2,
         vf_coef: float = 0.5,
         ent_coef: float = 0.01,
@@ -243,7 +247,7 @@ class PpoObjective(Objective):
         self.reward = _require_transform(reward, name="reward")
         self.value = _require_transform(value, name="value")
         self.gae_lambda = gae_lambda
-        self.bootstrap_before_group_boundary = bool(bootstrap_before_group_boundary)
+        self.ignore_cross_group_backups = bool(ignore_cross_group_backups)
         self.clip_eps = clip_eps
         self.vf_coef = vf_coef
         self.ent_coef = ent_coef
@@ -403,7 +407,7 @@ class PpoObjective(Objective):
             discounts=discounts,
             valid=valid,
             gae_lambda=self.gae_lambda,
-            bootstrap_before_group_boundary=self.bootstrap_before_group_boundary,
+            ignore_cross_group_backups=self.ignore_cross_group_backups,
         )
         pair_weight = pair_weight * participate
         valid = pair_weight > 0
