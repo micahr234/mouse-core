@@ -78,10 +78,6 @@ def _transform(**kwargs):
 
 
 def _loader(**kwargs) -> DataLoader:
-    if "sequence_length" in kwargs:
-        kwargs["samples_budget"] = kwargs.pop("sequence_length")
-    kwargs.pop("sample_start", None)
-    kwargs.pop("sample_end", None)
     kwargs.setdefault("sample_field", "action")
     kwargs.setdefault("transform", _transform())
     kwargs.setdefault("stores", _store_with_actions())
@@ -139,7 +135,7 @@ def test_dataloader_applies_augmenter_before_returning_batch() -> None:
         seed=0,
     )
     loader = _loader(
-        sequence_length=3,
+        samples_budget=3,
         batch_size=2,
         num_workers=0,
         transform=compose(stages=(_stamp_task, augmenter, _stamp_grouping, _tokenizer())),
@@ -272,8 +268,9 @@ class _ThreadMarkerTransform:
 def test_dataloader_runs_transform_in_worker_thread() -> None:
     marker = _ThreadMarkerTransform(_tokenizer(objective_fields=_obj("action", "reward")))
     loader = DataLoader(
-        sequence_length=3,
+        samples_budget=3,
         batch_size=2,
+        sample_field="action",
         num_workers=1,
         prefetch=1,
         seed=0,
@@ -328,23 +325,23 @@ def test_dataloader_worker_error_surfaces_even_with_full_prefetch_queue() -> Non
 def test_dataloader_validates_batch_size_length_and_prefetch() -> None:
     store = _store_with_actions()
     with pytest.raises(ValueError, match="batch_size must be >= 1"):
-        _loader(sequence_length=3, batch_size=0, num_workers=0, stores=store)
+        _loader(samples_budget=3, batch_size=0, num_workers=0, stores=store)
     with pytest.raises(ValueError, match="exactly one"):
         _loader(batch_size=1, num_workers=0, stores=store)
     with pytest.raises(ValueError, match="batch_size is required"):
-        _loader(sequence_length=3, num_workers=0, stores=store)
+        _loader(samples_budget=3, num_workers=0, stores=store)
     with pytest.raises(ValueError, match="batch_size is required"):
         _loader(token_budget=4, num_workers=0, stores=store)
     with pytest.raises(ValueError, match="exactly one"):
         _loader(
-            sequence_length=3,
+            samples_budget=3,
             token_budget=8,
             batch_size=1,
             num_workers=0,
             stores=store,
         )
     with pytest.raises(TypeError, match="sample_field"):
-        DataLoader(
+        DataLoader(  # type: ignore[call-arg] -- intentionally omit required argument
             token_budget=4,
             batch_size=1,
             num_workers=0,
@@ -361,20 +358,20 @@ def test_dataloader_validates_batch_size_length_and_prefetch() -> None:
             stores=store,
         )
     with pytest.raises(ValueError, match="samples_budget must be >= 1"):
-        _loader(sequence_length=0, batch_size=1, num_workers=0, stores=store)
+        _loader(samples_budget=0, batch_size=1, num_workers=0, stores=store)
     with pytest.raises(ValueError, match="prefetch must be >= 1"):
-        _loader(sequence_length=3, batch_size=1, num_workers=0, prefetch=0, stores=store)
+        _loader(samples_budget=3, batch_size=1, num_workers=0, prefetch=0, stores=store)
 
 
 def test_dataloader_num_workers_requires_free_threading() -> None:
     store = _store_with_actions()
     with patch.object(sysconfig, "get_config_var", return_value=0):
         with pytest.raises(RuntimeError, match="free-threaded"):
-            _loader(sequence_length=3, batch_size=1, num_workers=1, stores=store)
+            _loader(samples_budget=3, batch_size=1, num_workers=1, stores=store)
     if sysconfig.get_config_var("Py_GIL_DISABLED"):
         with patch.object(sys, "_is_gil_enabled", return_value=True):
             with pytest.raises(RuntimeError, match="free-threaded|GIL"):
-                _loader(sequence_length=3, batch_size=1, num_workers=1, stores=store)
+                _loader(samples_budget=3, batch_size=1, num_workers=1, stores=store)
 
 
 def test_dataloader_snapshots_loaded_source_and_appended_rows() -> None:
@@ -388,7 +385,7 @@ def test_dataloader_snapshots_loaded_source_and_appended_rows() -> None:
         )
     )
     store.append(data={"action": 3, "reward": 0.0, "episode_done": 0, "task_done": 0})
-    loader = _loader(sequence_length=1, batch_size=1, num_workers=0, seed=0, stores=store)
+    loader = _loader(samples_budget=1, batch_size=1, num_workers=0, seed=0, stores=store)
     seen: set[int] = set()
     for _ in range(24):
         _, obj, _sid = loader.next_batch()
@@ -413,16 +410,16 @@ def _tb_signature(
 
 def test_dataloader_seed_is_deterministic() -> None:
     store = _store_with_actions()
-    loader_a = _loader(sequence_length=3, batch_size=2, num_workers=0, seed=42, stores=store)
-    loader_b = _loader(sequence_length=3, batch_size=2, num_workers=0, seed=42, stores=store)
+    loader_a = _loader(samples_budget=3, batch_size=2, num_workers=0, seed=42, stores=store)
+    loader_b = _loader(samples_budget=3, batch_size=2, num_workers=0, seed=42, stores=store)
     assert _tb_signature(loader_a.next_batch()) == _tb_signature(loader_b.next_batch())
 
 
 @pytest.mark.skipif(not _free_threading_ok(), reason="free-threading (GIL disabled) required")
 def test_dataloader_seed_is_deterministic_with_workers() -> None:
     store = _store_with_actions()
-    loader_a = _loader(sequence_length=3, batch_size=2, num_workers=1, seed=42, stores=store)
-    loader_b = _loader(sequence_length=3, batch_size=2, num_workers=1, seed=42, stores=store)
+    loader_a = _loader(samples_budget=3, batch_size=2, num_workers=1, seed=42, stores=store)
+    loader_b = _loader(samples_budget=3, batch_size=2, num_workers=1, seed=42, stores=store)
     try:
         assert _tb_signature(loader_a.next_batch()) == _tb_signature(loader_b.next_batch())
     finally:
@@ -461,7 +458,7 @@ def test_dataloader_batch_k_is_independent_of_num_workers() -> None:
     """Sync and threaded loaders with the same seed yield the identical ordered stream."""
     store = _store_with_actions()
     sync = _loader(
-        sequence_length=3, batch_size=2, num_workers=0, seed=7, stores=store,
+        samples_budget=3, batch_size=2, num_workers=0, seed=7, stores=store,
         transform=_augmented_transform(),
     )
     expected = _signatures(sync, 12)
@@ -469,7 +466,7 @@ def test_dataloader_batch_k_is_independent_of_num_workers() -> None:
     if not _free_threading_ok():
         return
     threaded = _loader(
-        sequence_length=3, batch_size=2, num_workers=4, prefetch=2, seed=7, stores=store,
+        samples_budget=3, batch_size=2, num_workers=4, prefetch=2, seed=7, stores=store,
         transform=_augmented_transform(),
     )
     try:
@@ -481,10 +478,10 @@ def test_dataloader_batch_k_is_independent_of_num_workers() -> None:
 @pytest.mark.skipif(not _free_threading_ok(), reason="free-threading (GIL disabled) required")
 def test_dataloader_refresh_resumes_numbering_at_next_unseen_batch() -> None:
     store = _store_with_actions()
-    reference = _loader(sequence_length=3, batch_size=2, num_workers=0, seed=3, stores=store)
+    reference = _loader(samples_budget=3, batch_size=2, num_workers=0, seed=3, stores=store)
     expected = _signatures(reference, 8)
     loader = _loader(
-        sequence_length=3, batch_size=2, num_workers=3, prefetch=4, seed=3, stores=store
+        samples_budget=3, batch_size=2, num_workers=3, prefetch=4, seed=3, stores=store
     )
     try:
         got = _signatures(loader, 3)
@@ -498,8 +495,8 @@ def test_dataloader_refresh_resumes_numbering_at_next_unseen_batch() -> None:
 
 def test_dataloader_unseeded_stream_is_still_ordered_and_fresh() -> None:
     store = _store_with_actions()
-    a = _loader(sequence_length=3, batch_size=2, num_workers=0, stores=store)
-    b = _loader(sequence_length=3, batch_size=2, num_workers=0, stores=store)
+    a = _loader(samples_budget=3, batch_size=2, num_workers=0, stores=store)
+    b = _loader(samples_budget=3, batch_size=2, num_workers=0, stores=store)
     assert a.seed is None and b.seed is None
     assert a._entropy != b._entropy
     a.next_batch()
@@ -533,7 +530,7 @@ def test_dataloader_refresh_picks_up_appended_rows() -> None:
     store = Datastore()
     for action in (1, 2, 3):
         store.append(data={"action": action, "reward": 0.0, "episode_done": 0, "task_done": 0})
-    loader = _loader(sequence_length=3, batch_size=1, num_workers=0, stores=store)
+    loader = _loader(samples_budget=3, batch_size=1, num_workers=0, stores=store)
     loader.next_batch()
     store.append(data={"action": 4, "reward": 0.0, "episode_done": 0, "task_done": 0})
     _, obj_before, _sid = loader.next_batch()
@@ -551,7 +548,7 @@ def test_dataloader_refresh_drains_prefetch_queue_and_updates_store_sizes() -> N
     store = Datastore()
     for action in range(3):
         store.append(data={"action": action, "reward": 0.0, "episode_done": 0, "task_done": 0})
-    loader = _loader(sequence_length=2, batch_size=1, num_workers=1, prefetch=2, stores=store)
+    loader = _loader(samples_budget=2, batch_size=1, num_workers=1, prefetch=2, stores=store)
     try:
         loader.next_batch()
         assert loader._ns == [3]
@@ -592,7 +589,7 @@ def test_dataloader_keeps_a_short_sample_and_packs_another_copy() -> None:
 def test_dataloader_allows_short_stores() -> None:
     store = Datastore()
     store.append(data={"action": 7, "reward": 1.0, "episode_done": 0, "task_done": 0})
-    loader = _loader(sequence_length=4, batch_size=1, num_workers=0, stores=store)
+    loader = _loader(samples_budget=4, batch_size=1, num_workers=0, stores=store)
     tb, obj, _sid = loader.next_batch()
     assert int(tb.step_counts()[0]) == 1
     assert int(obj["action"][0]) == 7
@@ -600,7 +597,7 @@ def test_dataloader_allows_short_stores() -> None:
 
 def test_dataloader_allows_empty_stores_until_sampling() -> None:
     store = Datastore()
-    loader = _loader(sequence_length=2, batch_size=1, num_workers=0, stores=store)
+    loader = _loader(samples_budget=2, batch_size=1, num_workers=0, stores=store)
     try:
         with pytest.raises(ValueError, match="all stores are empty"):
             loader.next_batch()

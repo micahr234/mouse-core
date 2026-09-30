@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from mouse_core.objectives.base import Objective, _reject_predictions, _require_prediction
 
 
-class SvObjective(Objective):
+class SvObjective(Objective[...]):
     """Supervised value regression objective on per-action Q targets.
 
     Reads ``predictions`` (shape ``[B, S, A]``) and regresses toward

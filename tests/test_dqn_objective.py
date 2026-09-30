@@ -6,6 +6,7 @@ from typing import TypedDict
 import torch
 
 from mouse_core.objectives import (
+    CrossGroupBackups,
     Discount,
     DqnObjective,
     affine_reward,
@@ -1362,7 +1363,7 @@ class _EntropyKw(TypedDict):
     discount: Discount
     temperature: float
     double: bool
-    cross_group_backups: str
+    cross_group_backups: CrossGroupBackups
     gate: None
 
 
@@ -1528,7 +1529,7 @@ def test_dqn_value_must_return_same_shape() -> None:
 
 def _cutoff_loss(
     *,
-    cross_group_backups: str,
+    cross_group_backups: CrossGroupBackups,
     episode_done: torch.Tensor,
     task_done: torch.Tensor | None = None,
     discount: object | None = None,
@@ -1603,7 +1604,7 @@ def test_in_run_horizon_backup_stays_in_loss_and_logs() -> None:
     online = torch.tensor([[10.0], [30.0], [50.0], [0.0]])
     delayed = torch.tensor([[0.0], [3.0], [7.0], [11.0]])
 
-    def run(*, cross_group_backups: str) -> tuple[float, dict[str, float | torch.Tensor]]:
+    def run(*, cross_group_backups: CrossGroupBackups) -> tuple[float, dict[str, float | torch.Tensor]]:
         loss, metrics = DqnObjective(
             reward=_rew(),
             value=_val(),
@@ -1641,7 +1642,7 @@ def test_true_terminal_stays_for_either_ignore_flag() -> None:
 
 def _long_horizon_loss(
     *,
-    cross_group_backups: str,
+    cross_group_backups: CrossGroupBackups,
     td_lambda: float,
     n: int,
     episode_done: torch.Tensor | None = None,
@@ -1737,7 +1738,7 @@ def test_concatenated_groups_match_independent_backups() -> None:
         return {key: torch.cat([left[key], right[key]]) for key in left}
 
     def backups(
-        data: dict[str, torch.Tensor], *, cross_group_backups: str, gate: object,
+        data: dict[str, torch.Tensor], *, cross_group_backups: CrossGroupBackups, gate: object,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         objective = DqnObjective(
             reward=_rew(),
@@ -1795,7 +1796,7 @@ def test_fault_raises_when_a_backup_crosses_the_group() -> None:
     online = torch.zeros(2, 2)
     delayed = torch.tensor([[0.0, 0.0], [5.0, 0.0]])
 
-    def run(*, episode_done: torch.Tensor, cross_group_backups: str) -> float:
+    def run(*, episode_done: torch.Tensor, cross_group_backups: CrossGroupBackups) -> float:
         step_stream = {
             "action": torch.tensor([0, 0]),
             "reward": torch.tensor([0.0, 1.0]),
@@ -1828,11 +1829,11 @@ def test_fault_raises_when_a_backup_crosses_the_group() -> None:
     assert abs(fault_loss - 1.0) < 1e-05
     assert abs(fault_loss - ignore_loss) < 1e-05
     with pytest.raises(ValueError, match="bootstrap"):
-        run(episode_done=running, cross_group_backups="drop")
+        # Deliberately exercise runtime validation outside the literal type.
+        run(episode_done=running, cross_group_backups="drop")  # type: ignore[arg-type]
 
 
 def test_dqn_requires_cross_group_backups_argument() -> None:
     with pytest.raises(TypeError, match="cross_group_backups"):
         DqnObjective(  # type: ignore[call-arg]
             reward=_rew(), value=_val(), discount=_disc(), temperature=0.0, double=False, gate=None,)
-

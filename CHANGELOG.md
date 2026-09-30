@@ -205,13 +205,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``info_q_star`` and passes those ids as ``targets=``.
 - Objective ``__call__`` metrics are ``dict[str, float | Tensor]``.
   Scalar diagnostics stay floats; DQN also returns tensor fields.
-- ``Objective.__call__`` takes optional ``delayed_predictions``,
-  ``value_predictions``, and ``targets`` so DQN, PPO, and SP/SV
-  overrides match the base. Each objective still requires the
-  tensors it reads and raises ``TypeError`` when one of those is
-  missing or when it is given a tensor it does not use. A custom
-  ``Objective`` must accept the same optional parameters (``None`` for
-  a tensor it does not read).
+- ``Objective`` is generic over its call signature. Concrete and custom
+  subclasses declare their required keyword-only inputs on ``__call__``.
+  Each built-in objective raises ``TypeError`` when a tensor it reads is
+  missing or when it is given a prediction tensor it does not use.
 - ``Backbone.hidden_dim`` is an abstract property returning ``int``.
 - ``DqnObjective`` checks a gate's type and shape only. Values in
   ``[0, 1]`` stay the gate's contract; the objective does not reduce
@@ -381,6 +378,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still takes head instances, not name strings.
 
 ### Fixed
+- Objective call annotations now preserve each concrete objective's required
+  inputs, and ``cross_group_backups`` retains its literal type. Batch and
+  latent-generation tuple annotations match their returned values; CI tests
+  use the current DataLoader arguments and explicitly check tensor metrics.
 - ``DataLoader`` shutdown no longer raises
   ``TypeError: catching classes that do not inherit from BaseException``
   when a loader with ``num_workers > 0`` is still alive at interpreter

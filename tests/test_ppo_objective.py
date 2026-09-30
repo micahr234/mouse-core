@@ -2,7 +2,7 @@
 from __future__ import annotations
 import pytest
 import torch
-from mouse_core.objectives import PpoObjective, affine_reward, affine_value, boundary_discount, sample_discrete_action
+from mouse_core.objectives import CrossGroupBackups, PpoObjective, affine_reward, affine_value, boundary_discount, sample_discrete_action
 from mouse_core.objectives.dqn import _pair_weight
 from mouse_core.objectives.ppo import _gae_advantages
 
@@ -160,7 +160,7 @@ def test_ppo_cross_group_backups_is_switchable() -> None:
         normalize_advantage=False,
     )
 
-    def run(*, cross_group_backups: str, episode_done: torch.Tensor) -> tuple[float, dict[str, float | torch.Tensor]]:
+    def run(*, cross_group_backups: CrossGroupBackups, episode_done: torch.Tensor) -> tuple[float, dict[str, float | torch.Tensor]]:
         objective_data = {
             "action": torch.tensor([0, 0]),
             "reward": torch.tensor([0.0, 4.0]),
@@ -228,7 +228,7 @@ def test_ppo_zero_lambda_keeps_the_in_sample_step() -> None:
         "old_log_prob": torch.zeros(3),
     }
 
-    def run(*, cross_group_backups: str, gae_lambda: float) -> tuple[float, dict[str, float | torch.Tensor]]:
+    def run(*, cross_group_backups: CrossGroupBackups, gae_lambda: float) -> tuple[float, dict[str, float | torch.Tensor]]:
         loss, metrics = _ppo(
             cross_group_backups=cross_group_backups,
             discount=_disc(gamma_step=1.0),
@@ -271,7 +271,7 @@ def test_concatenated_groups_match_independent_gae() -> None:
         return {key: torch.cat([left[key], right[key]]) for key in left}
 
     def gae(
-        data: dict[str, torch.Tensor], *, cross_group_backups: str, gae_lambda: float,
+        data: dict[str, torch.Tensor], *, cross_group_backups: CrossGroupBackups, gae_lambda: float,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         n = int(data["reward"].shape[0])
         discounts = torch.full((n,), 0.99)
@@ -315,7 +315,7 @@ def test_fault_raises_when_a_gae_backup_crosses_the_group() -> None:
         "value": torch.tensor([[1.0], [5.0]]),
     }
 
-    def run(*, episode_done: torch.Tensor, cross_group_backups: str) -> float:
+    def run(*, episode_done: torch.Tensor, cross_group_backups: CrossGroupBackups) -> float:
         objective_data = {
             "action": torch.tensor([0, 0]),
             "reward": torch.tensor([0.0, 4.0]),
@@ -340,7 +340,8 @@ def test_fault_raises_when_a_gae_backup_crosses_the_group() -> None:
     ignore_loss = run(episode_done=terminal, cross_group_backups="ignore")
     assert abs(fault_loss - ignore_loss) < 1e-05
     with pytest.raises(ValueError, match="bootstrap"):
-        run(episode_done=terminal, cross_group_backups="drop")
+        # Deliberately exercise runtime validation outside the literal type.
+        run(episode_done=terminal, cross_group_backups="drop")  # type: ignore[arg-type]
 
 
 def test_ppo_requires_cross_group_backups_argument() -> None:

@@ -130,7 +130,9 @@ def test_dqn_reward_centering_centers_td_without_training_constant() -> None:
     # c = 0, so (δ - c)² is the plain residual: δ = [-1, 2], mean 2.5.
     # c is detached, so only Q receives a gradient.
     assert loss.item() == pytest.approx(2.5)
+    assert isinstance(metrics["action_value"], torch.Tensor)
     assert metrics["action_value"].item() == pytest.approx(2.5)
+    assert isinstance(metrics["reward_center"], torch.Tensor)
     assert metrics["reward_center"].item() == pytest.approx(0.0)
     assert "reward_center_loss" not in metrics
 
@@ -177,7 +179,9 @@ def test_dqn_centering_subtracts_same_offset_from_every_horizon() -> None:
     )
     assert loss.item() == pytest.approx(7.25)
     # backup stays the uncentered G.
+    assert isinstance(metrics["backup"], torch.Tensor)
     assert metrics["backup"].tolist() == pytest.approx([6.0, 5.0, 0.0])
+    assert isinstance(metrics["in_run_backup"], torch.Tensor)
     assert metrics["in_run_backup"].tolist() == pytest.approx([6.0, 5.0])
 
     loss.backward()
@@ -342,6 +346,7 @@ def test_dqn_reward_center_metric_is_a_snapshot() -> None:
     )
     with torch.no_grad():
         center.center.add_(1.0)
+    assert isinstance(metrics["reward_center"], torch.Tensor)
     assert metrics["reward_center"].item() == pytest.approx(0.0)
 
 
