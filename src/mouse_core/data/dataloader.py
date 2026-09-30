@@ -556,7 +556,9 @@ class DataLoader:
         # out-of-order worker arrivals in _reorder. Workers claim indices from
         # a counter created per _start_workers call, starting at _next_k.
         self._next_k = 0
-        self._reorder: dict[int, tuple[TokenBatch, dict[str, torch.Tensor]]] = {}
+        self._reorder: dict[
+            int, tuple[TokenBatch, dict[str, torch.Tensor], torch.Tensor]
+        ] = {}
 
         if isinstance(stores, _DS):
             stores = [stores]
