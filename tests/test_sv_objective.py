@@ -12,7 +12,7 @@ def test_sv_objective_mse_onto_targets() -> None:
         predictions=predictions,
         targets=torch.tensor([[[1.0, 2.0]]]),
     )
-    assert loss.item() == 0.0
+    assert loss["value"].item() == 0.0
     assert metrics["value"] == 0.0
 
 
@@ -23,7 +23,7 @@ def test_sv_objective_accepts_direct_q_targets() -> None:
         predictions=predictions,
         targets=torch.tensor([[[0.0, 1.0]]]),
     )
-    assert loss.item() > 0.0
+    assert loss["value"].item() > 0.0
 
 
 def test_sv_objective_requires_targets() -> None:

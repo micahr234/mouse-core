@@ -24,7 +24,7 @@ def test_sp_objective_ce_uses_best_action_ids() -> None:
         predictions=predictions,
         targets=_ce_targets(q),
     )
-    assert loss.ndim == 0
+    assert loss["action"].ndim == 0
     assert isinstance(metrics["action"], torch.Tensor)
     assert metrics["action"].ndim == 0
     assert metrics["action"] >= 0.0
@@ -41,7 +41,7 @@ def test_sp_objective_ce_skips_nonzero_mask_rows() -> None:
         predictions=logits,
         targets=_ce_targets(q),
     )
-    assert loss.item() < 1e-4
+    assert loss["action"].item() < 1e-4
 
 
 def test_sp_objective_ce_mask_key_none_keeps_terminals() -> None:
@@ -51,7 +51,7 @@ def test_sp_objective_ce_mask_key_none_keeps_terminals() -> None:
         predictions=predictions,
         targets=torch.tensor([[0]]),
     )
-    assert loss.item() > 1.0
+    assert loss["action"].item() > 1.0
 
 
 def test_sp_objective_ce_rejects_out_of_range_actions() -> None:
@@ -142,4 +142,4 @@ def test_sp_objective_accepts_direct_action_ids() -> None:
         predictions=predictions,
         targets=torch.tensor([[1]]),
     )
-    assert loss.item() > 0.0
+    assert loss["action"].item() > 0.0

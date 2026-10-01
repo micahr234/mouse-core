@@ -8,30 +8,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- ``RewardCentering``: one-buffer module (not a head, not a
-  parameter). The scalar starts at 0. Pass ``center`` as required
-  ``reward_center=`` on the ``DqnObjective`` call (``None`` disables),
-  with ``objective_data`` and the Q tensors. When set, every reward
-  slot in the backup is shaped by the constant potential ``c``: a slot
-  whose discount is ``γ`` subtracts ``(1 - γ) c``, which telescopes to
-  the same offset ``c`` on every action value — the head learns
-  ``Q - c`` and the policy ordering never changes, episodic or
-  continuing. The TD loss is ``(δ - K c)²`` with ``δ = G - Q(s, a)``
-  and ``K`` the target recursion run on reward ``1 - γ`` and value
-  ``0``; a constant ``γ < 1`` one-step target recovers classic reward
-  centering with average-reward estimate ``(1 - γ) c``, a ``γ = 1``
-  slot subtracts nothing, and a terminal subtracts the full ``c``.
-  ``c`` is detached, so the loss trains Q only. The buffer and the
-  copy step are separate, same as the delayed model and ``model_polyak``:
-  ``reward_centering_polyak(center=, tau=, values=)`` keeps no state
-  and sets ``c ← τ·mean(values) + (1−τ)·c`` (``τ = 0`` keeps it,
-  ``τ = 1`` copies the mean) — feed ``metrics["in_run_backup"]``
-  (``backup`` where ``backup_weight > 0``) so
-  ``c`` tracks the mean action value. Metric ``reward_center`` when
-  enabled. ``examples/16_train_offline_reward_centering_dqn.ipynb``
-  calls it at ``POLYAK_TAU_REWARD_CENTERING``.
+- ``ConstantHead``: a scalar parameter that does not read the
+  backbone. The output is ``scale * value``. ``value`` starts at 0.
+  ``DqnObjective`` requires ``reward_center=`` and
+  ``delayed_reward_center=`` (both a 0-dim float32 tensor, or both
+  ``None``). The backup uses the delayed center ``c'`` and detaches
+  it: one step is ``G = r - c' + γ c' + γ V``. ``action_value`` is
+  the TD loss and trains Q. It does not train ``c`` or ``c'``,
+  because a constant shift of every action value is already a bias
+  in the Q head. When the centers are set, ``reward_center`` is
+  ``-c · mean(δ)`` with ``δ`` detached, so gradient descent steps
+  ``c`` by that mean. When ``c = c'`` the target telescopes to the
+  same offset ``c`` on every action value, so the policy ordering
+  never changes, episodic or continuing. A constant ``γ < 1``
+  one-step target recovers classic reward centering, a ``γ = 1``
+  slot subtracts nothing, and a terminal subtracts the full ``c'``.
+  ``metrics["backup"]`` is that target. Metrics ``reward_center``,
+  ``delayed_reward_center``, and ``in_run_delta`` when enabled.
+  ``examples/16_train_offline_reward_centering_dqn.ipynb`` copies
+  every head onto the delayed model and sums the loss dict before
+  ``backward``. ``model_polyak`` tracks ``c'``.
 
 ### Changed
+- Objective ``__call__`` returns ``(losses, metrics)``. ``losses`` is
+  a dict of 0-dim tensors. Callers sum the terms they train.
+  ``DqnObjective`` uses ``action_value`` and, when centering is on,
+  ``reward_center``. ``PpoObjective`` uses ``ppo``, ``GrpoObjective``
+  uses ``grpo``, ``SpObjective`` uses ``action``, and ``SvObjective``
+  uses ``value``.
 - ``pack_token_batch`` and ``DataLoader.next_batch`` return
   ``(inputs, objective_data, group_id)``. ``group_id`` is int64
   ``[N]``, one id per step. It is not a key in ``objective_data``.

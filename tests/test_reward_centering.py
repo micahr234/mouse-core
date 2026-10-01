@@ -1,11 +1,11 @@
-"""Tests for RewardCentering and DQN reward-centering loss."""
+"""Tests for ConstantHead and DQN reward-centering loss."""
 
 from __future__ import annotations
 
 import pytest
 import torch
 
-from mouse_core.models import RewardCentering, reward_centering_polyak
+from mouse_core.models import ConstantHead
 from mouse_core.objectives import (
     DqnObjective,
     affine_reward,
@@ -47,12 +47,24 @@ def _val(**overrides: object):
     return affine_value(**kwargs)  # type: ignore[arg-type]
 
 
-def test_reward_centering_starts_at_zero() -> None:
-    center = RewardCentering()
-    assert center.center.dtype is torch.float32
-    assert center.center.item() == 0.0
-    assert not center.center.requires_grad
-    assert list(center.parameters()) == []
+def test_constant_head_starts_at_zero_and_ignores_backbone() -> None:
+    center = ConstantHead(scale=2.0)
+    assert center.scale == 2.0
+    assert center.value.dtype is torch.float32
+    assert center.value.item() == 0.0
+    assert center.value.requires_grad
+    h = torch.randn(3, 4, requires_grad=True)
+    out = center(h)
+    assert out.shape == ()
+    assert out.item() == pytest.approx(0.0)
+    with torch.no_grad():
+        center.value.fill_(3.0)
+    scaled = center(h)
+    assert scaled.item() == pytest.approx(6.0)
+    scaled.backward()
+    assert h.grad is None
+    assert center.value.grad is not None
+    assert center.value.grad.item() == pytest.approx(2.0)
 
 
 def _objective() -> DqnObjective:
@@ -97,7 +109,8 @@ def test_dqn_rejects_non_scalar_reward_center() -> None:
             objective_data=step_stream, group_id=_group_id(step_stream),
             predictions=online,
             delayed_predictions=delayed,
-            reward_center=RewardCentering(),  # type: ignore[arg-type]
+            reward_center=ConstantHead(scale=1.0),  # type: ignore[arg-type]
+            delayed_reward_center=torch.zeros(()),
         )
     with pytest.raises(TypeError, match="reward_center"):
         objective(
@@ -105,11 +118,12 @@ def test_dqn_rejects_non_scalar_reward_center() -> None:
             predictions=online,
             delayed_predictions=delayed,
             reward_center=torch.zeros(1),
+            delayed_reward_center=torch.zeros(()),
         )
 
 
-def test_dqn_reward_centering_centers_td_without_training_constant() -> None:
-    """gamma=0 so targets are rewards; the loss does not train the constant."""
+def test_dqn_loss_does_not_train_the_center() -> None:
+    """gamma=0 so the target is r - c'. action_value trains Q. reward_center trains c."""
     step_stream = {
         "action": torch.tensor([0, 1, 0]),
         "reward": torch.tensor([0.0, 1.0, 5.0]),
@@ -120,23 +134,32 @@ def test_dqn_reward_centering_centers_td_without_training_constant() -> None:
     # δ = [1-2, 5-3] = [-1, 2]; mean δ = 0.5
     online = torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]], requires_grad=True)
     delayed = torch.zeros(3, 2)
-    center = RewardCentering()
-    loss, metrics = _objective()(
+    center = ConstantHead(scale=1.0)
+    losses, metrics = _objective()(
         objective_data=step_stream, group_id=_group_id(step_stream),
         predictions=online,
         delayed_predictions=delayed,
-        reward_center=center.center,
+        reward_center=center.value,
+        delayed_reward_center=center.value,
     )
-    # c = 0, so (δ - c)² is the plain residual: δ = [-1, 2], mean 2.5.
-    # c is detached, so only Q receives a gradient.
-    assert loss.item() == pytest.approx(2.5)
+    # c' = 0, so the shaped target is the plain residual: δ = [-1, 2], loss 2.5.
+    assert losses["action_value"].item() == pytest.approx(2.5)
     assert metrics["action_value"].item() == pytest.approx(2.5)
     assert metrics["reward_center"].item() == pytest.approx(0.0)
     assert "reward_center_loss" not in metrics
+    in_run_delta = metrics["in_run_delta"]
+    assert isinstance(in_run_delta, torch.Tensor)
+    assert in_run_delta.tolist() == pytest.approx([-1.0, 2.0])
+    assert not in_run_delta.requires_grad
 
-    loss.backward()
-    assert center.center.grad is None
+    losses["action_value"].backward()
+    assert center.value.grad is None
     assert online.grad is not None
+    # δ = [-1, 2], mean 0.5. The center loss is -c · mean(δ), so ∂L/∂c = -0.5.
+    online.grad = None
+    losses["reward_center"].backward()
+    assert center.value.grad is not None
+    assert center.value.grad.item() == pytest.approx(-0.5)
 
 
 def test_dqn_centering_subtracts_same_offset_from_every_horizon() -> None:
@@ -148,8 +171,7 @@ def test_dqn_centering_subtracts_same_offset_from_every_horizon() -> None:
     the policy ordering intact (a per-reward count K = [2, 1] would
     penalize the longer backup). G_0 = r_1 + r_2 = 6, G_1 = r_2 = 5;
     δ = [6-2, 5-3] = [4, 2]. With c = 0.5 the residuals are
-    [3.5, 1.5] → loss (12.25 + 2.25) / 2 = 7.25. c is detached, so it
-    receives no gradient.
+    [3.5, 1.5] → loss (12.25 + 2.25) / 2 = 7.25. The loss trains Q.
     """
     step_stream = {
         "action": torch.tensor([0, 1, 0]),
@@ -169,18 +191,25 @@ def test_dqn_centering_subtracts_same_offset_from_every_horizon() -> None:
         gate=nstep_gate(n=2),
         cross_group_backups="bootstrap",
     )
-    loss, metrics = objective(
+    losses, metrics = objective(
         objective_data=step_stream, group_id=_group_id(step_stream),
         predictions=online,
         delayed_predictions=delayed,
         reward_center=center,
+        delayed_reward_center=center,
     )
-    assert loss.item() == pytest.approx(7.25)
-    # backup stays the uncentered G.
-    assert metrics["backup"].tolist() == pytest.approx([6.0, 5.0, 0.0])
-    assert metrics["in_run_backup"].tolist() == pytest.approx([6.0, 5.0])
+    assert losses["action_value"].item() == pytest.approx(7.25)
+    # Shaped backup is G − c. K = 1 on both in-run rows, so
+    # [6, 5, 0] − 0.5 = [5.5, 4.5, 0].
+    assert metrics["backup"].tolist() == pytest.approx([5.5, 4.5, 0.0])
+    assert metrics["in_run_backup"].tolist() == pytest.approx([5.5, 4.5])
+    # δ = shaped G − Q = [5.5 − 2, 4.5 − 3] = [3.5, 1.5].
+    in_run_delta = metrics["in_run_delta"]
+    assert isinstance(in_run_delta, torch.Tensor)
+    assert in_run_delta.tolist() == pytest.approx([3.5, 1.5])
+    assert not in_run_delta.requires_grad
 
-    loss.backward()
+    losses["action_value"].backward()
     assert center.grad is None
     assert online.grad is not None
 
@@ -215,14 +244,94 @@ def test_dqn_centering_subtracts_nothing_on_undiscounted_bootstrapped_steps() ->
         predictions=online,
         delayed_predictions=delayed,
         reward_center=torch.tensor(3.0),
+        delayed_reward_center=torch.tensor(3.0),
     )
     without, _ = objective(
         objective_data=step_stream, group_id=_group_id(step_stream),
         predictions=online,
         delayed_predictions=delayed,
-        reward_center=None,
+        reward_center=None, delayed_reward_center=None,
     )
-    assert with_center.item() == pytest.approx(without.item())
+    assert with_center["action_value"].item() == pytest.approx(without["action_value"].item())
+
+
+def test_dqn_requires_both_centers_or_neither() -> None:
+    step_stream = {
+        "action": torch.tensor([0, 1, 0]),
+        "reward": torch.tensor([0.0, 1.0, 5.0]),
+        "episode_done": torch.tensor([0, 1, 0]),
+        "task_done": torch.tensor([0, 0, 0]),
+    }
+    online = torch.zeros(3, 2)
+    with pytest.raises(ValueError, match="both be set or both be None"):
+        _objective()(
+            objective_data=step_stream, group_id=_group_id(step_stream),
+            predictions=online,
+            delayed_predictions=online,
+            reward_center=torch.zeros(()),
+            delayed_reward_center=None,
+        )
+
+
+def test_dqn_backup_uses_delayed_center() -> None:
+    """G = r - (1 - γ) c' + γ V. The loss does not train c.
+
+    γ = 0.9, c' = 2, V = 0. G = [1 - 0.2, 5 - 0.2] = [0.8, 4.8],
+    δ = [-1.2, 1.8], loss (1.44 + 3.24) / 2 = 2.34.
+    """
+    step_stream = {
+        "action": torch.tensor([0, 1, 0]),
+        "reward": torch.tensor([0.0, 1.0, 5.0]),
+        "episode_done": torch.tensor([0, 0, 0]),
+        "task_done": torch.tensor([0, 0, 0]),
+    }
+    online = torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]], requires_grad=True)
+    delayed = torch.zeros(3, 2)
+    center = torch.tensor(0.0, requires_grad=True)
+    delayed_center = torch.tensor(2.0, requires_grad=True)
+    objective = DqnObjective(
+        reward=_rew(),
+        value=_val(),
+        discount=_disc(gamma_step=0.9),
+        temperature=0.0,
+        double=False,
+        gate=None,
+        cross_group_backups="bootstrap",
+    )
+    losses, metrics = objective(
+        objective_data=step_stream, group_id=_group_id(step_stream),
+        predictions=online,
+        delayed_predictions=delayed,
+        reward_center=center,
+        delayed_reward_center=delayed_center,
+    )
+    assert losses["action_value"].item() == pytest.approx(2.34)
+    assert metrics["backup"].tolist() == pytest.approx([0.8, 4.8, 0.0])
+    losses["action_value"].backward()
+    assert center.grad is None
+    assert delayed_center.grad is None
+
+
+def test_dqn_terminal_target_uses_delayed_center() -> None:
+    """γ = 0 drops the bootstrap, so G = r - c'. The online center is unused."""
+    step_stream = {
+        "action": torch.tensor([0, 1, 0]),
+        "reward": torch.tensor([0.0, 1.0, 5.0]),
+        "episode_done": torch.tensor([0, 1, 0]),
+        "task_done": torch.tensor([0, 0, 0]),
+    }
+    online = torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]])
+    delayed = torch.zeros(3, 2)
+    losses, metrics = _objective()(
+        objective_data=step_stream, group_id=_group_id(step_stream),
+        predictions=online,
+        delayed_predictions=delayed,
+        reward_center=torch.tensor(0.5),
+        delayed_reward_center=torch.tensor(2.0),
+    )
+    # Unshaped G = [1, 5]. Delayed c' = 2 → [-1, 3]. Online c = 0.5 is unused.
+    assert metrics["in_run_backup"].tolist() == pytest.approx([-1.0, 3.0])
+    assert losses["action_value"].item() == pytest.approx(((-1.0 - 2.0) ** 2 + (3.0 - 3.0) ** 2) / 2)
 
 
 def test_dqn_centering_matches_classic_reward_centering_when_continuing() -> None:
@@ -250,13 +359,14 @@ def test_dqn_centering_matches_classic_reward_centering_when_continuing() -> Non
         gate=None,
         cross_group_backups="bootstrap",
     )
-    loss, _ = objective(
+    losses, _ = objective(
         objective_data=step_stream, group_id=_group_id(step_stream),
         predictions=online,
         delayed_predictions=delayed,
         reward_center=torch.tensor(2.0),
+        delayed_reward_center=torch.tensor(2.0),
     )
-    assert loss.item() == pytest.approx(2.34)
+    assert losses["action_value"].item() == pytest.approx(2.34)
 
 
 def test_dqn_centering_is_a_pure_value_shift() -> None:
@@ -290,59 +400,48 @@ def test_dqn_centering_is_a_pure_value_shift() -> None:
         cross_group_backups="bootstrap",
     )
     k = 2.5
-    base, _ = objective(
+    base_losses, _ = objective(
         objective_data=step_stream, group_id=_group_id(step_stream),
         predictions=online,
         delayed_predictions=delayed,
         reward_center=torch.tensor(0.0),
+        delayed_reward_center=torch.tensor(0.0),
     )
-    shifted, _ = objective(
+    shifted_losses, _ = objective(
         objective_data=step_stream, group_id=_group_id(step_stream),
         predictions=online - k,
         delayed_predictions=delayed - k,
         reward_center=torch.tensor(k),
+        delayed_reward_center=torch.tensor(k),
     )
-    assert shifted.item() == pytest.approx(base.item(), rel=1e-5)
-
-
-def test_reward_centering_update_is_polyak_average_of_values() -> None:
-    """center ← τ·mean(values) + (1−τ)·center. τ = 0 keeps it; τ = 1 replaces it."""
-    center = RewardCentering()
-    values = torch.tensor([0.0, 1.0, 5.0])
-    reward_centering_polyak(center=center, tau=0.0, values=values)
-    assert center.center.item() == pytest.approx(0.0)
-    reward_centering_polyak(center=center, tau=1.0, values=values)
-    assert center.center.item() == pytest.approx(2.0)
-    reward_centering_polyak(center=center, tau=0.5, values=torch.tensor([0.0, 0.0]))
-    assert center.center.item() == pytest.approx(1.0)
-    with pytest.raises(ValueError, match="tau"):
-        reward_centering_polyak(center=center, tau=1.5, values=values)
-    with pytest.raises(TypeError, match="RewardCentering"):
-        reward_centering_polyak(
-            center=torch.zeros(()),  # type: ignore[arg-type]
-            tau=0.0,
-            values=torch.zeros(1),
-        )
+    assert shifted_losses["action_value"].item() == pytest.approx(
+        base_losses["action_value"].item(), rel=1e-5
+    )
 
 
 def test_dqn_reward_center_metric_is_a_snapshot() -> None:
-    """The logged center must not change when ``update`` writes the buffer."""
+    """The logged center must not change when the parameter is written."""
     step_stream = {
         "action": torch.tensor([0, 1, 0]),
         "reward": torch.tensor([0.0, 1.0, 5.0]),
         "episode_done": torch.tensor([0, 1, 0]),
         "task_done": torch.tensor([0, 0, 0]),
     }
-    center = RewardCentering()
+    center = ConstantHead(scale=1.0)
     _, metrics = _objective()(
         objective_data=step_stream, group_id=_group_id(step_stream),
         predictions=torch.zeros(3, 2),
         delayed_predictions=torch.zeros(3, 2),
-        reward_center=center.center,
+        reward_center=center.value,
+        delayed_reward_center=center.value,
     )
     with torch.no_grad():
-        center.center.add_(1.0)
+        center.value.add_(1.0)
     assert metrics["reward_center"].item() == pytest.approx(0.0)
+    assert metrics["delayed_reward_center"].item() == pytest.approx(0.0)
+    in_run_delta = metrics["in_run_delta"]
+    assert isinstance(in_run_delta, torch.Tensor)
+    assert in_run_delta.tolist() == pytest.approx([1.0, 5.0])
 
 
 def test_dqn_without_centering_omits_center_metrics() -> None:
@@ -354,11 +453,13 @@ def test_dqn_without_centering_omits_center_metrics() -> None:
     }
     online = torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]])
     delayed = torch.zeros(3, 2)
-    loss, metrics = _objective()(
+    losses, metrics = _objective()(
         objective_data=step_stream, group_id=_group_id(step_stream),
         predictions=online,
         delayed_predictions=delayed,
-        reward_center=None,
+        reward_center=None, delayed_reward_center=None,
     )
-    assert loss.item() == pytest.approx(2.5)
+    assert losses["action_value"].item() == pytest.approx(2.5)
     assert "reward_center" not in metrics
+    assert "delayed_reward_center" not in metrics
+    assert "in_run_delta" not in metrics

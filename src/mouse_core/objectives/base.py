@@ -20,9 +20,9 @@ Example — custom objective::
             delayed_predictions: torch.Tensor | None = None,
             value_predictions: torch.Tensor | None = None,
             targets: torch.Tensor | None = None,
-        ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]:
+        ) -> tuple[dict[str, torch.Tensor], dict[str, float | torch.Tensor]]:
             ...
-            return loss, {"my_objective": loss.detach()}
+            return {"my_objective": loss}, {"my_objective": loss.detach()}
 """
 
 from __future__ import annotations
@@ -62,8 +62,11 @@ class Objective(ABC):
     and PPO takes ``value_predictions=``. Supervised objectives take
     ``targets=`` (action ids for SP, Q vectors for SV). A custom subclass
     must accept the same optional parameters (pass ``None`` for a tensor
-    it does not read). ``DqnObjective`` also takes ``reward_center=`` on
-    that call: a 0-dim float32 tensor, or ``None``.
+    it does not read). ``DqnObjective`` also takes ``reward_center=`` and
+    ``delayed_reward_center=`` on that call: each a 0-dim float32 tensor,
+    or both ``None``. The backup uses the delayed center. The returned
+    loss is a dict of terms. ``action_value`` trains Q. ``reward_center``
+    trains the online center from the detached residual.
     """
 
     @abstractmethod
@@ -75,8 +78,8 @@ class Objective(ABC):
         delayed_predictions: torch.Tensor | None = None,
         value_predictions: torch.Tensor | None = None,
         targets: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]:
-        """Compute a scalar loss and return diagnostic metrics.
+    ) -> tuple[dict[str, torch.Tensor], dict[str, float | torch.Tensor]]:
+        """Compute a dict of loss terms and return diagnostic metrics.
 
         Args:
             objective_data: ``dict[str, Tensor]`` of tokenizer ``objective_fields``
@@ -98,7 +101,9 @@ class Objective(ABC):
                 look up a ``targets_key`` in ``objective_data``.
 
         Returns:
-            ``(scalar_loss, metrics)`` where ``metrics`` holds detached
+            ``(losses, metrics)``. ``losses`` maps a name to a 0-dim
+            tensor to minimize. Callers sum the terms they train.
+            ``metrics`` holds detached
             0-dim tensors (or floats) for logging — prefer tensors so the
             train step can defer host materialization until log time —
             and, when an objective exposes them, detached tensors built

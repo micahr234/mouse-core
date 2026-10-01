@@ -34,7 +34,7 @@ def test_grpo_objective_runs() -> None:
     objective_data = {'action': torch.randint(0, a, (n,)), 'old_log_prob': torch.randn(n), 'advantage': torch.randn(n), 'group_id': torch.tensor([0, 0, 0, 0, 1, 1, 1, 1])}
     predictions = torch.randn(n, a)
     loss, metrics = GrpoObjective()(objective_data=objective_data, group_id=_group_id(objective_data), predictions=predictions)
-    assert loss.ndim == 0
+    assert loss["grpo"].ndim == 0
     assert 'grpo' in metrics
     assert 'policy_loss' in metrics
     assert 'entropy' in metrics
@@ -54,19 +54,19 @@ def test_grpo_objective_closed_form() -> None:
     objective_data = {'action': torch.tensor([0, 0]), 'old_log_prob': torch.tensor([0.0, 0.0]), 'advantage': torch.tensor([0.0, 3.0])}
     predictions = torch.tensor([[20.0, -20.0], [20.0, -20.0]])
     loss, metrics = GrpoObjective(ent_coef=0.0)(objective_data=objective_data, group_id=_group_id(objective_data), predictions=predictions)
-    assert abs(loss.item() - -3.0) < 0.001
+    assert abs(loss["grpo"].item() - -3.0) < 0.001
     assert abs(metrics['policy_loss'] - -3.0) < 0.001
 
 def test_grpo_objective_skips_sequence_boundaries() -> None:
     objective_data = {'action': torch.tensor([0, 0, 0]), 'old_log_prob': torch.zeros(3), 'advantage': torch.tensor([9.0, 9.0, 2.0]), 'group_id': torch.tensor([0, 1, 1])}
     predictions = torch.tensor([[20.0, -20.0], [20.0, -20.0], [20.0, -20.0]])
     loss, _ = GrpoObjective(ent_coef=0.0)(objective_data=objective_data, group_id=_group_id(objective_data), predictions=predictions)
-    assert abs(loss.item() - -2.0) < 0.001
+    assert abs(loss["grpo"].item() - -2.0) < 0.001
 
 
 def test_grpo_objective_all_out_of_run_pairs_yield_zero_loss() -> None:
     objective_data = {'action': torch.tensor([0, 1, 0]), 'old_log_prob': torch.zeros(3), 'advantage': torch.tensor([9.0, 9.0, 2.0]), 'group_id': torch.tensor([0, 1, 2])}
     predictions = torch.zeros(3, 2)
     loss, metrics = GrpoObjective(ent_coef=0.0)(objective_data=objective_data, group_id=_group_id(objective_data), predictions=predictions)
-    assert abs(loss.item()) < 1e-05
+    assert abs(loss["grpo"].item()) < 1e-05
     assert abs(metrics['advantage_mean']) < 1e-05

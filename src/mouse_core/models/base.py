@@ -18,6 +18,7 @@ from mouse_core.models.backbone.flex_decode import DecodeKernel, FlexDecodeSessi
 from mouse_core.models.backbone.packed_train import TrainKernel
 from mouse_core.models.heads.base import BaseHead, _bind_prediction_key
 from mouse_core.models.heads.classification import ClassificationHead
+from mouse_core.models.heads.constant import ConstantHead
 from mouse_core.models.heads.regression import RegressionHead
 from mouse_core.models.lora import LoRAConfig
 from mouse_core.models.reasoner import LatentReasoner, _InsertionPlan, _plan_insertions
@@ -423,6 +424,8 @@ def _head_config(name: str, head: BaseHead) -> dict[str, Any] | None:
             "use_norm": head.use_norm,
             "propagate_gradient": head.propagate_gradient,
         }
+    if isinstance(head, ConstantHead):
+        return {"name": name, "type": "constant", "scale": head.scale}
     if isinstance(head, RegressionHead):
         return {
             "name": name,
@@ -623,6 +626,8 @@ def _build_heads_from_config(heads: list[dict[str, Any]]) -> dict[str, BaseHead]
                 use_norm=spec["use_norm"],
                 propagate_gradient=spec["propagate_gradient"],
             )
+        elif head_type == "constant":
+            built[name] = ConstantHead(scale=spec["scale"])
         elif head_type == "regression":
             built[name] = RegressionHead(
                 in_features=spec["in_features"],

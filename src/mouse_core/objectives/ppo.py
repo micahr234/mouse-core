@@ -181,12 +181,13 @@ class PpoObjective(Objective):
         from mouse_core.models import prediction_key
         inputs, objective_data, group_id = loader.next_batch()
         out = model(inputs)
-        loss, metrics = objective(
+        losses, metrics = objective(
             objective_data=to_device(data=objective_data, device=device),
             group_id=group_id.to(device),
             predictions=out.predictions[prediction_key(head=policy_head)],
             value_predictions=out.predictions[prediction_key(head=value_head)],
         )
+        loss = torch.stack(tuple(losses.values())).sum()
 
     When ``old_log_prob`` is absent, the detached current log-probs are used
     (ratio = 1) — suitable for a single pass over a freshly collected batch.
@@ -276,7 +277,7 @@ class PpoObjective(Objective):
         group_id: torch.Tensor,
         predictions: torch.Tensor,
         value_predictions: torch.Tensor,
-    ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]: ...
+    ) -> tuple[dict[str, torch.Tensor], dict[str, float | torch.Tensor]]: ...
 
     @overload
     def __call__(
@@ -288,7 +289,7 @@ class PpoObjective(Objective):
         value_predictions: torch.Tensor,
         delayed_predictions: None = None,
         targets: None = None,
-    ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]: ...
+    ) -> tuple[dict[str, torch.Tensor], dict[str, float | torch.Tensor]]: ...
 
     def __call__(
         self,
@@ -299,7 +300,7 @@ class PpoObjective(Objective):
         delayed_predictions: torch.Tensor | None = None,
         value_predictions: torch.Tensor | None = None,
         targets: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]:
+    ) -> tuple[dict[str, torch.Tensor], dict[str, float | torch.Tensor]]:
         _reject_predictions(
             "PpoObjective",
             delayed_predictions=delayed_predictions,
@@ -489,4 +490,4 @@ class PpoObjective(Objective):
         metrics: dict[str, float | torch.Tensor] = dict(
             zip(named, torch.stack(list(named.values())).tolist())
         )
-        return loss, metrics
+        return {"ppo": loss}, metrics

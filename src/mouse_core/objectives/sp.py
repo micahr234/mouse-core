@@ -136,7 +136,7 @@ class SpObjective(Objective):
         objective_data: dict[str, torch.Tensor],
         predictions: torch.Tensor,
         targets: torch.Tensor,
-    ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]: ...
+    ) -> tuple[dict[str, torch.Tensor], dict[str, float | torch.Tensor]]: ...
 
     @overload
     def __call__(
@@ -147,7 +147,7 @@ class SpObjective(Objective):
         targets: torch.Tensor,
         delayed_predictions: None = None,
         value_predictions: None = None,
-    ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]: ...
+    ) -> tuple[dict[str, torch.Tensor], dict[str, float | torch.Tensor]]: ...
 
     def __call__(
         self,
@@ -157,7 +157,7 @@ class SpObjective(Objective):
         delayed_predictions: torch.Tensor | None = None,
         value_predictions: torch.Tensor | None = None,
         targets: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]:
+    ) -> tuple[dict[str, torch.Tensor], dict[str, float | torch.Tensor]]:
         _reject_predictions(
             "SpObjective",
             delayed_predictions=delayed_predictions,
@@ -205,4 +205,4 @@ class SpObjective(Objective):
         )
         # Keep the CE scalar on-device; loggers can ``.item()`` at log time.
         metrics: dict[str, float | torch.Tensor] = {"action": loss.detach()}
-        return loss, metrics
+        return {"action": loss}, metrics

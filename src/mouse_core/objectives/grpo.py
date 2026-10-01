@@ -84,11 +84,12 @@ class GrpoObjective(Objective):
         from mouse_core.models import prediction_key
         inputs, objective_data, group_id = loader.next_batch()
         out = model(inputs)
-        loss, metrics = objective(
+        losses, metrics = objective(
             objective_data=to_device(data=objective_data, device=device),
             group_id=group_id.to(device),
             predictions=out.predictions[prediction_key(head=policy_head)],
         )
+        loss = torch.stack(tuple(losses.values())).sum()
 
     ``old_log_prob`` and ``advantage`` are objective columns only — not
     tokenizer input fields.
@@ -133,7 +134,7 @@ class GrpoObjective(Objective):
         objective_data: dict[str, torch.Tensor],
         group_id: torch.Tensor,
         predictions: torch.Tensor,
-    ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]: ...
+    ) -> tuple[dict[str, torch.Tensor], dict[str, float | torch.Tensor]]: ...
 
     @overload
     def __call__(
@@ -145,7 +146,7 @@ class GrpoObjective(Objective):
         delayed_predictions: None = None,
         value_predictions: None = None,
         targets: None = None,
-    ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]: ...
+    ) -> tuple[dict[str, torch.Tensor], dict[str, float | torch.Tensor]]: ...
 
     def __call__(
         self,
@@ -156,7 +157,7 @@ class GrpoObjective(Objective):
         delayed_predictions: torch.Tensor | None = None,
         value_predictions: torch.Tensor | None = None,
         targets: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]:
+    ) -> tuple[dict[str, torch.Tensor], dict[str, float | torch.Tensor]]:
         _reject_predictions(
             "GrpoObjective",
             delayed_predictions=delayed_predictions,
@@ -270,4 +271,4 @@ class GrpoObjective(Objective):
         metrics: dict[str, float | torch.Tensor] = dict(
             zip(named, torch.stack(list(named.values())).tolist())
         )
-        return loss, metrics
+        return {"grpo": loss}, metrics

@@ -426,16 +426,16 @@ def test_dqn_duplicated_rows_match_single_head_output() -> None:
 
     base_data = _objective_data(N)
     base_loss, base_metrics = objective(
-        objective_data=base_data, group_id=_group_id(base_data), predictions=q,  delayed_predictions=q_target, reward_center=None
+        objective_data=base_data, group_id=_group_id(base_data), predictions=q,  delayed_predictions=q_target, reward_center=None, delayed_reward_center=None
     )
     # Duplicate every step's head-output row: same targets, same loss.
     q2 = q.repeat_interleave(2, dim=0)
     q2_target = q_target.repeat_interleave(2, dim=0)
     dup_data = _objective_data(N, counts=[2] * N)
     dup_loss, dup_metrics = objective(
-        objective_data=dup_data, group_id=_group_id(dup_data), predictions=q2,  delayed_predictions=q2_target, reward_center=None
+        objective_data=dup_data, group_id=_group_id(dup_data), predictions=q2,  delayed_predictions=q2_target, reward_center=None, delayed_reward_center=None
     )
-    assert torch.allclose(base_loss, dup_loss, atol=1e-6)
+    assert torch.allclose(base_loss["action_value"], dup_loss["action_value"], atol=1e-6)
     for key in ("q_values_mean", "q_values_min", "q_values_max"):
         assert base_metrics[key] == pytest.approx(dup_metrics[key], abs=1e-6)
 
@@ -450,11 +450,11 @@ def test_dqn_multi_head_output_shares_step_target() -> None:
     data = _objective_data(2, counts=[2, 1], actions=[0, 1])
     data["reward"] = torch.tensor([0.0, 0.5])
     loss, _ = objective(
-        objective_data=data, group_id=_group_id(data), predictions=q,  delayed_predictions=q_target, reward_center=None
+        objective_data=data, group_id=_group_id(data), predictions=q,  delayed_predictions=q_target, reward_center=None, delayed_reward_center=None
     )
     target = 0.5 + gamma * 60.0  # r_1 + gamma * max_a Q_target(s_1) (row 2)
     expected = ((2.0 - target) ** 2 + (4.0 - target) ** 2) / 2  # a_1 = 1
-    assert loss.item() == pytest.approx(expected)
+    assert loss["action_value"].item() == pytest.approx(expected)
 
 
 def test_dqn_misaligned_head_output_count_raises() -> None:
@@ -463,10 +463,10 @@ def test_dqn_misaligned_head_output_count_raises() -> None:
     objective = DqnObjective( reward=_rew(), value=_val(), discount=_disc(), temperature=0.0, double=False, gate=None, cross_group_backups="bootstrap")
     bad = _objective_data(N, counts=[2, 2, 1])
     with pytest.raises(ValueError, match="misaligned"):
-        objective(objective_data=bad, group_id=_group_id(bad), predictions=q,  delayed_predictions=q.clone(), reward_center=None)
+        objective(objective_data=bad, group_id=_group_id(bad), predictions=q,  delayed_predictions=q.clone(), reward_center=None, delayed_reward_center=None)
     plain = _objective_data(N)
     with pytest.raises(ValueError, match="head_output_count column"):
-        objective(objective_data=plain, group_id=_group_id(plain), predictions=q,  delayed_predictions=q.clone(), reward_center=None)
+        objective(objective_data=plain, group_id=_group_id(plain), predictions=q,  delayed_predictions=q.clone(), reward_center=None, delayed_reward_center=None)
 
 
 # ---------------------------------------------------------------------------
