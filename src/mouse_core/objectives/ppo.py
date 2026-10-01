@@ -131,7 +131,7 @@ def _gae_advantages(
     return advantages, returns, participate
 
 
-class PpoObjective(Objective):
+class PpoObjective(Objective[...]):
     """Clipped PPO policy+value objective with GAE.
 
     Instantiate with hyperparameters, then call with
@@ -258,7 +258,9 @@ class PpoObjective(Objective):
         self.reward = _require_transform(reward, name="reward")
         self.value = _require_transform(value, name="value")
         self.gae_lambda = gae_lambda
-        self.cross_group_backups = _require_cross_group_backups(cross_group_backups)
+        self.cross_group_backups: CrossGroupBackups = _require_cross_group_backups(
+            cross_group_backups
+        )
         self.clip_eps = clip_eps
         self.vf_coef = vf_coef
         self.ent_coef = ent_coef

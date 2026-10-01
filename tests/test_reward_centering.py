@@ -144,7 +144,9 @@ def test_dqn_loss_does_not_train_the_center() -> None:
     )
     # c' = 0, so the shaped target is the plain residual: δ = [-1, 2], loss 2.5.
     assert losses["action_value"].item() == pytest.approx(2.5)
+    assert isinstance(metrics["action_value"], torch.Tensor)
     assert metrics["action_value"].item() == pytest.approx(2.5)
+    assert isinstance(metrics["reward_center"], torch.Tensor)
     assert metrics["reward_center"].item() == pytest.approx(0.0)
     assert "reward_center_loss" not in metrics
     in_run_delta = metrics["in_run_delta"]
@@ -199,9 +201,11 @@ def test_dqn_centering_subtracts_same_offset_from_every_horizon() -> None:
         delayed_reward_center=center,
     )
     assert losses["action_value"].item() == pytest.approx(7.25)
-    # Shaped backup is G − c. K = 1 on both in-run rows, so
+    # Shaped backup is G − c'. K = 1 on both in-run rows, so
     # [6, 5, 0] − 0.5 = [5.5, 4.5, 0].
+    assert isinstance(metrics["backup"], torch.Tensor)
     assert metrics["backup"].tolist() == pytest.approx([5.5, 4.5, 0.0])
+    assert isinstance(metrics["in_run_backup"], torch.Tensor)
     assert metrics["in_run_backup"].tolist() == pytest.approx([5.5, 4.5])
     # δ = shaped G − Q = [5.5 − 2, 4.5 − 3] = [3.5, 1.5].
     in_run_delta = metrics["in_run_delta"]
@@ -306,6 +310,7 @@ def test_dqn_backup_uses_delayed_center() -> None:
         delayed_reward_center=delayed_center,
     )
     assert losses["action_value"].item() == pytest.approx(2.34)
+    assert isinstance(metrics["backup"], torch.Tensor)
     assert metrics["backup"].tolist() == pytest.approx([0.8, 4.8, 0.0])
     losses["action_value"].backward()
     assert center.grad is None
@@ -330,6 +335,7 @@ def test_dqn_terminal_target_uses_delayed_center() -> None:
         delayed_reward_center=torch.tensor(2.0),
     )
     # Unshaped G = [1, 5]. Delayed c' = 2 → [-1, 3]. Online c = 0.5 is unused.
+    assert isinstance(metrics["in_run_backup"], torch.Tensor)
     assert metrics["in_run_backup"].tolist() == pytest.approx([-1.0, 3.0])
     assert losses["action_value"].item() == pytest.approx(((-1.0 - 2.0) ** 2 + (3.0 - 3.0) ** 2) / 2)
 
@@ -437,7 +443,9 @@ def test_dqn_reward_center_metric_is_a_snapshot() -> None:
     )
     with torch.no_grad():
         center.value.add_(1.0)
+    assert isinstance(metrics["reward_center"], torch.Tensor)
     assert metrics["reward_center"].item() == pytest.approx(0.0)
+    assert isinstance(metrics["delayed_reward_center"], torch.Tensor)
     assert metrics["delayed_reward_center"].item() == pytest.approx(0.0)
     in_run_delta = metrics["in_run_delta"]
     assert isinstance(in_run_delta, torch.Tensor)

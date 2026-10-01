@@ -1,14 +1,15 @@
 """Base type for MOUSE objective objects.
 
 All objectives are plain Python objects: instantiate with hyperparameters,
-then call with ``objective_data=`` and ``predictions=`` to get a loss and metrics.
+then call with ``objective_data=``, ``predictions=``, and any inputs required
+by that objective to get a loss and metrics.
 
 Example — custom objective::
 
     from mouse_core.objectives.base import Objective
     import torch
 
-    class MyObjective(Objective):
+    class MyObjective(Objective[...]):
         def __init__(self, *, temperature: float):
             self.temperature = temperature
 
@@ -17,11 +18,9 @@ Example — custom objective::
             *,
             objective_data: dict[str, torch.Tensor],
             predictions: torch.Tensor,
-            delayed_predictions: torch.Tensor | None = None,
-            value_predictions: torch.Tensor | None = None,
-            targets: torch.Tensor | None = None,
+            targets: torch.Tensor,
         ) -> tuple[dict[str, torch.Tensor], dict[str, float | torch.Tensor]]:
-            ...
+            loss = ((predictions - targets) ** 2).mean()
             return {"my_objective": loss}, {"my_objective": loss.detach()}
 """
 
@@ -52,7 +51,7 @@ def _reject_predictions(owner: str, **unused: torch.Tensor | None) -> None:
             )
 
 
-class Objective(ABC):
+class Objective[**P](ABC):
     """Abstract base for all MOUSE objective objects.
 
     Subclass this and implement :meth:`__call__` to create a custom objective.
@@ -60,45 +59,34 @@ class Objective(ABC):
     the prediction tensor for the head being trained. Objectives that read
     another head also take that tensor: DQN takes ``delayed_predictions=``
     and PPO takes ``value_predictions=``. Supervised objectives take
-    ``targets=`` (action ids for SP, Q vectors for SV). A custom subclass
-    must accept the same optional parameters (pass ``None`` for a tensor
-    it does not read). ``DqnObjective`` also takes ``reward_center=`` and
+    ``targets=`` (action ids for SP, Q vectors for SV). DQN, PPO, and GRPO
+    require ``group_id=`` (int64 ``[N]``) beside ``objective_data``.
+    ``DqnObjective`` also requires ``reward_center=`` and
     ``delayed_reward_center=`` on that call: each a 0-dim float32 tensor,
     or both ``None``. The backup uses the delayed center. The returned
     loss is a dict of terms. ``action_value`` trains Q. ``reward_center``
     trains the online center from the detached residual.
+
+    ``P`` describes the subclass's call signature; there is no single
+    set of optional prediction arguments shared by all objectives.
+    Subclasses with their own keyword-only signatures use ``Objective[...]``
+    and declare their required inputs on ``__call__``. Use the concrete
+    objective type when calling it so those requirements remain checked.
     """
 
     @abstractmethod
     def __call__(
         self,
-        *,
-        objective_data: dict[str, torch.Tensor],
-        predictions: torch.Tensor,
-        delayed_predictions: torch.Tensor | None = None,
-        value_predictions: torch.Tensor | None = None,
-        targets: torch.Tensor | None = None,
+        *args: P.args,
+        **kwargs: P.kwargs,
     ) -> tuple[dict[str, torch.Tensor], dict[str, float | torch.Tensor]]:
         """Compute a dict of loss terms and return diagnostic metrics.
 
-        Args:
-            objective_data: ``dict[str, Tensor]`` of tokenizer ``objective_fields``
-                (``action``, ``reward``, ``episode_done``, ``task_done``, …),
-                keyed by flat step index. DQN, PPO, and GRPO also take
-                ``group_id`` (int64 ``[N]``) beside this dict.
-            predictions: Tensor for the head this objective trains, taken
-                from :meth:`~mouse_core.models.base.Model.forward` (index
-                ``ModelOutput.predictions`` with
-                :func:`~mouse_core.models.heads.base.prediction_key`).
-            delayed_predictions: Delayed Q for DQN. ``None`` on
-                objectives that do not read it. Omitting it on an objective
-                that does read it raises ``TypeError``.
-            value_predictions: Value-head tensor for PPO. ``None`` on
-                objectives that do not read it.
-            targets: Supervised target tensor for SP / SV (action ids or
-                Q vectors). ``None`` on objectives that do not read it.
-                Callers pass the tensor at call time; objectives do not
-                look up a ``targets_key`` in ``objective_data``.
+        Concrete objectives declare the required keyword-only arguments.
+        ``objective_data`` holds tokenizer ``objective_fields`` keyed by
+        flat step index; ``predictions`` comes from the matching head in
+        ``ModelOutput.predictions``. Additional group, prediction, and
+        target inputs depend on the objective.
 
         Returns:
             ``(losses, metrics)``. ``losses`` maps a name to a 0-dim

@@ -561,7 +561,7 @@ def _pair_values_to_rows(
     return padded[step_of]
 
 
-class DqnObjective(Objective):
+class DqnObjective(Objective[...]):
     """Bellman TD(λ) objective with a delayed target network.
 
     Instantiate with hyperparameters, then call with
@@ -817,7 +817,9 @@ class DqnObjective(Objective):
     ) -> None:
         self.temperature = _require_temperature(temperature)
         self.double = bool(double)
-        self.cross_group_backups = _require_cross_group_backups(cross_group_backups)
+        self.cross_group_backups: CrossGroupBackups = _require_cross_group_backups(
+            cross_group_backups
+        )
         self.discount = _require_transform(discount, name="discount")
         self.reward = _require_transform(reward, name="reward")
         self.value = _require_transform(value, name="value")

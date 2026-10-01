@@ -1156,7 +1156,7 @@ class Model(nn.Module):
         embeds: torch.Tensor,
         group_ids: torch.Tensor,
         plan: _InsertionPlan,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Generate latent thoughts on the autograd tape and assemble the extended stream.
 
         Runs ``R`` extra backbone passes over the growing per-burst prefixes

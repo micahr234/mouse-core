@@ -100,7 +100,7 @@ def _skip_mask(mask: torch.Tensor, n_rows: int) -> torch.Tensor:
     return values != 0
 
 
-class SpObjective(Objective):
+class SpObjective(Objective[...]):
     """Hard CE from integer action ids onto action logits at head-output positions.
 
     Reads ``predictions`` (shape ``[B, S, A]``) and compares against

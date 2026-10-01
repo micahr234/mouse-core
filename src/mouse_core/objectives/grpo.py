@@ -50,7 +50,7 @@ def group_relative_advantages(
     return (rewards - mean) / (std + eps)
 
 
-class GrpoObjective(Objective):
+class GrpoObjective(Objective[...]):
     """Clipped GRPO policy objective (no value / critic head).
 
     Instantiate with hyperparameters, then call with
