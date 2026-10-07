@@ -641,6 +641,253 @@ def test_text_tokenizer_rejects_duplicate_field_names_across_types() -> None:
         )
 
 
+def _capture_tokenizer(seen: list[str]):
+    class _CaptureTok:
+        def __call__(
+            self, text: str, add_special_tokens: bool = False, return_tensors: str | None = None
+        ):
+            seen.append(text)
+            ids = [ord(c) % 20 + 1 for c in text] or [1]
+            return {"input_ids": torch.tensor([ids], dtype=torch.long)}
+
+    return _CaptureTok()
+
+
+def _ids_for(text: str) -> list[int]:
+    return [ord(c) % 20 + 1 for c in text] or [1]
+
+
+def test_text_input_index_emits_each_element_in_field_order() -> None:
+    import numpy as np
+
+    seen: list[str] = []
+    tokenizer = Tokenizer(
+        input_fields=[
+            {"type": "text", "output_field": "obs_open", "format": "["},
+            {
+                "type": "text",
+                "input_field": "observation",
+                "input_index": 0,
+                "format": "{field:.2f}",
+            },
+            {
+                "type": "text",
+                "input_field": "observation",
+                "input_index": 1,
+                "format": ",{field:.2f}",
+            },
+            {
+                "type": "text",
+                "output_field": "obs_close",
+                "format": "]",
+                "head_output": True,
+            },
+        ],
+        tokenizer=_capture_tokenizer(seen),
+    )
+    step = tokenizer({"observation": [1.25, -0.5]})
+    assert seen == ["[", "1.25", ",-0.50", "]"]
+    assert step.ids.tolist() == (
+        _ids_for("[") + _ids_for("1.25") + _ids_for(",-0.50") + _ids_for("]")
+    )
+
+    first = Tokenizer(
+        input_fields=[
+            {
+                "type": "text",
+                "input_field": "observation",
+                "format": "{field:.2f}",
+                "head_output": True,
+            }
+        ],
+        tokenizer=_FakeTokenizer(),
+    )
+    second = Tokenizer(
+        input_fields=[
+            {
+                "type": "text",
+                "input_field": "observation",
+                "format": ",{field:.2f}",
+                "head_output": True,
+            }
+        ],
+        tokenizer=_FakeTokenizer(),
+    )
+    assert first({"observation": 1.25}).ids.tolist() == _ids_for("1.25")
+    assert second({"observation": -0.5}).ids.tolist() == _ids_for(",-0.50")
+
+    seen.clear()
+    swapped = Tokenizer(
+        input_fields=[
+            {
+                "type": "text",
+                "input_field": "observation",
+                "input_index": 1,
+                "format": "{field:.2f}",
+            },
+            {
+                "type": "text",
+                "input_field": "observation",
+                "input_index": 0,
+                "format": ",{field:.2f}",
+                "head_output": True,
+            },
+        ],
+        tokenizer=_capture_tokenizer(seen),
+    )
+    swapped({"observation": [1.25, -0.5]})
+    assert seen == ["-0.50", ",1.25"]
+
+    for value in (
+        np.array([1.25, -0.5]),
+        torch.tensor([1.25, -0.5]),
+    ):
+        seen.clear()
+        tokenizer({"observation": value})
+        assert seen == ["[", "1.25", ",-0.50", "]"]
+
+
+def test_text_scalar_without_input_index_renders_once() -> None:
+    seen: list[str] = []
+    tokenizer = Tokenizer(
+        input_fields=[
+            {
+                "type": "text",
+                "input_field": "observation",
+                "format": "{field:.2f}",
+                "head_output": True,
+            }
+        ],
+        tokenizer=_capture_tokenizer(seen),
+    )
+    tokenizer({"observation": 1.25})
+    assert seen == ["1.25"]
+
+
+def test_text_input_index_rejects_bad_shapes() -> None:
+    import numpy as np
+    import pytest
+
+    from mouse_core.data import TokenizerModalitySpec
+
+    vector = Tokenizer(
+        input_fields=[
+            {
+                "type": "text",
+                "input_field": "observation",
+                "format": "{field}",
+                "head_output": True,
+            }
+        ],
+        tokenizer=_FakeTokenizer(),
+    )
+    with pytest.raises(ValueError, match="1-D vector"):
+        vector({"observation": [1.25, -0.5]})
+    with pytest.raises(ValueError, match="rank 2"):
+        vector({"observation": np.array([[1.25, -0.5]])})
+
+    indexed = Tokenizer(
+        input_fields=[
+            {
+                "type": "text",
+                "input_field": "observation",
+                "input_index": 1,
+                "format": "{field:.2f}",
+                "head_output": True,
+            }
+        ],
+        tokenizer=_FakeTokenizer(),
+    )
+    with pytest.raises(ValueError, match="requires a 1-D vector"):
+        indexed({"observation": 1.25})
+    with pytest.raises(ValueError, match="out of range"):
+        indexed({"observation": [1.25]})
+    with pytest.raises(ValueError, match="rank 2"):
+        indexed({"observation": [[1.25, -0.5], [0.0, 1.0]]})
+
+    with pytest.raises(ValueError, match="input_index must be >= 0"):
+        TokenizerModalitySpec(
+            type="text", input_field="observation", input_index=-1, format="{field}"
+        )
+
+
+def test_text_input_index_uniqueness_and_rejected_types() -> None:
+    import pytest
+
+    from mouse_core.data import TokenizerModalitySpec
+
+    Tokenizer(
+        input_fields=[
+            {
+                "type": "text",
+                "input_field": "observation",
+                "input_index": 0,
+                "format": "{field}",
+            },
+            {
+                "type": "text",
+                "input_field": "observation",
+                "input_index": 1,
+                "format": "{field}",
+                "head_output": True,
+            },
+        ],
+        tokenizer=_FakeTokenizer(),
+    )
+    with pytest.raises(ValueError, match="input_index=0"):
+        Tokenizer(
+            input_fields=[
+                {
+                    "type": "text",
+                    "input_field": "observation",
+                    "input_index": 0,
+                    "format": "{field}",
+                },
+                {
+                    "type": "text",
+                    "input_field": "observation",
+                    "input_index": 0,
+                    "format": "{field}",
+                    "head_output": True,
+                },
+            ],
+            tokenizer=_FakeTokenizer(),
+        )
+    with pytest.raises(TypeError, match="does not accept input_index="):
+        TokenizerModalitySpec(type="token", input_field="a", input_index=0)
+    with pytest.raises(TypeError, match="does not accept input_index="):
+        TokenizerModalitySpec(type="text", output_field="c", format="c", input_index=0)
+    with pytest.raises(TypeError, match="does not accept input_index="):
+        TokenizerModalitySpec(type="image", input_field="img", input_index=0)
+
+
+def test_text_input_index_roundtrip(tmp_path) -> None:
+    from mouse_core.data import load_tokenizer, save_tokenizer
+
+    tokenizer = Tokenizer(
+        input_fields=[
+            {"type": "text", "output_field": "obs_open", "format": "["},
+            {
+                "type": "text",
+                "input_field": "observation",
+                "input_index": 0,
+                "format": "{field:.2f}",
+            },
+            {
+                "type": "text",
+                "input_field": "observation",
+                "input_index": 1,
+                "format": ",{field:.2f}",
+                "head_output": True,
+            },
+        ],
+        tokenizer=_FakeTokenizer(),
+    )
+    save_tokenizer(tokenizer=tokenizer, path=tmp_path)
+    loaded = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizer=_FakeTokenizer())
+    assert [spec.input_index for spec in loaded.input_fields] == [None, 0, 1]
+
+
 def test_token_modality_is_single_embed_row() -> None:
     D = 8
     emb = nn.Embedding(32, D)

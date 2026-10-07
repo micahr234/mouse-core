@@ -47,6 +47,16 @@ class TokenizerModalitySpec:
     ``format=`` are ``str.format`` strings: write ``{{`` / ``}}`` for a
     literal brace. ``token`` / ``image`` do not accept ``format=``.
 
+    Omit ``input_index`` and the text field is that whole scalar.
+    Set ``input_index`` (an int ``>= 0``) and the field reads that
+    element of a 1-D vector (``list``, ``tuple``, ``ndarray``, or
+    ``Tensor``) and renders it as one scalar. Repeat ``input_field``
+    with a different ``input_index`` for each element; fields still
+    emit in ``input_fields`` order. A 1-D vector without
+    ``input_index`` raises, a scalar with ``input_index`` raises, and
+    rank 2 or higher raises. ``token``,
+    ``image``, and const text reject ``input_index``.
+
     Optional ``when=`` is a callable ``ctx → bool``. The tokenizer builds
     ``ctx`` from the step dict and injects boolean ``group_start``. It
     calls the predicate twice: with ``group_start=False`` for ordinary
@@ -75,12 +85,15 @@ class TokenizerModalitySpec:
     Optional ``max_tokens=`` raises if that field emits more ids than
     the limit. Only the variable-length types accept it (``text`` /
     ``image``); ``token`` emits one id and rejects it. Every
-    ``output_field`` (including ``text`` / ``token`` names) must be
-    unique. Fields emit in ``input_fields`` order.
+    ``output_field`` must be unique, except text fields that share a
+    name with a different ``input_index``. That pair
+    ``(output_field, input_index)`` is the unique key, so the same
+    pair twice raises. Fields emit in ``input_fields`` order.
     """
 
     type: str
     input_field: str | None = None
+    input_index: int | None = None
     output_field: str | None = None
     format: str | None = None
     max_tokens: int | None = None
@@ -101,6 +114,7 @@ class TokenizerModalitySpec:
         if k == "text":
             self._init_text()
             return
+        self._reject_input_index(k)
         self._init_named_input()
         self._reject_text_format(k)
         if k == "image":
@@ -111,6 +125,7 @@ class TokenizerModalitySpec:
 
     def _init_text(self) -> None:
         if self.input_field is None:
+            self._reject_input_index("text const")
             self._reject_no_input_knobs("text const")
             if not self.output_field:
                 raise ValueError("text const field requires output_field=")
@@ -130,6 +145,7 @@ class TokenizerModalitySpec:
             return
         if not self.output_field:
             object.__setattr__(self, "output_field", self.input_field)
+        _validate_input_index(self)
         names = _text_format_placeholders(self.format, who=self.output_field)
         if len(names) != 1 or names[0] != TEXT_FORMAT_KEY:
             raise ValueError(
@@ -159,6 +175,13 @@ class TokenizerModalitySpec:
             raise TypeError(
                 f"tokenizer modality type={kind!r} does not accept max_tokens= "
                 "(it emits a fixed number of tokens; text / image only)"
+            )
+
+    def _reject_input_index(self, kind: str) -> None:
+        if self.input_index is not None:
+            raise TypeError(
+                f"tokenizer modality type={kind!r} does not accept input_index= "
+                "(text fields with input_field= only)"
             )
 
     def _reject_no_input_knobs(self, kind: str) -> None:
@@ -191,6 +214,22 @@ def _literal_placeholders(text: str, *, who: str) -> list[str]:
             )
         names.append(name)
     return names
+
+
+def _validate_input_index(spec: TokenizerModalitySpec) -> None:
+    index = spec.input_index
+    if index is None:
+        return
+    who = spec.output_field or spec.input_field or "field"
+    if isinstance(index, bool) or not isinstance(index, int):
+        raise TypeError(
+            f"tokenizer modality {who!r} input_index must be an int, "
+            f"got {type(index).__name__}"
+        )
+    if index < 0:
+        raise ValueError(
+            f"tokenizer modality {who!r} input_index must be >= 0, got {index}"
+        )
 
 
 def _validate_max_tokens(spec: TokenizerModalitySpec) -> None:
@@ -379,18 +418,36 @@ def resolve_tokenizer_modalities(
         specs.extend(expand_tokenizer_spec(spec))
 
     meta: list[TokenizerModalityMeta] = []
-    seen: set[str] = set()
+    seen_names: set[str] = set()
+    seen_indexed: set[tuple[str, int]] = set()
+    indexed_names: set[str] = set()
     for spec in specs:
         k = spec.type
         name = str(spec.output_field)
         if not name:
             raise ValueError("tokenizer modality is missing output_field=")
-        if name in seen:
-            raise ValueError(
-                f"duplicate tokenizer field name {name!r}; set a distinct "
-                "output_field= on each field"
-            )
-        seen.add(name)
+        if spec.input_index is None:
+            if name in seen_names or name in indexed_names:
+                raise ValueError(
+                    f"duplicate tokenizer field name {name!r}; set a distinct "
+                    "output_field= on each field"
+                )
+            seen_names.add(name)
+        else:
+            key = (name, spec.input_index)
+            if key in seen_indexed:
+                raise ValueError(
+                    f"duplicate tokenizer field name {name!r} with "
+                    f"input_index={spec.input_index}; each (output_field, "
+                    "input_index) pair must be unique"
+                )
+            if name in seen_names:
+                raise ValueError(
+                    f"duplicate tokenizer field name {name!r}; set a distinct "
+                    "output_field= on each field"
+                )
+            seen_indexed.add(key)
+            indexed_names.add(name)
         if k in ("text", "token"):
             meta.append(
                 TokenizerModalityMeta(

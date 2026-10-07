@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Text fields accept ``input_index``. The field reads that element of a
+  1-D vector and renders it as one scalar. Repeat ``input_field`` with
+  a different ``input_index`` for each element; fields still emit in
+  ``input_fields`` order. A vector without ``input_index`` raises, and
+  a scalar with ``input_index`` raises.
+  ``examples/17_collect_cartpole.ipynb`` stores random CartPole
+  observations as that vector.
+  ``examples/18_train_offline_cartpole_dqn.ipynb`` trains offline DQN
+  on it, one text field per element.
 - ``ConstantHead``: a scalar parameter that does not read the
   backbone. The output is ``scale * value``. ``value`` starts at 0.
   ``DqnObjective`` requires ``reward_center=`` and

@@ -63,7 +63,13 @@ class Tokenizer:
     train each of them toward the same per-step target.
 
     A ``text`` field requires ``format=``. ``input_field=`` reads the
-    step into exactly one placeholder ``{field}``.
+    step into exactly one placeholder ``{field}``. Omit ``input_index``
+    and that value is one scalar. Set ``input_index`` and the field
+    reads that element of a 1-D vector and renders it the same way.
+    Repeat the ``input_field`` with a different ``input_index`` for
+    each element; each piece is its own tokenize call, in
+    ``input_fields`` order. Brackets and commas are ordinary text (a
+    const field, or characters in ``format``).
     Omit ``input_field=`` and the field is a const: ``output_field=``
     names it and ``format=`` is the literal string (no placeholders;
     ``{{`` / ``}}`` for a literal brace, as in every ``format=``).
@@ -230,7 +236,80 @@ def _field_text_value(spec: TokenizerModalitySpec, row: dict[str, Any]) -> str |
         if spec.required:
             raise KeyError(f"Required modality {spec.input_field!r} is missing")
         return None
-    return spec.format.format_map({TEXT_FORMAT_KEY: unwrap_scalar(raw)})
+    value = _text_scalar(spec, raw)
+    return spec.format.format_map({TEXT_FORMAT_KEY: value})
+
+
+def _text_scalar(spec: TokenizerModalitySpec, raw: Any) -> Any:
+    """Scalar to interpolate, or one element selected by ``input_index``."""
+    who = spec.output_field
+    rank = _value_rank(raw)
+    index = spec.input_index
+    if index is None:
+        if rank == 1:
+            raise ValueError(
+                f"text field {who!r} value is a 1-D vector; set input_index= "
+                "to select an element"
+            )
+        if rank is not None and rank != 0:
+            raise ValueError(
+                f"text field {who!r} value has rank {rank}; expected a scalar"
+            )
+        return unwrap_scalar(raw)
+    if rank is None or rank == 0:
+        raise ValueError(
+            f"text field {who!r} input_index={index} requires a 1-D vector, "
+            "got a scalar"
+        )
+    if rank != 1:
+        raise ValueError(
+            f"text field {who!r} input_index={index} requires a 1-D vector, "
+            f"got rank {rank}"
+        )
+    n = _vector_length(raw)
+    if index >= n:
+        raise ValueError(
+            f"text field {who!r} input_index={index} is out of range for a "
+            f"vector of length {n}"
+        )
+    return unwrap_scalar(_vector_at(raw, index))
+
+
+def _value_rank(value: Any) -> int | None:
+    """Array rank, or ``None`` when ``value`` is a scalar (including ``str``)."""
+    if isinstance(value, (str, bytes)):
+        return None
+    if isinstance(value, torch.Tensor):
+        return int(value.ndim)
+    if isinstance(value, np.ndarray):
+        return int(value.ndim)
+    if isinstance(value, (list, tuple)):
+        if len(value) == 0:
+            return 1
+        if any(_is_nested_element(item) for item in value):
+            return 2
+        return 1
+    return None
+
+
+def _is_nested_element(item: Any) -> bool:
+    if isinstance(item, (str, bytes)):
+        return False
+    if isinstance(item, (list, tuple, np.ndarray)):
+        return True
+    if isinstance(item, torch.Tensor):
+        return item.ndim >= 1
+    return False
+
+
+def _vector_length(value: Any) -> int:
+    if isinstance(value, (torch.Tensor, np.ndarray)):
+        return int(value.shape[0])
+    return len(value)
+
+
+def _vector_at(value: Any, index: int) -> Any:
+    return value[index]
 
 
 def _require_max_tokens(spec: TokenizerModalitySpec, token_ids: list[int]) -> None:
