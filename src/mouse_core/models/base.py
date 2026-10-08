@@ -331,6 +331,17 @@ tokenizer = load_tokenizer(repo_id_or_path="{repo_id}")
     )
 
 
+def _config_num_frequencies(config: dict[str, Any]) -> int | None:
+    backbone = config["backbone"]
+    if backbone.get("type") == "identity":
+        value = backbone.get("num_frequencies")
+    else:
+        value = backbone.get("kwargs", {}).get("num_frequencies")
+    if value is None:
+        return None
+    return int(value)
+
+
 def _model_card_encoder_bits(
     config: dict[str, Any], *, tokenizer_repo_id: str
 ) -> tuple[str, str, str]:
@@ -342,10 +353,17 @@ def _model_card_encoder_bits(
         f'tokenizer = load_tokenizer(repo_id_or_path="{tokenizer_repo_id}")\n'
         "eval_transform = tokenizer"
     )
+    num_frequencies = _config_num_frequencies(config)
+    fourier_note = ""
+    if num_frequencies is not None:
+        fourier_note = (
+            f" `__numeric__` tokens use the same table, then add a Fourier "
+            f"projection of the scaled value (`num_frequencies={num_frequencies}`)."
+        )
     encoder_section = (
         f"The backbone looks up `__text__` and image-field token ids in a "
         f"tokenized :class:`~mouse_core.data.token_batch.TokenBatch` through "
-        f"its `embed_tokens` table ({hidden}-dimensional). Step templates "
+        f"its `embed_tokens` table ({hidden}-dimensional).{fourier_note} Step templates "
         f"and field packing live on `Tokenizer` (a separate Hub repo, "
         f"`{tokenizer_repo_id}`)."
     )
@@ -379,15 +397,18 @@ def _backbone_config(backbone: nn.Module) -> dict[str, Any]:
     from mouse_core.models.backbone.none import IdentityBackbone
 
     if isinstance(backbone, IdentityBackbone):
-        return {
+        config: dict[str, Any] = {
             "type": "identity",
             "hidden_dim": backbone.hidden_dim,
             "vocab_size": backbone.vocab_size,
         }
+        if backbone.num_frequencies is not None:
+            config["num_frequencies"] = backbone.num_frequencies
+        return config
     from mouse_core.models.backbone.transformer import TransformerBackbone
 
     if isinstance(backbone, TransformerBackbone):
-        config: dict[str, Any] = {
+        config = {
             "type": "transformer",
             "architecture": backbone.architecture,
             "hidden_dim": backbone.hidden_dim,
@@ -585,9 +606,13 @@ def _build_backbone_from_config(
     if backbone_type == "identity":
         from mouse_core.models.backbone import IdentityBackbone
 
+        identity_kwargs: dict[str, Any] = {}
+        if "num_frequencies" in config:
+            identity_kwargs["num_frequencies"] = int(config["num_frequencies"])
         return IdentityBackbone(
             hidden_dim=int(config["hidden_dim"]),
             vocab_size=int(config["vocab_size"]),
+            **identity_kwargs,
         )
     lora_cfg = config.get("lora")
     lora = LoRAConfig(**lora_cfg) if lora_cfg is not None else None
@@ -742,7 +767,8 @@ class Model(nn.Module):
       embeddings live on the backbone: ``TransformerBackbone`` loads
       native ``embed_tokens``;
       :class:`~mouse_core.models.backbone.IdentityBackbone` owns a
-      ``vocab_size`` × ``hidden_dim`` table.
+      ``vocab_size`` × ``hidden_dim`` table. ``num_frequencies`` adds
+      a Fourier projection onto ``__numeric__`` token embeddings.
     - ``heads``: heads can be provided in several ergonomic ways:
         - a single :class:`~mouse_core.models.heads.base.BaseHead` (e.g. ``RegressionHead(...)``):
           it becomes the only enabled head;

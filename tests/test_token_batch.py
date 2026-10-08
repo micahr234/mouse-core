@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from mouse_core.data import Tokenizer, pack_token_batch, to_device
+from tests._token_batch_helpers import IntIdTokenizer
 
 def when_episode_done_nonzero(ctx):
     return "episode_done" in ctx and ctx["episode_done"] != 0
@@ -31,14 +32,16 @@ def when_step_index_zero_or_group_start(ctx):
 def _tok(**kwargs) -> Tokenizer:
     return Tokenizer(
         input_fields=[
-            {"type": "token", "input_field": "action", "head_output": True},
+            {"type": "text", "input_field": "action", "format": "{field}", "head_output": True},
             {
-                "type": "token",
+                "type": "text",
                 "input_field": "episode_index",
+                "format": "{field}",
                 "when": when_step_index_zero,
             },
         ],
         objective_fields=[{"input_field": "reward"}, {"input_field": "action"}],
+        tokenizer=kwargs.pop("tokenizer", IntIdTokenizer()),
         **kwargs,
     )
 
@@ -108,14 +111,16 @@ def test_objective_column_stays_int_when_all_steps_are_int() -> None:
 def test_objective_vector_column_promotes_dtype() -> None:
     tok = Tokenizer(
         input_fields=[
-            {"type": "token", "input_field": "action", "head_output": True},
+            {"type": "text", "input_field": "action", "format": "{field}", "head_output": True},
             {
-                "type": "token",
+                "type": "text",
                 "input_field": "episode_index",
+                "format": "{field}",
                 "when": when_step_index_zero,
             },
         ],
         objective_fields=[{"input_field": "q"}],
+        tokenizer=IntIdTokenizer(),
     )
     steps = [
         tok({"action": 0, "q": np.array([1, 2]), "task_index": 0}),
@@ -130,14 +135,16 @@ def test_objective_ragged_float_vectors_pad_with_neg_inf() -> None:
     """Shorter rows are padded with -inf (the nonexistent-action sentinel), not 0."""
     tok = Tokenizer(
         input_fields=[
-            {"type": "token", "input_field": "action", "head_output": True},
+            {"type": "text", "input_field": "action", "format": "{field}", "head_output": True},
             {
-                "type": "token",
+                "type": "text",
                 "input_field": "episode_index",
+                "format": "{field}",
                 "when": when_step_index_zero,
             },
         ],
         objective_fields=[{"input_field": "q"}],
+        tokenizer=IntIdTokenizer(),
     )
     steps = [
         tok({"action": 0, "q": np.array([1.0, 2.0, 3.0]), "task_index": 0}),
@@ -154,14 +161,16 @@ def test_objective_ragged_int_vectors_raise() -> None:
     """Integer columns have no padding sentinel, so ragged shapes are an error."""
     tok = Tokenizer(
         input_fields=[
-            {"type": "token", "input_field": "action", "head_output": True},
+            {"type": "text", "input_field": "action", "format": "{field}", "head_output": True},
             {
-                "type": "token",
+                "type": "text",
                 "input_field": "episode_index",
+                "format": "{field}",
                 "when": when_step_index_zero,
             },
         ],
         objective_fields=[{"input_field": "q"}],
+        tokenizer=IntIdTokenizer(),
     )
     steps = [
         tok({"action": 0, "q": np.array([1, 2, 3]), "task_index": 0}),
@@ -174,14 +183,16 @@ def test_objective_ragged_int_vectors_raise() -> None:
 def test_objective_mixed_rank_raises() -> None:
     tok = Tokenizer(
         input_fields=[
-            {"type": "token", "input_field": "action", "head_output": True},
+            {"type": "text", "input_field": "action", "format": "{field}", "head_output": True},
             {
-                "type": "token",
+                "type": "text",
                 "input_field": "episode_index",
+                "format": "{field}",
                 "when": when_step_index_zero,
             },
         ],
         objective_fields=[{"input_field": "q"}],
+        tokenizer=IntIdTokenizer(),
     )
     steps = [
         tok({"action": 0, "q": np.array([1.0, 2.0]), "task_index": 0}),
@@ -202,11 +213,12 @@ class _FakeTokenizer:
 def test_positions_index_tokens_within_modality_per_step() -> None:
     tok = Tokenizer(
         input_fields=[
-            {"type": "token", "input_field": "action"},
-            {"type": "text", "output_field": "value", "format": "ab", "head_output": True},
+            {"type": "text", "input_field": "action", "format": "{field}"},
+            {"type": "text", "format": "ab", "head_output": True},
             {
-                "type": "token",
+                "type": "text",
                 "input_field": "episode_index",
+                "format": "{field}",
                 "when": when_step_index_zero,
             },
         ],

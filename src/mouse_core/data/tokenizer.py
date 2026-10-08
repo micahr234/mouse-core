@@ -1,12 +1,15 @@
-"""Tokenizer — one step dict → StepTokens (text / token / image).
+"""Tokenizer — one step dict → StepTokens (text / token / image / numeric).
 
 I/O
 ---
 * **in:** ``dict`` (one step)
 * **out:** :class:`~mouse_core.data.token_batch.StepTokens`
 
-``text`` / ``token`` fields share the ``__text__`` stream. Every other
-field is tagged by ``output_field`` (modality name). Pack ragged
+``text`` / ``token`` fields share the ``__text__`` stream.
+``token`` tokenizes a literal ``format`` to one token. ``numeric``
+fields share ``__numeric__``: ``format=`` is literal text tokenized
+to one token, and the scaled number is stored on ``values``. An ``image``
+field is named by its ``input_field``. Pack ragged
 per-sequence rows with :meth:`Tokenizer.pack_rows`; pack already-tokenized
 steps with :func:`~mouse_core.data.token_batch.pack_token_batch`.
 :func:`save_tokenizer` writes the packing spec as ``tokenizer.json``;
@@ -18,6 +21,7 @@ own repo via :func:`~mouse_core.models.base.push_model_to_hub`
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Sequence
 from dataclasses import asdict
 from pathlib import Path
@@ -29,10 +33,13 @@ import torch
 from mouse_core.data.io_fields import coerce_io_fields
 from mouse_core.data.modality import (
     KIND_IMAGE,
+    KIND_NUMERIC,
     KIND_TEXT,
     KIND_TOKEN,
+    NAME_NUMERIC,
     NAME_TEXT,
-    TEXT_FORMAT_KEY,
+    _field_label,
+    render_text_format,
     TokenizerModalityMeta,
     TokenizerModalitySpec,
     copy_keep_fields,
@@ -52,7 +59,8 @@ class Tokenizer:
     """CPU packer: one step dict → :class:`StepTokens`.
 
     Alignment is by modality **name**: ``__text__`` for ``text`` /
-    ``token`` fields, ``output_field`` for ``image``. ``input_fields=``
+    ``token`` fields, ``__numeric__`` for ``numeric``
+    fields, ``input_field`` for ``image``. ``input_fields=``
     are the tokens fed to the transformer, emitted in list order. Each
     field is its own tokenize/emit run (no BPE merge across ``text``
     fields). Exactly one input field must set ``head_output=True``: its
@@ -62,17 +70,31 @@ class Tokenizer:
     ``text`` run with more than one id), and the DQN objectives then
     train each of them toward the same per-step target.
 
-    A ``text`` field requires ``format=``. ``input_field=`` reads the
-    step into exactly one placeholder ``{field}``. Omit ``input_index``
+    A ``text`` field requires ``format=``. ``input_field=`` binds the
+    step value to the name ``field`` in an f-string (``{field+1}``,
+    ``{field:.3f}``). Omit ``input_index``
     and that value is one scalar. Set ``input_index`` and the field
     reads that element of a 1-D vector and renders it the same way.
     Repeat the ``input_field`` with a different ``input_index`` for
     each element; each piece is its own tokenize call, in
     ``input_fields`` order. Brackets and commas are ordinary text (a
     const field, or characters in ``format``).
-    Omit ``input_field=`` and the field is a const: ``output_field=``
-    names it and ``format=`` is the literal string (no placeholders;
-    ``{{`` / ``}}`` for a literal brace, as in every ``format=``).
+    Omit ``input_field=`` and the field is a const: ``format=`` is the
+    literal string. The word field is text. ``{field}`` is still a
+    placeholder and is rejected. ``{{`` / ``}}`` is a literal brace,
+    as in every ``format=``.
+    A ``numeric`` field requires ``input_field=``, ``format=``,
+    ``fourier_min=``, and ``fourier_max=``. ``format=`` is literal
+    text (the word field is text; ``{field}`` is rejected). The
+    number is mapped from ``[fourier_min, fourier_max]`` onto
+    ``[-1, 1]`` and stored on that token. The format must tokenize
+    to one id; zero or several raise. ``input_index`` selects one
+    element of a 1-D vector, as for ``text``. The backbone adds a
+    Fourier projection of that stored value when built with
+    ``num_frequencies``.
+    A ``token`` field has no ``input_field``. ``format=`` is literal
+    text and must tokenize to one ``__text__`` token; zero or several
+    raise.
     Optional ``when=`` is a callable ``ctx → bool``. The context is the
     step dict plus injected boolean ``group_start``. Ordinary emission
     uses ``group_start=False``; pack-time ``group_start_*`` uses
@@ -109,8 +131,11 @@ class Tokenizer:
         has_text = any(m.kind == KIND_TEXT for m in meta)
         has_token = any(m.kind == KIND_TOKEN for m in meta)
         has_image = any(m.kind == KIND_IMAGE for m in meta)
+        has_numeric = any(m.kind == KIND_NUMERIC for m in meta)
 
-        flagged = [m.spec.output_field for m in meta if m.spec.head_output]
+        flagged = [
+            m.spec.input_field or "const" for m in meta if m.spec.head_output
+        ]
         if len(flagged) != 1:
             raise ValueError(
                 "Tokenizer requires exactly one input field with "
@@ -118,7 +143,7 @@ class Tokenizer:
                 f"— the Q / action readout positions); got {flagged or 'none'}"
             )
 
-        needs_tokenizer = has_text
+        needs_tokenizer = has_text or has_numeric or has_token
         if tokenizer is not None:
             tok = tokenizer
         elif pretrained is not None and needs_tokenizer:
@@ -127,7 +152,8 @@ class Tokenizer:
             tok = AutoTokenizer.from_pretrained(pretrained, **dict(hub_kwargs or {}))
         elif needs_tokenizer:
             raise TypeError(
-                "Tokenizer with text input_fields requires tokenizer= or pretrained="
+                "Tokenizer with text, numeric, or token input_fields requires "
+                "tokenizer= or pretrained="
             )
         else:
             tok = None
@@ -144,8 +170,11 @@ class Tokenizer:
         if has_text or has_token:
             names.append(NAME_TEXT)
             mmap[NAME_TEXT] = ModalityInfo(type="token")
+        if has_numeric:
+            names.append(NAME_NUMERIC)
+            mmap[NAME_NUMERIC] = ModalityInfo(type="numeric")
         for m in meta:
-            if m.kind in (KIND_TEXT, KIND_TOKEN):
+            if m.kind in (KIND_TEXT, KIND_TOKEN, KIND_NUMERIC):
                 continue
             if m.name in mmap:
                 raise ValueError(f"duplicate tokenizer modality name {m.name!r}")
@@ -224,52 +253,80 @@ class Tokenizer:
 
 
 def _field_text_value(spec: TokenizerModalitySpec, row: dict[str, Any]) -> str | None:
-    assert isinstance(spec.output_field, str)
     assert spec.format is not None
-    # Const ``format=`` is validated as a placeholder-free format string,
-    # so render it through ``format_map`` too: ``{{`` / ``}}`` un-escape
-    # the same way as in a step-backed format.
     if spec.input_field is None:
-        return spec.format.format_map({})
+        return render_text_format(spec, field=None)
     raw = row.get(spec.input_field)
     if raw is None:
         if spec.required:
             raise KeyError(f"Required modality {spec.input_field!r} is missing")
         return None
     value = _text_scalar(spec, raw)
-    return spec.format.format_map({TEXT_FORMAT_KEY: value})
+    return render_text_format(spec, field=value)
+
+
+def _numeric_scaled(spec: TokenizerModalitySpec, row: dict[str, Any]) -> float | None:
+    """Map the field's number from ``[fourier_min, fourier_max]`` onto ``[-1, 1]``."""
+    in_name = spec.input_field
+    if not in_name:
+        raise RuntimeError("numeric field is missing input_field")
+    raw = row.get(in_name)
+    if raw is None:
+        if spec.required:
+            raise KeyError(f"Required modality {in_name!r} is missing")
+        return None
+    scalar = _text_scalar(spec, raw)
+    who = _field_label(spec)
+    if isinstance(scalar, (bool, np.bool_)):
+        raise TypeError(
+            f"numeric field {who!r} value must be a real number, "
+            f"got {type(scalar).__name__}"
+        )
+    if not isinstance(scalar, (int, float, np.integer, np.floating)):
+        raise TypeError(
+            f"numeric field {who!r} value must be a real number, "
+            f"got {type(scalar).__name__}"
+        )
+    value = float(scalar)
+    if not math.isfinite(value):
+        raise ValueError(f"numeric field {who!r} value must be finite, got {value!r}")
+    lo = spec.fourier_min
+    hi = spec.fourier_max
+    if lo is None or hi is None:
+        raise RuntimeError(f"numeric field {who!r} is missing fourier bounds")
+    return 2.0 * (value - lo) / (hi - lo) - 1.0
 
 
 def _text_scalar(spec: TokenizerModalitySpec, raw: Any) -> Any:
     """Scalar to interpolate, or one element selected by ``input_index``."""
-    who = spec.output_field
+    who = _field_label(spec)
     rank = _value_rank(raw)
     index = spec.input_index
     if index is None:
         if rank == 1:
             raise ValueError(
-                f"text field {who!r} value is a 1-D vector; set input_index= "
+                f"field {who!r} value is a 1-D vector; set input_index= "
                 "to select an element"
             )
         if rank is not None and rank != 0:
             raise ValueError(
-                f"text field {who!r} value has rank {rank}; expected a scalar"
+                f"field {who!r} value has rank {rank}; expected a scalar"
             )
         return unwrap_scalar(raw)
     if rank is None or rank == 0:
         raise ValueError(
-            f"text field {who!r} input_index={index} requires a 1-D vector, "
+            f"field {who!r} input_index={index} requires a 1-D vector, "
             "got a scalar"
         )
     if rank != 1:
         raise ValueError(
-            f"text field {who!r} input_index={index} requires a 1-D vector, "
+            f"field {who!r} input_index={index} requires a 1-D vector, "
             f"got rank {rank}"
         )
     n = _vector_length(raw)
     if index >= n:
         raise ValueError(
-            f"text field {who!r} input_index={index} is out of range for a "
+            f"field {who!r} input_index={index} is out of range for a "
             f"vector of length {n}"
         )
     return unwrap_scalar(_vector_at(raw, index))
@@ -312,6 +369,18 @@ def _vector_at(value: Any, index: int) -> Any:
     return value[index]
 
 
+def _require_one_token(spec: TokenizerModalitySpec, token_ids: list[int]) -> None:
+    """``numeric`` and ``token`` formats tokenize to one id."""
+    n = len(token_ids)
+    if n == 1:
+        return
+    who = _field_label(spec) if spec.input_field is not None else spec.type
+    raise ValueError(
+        f"{spec.type} field {who!r} format={spec.format!r} tokenized to "
+        f"{n} tokens; expected 1"
+    )
+
+
 def _require_max_tokens(spec: TokenizerModalitySpec, token_ids: list[int]) -> None:
     limit = spec.max_tokens
     if limit is None:
@@ -319,7 +388,7 @@ def _require_max_tokens(spec: TokenizerModalitySpec, token_ids: list[int]) -> No
     n = len(token_ids)
     if n > limit:
         raise ValueError(
-            f"field {spec.output_field!r} tokenized to {n} tokens "
+            f"field {spec.input_field or 'const'!r} tokenized to {n} tokens "
             f"(max_tokens={limit})"
         )
 
@@ -443,6 +512,40 @@ def _tokenize_step(
             )
             continue
 
+        if m.kind == KIND_NUMERIC:
+            scaled = _numeric_scaled(spec, row)
+            if scaled is None:
+                continue
+            if tokenizer is None:
+                raise RuntimeError("tokenizer required to tokenize numeric runs")
+            rendered = render_text_format(spec, field=None)
+            token_ids = _tokenize_ids(tokenizer, rendered)
+            _require_one_token(spec, token_ids)
+            _emit(
+                token_ids,
+                spec=spec,
+                name=NAME_NUMERIC,
+                to_group_start=to_group_start,
+                token_values=[scaled] * len(token_ids),
+                head_output=spec.head_output,
+            )
+            continue
+
+        if m.kind == KIND_TOKEN:
+            if tokenizer is None:
+                raise RuntimeError("tokenizer required to tokenize token runs")
+            rendered = render_text_format(spec, field=None)
+            token_ids = _tokenize_ids(tokenizer, rendered)
+            _require_one_token(spec, token_ids)
+            _emit(
+                token_ids,
+                spec=spec,
+                name=NAME_TEXT,
+                to_group_start=to_group_start,
+                head_output=spec.head_output,
+            )
+            continue
+
         in_name = str(spec.input_field)
         value = row.get(in_name)
         if value is None:
@@ -452,15 +555,7 @@ def _tokenize_step(
                 )
             continue
 
-        if m.kind == KIND_TOKEN:
-            _emit(
-                [int(unwrap_scalar(value))],
-                spec=spec,
-                name=NAME_TEXT,
-                to_group_start=to_group_start,
-                head_output=spec.head_output,
-            )
-        elif m.kind == KIND_IMAGE:
+        if m.kind == KIND_IMAGE:
             img_ids = _image_token_ids(image_tokenizer, value, in_name=in_name)
             _emit(
                 img_ids,
@@ -556,7 +651,7 @@ def tokenizer_config(*, tokenizer: Tokenizer) -> dict[str, Any]:
         data = asdict(spec)
         field: dict[str, Any] = {}
         for key, value in data.items():
-            if value is None:
+            if key.startswith("_") or value is None:
                 continue
             if key == "head_output" and value is False:
                 continue

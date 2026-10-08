@@ -33,19 +33,19 @@ from mouse_core.data import Augmenter, DataLoader, Datastore, Tokenizer, compose
 from mouse_core.data.token_batch import TokenBatch
 
 
-def when_episode_terminated(ctx):
+def on_episode_terminated(ctx):
     return "episode_terminated" in ctx and bool(ctx["episode_terminated"])
 
-def when_episode_truncated(ctx):
+def on_episode_truncated(ctx):
     return "episode_truncated" in ctx and bool(ctx["episode_truncated"])
 
-def when_group_start(ctx):
+def on_group_start(ctx):
     return bool(ctx["group_start"])
 
-def when_reward_nonzero(ctx):
+def on_reward_nonzero(ctx):
     return "reward" in ctx and ctx["reward"] != 0.0
 
-def when_episode_start(ctx):
+def on_episode_start(ctx):
     return bool(ctx.get("episode_start")) | bool(ctx["group_start"])
 
 
@@ -69,14 +69,14 @@ _EPISODES_PER_TASK = 4  # max task = 32 steps; keep ≤ shortest --workloads S
 _group_prefix = (
     "Your job is to predict the future sum of rewards in FrozenLake. "
     "Navigate a grid; reach the goal for reward; a hole ends the "
-    "episode with none. You have 20 episodes to solve the task. The "
+    "episode with none. Each episode lasts at most 30 steps. You have 20 episodes to solve the task. The "
     "grid is permuted, so squares are not in order; action ids may be "
     "remapped.\n"
     "Strategy: explore; keep a mental map of what has and has not been "
     "explored; avoid holes you have already fallen in; once you have a "
     "path to the goal, repeat it.\n"
-    "Predict when you see a new line. Step format: "
-    "action,observation[,r=reward][,d=done][,e=episode].\n"
+    "At the end of each line, predict the value of all actions. Format:\n"
+    "action,observation[,r=reward][,terminated][,truncated][,episode N].\n"
 )
 
 
@@ -156,9 +156,8 @@ def _train_transform() -> Any:
         input_fields=[
             {
                 "type": "text",
-                "output_field": "group_start",
                 "format": _group_prefix,
-                "when": when_group_start,
+                "when": on_group_start,
             },
             {"type": "text", "input_field": "action", "format": "{field},"},
             {"type": "text", "input_field": "observation", "format": "{field},"},
@@ -166,31 +165,29 @@ def _train_transform() -> Any:
                 "type": "text",
                 "input_field": "reward",
                 "format": "r={field:g},",
-                "when": when_reward_nonzero,
+                "when": on_reward_nonzero,
             },
             {
                 "type": "text",
                 "input_field": "episode_terminated",
-                "format": ",d=1",
-                "when": when_episode_terminated,
+                "format": ",terminated",
+                "when": on_episode_terminated,
             },
             {
                 "type": "text",
                 "input_field": "episode_truncated",
-                "format": ",d=2",
-                "when": when_episode_truncated,
+                "format": ",truncated",
+                "when": on_episode_truncated,
             },
             {
                 "type": "text",
                 "input_field": "episode_index",
-                "format": "e={field},",
-                "when": when_episode_start,
+                "format": ",episode {field+1}",
+                "when": on_episode_start,
             },
             {
-                "type": "text",
-                "output_field": "value",
+                "type": "token",
                 "format": "\n",
-                "max_tokens": 1,
                 "head_output": True,
             },
         ],

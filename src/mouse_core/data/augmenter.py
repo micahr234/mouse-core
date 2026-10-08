@@ -5,8 +5,9 @@ I/O
 * **in:** ``dict`` (one step)
 * **out:** ``dict`` (values may be transformed)
 
-Field keep/rename is the tokenizer's ``input_field`` / ``output_field``,
-not this class. Compose in pipeline order::
+Which columns are packed is the tokenizer's ``input_field``. This class
+transforms values; ``output_field`` here is where the transformed value
+is written. Compose in pipeline order::
 
     train_transform = compose(stages=(augmenter, tokenizer))
     eval_transform = tokenizer

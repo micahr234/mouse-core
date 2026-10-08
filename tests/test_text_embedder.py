@@ -7,7 +7,11 @@ from typing import Any
 import torch
 import torch.nn as nn
 from mouse_core.data import Tokenizer
-from tests._token_batch_helpers import batch_to_packed, batch_to_token_batch
+from tests._token_batch_helpers import (
+    IntIdTokenizer,
+    batch_to_packed,
+    batch_to_token_batch,
+)
 from mouse_core.models import Model
 from mouse_core.models.backbone import IdentityBackbone
 from mouse_core.models.heads import RegressionHead
@@ -61,7 +65,7 @@ class _FakeTokenizer:
 
 
 _DEFAULT_FIELDS: list[dict[str, Any]] = [
-    {"type": "token", "input_field": "action"},
+    {"type": "text", "input_field": "action", "format": "{field}"},
     {"type": "text", "input_field": "observation", "format": "{field}"},
     {"type": "text", "input_field": "reward", "format": "{field}", "when": when_reward_nonzero},
     {"type": "text", "input_field": "episode_done", "format": "{field}", "when": when_episode_done_nonzero},
@@ -74,7 +78,7 @@ def _tokenizer_fields(fields: list[dict[str, Any]], head_output: str = "action")
         data = dict(field)
         if data.get("type") == "text" and "format" not in data:
             data["format"] = "{field}"
-        if data.get("input_field") == head_output or data.get("output_field") == head_output:
+        if data.get("input_field") == head_output:
             data["head_output"] = True
         out.append(data)
     return out
@@ -100,7 +104,6 @@ def _text_pair(hidden_dim: int = 8, **kwargs):
     fields = _tokenizer_fields(input_fields, head_output=head_output)
     if not any(
         field.get("input_field") == "episode_index"
-        or field.get("output_field") == "episode_index"
         for field in fields
     ):
         head_at = next(
@@ -179,12 +182,12 @@ def test_text_tokenizer_when_not_equals_omits_value() -> None:
     emb = nn.Embedding(32, 8)
     with torch.no_grad():
         emb.weight.zero_()
-        emb.weight[0] = 7.0
+        emb.weight[ord("0") % 20 + 1] = 7.0
     tokenizer2, backbone2 = _text_pair(tokenizer=_CaptureTok(), embed_tokens=emb)
     out, _ = backbone2.embed(
         batch_to_token_batch(tokenizer2, [[{"observation": 1, "action": 0, "reward": 0.0, "episode_done": 0, "task_done": 0}]])
     )
-    assert seen == ["1"]
+    assert seen == ["0", "1"]
     matches = (out == 7.0).all(dim=-1)
     assert int(matches.sum().item()) == 1
 
@@ -196,8 +199,9 @@ def test_text_tokenizer_field_format_uses_str() -> None:
         input_fields=[
             {"type": "text", "input_field": "reward", "format": "{field}", "head_output": True},
             {
-                "type": "token",
+                "type": "text",
                 "input_field": "episode_index",
+                "format": "{field}",
                 "when": when_step_index_zero,
             },
         ],
@@ -217,8 +221,9 @@ def test_text_tokenizer_field_format_spec() -> None:
                 "head_output": True,
             },
             {
-                "type": "token",
+                "type": "text",
                 "input_field": "episode_index",
+                "format": "{field}",
                 "when": when_step_index_zero,
             },
         ],
@@ -234,27 +239,42 @@ def test_text_tokenizer_omitted_input_field_is_const() -> None:
             {"type": "text", "input_field": "action", "format": "{field}"},
             {
                 "type": "text",
-                "output_field": "value",
                 "format": ",value",
                 "head_output": True,
             },
             {
-                "type": "token",
+                "type": "text",
                 "input_field": "episode_index",
+                "format": "{field}",
                 "when": when_step_index_zero,
             },
         ],
         tokenizer=_FakeTokenizer(),
     )
-    spec = next(field for field in tokenizer.input_fields if field.output_field == "value")
+    spec = next(field for field in tokenizer.input_fields if field.format == ",value")
     assert spec.input_field is None
-    assert spec.output_field == "value"
     assert spec.format == ",value"
     step = tokenizer({"action": 3, "grouping_id": 0})
     assert step.ids.tolist() == [ord(c) % 20 + 1 for c in "3"] + [
         ord(c) % 20 + 1 for c in ",value"
     ]
     assert step.head_output_mask.tolist() == [False] * len("3") + [True] * len(",value")
+
+
+def test_text_tokenizer_const_format_keeps_the_word_field() -> None:
+    tokenizer = Tokenizer(
+        input_fields=[
+            {"type": "text", "input_field": "action", "format": "{field}"},
+            {
+                "type": "text",
+                "format": "field",
+                "head_output": True,
+            },
+        ],
+        tokenizer=_FakeTokenizer(),
+    )
+    step = tokenizer({"action": 1})
+    assert step.ids.tolist() == _enc("1") + _enc("field")
 
 
 def test_text_tokenizer_const_format_rejects_placeholder() -> None:
@@ -265,13 +285,13 @@ def test_text_tokenizer_const_format_rejects_placeholder() -> None:
             input_fields=[
                 {
                     "type": "text",
-                    "output_field": "value",
                     "format": ",{value}",
                     "head_output": True,
                 },
                 {
-                    "type": "token",
+                    "type": "text",
                     "input_field": "episode_index",
+                    "format": "{field}",
                     "when": when_step_index_zero,
                 },
             ],
@@ -284,14 +304,14 @@ def test_text_tokenizer_max_tokens_allows_at_limit() -> None:
         input_fields=[
             {
                 "type": "text",
-                "output_field": "value",
                 "format": "x",
                 "max_tokens": 1,
                 "head_output": True,
             },
             {
-                "type": "token",
+                "type": "text",
                 "input_field": "episode_index",
+                "format": "{field}",
                 "when": when_step_index_zero,
             },
         ],
@@ -308,14 +328,14 @@ def test_text_tokenizer_max_tokens_raises_when_exceeded() -> None:
         input_fields=[
             {
                 "type": "text",
-                "output_field": "value",
                 "format": "xy",
                 "max_tokens": 1,
                 "head_output": True,
             },
             {
-                "type": "token",
+                "type": "text",
                 "input_field": "episode_index",
+                "format": "{field}",
                 "when": when_step_index_zero,
             },
         ],
@@ -333,31 +353,14 @@ def test_text_tokenizer_max_tokens_must_be_positive() -> None:
             input_fields=[
                 {
                     "type": "text",
-                    "output_field": "value",
                     "format": "x",
                     "max_tokens": 0,
                     "head_output": True,
                 },
                 {
-                    "type": "token",
+                    "type": "text",
                     "input_field": "episode_index",
-                    "when": when_step_index_zero,
-                },
-            ],
-            tokenizer=_FakeTokenizer(),
-        )
-
-
-def test_text_tokenizer_const_requires_output_field() -> None:
-    import pytest
-
-    with pytest.raises(ValueError, match="requires output_field"):
-        Tokenizer(
-            input_fields=[
-                {"type": "text", "format": "value", "head_output": True},
-                {
-                    "type": "token",
-                    "input_field": "episode_index",
+                    "format": "{field}",
                     "when": when_step_index_zero,
                 },
             ],
@@ -389,13 +392,13 @@ def test_text_tokenizer_when_gates_cover_skip_literal_pattern() -> None:
             },
             {
                 "type": "text",
-                "output_field": "reward_zero",
                 "format": ",",
                 "when": _when_reward_zero,
             },
             {
-                "type": "token",
+                "type": "text",
                 "input_field": "episode_index",
+                "format": "{field}",
                 "when": when_step_index_zero,
             },
         ],
@@ -440,17 +443,17 @@ def test_text_tokenizer_when_or_in_callable() -> None:
                 "format": "{field}",
                 "when": when_any_reward,
             },
-            {"type": "token", "input_field": "action", "head_output": True},
+            {"type": "text", "input_field": "action", "format": "{field}", "head_output": True},
         ],
         tokenizer=_FakeTokenizer(),
     )
     zero = tok({"action": 1, "reward": 0.0, "grouping_id": 0})
     assert zero.ids.tolist() == (
-        _FakeTokenizer()("0.0")["input_ids"].view(-1).tolist() + [1]
+        _FakeTokenizer()("0.0")["input_ids"].view(-1).tolist() + _enc("1")
     )
     nonzero = tok({"action": 1, "reward": 2.0, "grouping_id": 0})
     assert nonzero.ids.tolist() == (
-        _FakeTokenizer()("2.0")["input_ids"].view(-1).tolist() + [1]
+        _FakeTokenizer()("2.0")["input_ids"].view(-1).tolist() + _enc("1")
     )
 
 
@@ -462,8 +465,9 @@ def test_text_tokenizer_requires_field_format() -> None:
             input_fields=[
                 {"type": "text", "input_field": "observation", "head_output": True},
                 {
-                    "type": "token",
+                    "type": "text",
                     "input_field": "episode_index",
+                    "format": "{field}",
                     "when": when_step_index_zero,
                 },
             ],
@@ -471,10 +475,26 @@ def test_text_tokenizer_requires_field_format() -> None:
         )
 
 
+def test_text_format_evaluates_expression_on_field() -> None:
+    tokenizer = Tokenizer(
+        input_fields=[
+            {
+                "type": "text",
+                "input_field": "episode_index",
+                "format": ",episode {field+1}",
+                "head_output": True,
+            },
+        ],
+        tokenizer=_FakeTokenizer(),
+    )
+    step = tokenizer({"episode_index": 0})
+    assert step.ids.tolist() == _enc(",episode 1")
+
+
 def test_text_tokenizer_field_format_must_use_field_placeholder() -> None:
     import pytest
 
-    with pytest.raises(ValueError, match="exactly one placeholder"):
+    with pytest.raises(ValueError, match="named field"):
         Tokenizer(
             input_fields=[
                 {
@@ -484,8 +504,9 @@ def test_text_tokenizer_field_format_must_use_field_placeholder() -> None:
                     "head_output": True,
                 },
                 {
-                    "type": "token",
+                    "type": "text",
                     "input_field": "episode_index",
+                    "format": "{field}",
                     "when": when_step_index_zero,
                 },
             ],
@@ -503,14 +524,14 @@ def test_text_tokenizer_const_and_when_gated_unescape_braces() -> None:
             {"type": "text", "input_field": "a", "format": "{{{field}}}"},
             {
                 "type": "text",
-                "output_field": "r_zero",
                 "format": "{{-}}",
                 "when": _when_r_equals_zero,
             },
-            {"type": "text", "output_field": "c", "format": "{{c}}", "head_output": True},
+            {"type": "text", "format": "{{c}}", "head_output": True},
             {
-                "type": "token",
+                "type": "text",
                 "input_field": "episode_index",
+                "format": "{field}",
                 "when": when_step_index_zero,
             },
         ],
@@ -533,14 +554,14 @@ def test_text_tokenizer_optional_missing_value_emits_nothing() -> None:
             },
             {
                 "type": "text",
-                "output_field": "r_zero",
                 "format": ",",
                 "when": _when_r_zero,
             },
-            {"type": "text", "output_field": "v", "format": "\n", "head_output": True},
+            {"type": "text", "format": "\n", "head_output": True},
             {
-                "type": "token",
+                "type": "text",
                 "input_field": "episode_index",
+                "format": "{field}",
                 "when": when_step_index_zero,
             },
         ],
@@ -558,13 +579,14 @@ def test_text_tokenizer_required_defaults_true() -> None:
 
     spec = TokenizerModalitySpec(type="text", input_field="a", format="{field}")
     assert spec.required is True
-    assert TokenizerModalitySpec(type="text", output_field="c", format="c").required is True
-    assert TokenizerModalitySpec(type="token", input_field="a").required is True
+    assert TokenizerModalitySpec(type="text", format="c").required is True
+    assert TokenizerModalitySpec(type="token", format="\n").required is True
     tokenizer = Tokenizer(
         input_fields=[{"type": "text", "input_field": "a", "format": "{field}", "head_output": True},
             {
-                "type": "token",
+                "type": "text",
                 "input_field": "episode_index",
+                "format": "{field}",
                 "when": when_step_index_zero,
             },
         ],
@@ -580,7 +602,7 @@ def test_text_tokenizer_no_input_fields_reject_step_knobs() -> None:
     from mouse_core.data import TokenizerModalitySpec
 
     with pytest.raises(TypeError, match="do not accept required=False"):
-        TokenizerModalitySpec(type="text", output_field="c", format="c", required=False)
+        TokenizerModalitySpec(type="text", format="c", required=False)
 
 
 def test_unknown_tokenizer_types_rejected() -> None:
@@ -588,7 +610,7 @@ def test_unknown_tokenizer_types_rejected() -> None:
 
     from mouse_core.data import TokenizerModalitySpec
 
-    for kind in ("discrete", "fourier", "continuous", "learnable"):
+    for kind in ("discrete", "fourier", "continuous", "learnable", "end"):
         with pytest.raises(ValueError, match="unknown tokenizer modality type"):
             TokenizerModalitySpec(type=kind, input_field="a")
 
@@ -599,7 +621,14 @@ def test_text_tokenizer_max_tokens_only_on_variable_length_types() -> None:
     from mouse_core.data import TokenizerModalitySpec
 
     for kwargs in (
-        {"type": "token", "input_field": "a"},
+        {
+            "type": "numeric",
+            "input_field": "a",
+            "format": "*",
+            "fourier_min": 0.0,
+            "fourier_max": 1.0,
+        },
+        {"type": "token", "format": "\n"},
     ):
         with pytest.raises(TypeError, match="does not accept max_tokens="):
             TokenizerModalitySpec(max_tokens=1, **kwargs)  # type: ignore[arg-type]
@@ -613,27 +642,29 @@ def test_text_tokenizer_max_tokens_only_on_variable_length_types() -> None:
 def test_text_tokenizer_rejects_duplicate_field_names_across_types() -> None:
     import pytest
 
-    with pytest.raises(ValueError, match="duplicate tokenizer field name 'value'"):
+    with pytest.raises(ValueError, match="duplicate tokenizer field 'value'"):
         Tokenizer(
             input_fields=[
-                {"type": "text", "input_field": "a", "output_field": "value", "format": "{field}"},
-                {"type": "token", "input_field": "value", "head_output": True},
+                {"type": "text", "input_field": "value", "format": "{field}"},
+                {"type": "text", "input_field": "value", "format": "{field}", "head_output": True},
                 {
-                    "type": "token",
+                    "type": "text",
                     "input_field": "episode_index",
+                    "format": "{field}",
                     "when": when_step_index_zero,
                 },
             ],
             tokenizer=_FakeTokenizer(),
         )
-    with pytest.raises(ValueError, match="duplicate tokenizer field name 'a'"):
+    with pytest.raises(ValueError, match="duplicate tokenizer field 'a'"):
         Tokenizer(
             input_fields=[
                 {"type": "text", "input_field": "a", "format": "{field}"},
-                {"type": "token", "input_field": "a", "head_output": True},
+                {"type": "text", "input_field": "a", "format": "{field}", "head_output": True},
                 {
-                    "type": "token",
+                    "type": "text",
                     "input_field": "episode_index",
+                    "format": "{field}",
                     "when": when_step_index_zero,
                 },
             ],
@@ -663,7 +694,7 @@ def test_text_input_index_emits_each_element_in_field_order() -> None:
     seen: list[str] = []
     tokenizer = Tokenizer(
         input_fields=[
-            {"type": "text", "output_field": "obs_open", "format": "["},
+            {"type": "text", "format": "["},
             {
                 "type": "text",
                 "input_field": "observation",
@@ -678,7 +709,6 @@ def test_text_input_index_emits_each_element_in_field_order() -> None:
             },
             {
                 "type": "text",
-                "output_field": "obs_close",
                 "format": "]",
                 "head_output": True,
             },
@@ -854,9 +884,9 @@ def test_text_input_index_uniqueness_and_rejected_types() -> None:
             tokenizer=_FakeTokenizer(),
         )
     with pytest.raises(TypeError, match="does not accept input_index="):
-        TokenizerModalitySpec(type="token", input_field="a", input_index=0)
+        TokenizerModalitySpec(type="token", format="\n", input_index=0)
     with pytest.raises(TypeError, match="does not accept input_index="):
-        TokenizerModalitySpec(type="text", output_field="c", format="c", input_index=0)
+        TokenizerModalitySpec(type="text", format="c", input_index=0)
     with pytest.raises(TypeError, match="does not accept input_index="):
         TokenizerModalitySpec(type="image", input_field="img", input_index=0)
 
@@ -866,7 +896,7 @@ def test_text_input_index_roundtrip(tmp_path) -> None:
 
     tokenizer = Tokenizer(
         input_fields=[
-            {"type": "text", "output_field": "obs_open", "format": "["},
+            {"type": "text", "format": "["},
             {
                 "type": "text",
                 "input_field": "observation",
@@ -897,10 +927,12 @@ def test_token_modality_is_single_embed_row() -> None:
     tokenizer, backbone = _text_pair(
         hidden_dim=D,
         embed_tokens=emb,
-        input_fields=[{"type": "token", "input_field": "action"},
+        tokenizer=IntIdTokenizer(),
+        input_fields=[{"type": "text", "input_field": "action", "format": "{field}"},
             {
-                "type": "token",
+                "type": "text",
                 "input_field": "episode_index",
+                "format": "{field}",
                 "when": when_step_index_zero,
             },
         ],
@@ -932,8 +964,9 @@ def test_text_tokenizer_tokenizes_each_field_separately() -> None:
             {"type": "text", "input_field": "observation", "format": "o={field}"},
             {"type": "text", "input_field": "action", "format": "a={field}"},
             {
-                "type": "token",
+                "type": "text",
                 "input_field": "episode_index",
+                "format": "{field}",
                 "when": when_step_index_zero,
             },
         ],
@@ -958,8 +991,9 @@ def test_identity_embed_image_token_ids() -> None:
             {"type": "text", "input_field": "observation", "format": "{field}"},
             {"type": "image", "input_field": "pixels"},
             {
-                "type": "token",
+                "type": "text",
                 "input_field": "episode_index",
+                "format": "{field}",
                 "when": when_step_index_zero,
             },
         ],
@@ -1033,14 +1067,14 @@ def _group_start_tokenizer(**kwargs):
         {
             "type": "text",
             "input_field": prefix_field,
-            "output_field": "group_start",
             "format": prefix_format,
             "when": when_group_start,
         },
-        {"type": "token", "input_field": "action", "head_output": True},
+        {"type": "text", "input_field": "action", "format": "{field}", "head_output": True},
         {
-            "type": "token",
+            "type": "text",
             "input_field": "episode_index",
+            "format": "{field}",
             "when": when_step_index_zero,
         },
     ]
@@ -1169,14 +1203,14 @@ def test_text_tokenizer_group_start_const_without_other_text_adds_text_modality(
         input_fields=[
             {
                 "type": "text",
-                "output_field": "group_start",
                 "format": "hello\n",
                 "when": when_group_start,
             },
-            {"type": "token", "input_field": "action", "head_output": True},
+            {"type": "text", "input_field": "action", "format": "{field}", "head_output": True},
             {
-                "type": "token",
+                "type": "text",
                 "input_field": "episode_index",
+                "format": "{field}",
                 "when": when_step_index_zero,
             },
         ],
@@ -1195,14 +1229,16 @@ def test_token_pack_ignores_missing_group_start() -> None:
     from mouse_core.data import Tokenizer, pack_token_batch
 
     tok = Tokenizer(
-        input_fields=[{"type": "token", "input_field": "action", "head_output": True},
+        input_fields=[{"type": "text", "input_field": "action", "format": "{field}", "head_output": True},
             {
-                "type": "token",
+                "type": "text",
                 "input_field": "episode_index",
+                "format": "{field}",
                 "when": when_step_index_zero,
             },
         ],
         objective_fields=_obj("action"),
+        tokenizer=IntIdTokenizer(),
     )
     steps = [
         tok({"action": 1, "task_index": 0}),
@@ -1237,7 +1273,6 @@ def test_episode_index_emits_only_on_step_zero() -> None:
             },
             {
                 "type": "text",
-                "output_field": "value",
                 "format": "\n",
                 "max_tokens": 1,
                 "head_output": True,
@@ -1273,13 +1308,15 @@ def test_episode_index_emits_only_on_step_zero() -> None:
 def test_token_episode_index_emits_only_on_step_zero() -> None:
     tok = Tokenizer(
         input_fields=[
-            {"type": "token", "input_field": "action", "head_output": True},
+            {"type": "text", "input_field": "action", "format": "{field}", "head_output": True},
             {
-                "type": "token",
+                "type": "text",
                 "input_field": "episode_index",
+                "format": "{field}",
                 "when": when_step_index_zero,
             },
         ],
+        tokenizer=IntIdTokenizer(),
     )
     zero = tok({"action": 1, "episode_index": 4, "step_index": 0, "task_index": 0})
     assert zero.ids.tolist() == [1, 4]
@@ -1297,8 +1334,9 @@ def test_when_rejects_non_callable_scalar() -> None:
         Tokenizer(
             input_fields=[
                 {
-                    "type": "token",
+                    "type": "text",
                     "input_field": "episode_index",
+                    "format": "{field}",
                     "when": 0,
                     "head_output": True,
                 }
@@ -1329,18 +1367,17 @@ def test_const_accepts_when() -> None:
         input_fields=[
             {
                 "type": "text",
-                "output_field": "mark",
                 "format": "x",
                 "when": when_step_index_zero,
             },
-            {"type": "token", "input_field": "action", "head_output": True},
+            {"type": "text", "input_field": "action", "format": "{field}", "head_output": True},
         ],
         tokenizer=_FakeTokenizer(),
     )
     zero = tok({"action": 1, "step_index": 0, "task_index": 0})
-    assert zero.ids.tolist() == _FakeTokenizer()("x")["input_ids"].view(-1).tolist() + [1]
+    assert zero.ids.tolist() == _FakeTokenizer()("x")["input_ids"].view(-1).tolist() + _enc("1")
     later = tok({"action": 1, "step_index": 2, "task_index": 0})
-    assert later.ids.tolist() == [1]
+    assert later.ids.tolist() == _enc("1")
 
 
 def test_when_equals_or_group_start_routes_value_to_ordinary() -> None:
@@ -1348,12 +1385,14 @@ def test_when_equals_or_group_start_routes_value_to_ordinary() -> None:
     tok = Tokenizer(
         input_fields=[
             {
-                "type": "token",
+                "type": "text",
                 "input_field": "episode_index",
+                "format": "{field}",
                 "when": when_step_index_zero_or_group_start,
             },
-            {"type": "token", "input_field": "action", "head_output": True},
+            {"type": "text", "input_field": "action", "format": "{field}", "head_output": True},
         ],
+        tokenizer=IntIdTokenizer(),
     )
     # step_index==0 → ordinary emit (not group_start_*), even with group_start set.
     zero = tok({"action": 1, "episode_index": 4, "step_index": 0, "task_index": 0})
@@ -1364,3 +1403,303 @@ def test_when_equals_or_group_start_routes_value_to_ordinary() -> None:
     assert later.ids.tolist() == [1]
     assert later.group_start_ids is not None
     assert later.group_start_ids.tolist() == [4]
+
+
+def _scaled(value: float, lo: float, hi: float) -> float:
+    import numpy as np
+
+    return float(np.float32(2.0 * (value - lo) / (hi - lo) - 1.0))
+
+
+def _encoded(text: str) -> list[int]:
+    return _FakeTokenizer()(text)["input_ids"].view(-1).tolist()
+
+
+def test_numeric_field_tokenizes_star_and_stores_scaled_value() -> None:
+    import pytest
+
+    from mouse_core.data.modality import NAME_NUMERIC
+
+    tokenizer = Tokenizer(
+        input_fields=[
+            {
+                "type": "text",
+                "input_field": "action",
+                "format": "{field}",
+                "head_output": True,
+            },
+            {
+                "type": "numeric",
+                "input_field": "observation",
+                "input_index": 0,
+                "format": "*",
+                "fourier_min": -4.8,
+                "fourier_max": 4.8,
+            },
+            {
+                "type": "numeric",
+                "input_field": "observation",
+                "input_index": 1,
+                "format": "*",
+                "fourier_min": -10.0,
+                "fourier_max": 10.0,
+            },
+        ],
+        tokenizer=_FakeTokenizer(),
+    )
+    step = tokenizer({"action": 0, "observation": [1.2, -5.0]})
+    assert step.ids.tolist() == _encoded("0") + _encoded("*") + _encoded("*")
+    numeric = step.modality_names.index(NAME_NUMERIC)
+    mask = step.modality_ids == numeric
+    assert step.values[mask].tolist() == pytest.approx(
+        [_scaled(1.2, -4.8, 4.8), _scaled(-5.0, -10.0, 10.0)]
+    )
+    assert step.values[~mask].tolist() == [0.0]
+    # A value outside the window is stored, not clipped.
+    wide = tokenizer({"action": 0, "observation": [20.0, 0.0]})
+    assert wide.values[wide.modality_ids == numeric][0].item() == pytest.approx(
+        _scaled(20.0, -4.8, 4.8)
+    )
+    assert wide.values[wide.modality_ids == numeric][0].item() > 1.0
+
+
+def test_numeric_format_is_literal_text() -> None:
+    import pytest
+
+    from mouse_core.data import TokenizerModalitySpec
+
+    with pytest.raises(ValueError, match="must not contain placeholders"):
+        TokenizerModalitySpec(
+            type="numeric",
+            input_field="observation",
+            format="{field}",
+            fourier_min=0.0,
+            fourier_max=1.0,
+        )
+    TokenizerModalitySpec(
+        type="numeric",
+        input_field="x",
+        format="field",
+        fourier_min=0.0,
+        fourier_max=2.0,
+    )
+    tokenizer = Tokenizer(
+        input_fields=[
+            {
+                "type": "numeric",
+                "input_field": "x",
+                "format": "field",
+                "fourier_min": 0.0,
+                "fourier_max": 2.0,
+                "head_output": True,
+            }
+        ],
+        tokenizer=_FakeTokenizer(),
+    )
+    with pytest.raises(ValueError, match="expected 1"):
+        tokenizer({"x": 1.0})
+
+
+def test_numeric_requires_distinct_finite_bounds() -> None:
+    import pytest
+
+    from mouse_core.data import TokenizerModalitySpec
+
+    with pytest.raises(ValueError, match="fourier_min"):
+        TokenizerModalitySpec(type="numeric", input_field="a", format="*")
+    with pytest.raises(ValueError, match="must differ"):
+        TokenizerModalitySpec(
+            type="numeric",
+            input_field="a",
+            format="*",
+            fourier_min=1.0,
+            fourier_max=1.0,
+        )
+    with pytest.raises(TypeError, match="fourier_min"):
+        TokenizerModalitySpec(
+            type="text",
+            input_field="a",
+            format="{field}",
+            fourier_min=0.0,
+            fourier_max=1.0,
+        )
+    with pytest.raises(TypeError, match="numeric"):
+        Tokenizer(
+            input_fields=[
+                {
+                    "type": "numeric",
+                    "input_field": "a",
+                    "format": "*",
+                    "fourier_min": 0.0,
+                    "fourier_max": 1.0,
+                    "head_output": True,
+                }
+            ]
+        )
+
+
+def test_numeric_group_start_keeps_the_scaled_value() -> None:
+    import pytest
+
+    tokenizer = Tokenizer(
+        input_fields=[
+            {
+                "type": "numeric",
+                "input_field": "observation",
+                "format": "*",
+                "fourier_min": 0.0,
+                "fourier_max": 1.0,
+                "when": when_group_start,
+            },
+            {"type": "text", "format": "\n", "head_output": True},
+        ],
+        tokenizer=_FakeTokenizer(),
+    )
+    step = tokenizer({"observation": 0.25})
+    assert step.group_start_values is not None
+    assert step.group_start_values.tolist() == pytest.approx([_scaled(0.25, 0.0, 1.0)])
+
+
+def test_numeric_config_roundtrip(tmp_path) -> None:
+    from mouse_core.data import load_tokenizer, save_tokenizer
+
+    tokenizer = Tokenizer(
+        input_fields=[
+            {"type": "text", "input_field": "action", "format": "{field}", "head_output": True},
+            {
+                "type": "numeric",
+                "input_field": "observation",
+                "input_index": 0,
+                "format": "*",
+                "fourier_min": -4.8,
+                "fourier_max": 4.8,
+            },
+        ],
+        tokenizer=_FakeTokenizer(),
+    )
+    save_tokenizer(tokenizer=tokenizer, path=tmp_path)
+    loaded = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizer=_FakeTokenizer())
+    spec = loaded.input_fields[1]
+    assert spec.type == "numeric"
+    assert spec.format == "*"
+    assert spec.input_index == 0
+    assert spec.fourier_min == -4.8
+    assert spec.fourier_max == 4.8
+    row = {"action": 1, "observation": [0.0, 9.0]}
+    assert loaded(row).values.tolist() == tokenizer(row).values.tolist()
+
+
+def test_numeric_embed_adds_fourier_of_the_scaled_value() -> None:
+    import pytest
+
+    from mouse_core.data import pack_token_batch
+    from mouse_core.data.modality import NAME_NUMERIC
+
+    tokenizer = Tokenizer(
+        input_fields=[
+            {
+                "type": "text",
+                "input_field": "action",
+                "format": "{field}",
+                "head_output": True,
+            },
+            {
+                "type": "numeric",
+                "input_field": "observation",
+                "format": "*",
+                "fourier_min": -1.0,
+                "fourier_max": 1.0,
+            },
+        ],
+        tokenizer=_FakeTokenizer(),
+    )
+    fresh = IdentityBackbone(hidden_dim=8, vocab_size=32, num_frequencies=4)
+    assert fresh.fourier is not None
+    assert torch.count_nonzero(fresh.fourier.proj.weight) == 0
+    low = tokenizer({"action": 0, "observation": -0.5})
+    batch, _, _ = pack_token_batch(
+        steps=[low], group_ids=[0], batch_size=1, continuing=None
+    )
+    embeds, _ = fresh.embed(batch)
+    numeric = low.modality_names.index(NAME_NUMERIC)
+    mask = torch.tensor(low.modality_ids == numeric)
+    star = low.ids[low.modality_ids == numeric]
+    looked = fresh.embed_tokens.weight[torch.tensor(star.tolist())]
+    assert torch.allclose(embeds[mask], looked)
+
+    backbone = IdentityBackbone(hidden_dim=8, vocab_size=32, num_frequencies=4)
+    assert backbone.fourier is not None
+    with torch.no_grad():
+        backbone.embed_tokens.weight.copy_(fresh.embed_tokens.weight)
+        backbone.fourier.proj.weight.normal_()
+    high = tokenizer({"action": 0, "observation": 0.5})
+    low_batch, _, _ = pack_token_batch(
+        steps=[low], group_ids=[0], batch_size=1, continuing=None
+    )
+    high_batch, _, _ = pack_token_batch(
+        steps=[high], group_ids=[0], batch_size=1, continuing=None
+    )
+    low_embeds, _ = backbone.embed(low_batch)
+    high_embeds, _ = backbone.embed(high_batch)
+    low_value = torch.tensor(low.values[low.modality_ids == numeric])
+    high_value = torch.tensor(high.values[high.modality_ids == numeric])
+    delta = high_embeds[mask] - low_embeds[mask]
+    fourier_delta = backbone.fourier(high_value) - backbone.fourier(low_value)
+    assert torch.allclose(delta, fourier_delta)
+    text = ~mask
+    assert torch.allclose(high_embeds[text], low_embeds[text])
+
+    plain = IdentityBackbone(hidden_dim=8, vocab_size=32)
+    with pytest.raises(RuntimeError, match="num_frequencies"):
+        plain.embed(low_batch)
+
+    loss = low_embeds.sum()
+    loss.backward()
+    grad = backbone.fourier.proj.weight.grad
+    assert grad is not None
+    assert float(grad.abs().sum()) > 0.0
+
+
+def test_token_field_emits_one_text_token() -> None:
+    import pytest
+
+    from mouse_core.data import TokenizerModalitySpec
+
+    tokenizer = Tokenizer(
+        input_fields=[
+            {"type": "text", "input_field": "action", "format": "{field}"},
+            {"type": "token", "format": "\n", "head_output": True},
+        ],
+        tokenizer=_FakeTokenizer(),
+    )
+    step = tokenizer({"action": 0})
+    assert step.ids.tolist() == _encoded("0") + _encoded("\n")
+    assert step.head_output_mask.tolist() == [False, True]
+    wide = Tokenizer(
+        input_fields=[{"type": "token", "format": "ab", "head_output": True}],
+        tokenizer=_FakeTokenizer(),
+    )
+    with pytest.raises(ValueError, match="expected 1"):
+        wide({})
+    with pytest.raises(TypeError, match="input_field"):
+        TokenizerModalitySpec(type="token", format="\n", input_field="a")
+    with pytest.raises(TypeError, match="max_tokens"):
+        TokenizerModalitySpec(type="token", format="\n", max_tokens=1)
+    with pytest.raises(TypeError, match="max_tokens"):
+        TokenizerModalitySpec(
+            type="numeric",
+            input_field="a",
+            format="*",
+            fourier_min=0.0,
+            fourier_max=1.0,
+            max_tokens=1,
+        )
+    with pytest.raises(ValueError, match="placeholders"):
+        TokenizerModalitySpec(type="token", format="{field}")
+
+
+def test_num_frequencies_must_be_a_positive_int() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="num_frequencies"):
+        IdentityBackbone(hidden_dim=4, vocab_size=8, num_frequencies=0)

@@ -28,7 +28,11 @@ def when_step_index_zero(ctx):
 def when_step_index_zero_or_group_start(ctx):
     return (ctx.get("step_index") == 0) | bool(ctx["group_start"])
 
-from tests._token_batch_helpers import batch_to_token_batch, token_tokenizer
+from tests._token_batch_helpers import (
+    IntIdTokenizer,
+    batch_to_token_batch,
+    token_tokenizer,
+)
 
 _TOK = token_tokenizer("action", "episode_done")
 
@@ -59,6 +63,7 @@ def test_composed_model_roundtrip(tmp_path) -> None:
     assert config['backbone']['hidden_dim'] == hidden_dim
     assert config['backbone']['vocab_size'] == 32
     assert 'embedder' not in config['backbone']
+    assert 'num_frequencies' not in config['backbone']
 
 
 def test_kernels_and_dtype_are_not_saved_and_come_from_the_loader(tmp_path) -> None:
@@ -76,6 +81,102 @@ def test_kernels_and_dtype_are_not_saved_and_come_from_the_loader(tmp_path) -> N
     assert (loaded.train_kernel, loaded.decode_kernel) == ('flex', 'flex')
     with pytest.raises(TypeError, match="train_kernel.*decode_kernel.*dtype"):
         load_model(repo_id_or_path=tmp_path)  # type: ignore[call-arg]
+
+
+def test_num_frequencies_roundtrip(tmp_path) -> None:
+    hidden_dim = 8
+    backbone = TransformerBackbone(
+        architecture="qwen3",
+        train_kernel="reference",
+        decode_kernel="flex",
+        dtype=torch.float32,
+        use_norm=True,
+        hidden_dim=hidden_dim,
+        num_layers=1,
+        num_heads=2,
+        vocab_size=32,
+        num_frequencies=3,
+    )
+    assert backbone.fourier is not None
+    with torch.no_grad():
+        backbone.fourier.proj.weight.fill_(0.25)
+    heads = RegressionHead(
+        in_features=hidden_dim,
+        out_features=4,
+        hidden_dim=hidden_dim,
+        num_layers=1,
+        use_norm=True,
+        propagate_gradient=1.0,
+    )
+    model = Model(backbone=backbone, heads=heads, action_source="action_value", reasoner=None)
+    save_model(model=model, path=tmp_path)
+    with (tmp_path / "config.json").open() as fh:
+        cfg = json.load(fh)["backbone"]
+    assert cfg["kwargs"]["num_frequencies"] == 3
+    loaded = cast(
+        TransformerBackbone,
+        load_model(
+            repo_id_or_path=tmp_path,
+            train_kernel="reference",
+            decode_kernel="flex",
+            dtype=torch.float32,
+        ).backbone,
+    )
+    assert loaded.num_frequencies == 3
+    assert loaded.fourier is not None
+    assert torch.equal(loaded.fourier.proj.weight, backbone.fourier.proj.weight)
+    assert not any(key.endswith("bands") for key in model.state_dict())
+
+
+def test_fourier_stays_trainable_when_lora_freezes_the_stack() -> None:
+    backbone = TransformerBackbone(
+        architecture="qwen3",
+        train_kernel="reference",
+        decode_kernel="flex",
+        dtype=torch.float32,
+        use_norm=True,
+        hidden_dim=8,
+        num_layers=1,
+        num_heads=2,
+        vocab_size=32,
+        num_frequencies=2,
+        lora=LoRAConfig(rank=2),
+    )
+    assert backbone.fourier is not None
+    assert backbone.fourier.proj.weight.requires_grad
+    assert any(not param.requires_grad for param in backbone.model.parameters())
+
+
+def test_identity_num_frequencies_roundtrip(tmp_path) -> None:
+    backbone = IdentityBackbone(hidden_dim=8, vocab_size=32, num_frequencies=4)
+    assert backbone.fourier is not None
+    with torch.no_grad():
+        backbone.fourier.proj.weight.normal_()
+    heads = RegressionHead(
+        in_features=8,
+        out_features=4,
+        hidden_dim=8,
+        num_layers=1,
+        use_norm=True,
+        propagate_gradient=1.0,
+    )
+    model = Model(backbone=backbone, heads=heads, action_source="action_value", reasoner=None)
+    save_model(model=model, path=tmp_path)
+    with (tmp_path / "config.json").open() as fh:
+        cfg = json.load(fh)["backbone"]
+    assert cfg["num_frequencies"] == 4
+    loaded = cast(
+        IdentityBackbone,
+        load_model(
+            repo_id_or_path=tmp_path,
+            train_kernel="reference",
+            decode_kernel="flex",
+            dtype=torch.float32,
+        ).backbone,
+    )
+    assert loaded.num_frequencies == 4
+    assert loaded.fourier is not None
+    assert torch.equal(loaded.fourier.proj.weight, backbone.fourier.proj.weight)
 
 
 def test_use_norm_false_roundtrip(tmp_path) -> None:
@@ -264,12 +365,13 @@ def test_tokenizer_roundtrip(tmp_path) -> None:
     """save_tokenizer writes tokenizer.json; load_tokenizer is the recall path."""
     tokenizer = Tokenizer(
         input_fields=[
-            {"type": "token", "input_field": "action"},
-            {"type": "token", "input_field": "episode_done", "required": False},
-            {"type": "token", "input_field": "done_code", "head_output": True},
+            {"type": "text", "input_field": "action", "format": "{field}"},
+            {"type": "text", "input_field": "episode_done", "format": "{field}", "required": False},
+            {"type": "text", "input_field": "done_code", "format": "{field}", "head_output": True},
             {
-                "type": "token",
+                "type": "text",
                 "input_field": "episode_index",
+                "format": "{field}",
                 "when": when_step_index_zero,
             },
         ],
@@ -279,10 +381,11 @@ def test_tokenizer_roundtrip(tmp_path) -> None:
             {"input_field": "episode_done"},
             {"input_field": "task_done"},
         ],
+        tokenizer=IntIdTokenizer(),
     )
     save_tokenizer(tokenizer=tokenizer, path=tmp_path)
     assert (tmp_path / "tokenizer.json").is_file()
-    loaded = load_tokenizer(repo_id_or_path=str(tmp_path))
+    loaded = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizer=IntIdTokenizer())
     assert loaded.pretrained is None
     assert loaded.objective_fields == (
         ("action", "action"),
@@ -311,7 +414,6 @@ def test_tokenizer_roundtrip_group_start_and_not_equals(tmp_path) -> None:
         input_fields=[
             {
                 "type": "text",
-                "output_field": "group_start",
                 "format": "hello\n",
                 "when": when_group_start,
             },
@@ -321,14 +423,15 @@ def test_tokenizer_roundtrip_group_start_and_not_equals(tmp_path) -> None:
                 "format": "{field}",
                 "when": when_reward_nonzero,
             },
-            {"type": "token", "input_field": "action", "head_output": True},
+            {"type": "text", "input_field": "action", "format": "{field}", "head_output": True},
         ],
         tokenizer=_Tok(),
     )
     save_tokenizer(tokenizer=tokenizer, path=tmp_path)
     loaded = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizer=_Tok())
     assert loaded.input_fields[0].when is when_group_start
-    assert loaded.input_fields[0].output_field == "group_start"
+    assert loaded.input_fields[0].input_field is None
+    assert loaded.input_fields[0].format == "hello\n"
     assert loaded.input_fields[1].when is when_reward_nonzero
     st = loaded({"action": 1, "reward": 1.0, "task_index": 0})
     assert st.group_start_ids is not None
@@ -348,14 +451,16 @@ def test_push_model_to_hub_requires_distinct_tokenizer_repo() -> None:
         reasoner=None,
     )
     tokenizer = Tokenizer(
-        input_fields=[{"type": "token", "input_field": "action", "head_output": True},
+        input_fields=[{"type": "text", "input_field": "action", "format": "{field}", "head_output": True},
             {
-                "type": "token",
+                "type": "text",
                 "input_field": "episode_index",
+                "format": "{field}",
                 "when": when_step_index_zero,
             },
         ],
         objective_fields=[],
+        tokenizer=IntIdTokenizer(),
     )
     with pytest.raises(ValueError, match="tokenizer_repo_id"):
         push_model_to_hub(

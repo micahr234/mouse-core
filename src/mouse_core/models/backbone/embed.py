@@ -1,11 +1,11 @@
-"""Lookup ``__text__`` / image ids through a backbone ``embed_tokens`` table."""
+"""Lookup token ids and add Fourier features on ``__numeric__``."""
 
 from __future__ import annotations
 
 import torch
 from torch import nn
 
-from mouse_core.data.modality import NAME_TEXT
+from mouse_core.data.modality import NAME_NUMERIC, NAME_TEXT
 from mouse_core.data.token_batch import ModalityInfo, TokenBatch
 
 
@@ -14,8 +14,15 @@ def embed_token_ids(
     embed_tokens: nn.Embedding,
     token_batch: TokenBatch,
     hidden_dim: int,
+    fourier: nn.Module | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Look up ``__text__`` and image token ids."""
+    """Look up ``__text__``, ``__numeric__``, and image token ids.
+
+    ``__numeric__`` rows are that lookup plus ``fourier(values)``.
+    ``fourier`` is the backbone's Fourier module, or ``None`` when the
+    backbone was built without ``num_frequencies``. A batch that
+    contains ``__numeric__`` tokens requires the module.
+    """
     device = embed_tokens.weight.device
     dtype = embed_tokens.weight.dtype
     t = token_batch.to_tensors(device)
@@ -33,20 +40,37 @@ def embed_token_ids(
                     "expected token/text"
                 )
             continue
+        if name == NAME_NUMERIC:
+            if info.type != "numeric":
+                raise TypeError(
+                    f"modality {name!r} type mismatch: batch={info.type!r} "
+                    "expected numeric"
+                )
+            if fourier is None:
+                raise RuntimeError(
+                    "TokenBatch has __numeric__ tokens but this backbone has no "
+                    "Fourier features; pass num_frequencies= when building it"
+                )
+            continue
         if info.type == "image":
             continue
         raise KeyError(
-            f"TokenBatch modality {name!r} is not a text/image id "
-            f"(expected {NAME_TEXT!r} / type=image)"
+            f"TokenBatch modality {name!r} is not a text/image/numeric id "
+            f"(expected {NAME_TEXT!r} / {NAME_NUMERIC!r} / type=image)"
         )
 
     L = ids.shape[0]
     embeds = torch.zeros(L, hidden_dim, device=device, dtype=dtype)
     if L > 0:
+        values = t["values"]
         for local_id, name in enumerate(names):
             mask = modality_ids == local_id
             if not bool(mask.any()):
                 continue
-            embeds[mask] = embed_tokens(ids[mask]).to(dtype=dtype)
+            looked = embed_tokens(ids[mask]).to(dtype=dtype)
+            if name == NAME_NUMERIC:
+                assert fourier is not None
+                looked = looked + fourier(values[mask]).to(dtype=dtype)
+            embeds[mask] = looked
 
     return embeds, t["head_output_indices"]

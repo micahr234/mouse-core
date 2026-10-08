@@ -84,19 +84,20 @@ def _head_output_tokenizer(
     value: str = "ab",
     tail: str | None = None,
 ) -> Tokenizer:
-    fields: list[dict] = [{"type": "token", "input_field": name} for name in token_fields]
+    fields: list[dict] = [{"type": "text", "input_field": name, "format": "{field}"} for name in token_fields]
     fields.append(
         {
-            "type": "token",
+            "type": "text",
             "input_field": "episode_index",
+            "format": "{field}",
             "when": when_step_index_zero,
         }
     )
     fields.append(
-        {"type": "text", "output_field": "value", "format": value, "head_output": True}
+        {"type": "text", "format": value, "head_output": True}
     )
     if tail is not None:
-        fields.append({"type": "token", "input_field": tail})
+        fields.append({"type": "text", "input_field": tail, "format": "{field}"})
     obj = [{"input_field": name} for name in token_fields]
     if tail is not None:
         obj.append({"input_field": tail})
@@ -160,10 +161,11 @@ def _packed(model: Model):
 def test_tokenizer_requires_exactly_one_head_output_field() -> None:
     with pytest.raises(ValueError, match="exactly one input field with"):
         Tokenizer(
-            input_fields=[{"type": "token", "input_field": "action"},
+            input_fields=[{"type": "text", "input_field": "action", "format": "{field}"},
                 {
-                    "type": "token",
+                    "type": "text",
                     "input_field": "episode_index",
+                    "format": "{field}",
                     "when": when_step_index_zero,
                 },
             ],
@@ -171,11 +173,12 @@ def test_tokenizer_requires_exactly_one_head_output_field() -> None:
     with pytest.raises(ValueError, match="exactly one input field with"):
         Tokenizer(
             input_fields=[
-                {"type": "token", "input_field": "action", "head_output": True},
-                {"type": "token", "input_field": "obs", "head_output": True},
+                {"type": "text", "input_field": "action", "format": "{field}", "head_output": True},
+                {"type": "text", "input_field": "obs", "format": "{field}", "head_output": True},
                 {
-                    "type": "token",
+                    "type": "text",
                     "input_field": "episode_index",
+                    "format": "{field}",
                     "when": when_step_index_zero,
                 },
             ],
@@ -185,7 +188,7 @@ def test_tokenizer_requires_exactly_one_head_output_field() -> None:
 def test_step_without_head_output_token_raises() -> None:
     tok = Tokenizer(
         input_fields=[
-            {"type": "token", "input_field": "action"},
+            {"type": "text", "input_field": "action", "format": "{field}"},
             {
                 "type": "text",
                 "input_field": "reward",
@@ -194,8 +197,9 @@ def test_step_without_head_output_token_raises() -> None:
                 "head_output": True,
             },
             {
-                "type": "token",
+                "type": "text",
                 "input_field": "episode_index",
+                "format": "{field}",
                 "when": when_step_index_zero,
             },
         ],
@@ -231,7 +235,6 @@ def test_head_output_rejects_group_start() -> None:
             input_fields=[
                 {
                     "type": "text",
-                    "output_field": "value",
                     "format": "\n",
                     "when": when_group_start,
                     "head_output": True,

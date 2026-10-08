@@ -196,13 +196,17 @@ class TokenBatch:
     Token type/kind is looked up via ``modality_map[modality_names[modality_ids[i]]]``:
 
     * text / token / image — ``ids[i]`` is a vocab row; ``values[i]`` is 0
+    * numeric — ``ids[i]`` is a vocab row of the literal ``format``;
+      ``values[i]`` is the scalar mapped from ``[fourier_min, fourier_max]``
+      onto ``[-1, 1]``
 
     Attributes:
         modality_ids: ``[L]`` int64 — index into ``modality_names``.
         modality_names: interned modality names for this batch.
         modality_map: name → :class:`ModalityInfo` (type/kind lookup).
         ids: ``[L]`` int64 — vocab / table row id.
-        values: ``[L]`` float32 — unused (0).
+        values: ``[L]`` float32 — 0 for text / token / image. For numeric,
+            the scalar mapped onto ``[-1, 1]``.
         positions: ``[L]`` int64 — index of the token among its modality's
             tokens within its step (see :class:`StepTokens`).
         group_ids: ``[L]`` int64 — which of the ``B`` groups each token belongs to.

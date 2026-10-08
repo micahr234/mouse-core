@@ -34,6 +34,7 @@ from mouse_core.models.backbone.flex_decode import FlexDecodeSession
 from mouse_core.models.backbone.llama import _LlamaBackboneConfig, llama_config_kwargs
 from mouse_core.models.backbone.qwen3 import _Qwen3BackboneConfig, qwen3_config_kwargs
 from mouse_core.models.backbone.embed import embed_token_ids
+from mouse_core.models.backbone.fourier import FourierFeatures, check_num_frequencies
 from mouse_core.models.lora import LoRAConfig
 
 Architecture = Literal["llama", "qwen3", "hf"]
@@ -193,6 +194,11 @@ class TransformerBackbone(Backbone):
     Token embeddings live on this module: ``pretrained=`` loads the
     checkpoint's ``embed_tokens``; from-scratch stacks take ``vocab_size=``
     (or a stub of 1 when the table is unused).
+
+    ``num_frequencies`` builds a Fourier module added onto ``__numeric__``
+    token embeddings. The module sits beside the decoder, so LoRA
+    freezing of ``self.model`` leaves it trainable. Omit
+    ``num_frequencies`` and a batch that contains those tokens raises.
     """
 
     architecture: Architecture
@@ -215,6 +221,7 @@ class TransformerBackbone(Backbone):
         hub_kwargs: dict[str, Any] | None = None,
         lora: LoRAConfig | None = None,
         hf_config: dict[str, Any] | None = None,
+        num_frequencies: int | None = None,
         **config_kwargs: Any,
     ) -> None:
         super().__init__()
@@ -229,6 +236,8 @@ class TransformerBackbone(Backbone):
                 "TransformerBackbone requires pretrained= or architecture= "
                 "('llama', 'qwen3', or 'hf')."
             )
+        self.num_frequencies = check_num_frequencies(num_frequencies)
+        self.fourier: FourierFeatures | None = None
 
         if pretrained is not None:
             self._init_from_pretrained(
@@ -241,45 +250,58 @@ class TransformerBackbone(Backbone):
                 lora=lora,
                 config_kwargs=config_kwargs,
             )
-            return
-        assert architecture is not None
-        if config_kwargs:
-            # hf rebuild only accepts hf_config / use_norm; extras are a second path.
-            extra = set(config_kwargs)
-            if architecture == "hf" and extra:
-                raise TypeError(
-                    f"architecture='hf' does not take {sorted(extra)}; "
-                    "pass hf_config= from a saved checkpoint."
+        else:
+            assert architecture is not None
+            if config_kwargs:
+                # hf rebuild only accepts hf_config / use_norm; extras are a second path.
+                extra = set(config_kwargs)
+                if architecture == "hf" and extra:
+                    raise TypeError(
+                        f"architecture='hf' does not take {sorted(extra)}; "
+                        "pass hf_config= from a saved checkpoint."
+                    )
+            if architecture == "hf":
+                if hf_config is None:
+                    raise TypeError("architecture='hf' requires hf_config= (from save_model).")
+                if hidden_dim is not None and int(hidden_dim) != _hidden_size(hf_config):
+                    raise ValueError(
+                        f"hidden_dim={hidden_dim} does not match hf_config hidden size "
+                        f"{_hidden_size(hf_config)}."
+                    )
+                self._init_hf_module(
+                    model=_build_hf_from_config(hf_config),
+                    dtype=dtype,
+                    use_norm=use_norm,
+                    lora=lora,
                 )
-        if architecture == "hf":
-            if hf_config is None:
-                raise TypeError("architecture='hf' requires hf_config= (from save_model).")
-            if hidden_dim is not None and int(hidden_dim) != _hidden_size(hf_config):
-                raise ValueError(
-                    f"hidden_dim={hidden_dim} does not match hf_config hidden size "
-                    f"{_hidden_size(hf_config)}."
+            else:
+                if hidden_dim is None:
+                    raise TypeError(
+                        f"architecture={architecture!r} requires hidden_dim plus stack "
+                        "arguments (e.g. TransformerBackbone(architecture='qwen3', "
+                        "hidden_dim=128, num_layers=2, num_heads=4, use_norm=True))."
+                    )
+                self._init_named_stack(
+                    architecture=architecture,
+                    hidden_dim=int(hidden_dim),
+                    dtype=dtype,
+                    use_norm=use_norm,
+                    lora=lora,
+                    config_kwargs=config_kwargs,
                 )
-            self._init_hf_module(
-                model=_build_hf_from_config(hf_config),
-                dtype=dtype,
-                use_norm=use_norm,
-                lora=lora,
-            )
+        self._install_fourier(dtype=dtype)
+
+    def _install_fourier(self, *, dtype: torch.dtype) -> None:
+        count = self.num_frequencies
+        if count is None:
+            self.fourier = None
             return
-        if hidden_dim is None:
-            raise TypeError(
-                f"architecture={architecture!r} requires hidden_dim plus stack "
-                "arguments (e.g. TransformerBackbone(architecture='qwen3', "
-                "hidden_dim=128, num_layers=2, num_heads=4, use_norm=True))."
-            )
-        self._init_named_stack(
-            architecture=architecture,
-            hidden_dim=int(hidden_dim),
-            dtype=dtype,
-            use_norm=use_norm,
-            lora=lora,
-            config_kwargs=config_kwargs,
+        self.fourier = FourierFeatures(
+            num_frequencies=count,
+            hidden_dim=self.hidden_dim,
         )
+        self.fourier.to(dtype=dtype)
+        self._config_kwargs["num_frequencies"] = self.num_frequencies
 
     def _vocab_size_for_stack(self, *, config_vocab: int | None) -> int:
         if config_vocab is None:
@@ -477,6 +499,7 @@ class TransformerBackbone(Backbone):
             embed_tokens=cast(nn.Embedding, self.model.get_input_embeddings()),
             token_batch=token_batch,
             hidden_dim=self.hidden_dim,
+            fourier=self.fourier,
         )
 
     def decode_session(self, batch_size: int) -> FlexDecodeSession:

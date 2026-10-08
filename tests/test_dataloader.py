@@ -23,6 +23,7 @@ from mouse_core.data import (
 from mouse_core.data.augmenter import _stable_hash
 from mouse_core.data.dataloader import _sequence_generation
 from mouse_core.data.token_batch import StepTokens, TokenBatch
+from tests._token_batch_helpers import IntIdTokenizer
 from tests._token_batch_helpers import token_tokenizer
 
 
@@ -56,14 +57,16 @@ def _tokenizer(*, objective_fields: list[dict[str, str]] | None = None) -> Token
     )
     return Tokenizer(
         input_fields=[
-            {"type": "token", "input_field": "action", "head_output": True},
+            {"type": "text", "input_field": "action", "format": "{field}", "head_output": True},
             {
-                "type": "token",
+                "type": "text",
                 "input_field": "episode_index",
+                "format": "{field}",
                 "when": when_step_index_zero,
             },
         ],
         objective_fields=keep,
+        tokenizer=IntIdTokenizer(),
     )
 
 
@@ -849,15 +852,16 @@ def when_group_start(ctx):
 
 def _task_transform(*, group_start: bool):
     fields: list[dict] = [
-        {"type": "token", "input_field": "action", "head_output": True},
+        {"type": "text", "input_field": "action", "format": "{field}", "head_output": True},
     ]
     if group_start:
         fields.append(
-            {"type": "token", "input_field": "mark", "when": when_group_start}
+            {"type": "text", "input_field": "mark", "format": "{field}", "when": when_group_start}
         )
     tokenizer = Tokenizer(
         input_fields=fields,
         objective_fields=_obj("action", "store_index", "task_done"),
+        tokenizer=IntIdTokenizer(),
     )
     return compose(stages=(_stamp_grouping, tokenizer))
 

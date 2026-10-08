@@ -8,15 +8,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Tokenizer ``type="token"`` tokenizes a literal ``format`` to one
+  ``__text__`` token. Zero or several tokens raise. It has no
+  ``input_field`` and rejects ``max_tokens``. Example readouts use
+  ``format="\n"`` and ``head_output: True``.
+- Tokenizer ``type="numeric"`` tokenizes ``format=`` as literal text
+  to one token and stores the number on ``values``. Zero or several
+  tokens raise. The word field is text; ``{field}`` is rejected.
+  ``fourier_min`` and ``fourier_max`` map
+  the number from that window onto ``[-1, 1]`` with no clipping.
+  Pass ``num_frequencies`` when building the backbone and it adds a
+  Fourier projection of that scaled value onto those token
+  embeddings. The projection starts at 0, so a pretrained token
+  embedding is unchanged until it trains. Omit ``num_frequencies``
+  and a batch that contains numeric tokens raises.
+  ``examples/18_train_offline_cartpole_dqn.ipynb`` uses one character
+  per CartPole observation element (``x``, ``v``, ``t``, ``w``) and a
+  ``token`` comma between the action and those characters.
 - Text fields accept ``input_index``. The field reads that element of a
   1-D vector and renders it as one scalar. Repeat ``input_field`` with
   a different ``input_index`` for each element; fields still emit in
   ``input_fields`` order. A vector without ``input_index`` raises, and
-  a scalar with ``input_index`` raises.
+  a scalar with ``input_index`` raises. Numeric fields use the same
+  index to pick the scalar that the Fourier add carries.
   ``examples/17_collect_cartpole.ipynb`` stores random CartPole
   observations as that vector.
-  ``examples/18_train_offline_cartpole_dqn.ipynb`` trains offline DQN
-  on it, one text field per element.
 - ``ConstantHead``: a scalar parameter that does not read the
   backbone. The output is ``scale * value``. ``value`` starts at 0.
   ``DqnObjective`` requires ``reward_center=`` and
@@ -39,6 +55,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``backward``. ``model_polyak`` tracks ``c'``.
 
 ### Changed
+- Example text fields write the episode number as ``,episode {field+1}``
+  (episode index 0 renders as episode 1). The GRPO example clears a trunk
+  context when ``task_index`` changes, so a new map does not condition on
+  the previous one. Example ``ClassificationHead`` initial ``scale`` is
+  ``1.0``.
+- Example group prefixes state the step cap for an episode: CartPole
+  uses ``MAX_EPISODE_STEPS``, FrozenLake uses ``MAX_STEPS_PER_EPISODE``.
+- Example group prefixes say to predict the value of all actions at the
+  end of each line, and put the step pattern on the next line.
+- Text ``format=`` is an f-string. The step value is the name ``field``,
+  so ``{field+1}`` and ``{field:.3f}`` both render. A const ``format=``
+  has no step value: the word field is text, and ``{field}`` is
+  rejected. ``{{`` / ``}}`` are still a literal brace.
 - Live environments are mouse-gym only. ``step`` returns
   ``(observation, reward, terminated, truncated, info)``. DQN and PPO
   read ``terminated`` and ``truncated`` (bool, or int ``0`` / ``1``)
@@ -54,12 +83,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``truncated`` are the task. Inner episode ends stay on the
   observation and are copied onto the row as ``episode_terminated``,
   ``episode_truncated``, and ``episode_ended``. The collector assigns
-  ``task_index`` and ``episode_index``. Text fields emit ``,d=1`` /
-  ``,d=2`` for those episode bools, and ``,e=`` when ``episode_start``
+  ``task_index`` and ``episode_index``. Text fields emit ``,terminated`` /
+  ``,truncated`` for those episode bools, and ``,episode {field+1}`` when ``episode_start``
   is true or at group start. Training discounts use
   ``gamma_terminated=0.0`` and ``gamma_truncated=0.0``, so the return
-  stops at the task and continues across inner episodes. The
-  ``examples`` extra installs ``repeat-task-gym``.
+  stops at the task and continues across inner episodes. DQN notebooks
+  pass ``double=True`` and ``cross_group_backups="fault"``. The PPO
+  notebook passes ``cross_group_backups="fault"``. A task-ending γ of
+  ``0`` does not read past the group, so ``"fault"`` does not raise on
+  a complete task. The ``examples`` extra installs ``repeat-task-gym``.
 - Objective ``__call__`` returns ``(losses, metrics)``. ``losses`` is
   a dict of 0-dim tensors. Callers sum the terms they train.
   ``DqnObjective`` uses ``action_value`` and, when centering is on,
@@ -102,6 +134,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keys use the constructor values. A flat parameter list is unchanged.
 
 ### Removed
+- Tokenizer ``type="token"`` no longer reads an integer ``input_field``
+  and emits that integer as a vocab id. ``token`` is a literal
+  ``format`` that must be one ``__text__`` token.
+- Tokenizer input fields no longer take ``output_field``. A const is
+  ``format=`` with no name. An image modality is named by its
+  ``input_field``. Two fields that read the same ``input_field``
+  (and the same ``input_index``, when set) are rejected.
+  ``objective_fields`` still take an optional ``output_field``.
 - ``DataLoader`` ``sample_start`` and ``sample_end``. A sample is a
   contiguous ``sample_field`` run.
 - ``grouping_field`` on ``Tokenizer``, ``StepTokens``, ``TokenBatch``,
@@ -119,7 +159,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inside the callable with ``|`` / ``or``. Named module-level
   callables round-trip through ``save_tokenizer`` / ``load_tokenizer``
   as ``module:qualname`` refs. Notebooks define those predicates
-  inline (``when_group_start``, ``when_reward_nonzero``).
+  inline (``on_group_start``, ``on_reward_nonzero``).
 - ``best_action(q)``: integer action id per row, uniform among finite
   maxima (``-inf`` padding never selected). ``SpObjective`` callers that
   distill from Q* run this outside and pass the ids as ``targets=``.
@@ -228,10 +268,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (a safety cap so the end-match wins). Incomplete ``sample_end``
   starts are skipped rather than truncated (see Changed above).
 - Tokenizer fields use inline condition callables in each notebook:
-  FrozenLake prompt via ``when_group_start``, reward zeros via
-  ``when_reward_nonzero``, inner episode flags via
-  ``when_episode_terminated`` / ``when_episode_truncated``, and
-  ``episode_index`` via ``when_episode_start``.
+  FrozenLake prompt via ``on_group_start``, reward zeros via
+  ``on_reward_nonzero``, inner episode flags via
+  ``on_episode_terminated`` / ``on_episode_truncated``, and
+  ``episode_index`` via ``on_episode_start``.
 - ``SpObjective`` / ``SvObjective`` take supervised labels as call-time
   ``targets=`` (action ids for hard CE; Q vectors for SV), matching DQN
   ``predictions=`` / ``delayed_predictions=``. ``targets_key`` is

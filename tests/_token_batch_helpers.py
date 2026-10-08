@@ -33,24 +33,36 @@ def when_step_index_zero_or_group_start(ctx):
 DEFAULT_TOKEN_VOCAB = 32
 
 
+class IntIdTokenizer:
+    """Map a rendered integer string back to that integer as one token id."""
+
+    def __call__(
+        self,
+        text: str,
+        add_special_tokens: bool = False,
+        return_tensors: str | None = None,
+    ):
+        return {"input_ids": torch.tensor([[int(text)]], dtype=torch.long)}
+
+
 def token_tokenizer(
     *fields: str,
     objective_fields: list[dict[str, Any]] | list[str] | None = None,
     **kwargs: Any,
 ) -> Tokenizer:
-    """Pack integer step fields as ``type="token"`` (shared ``__text__`` stream).
+    """Pack integer step fields as ``type="text"`` with ``format="{field}"``.
 
-    The last listed field is ``head_output=True``. Reward floats stay on
-    ``objective_fields`` only.
+    ``IntIdTokenizer`` turns that rendered integer into one vocab id, so an
+    action value of ``1`` is still token id ``1``. The last listed field is
+    ``head_output=True``. Reward floats stay on ``objective_fields`` only.
     """
     input_fields: list[dict[str, Any]] = [
-        {"type": "token", "input_field": name} for name in fields
+        {"type": "text", "input_field": name, "format": "{field}"} for name in fields
     ]
     if input_fields:
         input_fields[-1]["head_output"] = True
     if input_fields and not any(
         field.get("input_field") == "episode_index"
-        or field.get("output_field") == "episode_index"
         for field in input_fields
     ):
         head_at = next(
@@ -59,8 +71,9 @@ def token_tokenizer(
         input_fields.insert(
             head_at,
             {
-                "type": "token",
+                "type": "text",
                 "input_field": "episode_index",
+                "format": "{field}",
                 "when": when_step_index_zero,
             },
         )
@@ -70,6 +83,8 @@ def token_tokenizer(
         resolved = [{"input_field": name} for name in cast(list[str], objective_fields)]
     else:
         resolved = cast(list[dict[str, Any]], objective_fields)
+    if "tokenizer" not in kwargs:
+        kwargs["tokenizer"] = IntIdTokenizer()
     return Tokenizer(
         input_fields=input_fields,
         objective_fields=resolved,
