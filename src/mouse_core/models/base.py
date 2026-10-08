@@ -355,8 +355,8 @@ batch = [[
         "action": 0,
         "observation": 1,
         "reward": 0.0,
-        "episode_done": 0,
-        "task_done": 0,
+        "terminated": False,
+        "truncated": False,
         "task_index": 0,
     }
 ]]"""

@@ -64,84 +64,71 @@ def affine_reward(
     return reward
 
 
+def _as_flag(values: torch.Tensor, *, name: str) -> torch.Tensor:
+    """Bool mask from a mouse-gym ``terminated`` / ``truncated`` column.
+
+    Accepts a bool tensor or an int64 tensor of ``0`` / ``1`` (the dtype
+    ``pack_token_batch`` writes for a bool column).
+    """
+    if values.dtype == torch.bool:
+        return values
+    if values.dtype != torch.int64:
+        raise TypeError(f"{name} must be bool or int64, got {values.dtype}.")
+    if bool((values < 0).any() or (values > 1).any()):
+        raise ValueError(f"{name} must be 0 or 1.")
+    return values.bool()
+
+
 def boundary_reward(
     *,
     scale: float,
     shift: float,
-    reward_episode_terminal_scale: float,
-    reward_episode_terminal_shift: float,
-    reward_episode_truncated_scale: float,
-    reward_episode_truncated_shift: float,
-    reward_task_terminal_scale: float,
-    reward_task_terminal_shift: float,
-    reward_task_truncated_scale: float,
-    reward_task_truncated_shift: float,
+    reward_terminated_scale: float,
+    reward_terminated_shift: float,
+    reward_truncated_scale: float,
+    reward_truncated_shift: float,
 ) -> Reward:
-    """Done-code affine: ``(scale × episode scale × task scale) * reward + shift + episode shift + task shift``.
+    """Flag affine: ``(scale × terminated scale × truncated scale) * reward + shift + extras``.
 
-    Both done fields use codes ``0`` / ``1`` / ``2``. Every transition is
-    ``scale * reward + shift``. Scale extras are ``1.0`` and shift extras
-    are ``0.0`` when the matching code is ``0``. When a task ends both
-    extras fire (e.g. ``episode_done=1`` and ``task_done=2``): scales
-    multiply and shifts add.
+    ``terminated`` and ``truncated`` are the mouse-gym step flags (bool, or
+    ``0`` / ``1``). Every transition is ``scale * reward + shift``. A flag
+    that is false contributes scale ``1`` and shift ``0``. When both flags
+    are true the scales multiply and the shifts add.
 
     Args:
         scale: Multiplier applied to the ``reward`` column.
         shift: Offset added after ``scale``. A running transition
-            (both codes ``0``) uses only ``scale * reward + shift``.
-        reward_episode_terminal_scale: Extra scale when the episode
-            terminates (``episode_done == 1``).
-        reward_episode_terminal_shift: Extra shift when the episode
-            terminates (``episode_done == 1``).
-        reward_episode_truncated_scale: Extra scale when the episode is
-            truncated (``episode_done == 2``).
-        reward_episode_truncated_shift: Extra shift when the episode is
-            truncated (``episode_done == 2``).
-        reward_task_terminal_scale: Extra scale when the task terminates
-            (``task_done == 1``; ``EnvConfig.terminate_task``).
-        reward_task_terminal_shift: Extra shift when the task terminates
-            (``task_done == 1``; ``EnvConfig.terminate_task``).
-        reward_task_truncated_scale: Extra scale when the task is
-            truncated (``task_done == 2``; last episode of
-            ``max_task_episodes``).
-        reward_task_truncated_shift: Extra shift when the task is
-            truncated (``task_done == 2``; last episode of
-            ``max_task_episodes``).
+            (both flags false) uses only ``scale * reward + shift``.
+        reward_terminated_scale: Extra scale when ``terminated`` is true.
+        reward_terminated_shift: Extra shift when ``terminated`` is true.
+        reward_truncated_scale: Extra scale when ``truncated`` is true.
+        reward_truncated_shift: Extra shift when ``truncated`` is true.
     """
 
     def reward(
         *,
         reward: torch.Tensor,
-        episode_done: torch.Tensor,
-        task_done: torch.Tensor,
+        terminated: torch.Tensor,
+        truncated: torch.Tensor,
         **_: torch.Tensor,
     ) -> torch.Tensor:
-        episode_scales = torch.tensor(
-            [1.0, reward_episode_terminal_scale, reward_episode_truncated_scale],
-            dtype=torch.float32,
-            device=reward.device,
+        term = _as_flag(terminated, name="terminated")
+        trunc = _as_flag(truncated, name="truncated")
+        row_scale = torch.full(term.shape, scale, dtype=torch.float32, device=reward.device)
+        row_shift = torch.full(term.shape, shift, dtype=torch.float32, device=reward.device)
+        row_scale = torch.where(
+            term, row_scale * reward_terminated_scale, row_scale
         )
-        episode_shifts = torch.tensor(
-            [0.0, reward_episode_terminal_shift, reward_episode_truncated_shift],
-            dtype=torch.float32,
-            device=reward.device,
+        row_shift = torch.where(
+            term, row_shift + reward_terminated_shift, row_shift
         )
-        task_scales = torch.tensor(
-            [1.0, reward_task_terminal_scale, reward_task_truncated_scale],
-            dtype=torch.float32,
-            device=reward.device,
+        row_scale = torch.where(
+            trunc, row_scale * reward_truncated_scale, row_scale
         )
-        task_shifts = torch.tensor(
-            [0.0, reward_task_terminal_shift, reward_task_truncated_shift],
-            dtype=torch.float32,
-            device=reward.device,
+        row_shift = torch.where(
+            trunc, row_shift + reward_truncated_shift, row_shift
         )
-        return (
-            scale * episode_scales[episode_done] * task_scales[task_done] * reward
-            + shift
-            + episode_shifts[episode_done]
-            + task_shifts[task_done]
-        )
+        return row_scale * reward + row_shift
 
     return reward
 
@@ -168,77 +155,44 @@ def boundary_value(
     *,
     scale: float,
     shift: float,
-    value_episode_terminal_scale: float,
-    value_episode_terminal_shift: float,
-    value_episode_truncated_scale: float,
-    value_episode_truncated_shift: float,
-    value_task_terminal_scale: float,
-    value_task_terminal_shift: float,
-    value_task_truncated_scale: float,
-    value_task_truncated_shift: float,
+    value_terminated_scale: float,
+    value_terminated_shift: float,
+    value_truncated_scale: float,
+    value_truncated_shift: float,
 ) -> Value:
-    """Done-code affine: ``(scale × episode scale × task scale) * value + shift + episode shift + task shift``.
+    """Flag affine: ``(scale × terminated scale × truncated scale) * value + shift + extras``.
 
-    Both done fields use codes ``0`` / ``1`` / ``2``. Every row is
-    ``scale * value + shift``. Scale extras are ``1.0`` and shift extras
-    are ``0.0`` when the matching code is ``0``. When a task ends both
-    extras fire (e.g. ``episode_done=1`` and ``task_done=2``): scales
-    multiply and shifts add. Per-row extras broadcast over remaining
-    value dimensions (``[P, A]``, ``[P, L, A]``).
+    ``terminated`` and ``truncated`` are the mouse-gym step flags (bool, or
+    ``0`` / ``1``). Every row is ``scale * value + shift``. A flag that is
+    false contributes scale ``1`` and shift ``0``. When both flags are true
+    the scales multiply and the shifts add. Per-row extras broadcast over
+    remaining value dimensions (``[P, A]``, ``[P, L, A]``).
 
     Args:
         scale: Multiplier applied to the value / Q tensor.
         shift: Offset added after ``scale``. A running row
-            (both codes ``0``) uses only ``scale * value + shift``.
-        value_episode_terminal_scale: Extra scale when the episode
-            terminates (``episode_done == 1``).
-        value_episode_terminal_shift: Extra shift when the episode
-            terminates (``episode_done == 1``).
-        value_episode_truncated_scale: Extra scale when the episode is
-            truncated (``episode_done == 2``).
-        value_episode_truncated_shift: Extra shift when the episode is
-            truncated (``episode_done == 2``).
-        value_task_terminal_scale: Extra scale when the task terminates
-            (``task_done == 1``; ``EnvConfig.terminate_task``).
-        value_task_terminal_shift: Extra shift when the task terminates
-            (``task_done == 1``; ``EnvConfig.terminate_task``).
-        value_task_truncated_scale: Extra scale when the task is
-            truncated (``task_done == 2``; last episode of
-            ``max_task_episodes``).
-        value_task_truncated_shift: Extra shift when the task is
-            truncated (``task_done == 2``; last episode of
-            ``max_task_episodes``).
+            (both flags false) uses only ``scale * value + shift``.
+        value_terminated_scale: Extra scale when ``terminated`` is true.
+        value_terminated_shift: Extra shift when ``terminated`` is true.
+        value_truncated_scale: Extra scale when ``truncated`` is true.
+        value_truncated_shift: Extra shift when ``truncated`` is true.
     """
 
     def value(
         *,
         value: torch.Tensor,
-        episode_done: torch.Tensor,
-        task_done: torch.Tensor,
+        terminated: torch.Tensor,
+        truncated: torch.Tensor,
         **_: torch.Tensor,
     ) -> torch.Tensor:
-        episode_scales = torch.tensor(
-            [1.0, value_episode_terminal_scale, value_episode_truncated_scale],
-            dtype=torch.float32,
-            device=value.device,
-        )
-        episode_shifts = torch.tensor(
-            [0.0, value_episode_terminal_shift, value_episode_truncated_shift],
-            dtype=torch.float32,
-            device=value.device,
-        )
-        task_scales = torch.tensor(
-            [1.0, value_task_terminal_scale, value_task_truncated_scale],
-            dtype=torch.float32,
-            device=value.device,
-        )
-        task_shifts = torch.tensor(
-            [0.0, value_task_terminal_shift, value_task_truncated_shift],
-            dtype=torch.float32,
-            device=value.device,
-        )
-        row_scale = scale * episode_scales[episode_done] * task_scales[task_done]
-        row_shift = shift + episode_shifts[episode_done] + task_shifts[task_done]
+        term = _as_flag(terminated, name="terminated")
+        trunc = _as_flag(truncated, name="truncated")
+        row_scale = torch.full(term.shape, scale, dtype=torch.float32, device=value.device)
+        row_shift = torch.full(term.shape, shift, dtype=torch.float32, device=value.device)
+        row_scale = torch.where(term, row_scale * value_terminated_scale, row_scale)
+        row_shift = torch.where(term, row_shift + value_terminated_shift, row_shift)
+        row_scale = torch.where(trunc, row_scale * value_truncated_scale, row_scale)
+        row_shift = torch.where(trunc, row_shift + value_truncated_shift, row_shift)
         while row_scale.ndim < value.ndim:
             row_scale = row_scale.unsqueeze(-1)
             row_shift = row_shift.unsqueeze(-1)
@@ -250,50 +204,43 @@ def boundary_value(
 def boundary_discount(
     *,
     gamma_step: float,
-    gamma_episode_terminal: float,
-    gamma_episode_truncated: float,
-    gamma_task_terminal: float,
-    gamma_task_truncated: float,
+    gamma_terminated: float,
+    gamma_truncated: float,
 ) -> Discount:
-    """Done-code lookup: ``gamma_step`` × episode extra × task extra.
+    """Flag lookup: ``gamma_step`` × terminated extra × truncated extra.
 
-    Both fields use codes ``0`` / ``1`` / ``2``. Every transition is
-    multiplied by ``gamma_step``. Episode and task extras are ``1.0`` when
-    the matching code is ``0``. When a task ends both extras fire (e.g.
-    ``episode_done=1`` and ``task_done=2``) and the product is used; a
-    factor of ``0.0`` zeros the whole bootstrap.
+    ``terminated`` and ``truncated`` are the mouse-gym step flags (bool, or
+    ``0`` / ``1``). Every transition is multiplied by ``gamma_step``. A flag
+    that is false contributes ``1``. When both flags are true the extras
+    multiply; a factor of ``0.0`` zeros the whole bootstrap.
+
+    The flags mean whatever the wrapped env uses them for. A
+    ``RepeatTaskEnv`` reports the task on these flags and keeps episode ends
+    in the observation, so a zero task gamma stops the return at the task
+    and leaves episode boundaries inside the run.
 
     Args:
         gamma_step: Always multiplied. A running transition
-            (both codes ``0``) uses only this factor.
-        gamma_episode_terminal: Extra factor when the episode terminates
-            (``episode_done == 1``).
-        gamma_episode_truncated: Extra factor when the episode is truncated
-            (``episode_done == 2``).
-        gamma_task_terminal: Extra factor when the task terminates
-            (``task_done == 1``; ``EnvConfig.terminate_task``).
-        gamma_task_truncated: Extra factor when the task is truncated
-            (``task_done == 2``; last episode of ``max_task_episodes``).
+            (both flags false) uses only this factor.
+        gamma_terminated: Extra factor when ``terminated`` is true.
+        gamma_truncated: Extra factor when ``truncated`` is true.
             ``0.0`` zeros the bootstrap.
     """
 
     def discount(
         *,
-        episode_done: torch.Tensor,
-        task_done: torch.Tensor,
+        terminated: torch.Tensor,
+        truncated: torch.Tensor,
         **_: torch.Tensor,
     ) -> torch.Tensor:
-        episode_gammas = torch.tensor(
-            [1.0, gamma_episode_terminal, gamma_episode_truncated],
-            dtype=torch.float32,
-            device=episode_done.device,
+        term = _as_flag(terminated, name="terminated")
+        trunc = _as_flag(truncated, name="truncated")
+        gamma = torch.full(
+            term.shape, gamma_step, dtype=torch.float32, device=term.device
         )
-        task_gammas = torch.tensor(
-            [1.0, gamma_task_terminal, gamma_task_truncated],
-            dtype=torch.float32,
-            device=episode_done.device,
-        )
-        return gamma_step * episode_gammas[episode_done] * task_gammas[task_done]
+        gamma = torch.where(term, gamma * gamma_terminated, gamma)
+        gamma = torch.where(trunc, gamma * gamma_truncated, gamma)
+        return gamma
 
     return discount
 
@@ -323,7 +270,7 @@ class Gate(Protocol):
     the target and leaves the step out of the loss and out of logged
     metrics when the factor on it is non-zero.
     ``cross_group_backups="fault"`` raises on that step instead. A
-    done-code γ of ``0``, or a horizon that puts no
+    terminated or truncated γ of ``0``, or a horizon that puts no
     weight on that value, does not depend on it, so the step stays. A
     gate ``0`` on a step still inside the run still bootstraps. Values
     must lie in

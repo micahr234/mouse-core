@@ -39,6 +39,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``backward``. ``model_polyak`` tracks ``c'``.
 
 ### Changed
+- Live environments are mouse-gym only. ``step`` returns
+  ``(observation, reward, terminated, truncated, info)``. DQN and PPO
+  read ``terminated`` and ``truncated`` (bool, or int ``0`` / ``1``)
+  through ``terminated_key`` / ``truncated_key``. A false flag
+  contributes scale ``1``, shift ``0``, and gamma ``1``. Both flags
+  can be true; the extras multiply. ``boundary_discount`` takes
+  ``gamma_step``, ``gamma_terminated``, and ``gamma_truncated``.
+  ``boundary_reward`` and ``boundary_value`` take the matching
+  ``*_terminated_*`` and ``*_truncated_*`` scale and shift.
+  ``SpObjective`` requires ``mask_key`` (``None`` disables the skip).
+- Example notebooks wrap the Gymnasium env in ``RepeatTaskEnv`` and
+  pass it to mouse-gym with ``env_fn``. Mouse-gym ``terminated`` /
+  ``truncated`` are the task. Inner episode ends stay on the
+  observation and are copied onto the row as ``episode_terminated``,
+  ``episode_truncated``, and ``episode_ended``. The collector assigns
+  ``task_index`` and ``episode_index``. Text fields emit ``,d=1`` /
+  ``,d=2`` for those episode bools, and ``,e=`` when ``episode_start``
+  is true or at group start. Training discounts use
+  ``gamma_terminated=0.0`` and ``gamma_truncated=0.0``, so the return
+  stops at the task and continues across inner episodes. The
+  ``examples`` extra installs ``repeat-task-gym``.
 - Objective ``__call__`` returns ``(losses, metrics)``. ``losses`` is
   a dict of 0-dim tensors. Callers sum the terms they train.
   ``DqnObjective`` uses ``action_value`` and, when centering is on,
@@ -122,7 +143,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that step is updated from that value and stays. ``"ignore"`` leaves
   that off-data value out of the target and leaves the step out of the
   loss and out of logged metrics when the factor on it is non-zero.
-  ``"fault"`` raises on that step instead. A done-code γ of ``0``, or a
+  ``"fault"`` raises on that step instead. A terminated or truncated γ of ``0``, or a
   horizon that puts no weight on that value, does not depend on it, so
   the step stays and ``"fault"`` does not raise. An earlier step whose
   backup stays inside the task stays either way.
@@ -152,10 +173,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``head_output_indices`` for ``Model.head(h=)``. Use it when
   ``copy(..., backbone=False, reasoner=False)`` so delayed heads read
   the online stream without a second backbone pass.
-- ``boundary_discount``: ``gamma_step`` × episode extra × task extra
-  done-code lookup. ``gamma_step`` multiplies every transition; extras
-  are ``1.0`` when the matching code is ``0``. Pass it as ``discount=``
-  to the DQN-family and PPO
+- ``boundary_discount``: ``gamma_step`` × terminated extra × truncated
+  extra. ``gamma_step`` multiplies every transition; a false flag
+  contributes ``1``. Both flags can be true, and the extras multiply.
+  Pass it as ``discount=`` to the DQN-family and PPO
   objectives, or any ``discount(**objective_data)`` returning
   per-step γ. ``discount=None`` skips the call and uses ``1``.
 - ``affine_reward``: ``scale * reward + shift``. Shared by the
@@ -163,18 +184,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``mouse_core.objectives``. Pass it as ``reward=``, or any
   ``reward(**objective_data)`` returning per-step r. ``reward=None``
   skips the call and uses the ``reward`` column.
-- ``boundary_reward``: ``(scale × episode scale × task scale) *
-  reward + shift + episode shift + task shift`` done-code lookup.
-  Scale extras are ``1.0`` and shift extras are ``0.0`` when the
-  matching code is ``0``. Pass it as ``reward=``.
+- ``boundary_reward``: ``(scale × terminated scale × truncated scale) *
+  reward + shift + terminated shift + truncated shift``. Scale extras
+  are ``1`` and shift extras are ``0`` when the flag is false. Both
+  flags can be true, and the extras multiply (shifts add). Pass it as
+  ``reward=``.
 - ``affine_value``: ``scale * value + shift`` on a Q / V tensor.
   Shared by the DQN-family and PPO objectives. Pass it as ``value=``,
   or any ``value(value=..., **objective_data)`` returning the same
   shape. ``value=None`` skips the call and leaves Q / V unchanged.
-- ``boundary_value``: ``(scale × episode scale × task scale) *
-  value + shift + episode shift + task shift`` done-code lookup.
-  Scale extras are ``1.0`` and shift extras are ``0.0`` when the
-  matching code is ``0``. Pass it as ``value=``.
+- ``boundary_value``: ``(scale × terminated scale × truncated scale) *
+  value + shift + terminated shift + truncated shift``. Scale extras
+  are ``1`` and shift extras are ``0`` when the flag is false. Both
+  flags can be true, and the extras multiply (shifts add). Pass it as
+  ``value=``.
 - ``TransformerBackbone``: one public transformer backbone. ``pretrained=``
   inspects the Hub config. Packed Flex / varlen / padded kernels run when
   every layer is a Llama/Qwen3-shaped softmax block (including other
@@ -199,14 +222,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Training examples and ``bench/bench_dataloader.py`` define
   ``full_task_start`` / ``full_task_end`` inline and pin
   ``sample_start`` / ``sample_end`` so each packed sequence is one
-  full task (episode-0 start through ``task_done != 0`` inclusive).
+  full task (episode-0 start through mouse-gym ``terminated`` or
+  ``truncated`` inclusive).
   Example ``SEQUENCE_LENGTH`` is ``MAX_TASK_EPISODES * MAX_STEPS_PER_EPISODE``
   (a safety cap so the end-match wins). Incomplete ``sample_end``
   starts are skipped rather than truncated (see Changed above).
 - Tokenizer fields use inline condition callables in each notebook:
-  FrozenLake prompt via ``when_group_start``, reward / episode_done
-  zeros via ``when_reward_nonzero`` / ``when_episode_done_nonzero``,
-  and ``episode_index`` via ``when_step_index_zero_or_group_start``.
+  FrozenLake prompt via ``when_group_start``, reward zeros via
+  ``when_reward_nonzero``, inner episode flags via
+  ``when_episode_terminated`` / ``when_episode_truncated``, and
+  ``episode_index`` via ``when_episode_start``.
 - ``SpObjective`` / ``SvObjective`` take supervised labels as call-time
   ``targets=`` (action ids for hard CE; Q vectors for SV), matching DQN
   ``predictions=`` / ``delayed_predictions=``. ``targets_key`` is

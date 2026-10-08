@@ -39,10 +39,8 @@ def _group_id(data: dict[str, torch.Tensor]) -> torch.Tensor:
 def _disc(**overrides: float):
     kwargs = dict(
         gamma_step=1.0,
-        gamma_episode_terminal=0.0,
-        gamma_episode_truncated=0.0,
-        gamma_task_terminal=0.0,
-        gamma_task_truncated=0.0,
+        gamma_terminated=0.0,
+        gamma_truncated=0.0,
     )
     kwargs.update(overrides)
     return boundary_discount(**kwargs)
@@ -65,72 +63,66 @@ def _val(**overrides: object):
 def test_boundary_discount_always_multiplies_gamma_step() -> None:
     discount = boundary_discount(
         gamma_step=0.5,
-        gamma_episode_terminal=0.4,
-        gamma_episode_truncated=0.2,
-        gamma_task_terminal=0.8,
-        gamma_task_truncated=0.25,
+        gamma_terminated=0.4,
+        gamma_truncated=0.2,
     )
     got = discount(
-        episode_done=torch.tensor([0, 1, 2, 1, 2]),
-        task_done=torch.tensor([0, 0, 0, 2, 1]),
+        terminated=torch.tensor([0, 1, 0, 1, 1]),
+        truncated=torch.tensor([0, 0, 1, 1, 1]),
     )
-    want = torch.tensor([0.5, 0.5 * 0.4, 0.5 * 0.2, 0.5 * 0.4 * 0.25, 0.5 * 0.2 * 0.8])
+    want = torch.tensor([
+        0.5,
+        0.5 * 0.4,
+        0.5 * 0.2,
+        0.5 * 0.4 * 0.2,
+        0.5 * 0.4 * 0.2,
+    ])
     assert torch.allclose(got, want)
 
 
-def test_boundary_reward_applies_episode_and_task_affine() -> None:
+def test_boundary_reward_applies_terminated_and_truncated_affine() -> None:
     reward = boundary_reward(
         scale=2.0,
         shift=1.0,
-        reward_episode_terminal_scale=3.0,
-        reward_episode_terminal_shift=10.0,
-        reward_episode_truncated_scale=0.5,
-        reward_episode_truncated_shift=4.0,
-        reward_task_terminal_scale=2.0,
-        reward_task_terminal_shift=3.0,
-        reward_task_truncated_scale=0.25,
-        reward_task_truncated_shift=0.5,
+        reward_terminated_scale=3.0,
+        reward_terminated_shift=10.0,
+        reward_truncated_scale=0.5,
+        reward_truncated_shift=4.0,
     )
     got = reward(
-        reward=torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0]),
-        episode_done=torch.tensor([0, 1, 2, 1, 2]),
-        task_done=torch.tensor([0, 0, 0, 2, 1]),
+        reward=torch.tensor([1.0, 1.0, 1.0, 1.0]),
+        terminated=torch.tensor([0, 1, 0, 1]),
+        truncated=torch.tensor([0, 0, 1, 1]),
     )
     want = torch.tensor([
         2.0 * 1.0 + 1.0,
         2.0 * 3.0 * 1.0 + 1.0 + 10.0,
         2.0 * 0.5 * 1.0 + 1.0 + 4.0,
-        2.0 * 3.0 * 0.25 * 1.0 + 1.0 + 10.0 + 0.5,
-        2.0 * 0.5 * 2.0 * 1.0 + 1.0 + 4.0 + 3.0,
+        2.0 * 3.0 * 0.5 * 1.0 + 1.0 + 10.0 + 4.0,
     ])
     assert torch.allclose(got, want)
 
 
-def test_boundary_value_applies_episode_and_task_affine() -> None:
+def test_boundary_value_applies_terminated_and_truncated_affine() -> None:
     value = boundary_value(
         scale=2.0,
         shift=1.0,
-        value_episode_terminal_scale=3.0,
-        value_episode_terminal_shift=10.0,
-        value_episode_truncated_scale=0.5,
-        value_episode_truncated_shift=4.0,
-        value_task_terminal_scale=2.0,
-        value_task_terminal_shift=3.0,
-        value_task_truncated_scale=0.25,
-        value_task_truncated_shift=0.5,
+        value_terminated_scale=3.0,
+        value_terminated_shift=10.0,
+        value_truncated_scale=0.5,
+        value_truncated_shift=4.0,
     )
-    q = torch.ones(5, 2)
+    q = torch.ones(4, 2)
     got = value(
         value=q,
-        episode_done=torch.tensor([0, 1, 2, 1, 2]),
-        task_done=torch.tensor([0, 0, 0, 2, 1]),
+        terminated=torch.tensor([0, 1, 0, 1]),
+        truncated=torch.tensor([0, 0, 1, 1]),
     )
     want_rows = torch.tensor([
         2.0 * 1.0 + 1.0,
         2.0 * 3.0 * 1.0 + 1.0 + 10.0,
         2.0 * 0.5 * 1.0 + 1.0 + 4.0,
-        2.0 * 3.0 * 0.25 * 1.0 + 1.0 + 10.0 + 0.5,
-        2.0 * 0.5 * 2.0 * 1.0 + 1.0 + 4.0 + 3.0,
+        2.0 * 3.0 * 0.5 * 1.0 + 1.0 + 10.0 + 4.0,
     ])
     assert got.shape == q.shape
     assert torch.allclose(got, want_rows.unsqueeze(-1).expand_as(q))
@@ -141,8 +133,8 @@ def test_objective_none_transforms_are_identity() -> None:
     step_stream = {
             "action": torch.tensor([0, 1, 0]),
             "reward": torch.tensor([0.0, 1.0, 5.0]),
-            "episode_done": torch.tensor([0, 1, 0]),
-            "task_done": torch.tensor([0, 0, 0]),
+            "terminated": torch.tensor([0, 1, 0]),
+            "truncated": torch.tensor([0, 0, 0]),
         }
     predictions, delayed = _q(
         torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]]),
@@ -150,7 +142,7 @@ def test_objective_none_transforms_are_identity() -> None:
     )
     skipped, _ = DqnObjective(        reward=None, value=None, discount=None, temperature=0.0, double=False, gate=None,
      cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  delayed_predictions=delayed, reward_center=None, delayed_reward_center=None)
-    explicit, _ = DqnObjective(        reward=_rew(), value=_val(), discount=_disc(gamma_step=1.0, gamma_episode_terminal=1.0, gamma_episode_truncated=1.0, gamma_task_terminal=1.0, gamma_task_truncated=1.0), temperature=0.0, double=False, gate=None,
+    explicit, _ = DqnObjective(        reward=_rew(), value=_val(), discount=_disc(gamma_step=1.0, gamma_terminated=1.0, gamma_truncated=1.0), temperature=0.0, double=False, gate=None,
      cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  delayed_predictions=delayed, reward_center=None, delayed_reward_center=None)
     assert abs(skipped["action_value"].item() - explicit["action_value"].item()) < 1e-05
 
@@ -210,7 +202,7 @@ def _q(online: torch.Tensor, delayed: torch.Tensor) -> tuple[torch.Tensor, torch
 
 def test_dqn_objective_runs() -> None:
     n, a = (8, 3)
-    step_stream = {'action': torch.randint(0, a, (n,)), 'reward': torch.randn(n), 'episode_done': torch.zeros(n, dtype=torch.long), 'task_done': torch.zeros(n, dtype=torch.long), 'group_id': torch.tensor([0, 0, 0, 0, 1, 1, 1, 1])}
+    step_stream = {'action': torch.randint(0, a, (n,)), 'reward': torch.randn(n), 'terminated': torch.zeros(n, dtype=torch.long), 'truncated': torch.zeros(n, dtype=torch.long), 'group_id': torch.tensor([0, 0, 0, 0, 1, 1, 1, 1])}
     predictions, delayed = _q(torch.randn(n, a), torch.randn(n, a))
     objective = DqnObjective( reward=_rew(), value=_val(), discount=_disc(gamma_step=0.99), temperature=0.0, double=False, gate=None, cross_group_backups="bootstrap")
     loss, metrics = objective(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  delayed_predictions=delayed, reward_center=None, delayed_reward_center=None)
@@ -240,8 +232,8 @@ def test_dqn_metrics_backup_matches_loss_target() -> None:
     data = {
         'action': torch.tensor([0, 0], dtype=torch.int64),
         'reward': torch.tensor([0.0, 1.0]),
-        'episode_done': torch.zeros(2, dtype=torch.int64),
-        'task_done': torch.zeros(2, dtype=torch.int64),
+        'terminated': torch.zeros(2, dtype=torch.int64),
+        'truncated': torch.zeros(2, dtype=torch.int64),
         'task_index': torch.zeros(2, dtype=torch.int64),
     }
     online = torch.zeros(2, 2, requires_grad=True)
@@ -280,20 +272,20 @@ def test_dqn_metrics_backup_matches_loss_target() -> None:
 
 def test_dqn_objective_rejects_wrong_action_shape() -> None:
     n, a = (4, 3)
-    step_stream = {'action': torch.randint(0, a, (n, 1)), 'reward': torch.randn(n), 'episode_done': torch.zeros(n, dtype=torch.long), 'task_done': torch.zeros(n, dtype=torch.long)}
+    step_stream = {'action': torch.randint(0, a, (n, 1)), 'reward': torch.randn(n), 'terminated': torch.zeros(n, dtype=torch.long), 'truncated': torch.zeros(n, dtype=torch.long)}
     predictions, delayed = _q(torch.randn(n, a), torch.randn(n, a))
     with pytest.raises(ValueError, match="action shape"):
         DqnObjective( reward=_rew(), value=_val(), discount=_disc(gamma_step=0.99), temperature=0.0, double=False, gate=None, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  delayed_predictions=delayed, reward_center=None, delayed_reward_center=None)
 
 def test_dqn_objective_requires_min_sequence() -> None:
-    step_stream = {'action': torch.zeros(1, dtype=torch.long), 'reward': torch.zeros(1), 'episode_done': torch.zeros(1, dtype=torch.long), 'task_done': torch.zeros(1, dtype=torch.long)}
+    step_stream = {'action': torch.zeros(1, dtype=torch.long), 'reward': torch.zeros(1), 'terminated': torch.zeros(1, dtype=torch.long), 'truncated': torch.zeros(1, dtype=torch.long)}
     predictions, delayed = _q(torch.zeros(1, 2), torch.zeros(1, 2))
     with pytest.raises(ValueError, match="Not enough"):
         DqnObjective( reward=_rew(), value=_val(), discount=_disc(), temperature=0.0, double=False, gate=None, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  delayed_predictions=delayed, reward_center=None, delayed_reward_center=None)
 
 def test_dqn_objective_trains_on_terminal_transitions() -> None:
     """Transitions *from* terminal states must contribute to the loss."""
-    step_stream = {'action': torch.tensor([0, 1, 0]), 'reward': torch.tensor([0.0, 1.0, 5.0]), 'episode_done': torch.tensor([0, 1, 0]), 'task_done': torch.tensor([0, 0, 0])}
+    step_stream = {'action': torch.tensor([0, 1, 0]), 'reward': torch.tensor([0.0, 1.0, 5.0]), 'terminated': torch.tensor([0, 1, 0]), 'truncated': torch.tensor([0, 0, 0])}
     predictions, delayed = _q(torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]]), torch.zeros(3, 2))
     loss, _ = DqnObjective( reward=_rew(), value=_val(), discount=_disc(gamma_step=0.0), temperature=0.0, double=False, gate=None, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  delayed_predictions=delayed, reward_center=None, delayed_reward_center=None)
     assert abs(loss["action_value"].item() - 2.5) < 1e-05
@@ -331,8 +323,8 @@ def test_dqn_objective_reward_scale_and_shift() -> None:
     step_stream = {
             "action": torch.tensor([0, 1, 0]),
             "reward": torch.tensor([0.0, 1.0, 5.0]),
-            "episode_done": torch.tensor([0, 1, 0]),
-            "task_done": torch.tensor([0, 0, 0]),
+            "terminated": torch.tensor([0, 1, 0]),
+            "truncated": torch.tensor([0, 0, 0]),
         }
     predictions, delayed = _q(torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]]), torch.zeros(3, 2))
     # Unscaled targets 1 and 5 → MSE 2.5. Scale 2: targets 2 and 10 → (2-2)^2, (3-10)^2.
@@ -351,8 +343,8 @@ def test_dqn_objective_custom_reward_reads_objective_data() -> None:
             "action": torch.tensor([0, 1, 0]),
             "reward": torch.tensor([0.0, 1.0, 5.0]),
             "bonus": torch.tensor([0.0, 1.0, 1.0]),
-            "episode_done": torch.tensor([0, 1, 0]),
-            "task_done": torch.tensor([0, 0, 0]),
+            "terminated": torch.tensor([0, 1, 0]),
+            "truncated": torch.tensor([0, 0, 0]),
         }
     predictions, delayed = _q(torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]]), torch.zeros(3, 2))
 
@@ -368,8 +360,8 @@ def test_dqn_objective_q_affine_is_identity_by_default() -> None:
     step_stream = {
             "action": torch.tensor([0, 1, 0]),
             "reward": torch.tensor([0.0, 1.0, 5.0]),
-            "episode_done": torch.tensor([0, 1, 0]),
-            "task_done": torch.tensor([0, 0, 0]),
+            "terminated": torch.tensor([0, 1, 0]),
+            "truncated": torch.tensor([0, 0, 0]),
         }
     predictions, delayed = _q(torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]]), torch.zeros(3, 2))
     plain, _ = DqnObjective( reward=_rew(), value=_val(), discount=_disc(gamma_step=0.0), temperature=0.0, double=False, gate=None, cross_group_backups="bootstrap")(
@@ -384,8 +376,8 @@ def test_dqn_objective_q_scale_and_shift() -> None:
     step_stream = {
             "action": torch.tensor([0, 1, 0]),
             "reward": torch.tensor([0.0, 1.0, 5.0]),
-            "episode_done": torch.tensor([0, 1, 0]),
-            "task_done": torch.tensor([0, 0, 0]),
+            "terminated": torch.tensor([0, 1, 0]),
+            "truncated": torch.tensor([0, 0, 0]),
         }
     online = torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]])
     predictions, delayed = _q(online, torch.zeros(3, 2))
@@ -399,7 +391,7 @@ def test_dqn_objective_q_scale_and_shift() -> None:
 
 
 def _sequence_fixture(group_id: list[int]) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
-    step_stream = {'action': torch.tensor([0, 1, 0]), 'reward': torch.tensor([0.0, 1.0, 5.0]), 'episode_done': torch.tensor([0, 0, 0]), 'task_done': torch.tensor([0, 0, 0]), 'group_id': torch.tensor(group_id)}
+    step_stream = {'action': torch.tensor([0, 1, 0]), 'reward': torch.tensor([0.0, 1.0, 5.0]), 'terminated': torch.tensor([0, 0, 0]), 'truncated': torch.tensor([0, 0, 0]), 'group_id': torch.tensor(group_id)}
     predictions, delayed = _q(torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]]), torch.zeros(3, 2))
     return (step_stream, predictions, delayed)
 
@@ -426,8 +418,8 @@ def test_dqn_objective_skips_transitions_across_tasks() -> None:
     step_stream = {
             'action': torch.tensor([0, 1, 0]),
             'reward': torch.tensor([0.0, 1.0, 5.0]),
-            'episode_done': torch.tensor([0, 1, 0]),
-            'task_done': torch.tensor([0, 2, 0]),
+            'terminated': torch.tensor([0, 1, 0]),
+            'truncated': torch.tensor([0, 1, 0]),
             'group_id': torch.tensor([0, 0, 1]),
         }
     predictions, delayed = _q(torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]]), torch.zeros(3, 2))
@@ -458,7 +450,7 @@ def test_pair_weight_zeros_window_cut_and_task_change() -> None:
     reset = {
             'group_id': torch.tensor([0, 0, 0]),
             'task_index': torch.tensor([0, 0, 0]),
-            'episode_done': torch.tensor([0, 1, 0]),
+            'terminated': torch.tensor([0, 1, 0]),
         }
     assert torch.equal(
         _pair_weight(group_id=reset["group_id"], N=3, device="cpu"),
@@ -470,8 +462,8 @@ def test_dqn_objective_rejects_out_of_range_action() -> None:
     step_stream = {
             'action': torch.tensor([0, 9]),
             'reward': torch.tensor([0.0, 1.0]),
-            'episode_done': torch.zeros(2, dtype=torch.long),
-            'task_done': torch.zeros(2, dtype=torch.long),
+            'terminated': torch.zeros(2, dtype=torch.long),
+            'truncated': torch.zeros(2, dtype=torch.long),
         }
     predictions, delayed = _q(torch.zeros(2, 3), torch.zeros(2, 3))
     with pytest.raises(ValueError, match="action ids must be in"):
@@ -487,8 +479,8 @@ def test_dqn_same_run_episode_reset_trains_both_pairs() -> None:
     step_stream = {
             'action': torch.tensor([0, 1, 0]),
             'reward': torch.tensor([0.0, 1.0, 5.0]),
-            'episode_done': torch.tensor([0, 1, 0]),
-            'task_done': torch.tensor([0, 0, 0]),
+            'terminated': torch.tensor([0, 1, 0]),
+            'truncated': torch.tensor([0, 0, 0]),
             'group_id': torch.tensor([0, 0, 0]),
             'task_index': torch.tensor([0, 0, 0]),
         }
@@ -497,13 +489,13 @@ def test_dqn_same_run_episode_reset_trains_both_pairs() -> None:
     assert abs(loss["action_value"].item() - 2.5) < 1e-05
 
 
-def test_dqn_objective_multiplies_step_episode_and_task_gammas() -> None:
-    """``gamma_step`` always multiplies the episode extra and the task extra."""
+def test_dqn_objective_multiplies_step_terminated_and_truncated_gammas() -> None:
+    """``gamma_step`` always multiplies the terminated extra and the truncated extra."""
     step_stream = {
             'action': torch.tensor([0, 1]),
             'reward': torch.tensor([0.0, 1.0]),
-            'episode_done': torch.tensor([0, 1]),
-            'task_done': torch.tensor([0, 2]),
+            'terminated': torch.tensor([0, 1]),
+            'truncated': torch.tensor([0, 1]),
         }
     predictions, delayed = _q(
         torch.tensor([[0.0, 2.0], [4.0, 0.0]]),
@@ -514,14 +506,14 @@ def test_dqn_objective_multiplies_step_episode_and_task_gammas() -> None:
     # Without gamma_step the product would be 0.4 (target 5, loss 9).
     loss, _ = DqnObjective(        reward=_rew(),
         value=_val(),
-        discount=_disc(gamma_step=0.5, gamma_episode_terminal=1.0, gamma_task_truncated=0.4),
+        discount=_disc(gamma_step=0.5, gamma_terminated=1.0, gamma_truncated=0.4),
         temperature=0.0, double=False, gate=None,
      cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  delayed_predictions=delayed, reward_center=None, delayed_reward_center=None)
     assert abs(loss["action_value"].item() - 1.0) < 1e-05
     # gamma_step=0 zeros the bootstrap even when both extras are 1.
     zero_step, _ = DqnObjective(        reward=_rew(),
         value=_val(),
-        discount=_disc(gamma_step=0.0, gamma_episode_terminal=1.0, gamma_task_truncated=1.0),
+        discount=_disc(gamma_step=0.0, gamma_terminated=1.0, gamma_truncated=1.0),
         temperature=0.0, double=False, gate=None,
      cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  delayed_predictions=delayed, reward_center=None, delayed_reward_center=None)
     assert abs(zero_step["action_value"].item() - 1.0) < 1e-05
@@ -536,8 +528,8 @@ def _double_step() -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]
     step_stream = {
         "action": torch.tensor([0, 0]),
         "reward": torch.tensor([0.0, 0.0]),
-        "episode_done": torch.zeros(2, dtype=torch.int64),
-        "task_done": torch.zeros(2, dtype=torch.int64),
+        "terminated": torch.zeros(2, dtype=torch.int64),
+        "truncated": torch.zeros(2, dtype=torch.int64),
     }
     online = torch.tensor([[2.0, 0.0], [0.0, 5.0]])
     delayed = torch.tensor([[0.0, 0.0], [9.0, 1.0]])
@@ -608,8 +600,8 @@ def test_double_soft_value_uses_online_policy_on_delayed_q() -> None:
     step_stream = {
         "action": torch.tensor([0, 0]),
         "reward": torch.tensor([0.0, 0.0]),
-        "episode_done": torch.zeros(2, dtype=torch.int64),
-        "task_done": torch.zeros(2, dtype=torch.int64),
+        "terminated": torch.zeros(2, dtype=torch.int64),
+        "truncated": torch.zeros(2, dtype=torch.int64),
     }
     online = torch.tensor([[0.0, 0.0], [0.0, 0.0]])
     delayed = torch.tensor([[0.0, 0.0], [0.0, 2.0]])
@@ -636,8 +628,8 @@ def test_double_enters_the_lambda_return() -> None:
     step_stream = {
         "action": torch.tensor([0, 0, 0]),
         "reward": torch.tensor([0.0, 1.0, 0.0]),
-        "episode_done": torch.zeros(3, dtype=torch.int64),
-        "task_done": torch.zeros(3, dtype=torch.int64),
+        "terminated": torch.zeros(3, dtype=torch.int64),
+        "truncated": torch.zeros(3, dtype=torch.int64),
     }
     online = torch.tensor([[5.0, 0.0], [0.0, 9.0], [0.0, 3.0]])
     delayed = torch.tensor([[0.0, 0.0], [4.0, 1.0], [0.0, 8.0]])
@@ -676,8 +668,8 @@ def test_dqn_objective_does_not_backprop_through_delayed_q() -> None:
     step_stream = {
             "action": torch.zeros(n, dtype=torch.long),
             "reward": torch.ones(n),
-            "episode_done": torch.zeros(n, dtype=torch.long),
-            "task_done": torch.zeros(n, dtype=torch.long),
+            "terminated": torch.zeros(n, dtype=torch.long),
+            "truncated": torch.zeros(n, dtype=torch.long),
         }
     online = torch.randn(n, a, requires_grad=True)
     delayed = torch.randn(n, a, requires_grad=True)
@@ -698,8 +690,8 @@ def _lambda_fixture() -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tens
     step_stream = {
             "action": torch.tensor([0, 0, 1]),
             "reward": torch.tensor([0.0, 1.0, 10.0]),
-            "episode_done": torch.zeros(3, dtype=torch.int64),
-            "task_done": torch.zeros(3, dtype=torch.int64),
+            "terminated": torch.zeros(3, dtype=torch.int64),
+            "truncated": torch.zeros(3, dtype=torch.int64),
             "group_id": torch.zeros(3, dtype=torch.int64),
             "info_q_star": torch.tensor(
                 [[10.0, 0.0], [0.0, 10.0], [0.0, 10.0]]
@@ -753,7 +745,7 @@ def test_td_lambda_terminal_gamma_zero_ends_the_trace() -> None:
     """s0 → s1 terminates the episode (code stored at s1): G_0 = r only."""
     step_stream, predictions, delayed = _lambda_fixture()
     step_stream = {key: value.clone() for key, value in step_stream.items()}
-    step_stream["episode_done"] = torch.tensor([0, 1, 0])
+    step_stream["terminated"] = torch.tensor([0, 1, 0])
     loss, _ = DqnObjective( reward=_rew(), value=_val(), discount=_disc(), gate=_gate(td_lambda=1.0), temperature=0.0, double=False, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  delayed_predictions=delayed, reward_center=None, delayed_reward_center=None)
     # s0: (5 - 1)^2 = 16 — neither V(s1) nor the next episode's return; s1: 12100.
     assert abs(loss["action_value"].item() - (16.0 + 12100.0) / 2) < 1e-03
@@ -763,8 +755,8 @@ def test_td_lambda_truncation_gamma_carries_the_trace_discounted() -> None:
     """A non-zero truncation gamma bootstraps through the reset, so the trace does too."""
     step_stream, predictions, delayed = _lambda_fixture()
     step_stream = {key: value.clone() for key, value in step_stream.items()}
-    step_stream["episode_done"] = torch.tensor([0, 2, 0])
-    loss, _ = DqnObjective( reward=_rew(), value=_val(), discount=_disc(gamma_episode_truncated=0.5), gate=_gate(td_lambda=1.0), temperature=0.0, double=False, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  delayed_predictions=delayed, reward_center=None, delayed_reward_center=None)
+    step_stream["truncated"] = torch.tensor([0, 1, 0])
+    loss, _ = DqnObjective( reward=_rew(), value=_val(), discount=_disc(gamma_truncated=0.5), gate=_gate(td_lambda=1.0), temperature=0.0, double=False, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  delayed_predictions=delayed, reward_center=None, delayed_reward_center=None)
     # s0: 1 + 0.5 * G_1 = 1 + 0.5 * 110 = 56 → (5 - 56)^2 = 2601; s1: 12100.
     assert abs(loss["action_value"].item() - (2601.0 + 12100.0) / 2) < 1e-03
 
@@ -772,10 +764,10 @@ def test_td_lambda_truncation_gamma_carries_the_trace_discounted() -> None:
 def test_td_lambda_task_gamma_scales_the_trace() -> None:
     step_stream, predictions, delayed = _lambda_fixture()
     step_stream = {key: value.clone() for key, value in step_stream.items()}
-    step_stream["task_done"] = torch.tensor([0, 2, 0])
-    full, _ = DqnObjective( reward=_rew(), value=_val(), discount=_disc(gamma_task_truncated=1.0), gate=_gate(td_lambda=1.0), temperature=0.0, double=False, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  delayed_predictions=delayed, reward_center=None, delayed_reward_center=None)
+    step_stream["truncated"] = torch.tensor([0, 1, 0])
+    full, _ = DqnObjective( reward=_rew(), value=_val(), discount=_disc(gamma_truncated=1.0), gate=_gate(td_lambda=1.0), temperature=0.0, double=False, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  delayed_predictions=delayed, reward_center=None, delayed_reward_center=None)
     assert abs(full["action_value"].item() - _FULL_RETURN) < 1e-03
-    cut, _ = DqnObjective( reward=_rew(), value=_val(), discount=_disc(gamma_task_truncated=0.0), gate=_gate(td_lambda=1.0), temperature=0.0, double=False, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  delayed_predictions=delayed, reward_center=None, delayed_reward_center=None)
+    cut, _ = DqnObjective( reward=_rew(), value=_val(), discount=_disc(gamma_truncated=0.0), gate=_gate(td_lambda=1.0), temperature=0.0, double=False, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  delayed_predictions=delayed, reward_center=None, delayed_reward_center=None)
     assert abs(cut["action_value"].item() - (16.0 + 12100.0) / 2) < 1e-03
 
 
@@ -1393,8 +1385,8 @@ def test_temperature_soft_value_is_logsumexp() -> None:
     step_stream = {
             "action": torch.tensor([0, 0]),
             "reward": torch.tensor([0.0, 0.0]),
-            "episode_done": torch.zeros(2, dtype=torch.int64),
-            "task_done": torch.zeros(2, dtype=torch.int64),
+            "terminated": torch.zeros(2, dtype=torch.int64),
+            "truncated": torch.zeros(2, dtype=torch.int64),
         }
     online = torch.tensor([[0.0, 0.0], [0.0, 0.0]])
     delayed = torch.tensor([[0.0, 0.0], [0.0, 0.0]])
@@ -1430,8 +1422,8 @@ def test_temperature_does_not_change_gamma_zero_target() -> None:
     step_stream = {
             "action": torch.tensor([0, 1, 0]),
             "reward": torch.tensor([0.0, 1.0, 5.0]),
-            "episode_done": torch.tensor([0, 1, 0]),
-            "task_done": torch.tensor([0, 0, 0]),
+            "terminated": torch.tensor([0, 1, 0]),
+            "truncated": torch.tensor([0, 0, 0]),
         }
     predictions, delayed = _q(
         torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]]), torch.zeros(3, 2)
@@ -1456,16 +1448,16 @@ def test_dqn_custom_discount_function() -> None:
     step_stream = {
             "action": torch.tensor([0, 1]),
             "reward": torch.tensor([0.0, 1.0]),
-            "episode_done": torch.tensor([0, 0]),
-            "task_done": torch.tensor([0, 0]),
+            "terminated": torch.tensor([0, 0]),
+            "truncated": torch.tensor([0, 0]),
         }
     predictions, delayed = _q(
         torch.tensor([[0.0, 2.0], [0.0, 0.0]]),
         torch.tensor([[0.0, 0.0], [10.0, 0.0]]),
     )
 
-    def half(*, episode_done: torch.Tensor, **_: torch.Tensor) -> torch.Tensor:
-        return torch.full(episode_done.shape, 0.5, dtype=torch.float32)
+    def half(*, terminated: torch.Tensor, **_: torch.Tensor) -> torch.Tensor:
+        return torch.full(terminated.shape, 0.5, dtype=torch.float32)
 
     # Q(s0, a=1)=2; r=1; V=10; γ=0.5 → target 6; loss (2-6)^2 = 16.
     loss, _ = DqnObjective(        reward=_rew(), value=_val(), discount=half, temperature=0.0, double=False, gate=None
@@ -1477,12 +1469,12 @@ def test_dqn_discount_must_return_per_step_tensor() -> None:
     step_stream = {
             "action": torch.tensor([0, 1]),
             "reward": torch.tensor([0.0, 1.0]),
-            "episode_done": torch.tensor([0, 0]),
-            "task_done": torch.tensor([0, 0]),
+            "terminated": torch.tensor([0, 0]),
+            "truncated": torch.tensor([0, 0]),
         }
     predictions, delayed = _q(torch.zeros(2, 2), torch.zeros(2, 2))
 
-    def bad(*, episode_done: torch.Tensor, **_: torch.Tensor) -> torch.Tensor:
+    def bad(*, terminated: torch.Tensor, **_: torch.Tensor) -> torch.Tensor:
         return torch.tensor([0.5])
 
     with pytest.raises(ValueError, match="discount must return shape"):
@@ -1495,8 +1487,8 @@ def test_dqn_reward_must_return_per_step_tensor() -> None:
     step_stream = {
             "action": torch.tensor([0, 1]),
             "reward": torch.tensor([0.0, 1.0]),
-            "episode_done": torch.tensor([0, 0]),
-            "task_done": torch.tensor([0, 0]),
+            "terminated": torch.tensor([0, 0]),
+            "truncated": torch.tensor([0, 0]),
         }
     predictions, delayed = _q(torch.zeros(2, 2), torch.zeros(2, 2))
 
@@ -1513,8 +1505,8 @@ def test_dqn_value_must_return_same_shape() -> None:
     step_stream = {
             "action": torch.tensor([0, 1]),
             "reward": torch.tensor([0.0, 1.0]),
-            "episode_done": torch.tensor([0, 0]),
-            "task_done": torch.tensor([0, 0]),
+            "terminated": torch.tensor([0, 0]),
+            "truncated": torch.tensor([0, 0]),
         }
     predictions, delayed = _q(torch.zeros(2, 2), torch.zeros(2, 2))
 
@@ -1530,8 +1522,8 @@ def test_dqn_value_must_return_same_shape() -> None:
 def _cutoff_loss(
     *,
     cross_group_backups: CrossGroupBackups,
-    episode_done: torch.Tensor,
-    task_done: torch.Tensor | None = None,
+    terminated: torch.Tensor,
+    truncated: torch.Tensor | None = None,
     discount: object | None = None,
     gate: object | None = None,
 ) -> float:
@@ -1539,8 +1531,8 @@ def _cutoff_loss(
     step_stream = {
         "action": torch.tensor([0, 0]),
         "reward": torch.tensor([0.0, 1.0]),
-        "episode_done": episode_done,
-        "task_done": torch.zeros(2, dtype=torch.int64) if task_done is None else task_done,
+        "terminated": terminated,
+        "truncated": torch.zeros(2, dtype=torch.int64) if truncated is None else truncated,
     }
     online = torch.zeros(2, 2)
     delayed = torch.tensor([[0.0, 0.0], [5.0, 0.0]])
@@ -1560,15 +1552,15 @@ def test_cross_group_value_is_bootstrapped_unless_ignored() -> None:
     """A non-zero cutoff factor bootstraps unless the backup is ignored."""
     running = torch.tensor([0, 0])
     # r + V(s') = 6 → 36. The only step's factor on that V is non-zero, so ignoring the backup drops it.
-    assert abs(_cutoff_loss(cross_group_backups="bootstrap", episode_done=running) - 36.0) < 1e-05
-    assert abs(_cutoff_loss(cross_group_backups="ignore", episode_done=running) - 0.0) < 1e-05
-    truncated = torch.tensor([0, 2])
-    trunc_discount = _disc(gamma_episode_truncated=1.0)
+    assert abs(_cutoff_loss(cross_group_backups="bootstrap", terminated=running) - 36.0) < 1e-05
+    assert abs(_cutoff_loss(cross_group_backups="ignore", terminated=running) - 0.0) < 1e-05
+    truncated_flags = torch.tensor([0, 1])
+    trunc_discount = _disc(gamma_truncated=1.0)
     assert abs(_cutoff_loss(
-        cross_group_backups="bootstrap", episode_done=truncated, discount=trunc_discount,
+        cross_group_backups="bootstrap", terminated=running, truncated=truncated_flags, discount=trunc_discount,
     ) - 36.0) < 1e-05
     assert abs(_cutoff_loss(
-        cross_group_backups="ignore", episode_done=truncated, discount=trunc_discount,
+        cross_group_backups="ignore", terminated=running, truncated=truncated_flags, discount=trunc_discount,
     ) - 0.0) < 1e-05
 
 
@@ -1598,8 +1590,8 @@ def test_in_run_horizon_backup_stays_in_loss_and_logs() -> None:
     step_stream = {
         "action": torch.zeros(4, dtype=torch.long),
         "reward": torch.tensor([0.0, 1.0, 10.0, 100.0]),
-        "episode_done": torch.zeros(4, dtype=torch.long),
-        "task_done": torch.zeros(4, dtype=torch.long),
+        "terminated": torch.zeros(4, dtype=torch.long),
+        "truncated": torch.zeros(4, dtype=torch.long),
     }
     online = torch.tensor([[10.0], [30.0], [50.0], [0.0]])
     delayed = torch.tensor([[0.0], [3.0], [7.0], [11.0]])
@@ -1627,15 +1619,15 @@ def test_in_run_horizon_backup_stays_in_loss_and_logs() -> None:
 
 
 def test_true_terminal_stays_for_either_ignore_flag() -> None:
-    """A done-code γ of 0 removes the value for either flag."""
+    """A terminated or truncated γ of 0 removes the value for either flag."""
     terminal = torch.tensor([0, 1])
-    episode = _cutoff_loss(cross_group_backups="bootstrap", episode_done=terminal)
-    episode_off = _cutoff_loss(cross_group_backups="ignore", episode_done=terminal)
+    episode = _cutoff_loss(cross_group_backups="bootstrap", terminated=terminal)
+    episode_off = _cutoff_loss(cross_group_backups="ignore", terminated=terminal)
     assert abs(episode - 1.0) < 1e-05
     assert abs(episode_off - episode) < 1e-05
     task = torch.tensor([0, 1])
-    task_on = _cutoff_loss(cross_group_backups="bootstrap", episode_done=torch.zeros(2, dtype=torch.int64), task_done=task)
-    task_off = _cutoff_loss(cross_group_backups="ignore", episode_done=torch.zeros(2, dtype=torch.int64), task_done=task)
+    task_on = _cutoff_loss(cross_group_backups="bootstrap", terminated=torch.zeros(2, dtype=torch.int64), truncated=task)
+    task_off = _cutoff_loss(cross_group_backups="ignore", terminated=torch.zeros(2, dtype=torch.int64), truncated=task)
     assert abs(task_on - 1.0) < 1e-05
     assert abs(task_off - task_on) < 1e-05
 
@@ -1645,15 +1637,15 @@ def _long_horizon_loss(
     cross_group_backups: CrossGroupBackups,
     td_lambda: float,
     n: int,
-    episode_done: torch.Tensor | None = None,
+    terminated: torch.Tensor | None = None,
 ) -> tuple[float, dict[str, float | torch.Tensor]]:
     """Four steps. ``n`` runs past the batch. ``td_lambda`` is the trace factor."""
-    done = torch.zeros(4, dtype=torch.long) if episode_done is None else episode_done
+    done = torch.zeros(4, dtype=torch.long) if terminated is None else terminated
     step_stream = {
         "action": torch.zeros(4, dtype=torch.long),
         "reward": torch.tensor([0.0, 1.0, 10.0, 100.0]),
-        "episode_done": done,
-        "task_done": torch.zeros(4, dtype=torch.long),
+        "terminated": done,
+        "truncated": torch.zeros(4, dtype=torch.long),
     }
     online = torch.tensor([[10.0], [30.0], [50.0], [0.0]])
     delayed = torch.tensor([[0.0], [3.0], [7.0], [11.0]])
@@ -1707,10 +1699,10 @@ def test_true_terminal_stays_when_the_horizon_passes_the_sample() -> None:
     # Returns stop on the rewards: 111, 110, 100. No cutoff value either way.
     sq = (111.0 - 10.0) ** 2 + (110.0 - 30.0) ** 2 + (100.0 - 50.0) ** 2
     on_loss, on_metrics = _long_horizon_loss(
-        cross_group_backups="bootstrap", td_lambda=1.0, n=10, episode_done=done,
+        cross_group_backups="bootstrap", td_lambda=1.0, n=10, terminated=done,
     )
     off_loss, off_metrics = _long_horizon_loss(
-        cross_group_backups="ignore", td_lambda=1.0, n=10, episode_done=done,
+        cross_group_backups="ignore", td_lambda=1.0, n=10, terminated=done,
     )
     assert abs(on_loss - sq / 3) < 1e-02
     assert abs(off_loss - on_loss) < 1e-04
@@ -1727,8 +1719,8 @@ def test_concatenated_groups_match_independent_backups() -> None:
         return {
             "action": torch.randint(0, n_actions, (n,)),
             "reward": torch.randn(n) + shift,
-            "episode_done": torch.zeros(n, dtype=torch.long),
-            "task_done": torch.zeros(n, dtype=torch.long),
+            "terminated": torch.zeros(n, dtype=torch.long),
+            "truncated": torch.zeros(n, dtype=torch.long),
             "group_id": torch.full((n,), group_id, dtype=torch.int64),
             "q": torch.randn(n, n_actions) + shift,
             "q_delayed": torch.randn(n, n_actions) + 3.0 * shift,
@@ -1750,7 +1742,7 @@ def test_concatenated_groups_match_independent_backups() -> None:
             cross_group_backups=cross_group_backups,
     )
         _, metrics = objective(
-            objective_data={key: data[key] for key in ("action", "reward", "episode_done", "task_done")},
+            objective_data={key: data[key] for key in ("action", "reward", "terminated", "truncated")},
             group_id=data["group_id"],
             predictions=data["q"],
             delayed_predictions=data["q_delayed"],
@@ -1796,12 +1788,12 @@ def test_fault_raises_when_a_backup_crosses_the_group() -> None:
     online = torch.zeros(2, 2)
     delayed = torch.tensor([[0.0, 0.0], [5.0, 0.0]])
 
-    def run(*, episode_done: torch.Tensor, cross_group_backups: CrossGroupBackups) -> float:
+    def run(*, terminated: torch.Tensor, cross_group_backups: CrossGroupBackups) -> float:
         step_stream = {
             "action": torch.tensor([0, 0]),
             "reward": torch.tensor([0.0, 1.0]),
-            "episode_done": episode_done,
-            "task_done": torch.zeros(2, dtype=torch.long),
+            "terminated": terminated,
+            "truncated": torch.zeros(2, dtype=torch.long),
         }
         loss, _ = DqnObjective(
             reward=_rew(),
@@ -1822,15 +1814,15 @@ def test_fault_raises_when_a_backup_crosses_the_group() -> None:
 
     running = torch.zeros(2, dtype=torch.long)
     with pytest.raises(ValueError, match="cross-group backup at step 0"):
-        run(episode_done=running, cross_group_backups="fault")
+        run(terminated=running, cross_group_backups="fault")
     terminal = torch.tensor([0, 1])
-    fault_loss = run(episode_done=terminal, cross_group_backups="fault")
-    ignore_loss = run(episode_done=terminal, cross_group_backups="ignore")
+    fault_loss = run(terminated=terminal, cross_group_backups="fault")
+    ignore_loss = run(terminated=terminal, cross_group_backups="ignore")
     assert abs(fault_loss - 1.0) < 1e-05
     assert abs(fault_loss - ignore_loss) < 1e-05
     with pytest.raises(ValueError, match="bootstrap"):
         # Deliberately exercise runtime validation outside the literal type.
-        run(episode_done=running, cross_group_backups="drop")  # type: ignore[arg-type]
+        run(terminated=running, cross_group_backups="drop")  # type: ignore[arg-type]
 
 
 def test_dqn_requires_cross_group_backups_argument() -> None:

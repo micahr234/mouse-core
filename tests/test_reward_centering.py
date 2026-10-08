@@ -26,10 +26,8 @@ def _group_id(data: dict[str, torch.Tensor]) -> torch.Tensor:
 def _disc(**overrides: float):
     kwargs = dict(
         gamma_step=1.0,
-        gamma_episode_terminal=0.0,
-        gamma_episode_truncated=0.0,
-        gamma_task_terminal=0.0,
-        gamma_task_truncated=0.0,
+        gamma_terminated=0.0,
+        gamma_truncated=0.0,
     )
     kwargs.update(overrides)
     return boundary_discount(**kwargs)
@@ -83,8 +81,8 @@ def test_dqn_requires_reward_center_argument() -> None:
     step_stream = {
         "action": torch.tensor([0, 1, 0]),
         "reward": torch.tensor([0.0, 1.0, 5.0]),
-        "episode_done": torch.tensor([0, 1, 0]),
-        "task_done": torch.tensor([0, 0, 0]),
+        "terminated": torch.tensor([0, 1, 0]),
+        "truncated": torch.tensor([0, 0, 0]),
     }
     with pytest.raises(TypeError, match="reward_center"):
         _objective()(  # type: ignore[call-arg]
@@ -98,8 +96,8 @@ def test_dqn_rejects_non_scalar_reward_center() -> None:
     step_stream = {
         "action": torch.tensor([0, 1, 0]),
         "reward": torch.tensor([0.0, 1.0, 5.0]),
-        "episode_done": torch.tensor([0, 1, 0]),
-        "task_done": torch.tensor([0, 0, 0]),
+        "terminated": torch.tensor([0, 1, 0]),
+        "truncated": torch.tensor([0, 0, 0]),
     }
     objective = _objective()
     online = torch.zeros(3, 2)
@@ -127,8 +125,8 @@ def test_dqn_loss_does_not_train_the_center() -> None:
     step_stream = {
         "action": torch.tensor([0, 1, 0]),
         "reward": torch.tensor([0.0, 1.0, 5.0]),
-        "episode_done": torch.tensor([0, 1, 0]),
-        "task_done": torch.tensor([0, 0, 0]),
+        "terminated": torch.tensor([0, 1, 0]),
+        "truncated": torch.tensor([0, 0, 0]),
     }
     # Taken Q at next-action rows: actions [1,0] → Q 2 and 3; targets 1 and 5.
     # δ = [1-2, 5-3] = [-1, 2]; mean δ = 0.5
@@ -178,8 +176,8 @@ def test_dqn_centering_subtracts_same_offset_from_every_horizon() -> None:
     step_stream = {
         "action": torch.tensor([0, 1, 0]),
         "reward": torch.tensor([0.0, 1.0, 5.0]),
-        "episode_done": torch.tensor([0, 0, 1]),
-        "task_done": torch.tensor([0, 0, 0]),
+        "terminated": torch.tensor([0, 0, 1]),
+        "truncated": torch.tensor([0, 0, 0]),
     }
     online = torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]], requires_grad=True)
     delayed = torch.zeros(3, 2)
@@ -229,8 +227,8 @@ def test_dqn_centering_subtracts_nothing_on_undiscounted_bootstrapped_steps() ->
     step_stream = {
         "action": torch.tensor([0, 1, 0]),
         "reward": torch.tensor([0.0, 1.0, 5.0]),
-        "episode_done": torch.tensor([0, 0, 0]),
-        "task_done": torch.tensor([0, 0, 0]),
+        "terminated": torch.tensor([0, 0, 0]),
+        "truncated": torch.tensor([0, 0, 0]),
     }
     online = torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]])
     delayed = torch.zeros(3, 2)
@@ -263,8 +261,8 @@ def test_dqn_requires_both_centers_or_neither() -> None:
     step_stream = {
         "action": torch.tensor([0, 1, 0]),
         "reward": torch.tensor([0.0, 1.0, 5.0]),
-        "episode_done": torch.tensor([0, 1, 0]),
-        "task_done": torch.tensor([0, 0, 0]),
+        "terminated": torch.tensor([0, 1, 0]),
+        "truncated": torch.tensor([0, 0, 0]),
     }
     online = torch.zeros(3, 2)
     with pytest.raises(ValueError, match="both be set or both be None"):
@@ -286,8 +284,8 @@ def test_dqn_backup_uses_delayed_center() -> None:
     step_stream = {
         "action": torch.tensor([0, 1, 0]),
         "reward": torch.tensor([0.0, 1.0, 5.0]),
-        "episode_done": torch.tensor([0, 0, 0]),
-        "task_done": torch.tensor([0, 0, 0]),
+        "terminated": torch.tensor([0, 0, 0]),
+        "truncated": torch.tensor([0, 0, 0]),
     }
     online = torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]], requires_grad=True)
     delayed = torch.zeros(3, 2)
@@ -322,8 +320,8 @@ def test_dqn_terminal_target_uses_delayed_center() -> None:
     step_stream = {
         "action": torch.tensor([0, 1, 0]),
         "reward": torch.tensor([0.0, 1.0, 5.0]),
-        "episode_done": torch.tensor([0, 1, 0]),
-        "task_done": torch.tensor([0, 0, 0]),
+        "terminated": torch.tensor([0, 1, 0]),
+        "truncated": torch.tensor([0, 0, 0]),
     }
     online = torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]])
     delayed = torch.zeros(3, 2)
@@ -351,8 +349,8 @@ def test_dqn_centering_matches_classic_reward_centering_when_continuing() -> Non
     step_stream = {
         "action": torch.tensor([0, 1, 0]),
         "reward": torch.tensor([0.0, 1.0, 5.0]),
-        "episode_done": torch.tensor([0, 0, 0]),
-        "task_done": torch.tensor([0, 0, 0]),
+        "terminated": torch.tensor([0, 0, 0]),
+        "truncated": torch.tensor([0, 0, 0]),
     }
     online = torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]])
     delayed = torch.zeros(3, 2)
@@ -387,8 +385,8 @@ def test_dqn_centering_is_a_pure_value_shift() -> None:
     step_stream = {
         "action": torch.tensor([0, 1, 0, 2, 1, 0]),
         "reward": torch.randn(6),
-        "episode_done": torch.tensor([0, 0, 1, 0, 0, 2]),
-        "task_done": torch.tensor([0, 0, 0, 0, 0, 0]),
+        "terminated": torch.tensor([0, 0, 1, 0, 0, 0]),
+        "truncated": torch.tensor([0, 0, 0, 0, 0, 1]),
     }
     online = torch.randn(6, 3)
     delayed = torch.randn(6, 3)
@@ -397,8 +395,8 @@ def test_dqn_centering_is_a_pure_value_shift() -> None:
         value=_val(),
         discount=_disc(
             gamma_step=0.9,
-            gamma_episode_terminal=0.0,
-            gamma_episode_truncated=1.0,
+            gamma_terminated=0.0,
+            gamma_truncated=1.0,
         ),
         temperature=0.7,
         double=True,
@@ -430,8 +428,8 @@ def test_dqn_reward_center_metric_is_a_snapshot() -> None:
     step_stream = {
         "action": torch.tensor([0, 1, 0]),
         "reward": torch.tensor([0.0, 1.0, 5.0]),
-        "episode_done": torch.tensor([0, 1, 0]),
-        "task_done": torch.tensor([0, 0, 0]),
+        "terminated": torch.tensor([0, 1, 0]),
+        "truncated": torch.tensor([0, 0, 0]),
     }
     center = ConstantHead(scale=1.0)
     _, metrics = _objective()(
@@ -456,8 +454,8 @@ def test_dqn_without_centering_omits_center_metrics() -> None:
     step_stream = {
         "action": torch.tensor([0, 1, 0]),
         "reward": torch.tensor([0.0, 1.0, 5.0]),
-        "episode_done": torch.tensor([0, 1, 0]),
-        "task_done": torch.tensor([0, 0, 0]),
+        "terminated": torch.tensor([0, 1, 0]),
+        "truncated": torch.tensor([0, 0, 0]),
     }
     online = torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]])
     delayed = torch.zeros(3, 2)

@@ -10,10 +10,8 @@ from mouse_core.objectives.ppo import _gae_advantages
 def _disc(**overrides: float):
     kwargs = dict(
         gamma_step=1.0,
-        gamma_episode_terminal=0.0,
-        gamma_episode_truncated=0.0,
-        gamma_task_terminal=0.0,
-        gamma_task_truncated=0.0,
+        gamma_terminated=0.0,
+        gamma_truncated=0.0,
     )
     kwargs.update(overrides)
     return boundary_discount(**kwargs)
@@ -62,9 +60,9 @@ def _ppo(**overrides: object) -> _PpoCall:
 def _ppo_batch(*, n: int=8, a: int=3, with_old_log_prob: bool=True, group_id: list[int] | None=None) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     action = torch.randint(0, a, (n,))
     reward = torch.randn(n)
-    episode_done = torch.zeros(n, dtype=torch.long)
-    task_done = torch.zeros(n, dtype=torch.long)
-    data: dict[str, torch.Tensor] = {'action': action, 'reward': reward, 'episode_done': episode_done, 'task_done': task_done, 'group_id': torch.tensor(group_id if group_id is not None else [0] * (n // 2) + [1] * (n - n // 2))}
+    terminated = torch.zeros(n, dtype=torch.long)
+    truncated = torch.zeros(n, dtype=torch.long)
+    data: dict[str, torch.Tensor] = {'action': action, 'reward': reward, 'terminated': terminated, 'truncated': truncated, 'group_id': torch.tensor(group_id if group_id is not None else [0] * (n // 2) + [1] * (n - n // 2))}
     if with_old_log_prob:
         data['old_log_prob'] = torch.randn(n)
     objective_data = data
@@ -99,13 +97,13 @@ def test_ppo_objective_rejects_wrong_action_shape() -> None:
         _ppo()(objective_data=objective_data, predictions=predictions)
 
 def test_ppo_objective_requires_min_sequence() -> None:
-    objective_data = {'action': torch.zeros(1, dtype=torch.long), 'reward': torch.zeros(1), 'episode_done': torch.zeros(1, dtype=torch.long), 'task_done': torch.zeros(1, dtype=torch.long)}
+    objective_data = {'action': torch.zeros(1, dtype=torch.long), 'reward': torch.zeros(1), 'terminated': torch.zeros(1, dtype=torch.long), 'truncated': torch.zeros(1, dtype=torch.long)}
     predictions = {'action': torch.zeros(1, 2), 'value': torch.zeros(1, 1)}
     with pytest.raises(ValueError, match="N >= 2"):
         _ppo()(objective_data=objective_data, predictions=predictions)
 
 def test_ppo_objective_closed_form_single_transition() -> None:
-    objective_data = {'action': torch.tensor([0, 0]), 'reward': torch.tensor([0.0, 4.0]), 'episode_done': torch.tensor([0, 0]), 'task_done': torch.tensor([0, 0]), 'old_log_prob': torch.tensor([0.0, 0.0])}
+    objective_data = {'action': torch.tensor([0, 0]), 'reward': torch.tensor([0.0, 4.0]), 'terminated': torch.tensor([0, 0]), 'truncated': torch.tensor([0, 0]), 'old_log_prob': torch.tensor([0.0, 0.0])}
     predictions = {'action': torch.tensor([[20.0, -20.0], [20.0, -20.0]]), 'value': torch.tensor([[1.0], [0.0]])}
     objective = _ppo(discount=_disc(gamma_step=0.0), gae_lambda=1.0, clip_eps=0.2, vf_coef=1.0, ent_coef=0.0, normalize_advantage=False)
     loss, metrics = objective(objective_data=objective_data, predictions=predictions)
@@ -114,13 +112,13 @@ def test_ppo_objective_closed_form_single_transition() -> None:
     assert abs(metrics['value_loss'] - 9.0) < 0.001
 
 def test_ppo_objective_skips_transitions_across_sequences() -> None:
-    objective_data = {'action': torch.tensor([0, 0, 0]), 'reward': torch.tensor([0.0, 1.0, 5.0]), 'episode_done': torch.tensor([0, 0, 0]), 'task_done': torch.tensor([0, 0, 0]), 'old_log_prob': torch.tensor([0.0, 0.0, 0.0]), 'group_id': torch.tensor([0, 1, 1])}
+    objective_data = {'action': torch.tensor([0, 0, 0]), 'reward': torch.tensor([0.0, 1.0, 5.0]), 'terminated': torch.tensor([0, 0, 0]), 'truncated': torch.tensor([0, 0, 0]), 'old_log_prob': torch.tensor([0.0, 0.0, 0.0]), 'group_id': torch.tensor([0, 1, 1])}
     predictions = {'action': torch.tensor([[20.0, -20.0], [20.0, -20.0], [20.0, -20.0]]), 'value': torch.tensor([[0.0], [2.0], [0.0]])}
     loss, _ = _ppo(discount=_disc(gamma_step=0.0), gae_lambda=1.0, vf_coef=1.0, ent_coef=0.0, normalize_advantage=False)(objective_data=objective_data, predictions=predictions)
     assert abs(loss["ppo"].item() - 6.0) < 0.001
 
 def test_ppo_objective_all_out_of_run_pairs_yield_zero_loss() -> None:
-    objective_data = {'action': torch.tensor([0, 1, 0]), 'reward': torch.tensor([0.0, 1.0, 5.0]), 'episode_done': torch.tensor([0, 0, 0]), 'task_done': torch.tensor([0, 0, 0]), 'group_id': torch.tensor([0, 1, 2])}
+    objective_data = {'action': torch.tensor([0, 1, 0]), 'reward': torch.tensor([0.0, 1.0, 5.0]), 'terminated': torch.tensor([0, 0, 0]), 'truncated': torch.tensor([0, 0, 0]), 'group_id': torch.tensor([0, 1, 2])}
     predictions = {'action': torch.zeros(3, 2), 'value': torch.zeros(3, 1)}
     loss, metrics = _ppo()(objective_data=objective_data, predictions=predictions)
     assert abs(loss["ppo"].item()) < 1e-05
@@ -160,12 +158,12 @@ def test_ppo_cross_group_backups_is_switchable() -> None:
         normalize_advantage=False,
     )
 
-    def run(*, cross_group_backups: CrossGroupBackups, episode_done: torch.Tensor) -> tuple[float, dict[str, float | torch.Tensor]]:
+    def run(*, cross_group_backups: CrossGroupBackups, terminated: torch.Tensor) -> tuple[float, dict[str, float | torch.Tensor]]:
         objective_data = {
             "action": torch.tensor([0, 0]),
             "reward": torch.tensor([0.0, 4.0]),
-            "episode_done": episode_done,
-            "task_done": torch.tensor([0, 0]),
+            "terminated": terminated,
+            "truncated": torch.tensor([0, 0]),
             "old_log_prob": torch.tensor([0.0, 0.0]),
         }
         loss, metrics = _ppo(cross_group_backups=cross_group_backups, **common)(
@@ -174,21 +172,21 @@ def test_ppo_cross_group_backups_is_switchable() -> None:
         return float(loss["ppo"].item()), metrics
 
     # δ = 4 + V(s') - 1 = 8; value loss 64; policy loss -8.
-    on_loss, on_metrics = run(cross_group_backups="bootstrap", episode_done=torch.tensor([0, 0]))
+    on_loss, on_metrics = run(cross_group_backups="bootstrap", terminated=torch.tensor([0, 0]))
     assert abs(on_loss - 56.0) < 0.001
     assert abs(on_metrics["value_mean"] - 1.0) < 0.001
     # The only step's factor on V(s') is non-zero, so it leaves the loss and the logs.
-    off_loss, off_metrics = run(cross_group_backups="ignore", episode_done=torch.tensor([0, 0]))
+    off_loss, off_metrics = run(cross_group_backups="ignore", terminated=torch.tensor([0, 0]))
     assert abs(off_loss) < 0.001
     assert abs(off_metrics["value_mean"]) < 0.001
     assert abs(off_metrics["policy_loss"]) < 0.001
-    truncated = _disc(gamma_step=1.0, gamma_episode_truncated=1.0)
+    truncated = _disc(gamma_step=1.0, gamma_truncated=1.0)
     on, on_logs = _ppo(cross_group_backups="bootstrap", discount=truncated, gae_lambda=1.0, vf_coef=1.0, ent_coef=0.0, normalize_advantage=False)(
         objective_data={
             "action": torch.tensor([0, 0]),
             "reward": torch.tensor([0.0, 4.0]),
-            "episode_done": torch.tensor([0, 2]),
-            "task_done": torch.tensor([0, 0]),
+            "terminated": torch.tensor([0, 0]),
+            "truncated": torch.tensor([0, 1]),
             "old_log_prob": torch.tensor([0.0, 0.0]),
         },
         predictions=predictions,
@@ -197,8 +195,8 @@ def test_ppo_cross_group_backups_is_switchable() -> None:
         objective_data={
             "action": torch.tensor([0, 0]),
             "reward": torch.tensor([0.0, 4.0]),
-            "episode_done": torch.tensor([0, 2]),
-            "task_done": torch.tensor([0, 0]),
+            "terminated": torch.tensor([0, 0]),
+            "truncated": torch.tensor([0, 1]),
             "old_log_prob": torch.tensor([0.0, 0.0]),
         },
         predictions=predictions,
@@ -207,8 +205,8 @@ def test_ppo_cross_group_backups_is_switchable() -> None:
     assert abs(on_logs["value_mean"] - 1.0) < 0.001
     assert abs(off["ppo"].item()) < 0.001
     assert abs(off_logs["value_mean"]) < 0.001
-    terminal_on, terminal_on_logs = run(cross_group_backups="bootstrap", episode_done=torch.tensor([0, 1]))
-    terminal_off, terminal_off_logs = run(cross_group_backups="ignore", episode_done=torch.tensor([0, 1]))
+    terminal_on, terminal_on_logs = run(cross_group_backups="bootstrap", terminated=torch.tensor([0, 1]))
+    terminal_off, terminal_off_logs = run(cross_group_backups="ignore", terminated=torch.tensor([0, 1]))
     assert abs(terminal_on - 6.0) < 0.001
     assert abs(terminal_off - terminal_on) < 1e-05
     assert abs(terminal_off_logs["value_mean"] - terminal_on_logs["value_mean"]) < 1e-05
@@ -223,8 +221,8 @@ def test_ppo_zero_lambda_keeps_the_in_sample_step() -> None:
     objective_data = {
         "action": torch.tensor([0, 0, 0]),
         "reward": torch.tensor([0.0, 4.0, 8.0]),
-        "episode_done": torch.zeros(3, dtype=torch.long),
-        "task_done": torch.zeros(3, dtype=torch.long),
+        "terminated": torch.zeros(3, dtype=torch.long),
+        "truncated": torch.zeros(3, dtype=torch.long),
         "old_log_prob": torch.zeros(3),
     }
 
@@ -263,7 +261,7 @@ def test_concatenated_groups_match_independent_gae() -> None:
         return {
             "reward": torch.randn(n) + shift,
             "value": torch.randn(n) + shift,
-            "episode_done": torch.zeros(n, dtype=torch.long),
+            "terminated": torch.zeros(n, dtype=torch.long),
             "group_id": torch.full((n,), group_id, dtype=torch.int64),
         }
 
@@ -275,7 +273,7 @@ def test_concatenated_groups_match_independent_gae() -> None:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         n = int(data["reward"].shape[0])
         discounts = torch.full((n,), 0.99)
-        discounts = torch.where(data["episode_done"] == 1, torch.zeros(n), discounts)
+        discounts = torch.where(data["terminated"] == 1, torch.zeros(n), discounts)
         pair = _pair_weight(group_id=data["group_id"], N=n, device="cpu")
         return _gae_advantages(
             rewards=data["reward"][1:],
@@ -315,12 +313,12 @@ def test_fault_raises_when_a_gae_backup_crosses_the_group() -> None:
         "value": torch.tensor([[1.0], [5.0]]),
     }
 
-    def run(*, episode_done: torch.Tensor, cross_group_backups: CrossGroupBackups) -> float:
+    def run(*, terminated: torch.Tensor, cross_group_backups: CrossGroupBackups) -> float:
         objective_data = {
             "action": torch.tensor([0, 0]),
             "reward": torch.tensor([0.0, 4.0]),
-            "episode_done": episode_done,
-            "task_done": torch.tensor([0, 0]),
+            "terminated": terminated,
+            "truncated": torch.tensor([0, 0]),
             "old_log_prob": torch.tensor([0.0, 0.0]),
         }
         loss, _ = _ppo(
@@ -334,14 +332,14 @@ def test_fault_raises_when_a_gae_backup_crosses_the_group() -> None:
         return float(loss["ppo"].item())
 
     with pytest.raises(ValueError, match="cross-group backup at step 0"):
-        run(episode_done=torch.tensor([0, 0]), cross_group_backups="fault")
+        run(terminated=torch.tensor([0, 0]), cross_group_backups="fault")
     terminal = torch.tensor([0, 1])
-    fault_loss = run(episode_done=terminal, cross_group_backups="fault")
-    ignore_loss = run(episode_done=terminal, cross_group_backups="ignore")
+    fault_loss = run(terminated=terminal, cross_group_backups="fault")
+    ignore_loss = run(terminated=terminal, cross_group_backups="ignore")
     assert abs(fault_loss - ignore_loss) < 1e-05
     with pytest.raises(ValueError, match="bootstrap"):
         # Deliberately exercise runtime validation outside the literal type.
-        run(episode_done=terminal, cross_group_backups="drop")  # type: ignore[arg-type]
+        run(terminated=terminal, cross_group_backups="drop")  # type: ignore[arg-type]
 
 
 def test_ppo_requires_cross_group_backups_argument() -> None:

@@ -46,10 +46,8 @@ def _group_id(data: dict[str, torch.Tensor]) -> torch.Tensor:
 def _disc(**overrides: float):
     kwargs = dict(
         gamma_step=1.0,
-        gamma_episode_terminal=0.0,
-        gamma_episode_truncated=0.0,
-        gamma_task_terminal=0.0,
-        gamma_task_truncated=0.0,
+        gamma_terminated=0.0,
+        gamma_truncated=0.0,
     )
     kwargs.update(overrides)
     return boundary_discount(**kwargs)
@@ -408,8 +406,8 @@ def _objective_data(
     data = {
         "action": torch.tensor(actions or list(range(N)), dtype=torch.int64) % _ACTIONS,
         "reward": torch.arange(N, dtype=torch.float32) / 2,
-        "episode_done": torch.zeros(N, dtype=torch.int64),
-        "task_done": torch.zeros(N, dtype=torch.int64),
+        "terminated": torch.zeros(N, dtype=torch.int64),
+        "truncated": torch.zeros(N, dtype=torch.int64),
         "group_id": torch.zeros(N, dtype=torch.int64),
     }
     if counts is not None:

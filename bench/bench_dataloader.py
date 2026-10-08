@@ -31,8 +31,13 @@ from datasets import Dataset
 
 from mouse_core.data import Augmenter, DataLoader, Datastore, Tokenizer, compose
 from mouse_core.data.token_batch import TokenBatch
-def when_episode_done_nonzero(ctx):
-    return "episode_done" in ctx and ctx["episode_done"] != 0
+
+
+def when_episode_terminated(ctx):
+    return "episode_terminated" in ctx and bool(ctx["episode_terminated"])
+
+def when_episode_truncated(ctx):
+    return "episode_truncated" in ctx and bool(ctx["episode_truncated"])
 
 def when_group_start(ctx):
     return bool(ctx["group_start"])
@@ -40,11 +45,8 @@ def when_group_start(ctx):
 def when_reward_nonzero(ctx):
     return "reward" in ctx and ctx["reward"] != 0.0
 
-def when_step_index_zero(ctx):
-    return "step_index" in ctx and ctx["step_index"] == 0
-
-def when_step_index_zero_or_group_start(ctx):
-    return (ctx.get("step_index") == 0) | bool(ctx["group_start"])
+def when_episode_start(ctx):
+    return bool(ctx.get("episode_start")) | bool(ctx["group_start"])
 
 
 _BENCH_DIR = Path(__file__).resolve().parent
@@ -92,15 +94,19 @@ def _synthetic_rows(n: int, *, seed: int) -> list[dict[str, Any]]:
     episode = 0
     ep_step = 0
     for _ in range(n):
-        episode_done = 2 if ep_step + 1 >= _STEPS_PER_EPISODE else 0
-        task_done = 2 if episode_done and episode + 1 >= _EPISODES_PER_TASK else 0
+        episode_truncated = ep_step + 1 >= _STEPS_PER_EPISODE
+        task_truncated = episode_truncated and episode + 1 >= _EPISODES_PER_TASK
         rows.append(
             {
                 "action": int(rng.integers(0, _MAX_ACTIONS)),
                 "observation": int(rng.integers(0, _MAX_OBS)),
                 "reward": float(rng.random()),
-                "episode_done": episode_done,
-                "task_done": task_done,
+                "terminated": False,
+                "truncated": task_truncated,
+                "episode_terminated": False,
+                "episode_truncated": episode_truncated,
+                "episode_ended": episode_truncated,
+                "episode_start": ep_step == 0,
                 "task_index": task,
                 "episode_index": episode,
                 "step_index": ep_step,
@@ -108,10 +114,10 @@ def _synthetic_rows(n: int, *, seed: int) -> list[dict[str, Any]]:
             }
         )
         ep_step += 1
-        if episode_done:
+        if episode_truncated:
             ep_step = 0
             episode += 1
-        if task_done:
+        if task_truncated:
             episode = 0
             task += 1
     return rows
@@ -164,15 +170,21 @@ def _train_transform() -> Any:
             },
             {
                 "type": "text",
-                "input_field": "episode_done",
-                "format": "d={field},",
-                "when": when_episode_done_nonzero,
+                "input_field": "episode_terminated",
+                "format": ",d=1",
+                "when": when_episode_terminated,
+            },
+            {
+                "type": "text",
+                "input_field": "episode_truncated",
+                "format": ",d=2",
+                "when": when_episode_truncated,
             },
             {
                 "type": "text",
                 "input_field": "episode_index",
                 "format": "e={field},",
-                "when": when_step_index_zero_or_group_start,
+                "when": when_episode_start,
             },
             {
                 "type": "text",
@@ -185,8 +197,8 @@ def _train_transform() -> Any:
         objective_fields=[
             {"input_field": "action"},
             {"input_field": "reward"},
-            {"input_field": "episode_done"},
-            {"input_field": "task_done"},
+            {"input_field": "terminated"},
+            {"input_field": "truncated"},
         ],
         pretrained="Qwen/Qwen3-0.6B",
     )

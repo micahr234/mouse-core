@@ -79,7 +79,7 @@ _CASES: list[tuple[Objective[...], dict[str, object], tuple[str, ...]]] = [
         {"group_id": torch.zeros(2, dtype=torch.int64)},
         ("group_id",),
     ),
-    (SpObjective(), {"targets": torch.zeros(2, dtype=torch.int64)}, ("targets",)),
+    (SpObjective(mask_key=None), {"targets": torch.zeros(2, dtype=torch.int64)}, ("targets",)),
     (SvObjective(), {"targets": torch.zeros(2, 2)}, ("targets",)),
 ]
 

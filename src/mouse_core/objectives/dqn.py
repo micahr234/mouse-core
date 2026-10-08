@@ -15,31 +15,28 @@ from mouse_core.objectives.transforms import (
     Value,
     _apply_transform,
     _apply_value,
+    _as_flag,
     _require_transform,
 )
 
 
-def _require_done_codes(
+def _require_done_flags(
     objective_data: dict[str, torch.Tensor],
     *,
-    episode_done_key: str,
-    task_done_key: str,
+    terminated_key: str,
+    truncated_key: str,
     N: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Read and validate mouse-gym ``episode_done`` / ``task_done`` columns."""
-    codes: list[torch.Tensor] = []
-    for key in (episode_done_key, task_done_key):
+    """Read and validate mouse-gym ``terminated`` / ``truncated`` columns."""
+    flags: list[torch.Tensor] = []
+    for key in (terminated_key, truncated_key):
         values = objective_data[key]
-        if values.dtype != torch.int64:
-            raise TypeError(f"{key} must be int64, got {values.dtype}.")
         if values.shape != torch.Size([N]):
             raise ValueError(
                 f"objective expects {key} shape [{N}], got {tuple(values.shape)}."
             )
-        if bool((values < 0).any() or (values > 2).any()):
-            raise ValueError(f"{key} codes must be 0, 1, or 2.")
-        codes.append(values)
-    return codes[0], codes[1]
+        flags.append(_as_flag(values, name=key).to(dtype=torch.int64))
+    return flags[0], flags[1]
 
 
 def _head_output_layout(
@@ -593,17 +590,18 @@ class DqnObjective(Objective[...]):
     backups are the same in a batch that also holds other groups as they
     are when that group is the whole batch: a backup never reads another
     group's reward or value. If every
-    weight is ``0`` the loss is ``0``. Episode resets inside a run
-    (``episode_done`` 1/2, then a reset frame) are still in-run and may train.
-    Gamma is the Bellman discount from the done codes at ``i+1`` inside a
-    same-run pair — it is not a run mask.
+    weight is ``0`` the loss is ``0``. A step whose ``terminated`` or
+    ``truncated`` flag is set is still in-run when ``group_id`` does not
+    change, and may train. Gamma is the Bellman discount from those flags
+    at ``i+1`` inside a same-run pair — it is not a run mask.
 
     ``reward(**objective_data)`` supplies the per-step reward; the value
     stored at ``i+1`` is ``r_t``. ``affine_reward`` is the column
-    affine; ``boundary_reward`` applies episode / task scale and shift extras.
+    affine; ``boundary_reward`` applies terminated / truncated scale and
+    shift extras.
     ``value(value=..., **objective_data)`` supplies the per-step affine
     on online and delayed Q. ``affine_value`` is the prediction affine;
-    ``boundary_value`` applies episode / task scale and shift extras.
+    ``boundary_value`` applies terminated / truncated scale and shift extras.
     ``discount(**objective_data)``
     supplies the per-step γ that multiplies the bootstrap and the
     continued return. ``boundary_discount`` is the standard
@@ -640,7 +638,8 @@ class DqnObjective(Objective[...]):
     ``cross_group_backups="ignore"`` leaves that off-data ``V`` out of
     the target and leaves the step out of the loss and out of logged
     metrics when the factor on it is non-zero.
-    ``cross_group_backups="fault"`` raises instead. A done-code γ of
+    ``cross_group_backups="fault"`` raises instead. A terminated or
+    truncated γ of
     ``0``, or a horizon that puts no
     weight on that value, does not depend on it, so the step stays. A
     gate cut on a later in-run step still bootstraps. ``V`` is delayed max-Q when
@@ -682,8 +681,8 @@ class DqnObjective(Objective[...]):
     value ``0``, and the shift telescopes to exactly ``c`` on every
     action value — the policy ordering never changes. ``None`` keeps
     plain ``δ²``.
-    The trace never crosses a run break. At an episode /
-    task boundary ``γ`` is ``discount`` at the done codes stored there and
+    The trace never crosses a run break. At a ``terminated`` or
+    ``truncated`` step ``γ`` is ``discount`` from those flags and
     multiplies both the bootstrap and the continued return, so a ``0``
     discount ends the trace while a non-zero truncation gamma carries it
     (discounted) into the reset frame's return. A gate that cuts on the
@@ -716,16 +715,16 @@ class DqnObjective(Objective[...]):
 
     Those columns arrive in ``objective_data`` only if they are listed in the
     tokenizer ``objective_fields`` keep-list (input fields are not auto-copied).
-    ``task_done`` is an objective column only — do not add it as a tokenizer
-    input field, or it will be fed to the transformer::
+    ``terminated`` and ``truncated`` are objective columns only — do not add
+    them as tokenizer input fields, or they will be fed to the transformer::
 
         tokenizer = Tokenizer(
             ...,
             objective_fields=[
                 {"input_field": "action"},
                 {"input_field": "reward"},
-                {"input_field": "episode_done"},
-                {"input_field": "task_done"},
+                {"input_field": "terminated"},
+                {"input_field": "truncated"},
             ],
         )
 
@@ -736,21 +735,21 @@ class DqnObjective(Objective[...]):
             any ``discount(**objective_data) -> [N]`` is accepted.
         reward: Per-step reward from unpacked ``objective_data`` columns.
             ``affine_reward`` is the column affine; ``boundary_reward``
-            applies episode / task scale and shift extras
+            applies terminated / truncated scale and shift extras
             (``None`` skips the call);
             any ``reward(**objective_data) -> [N]`` is accepted.
             Does not change ``objective_data``.
         value: Per-step affine on online and delayed Q from unpacked
             ``objective_data`` columns plus ``value=``. ``affine_value``
-            is the prediction affine; ``boundary_value`` applies episode
-            / task scale and shift extras
+            is the prediction affine; ``boundary_value`` applies terminated
+            / truncated scale and shift extras
             (``None`` skips the call);
             any ``value(value=..., **objective_data)`` returning the same
             shape is accepted. Same callable on both networks. Does not
             change the prediction tensors or eval ``argmax``.
         action_key: Key in ``objective_data`` that holds the integer action.
-        episode_done_key: Key in ``objective_data`` for the episode-done code.
-        task_done_key: Key in ``objective_data`` for the task-done code.
+        terminated_key: Key in ``objective_data`` for mouse-gym ``terminated``.
+        truncated_key: Key in ``objective_data`` for mouse-gym ``truncated``.
         cql_weight: Alpha coefficient for the Conservative Q-Learning penalty.
             ``0.0`` disables CQL.
         cql_scale_q_eps: Additive floor used when scaling the CQL penalty.
@@ -793,7 +792,7 @@ class DqnObjective(Objective[...]):
             that off-data ``V`` out of the target and leaves the step
             out of the loss and out of logged metrics when the factor
             on it is non-zero. ``"fault"`` raises on that step instead.
-            A done-code γ of ``0``, or a horizon that puts no weight on
+            A terminated or truncated γ of ``0``, or a horizon that puts no weight on
             that value, does not depend on it, so the step stays and
             ``"fault"`` does not raise. An earlier step whose backup
             stays inside the task stays either way.
@@ -809,8 +808,8 @@ class DqnObjective(Objective[...]):
         double: bool,
         cross_group_backups: CrossGroupBackups,
         action_key: str = "action",
-        episode_done_key: str = "episode_done",
-        task_done_key: str = "task_done",
+        terminated_key: str = "terminated",
+        truncated_key: str = "truncated",
         gate: Gate | None,
         cql_weight: float = 0.0,
         cql_scale_q_eps: float = 1.0,
@@ -824,8 +823,8 @@ class DqnObjective(Objective[...]):
         self.reward = _require_transform(reward, name="reward")
         self.value = _require_transform(value, name="value")
         self.action_key = action_key
-        self.episode_done_key = episode_done_key
-        self.task_done_key = task_done_key
+        self.terminated_key = terminated_key
+        self.truncated_key = truncated_key
         self.cql_weight = cql_weight
         self.cql_scale_q_eps = cql_scale_q_eps
         self.gate = _require_transform(gate, name="gate")
@@ -932,10 +931,10 @@ class DqnObjective(Objective[...]):
             identity=objective_data["reward"],
         )
 
-        _require_done_codes(
+        _require_done_flags(
             objective_data,
-            episode_done_key=self.episode_done_key,
-            task_done_key=self.task_done_key,
+            terminated_key=self.terminated_key,
+            truncated_key=self.truncated_key,
             N=N,
         )
 
@@ -970,8 +969,8 @@ class DqnObjective(Objective[...]):
         )
 
         # Each token at position i encodes (obs_i, action_{i-1}, reward_{i-1},
-        # episode_done_{i-1}, task_done_{i-1}), i.e. the action, reward, and
-        # done codes stored at i are the ones that *produced* obs_i, not the
+        # terminated_{i-1}, truncated_{i-1}), i.e. the action, reward, and
+        # flags stored at i are the ones that *produced* obs_i, not the
         # ones taken *from* obs_i.  The transition out of state i is therefore
         # described by the fields stored at i+1.
         step_next = (step_of + 1).clamp(max=N - 1)  # [P] (final step clamped, weight 0)

@@ -59,7 +59,7 @@ def _align_splits(splits: dict[str, Dataset]) -> dict[str, Dataset]:
     - Column order differs between splits.
 
     A column entirely absent from a split is an error: fabricating values
-    (``0`` done codes, ``0`` actions) would silently train wrong later. Add
+    (``False`` terminated flags, ``0`` actions) would silently train wrong later. Add
     the column to every split's rows explicitly before pushing.
     """
     if len(splits) <= 1:

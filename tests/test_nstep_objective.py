@@ -26,10 +26,8 @@ def _group_id(data: dict[str, torch.Tensor]) -> torch.Tensor:
 def _disc(**overrides: float):
     kwargs = dict(
         gamma_step=1.0,
-        gamma_episode_terminal=0.0,
-        gamma_episode_truncated=0.0,
-        gamma_task_terminal=0.0,
-        gamma_task_truncated=0.0,
+        gamma_terminated=0.0,
+        gamma_truncated=0.0,
     )
     kwargs.update(overrides)
     return boundary_discount(**kwargs)
@@ -73,8 +71,8 @@ def _lambda_fixture() -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tens
     step_stream = {
             "action": torch.tensor([0, 0, 1]),
             "reward": torch.tensor([0.0, 1.0, 10.0]),
-            "episode_done": torch.zeros(3, dtype=torch.int64),
-            "task_done": torch.zeros(3, dtype=torch.int64),
+            "terminated": torch.zeros(3, dtype=torch.int64),
+            "truncated": torch.zeros(3, dtype=torch.int64),
             "group_id": torch.zeros(3, dtype=torch.int64),
         }
     online = torch.tensor([[5.0, 0.0], [0.0, 0.0], [0.0, 0.0]])
@@ -195,7 +193,7 @@ def test_nstep_gate_returns_a_square_matrix() -> None:
 def test_nstep_terminal_gamma_zero_ends_the_sum() -> None:
     step_stream, predictions, delayed = _lambda_fixture()
     step_stream = {key: value.clone() for key, value in step_stream.items()}
-    step_stream["episode_done"] = torch.tensor([0, 1, 0])
+    step_stream["terminated"] = torch.tensor([0, 1, 0])
     loss, _ = _nstep(n=2)(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  delayed_predictions=delayed, reward_center=None, delayed_reward_center=None)
     # s0: (5 - 1)^2 = 16 — neither V(s1) nor the next episode's return; s1: 12100.
     assert abs(loss["action_value"].item() - (16.0 + 12100.0) / 2) < 1e-03
@@ -204,9 +202,9 @@ def test_nstep_terminal_gamma_zero_ends_the_sum() -> None:
 def test_nstep_truncation_gamma_carries_the_sum_discounted() -> None:
     step_stream, predictions, delayed = _lambda_fixture()
     step_stream = {key: value.clone() for key, value in step_stream.items()}
-    step_stream["episode_done"] = torch.tensor([0, 2, 0])
+    step_stream["truncated"] = torch.tensor([0, 1, 0])
     loss, _ = _nstep(
-        n=2, discount=_disc(gamma_episode_truncated=0.5)
+        n=2, discount=_disc(gamma_truncated=0.5)
     )(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  delayed_predictions=delayed, reward_center=None, delayed_reward_center=None)
     # s0: 1 + 0.5 * 10 + 0.5 * 100 = 56 → (5 - 56)^2 = 2601; s1: 12100.
     assert abs(loss["action_value"].item() - (2601.0 + 12100.0) / 2) < 1e-03
@@ -225,8 +223,8 @@ def test_nstep_all_out_of_run_pairs_yield_zero_loss() -> None:
     step_stream = {
             "action": torch.tensor([0, 1, 0]),
             "reward": torch.tensor([0.0, 1.0, 5.0]),
-            "episode_done": torch.zeros(3, dtype=torch.int64),
-            "task_done": torch.zeros(3, dtype=torch.int64),
+            "terminated": torch.zeros(3, dtype=torch.int64),
+            "truncated": torch.zeros(3, dtype=torch.int64),
             "group_id": torch.tensor([0, 1, 2]),
         }
     predictions, delayed = _q(torch.ones(3, 2), torch.ones(3, 2))
@@ -263,8 +261,8 @@ def test_nstep_does_not_backprop_through_delayed_q() -> None:
     step_stream = {
             "action": torch.zeros(n, dtype=torch.long),
             "reward": torch.ones(n),
-            "episode_done": torch.zeros(n, dtype=torch.long),
-            "task_done": torch.zeros(n, dtype=torch.long),
+            "terminated": torch.zeros(n, dtype=torch.long),
+            "truncated": torch.zeros(n, dtype=torch.long),
         }
     online = torch.randn(n, a, requires_grad=True)
     delayed_q = torch.randn(n, a, requires_grad=True)
@@ -303,8 +301,8 @@ def test_nstep_requires_min_sequence() -> None:
     step_stream = {
             "action": torch.zeros(1, dtype=torch.long),
             "reward": torch.zeros(1),
-            "episode_done": torch.zeros(1, dtype=torch.long),
-            "task_done": torch.zeros(1, dtype=torch.long),
+            "terminated": torch.zeros(1, dtype=torch.long),
+            "truncated": torch.zeros(1, dtype=torch.long),
         }
     predictions, delayed = _q(torch.zeros(1, 2), torch.zeros(1, 2))
     with pytest.raises(ValueError, match="Not enough"):
@@ -323,8 +321,8 @@ def test_nstep_temperature_matches_dqn_one_step() -> None:
     step_stream = {
             "action": torch.tensor([0, 0]),
             "reward": torch.tensor([0.0, 0.0]),
-            "episode_done": torch.zeros(2, dtype=torch.int64),
-            "task_done": torch.zeros(2, dtype=torch.int64),
+            "terminated": torch.zeros(2, dtype=torch.int64),
+            "truncated": torch.zeros(2, dtype=torch.int64),
         }
     predictions, delayed = _q(torch.zeros(2, 2), torch.zeros(2, 2))
     nstep_loss, nstep_m = _nstep(temperature=1.0)(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  delayed_predictions=delayed, reward_center=None, delayed_reward_center=None)

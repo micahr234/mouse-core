@@ -6,7 +6,7 @@ from mouse_core.objectives import SpObjective, best_action
 from mouse_core.objectives.sp import sp_ce
 
 
-def _episode_done(*shape: int, fill: int = 0) -> torch.Tensor:
+def _ended(*shape: int, fill: int = 0) -> torch.Tensor:
     return torch.full(shape, fill, dtype=torch.int64)
 
 
@@ -17,9 +17,9 @@ def _ce_targets(q: torch.Tensor) -> torch.Tensor:
 
 def test_sp_objective_ce_uses_best_action_ids() -> None:
     q = torch.tensor([[[0.0, 1.0, -torch.inf]]])
-    objective_data = {"episode_done": _episode_done(*q.shape[:-1])}
+    objective_data = {"episode_ended": _ended(*q.shape[:-1])}
     predictions = torch.tensor([[[0.0, 1.0, 100.0]]])
-    loss, metrics = SpObjective()(
+    loss, metrics = SpObjective(mask_key="episode_ended")(
         objective_data=objective_data,
         predictions=predictions,
         targets=_ce_targets(q),
@@ -32,11 +32,11 @@ def test_sp_objective_ce_uses_best_action_ids() -> None:
 
 
 def test_sp_objective_ce_skips_nonzero_mask_rows() -> None:
-    """Any nonzero mask (terminated=1, truncated=2, ...) drops the row."""
+    """Any nonzero mask drops the row."""
     q = torch.tensor([[[0.0, 0.0], [0.0, 1.0], [0.0, 1.0]]])
     logits = torch.tensor([[[0.0, 100.0], [100.0, 0.0], [0.0, 100.0]]])
-    objective_data = {"episode_done": torch.tensor([[1, 2, 0]], dtype=torch.int64)}
-    loss, _ = SpObjective()(
+    objective_data = {"episode_ended": torch.tensor([[1, 1, 0]], dtype=torch.int64)}
+    loss, _ = SpObjective(mask_key="episode_ended")(
         objective_data=objective_data,
         predictions=logits,
         targets=_ce_targets(q),
@@ -55,10 +55,10 @@ def test_sp_objective_ce_mask_key_none_keeps_terminals() -> None:
 
 
 def test_sp_objective_ce_rejects_out_of_range_actions() -> None:
-    objective_data = {"episode_done": _episode_done(1, 1)}
+    objective_data = {"episode_ended": _ended(1, 1)}
     predictions = torch.tensor([[[0.0, 1.0]]])
     try:
-        SpObjective()(
+        SpObjective(mask_key="episode_ended")(
             objective_data=objective_data,
             predictions=predictions,
             targets=torch.tensor([[3]]),
@@ -70,10 +70,10 @@ def test_sp_objective_ce_rejects_out_of_range_actions() -> None:
 
 
 def test_sp_objective_requires_targets() -> None:
-    objective_data = {"episode_done": _episode_done(1, 1)}
+    objective_data = {"episode_ended": _ended(1, 1)}
     predictions = torch.tensor([[[0.0, 1.0]]])
     try:
-        SpObjective()(
+        SpObjective(mask_key="episode_ended")(
             objective_data=objective_data,
             predictions=predictions,
             targets=None,  # type: ignore[arg-type]
@@ -135,9 +135,9 @@ def test_sp_ce_ignores_padded_student_logits() -> None:
 
 
 def test_sp_objective_accepts_direct_action_ids() -> None:
-    objective_data = {"episode_done": _episode_done(1, 1)}
+    objective_data = {"episode_ended": _ended(1, 1)}
     predictions = torch.tensor([[[0.0, 1.0]]])
-    loss, _ = SpObjective()(
+    loss, _ = SpObjective(mask_key="episode_ended")(
         objective_data=objective_data,
         predictions=predictions,
         targets=torch.tensor([[1]]),

@@ -111,20 +111,23 @@ class SpObjective(Objective[...]):
     ``delayed_predictions=``); there is no ``targets_key`` batch lookup.
 
     Rows where ``mask_key`` is True or any nonzero number are dropped. Pass
-    ``mask_key="episode_done"`` to skip terminated and truncated steps.
+    ``mask_key="episode_ended"`` to skip steps where the wrapped episode
+    ended (``episode_terminated`` or ``episode_truncated`` on a
+    ``RepeatTaskEnv`` observation, or mouse-gym ``terminated`` /
+    ``truncated`` when the wrapped env's episode is the rollout unit).
 
     Args:
         label_smoothing: Mixes uniform mass over all action slots into the
             hard label.
         mask_key: Key in ``objective_data`` for a per-row skip mask (bool True
-            or any nonzero number). ``None`` disables the skip.
+            or any nonzero number). ``None`` disables the skip. Required.
     """
 
     def __init__(
         self,
         *,
         label_smoothing: float = 0.0,
-        mask_key: str | None = "episode_done",
+        mask_key: str | None,
     ) -> None:
         self.label_smoothing = label_smoothing
         self.mask_key = mask_key

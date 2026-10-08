@@ -89,10 +89,10 @@ class Tokenizer:
     (``sample_field``); this tokenizer does not read them.
 
     TD / PPO / GRPO objectives read ``action``, ``reward``,
-    ``episode_done``, and ``task_done`` from that keep-list (plus extras
-    such as ``old_log_prob``). ``task_done`` is an objective column only
-    — it is not interpolated into a field format and is not fed to the
-    transformer.
+    ``terminated``, and ``truncated`` from that keep-list (plus extras
+    such as ``old_log_prob``). ``terminated`` and ``truncated`` are
+    objective columns only — they are not interpolated into a field
+    format and are not fed to the transformer.
     """
 
     def __init__(

@@ -14,7 +14,7 @@ from mouse_core.objectives.dqn import (
     _raise_if_cross_group_backup,
     _require_action_ids,
     _require_cross_group_backups,
-    _require_done_codes,
+    _require_done_flags,
     _require_step_aligned_predictions,
     _weighted_mean,
     _zero_off_data_factor_scan,
@@ -65,7 +65,7 @@ def _gae_advantages(
     Args:
         rewards: ``[N-1]`` rewards for transitions out of states ``0..N-2``.
         values: ``[N]`` value predictions ``V(s_i)``.
-        discounts: ``[N-1]`` per-transition discount (from episode/task done codes).
+        discounts: ``[N-1]`` per-transition discount (from terminated / truncated).
         valid: ``[N-1]`` mask — False at run boundaries (different
             ``group_id``).
         gae_lambda: GAE λ.
@@ -149,20 +149,21 @@ class PpoObjective(Objective[...]):
     advantages and returns for a group are the same in a batch that also
     holds other groups as they are when that group is the whole batch.
     Timing matches :class:`~mouse_core.objectives.dqn.DqnObjective`: token ``i``
-    encodes state ``s_i``, and the action / reward / episode-done /
-    task-done / behavior log-prob stored at ``i+1`` describe the transition
+    encodes state ``s_i``, and the action / reward / terminated /
+    truncated / behavior log-prob stored at ``i+1`` describe the transition
     out of ``s_i``.
 
     ``reward(**objective_data)`` supplies the per-step reward; the value
     stored at ``i+1`` is ``r_t``. ``affine_reward`` is the column
-    affine; ``boundary_reward`` applies episode / task scale and shift extras.
+    affine; ``boundary_reward`` applies terminated / truncated scale and
+    shift extras.
     ``value(value=..., **objective_data)`` supplies the per-step affine
     on the value-head output. ``affine_value`` is the prediction affine;
-    ``boundary_value`` applies episode / task scale and shift extras.
+    ``boundary_value`` applies terminated / truncated scale and shift extras.
     Discounts match ``DqnObjective``:
     ``discount(**objective_data)``.
 
-    ``task_done`` and ``old_log_prob`` are objective columns only — not
+    ``truncated`` and ``old_log_prob`` are objective columns only — not
     tokenizer input. Stamp behavior log-probs on rollout rows
     (same step as ``action``) and include them in the tokenizer ``objective_fields``
     keep-list so they land in ``objective_data``::
@@ -172,8 +173,8 @@ class PpoObjective(Objective[...]):
             objective_fields=[
                 {"input_field": "action"},
                 {"input_field": "reward"},
-                {"input_field": "episode_done"},
-                {"input_field": "task_done"},
+                {"input_field": "terminated"},
+                {"input_field": "truncated"},
                 {"input_field": "old_log_prob"},
             ],
         )
@@ -199,13 +200,13 @@ class PpoObjective(Objective[...]):
             any ``discount(**objective_data) -> [N]`` is accepted.
         reward: Per-step reward from unpacked ``objective_data`` columns.
             ``affine_reward`` is the column affine; ``boundary_reward``
-            applies episode / task scale and shift extras
+            applies terminated / truncated scale and shift extras
             (``None`` skips the call);
             any ``reward(**objective_data) -> [N]`` is accepted.
         value: Per-step affine on the value-head output from unpacked
             ``objective_data`` columns plus ``value=``. ``affine_value``
-            is the prediction affine; ``boundary_value`` applies episode
-            / task scale and shift extras
+            is the prediction affine; ``boundary_value`` applies terminated
+            / truncated scale and shift extras
             (``None`` skips the call);
             any ``value(value=..., **objective_data)`` returning the same
             shape is accepted.
@@ -221,7 +222,7 @@ class PpoObjective(Objective[...]):
             that off-data ``V`` out of the advantage and leaves the step
             out of the loss and out of logged metrics when the factor on
             it is non-zero. ``"fault"`` raises on that step instead. A
-            done-code γ of ``0``, or a horizon that puts no weight on
+            terminated or truncated γ of ``0``, or a horizon that puts no weight on
             that value, does not depend on it, so the step stays and
             ``"fault"`` does not raise. ``V`` at a state that still has
             a later in-run step is unchanged.
@@ -230,8 +231,8 @@ class PpoObjective(Objective[...]):
         ent_coef: Weight on the policy entropy bonus (subtracted from the loss).
         normalize_advantage: If True, standardize advantages over valid pairs.
         action_key: Key in ``objective_data`` for integer actions.
-        episode_done_key: Key in ``objective_data`` for episode-done codes.
-        task_done_key: Key in ``objective_data`` for task-done codes.
+        terminated_key: Key in ``objective_data`` for mouse-gym ``terminated``.
+        truncated_key: Key in ``objective_data`` for mouse-gym ``truncated``.
         old_log_prob_key: Key in ``objective_data`` for behavior log-probs.
         num_actions: If set, only the first ``num_actions`` logits participate.
     """
@@ -249,8 +250,8 @@ class PpoObjective(Objective[...]):
         ent_coef: float = 0.01,
         normalize_advantage: bool = True,
         action_key: str = "action",
-        episode_done_key: str = "episode_done",
-        task_done_key: str = "task_done",
+        terminated_key: str = "terminated",
+        truncated_key: str = "truncated",
         old_log_prob_key: str = "old_log_prob",
         num_actions: int | None = None,
     ) -> None:
@@ -266,8 +267,8 @@ class PpoObjective(Objective[...]):
         self.ent_coef = ent_coef
         self.normalize_advantage = normalize_advantage
         self.action_key = action_key
-        self.episode_done_key = episode_done_key
-        self.task_done_key = task_done_key
+        self.terminated_key = terminated_key
+        self.truncated_key = truncated_key
         self.old_log_prob_key = old_log_prob_key
         self.num_actions = num_actions
 
@@ -375,10 +376,10 @@ class PpoObjective(Objective[...]):
             identity=objective_data["reward"],
         )
 
-        _require_done_codes(
+        _require_done_flags(
             objective_data,
-            episode_done_key=self.episode_done_key,
-            task_done_key=self.task_done_key,
+            terminated_key=self.terminated_key,
+            truncated_key=self.truncated_key,
             N=N,
         )
         values = _apply_value(

@@ -33,6 +33,7 @@ Issues = "https://github.com/micahr234/mouse-core/issues"
 [project.optional-dependencies]
 examples = [
     "mouse-gym @ git+https://github.com/micahr234/mouse-gym.git@main",
+    "repeat-task-gym @ git+https://github.com/micahr234/repeat-task-gym.git@main",
     "procedural-frozenlake @ git+https://github.com/micahr234/procedural-frozenlake.git@main",
     "gymnasium[toy-text]>=1.3.0",
     "jupyter>=1.1.1",
