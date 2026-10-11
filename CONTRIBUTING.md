@@ -13,17 +13,17 @@ MOUSE is actively developed and contributions are very welcome — whether that'
 ## Development setup
 
 ```bash
-# Clone and create a free-threaded Python 3.14t virtual environment (via uv)
+# Clone and create a free-threaded Python 3.15t virtual environment (via uv)
 git clone https://github.com/micahr234/mouse-core.git
 cd mouse-core
 source scripts/install.sh
 ```
 
-This installs the package in editable mode with the `dev` and `all` extras (`all` bundles every feature extra — currently `examples`). Activate with `source .venv/bin/activate`. The install uses free-threaded CPython (`3.14t`). System packages needed to run the notebooks are documented under **Example dependencies** in the [README](README.md#example-dependencies).
+This installs the package in editable mode with the `dev` and `all` extras (`all` bundles every feature extra — currently `examples`). Activate with `source .venv/bin/activate`. The install uses free-threaded CPython (`3.15t`). `torch` 2.15 wheels for that interpreter come from the PyTorch test index (`cu132` when `nvidia-smi` is present, CPU otherwise). System packages needed to run the notebooks are documented under **Example dependencies** in the [README](README.md#example-dependencies).
 
 ### Temporary `PYTHON_GIL=0` (remove when possible)
 
-`scripts/install.sh` and CI set `PYTHON_GIL=0` so the free-threaded interpreter **keeps the GIL off** after imports. `tokenizers>=0.23.2` declares `Py_MOD_GIL_NOT_USED`. Triton still does not, so importing `triton._C.libtriton` (pulled in by torch) would otherwise re-enable the GIL.
+`scripts/install.sh` and CI set `PYTHON_GIL=0` so the free-threaded interpreter **keeps the GIL off** after imports. `tokenizers>=0.23.3` declares `Py_MOD_GIL_NOT_USED`. Triton still does not, so importing `triton._C.libtriton` (pulled in by torch) would otherwise re-enable the GIL.
 
 **Follow-up:** when Triton declares `Py_MOD_GIL_NOT_USED`, drop `PYTHON_GIL=0` from [`scripts/install.sh`](scripts/install.sh) and [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 
@@ -49,7 +49,7 @@ If you add a new feature, include a short usage example in the PR description or
 
 ## Code style
 
-- Python 3.14+ (free-threaded `3.14t` for multi-worker DataLoader), type-annotated throughout.
+- Python 3.15+ (free-threaded `3.15t` for multi-worker DataLoader), type-annotated throughout.
 - Follow the existing patterns: base classes in `base.py`, public API in `__init__.py`, usage in `examples/`.
 - Avoid silent fallbacks — if a precondition isn't met, raise a clear error.
 - Comments should explain *why*, not *what*.

@@ -23,18 +23,22 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: astral-sh/setup-uv@v10.1.0
+      - uses: astral-sh/setup-uv@v10.3.0
         with:
           enable-cache: true
           cache-dependency-glob: "pyproject.toml"
 
       - name: Install free-threaded Python and package
         run: |
-          uv python install 3.14t
-          uv venv --python 3.14t
-          # Install CPU-only torch first so the large CUDA wheel is never fetched in CI.
-          uv pip install torch --index-url https://download.pytorch.org/whl/cpu --python .venv/bin/python
-          uv pip install -e ".[dev]" --python .venv/bin/python
+          uv python install 3.15t
+          uv venv --python 3.15t
+          # torch 2.15 cp315t wheels are on the PyTorch test index, not PyPI.
+          # The CPU index keeps CI from fetching a CUDA wheel. unsafe-best-match
+          # is required so PyPI still supplies packages the test index also hosts
+          # (numpy) at the versions this project requires.
+          uv pip install -e ".[dev]" --python .venv/bin/python \
+            --extra-index-url https://download.pytorch.org/whl/test/cpu \
+            --index-strategy unsafe-best-match
 
       - name: Type check
         run: .venv/bin/pyright src/ tests/
@@ -47,15 +51,15 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: astral-sh/setup-uv@v10.1.0
+      - uses: astral-sh/setup-uv@v10.3.0
         with:
           enable-cache: true
 
       - name: Install free-threaded Python and build tools
         run: |
-          uv python install 3.14t
-          uv venv --python 3.14t
-          uv pip install "build>=1.2" "twine>=6.1" --python .venv/bin/python
+          uv python install 3.15t
+          uv venv --python 3.15t
+          uv pip install "build>=1.6.1" "twine>=7.0.0" --python .venv/bin/python
 
       - name: Build wheel and sdist
         run: .venv/bin/python -m build

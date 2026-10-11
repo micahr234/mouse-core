@@ -35,10 +35,14 @@ In the video below, an agent plays FrozenLake on a map it has never seen before,
 ## Install 📦
 
 ```bash
-pip install mouse-core
+pip install mouse-core --extra-index-url https://download.pytorch.org/whl/test/cu132
 ```
 
-For development (free-threaded Python **3.14t** via uv — required for
+`torch` 2.15 wheels for Python 3.15 are not on PyPI yet. The extra index
+above is the CUDA 13.2 build. Use `https://download.pytorch.org/whl/test/cpu`
+instead when you do not have a CUDA 13.2 driver.
+
+For development (free-threaded Python **3.15t** via uv — required for
 `DataLoader(num_workers>0)`):
 
 ```bash

@@ -55,6 +55,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``backward``. ``model_polyak`` tracks ``c'``.
 
 ### Changed
+- Minimum Python is **3.15** (free-threaded ``3.15t``). Dependency floors
+  raised to current releases (``torch>=2.15.0``, ``numpy>=2.5.4``,
+  ``transformers>=5.19.0``, ``tokenizers>=0.23.3``, ``datasets>=5.1.0``,
+  ``huggingface_hub>=2.2.0``, ``gymnasium[toy-text]>=1.4.0``,
+  ``ipykernel>=7.4.0``, ``matplotlib>=3.11.2``). ``torch`` 2.15 wheels for
+  this interpreter are installed from the PyTorch test index. The CUDA
+  page pool calls ``libcuda`` directly; ``cuda-bindings`` has no
+  free-threaded 3.15 wheel.
 - Example text fields write the episode number as ``,episode {field+1}``
   (episode index 0 renders as episode 1). The GRPO example clears a trunk
   context when ``task_index`` changes, so a new map does not condition on

@@ -7,9 +7,141 @@ buffer is a normal tensor and growth copies the prefix into a larger one.
 
 from __future__ import annotations
 
+import ctypes
+from ctypes import c_int, c_size_t, c_ubyte, c_uint64, c_ushort, c_void_p
 from typing import Any
 
 import torch
+
+# cuda-bindings publishes no free-threaded 3.15 wheel, so the page pool
+# calls libcuda itself. Layout matches cuda.h (CUDA 13).
+_CUDA_SUCCESS = 0
+_CU_MEM_ALLOCATION_TYPE_PINNED = 0x1
+_CU_MEM_HANDLE_TYPE_NONE = 0x0
+_CU_MEM_LOCATION_TYPE_DEVICE = 0x1
+_CU_MEM_ACCESS_FLAGS_PROT_READWRITE = 0x3
+_CU_MEM_ALLOC_GRANULARITY_RECOMMENDED = 0x1
+
+
+class _CUmemLocation(ctypes.Structure):
+    _fields_ = (("type", c_int), ("id", c_int))
+
+
+class _CUmemAllocFlags(ctypes.Structure):
+    _fields_ = (
+        ("compressionType", c_ubyte),
+        ("gpuDirectRDMACapable", c_ubyte),
+        ("usage", c_ushort),
+        ("reserved", c_ubyte * 4),
+    )
+
+
+class _CUmemAllocationProp(ctypes.Structure):
+    _fields_ = (
+        ("type", c_int),
+        ("requestedHandleTypes", c_int),
+        ("location", _CUmemLocation),
+        ("win32HandleMetaData", c_void_p),
+        ("allocFlags", _CUmemAllocFlags),
+    )
+
+
+class _CUmemAccessDesc(ctypes.Structure):
+    _fields_ = (("location", _CUmemLocation), ("flags", c_int))
+
+
+class _CudaDriver:
+    """Subset of the CUDA driver API the page pool maps with."""
+
+    def __init__(self) -> None:
+        lib = ctypes.CDLL("libcuda.so.1")
+        lib.cuMemGetAllocationGranularity.argtypes = [
+            ctypes.POINTER(c_size_t),
+            ctypes.POINTER(_CUmemAllocationProp),
+            c_int,
+        ]
+        lib.cuMemGetAllocationGranularity.restype = c_int
+        lib.cuMemAddressReserve.argtypes = [
+            ctypes.POINTER(c_uint64),
+            c_size_t,
+            c_size_t,
+            c_uint64,
+            c_uint64,
+        ]
+        lib.cuMemAddressReserve.restype = c_int
+        lib.cuMemAddressFree.argtypes = [c_uint64, c_size_t]
+        lib.cuMemAddressFree.restype = c_int
+        lib.cuMemCreate.argtypes = [
+            ctypes.POINTER(c_uint64),
+            c_size_t,
+            ctypes.POINTER(_CUmemAllocationProp),
+            c_uint64,
+        ]
+        lib.cuMemCreate.restype = c_int
+        lib.cuMemRelease.argtypes = [c_uint64]
+        lib.cuMemRelease.restype = c_int
+        lib.cuMemMap.argtypes = [c_uint64, c_size_t, c_size_t, c_uint64, c_uint64]
+        lib.cuMemMap.restype = c_int
+        lib.cuMemUnmap.argtypes = [c_uint64, c_size_t]
+        lib.cuMemUnmap.restype = c_int
+        lib.cuMemSetAccess.argtypes = [
+            c_uint64,
+            c_size_t,
+            ctypes.POINTER(_CUmemAccessDesc),
+            c_size_t,
+        ]
+        lib.cuMemSetAccess.restype = c_int
+        self._lib = lib
+
+    def cuMemGetAllocationGranularity(self, prop: _CUmemAllocationProp, option: int) -> tuple[int, int]:
+        gran = c_size_t()
+        err = self._lib.cuMemGetAllocationGranularity(ctypes.byref(gran), ctypes.byref(prop), option)
+        return err, int(gran.value)
+
+    def cuMemAddressReserve(self, size: int, alignment: int, addr: int, flags: int) -> tuple[int, int]:
+        ptr = c_uint64()
+        err = self._lib.cuMemAddressReserve(ctypes.byref(ptr), size, alignment, addr, flags)
+        return err, int(ptr.value)
+
+    def cuMemAddressFree(self, ptr: int, size: int) -> tuple[int]:
+        return (self._lib.cuMemAddressFree(ptr, size),)
+
+    def cuMemCreate(self, size: int, prop: _CUmemAllocationProp, flags: int) -> tuple[int, int]:
+        handle = c_uint64()
+        err = self._lib.cuMemCreate(ctypes.byref(handle), size, ctypes.byref(prop), flags)
+        return err, int(handle.value)
+
+    def cuMemRelease(self, handle: int) -> tuple[int]:
+        return (self._lib.cuMemRelease(handle),)
+
+    def cuMemMap(self, ptr: int, size: int, offset: int, handle: int, flags: int) -> tuple[int]:
+        return (self._lib.cuMemMap(ptr, size, offset, handle, flags),)
+
+    def cuMemUnmap(self, ptr: int, size: int) -> tuple[int]:
+        return (self._lib.cuMemUnmap(ptr, size),)
+
+    def cuMemSetAccess(
+        self,
+        ptr: int,
+        size: int,
+        descs: list[_CUmemAccessDesc],
+        count: int,
+    ) -> tuple[int]:
+        array = (_CUmemAccessDesc * count)(*descs)
+        return (self._lib.cuMemSetAccess(ptr, size, array, count),)
+
+
+_DRIVER: _CudaDriver | None = None
+
+
+def _cuda_driver() -> _CudaDriver:
+    global _DRIVER
+    if _DRIVER is None:
+        try:
+            _DRIVER = _CudaDriver()
+        except OSError as exc:
+            raise RuntimeError("libcuda.so.1 is not available") from exc
+    return _DRIVER
 
 
 def _prod(shape: tuple[int, ...]) -> int:
@@ -29,15 +161,13 @@ def _device_index(device: torch.device) -> int:
     return int(torch.cuda.current_device())
 
 
-def _check_drv(result: Any, label: str) -> Any:
-    from cuda.bindings import driver as drv  # type: ignore[attr-defined]
-
-    if not isinstance(result, tuple):
-        result = (result,)
+def _check_drv(result: tuple[int, ...], label: str) -> int:
     err = result[0]
-    if err != drv.CUresult.CUDA_SUCCESS:
+    if err != _CUDA_SUCCESS:
         raise RuntimeError(f"{label}: {err}")
-    return result[1] if len(result) > 1 else None
+    if len(result) == 1:
+        return 0
+    return result[1]
 
 
 def _raw_shape(shape: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
@@ -164,7 +294,7 @@ class ExpandableKvTensor:
         self._shape = new_shape
 
     def _init_vmm(self, shape: tuple[int, int, int, int]) -> None:
-        from cuda.bindings import driver as drv  # type: ignore[attr-defined]
+        drv = _cuda_driver()
 
         torch.cuda.init()
         idx = _device_index(self.device)
@@ -172,16 +302,16 @@ class ExpandableKvTensor:
         # Touch the caching allocator so the process has a current context.
         torch.zeros(1, device=self.device)
 
-        prop = drv.CUmemAllocationProp()
-        prop.type = drv.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
-        prop.location.type = drv.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
+        prop = _CUmemAllocationProp()
+        prop.type = _CU_MEM_ALLOCATION_TYPE_PINNED
+        prop.location.type = _CU_MEM_LOCATION_TYPE_DEVICE
         prop.location.id = idx
-        prop.requestedHandleTypes = drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_NONE
+        prop.requestedHandleTypes = _CU_MEM_HANDLE_TYPE_NONE
         gran = int(
             _check_drv(
                 drv.cuMemGetAllocationGranularity(
                     prop,
-                    drv.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_RECOMMENDED,
+                    _CU_MEM_ALLOC_GRANULARITY_RECOMMENDED,
                 ),
                 "cuMemGetAllocationGranularity",
             )
@@ -189,10 +319,10 @@ class ExpandableKvTensor:
         if gran < 1:
             raise RuntimeError("CUDA VMM granularity is 0.")
 
-        access = drv.CUmemAccessDesc()
-        access.location.type = drv.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
+        access = _CUmemAccessDesc()
+        access.location.type = _CU_MEM_LOCATION_TYPE_DEVICE
         access.location.id = idx
-        access.flags = drv.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
+        access.flags = _CU_MEM_ACCESS_FLAGS_PROT_READWRITE
 
         need = self._nbytes(shape)
         free, _total = torch.cuda.mem_get_info(idx)

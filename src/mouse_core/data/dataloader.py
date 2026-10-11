@@ -95,7 +95,7 @@ StepTransform = Callable[[dict], StepTokens]
 
 _FREE_THREADING_HINT = (
     "DataLoader(num_workers>0) requires a free-threaded CPython build with the "
-    "GIL disabled (e.g. Python 3.14t). Install with `uv python install 3.14t` "
+    "GIL disabled (e.g. Python 3.15t). Install with `uv python install 3.15t` "
     "and create the venv with that interpreter. If imports re-enable the GIL "
     "(Triton still does this), run with `PYTHON_GIL=0` or "
     "`python -Xgil=0`."

@@ -333,10 +333,15 @@ def _compile_text_format(
 
 def render_text_format(spec: TokenizerModalitySpec, *, field: Any) -> str:
     """Fill ``spec.format`` as an f-string. ``field`` is the step value."""
+    code = spec._format_code
+    if code is None:
+        raise ValueError(
+            f"text modality {_field_label(spec)!r} format= was not compiled"
+        )
     local = {"field": field} if spec.input_field is not None else {}
     try:
         text = eval(  # noqa: S307 — format= is the caller's f-string
-            spec._format_code,
+            code,
             {"__builtins__": _FSTRING_BUILTINS},
             local,
         )
