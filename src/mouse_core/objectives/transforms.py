@@ -330,35 +330,6 @@ def lambda_gate(*, td_lambda: float) -> Gate:
     return gate
 
 
-def watkins_gate() -> Gate:
-    """Hard trace cut where the taken action is not an online argmax.
-
-    Returns ``[N, N]``. Column ``s`` is ``1`` when the action taken from
-    step ``s`` is an online max of ``q`` (ties count) and ``0`` otherwise.
-    Column ``0`` and the last column are ``0``. The objective still
-    applies the in-run mask. Fewer than 2 steps, or an ``action`` whose
-    length is not ``N``, raises.
-    """
-
-    def gate(
-        *,
-        q: torch.Tensor,
-        action: torch.Tensor,
-        **_: torch.Tensor,
-    ) -> torch.Tensor:
-        N = _require_gate_batch(q=q, action=action)
-        scores = q[:-1]
-        taken = action[1:].unsqueeze(-1)
-        is_max = scores == scores.amax(dim=-1, keepdim=True)
-        greedy = is_max.gather(dim=-1, index=taken).squeeze(-1).to(dtype=q.dtype)
-        column = torch.cat([greedy, greedy.new_zeros(1)])
-        t = torch.arange(N, device=q.device).unsqueeze(1)
-        s = torch.arange(N, device=q.device).unsqueeze(0)
-        return torch.where(s > t, column, column.new_zeros(()))
-
-    return gate
-
-
 def nstep_gate(*, n: int) -> Gate:
     """n-step return. The continuation is ``1`` out to lag ``n``.
 
@@ -398,7 +369,7 @@ def value_gap_gate(
     bias: float,
     eps: float | None = None,
 ) -> Gate:
-    """Soft trace cut from the optimality gap.
+    """Soft or hard trace cut from the optimality gap.
 
     ``policy_delayed`` picks the greedy action ``a* = argmax Q`` on
     detached per-step Q after ``value``. ``False`` reads online ``q``.
@@ -414,7 +385,11 @@ def value_gap_gate(
 
     For positive beta, ``c = 2 ** (gap / beta)``. Zero beta uses the
     limit directly: ``c = 1`` for adjusted gap ``0``, otherwise ``0``.
-    This includes ties without producing ``0/0``. ``normalize=True`` uses
+    This includes ties without producing ``0/0``. With ``beta=0``,
+    ``bias=0``, and both delayed flags ``False``, this is the Watkins
+    hard cut: only an online argmax continues, including ties.
+    Compose with ``lambda_gate`` through ``general_gate`` to multiply
+    this continuation by TD λ. ``normalize=True`` uses
 
     ``gap = min(0, (Q(s, a_taken) - V) / (|max_a Q| + eps) - bias)``.
 
@@ -424,10 +399,10 @@ def value_gap_gate(
     gap ``0`` before ``bias``. The bootstrap state value stays the
     delayed one the objective already computes. Returns ``[N, N]``.
     Column ``s`` is that continuation through step ``s`` for every
-    earlier start, the same step ``watkins_gate`` marks with its greedy
-    flag. Column ``0`` and the last column are ``0`` (no action leaves
-    the batch). A gap of ``0`` continues with ``c = 1``. A gap of
-    ``-beta`` continues at ``1/2``. A larger ``beta`` is a softer cut.
+    earlier start. Column ``0`` and the last column are ``0`` (no action
+    leaves the batch). A gap of ``0`` continues with ``c = 1``. A gap of
+    ``-beta`` continues at ``1/2`` for positive beta. A larger ``beta``
+    is a softer cut.
     A negative gap shrinks the continuation toward a bootstrap of the
     delayed state value. The objective still applies the in-run mask.
     Fewer than 2 steps, or an ``action`` whose length is not ``N``,

@@ -14,7 +14,6 @@ from mouse_core.objectives.transforms import (
     lambda_gate,
     nstep_gate,
     value_gap_gate,
-    watkins_gate,
 )
 from mouse_core.objectives.grpo import GrpoObjective, group_relative_advantages
 from mouse_core.objectives.ppo import PpoObjective, sample_discrete_action
@@ -38,7 +37,6 @@ __all__ = [
     "lambda_gate",
     "nstep_gate",
     "value_gap_gate",
-    "watkins_gate",
     "GrpoObjective",
     "group_relative_advantages",
     "PpoObjective",

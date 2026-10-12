@@ -579,19 +579,21 @@ class DqnObjective(Objective[...]):
     continuation. ``q`` is the detached per-step online Q.
     ``q_delayed`` is the detached per-step delayed Q. ``lambda_gate``
     is the λ-return to the end of the run. ``nstep_gate`` is the n-step
-    return. ``watkins_gate`` cuts where the taken action is not an
-    online argmax. ``value_gap_gate`` is the optimality-gap cut.
+    return. ``value_gap_gate`` is the optimality-gap cut.
     ``policy_delayed`` picks ``a* = argmax``. ``value_delayed`` scores
     ``V = Q(s, a*)`` and the taken action. Either flag, or both, reads
     delayed Q. The signed gap is ``Q(s, a_taken) - V``. ``bias`` is
-    subtracted, then the gap is capped at ``0``. ``c = 2 ** (gap / beta)``.
+    subtracted, then the gap is capped at ``0``. For positive beta,
+    ``c = 2 ** (gap / beta)``. Zero beta gives ``1`` for zero gap
+    and ``0`` for negative gap. With ``bias=0`` and both delayed
+    flags ``False``, zero beta is the Watkins hard cut (ties continue).
     ``normalize=True`` divides the signed gap by
     ``|max_a Q| + eps`` (``eps`` required). ``normalize=False``
     uses the raw signed gap. A gap of ``0`` continues at ``c = 1``.
-    A gap of ``-beta`` continues at ``1/2``. A larger ``beta`` is a
-    softer cut. ``general_gate(gates=)``
-    multiplies those matrices, so a step continues only where every
-    gate continues. The callable returns
+    For positive beta, a gap of ``-beta`` continues at ``1/2``. A larger
+    ``beta`` is a softer cut. ``general_gate(gates=)`` multiplies those
+    matrices; combining ``lambda_gate`` and ``value_gap_gate`` gives
+    ``λ * c`` for both soft and hard cuts. The callable returns
     ``[N, N]``. ``gate=None`` is the one-step target (a zero matrix).
 
     The target is
@@ -641,20 +643,20 @@ class DqnObjective(Objective[...]):
     multiplies both the bootstrap and the continued return, so a ``0``
     discount ends the trace while a non-zero truncation gamma carries it
     (discounted) into the reset frame's return. A gate that cuts on the
-    action reads detached Q. ``watkins_gate`` cuts wherever the taken
-    action is not the online argmax (ties included).
+    action reads detached Q.
     ``value_gap_gate(beta=, normalize=, policy_delayed=, value_delayed=, bias=, eps=)``
-    softens that cut. ``policy_delayed`` picks ``a* = argmax``.
+    controls that cut. ``policy_delayed`` picks ``a* = argmax``.
     ``value_delayed`` scores ``V = Q(s, a*)`` and the taken action.
     Either flag, or both, reads delayed Q. The signed gap is
     ``Q(s, a_taken) - V``. ``normalize=True`` divides by
     ``|max_a Q| + eps`` (``eps`` required). ``bias`` is subtracted and
-    the gap is capped at ``0``. ``c = 2 ** (gap / beta)``.
+    the gap is capped at ``0``. For positive beta, ``c = 2 ** (gap / beta)``.
+    Zero beta gives ``1`` for zero gap and ``0`` for negative gap.
     ``normalize=False`` uses the raw signed gap and takes no ``eps``.
-    A gap of ``0`` continues at ``c = 1``. A gap of ``-beta`` continues
-    at ``1/2``. A larger ``beta`` is a softer cut. A negative gap
-    bootstraps the delayed state value. ``watkins_gate`` reads online Q.
-    ``value_gap_gate`` reads online Q, delayed Q, or both. Both leave
+    A gap of ``0`` continues at ``c = 1``. For positive beta, a gap of
+    ``-beta`` continues at ``1/2``. A larger ``beta`` is a softer cut.
+    A negative gap moves the return toward the delayed state value.
+    ``value_gap_gate`` reads online Q, delayed Q, or both. It leaves
     oracle columns such as ``info_q_star`` unread. ``metrics["entropy"]`` is the in-run mean of
     ``H[softmax(Q / α)]`` on online Q when ``temperature > 0``.
     ``metrics["backup"]`` is the per-row Bellman target ``G`` (``[P]``)
@@ -711,17 +713,17 @@ class DqnObjective(Objective[...]):
             Required. ``None`` is the one-step target (a zero matrix).
             ``lambda_gate`` is the λ-return to the end of the run
             (``td_lambda=``). ``nstep_gate`` is the n-step return
-            (``n=``). ``watkins_gate`` cuts where the taken action is
-            not an online argmax. ``value_gap_gate`` is the optimality-gap cut.
+            (``n=``). ``value_gap_gate`` is the optimality-gap cut.
             ``policy_delayed`` picks ``a* = argmax``. ``value_delayed``
             scores ``V = Q(s, a*)`` and the taken action. Either flag,
             or both, reads delayed Q. The signed gap is
             ``Q(s, a_taken) - V``. ``normalize=True`` divides by
             ``|max_a Q| + eps`` on the value Q (``eps`` required).
             ``bias`` is subtracted, then the gap is capped at ``0``.
-            ``c = 2 ** (gap / beta)``. A gap of ``0`` continues at
-            ``c = 1``. A gap of ``-beta`` continues at ``1/2``. A larger
-            ``beta`` is a softer cut. ``normalize=False``
+            For positive beta, ``c = 2 ** (gap / beta)``. Zero beta gives
+            ``1`` for zero gap and ``0`` for negative gap. A gap of ``0``
+            continues at ``c = 1``. For positive beta, a gap of ``-beta``
+            continues at ``1/2``. A larger ``beta`` is a softer cut. ``normalize=False``
             uses the raw signed gap and takes no ``eps``. ``general_gate(gates=)`` is the
             element-wise product of those matrices. A callable returning
             ``[N, N]`` is accepted. Row ``t``, column ``s`` is the continuation at

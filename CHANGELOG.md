@@ -128,6 +128,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keys use the constructor values. A flat parameter list is unchanged.
 
 ### Removed
+- The separate ``watkins_gate`` function and export. Use
+  ``value_gap_gate(beta=0.0, normalize=False, policy_delayed=False,
+  value_delayed=False, bias=0.0)`` for the same online greedy hard cut,
+  including ties. Compose it with ``lambda_gate(td_lambda=...)`` through
+  ``general_gate`` to apply TD λ on top of the value-gap cut.
 - DQN reward centering. ``ConstantHead`` is gone. ``DqnObjective`` no
   longer takes ``reward_center=`` or ``delayed_reward_center=``. The
   backup is ``G = r + γ V``. ``metrics["in_run_delta"]`` is gone.

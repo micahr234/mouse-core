@@ -17,7 +17,6 @@ from mouse_core.objectives import (
     general_gate,
     lambda_gate,
     nstep_gate,
-    watkins_gate,
 )
 import pytest
 from mouse_core.objectives.dqn import (
@@ -770,13 +769,13 @@ def test_td_lambda_task_gamma_scales_the_trace() -> None:
     assert abs(cut["action_value"].item() - (16.0 + 12100.0) / 2) < 1e-03
 
 
-def test_watkins_cuts_when_taken_action_is_not_online_greedy() -> None:
+def test_value_gap_zero_beta_cuts_when_taken_action_is_not_online_greedy() -> None:
     """Online Q at s1 prefers 0; taken action is 1 → cut. Oracle would continue."""
     step_stream, predictions, delayed = _lambda_fixture()
     q = predictions.clone()
     q[1] = torch.tensor([10.0, 0.0])
     predictions = q
-    loss, metrics = DqnObjective( reward=_rew(), value=_val(), discount=_disc(), gate=watkins_gate(), temperature=0.0, double=False, cross_group_backups="bootstrap")(
+    loss, metrics = DqnObjective( reward=_rew(), value=_val(), discount=_disc(), gate=value_gap_gate(beta=0.0, normalize=False, policy_delayed=False, value_delayed=False, bias=0.0), temperature=0.0, double=False, cross_group_backups="bootstrap")(
         objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  delayed_predictions=delayed
     )
     one_step, _ = DqnObjective( reward=_rew(), value=_val(), discount=_disc(), temperature=0.0, double=False, gate=None, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  delayed_predictions=delayed)
@@ -792,7 +791,7 @@ def test_gates_reject_a_short_batch() -> None:
     with pytest.raises(ValueError, match="at least 2"):
         lambda_gate(td_lambda=1.0)(q=q, action=action)
     with pytest.raises(ValueError, match="at least 2"):
-        watkins_gate()(q=q, action=action)
+        value_gap_gate(beta=0.0, normalize=False, policy_delayed=False, value_delayed=False, bias=0.0)(q=q, action=action, q_delayed=q)
     with pytest.raises(ValueError, match="at least 2"):
         nstep_gate(n=2)(q=q, action=action)
     with pytest.raises(ValueError, match="at least 2"):
@@ -850,21 +849,22 @@ def test_gate_rejects_a_vector() -> None:
             value_gap_gate(beta=1.0, policy_delayed=False, value_delayed=False, normalize=False, bias=bias)  # type: ignore[arg-type]
 
 
-def test_general_gate_multiplies_continuation_matrices() -> None:
+@pytest.mark.parametrize("beta", [0.0, 0.5])
+def test_general_gate_multiplies_continuation_matrices(beta: float) -> None:
     """The product continues only where every gate continues."""
-    q = torch.tensor([[1.0, 4.0], [5.0, 1.0], [0.0, 0.0]])
-    action = torch.tensor([0, 0, 1])
+    q = torch.tensor([[1.0, 4.0], [1.0, 5.0], [5.0, 1.0], [0.0, 0.0]])
+    action = torch.tensor([0, 0, 1, 1])
     lam = lambda_gate(td_lambda=0.5)(q=q, action=action)
     horizon = nstep_gate(n=2)(q=q, action=action)
-    greedy = watkins_gate()(q=q, action=action)
-    gap = value_gap_gate(bias=0.0, beta=0.5, policy_delayed=False, value_delayed=False, normalize=True, eps=1.0)(q=q, action=action, q_delayed=q)
+    gap = value_gap_gate(bias=0.0, beta=beta, policy_delayed=False, value_delayed=False, normalize=True, eps=1.0)(q=q, action=action, q_delayed=q)
     got = general_gate(gates=(
         lambda_gate(td_lambda=0.5),
         nstep_gate(n=2),
-        watkins_gate(),
-        value_gap_gate(bias=0.0, beta=0.5, policy_delayed=False, value_delayed=False, normalize=True, eps=1.0),
+        value_gap_gate(bias=0.0, beta=beta, policy_delayed=False, value_delayed=False, normalize=True, eps=1.0),
     ))(q=q, action=action, q_delayed=q)
-    assert torch.equal(got, lam * horizon * greedy * gap)
+    assert torch.equal(got, lam * horizon * gap)
+    assert got[0, 1].item() == 0.5
+    assert got[1, 2].item() == pytest.approx(0.0 if beta == 0 else 0.5 * 2 ** (-4 / 3))
     one = general_gate(gates=(lambda_gate(td_lambda=0.5),))(q=q, action=action)
     assert torch.equal(one, lam)
 
@@ -897,18 +897,18 @@ def test_general_gate_matches_the_truncated_lambda_return() -> None:
     )
     ref = ref * in_run.to(dtype=ref.dtype)
     assert torch.allclose(got, ref, atol=1e-5, rtol=1e-5)
-    watkins, _ = _continuation_targets(
+    hard_gap, _ = _continuation_targets(
         reward=reward, discount_all=discount, v_step=v, pair_weight=pair_weight,
         continuation=general_gate(gates=(
-            lambda_gate(td_lambda=lam), watkins_gate(),
-        ))(q=q, action=action),
+            lambda_gate(td_lambda=lam), value_gap_gate(beta=0.0, normalize=False, policy_delayed=False, value_delayed=False, bias=0.0),
+        ))(q=q, action=action, q_delayed=q),
      cross_group_backups="bootstrap")
-    watkins_ref = _reference_lambda(
+    hard_gap_ref = _reference_lambda(
         r=reward[1:], g=discount[1:], v_next=v[1:], cont=greedy_cont,
         td_lambda=lam, n=T,
     )
-    watkins_ref = watkins_ref * in_run.to(dtype=watkins_ref.dtype)
-    assert torch.allclose(watkins, watkins_ref, atol=1e-5, rtol=1e-5)
+    hard_gap_ref = hard_gap_ref * in_run.to(dtype=hard_gap_ref.dtype)
+    assert torch.allclose(hard_gap, hard_gap_ref, atol=1e-5, rtol=1e-5)
 
 
 def test_general_gate_rejects_a_bad_sequence() -> None:
@@ -1192,12 +1192,12 @@ def test_gap_does_not_backprop_into_the_online_max() -> None:
     assert online.grad[0, 0].item() != 0.0
 
 
-def test_watkins_continues_when_taken_action_matches_online_q() -> None:
+def test_value_gap_zero_beta_continues_when_taken_action_matches_online_q() -> None:
     step_stream, predictions, delayed = _lambda_fixture()
     q = predictions.clone()
     q[1] = torch.tensor([-1.0, 0.0])  # greedy at s1 is the taken action; Q(s1,a=1) stays 0
     predictions = q
-    loss, metrics = DqnObjective( reward=_rew(), value=_val(), discount=_disc(), gate=watkins_gate(), temperature=0.0, double=False, cross_group_backups="bootstrap")(
+    loss, metrics = DqnObjective( reward=_rew(), value=_val(), discount=_disc(), gate=value_gap_gate(beta=0.0, normalize=False, policy_delayed=False, value_delayed=False, bias=0.0), temperature=0.0, double=False, cross_group_backups="bootstrap")(
         objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  delayed_predictions=delayed
     )
     assert abs(loss["action_value"].item() - _FULL_RETURN) < 1e-03
@@ -1321,12 +1321,12 @@ def test_nstep_and_lambda_match_per_start_recursion() -> None:
     )
     lam_ref = lam_ref * in_run.to(dtype=lam_ref.dtype)
     assert torch.allclose(lam_got, lam_ref, atol=1e-5, rtol=1e-5)
-    watkins_got = returns(watkins_gate()(q=q, action=action))
-    watkins_ref = _reference_lambda(
+    hard_gap_got = returns(value_gap_gate(beta=0.0, normalize=False, policy_delayed=False, value_delayed=False, bias=0.0)(q=q, action=action, q_delayed=q))
+    hard_gap_ref = _reference_lambda(
         r=r, g=g, v_next=v_next, cont=greedy_cont, td_lambda=1.0, n=T
     )
-    watkins_ref = watkins_ref * in_run.to(dtype=watkins_ref.dtype)
-    assert torch.allclose(watkins_got, watkins_ref, atol=1e-5, rtol=1e-5)
+    hard_gap_ref = hard_gap_ref * in_run.to(dtype=hard_gap_ref.dtype)
+    assert torch.allclose(hard_gap_got, hard_gap_ref, atol=1e-5, rtol=1e-5)
     past = returns(nstep_gate(n=T + 5)(q=torch.zeros(N, 1), action=torch.zeros(N, dtype=torch.long)))
     full = returns(lambda_gate(td_lambda=1.0)(q=torch.zeros(N, 1), action=torch.zeros(N, dtype=torch.long)))
     assert torch.allclose(past, full, atol=1e-5, rtol=1e-5)
@@ -1760,7 +1760,7 @@ def test_concatenated_groups_match_independent_backups() -> None:
         None,
         lambda_gate(td_lambda=1.0),
         nstep_gate(n=8),
-        watkins_gate(),
+        value_gap_gate(beta=0.0, normalize=False, policy_delayed=False, value_delayed=False, bias=0.0),
         value_gap_gate(
             beta=1.0, normalize=False, policy_delayed=False, value_delayed=True, bias=0.0,
         ),
@@ -1841,8 +1841,15 @@ def test_value_gap_zero_beta_matches_hard_greedy_cut(normalize, delayed):
         beta=0., normalize=normalize, policy_delayed=delayed,
         value_delayed=delayed, bias=0., **kwargs,
     )(q=q, q_delayed=q_delayed, action=action)
-    scores = q_delayed if delayed else q
-    expected = watkins_gate()(q=scores, action=action)
+    # Column 1 is an exact tie. Column 2 differs by only 1e-7;
+    # column 3 switches its greedy action between online and delayed Q.
+    expected = torch.tensor([
+        [0., 1., float(delayed), float(not delayed), 0.],
+        [0., 0., float(delayed), float(not delayed), 0.],
+        [0., 0., 0., float(not delayed), 0.],
+        [0., 0., 0., 0., 0.],
+        [0., 0., 0., 0., 0.],
+    ])
     torch.testing.assert_close(c, expected)
     assert torch.isfinite(c).all()
 
