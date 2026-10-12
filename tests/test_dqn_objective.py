@@ -814,7 +814,7 @@ def test_gate_rejects_a_vector() -> None:
     with pytest.raises(ValueError, match=r"\[3, 3\]"):
         DqnObjective(            reward=_rew(), value=_val(), discount=_disc(), gate=gate, temperature=0.0, double=False,
          cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  delayed_predictions=delayed)
-    for beta in (0.0, -1.0, float("nan"), float("inf")):
+    for beta in (-1.0, float("nan"), float("inf")):
         with pytest.raises(ValueError, match="beta"):
             value_gap_gate(bias=0.0, beta=beta, policy_delayed=False, value_delayed=False, normalize=True, eps=1.0)
     for beta in (True, "1"):
@@ -1828,3 +1828,50 @@ def test_dqn_requires_cross_group_backups_argument() -> None:
         DqnObjective(  # type: ignore[call-arg]
             reward=_rew(), value=_val(), discount=_disc(), temperature=0.0, double=False, gate=None,
         )
+
+
+@pytest.mark.parametrize("normalize", [False, True])
+@pytest.mark.parametrize("delayed", [False, True])
+def test_value_gap_zero_beta_matches_hard_greedy_cut(normalize, delayed):
+    q = torch.tensor([[0., 0.], [1., 1.], [0., -1e-7], [2., 1.], [0., 0.]])
+    q_delayed = q.flip(-1)
+    action = torch.tensor([0, 0, 1, 1, 0])
+    kwargs = {"eps": 1e-6} if normalize else {}
+    c = value_gap_gate(
+        beta=0., normalize=normalize, policy_delayed=delayed,
+        value_delayed=delayed, bias=0., **kwargs,
+    )(q=q, q_delayed=q_delayed, action=action)
+    scores = q_delayed if delayed else q
+    expected = watkins_gate()(q=scores, action=action)
+    torch.testing.assert_close(c, expected)
+    assert torch.isfinite(c).all()
+
+
+@pytest.mark.parametrize("normalize", [False, True])
+@pytest.mark.parametrize("bias,expected", [(0., 0.), (0.1, 0.), (-0.5, 1.)])
+def test_value_gap_zero_beta_applies_bias_before_cut(normalize, bias, expected):
+    q = torch.tensor([[0., 0.], [0.5, 0.25], [0., 0.]])
+    kwargs = {"eps": 1e-6} if normalize else {}
+    c = value_gap_gate(
+        beta=0., normalize=normalize, policy_delayed=False,
+        value_delayed=False, bias=bias, **kwargs,
+    )(q=q, q_delayed=q, action=torch.tensor([0, 0, 1]))
+    assert c[0, 1].item() == expected
+
+
+def test_value_gap_zero_beta_positive_bias_cuts_ties():
+    q = torch.zeros(3, 2)
+    c = value_gap_gate(
+        beta=0., normalize=False, policy_delayed=False,
+        value_delayed=False, bias=0.1,
+    )(q=q, q_delayed=q, action=torch.zeros(3, dtype=torch.long))
+    assert not c.any()
+
+
+def test_value_gap_zero_beta_mixed_networks_preserves_positive_gap_cap():
+    q = torch.tensor([[0., 0.], [2., 1.], [0., 0.]])
+    c = value_gap_gate(
+        beta=0., normalize=False, policy_delayed=False,
+        value_delayed=True, bias=0.,
+    )(q=q, q_delayed=q.flip(-1), action=torch.tensor([0, 0, 1]))
+    assert c[0, 1].item() == 1.

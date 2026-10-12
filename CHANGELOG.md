@@ -35,6 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   observations as that vector.
 
 ### Changed
+- ``value_gap_gate`` accepts ``beta=0`` as the hard-cutoff limit: adjusted
+  gap zero continues with 1, and a negative gap cuts with 0. Ties avoid
+  division by zero; negative and non-finite beta values remain invalid.
 - Minimum Python is **3.15** (free-threaded ``3.15t``). Dependency floors
   raised to current releases (``torch>=2.15.0``, ``numpy>=2.5.4``,
   ``transformers>=5.19.0``, ``tokenizers>=0.23.3``, ``datasets>=5.1.0``,

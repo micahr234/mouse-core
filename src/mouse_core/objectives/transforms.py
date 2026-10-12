@@ -412,7 +412,9 @@ def value_gap_gate(
 
     ``gap = min(0, Q(s, a_taken) - V - bias)``
 
-    ``c = 2 ** (gap / beta)``. ``normalize=True`` uses
+    For positive beta, ``c = 2 ** (gap / beta)``. Zero beta uses the
+    limit directly: ``c = 1`` for adjusted gap ``0``, otherwise ``0``.
+    This includes ties without producing ``0/0``. ``normalize=True`` uses
 
     ``gap = min(0, (Q(s, a_taken) - V) / (|max_a Q| + eps) - bias)``.
 
@@ -432,9 +434,10 @@ def value_gap_gate(
     raises.
 
     Args:
-        beta: Positive denominator of ``c = 2 ** (gap / beta)``. A gap
-            of ``-beta`` continues at ``1/2``. A larger ``beta`` is a
-            softer cut.
+        beta: Nonnegative denominator of ``c = 2 ** (gap / beta)``.
+            Zero uses the limit: continuation 1 for adjusted gap 0,
+            otherwise 0, without division. For positive beta, a gap
+            of ``-beta`` continues at ``1/2``; larger beta is a softer cut.
         normalize: ``True`` divides the signed gap by
             ``|max_a Q| + eps`` on the value Q before ``bias``.
             ``False`` uses the raw signed gap.
@@ -453,8 +456,8 @@ def value_gap_gate(
     if isinstance(beta, bool) or not isinstance(beta, (int, float)):
         raise TypeError(f"beta must be a real number, got {type(beta)}.")
     scale = float(beta)
-    if not math.isfinite(scale) or scale <= 0.0:
-        raise ValueError(f"beta must be finite and > 0, got {beta}.")
+    if not math.isfinite(scale) or scale < 0.0:
+        raise ValueError(f"beta must be finite and >= 0, got {beta}.")
     if not isinstance(normalize, bool):
         raise TypeError(f"normalize must be a bool, got {type(normalize)}.")
     if not isinstance(policy_delayed, bool):
@@ -503,7 +506,10 @@ def value_gap_gate(
             q_max = values.amax(dim=-1)
             signed = signed / (q_max.abs() + floor)
         gap = (signed - shift).clamp(max=0)
-        cont = torch.exp2(gap / scale)
+        if scale == 0.0:
+            cont = (gap == 0).to(dtype=gap.dtype)
+        else:
+            cont = torch.exp2(gap / scale)
         cont[0] = 0
         column = torch.cat([cont, cont.new_zeros(1)])
         t = torch.arange(N, device=values.device).unsqueeze(1)
