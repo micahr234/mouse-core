@@ -1266,8 +1266,9 @@ class Model(nn.Module):
         ``backbone=False`` (and ``reasoner=False``), skip the second
         backbone pass: ``delayed_model.head(h=delayed_model.pool(output=out))``
         under ``torch.no_grad()``. Interpolate with
-        ``model_polyak(online=model, delayed=delayed_model, ...)`` with a
-        ``tau`` for each copied section.
+        a bound ``update = model_polyak(online=model, delayed=delayed_model)``
+        and then ``update(tau_heads=..., tau_backbone=...)`` after each
+        optimizer step. Use ``None`` for a shared section.
         Online / inference: ``inputs, _, _ = pack_token_batch(steps=[eval_transform(step)],
         group_ids=[0], continuing=None)`` then ``model(inputs, use_cache=True)``
         (optionally ragged; empty-only batches raise). Pass ``out.cache``

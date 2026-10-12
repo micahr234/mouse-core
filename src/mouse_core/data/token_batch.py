@@ -2,12 +2,37 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
 import torch
+
+
+_TensorCache = dict[tuple[int, torch.device, bool], tuple[object, dict[str, Any]]]
+_tensor_cache: ContextVar[_TensorCache | None] = ContextVar("token_batch_tensors", default=None)
+
+
+@contextmanager
+def reuse_token_tensors() -> Iterator[None]:
+    """Reuse batch conversions within one online/delayed forward pair.
+
+    Each TokenBatch/device/inference-mode combination is converted once.
+    Batches and returned tensors must be treated as read-only in this scope.
+    Exiting (including on error) drops the cache; later scopes see fresh data.
+    Model activations and parameters are never cached. Nested scopes have
+    independent caches. The cache is local to the execution context.
+    """
+    cache: _TensorCache = {}
+    token = _tensor_cache.set(cache)
+    try:
+        yield
+    finally:
+        _tensor_cache.reset(token)
+        cache.clear()
 
 
 @dataclass(frozen=True)
@@ -339,8 +364,16 @@ class TokenBatch:
         )
 
     def to_tensors(self, device: torch.device | str | None = None) -> dict[str, Any]:
-        """Move arrays to torch tensors on ``device`` (CPU if None)."""
+        """Move arrays to tensors; reuse them inside ``reuse_token_tensors``."""
         dev = torch.device(device) if device is not None else torch.device("cpu")
+        if dev.type == "cuda" and dev.index is None:
+            dev = torch.device("cuda", torch.cuda.current_device())
+        elif dev.type == "cpu":
+            dev = torch.device("cpu")
+        cache = _tensor_cache.get()
+        key = (id(self), dev, torch.is_inference_mode_enabled())
+        if cache is not None and key in cache:
+            return cache[key][1]
 
         def _long(a: np.ndarray) -> torch.Tensor:
             return torch.from_numpy(np.asarray(a, dtype=np.int64)).to(dev)
@@ -348,7 +381,7 @@ class TokenBatch:
         def _float(a: np.ndarray) -> torch.Tensor:
             return torch.from_numpy(np.asarray(a, dtype=np.float32)).to(dev)
 
-        return {
+        tensors = {
             "modality_ids": _long(self.modality_ids),
             "ids": _long(self.ids),
             "values": _float(self.values),
@@ -360,6 +393,10 @@ class TokenBatch:
             "head_output_steps": _long(self.head_output_steps),
             "B": self.B,
         }
+        if cache is not None:
+            # Retain the batch as well, so its id cannot be recycled in scope.
+            cache[key] = (self, tensors)
+        return tensors
 
 
 def empty_token_batch(

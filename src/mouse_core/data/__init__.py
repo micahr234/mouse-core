@@ -14,6 +14,7 @@ from mouse_core.data.token_batch import (
     TokenBatch,
     empty_token_batch,
     pack_token_batch,
+    reuse_token_tensors,
     step_counts_from_group_id,
     to_device,
 )
@@ -32,6 +33,7 @@ __all__ = [
     "StepTokens",
     "TokenBatch",
     "pack_token_batch",
+    "reuse_token_tensors",
     "empty_token_batch",
     "step_counts_from_group_id",
     "to_device",

@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 import torch
 
-from mouse_core.data import Tokenizer, pack_token_batch, to_device
+from mouse_core.data import Tokenizer, pack_token_batch, reuse_token_tensors, to_device
 from tests._token_batch_helpers import IntIdTokenizer
 
 def when_episode_done_nonzero(ctx):
@@ -97,6 +97,43 @@ def test_to_device_moves_every_tensor() -> None:
     moved = to_device(data=data, device="cpu")
     assert set(moved) == {"reward", "action"}
     assert all(value.device.type == "cpu" for value in moved.values())
+
+
+def test_tensor_reuse_is_scoped_by_batch_and_restores_after_errors() -> None:
+    tok = _tok()
+    batch = tok.pack_rows(rows=[[{"action": 0, "reward": 0.0}]], continuing=None)
+    other = tok.pack_rows(rows=[[{"action": 1, "reward": 1.0}]], continuing=None)
+    with reuse_token_tensors():
+        first = batch.to_tensors()
+        with torch.no_grad():
+            assert batch.to_tensors("cpu") is first
+        assert other.to_tensors() is not first
+        with pytest.raises(RuntimeError, match="interrupted"):
+            with reuse_token_tensors():
+                assert batch.to_tensors() is not first
+                raise RuntimeError("interrupted")
+        assert batch.to_tensors() is first
+    assert batch.to_tensors() is not first
+    batch.ids[:] = 7
+    with reuse_token_tensors():
+        fresh = batch.to_tensors()
+        assert fresh is not first
+        assert (fresh["ids"] == 7).all()
+
+
+def test_tensor_reuse_separates_inference_tensors_from_autograd_inputs() -> None:
+    batch = _tok().pack_rows(rows=[[{"action": 1, "reward": 0.0}]], continuing=None)
+    with reuse_token_tensors():
+        with torch.inference_mode():
+            inference = batch.to_tensors()
+        normal = batch.to_tensors()
+        assert normal is not inference
+        assert not normal["ids"].is_inference()
+        # Embedding backward needs to save the indices, which inference-mode
+        # tensors cannot do. Inference-first reuse must still allow training.
+        embedding = torch.nn.Embedding(32, 4)
+        embedding(normal["ids"]).sum().backward()
+        assert embedding.weight.grad is not None
 
 
 def test_objective_column_stays_int_when_all_steps_are_int() -> None:

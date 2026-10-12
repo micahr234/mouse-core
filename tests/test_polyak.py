@@ -133,6 +133,96 @@ def _two_head_model(hidden_dim: int = 8) -> Model:
     )
 
 
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_bound_polyak_matches_per_tensor_updates_with_changing_head_rates(monkeypatch, device) -> None:
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    model = _two_head_model().to(device=torch.device(device))
+    delayed = model.copy(heads=True, backbone=True, reasoner=False)
+    update = model_polyak(online=model, delayed=delayed)
+    sources = dict(model.named_parameters())
+    targets = dict(delayed.named_parameters())
+    reference = {name: p.detach().clone() for name, p in targets.items()}
+
+    def no_traversal(*args, **kwargs):
+        raise AssertionError("a bound update must not traverse the model again")
+
+    monkeypatch.setattr(nn.Module, "named_parameters", no_traversal)
+    for step in range(12):
+        rates = {"action_value": [0.0, 0.0005, 1.0][step % 3], "behavior": 0.2}
+        with torch.no_grad():
+            for name, source in sources.items():
+                source.add_(0.1)
+                rate = rates[name.split(".")[1]] if name.startswith("heads.") else 0.05
+                reference[name].lerp_(source, rate)
+        update(tau_heads=rates, tau_backbone=0.05)
+        for name, target in targets.items():
+            torch.testing.assert_close(target, reference[name], rtol=0, atol=0)
+            assert target is not sources[name]
+            assert not target.requires_grad
+
+
+@pytest.mark.parametrize("rates,backbone_tau", [
+    ({"action_value": 0.1}, 0.2),
+    ({"action_value": 0.1, "behavior": -1.0}, 0.2),
+    ({"action_value": 0.1, "behavior": 0.2}, float("nan")),
+])
+def test_bound_polyak_validates_all_rates_before_writing(rates, backbone_tau) -> None:
+    model = _two_head_model()
+    delayed = model.copy(heads=True, backbone=True, reasoner=False)
+    update = model_polyak(online=model, delayed=delayed)
+    before = {name: p.detach().clone() for name, p in delayed.named_parameters()}
+    _perturb(model)
+    with pytest.raises(ValueError):
+        update(tau_heads=rates, tau_backbone=backbone_tau)
+    for name, param in delayed.named_parameters():
+        torch.testing.assert_close(param, before[name], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_tensor_reuse_preserves_separate_delayed_forward_and_online_gradients(monkeypatch, device) -> None:
+    from mouse_core.data import reuse_token_tensors
+
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    torch.manual_seed(0)
+    model = _llama_model().to(device=torch.device(device)).eval()
+    delayed = model.copy(heads=True, backbone=True, reasoner=False).eval()
+    _perturb(model.heads)
+    batch = _token_batch(model)
+    conversions = []
+    from_numpy = torch.from_numpy
+
+    def record(array):
+        conversions.append(array)
+        return from_numpy(array)
+
+    monkeypatch.setattr(torch, "from_numpy", record)
+
+    def forward_pair():
+        online_q = model(batch).predictions["action_value"]
+        with torch.no_grad():
+            delayed_q = delayed(batch).predictions["action_value"]
+        (online_q - delayed_q).square().mean().backward()
+        return online_q, delayed_q
+
+    expected = forward_pair()
+    expected_grads = {name: p.grad.clone() for name, p in model.named_parameters() if p.grad is not None}
+    uncached_count = len(conversions)
+    model.zero_grad(set_to_none=True)
+    conversions.clear()
+    with reuse_token_tensors():
+        actual = forward_pair()
+    assert len(conversions) < uncached_count
+    for got, want in zip(actual, expected, strict=True):
+        torch.testing.assert_close(got, want, rtol=0, atol=0)
+    for name, param in model.named_parameters():
+        if name in expected_grads:
+            torch.testing.assert_close(param.grad, expected_grads[name], rtol=0, atol=0)
+    assert delayed.backbone is not model.backbone
+    assert all(p.grad is None for p in delayed.parameters())
+
+
 def test_copy_heads_true_copies_every_head() -> None:
     model = _two_head_model()
     delayed = model.copy(heads=True, backbone=True, reasoner=False)
@@ -181,7 +271,7 @@ def test_polyak_skips_online_heads_the_delayed_model_does_not_carry() -> None:
     model = _two_head_model()
     delayed = model.copy(heads=(model._heads["action_value"],), backbone=True, reasoner=False)
     _perturb(model.heads)
-    model_polyak(online=model, delayed=delayed, tau_heads=1.0, tau_backbone=0.0)
+    model_polyak(online=model, delayed=delayed)(tau_heads=1.0, tau_backbone=0.0)
     online = dict(model.named_parameters())
     for name, p in delayed.named_parameters():
         if name.startswith("heads."):
@@ -268,7 +358,7 @@ def test_delayed_model_ignores_online_changes_until_update() -> None:
         still_delayed = delayed(batch)
     assert _q_close(before, still_delayed)
     assert not _q_close(online, still_delayed)
-    model_polyak(online=model, delayed=delayed, tau_heads=1.0, tau_backbone=1.0)
+    model_polyak(online=model, delayed=delayed)(tau_heads=1.0, tau_backbone=1.0)
     with torch.no_grad():
         copied = delayed(batch)
     assert _q_close(online, copied)
@@ -316,7 +406,7 @@ def test_all_zero_tau_does_not_write_delayed_params() -> None:
     model = _tiny_model()
     delayed = model.copy(heads=True, backbone=True, reasoner=False)
     versions = [param._version for param in delayed.parameters()]
-    model_polyak(online=model, delayed=delayed, tau_heads=0.0, tau_backbone=0.0)
+    model_polyak(online=model, delayed=delayed)(tau_heads=0.0, tau_backbone=0.0)
     assert [param._version for param in delayed.parameters()] == versions
 
 
@@ -324,63 +414,63 @@ def test_polyak_requires_a_tau_per_copied_section() -> None:
     model = _tiny_model()
     both = model.copy(heads=True, backbone=True, reasoner=False)
     with pytest.raises(ValueError, match="tau_backbone is required"):
-        model_polyak(online=model, delayed=both, tau_heads=0.1)
+        model_polyak(online=model, delayed=both)(tau_heads=0.1, tau_backbone=None)
     with pytest.raises(ValueError, match="tau_heads is required"):
-        model_polyak(online=model, delayed=both, tau_backbone=0.1)
-    model_polyak(online=model, delayed=both, tau_heads=0.1, tau_backbone=0.1)
-    model_polyak(online=model, delayed=model.copy(heads=True, backbone=False, reasoner=False), tau_heads=0.1)
-    model_polyak(online=model, delayed=model.copy(heads=False, backbone=True, reasoner=False), tau_backbone=0.1)
+        model_polyak(online=model, delayed=both)(tau_heads=None, tau_backbone=0.1)
+    model_polyak(online=model, delayed=both)(tau_heads=0.1, tau_backbone=0.1)
+    model_polyak(online=model, delayed=model.copy(heads=True, backbone=False, reasoner=False))(tau_heads=0.1, tau_backbone=None)
+    model_polyak(online=model, delayed=model.copy(heads=False, backbone=True, reasoner=False))(tau_heads=None, tau_backbone=0.1)
 
 
 def test_polyak_shared_backbone_omits_tau_backbone() -> None:
     model = _tiny_model()
     delayed = model.copy(heads=True, backbone=False, reasoner=False)
     _perturb(model.heads)
-    model_polyak(online=model, delayed=delayed, tau_heads=1.0)
+    model_polyak(online=model, delayed=delayed)(tau_heads=1.0, tau_backbone=None)
     online = dict(model.named_parameters())
     for name, p in delayed.named_parameters():
         if name.startswith("heads."):
             assert torch.equal(p, online[name])
     _perturb(model.heads)
-    model_polyak(online=model, delayed=delayed, tau_heads=1.0, tau_backbone=1.0)
+    model_polyak(online=model, delayed=delayed)(tau_heads=1.0, tau_backbone=1.0)
     online = dict(model.named_parameters())
     for name, p in delayed.named_parameters():
         if name.startswith("heads."):
             assert torch.equal(p, online[name])
     with pytest.raises(ValueError, match="tau_backbone must be None or 1"):
-        model_polyak(online=model, delayed=delayed, tau_heads=0.1, tau_backbone=0.1)
+        model_polyak(online=model, delayed=delayed)(tau_heads=0.1, tau_backbone=0.1)
     with pytest.raises(ValueError, match="tau_backbone must be None or 1"):
-        model_polyak(online=model, delayed=delayed, tau_heads=0.1, tau_backbone=0.0)
+        model_polyak(online=model, delayed=delayed)(tau_heads=0.1, tau_backbone=0.0)
 
 
 def test_polyak_copied_section_rejects_tau_none() -> None:
     model = _tiny_model()
     delayed = model.copy(heads=True, backbone=True, reasoner=False)
     with pytest.raises(ValueError, match="tau_backbone is required"):
-        model_polyak(online=model, delayed=delayed, tau_heads=0.1, tau_backbone=None)
+        model_polyak(online=model, delayed=delayed)(tau_heads=0.1, tau_backbone=None)
     with pytest.raises(ValueError, match="tau_heads is required"):
-        model_polyak(online=model, delayed=delayed, tau_heads=None, tau_backbone=0.1)
+        model_polyak(online=model, delayed=delayed)(tau_heads=None, tau_backbone=0.1)
 
 
 def test_polyak_shared_heads_omits_tau_heads() -> None:
     model = _tiny_model()
     delayed = model.copy(heads=False, backbone=True, reasoner=False)
     _perturb(model.backbone)
-    model_polyak(online=model, delayed=delayed, tau_backbone=1.0)
+    model_polyak(online=model, delayed=delayed)(tau_heads=None, tau_backbone=1.0)
     online = dict(model.named_parameters())
     for name, p in delayed.named_parameters():
         if name.startswith("backbone."):
             assert torch.equal(p, online[name])
     _perturb(model.backbone)
-    model_polyak(online=model, delayed=delayed, tau_heads=1.0, tau_backbone=1.0)
+    model_polyak(online=model, delayed=delayed)(tau_heads=1.0, tau_backbone=1.0)
     online = dict(model.named_parameters())
     for name, p in delayed.named_parameters():
         if name.startswith("backbone."):
             assert torch.equal(p, online[name])
     with pytest.raises(ValueError, match="tau_heads must be None or 1"):
-        model_polyak(online=model, delayed=delayed, tau_heads=0.1, tau_backbone=0.1)
+        model_polyak(online=model, delayed=delayed)(tau_heads=0.1, tau_backbone=0.1)
     with pytest.raises(ValueError, match="tau_heads must be None or 1"):
-        model_polyak(online=model, delayed=delayed, tau_heads=0.0, tau_backbone=0.1)
+        model_polyak(online=model, delayed=delayed)(tau_heads=0.0, tau_backbone=0.1)
 
 
 def test_polyak_tau_is_convex_combination_and_can_change() -> None:
@@ -391,9 +481,9 @@ def test_polyak_tau_is_convex_combination_and_can_change() -> None:
     delayed_p = next(delayed.heads.parameters())
     online.data.fill_(1.0)
     delayed_p.data.fill_(0.0)
-    model_polyak(online=model, delayed=delayed, tau_heads=0.5, tau_backbone=0.0)
+    model_polyak(online=model, delayed=delayed)(tau_heads=0.5, tau_backbone=0.0)
     assert torch.allclose(delayed_p, torch.full_like(delayed_p, 0.5))
-    model_polyak(online=model, delayed=delayed, tau_heads=1.0, tau_backbone=0.0)
+    model_polyak(online=model, delayed=delayed)(tau_heads=1.0, tau_backbone=0.0)
     assert torch.allclose(delayed_p, torch.ones_like(delayed_p))
 
 
@@ -403,7 +493,7 @@ def test_each_tau_interpolates_only_its_section() -> None:
     delayed = model.copy(heads=True, backbone=True, reasoner=False)
     snapshot = {n: p.detach().clone() for n, p in delayed.named_parameters()}
     _perturb(model)
-    model_polyak(online=model, delayed=delayed, tau_heads=0.0, tau_backbone=0.25)
+    model_polyak(online=model, delayed=delayed)(tau_heads=0.0, tau_backbone=0.25)
     online = dict(model.named_parameters())
     for name, p in delayed.named_parameters():
         if name.startswith("heads."):
@@ -424,7 +514,7 @@ def test_tau_backbone_also_moves_reasoner() -> None:
     dr = reasoning.copy(heads=True, backbone=True, reasoner=True)
     assert reasoning.reasoner is not None and dr.reasoner is not None
     _perturb(reasoning.reasoner)
-    model_polyak(online=reasoning, delayed=dr, tau_heads=0.0, tau_backbone=1.0)
+    model_polyak(online=reasoning, delayed=dr)(tau_heads=0.0, tau_backbone=1.0)
     for a, b in zip(dr.reasoner.parameters(), reasoning.reasoner.parameters(), strict=True):
         assert torch.equal(a, b)
 
@@ -433,9 +523,9 @@ def test_polyak_rejects_tau_out_of_range() -> None:
     model = _tiny_model()
     delayed = model.copy(heads=True, backbone=True, reasoner=False)
     with pytest.raises(ValueError, match=r"tau_heads must be in \[0, 1\]"):
-        model_polyak(online=model, delayed=delayed, tau_heads=1.5, tau_backbone=0.1)
+        model_polyak(online=model, delayed=delayed)(tau_heads=1.5, tau_backbone=0.1)
     with pytest.raises(ValueError, match=r"tau_backbone must be in \[0, 1\]"):
-        model_polyak(online=model, delayed=delayed, tau_heads=0.1, tau_backbone=2.0)
+        model_polyak(online=model, delayed=delayed)(tau_heads=0.1, tau_backbone=2.0)
 
 
 def test_polyak_small_tau_accumulates_in_fp32() -> None:

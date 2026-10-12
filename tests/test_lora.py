@@ -334,7 +334,7 @@ def test_full_fp32_path_trains_backbone_directly_with_adamw_and_polyak() -> None
     assert q_proj.weight.grad is not None
     optimizer.step()
     assert not torch.equal(q_proj.weight, before)
-    model_polyak(online=model, delayed=delayed, tau_heads=0.5, tau_backbone=0.5)
+    model_polyak(online=model, delayed=delayed)(tau_heads=0.5, tau_backbone=0.5)
     delayed_after = delayed.backbone.model.layers[0].self_attn.q_proj.weight  # type: ignore[union-attr]
     assert torch.allclose(delayed_after, 0.5 * delayed_before + 0.5 * q_proj.weight)
 
@@ -417,8 +417,9 @@ def test_polyak_interpolates_lora_adapters_in_fp32_without_shadows() -> None:
         for w in online_b:
             w.fill_(1.0)
     tau = 0.0005
+    update_delayed = model_polyak(online=model, delayed=delayed)
     for _ in range(200):
-        model_polyak(online=model, delayed=delayed, tau_heads=0.0, tau_backbone=tau)
+        update_delayed(tau_heads=0.0, tau_backbone=tau)
     expected = 1.0 - (1.0 - tau) ** 200
     for w in delayed_b:
         assert torch.allclose(w, torch.full_like(w, expected), atol=1e-6)
@@ -427,7 +428,7 @@ def test_polyak_interpolates_lora_adapters_in_fp32_without_shadows() -> None:
         online_q = model(batch).predictions["action_value"]
         delayed_q = delayed(batch).predictions["action_value"]
     assert not torch.allclose(online_q, delayed_q)
-    model_polyak(online=model, delayed=delayed, tau_heads=1.0, tau_backbone=1.0)
+    update_delayed(tau_heads=1.0, tau_backbone=1.0)
     with torch.no_grad():
         copied_q = delayed(batch).predictions["action_value"]
     assert torch.allclose(online_q, copied_q)

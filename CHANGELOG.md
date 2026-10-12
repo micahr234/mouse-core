@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- ``mouse_core.data.reuse_token_tensors()`` scopes read-only batch tensor
+  reuse across online/delayed forwards, keyed by batch, device, and
+  inference mode. Exiting the scope releases its cache. Model parameters
+  and activations remain separate.
 - Tokenizer ``type="token"`` tokenizes a literal ``format`` to one
   ``__text__`` token. Zero or several tokens raise. It has no
   ``input_field`` and rejects ``max_tokens``. Example readouts use
@@ -35,6 +39,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   observations as that vector.
 
 ### Changed
+- ``model_polyak(online=..., delayed=...)`` now binds a reusable updater.
+  Call it with explicit ``tau_heads=`` and ``tau_backbone=`` after each
+  optimizer step; ``None`` denotes a shared section. Parameter validation
+  and pairing run once at binding, and grouped fp32 tensor operations
+  perform the interpolation. ``tau_heads`` also accepts per-head rates.
+  Rebind after changing model structure, parameters, trainability, device,
+  or dtype. Examples use the bound updater.
 - ``value_gap_gate`` accepts ``beta=0`` as the hard-cutoff limit: adjusted
   gap zero continues with 1, and a negative gap cuts with 0. Ties avoid
   division by zero; negative and non-finite beta values remain invalid.
@@ -117,9 +128,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Online rollouts reset the context and ``DecodeCache.reset_rows``
   when ``sample_field`` changes, then pack the new sample with
   ``continuing`` false.
-- ``Polyak`` is the function ``model_polyak(online=, delayed=,
-  tau_heads=, tau_backbone=)``. It keeps no state; the delayed weights
-  stay on the delayed model.
+- ``Polyak`` is replaced by ``model_polyak(online=, delayed=)``, which
+  binds an updater called with ``tau_heads=`` and ``tau_backbone=``.
+  Delayed weights stay on the delayed model.
 - Training notebooks step the heads and the backbone in separate
   ``AdamW`` groups (``LR_HEADS``, ``LR_BACKBONE``). The reasoning
   notebook's reasoner uses ``LR_BACKBONE``.

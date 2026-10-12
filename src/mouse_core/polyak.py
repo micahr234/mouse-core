@@ -1,47 +1,24 @@
-"""``model_polyak`` interpolates a delayed model toward the online model.
+"""Bind grouped fp32 Polyak updates to an online/delayed model pair.
 
-The delayed model comes from :meth:`~mouse_core.models.base.Model.copy`,
-which names every section (``heads``, ``backbone``, ``reasoner``).
-Copied trainable parameters are frozen copies; frozen LoRA-base
-weights stay shared by reference. An uncopied backbone or reasoner
-**is** the online module. After each ``optimizer.step()`` call
-:func:`model_polyak` with this step's ``tau`` for each copied
-section — heads, and backbone when that section was copied (the
-reasoner follows the backbone; token embeddings ride with the
-backbone)::
+Build after moving/copying the models, then reuse after optimizer steps::
 
-    delayed_model = model.copy(heads=True, backbone=True, reasoner=False)
-    out = model(inputs)
-    with torch.no_grad():
-        delayed_out = delayed_model(inputs)
-    ...
-    model_polyak(
-        online=model, delayed=delayed_model,
-        tau_heads=0.001, tau_backbone=0.1,
-    )
+    update_delayed = model_polyak(online=model, delayed=delayed_model)
+    update_delayed(tau_heads={"q": 0.001}, tau_backbone=0.1)
 
-The function keeps no state. The delayed weights stay on
-``delayed_model``. Pass a ``tau`` only for sections the delayed model
-copied. Heads-only delay omits ``tau_backbone``::
-
-    delayed_model = model.copy(heads=True, backbone=False, reasoner=False)
-    ...
-    delayed_predictions = delayed_model.head(h=delayed_model.pool(output=out))
-    model_polyak(online=model, delayed=delayed_model, tau_heads=0.001)
-
-Per copied section, ``θ_delayed ← τ·θ_online + (1−τ)·θ_delayed``.
-``τ = 0`` keeps that section frozen; ``τ = 1`` copies the online
-weights (no delay). The heads section pairs each delayed head with
-the online head of the same name; online heads the delayed model
-does not carry are not interpolated.
-
-Every interpolated parameter is fp32, so a small ``tau`` never
-rounds away. Shared frozen parameters are not interpolated.
-``model_polyak`` rejects a non-fp32 parameter it would have to interpolate.
+The callable retains validated parameter pairs, not parameter snapshots.
+Each call applies ``delayed.lerp_(online, tau)`` through grouped foreach
+operations. Backbone and reasoner use ``tau_backbone``; heads can use one
+scalar or a mapping with one rate for every head carried by the delayed
+model. Pass ``None`` for shared sections (``1`` is also a no-op). Copied
+sections require a rate. Zero skips writes. Frozen shared base weights
+are never interpolated. Rebind after replacing parameters, changing their
+trainability/dtype/device, or changing model sections. In-place optimizer
+steps and ordinary in-place state-dict loads preserve the binding.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 import torch
@@ -102,7 +79,15 @@ class _PolyakState:
                     "dtype=torch.float32 to delay a fine-tuned backbone, or freeze it "
                     "with lora= to use a bf16 base."
                 )
+            if online_p.device != delayed_p.device:
+                raise ValueError(f"{section} parameters must be on the same device")
             self._pairs.append((online_p, delayed_p))
+        groups: dict[torch.device, tuple[list[torch.Tensor], list[torch.Tensor]]] = {}
+        for online_p, delayed_p in self._pairs:
+            sources, targets = groups.setdefault(online_p.device, ([], []))
+            sources.append(online_p)
+            targets.append(delayed_p)
+        self._groups = tuple(groups.values())
 
     def __len__(self) -> int:
         return len(self._pairs)
@@ -112,8 +97,8 @@ class _PolyakState:
         """θ_delayed ← τ·θ_online + (1−τ)·θ_delayed."""
         if tau <= 0.0:
             return
-        for online_p, delayed_p in self._pairs:
-            delayed_p.lerp_(online_p, tau)
+        for sources, targets in self._groups:
+            torch._foreach_lerp_(targets, sources, tau)
 
 
 def _check_tau(name: str, tau: float) -> float:
@@ -143,102 +128,108 @@ def _check_section_tau(name: str, tau: float | None, *, copied: bool) -> float |
     return tau
 
 
-def model_polyak(
-    *,
-    online: Model,
-    delayed: Model,
-    tau_heads: float | None = None,
-    tau_backbone: float | None = None,
-) -> None:
-    """Move copied delayed sections toward the online model after an optimizer step.
+class _ModelPolyak:
+    def __init__(self, *, online: Model, delayed: Model) -> None:
+        from mouse_core.models.base import Model as _Model
 
-    Keeps no state. The delayed weights stay on ``delayed``. Pair with
-    the model from :meth:`~mouse_core.models.base.Model.copy`. The
-    sections are heads and, when copied, backbone; the reasoner section
-    follows the backbone. Token embeddings ride with the backbone. The
-    heads section covers the heads the delayed model carries (each
-    paired with the online head of the same name); every delayed head
-    must exist online. A shared section is not interpolated.
+        if not isinstance(online, _Model) or not isinstance(delayed, _Model):
+            raise TypeError("model_polyak interpolates a delayed Model toward an online Model.")
+        if delayed is online:
+            raise ValueError(
+                "delayed must come from Model.copy(heads=..., backbone=..., "
+                "reasoner=...), not be the online model."
+            )
+        if not any(p.requires_grad for p in online.parameters()):
+            raise ValueError("online must be the trainable model, not a delayed copy.")
+        if (online.reasoner is None) != (delayed.reasoner is None):
+            raise ValueError(
+                "online and delayed models must have the same sections; "
+                "build the delayed model with Model.copy(heads=..., "
+                "backbone=..., reasoner=...)."
+            )
 
-    Pass a ``tau`` only for sections the delayed model copied. Each
-    required ``tau`` is a ``float`` in ``[0, 1]``: ``0`` skips that
-    section, ``1`` copies the online weights. ``tau_backbone`` also
-    applies to a copied reasoner and to token embeddings. Omitting a
-    shared section's ``tau`` (or passing ``None`` or ``1``) is a no-op;
-    any other float raises. All-zero ``tau`` on the copied sections
-    returns without touching any delayed parameter. Pass new values
-    each step to change them mid-run.
+        extra = [name for name in delayed.heads if name not in online.heads]
+        if extra:
+            raise ValueError(
+                f"delayed heads {extra} do not exist on the online model "
+                f"(online heads are {tuple(online.heads)}); build the delayed "
+                "model with Model.copy(heads=..., backbone=..., reasoner=...)."
+            )
 
-    Args:
-        online: Source model (backbone, heads).
-        delayed: Model from ``online.copy(heads=..., backbone=..., reasoner=...)``.
-        tau_heads: Interpolation for copied heads. Omit when heads are shared.
-        tau_backbone: Interpolation for a copied backbone and reasoner.
-            Omit when that section is shared.
+        copied: list[nn.Module] = []
+        heads: dict[str, _PolyakState | None] = {}
+        for name in delayed.heads:
+            delayed_head = delayed.heads[name]
+            online_head = online.heads[name]
+            if delayed_head is online_head:
+                heads[name] = None
+                continue
+            copied.append(delayed_head)
+            heads[name] = _PolyakState(online_head, delayed_head, section=f"heads.{name}")
+        backbone: list[_PolyakState] = []
+        if delayed.backbone is not online.backbone:
+            copied.append(delayed.backbone)
+            backbone.append(_PolyakState(online.backbone, delayed.backbone, section="backbone"))
+        if (
+            online.reasoner is not None
+            and delayed.reasoner is not None
+            and delayed.reasoner is not online.reasoner
+        ):
+            copied.append(delayed.reasoner)
+            backbone.append(_PolyakState(online.reasoner, delayed.reasoner, section="reasoner"))
+        if any(p.requires_grad for module in copied for p in module.parameters()):
+            raise ValueError(
+                "a copied delayed section has trainable parameters; build the "
+                "delayed model with Model.copy(heads=..., backbone=..., reasoner=...)."
+            )
+
+        self._heads = heads
+        self._backbone = backbone
+
+    def __call__(
+        self,
+        *,
+        tau_heads: float | Mapping[str, float | None] | None,
+        tau_backbone: float | None,
+    ) -> None:
+        if isinstance(tau_heads, Mapping):
+            if set(tau_heads) != set(self._heads):
+                raise ValueError("tau_heads must name every delayed head exactly once")
+            rates = dict(tau_heads)
+        else:
+            # Validate the scalar even when the delayed model carries no heads.
+            _check_section_tau("tau_heads", tau_heads, copied=any(
+                state is not None for state in self._heads.values()
+            ))
+            rates = dict.fromkeys(self._heads, tau_heads)
+        checked = {
+            name: _check_section_tau("tau_heads", rates[name], copied=state is not None)
+            for name, state in self._heads.items()
+        }
+        backbone_tau = _check_section_tau(
+            "tau_backbone", tau_backbone, copied=bool(self._backbone)
+        )
+        # Validate every rate before writing any section.
+        for name, state in self._heads.items():
+            tau = checked[name]
+            if state is not None and tau is not None:
+                state.update(tau)
+        if backbone_tau is not None:
+            for state in self._backbone:
+                state.update(backbone_tau)
+
+
+def model_polyak(*, online: Model, delayed: Model) -> _ModelPolyak:
+    """Bind and validate an updater once, then call it after optimizer steps.
+
+    ``update = model_polyak(online=model, delayed=delayed_model)`` followed
+    by ``update(tau_heads=..., tau_backbone=...)``. Both rates are explicit;
+    use ``None`` for shared sections. ``tau_heads`` can be a scalar or a
+    mapping whose keys exactly match the delayed model's heads. Each rate
+    is in ``[0, 1]``. The copied reasoner follows the backbone rate.
+
+    Bind after model construction/device placement. Rebind after replacing
+    parameters or changing model sections, trainability, dtype, or device.
+    Validation and parameter pairing happen at binding, not every update.
     """
-    from mouse_core.models.base import Model as _Model
-
-    if not isinstance(online, _Model) or not isinstance(delayed, _Model):
-        raise TypeError("model_polyak interpolates a delayed Model toward an online Model.")
-    if delayed is online:
-        raise ValueError(
-            "delayed must come from Model.copy(heads=..., backbone=..., "
-            "reasoner=...), not be the online model."
-        )
-    if not any(p.requires_grad for p in online.parameters()):
-        raise ValueError("online must be the trainable model, not a delayed copy.")
-    if (online.reasoner is None) != (delayed.reasoner is None):
-        raise ValueError(
-            "online and delayed models must have the same sections; "
-            "build the delayed model with Model.copy(heads=..., "
-            "backbone=..., reasoner=...)."
-        )
-
-    extra = [name for name in delayed.heads if name not in online.heads]
-    if extra:
-        raise ValueError(
-            f"delayed heads {extra} do not exist on the online model "
-            f"(online heads are {tuple(online.heads)}); build the delayed "
-            "model with Model.copy(heads=..., backbone=..., reasoner=...)."
-        )
-
-    copied: list[nn.Module] = []
-    heads: list[_PolyakState] = []
-    for name in delayed.heads:
-        delayed_head = delayed.heads[name]
-        online_head = online.heads[name]
-        if delayed_head is online_head:
-            continue
-        copied.append(delayed_head)
-        heads.append(_PolyakState(online_head, delayed_head, section=f"heads.{name}"))
-    backbone: list[_PolyakState] = []
-    if delayed.backbone is not online.backbone:
-        copied.append(delayed.backbone)
-        backbone.append(_PolyakState(online.backbone, delayed.backbone, section="backbone"))
-    if (
-        online.reasoner is not None
-        and delayed.reasoner is not None
-        and delayed.reasoner is not online.reasoner
-    ):
-        copied.append(delayed.reasoner)
-        backbone.append(_PolyakState(online.reasoner, delayed.reasoner, section="reasoner"))
-    if any(p.requires_grad for module in copied for p in module.parameters()):
-        raise ValueError(
-            "a copied delayed section has trainable parameters; build the "
-            "delayed model with Model.copy(heads=..., backbone=..., reasoner=...)."
-        )
-
-    copied_heads = bool(heads)
-    copied_backbone = bool(backbone)
-    tau_heads = _check_section_tau("tau_heads", tau_heads, copied=copied_heads)
-    tau_backbone = _check_section_tau("tau_backbone", tau_backbone, copied=copied_backbone)
-    if (not copied_heads or tau_heads == 0.0) and (
-        not copied_backbone or tau_backbone == 0.0
-    ):
-        return
-    if copied_heads and tau_heads is not None and tau_heads > 0.0:
-        for state in heads:
-            state.update(tau_heads)
-    if copied_backbone and tau_backbone is not None and tau_backbone > 0.0:
-        for state in backbone:
-            state.update(tau_backbone)
+    return _ModelPolyak(online=online, delayed=delayed)
