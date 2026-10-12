@@ -17,7 +17,7 @@ backbone)::
     ...
     model_polyak(
         online=model, delayed=delayed_model,
-        tau_heads=0.0001, tau_backbone=0.01,
+        tau_heads=0.001, tau_backbone=0.1,
     )
 
 The function keeps no state. The delayed weights stay on
@@ -27,7 +27,7 @@ copied. Heads-only delay omits ``tau_backbone``::
     delayed_model = model.copy(heads=True, backbone=False, reasoner=False)
     ...
     delayed_predictions = delayed_model.head(h=delayed_model.pool(output=out))
-    model_polyak(online=model, delayed=delayed_model, tau_heads=0.0001)
+    model_polyak(online=model, delayed=delayed_model, tau_heads=0.001)
 
 Per copied section, ``θ_delayed ← τ·θ_online + (1−τ)·θ_delayed``.
 ``τ = 0`` keeps that section frozen; ``τ = 1`` copies the online

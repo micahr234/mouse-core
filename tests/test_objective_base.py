@@ -59,10 +59,8 @@ _CASES: list[tuple[Objective[...], dict[str, object], tuple[str, ...]]] = [
         {
             "group_id": torch.zeros(2, dtype=torch.int64),
             "delayed_predictions": torch.zeros(2, 2),
-            "reward_center": None,
-            "delayed_reward_center": None,
         },
-        ("group_id", "delayed_predictions", "reward_center", "delayed_reward_center"),
+        ("group_id", "delayed_predictions"),
     ),
     (
         PpoObjective(

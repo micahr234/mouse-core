@@ -61,11 +61,8 @@ class Objective[**P](ABC):
     and PPO takes ``value_predictions=``. Supervised objectives take
     ``targets=`` (action ids for SP, Q vectors for SV). DQN, PPO, and GRPO
     require ``group_id=`` (int64 ``[N]``) beside ``objective_data``.
-    ``DqnObjective`` also requires ``reward_center=`` and
-    ``delayed_reward_center=`` on that call: each a 0-dim float32 tensor,
-    or both ``None``. The backup uses the delayed center. The returned
-    loss is a dict of terms. ``action_value`` trains Q. ``reward_center``
-    trains the online center from the detached residual.
+    The returned loss is a dict of terms. ``DqnObjective`` trains Q
+    through ``action_value``.
 
     ``P`` describes the subclass's call signature; there is no single
     set of optional prediction arguments shared by all objectives.

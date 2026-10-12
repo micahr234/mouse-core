@@ -406,15 +406,15 @@ def value_gap_gate(
     rule as ``get_action(temperature=0)``. ``value_delayed`` scores
     that action and the taken action on online ``q`` or on
     ``q_delayed``. ``V = Q_value(s, a*)``. The signed gap is
-    ``Q_value(s, a_taken) - V``. ``normalize=True`` divides it by the
-    range of the value Q. ``bias`` is added, then the gap is capped at
-    ``0``:
+    ``Q_value(s, a_taken) - V``. ``normalize=True`` divides it by
+    ``|max_a Q| + eps`` on the value Q. ``bias`` is subtracted, then the
+    gap is capped at ``0``:
 
-    ``gap = min(0, Q(s, a_taken) - V + bias)``
+    ``gap = min(0, Q(s, a_taken) - V - bias)``
 
-    ``c = exp(beta * gap)``. ``normalize=True`` uses
+    ``c = 2 ** (gap / beta)``. ``normalize=True`` uses
 
-    ``gap = min(0, (Q(s, a_taken) - V) / (max_a Q - min_a Q + eps) + bias)``.
+    ``gap = min(0, (Q(s, a_taken) - V) / (|max_a Q| + eps) - bias)``.
 
     ``eps`` is required when ``normalize`` is ``True`` and is rejected
     when ``normalize`` is ``False``. When the two flags agree, ``V`` is
@@ -424,31 +424,31 @@ def value_gap_gate(
     Column ``s`` is that continuation through step ``s`` for every
     earlier start, the same step ``watkins_gate`` marks with its greedy
     flag. Column ``0`` and the last column are ``0`` (no action leaves
-    the batch). A gap of ``0`` continues with ``c = 1``. A negative gap
-    shrinks the continuation toward a bootstrap of the delayed state
-    value. The objective still applies the in-run mask. Fewer than 2
-    steps, or an ``action`` whose length is not ``N``, raises.
+    the batch). A gap of ``0`` continues with ``c = 1``. A gap of
+    ``-beta`` continues at ``1/2``. A larger ``beta`` is a softer cut.
+    A negative gap shrinks the continuation toward a bootstrap of the
+    delayed state value. The objective still applies the in-run mask.
+    Fewer than 2 steps, or an ``action`` whose length is not ``N``,
+    raises.
 
     Args:
-        beta: Positive scale on the gap. With ``normalize=True``, a
-            taken action at the minimum of the value Q continues near
-            ``exp(-beta)`` when the range is large next to ``eps``,
-            ``bias`` is ``0``, and ``a*`` is a max of that Q. With
-            ``normalize=False``, a gap of ``-1`` continues at
-            ``exp(-beta)``.
+        beta: Positive denominator of ``c = 2 ** (gap / beta)``. A gap
+            of ``-beta`` continues at ``1/2``. A larger ``beta`` is a
+            softer cut.
         normalize: ``True`` divides the signed gap by
-            ``max_a Q - min_a Q + eps`` on the value Q before ``bias``.
+            ``|max_a Q| + eps`` on the value Q before ``bias``.
             ``False`` uses the raw signed gap.
         policy_delayed: ``False`` picks ``a*`` from online Q. ``True``
             picks ``a*`` from delayed Q.
         value_delayed: ``False`` scores ``V`` and the taken action on
             online Q. ``True`` scores them on delayed Q.
-        bias: Shift added to the signed gap before the cap at ``0``.
+        bias: Shift subtracted from the signed gap before the cap at ``0``.
             ``0`` leaves that gap in place. A positive shift moves a
-            negative gap toward ``0``. A negative shift moves it down.
-        eps: Positive floor added to ``max_a Q - min_a Q``. Required
-            when ``normalize`` is ``True``. Omit it when ``normalize``
-            is ``False``.
+            negative gap further down. A negative shift moves it toward
+            ``0``.
+        eps: Positive floor added to ``|max_a Q|``. Required when
+            ``normalize`` is ``True``. Omit it when ``normalize`` is
+            ``False``.
     """
     if isinstance(beta, bool) or not isinstance(beta, (int, float)):
         raise TypeError(f"beta must be a real number, got {type(beta)}.")
@@ -501,10 +501,9 @@ def value_gap_gate(
         signed = q_taken - q_star
         if floor is not None:
             q_max = values.amax(dim=-1)
-            q_min = values.amin(dim=-1)
-            signed = signed / (q_max - q_min + floor)
-        gap = (signed + shift).clamp(max=0)
-        cont = torch.exp(scale * gap)
+            signed = signed / (q_max.abs() + floor)
+        gap = (signed - shift).clamp(max=0)
+        cont = torch.exp2(gap / scale)
         cont[0] = 0
         column = torch.cat([cont, cont.new_zeros(1)])
         t = torch.arange(N, device=values.device).unsqueeze(1)

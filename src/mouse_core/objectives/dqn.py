@@ -413,8 +413,7 @@ def _block_returns(
         local_col = torch.arange(rows, device=device)
         before = local_col < local_row
         step[:, :rows] = torch.where(before, step.new_ones(()), step[:, :rows])
-        # Out of place so a reward that depends on a parameter (the
-        # centering constant) keeps a gradient. ``step`` does not.
+        # Out of place so a reward that requires grad keeps it. ``step`` does not.
         left = torch.where(before, term.new_zeros(()), term[:, :rows])
         term = torch.cat([left, term[:, rows:]], dim=1) if width > rows else left
     if leave_out:
@@ -522,33 +521,6 @@ def _read_gate(
     return values
 
 
-def _require_reward_center(
-    center: torch.Tensor | None,
-    *,
-    name: str,
-    device: torch.device,
-) -> torch.Tensor | None:
-    """Return a 0-dim float32 centering constant, or ``None``."""
-    if center is None:
-        return None
-    if not isinstance(center, torch.Tensor):
-        raise TypeError(
-            f"{name} must be a 0-dim float32 tensor or None, got "
-            f"{type(center).__name__}."
-        )
-    if center.dtype != torch.float32 or center.ndim != 0:
-        raise TypeError(
-            f"{name} must be a 0-dim float32 tensor or None, got "
-            f"shape {tuple(center.shape)} dtype {center.dtype}."
-        )
-    if center.device != device:
-        raise ValueError(
-            f"{name} device {center.device} must match predictions "
-            f"device {device}."
-        )
-    return center
-
-
 def _pair_values_to_rows(
     pair_values: torch.Tensor,
     step_of: torch.Tensor,
@@ -564,10 +536,7 @@ class DqnObjective(Objective[...]):
     Instantiate with hyperparameters, then call with
     ``objective_data=``, ``group_id=`` (int64 ``[N]``, one id per step,
     returned beside ``objective_data``), the online Q tensor as ``predictions=``, the
-    delayed Q tensor as ``delayed_predictions=``, ``reward_center=``
-    (a 0-dim float32 tensor, or ``None``), and
-    ``delayed_reward_center=`` (the same, or ``None`` when
-    ``reward_center`` is ``None``). Both Q tensors come
+    delayed Q tensor as ``delayed_predictions=``. Both Q tensors come
     from the matching head on
     :class:`~mouse_core.models.base.Model`
     (``model.copy(heads=True, backbone=True, reasoner=False)``) run on
@@ -614,11 +583,13 @@ class DqnObjective(Objective[...]):
     online argmax. ``value_gap_gate`` is the optimality-gap cut.
     ``policy_delayed`` picks ``a* = argmax``. ``value_delayed`` scores
     ``V = Q(s, a*)`` and the taken action. Either flag, or both, reads
-    delayed Q. The signed gap is ``Q(s, a_taken) - V``. ``bias`` shifts
-    it, then it is capped at ``0``. ``c = exp(beta * gap)``.
+    delayed Q. The signed gap is ``Q(s, a_taken) - V``. ``bias`` is
+    subtracted, then the gap is capped at ``0``. ``c = 2 ** (gap / beta)``.
     ``normalize=True`` divides the signed gap by
-    ``max_a Q - min_a Q + eps`` (``eps`` required). ``normalize=False``
-    uses the raw signed gap. ``general_gate(gates=)``
+    ``|max_a Q| + eps`` (``eps`` required). ``normalize=False``
+    uses the raw signed gap. A gap of ``0`` continues at ``c = 1``.
+    A gap of ``-beta`` continues at ``1/2``. A larger ``beta`` is a
+    softer cut. ``general_gate(gates=)``
     multiplies those matrices, so a step continues only where every
     gate continues. The callable returns
     ``[N, N]``. ``gate=None`` is the one-step target (a zero matrix).
@@ -663,24 +634,8 @@ class DqnObjective(Objective[...]):
     ``δ = G - Q(s, a)`` and ``G`` the backup above. One-step,
     ``temperature=0``, and ``double=False`` make ``δ`` the residual
     ``r + γ max_a Q_delayed(s', a) - Q(s, a)``.
-    ``reward_center`` is the online centering constant ``c``: a 0-dim
-    float32 tensor (the output of
-    :class:`~mouse_core.models.heads.constant.ConstantHead`,
-    ``scale * value``), or
-    ``None``. ``delayed_reward_center`` is the delayed constant
-    ``c'``. Both are set, or both are ``None``. The backup uses
-    ``c'`` for both potentials and detaches it, so one step is
-    ``G = r - c' + γ c' + γ V``. The returned loss is a dict.
-    ``action_value`` is the TD loss and trains Q. It does not train
-    ``c`` or ``c'``: a constant shift of every action value is already
-    a bias in the Q head. When the centers are set, ``reward_center``
-    is ``-c · mean(δ)`` with ``δ`` detached, so gradient descent steps
-    ``c`` by that mean. ``c'`` tracks ``c`` through the delayed copy.
-    When ``c = c'`` the target is
-    ``G - K c`` with ``K`` the same recursion on reward ``1 - γ`` and
-    value ``0``, and the shift telescopes to exactly ``c`` on every
-    action value — the policy ordering never changes. ``None`` keeps
-    plain ``δ²``.
+    The returned loss is a dict. ``action_value`` is the TD loss and
+    trains Q.
     The trace never crosses a run break. At a ``terminated`` or
     ``truncated`` step ``γ`` is ``discount`` from those flags and
     multiplies both the bootstrap and the continued return, so a ``0``
@@ -692,23 +647,21 @@ class DqnObjective(Objective[...]):
     softens that cut. ``policy_delayed`` picks ``a* = argmax``.
     ``value_delayed`` scores ``V = Q(s, a*)`` and the taken action.
     Either flag, or both, reads delayed Q. The signed gap is
-    ``Q(s, a_taken) - V``. ``normalize=True`` divides by the value
-    range (``eps`` required). ``bias`` is added and the gap is capped
-    at ``0``. ``c = exp(beta * gap)``. ``normalize=False`` uses the raw
-    signed gap and takes no ``eps``.
-    A zero gap continues and a larger gap bootstraps the delayed
-    state value. ``watkins_gate`` reads online Q.
+    ``Q(s, a_taken) - V``. ``normalize=True`` divides by
+    ``|max_a Q| + eps`` (``eps`` required). ``bias`` is subtracted and
+    the gap is capped at ``0``. ``c = 2 ** (gap / beta)``.
+    ``normalize=False`` uses the raw signed gap and takes no ``eps``.
+    A gap of ``0`` continues at ``c = 1``. A gap of ``-beta`` continues
+    at ``1/2``. A larger ``beta`` is a softer cut. A negative gap
+    bootstraps the delayed state value. ``watkins_gate`` reads online Q.
     ``value_gap_gate`` reads online Q, delayed Q, or both. Both leave
     oracle columns such as ``info_q_star`` unread. ``metrics["entropy"]`` is the in-run mean of
     ``H[softmax(Q / α)]`` on online Q when ``temperature > 0``.
     ``metrics["backup"]`` is the per-row Bellman target ``G`` (``[P]``)
-    the taken action is regressed to. When ``reward_center`` is set,
-    ``G`` is the shaped target. ``metrics["backup_weight"]`` is
+    the taken action is regressed to. ``metrics["backup_weight"]`` is
     the matching per-row weight (``0`` when the step is out of the loss
     and out of logged metrics). ``metrics["in_run_backup"]`` is
     ``backup`` on the rows with ``backup_weight > 0``.
-    ``metrics["in_run_delta"]`` (present when ``reward_center`` is set)
-    is that call's centered residual ``δ − K c`` on those same rows.
     All of these are detached. The
     continuation matrix stays the one ``[N, N]`` the gate returned. Rows
     are cumprod'd in blocks, and that read does not sync the host.
@@ -764,9 +717,11 @@ class DqnObjective(Objective[...]):
             scores ``V = Q(s, a*)`` and the taken action. Either flag,
             or both, reads delayed Q. The signed gap is
             ``Q(s, a_taken) - V``. ``normalize=True`` divides by
-            ``max_a Q - min_a Q + eps`` on the value Q (``eps`` required).
-            ``bias`` shifts that gap, then it is capped at ``0``.
-            ``c = exp(beta * gap)``. ``normalize=False``
+            ``|max_a Q| + eps`` on the value Q (``eps`` required).
+            ``bias`` is subtracted, then the gap is capped at ``0``.
+            ``c = 2 ** (gap / beta)``. A gap of ``0`` continues at
+            ``c = 1``. A gap of ``-beta`` continues at ``1/2``. A larger
+            ``beta`` is a softer cut. ``normalize=False``
             uses the raw signed gap and takes no ``eps``. ``general_gate(gates=)`` is the
             element-wise product of those matrices. A callable returning
             ``[N, N]`` is accepted. Row ``t``, column ``s`` is the continuation at
@@ -837,8 +792,6 @@ class DqnObjective(Objective[...]):
         group_id: torch.Tensor,
         predictions: torch.Tensor,
         delayed_predictions: torch.Tensor,
-        reward_center: torch.Tensor | None,
-        delayed_reward_center: torch.Tensor | None,
     ) -> tuple[dict[str, torch.Tensor], dict[str, float | torch.Tensor]]: ...
 
     @overload
@@ -849,8 +802,6 @@ class DqnObjective(Objective[...]):
         group_id: torch.Tensor,
         predictions: torch.Tensor,
         delayed_predictions: torch.Tensor,
-        reward_center: torch.Tensor | None,
-        delayed_reward_center: torch.Tensor | None,
         value_predictions: None = None,
         targets: None = None,
     ) -> tuple[dict[str, torch.Tensor], dict[str, float | torch.Tensor]]: ...
@@ -862,8 +813,6 @@ class DqnObjective(Objective[...]):
         group_id: torch.Tensor,
         predictions: torch.Tensor,
         delayed_predictions: torch.Tensor | None = None,
-        reward_center: torch.Tensor | None,
-        delayed_reward_center: torch.Tensor | None,
         value_predictions: torch.Tensor | None = None,
         targets: torch.Tensor | None = None,
     ) -> tuple[dict[str, torch.Tensor], dict[str, float | torch.Tensor]]:
@@ -876,19 +825,6 @@ class DqnObjective(Objective[...]):
         q_target: torch.Tensor = _require_prediction(
             delayed_predictions, owner="DqnObjective", name="delayed_predictions"
         ).detach()
-        center = _require_reward_center(
-            reward_center, name="reward_center", device=q.device
-        )
-        delayed_center = _require_reward_center(
-            delayed_reward_center, name="delayed_reward_center", device=q.device
-        )
-        if (center is None) != (delayed_center is None):
-            raise ValueError(
-                "reward_center and delayed_reward_center must both be set "
-                "or both be None."
-            )
-        if delayed_center is not None:
-            delayed_center = delayed_center.detach()
 
         if q.ndim != 2:
             raise ValueError(
@@ -1005,10 +941,6 @@ class DqnObjective(Objective[...]):
             dtype=value_dtype,
             device=device,
         )
-        if delayed_center is not None:
-            # The backup uses the delayed center only. Each reward slot at
-            # discount γ subtracts (1 - γ)·c'. c' is detached.
-            reward = reward - (1.0 - discount_all) * delayed_center
         pair_target, participate = _continuation_targets(
             reward=reward,
             discount_all=discount_all,
@@ -1024,9 +956,7 @@ class DqnObjective(Objective[...]):
         row_weight = torch.cat([pair_weight, pair_weight.new_zeros(1)])[step_of]  # [P]
         td_target = _pair_values_to_rows(pair_target, step_of)  # [P]
 
-        # δ = G - Q(s, a). G uses the delayed center. action_value trains Q.
-        # metrics["in_run_delta"] is δ on in-run rows. reward_center is
-        # -c · mean(δ) with δ detached.
+        # δ = G - Q(s, a). action_value trains Q.
         delta = td_target - q_values
         td_sq = delta ** 2
 
@@ -1041,10 +971,6 @@ class DqnObjective(Objective[...]):
         td_loss = _weighted_mean(per_row, row_weight)
         td_loss_log = _weighted_mean(td_sq.detach(), row_weight)
         losses: dict[str, torch.Tensor] = {"action_value": td_loss}
-        if center is not None:
-            # δ is detached, so this term trains c and not Q.
-            # Descent steps c by the weighted mean residual.
-            losses["reward_center"] = -center * _weighted_mean(delta.detach(), row_weight)
 
         curr_max_q = q.amax(dim=-1)  # [P]  max online Q at s_i
         q_mean, q_std, q_min, q_max = _in_run_stats(curr_max_q.detach(), row_weight)
@@ -1057,10 +983,6 @@ class DqnObjective(Objective[...]):
         }
         if cql_penalty_mean is not None:
             named["cql_penalty"] = cql_penalty_mean
-        if center is not None and delayed_center is not None:
-            # ``clone`` so the logged value is a snapshot of the parameter.
-            named["reward_center"] = center.detach().clone()
-            named["delayed_reward_center"] = delayed_center.detach().clone()
         if self.temperature > 0.0:
             named["entropy"] = _weighted_mean(
                 _boltzmann_entropy(q.detach(), temperature=self.temperature),
@@ -1073,12 +995,8 @@ class DqnObjective(Objective[...]):
         # Same G and row weight the loss used — callers log these
         # instead of rebuilding the backup. ``in_run_backup`` is the
         # rows with a positive weight, already selected.
-        # ``in_run_delta`` is δ = G − Q on those rows. G uses the delayed
-        # center. The reward_center loss trains c from that residual.
         metrics["backup"] = td_target.detach()
         metrics["backup_weight"] = row_weight.detach()
         in_run = metrics["backup_weight"] > 0
         metrics["in_run_backup"] = metrics["backup"][in_run]
-        if center is not None:
-            metrics["in_run_delta"] = delta.detach()[in_run]
         return losses, metrics

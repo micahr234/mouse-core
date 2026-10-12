@@ -33,26 +33,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   index to pick the scalar that the Fourier add carries.
   ``examples/17_collect_cartpole.ipynb`` stores random CartPole
   observations as that vector.
-- ``ConstantHead``: a scalar parameter that does not read the
-  backbone. The output is ``scale * value``. ``value`` starts at 0.
-  ``DqnObjective`` requires ``reward_center=`` and
-  ``delayed_reward_center=`` (both a 0-dim float32 tensor, or both
-  ``None``). The backup uses the delayed center ``c'`` and detaches
-  it: one step is ``G = r - c' + γ c' + γ V``. ``action_value`` is
-  the TD loss and trains Q. It does not train ``c`` or ``c'``,
-  because a constant shift of every action value is already a bias
-  in the Q head. When the centers are set, ``reward_center`` is
-  ``-c · mean(δ)`` with ``δ`` detached, so gradient descent steps
-  ``c`` by that mean. When ``c = c'`` the target telescopes to the
-  same offset ``c`` on every action value, so the policy ordering
-  never changes, episodic or continuing. A constant ``γ < 1``
-  one-step target recovers classic reward centering, a ``γ = 1``
-  slot subtracts nothing, and a terminal subtracts the full ``c'``.
-  ``metrics["backup"]`` is that target. Metrics ``reward_center``,
-  ``delayed_reward_center``, and ``in_run_delta`` when enabled.
-  ``examples/16_train_offline_reward_centering_dqn.ipynb`` copies
-  every head onto the delayed model and sums the loss dict before
-  ``backward``. ``model_polyak`` tracks ``c'``.
 
 ### Changed
 - Minimum Python is **3.15** (free-threaded ``3.15t``). Dependency floors
@@ -72,6 +52,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   uses ``MAX_EPISODE_STEPS``, FrozenLake uses ``MAX_STEPS_PER_EPISODE``.
 - Example group prefixes say to predict the value of all actions at the
   end of each line, and put the step pattern on the next line.
+- Example notebooks set ``POLYAK_TAU_HEADS = 0.001`` and
+  ``POLYAK_TAU_BACKBONE = 0.1``. The n-step example copies heads only
+  and sets ``POLYAK_TAU_HEADS`` alone.
 - Text ``format=`` is an f-string. The step value is the name ``field``,
   so ``{field+1}`` and ``{field:.3f}`` both render. A const ``format=``
   has no step value: the word field is text, and ``{field}`` is
@@ -102,8 +85,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a complete task. The ``examples`` extra installs ``repeat-task-gym``.
 - Objective ``__call__`` returns ``(losses, metrics)``. ``losses`` is
   a dict of 0-dim tensors. Callers sum the terms they train.
-  ``DqnObjective`` uses ``action_value`` and, when centering is on,
-  ``reward_center``. ``PpoObjective`` uses ``ppo``, ``GrpoObjective``
+  ``DqnObjective`` uses ``action_value``. ``PpoObjective`` uses ``ppo``,
+  ``GrpoObjective``
   uses ``grpo``, ``SpObjective`` uses ``action``, and ``SvObjective``
   uses ``value``.
 - ``pack_token_batch`` and ``DataLoader.next_batch`` return
@@ -142,6 +125,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keys use the constructor values. A flat parameter list is unchanged.
 
 ### Removed
+- DQN reward centering. ``ConstantHead`` is gone. ``DqnObjective`` no
+  longer takes ``reward_center=`` or ``delayed_reward_center=``. The
+  backup is ``G = r + γ V``. ``metrics["in_run_delta"]`` is gone.
+  ``examples/16_train_offline_reward_centering_dqn.ipynb`` is gone.
 - Tokenizer ``type="token"`` no longer reads an integer ``input_field``
   and emits that integer as a vocab id. ``token`` is a literal
   ``format`` that must be one ``__text__`` token.
@@ -204,11 +191,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``V = Q(s, a*)`` and the taken action (online or delayed). Either
   flag, or both, reads delayed Q, passed to the gate as ``q_delayed``.
   The signed gap is ``Q(s, a_taken) - V``. ``normalize=True`` divides
-  by ``max_a Q - min_a Q + eps`` on the value Q and requires ``eps``.
+  by ``|max_a Q| + eps`` on the value Q and requires ``eps``.
   ``normalize=False`` uses the raw signed gap and takes no ``eps``.
-  ``bias`` is added and the gap is capped at ``0``.
-  ``c = exp(beta * gap)``. A zero gap continues (``c = 1``); a negative
-  gap bootstraps the delayed state value.
+  ``bias`` is subtracted and the gap is capped at ``0``.
+  ``c = 2 ** (gap / beta)``. A gap of ``0`` continues (``c = 1``).
+  A gap of ``-beta`` continues at ``1/2``. A larger ``beta`` is a
+  softer cut. A negative gap bootstraps the delayed state value.
   ``examples/14_train_offline_value_gap_dqn.ipynb`` is the same offline
   loop as ``02`` with this gate.
 - ``DqnObjective`` requires ``double``. ``False`` bootstraps from delayed
