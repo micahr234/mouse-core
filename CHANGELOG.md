@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `DiscretizedActionHead` produces one Q-value per row of a fixed continuous
+  action table. `discrete_to_continuous` decodes IDs; `continuous_to_discrete`
+  quantizes by Euclidean distance (ties choose the lowest ID). The table is a
+  non-trainable buffer saved with the model and restored by `load_model`.
+  Example 19 uses this head for Pendulum DQN, with continuous torque in the
+  transformer history and discrete IDs in the objective.
 - ``mouse_core.data.reuse_token_tensors()`` scopes read-only batch tensor
   reuse across online/delayed forwards, keyed by batch, device, and
   inference mode. Exiting the scope releases its cache. Model parameters

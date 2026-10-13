@@ -18,6 +18,7 @@ from mouse_core.models.backbone.flex_decode import DecodeKernel, FlexDecodeSessi
 from mouse_core.models.backbone.packed_train import TrainKernel
 from mouse_core.models.heads.base import BaseHead, _bind_prediction_key
 from mouse_core.models.heads.classification import ClassificationHead
+from mouse_core.models.heads.discretized_action import DiscretizedActionHead
 from mouse_core.models.heads.regression import RegressionHead
 from mouse_core.models.lora import LoRAConfig
 from mouse_core.models.reasoner import LatentReasoner, _InsertionPlan, _plan_insertions
@@ -445,9 +446,9 @@ def _head_config(name: str, head: BaseHead) -> dict[str, Any] | None:
             "propagate_gradient": head.propagate_gradient,
         }
     if isinstance(head, RegressionHead):
-        return {
+        spec = {
             "name": name,
-            "type": "regression",
+            "type": "discretized_action" if isinstance(head, DiscretizedActionHead) else "regression",
             "in_features": head.in_features,
             "out_features": head.out_features,
             "hidden_dim": head.hidden_dim,
@@ -456,6 +457,9 @@ def _head_config(name: str, head: BaseHead) -> dict[str, Any] | None:
             "use_norm": head.use_norm,
             "propagate_gradient": head.propagate_gradient,
         }
+        if isinstance(head, DiscretizedActionHead):
+            spec["action_dim"] = head.action_dim
+        return spec
     raise TypeError(f"save_model does not know how to serialize head {name!r} ({type(head).__name__}).")
 
 
@@ -536,15 +540,16 @@ def load_model(
             "with save_model(...)."
         )
 
+    state = torch.load(weights_path, map_location=map_location)
     model = _build_model_from_config(
         config,
+        state=state,
         train_kernel=train_kernel,
         decode_kernel=decode_kernel,
         dtype=dtype,
         train_autocast_dtype=train_autocast_dtype,
         decode_autocast_dtype=decode_autocast_dtype,
     )
-    state = torch.load(weights_path, map_location=map_location)
     model.load_state_dict(state)
     return model
 
@@ -552,6 +557,7 @@ def load_model(
 def _build_model_from_config(
     config: dict[str, Any],
     *,
+    state: Mapping[str, torch.Tensor],
     train_kernel: TrainKernel,
     decode_kernel: DecodeKernel,
     dtype: torch.dtype,
@@ -567,7 +573,7 @@ def _build_model_from_config(
         decode_autocast_dtype=decode_autocast_dtype,
     )
     heads_cfg = config["heads"]
-    heads = _build_heads_from_config(heads_cfg["heads"])
+    heads = _build_heads_from_config(heads_cfg["heads"], state=state)
     reasoner_cfg = config.get("reasoner")
     reasoner = (
         LatentReasoner(
@@ -633,7 +639,9 @@ def _build_backbone_from_config(
     raise ValueError(f"Unsupported backbone type {backbone_type!r}.")
 
 
-def _build_heads_from_config(heads: list[dict[str, Any]]) -> dict[str, BaseHead]:
+def _build_heads_from_config(
+    heads: list[dict[str, Any]], *, state: Mapping[str, torch.Tensor],
+) -> dict[str, BaseHead]:
     built: dict[str, BaseHead] = {}
     for spec in heads:
         name = spec["name"]
@@ -642,6 +650,20 @@ def _build_heads_from_config(heads: list[dict[str, Any]]) -> dict[str, BaseHead]
             built[name] = ClassificationHead(
                 in_features=spec["in_features"],
                 out_features=spec["out_features"],
+                hidden_dim=spec["hidden_dim"],
+                num_layers=spec["num_layers"],
+                scale=spec.get("scale", 1.0),
+                use_norm=spec["use_norm"],
+                propagate_gradient=spec["propagate_gradient"],
+            )
+        elif head_type == "discretized_action":
+            # The table lives once in the checkpoint, as a persistent buffer.
+            table = state[f"heads.{name}.action_vectors"]
+            if tuple(table.shape) != (spec["out_features"], spec["action_dim"]):
+                raise ValueError(f"Action table shape for head {name!r} does not match its config.")
+            built[name] = DiscretizedActionHead(
+                in_features=spec["in_features"],
+                action_vectors=table,
                 hidden_dim=spec["hidden_dim"],
                 num_layers=spec["num_layers"],
                 scale=spec.get("scale", 1.0),
