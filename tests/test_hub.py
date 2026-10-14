@@ -168,6 +168,23 @@ def test_load_stores_from_hub_scopes_short_names(monkeypatch: pytest.MonkeyPatch
     assert snapshot_calls == [('user/dataset', ['config'], 'train', None, 'token')]
     assert calls == [('parquet', {'data_files': {'config': [str(snapshot_dir / 'data/config/train-00000-of-00001.parquet')]}})]
 
+def test_load_stores_from_hub_keeps_hyphenated_store_name(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    calls: list[tuple[str, dict]] = []
+    snapshot_dir = _write_snapshot(tmp_path, 'double-integrator-random')
+
+    def fake_load_dataset(path: str, **kwargs):
+        calls.append((path, kwargs))
+        return {'double_integrator_random': Dataset.from_list([{'observation': {'discrete': 0}, 'action': {'discrete': 0}, 'reward': 0.0, 'episode_done': 0, 'task_done': 0, 'step_index': 0}])}
+
+    def fake_snapshot(*, repo_id: str, store_names: list[str] | None, split: str, revision: str | None, token: str | bool | None, force_download: bool=False):
+        return snapshot_dir
+    monkeypatch.setattr(hub, '_snapshot_store_repo', fake_snapshot)
+    monkeypatch.setattr(hub, 'load_dataset', fake_load_dataset)
+    stores = hub.load_stores_from_hub(split='train', repo_id='org/dataset', store_names=['double-integrator-random'])
+    assert [store.name for store in stores] == ['double-integrator-random']
+    assert [len(store) for store in stores] == [1]
+    assert calls == [('parquet', {'data_files': {'double_integrator_random': [str(snapshot_dir / 'data/double-integrator-random/train-00000-of-00001.parquet')]}})]
+
 def test_load_stores_from_hub_requires_non_empty_store_names() -> None:
     with pytest.raises(ValueError, match='non-empty'):
         hub.load_stores_from_hub(repo_id='dataset', store_names=['cartpole', ''])

@@ -171,6 +171,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ``DataLoader`` ``sequence_length`` and ``total_batches``. A batch is
   one of ``samples_budget`` (steps) or ``token_budget`` (packed tokens).
 
+### Fixed
+- ``load_stores_from_hub`` loading a store whose name contains a hyphen no longer fails split-name validation.
+
 ### Added
 - Tokenizer ``when=`` is a callable ``ctx → bool``: the step dict plus
   injected boolean ``group_start``. Ordinary emission uses

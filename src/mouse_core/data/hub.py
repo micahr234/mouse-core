@@ -364,6 +364,39 @@ def _resolve_dataset_repo_id(repo_id: str, token: str | bool | None = None) -> s
     return f"{user}/{repo_id}"
 
 
+_SPLIT_RE = re.compile(r"^\w+(\.\w+)*$")
+
+
+def _load_split_keys(store_names: list[str]) -> dict[str, str]:
+    """Map each store name to a Hugging Face split key.
+
+    Names that already match the split pattern stay unchanged, so existing
+    ``data_files`` keys such as ``cartpole`` and ``config`` are preserved.
+    Any other name is rewritten to a unique legal key. The caller reads that
+    key back out of the loaded dataset and keeps the original store name.
+    """
+    keys: dict[str, str] = {}
+    used: set[str] = set()
+    pending: list[tuple[int, str]] = []
+    for index, name in enumerate(store_names):
+        if _SPLIT_RE.fullmatch(name):
+            keys[name] = name
+            used.add(name)
+        else:
+            pending.append((index, name))
+    for index, name in pending:
+        base = re.sub(r"[^\w.]+", "_", name).strip("._") or f"store_{index}"
+        if not _SPLIT_RE.fullmatch(base):
+            base = f"store_{index}"
+        key, n = base, 2
+        while key in used:
+            key = f"{base}_{n}"
+            n += 1
+        keys[name] = key
+        used.add(key)
+    return keys
+
+
 def load_stores_from_hub(
     *,
     repo_id: str,
@@ -382,7 +415,9 @@ def load_stores_from_hub(
     ``datasets.load_dataset("parquet", data_files=...)`` call. This avoids one
     Hub tree/glob request per store. When ``store_names`` is omitted, store
     names are discovered from local ``data/{store}/{split}-*.parquet`` paths.
-    Each store name is copied onto the returned ``Datastore.name``.
+    Each store name is copied onto the returned ``Datastore.name``. A name
+    that is not a legal Hugging Face split name, such as one containing a
+    hyphen, is remapped to a legal key for that parquet load.
     """
     if store_names is not None:
         if not store_names:
@@ -418,16 +453,16 @@ def load_stores_from_hub(
 
     from mouse_core.data.datastore import Datastore as _DS
 
+    split_keys = _load_split_keys(store_names)
     loaded = load_dataset(
         "parquet",
-        data_files=data_files,
+        data_files={split_keys[name]: data_files[name] for name in store_names},
         **load_kwargs,
     )
-
     stores: list[Datastore] = []
     for store_name in store_names:
         store = _DS(name=store_name)
-        store.from_dataset(ds=loaded[store_name])
+        store.from_dataset(ds=loaded[split_keys[store_name]])
         stores.append(store)
     return stores
 
