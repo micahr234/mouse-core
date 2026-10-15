@@ -26,7 +26,7 @@ _TOKENS_PER_STEP = 3
 
 def _tiny_model(*, num_thoughts: int = 2, with_reasoner: bool = True) -> Model:
     backbone = TransformerBackbone(architecture="llama", 
-        train_kernel="reference", decode_kernel="flex", dtype=torch.float32, use_norm=True,
+        train_kernel="reference", decode_kernel="flex", dtype=torch.float32,
         hidden_dim=_HIDDEN,
         num_layers=2,
         num_heads=2,
@@ -37,7 +37,7 @@ def _tiny_model(*, num_thoughts: int = 2, with_reasoner: bool = True) -> Model:
         in_features=_HIDDEN,
         out_features=_ACTIONS,
         hidden_dim=_HIDDEN,
-        num_layers=1, use_norm=True,
+        num_layers=1,
         propagate_gradient=1.0,
     )
     reasoner = (

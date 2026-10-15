@@ -113,7 +113,7 @@ _TOK = _head_output_tokenizer("action", "observation", "episode_done")
 
 def _tiny_model(*, with_reasoner: bool = False) -> Model:
     backbone = TransformerBackbone(architecture="llama",
-        train_kernel="reference", decode_kernel="flex", dtype=torch.float32, use_norm=True,
+        train_kernel="reference", decode_kernel="flex", dtype=torch.float32,
         hidden_dim=_HIDDEN,
         num_layers=2,
         num_heads=2,
@@ -123,7 +123,7 @@ def _tiny_model(*, with_reasoner: bool = False) -> Model:
         in_features=_HIDDEN,
         out_features=_ACTIONS,
         hidden_dim=_HIDDEN,
-        num_layers=1, use_norm=True,
+        num_layers=1,
         propagate_gradient=1.0,
     )
     reasoner = (
@@ -318,12 +318,12 @@ def test_get_action_uses_last_valid_head_output_not_last_token() -> None:
     torch.manual_seed(0)
     hidden = _HIDDEN
     backbone = TransformerBackbone(architecture="llama",
-        train_kernel="reference", decode_kernel="flex", dtype=torch.float32, use_norm=True,
+        train_kernel="reference", decode_kernel="flex", dtype=torch.float32,
         hidden_dim=hidden, num_layers=2, num_heads=2, max_position_embeddings=128, vocab_size=32)
     model = Model(
         backbone=backbone,
         heads=(head := RegressionHead(
-            in_features=hidden, out_features=_ACTIONS, hidden_dim=hidden, num_layers=1, use_norm=True,
+            in_features=hidden, out_features=_ACTIONS, hidden_dim=hidden, num_layers=1,
             propagate_gradient=1.0,
         )),
         action_source="action_value",

@@ -17,7 +17,6 @@ def _filled_head(*, propagate_gradient: float) -> RegressionHead:
         out_features=4,
         hidden_dim=8,
         num_layers=1,
-        use_norm=False,
         scale=1.0,
         propagate_gradient=propagate_gradient,
     )
@@ -68,7 +67,6 @@ def test_propagate_gradient_rejects_bad_values(bad: object) -> None:
             out_features=4,
             hidden_dim=8,
             num_layers=1,
-            use_norm=True,
             propagate_gradient=bad,  # type: ignore[arg-type]
         )
 
@@ -112,7 +110,6 @@ def test_classification_head_accepts_propagate_gradient() -> None:
         out_features=4,
         hidden_dim=8,
         num_layers=1,
-        use_norm=True,
         propagate_gradient=0.0,
     )
     assert head.propagate_gradient == 0.0

@@ -35,7 +35,6 @@ class DiscretizedActionHead(RegressionHead):
         action_vectors: torch.Tensor,
         hidden_dim: int,
         num_layers: int,
-        use_norm: bool,
         propagate_gradient: float,
         scale: float = 1.0,
     ) -> None:
@@ -54,7 +53,6 @@ class DiscretizedActionHead(RegressionHead):
             out_features=table.shape[0],
             hidden_dim=hidden_dim,
             num_layers=num_layers,
-            use_norm=use_norm,
             propagate_gradient=propagate_gradient,
             scale=scale,
         )

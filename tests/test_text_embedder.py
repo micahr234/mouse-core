@@ -1032,12 +1032,12 @@ def test_text_tokenizer_keeps_length_one_vector_as_vector() -> None:
 
 
 def test_text_model_card_describes_tokenizer(tmp_path) -> None:
-    from mouse_core.models.base import _write_model_card
+    from mouse_core.models.io import _write_model_card
 
     model = Model(
         backbone=IdentityBackbone(hidden_dim=8, vocab_size=16),
         heads=(head := RegressionHead(
-            in_features=8, out_features=4, hidden_dim=8, num_layers=1, use_norm=True,
+            in_features=8, out_features=4, hidden_dim=8, num_layers=1,
             propagate_gradient=1.0,
         )),
         action_source="action_value",

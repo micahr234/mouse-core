@@ -33,8 +33,8 @@ _TOK = token_tokenizer("action", "episode_done")
 
 def _tiny_model(architecture: Literal["llama", "qwen3"] = "qwen3", tokens: int=1, dtype: torch.dtype = torch.float32, train_kernel: TrainKernel = "reference", **backbone_kwargs) -> Model:
     hidden_dim = 16
-    backbone = TransformerBackbone(architecture=architecture, train_kernel=train_kernel, decode_kernel="flex", dtype=dtype, use_norm=True, hidden_dim=hidden_dim, num_layers=2, num_heads=2, vocab_size=32, **backbone_kwargs)
-    head = RegressionHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, use_norm=True, propagate_gradient=1.0)
+    backbone = TransformerBackbone(architecture=architecture, train_kernel=train_kernel, decode_kernel="flex", dtype=dtype, hidden_dim=hidden_dim, num_layers=2, num_heads=2, vocab_size=32, **backbone_kwargs)
+    head = RegressionHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, propagate_gradient=1.0)
     return Model(backbone=backbone, heads=head, action_source="action_value", reasoner=None).eval()
 
 def _steps(n: int, start: int=0) -> list[dict]:
@@ -140,13 +140,13 @@ def test_cuda_bf16_lora_compiled_train_matches_cached_decode() -> None:
     torch.manual_seed(5)
     hidden_dim = 64
     backbone = TransformerBackbone(architecture="qwen3", 
-        train_kernel="varlen", decode_kernel="flex", dtype=torch.bfloat16, use_norm=True,
+        train_kernel="varlen", decode_kernel="flex", dtype=torch.bfloat16,
         hidden_dim=hidden_dim,
         num_layers=2,
         num_heads=4,
         lora=LoRAConfig(rank=4, alpha=8.0), vocab_size=32)
     head = RegressionHead(
-        in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, use_norm=True,
+        in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1,
         propagate_gradient=1.0,
     )
     model = Model(backbone=backbone, heads=head, action_source="action_value", reasoner=None).eval().to(torch.device('cuda'))
@@ -240,7 +240,7 @@ def test_cuda_step_cudagraph_matches_eager_decode(S: int) -> None:
     torch.manual_seed(0)
     device = torch.device('cuda')
     backbone = TransformerBackbone(architecture="qwen3", 
-        train_kernel="varlen", decode_kernel="flex", dtype=torch.bfloat16, use_norm=True,
+        train_kernel="varlen", decode_kernel="flex", dtype=torch.bfloat16,
         hidden_dim=64, num_layers=2, num_heads=4, lora=LoRAConfig(rank=4, alpha=8.0)).to(device).eval()
     for n, p in backbone.named_parameters():
         if ".lora_B." in n:
@@ -292,7 +292,7 @@ def test_cuda_step_graph_survives_chunk_shape_change() -> None:
     torch.manual_seed(0)
     device = torch.device('cuda')
     backbone = TransformerBackbone(architecture="qwen3", 
-        train_kernel="varlen", decode_kernel="flex", dtype=torch.bfloat16, use_norm=True,
+        train_kernel="varlen", decode_kernel="flex", dtype=torch.bfloat16,
         hidden_dim=64, num_layers=2, num_heads=4).to(device).eval()
     inner = cast(nn.Module, cast(Any, backbone).model)
     B, D = 2, 64
@@ -335,7 +335,7 @@ def _cuda_graph_session(batch_size: int = 2) -> tuple[Any, torch.device, int]:
 
     device = torch.device("cuda")
     backbone = TransformerBackbone(architecture="qwen3", 
-        train_kernel="varlen", decode_kernel="flex", dtype=torch.bfloat16, use_norm=True,
+        train_kernel="varlen", decode_kernel="flex", dtype=torch.bfloat16,
         hidden_dim=64, num_layers=2, num_heads=4, lora=LoRAConfig(rank=4, alpha=8.0)).to(device).eval()
     inner = cast(nn.Module, cast(Any, backbone).model)
     return FlexDecodeSession(inner, batch_size=batch_size), device, 64

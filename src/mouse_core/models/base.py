@@ -1,11 +1,10 @@
+"""Composable model execution, head readout, and delayed model copies."""
+
 from __future__ import annotations
 
 import copy
-import json
-import tempfile
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass
-from pathlib import Path
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Self, cast
 
 import numpy as np
@@ -14,675 +13,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from mouse_core.models.backbone.base import Backbone, _reject_dtype_cast
-from mouse_core.models.backbone.flex_decode import DecodeKernel, FlexDecodeSession, packed_rope_positions
-from mouse_core.models.backbone.packed_train import TrainKernel
+from mouse_core.models.backbone.flex_decode import FlexDecodeSession, packed_rope_positions
 from mouse_core.models.heads.base import BaseHead, _bind_prediction_key
 from mouse_core.models.heads.classification import ClassificationHead
-from mouse_core.models.heads.discretized_action import DiscretizedActionHead
 from mouse_core.models.heads.regression import RegressionHead
-from mouse_core.models.lora import LoRAConfig
+from mouse_core.models.projection import ProjectionHead
 from mouse_core.models.reasoner import LatentReasoner, _InsertionPlan, _plan_insertions
 
 if TYPE_CHECKING:
     from mouse_core.data.token_batch import TokenBatch
-    from mouse_core.data.tokenizer import Tokenizer
-
-
-def _hub_repo_id_for_user(repo_id: str, token: str | bool | None = None) -> str:
-    """Resolve an unscoped Hub repo name under the authenticated user."""
-    if "/" in repo_id:
-        return repo_id
-
-    from huggingface_hub import HfApi
-
-    user = HfApi().whoami(token=token)["name"]
-    return f"{user}/{repo_id}"
-
-
-def save_model(*, model: "Model", path: str | Path) -> None:
-    """Save a MOUSE model checkpoint to a directory.
-
-    Writes ``pytorch_model.bin`` and ``config.json`` into *path*. The
-    packing spec is a separate object — :func:`~mouse_core.data.tokenizer.save_tokenizer`
-    / :func:`~mouse_core.data.tokenizer.load_tokenizer`.
-
-    Args:
-        model: The model instance to save.
-        path: Destination directory (created if absent).
-
-    Example::
-
-        save_model(model=model, path="./checkpoints/step-10000")
-        save_tokenizer(tokenizer=tokenizer, path="./checkpoints/step-10000-tokenizer")
-        model2 = load_model(
-            repo_id_or_path="./checkpoints/step-10000",
-            train_kernel="flex", decode_kernel="flex", dtype=torch.float32,
-        )
-        tokenizer2 = load_tokenizer(repo_id_or_path="./checkpoints/step-10000-tokenizer")
-    """
-    path = Path(path)
-    path.mkdir(parents=True, exist_ok=True)
-    with (path / "config.json").open("w") as fh:
-        json.dump(_model_config(model), fh, indent=2, sort_keys=True)
-        fh.write("\n")
-    torch.save(model.state_dict(), path / "pytorch_model.bin")
-
-
-def _create_hub_repo(
-    *,
-    repo_id: str,
-    private: bool,
-    clear: bool,
-    token: str | bool | None,
-) -> tuple[str, str]:
-    """Create or open a Hub repo, optionally clearing it. Returns ``(url, hub_repo_id)``."""
-    from huggingface_hub import HfApi
-
-    api = HfApi()
-    repo_url = api.create_repo(
-        repo_id=repo_id,
-        private=private,
-        exist_ok=True,
-        token=token,
-    )
-    hub_repo_id = repo_url.repo_id
-    if clear:
-        # huggingface_hub never deletes .gitattributes, so exclude it from the
-        # list to avoid a spurious "no files modified" warning when it is the
-        # only file present (e.g. a freshly created repo).
-        existing = [f for f in api.list_repo_files(hub_repo_id) if f != ".gitattributes"]
-        if existing:
-            api.delete_files(
-                repo_id=hub_repo_id,
-                delete_patterns=existing,
-                commit_message="Clear repository before upload",
-            )
-    return str(repo_url), hub_repo_id
-
-
-def push_model_to_hub(
-    *,
-    model: "Model",
-    tokenizer: "Tokenizer",
-    repo_id: str,
-    tokenizer_repo_id: str,
-    commit_message: str = "Upload MOUSE model",
-    tokenizer_commit_message: str = "Upload MOUSE tokenizer",
-    private: bool = False,
-    clear: bool = False,
-    **kwargs: Any,
-) -> tuple[str, str]:
-    """Push a MOUSE model and its tokenizer to two Hugging Face Hub repos.
-
-    The tokenizer is a separate object and a separate repository — it is
-    not written into the model checkpoint. :func:`load_model` reads
-    *repo_id*; :func:`~mouse_core.data.tokenizer.load_tokenizer` reads
-    *tokenizer_repo_id*.
-
-    Args:
-        model: The model instance to upload.
-        tokenizer: The :class:`~mouse_core.data.tokenizer.Tokenizer` used
-            to pack steps for this model. Required — a different object
-            from *model*, uploaded to *tokenizer_repo_id*.
-        repo_id: Hub repository ID for the model, e.g. ``"my-model"`` or
-            ``"your-org/your-model"``. Unscoped names are resolved under
-            the authenticated user.
-        tokenizer_repo_id: Hub repository ID for the packing spec. Must
-            differ from *repo_id*.
-        commit_message: Commit message for the model repo.
-        tokenizer_commit_message: Commit message for the tokenizer repo.
-        private: Create private repositories if they do not already exist.
-        clear: Delete all existing files in each repository before uploading.
-        **kwargs: Forwarded to ``huggingface_hub.HfApi.upload_folder``.
-
-    Returns:
-        ``(model_url, tokenizer_url)`` Hub URL strings.
-
-    Example::
-
-        model_url, tokenizer_url = push_model_to_hub(
-            model=model,
-            tokenizer=tokenizer,
-            repo_id="my-model",
-            tokenizer_repo_id="my-tokenizer",
-            clear=True,
-        )
-    """
-    from huggingface_hub import HfApi
-
-    from mouse_core.data.tokenizer import Tokenizer, save_tokenizer
-
-    if not isinstance(tokenizer, Tokenizer):
-        raise TypeError(
-            f"push_model_to_hub requires tokenizer= to be a Tokenizer, got {type(tokenizer).__name__}."
-        )
-    if repo_id == tokenizer_repo_id:
-        raise ValueError(
-            "tokenizer_repo_id must be a different Hub repo than repo_id; "
-            f"got {repo_id!r} for both."
-        )
-    token = kwargs.get("token")
-    model_url, hub_model_id = _create_hub_repo(
-        repo_id=repo_id, private=private, clear=clear, token=token
-    )
-    tokenizer_url, hub_tok_id = _create_hub_repo(
-        repo_id=tokenizer_repo_id, private=private, clear=clear, token=token
-    )
-    if hub_model_id == hub_tok_id:
-        raise ValueError(
-            "tokenizer_repo_id resolved to the same Hub repo as repo_id "
-            f"({hub_model_id!r}); pass a different tokenizer_repo_id."
-        )
-    api = HfApi()
-    with tempfile.TemporaryDirectory() as model_tmp, tempfile.TemporaryDirectory() as tok_tmp:
-        save_model(model=model, path=model_tmp)
-        _write_model_card(
-            repo_id=hub_model_id,
-            tokenizer_repo_id=hub_tok_id,
-            model=model,
-            path=Path(model_tmp) / "README.md",
-        )
-        save_tokenizer(tokenizer=tokenizer, path=tok_tmp)
-        _write_tokenizer_card(repo_id=hub_tok_id, path=Path(tok_tmp) / "README.md")
-        api.upload_folder(
-            repo_id=hub_model_id,
-            folder_path=model_tmp,
-            commit_message=commit_message,
-            **kwargs,
-        )
-        api.upload_folder(
-            repo_id=hub_tok_id,
-            folder_path=tok_tmp,
-            commit_message=tokenizer_commit_message,
-            **kwargs,
-        )
-    return model_url, tokenizer_url
-
-
-def _write_model_card(
-    *,
-    model: "Model",
-    path: Path,
-    repo_id: str,
-    tokenizer_repo_id: str,
-) -> None:
-    config = _model_config(model)
-    heads = config["heads"]["heads"]
-    head_names = ", ".join(head["name"] for head in heads) or "none"
-    reasoner_cfg = config.get("reasoner")
-    reasoner_line = (
-        f"\n- Latent reasoner: `num_thoughts={reasoner_cfg['num_thoughts']}`"
-        if reasoner_cfg
-        else ""
-    )
-    lora_cfg = config["backbone"].get("lora")
-    if lora_cfg:
-        reasoner_line += (
-            f"\n- LoRA: `rank={lora_cfg['rank']}`, `alpha={lora_cfg['alpha']}` "
-            f"on every backbone `nn.Linear` (fp32 adapters over frozen base weights)"
-        )
-    encoder_section, tokenizer_snippet, objective_data_example = _model_card_encoder_bits(
-        config, tokenizer_repo_id=tokenizer_repo_id
-    )
-    text = f"""---
-library_name: mouse-core
-tags:
-- mouse-core
-- reinforcement-learning
----
-
-# {repo_id}
-
-This repository contains a MOUSE model checkpoint. The packing spec
-lives in a separate repo (`{tokenizer_repo_id}`).
-
-## Architecture
-
-- Backbone: `{config["backbone"]["type"]}`
-- Hidden dimension: `{config["hidden_dim"]}`
-- Heads: `{head_names}`
-- Action source: `{config["heads"]["action_source"]}`{reasoner_line}
-
-### Token embeddings
-
-{encoder_section}
-
-## Install MouseCore
-
-```bash
-pip install mouse-core
-```
-
-## Load The Model
-
-```python
-import torch
-from mouse_core import load_model
-from mouse_core.models import preferred_dtype
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = (
-    load_model(
-        repo_id_or_path="{repo_id}",
-        train_kernel="flex",
-        decode_kernel="flex",
-        dtype=preferred_dtype(device=device),
-        map_location="cpu",
-    )
-    .eval()
-    .to(device)
-)
-```
-
-## Run Inference
-
-Training and inference both take a `TokenBatch`. Training typically uses
-`DataLoader(transform=compose(stages=(augmenter, tokenizer)))`. Online / inference
-uses the tokenizer (no augmenter → `StepTokens`) and
-`pack_token_batch` when combining steps. The packing spec is a
-separate Hub repo — `load_tokenizer` on `{tokenizer_repo_id}`.
-
-```python
-{tokenizer_snippet}
-
-{objective_data_example}
-
-with torch.no_grad():
-    steps = [eval_transform(step) for step in batch[0]]
-    inputs, _, _ = pack_token_batch(steps=steps, group_ids=[0] * len(steps), continuing=None)
-    out = model(inputs, use_cache=True)
-    action = model.get_action(out=out, temperature=0.0)
-```
-
-`model()` returns a `ModelOutput` with `predictions` and
-`last_hidden_state`. `pack_token_batch` /
-`DataLoader.next_batch()` return `(inputs, objective_data, group_id)`;
-pass `objective_data` and `group_id` to DQN, PPO, and GRPO during
-training. For cached incremental
-rollout, pass ``out.cache`` back as ``cache=`` with `use_cache=True`.
-Cached batch rows may have different
-lengths on every call (e.g. envs emitting different numbers of steps between
-model calls): decoding runs through a FlexAttention session carried in the
-cache, so each row decodes exactly as it would alone.
-"""
-    path.write_text(text, encoding="utf-8")
-
-
-def _write_tokenizer_card(*, path: Path, repo_id: str) -> None:
-    path.write_text(
-        f"""---
-library_name: mouse-core
-tags:
-- mouse-core
-- tokenizer
----
-
-# {repo_id}
-
-MOUSE tokenizer packing spec (`tokenizer.json`). Load with:
-
-```python
-from mouse_core.data import load_tokenizer
-
-tokenizer = load_tokenizer(repo_id_or_path="{repo_id}")
-```
-""",
-        encoding="utf-8",
-    )
-
-
-def _config_num_frequencies(config: dict[str, Any]) -> int | None:
-    backbone = config["backbone"]
-    if backbone.get("type") == "identity":
-        value = backbone.get("num_frequencies")
-    else:
-        value = backbone.get("kwargs", {}).get("num_frequencies")
-    if value is None:
-        return None
-    return int(value)
-
-
-def _model_card_encoder_bits(
-    config: dict[str, Any], *, tokenizer_repo_id: str
-) -> tuple[str, str, str]:
-    """Return ``(encoder_section, tokenizer_snippet, step_example)`` for the card."""
-    hidden = config["hidden_dim"]
-    tokenizer_snippet = (
-        "from mouse_core.data import load_tokenizer, pack_token_batch\n"
-        "\n"
-        f'tokenizer = load_tokenizer(repo_id_or_path="{tokenizer_repo_id}")\n'
-        "eval_transform = tokenizer"
-    )
-    num_frequencies = _config_num_frequencies(config)
-    fourier_note = ""
-    if num_frequencies is not None:
-        fourier_note = (
-            f" `__numeric__` tokens use the same table, then add a Fourier "
-            f"projection of the scaled value (`num_frequencies={num_frequencies}`)."
-        )
-    encoder_section = (
-        f"The backbone looks up `__text__` and image-field token ids in a "
-        f"tokenized :class:`~mouse_core.data.token_batch.TokenBatch` through "
-        f"its `embed_tokens` table ({hidden}-dimensional).{fourier_note} Step templates "
-        f"and field packing live on `Tokenizer` (a separate Hub repo, "
-        f"`{tokenizer_repo_id}`)."
-    )
-    step_example = """# load_tokenizer(repo) is the same packing spec used at train time.
-batch = [[
-    {
-        "action": 0,
-        "observation": 1,
-        "reward": 0.0,
-        "terminated": False,
-        "truncated": False,
-        "task_index": 0,
-    }
-]]"""
-    return encoder_section, tokenizer_snippet, step_example
-
-
-def _model_config(model: "Model") -> dict[str, Any]:
-    config: dict[str, Any] = {
-        "format": "mouse-core-model-v1",
-        "hidden_dim": int(model.hidden_dim),
-        "backbone": _backbone_config(model.backbone),
-        "heads": _heads_config(model),
-    }
-    if model.reasoner is not None:
-        config["reasoner"] = {"num_thoughts": int(model.reasoner.num_thoughts)}
-    return config
-
-
-def _backbone_config(backbone: nn.Module) -> dict[str, Any]:
-    from mouse_core.models.backbone.none import IdentityBackbone
-
-    if isinstance(backbone, IdentityBackbone):
-        config: dict[str, Any] = {
-            "type": "identity",
-            "hidden_dim": backbone.hidden_dim,
-            "vocab_size": backbone.vocab_size,
-        }
-        if backbone.num_frequencies is not None:
-            config["num_frequencies"] = backbone.num_frequencies
-        return config
-    from mouse_core.models.backbone.transformer import TransformerBackbone
-
-    if isinstance(backbone, TransformerBackbone):
-        config = {
-            "type": "transformer",
-            "architecture": backbone.architecture,
-            "hidden_dim": backbone.hidden_dim,
-            "kwargs": dict(backbone._config_kwargs),
-        }
-        if backbone.lora is not None:
-            config["lora"] = asdict(backbone.lora)
-        return config
-    raise TypeError(
-        "save_model currently supports IdentityBackbone and TransformerBackbone. "
-        f"Got {type(backbone).__name__}."
-    )
-
-
-def _heads_config(model: "Model") -> dict[str, Any]:
-    heads = []
-    for name, head in model._heads.items():
-        spec = _head_config(name, head)
-        if spec is not None:
-            heads.append(spec)
-    return {"action_source": model.action_source, "heads": heads}
-
-
-def _head_config(name: str, head: BaseHead) -> dict[str, Any] | None:
-    if isinstance(head, ClassificationHead):
-        return {
-            "name": name,
-            "type": "classification",
-            "in_features": head.in_features,
-            "out_features": head.out_features,
-            "hidden_dim": head.hidden_dim,
-            "num_layers": head.num_layers,
-            "scale": head.scale,
-            "use_norm": head.use_norm,
-            "propagate_gradient": head.propagate_gradient,
-        }
-    if isinstance(head, RegressionHead):
-        spec = {
-            "name": name,
-            "type": "discretized_action" if isinstance(head, DiscretizedActionHead) else "regression",
-            "in_features": head.in_features,
-            "out_features": head.out_features,
-            "hidden_dim": head.hidden_dim,
-            "num_layers": head.num_layers,
-            "scale": head.scale,
-            "use_norm": head.use_norm,
-            "propagate_gradient": head.propagate_gradient,
-        }
-        if isinstance(head, DiscretizedActionHead):
-            spec["action_dim"] = head.action_dim
-        return spec
-    raise TypeError(f"save_model does not know how to serialize head {name!r} ({type(head).__name__}).")
-
-
-def _drop_none(data: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in data.items() if value is not None}
-
-
-def load_model(
-    *,
-    repo_id_or_path: str,
-    train_kernel: TrainKernel,
-    decode_kernel: DecodeKernel,
-    dtype: torch.dtype,
-    train_autocast_dtype: torch.dtype | None = None,
-    decode_autocast_dtype: torch.dtype | None = None,
-    force_download: bool = True,
-    local_dir: str | Path | None = None,
-    **kwargs: Any,
-) -> "Model":
-    """Load a MOUSE model from a local directory or HuggingFace Hub repo.
-
-    Args:
-        repo_id_or_path: A local path to a checkpoint directory or a HF Hub
-            repo id (e.g. ``"my-model"`` or ``"your-org/your-model"``).
-            Unscoped Hub names are resolved under the authenticated user.
-        train_kernel: Kernel for the uncached (packed) forward of a
-            transformer backbone: ``"varlen"``, ``"padded"``, ``"flex"``, or
-            ``"reference"``. Strict — a kernel that cannot run on the current
-            device/dtype raises instead of falling back.
-        decode_kernel: Kernel for cached decode, ``"flex"``.
-        dtype: Dtype of the transformer backbone's base weights
-            (``preferred_dtype(device=device)`` for inference or a LoRA base,
-            ``torch.float32`` to fine-tune them). The saved weights are cast
-            into it.
-        train_autocast_dtype: ``torch.bfloat16`` / ``torch.float16``
-            declares bf16/fp16 mixed precision for the packed training
-            forward of a fp32 backbone; ``None`` (default) trains in the
-            base dtype.
-        decode_autocast_dtype: The same declaration for cached decode
-            (which also allocates its KV pool in the autocast dtype);
-            ``None`` (default) decodes in the base dtype.
-
-            All of these are execution choices for the loading machine, not
-            model properties, so they are never stored in the checkpoint and
-            must be given here (ignored by backbones without a transformer
-            stack).
-        force_download: If ``True`` (default), bypass the HF Hub cache and re-download.
-            Ignored for local paths.
-        local_dir: Directory where Hub files are saved after download.
-            Ignored for local paths.
-        **kwargs: Supports ``map_location`` for ``torch.load`` and forwards Hub
-            download kwargs such as ``revision`` or ``token``.
-
-    Returns:
-        The loaded model instance.
-    """
-    map_location = kwargs.pop("map_location", "cpu")
-    local = Path(repo_id_or_path)
-    if local.exists():
-        config_path = local / "config.json"
-        weights_path = local / "pytorch_model.bin"
-        with config_path.open() as fh:
-            config = json.load(fh)
-    else:
-        from huggingface_hub import hf_hub_download
-        hf_kwargs: dict[str, Any] = {"force_download": force_download, **kwargs}
-        if local_dir is not None:
-            hf_kwargs["local_dir"] = str(local_dir)
-        hub_repo_id = _hub_repo_id_for_user(repo_id_or_path, token=kwargs.get("token"))
-        config_path = Path(hf_hub_download(repo_id=hub_repo_id, filename="config.json", **hf_kwargs))
-        weights_path = Path(hf_hub_download(repo_id=hub_repo_id, filename="pytorch_model.bin", **hf_kwargs))
-        with config_path.open() as fh:
-            config = json.load(fh)
-
-    if config.get("format") != "mouse-core-model-v1":
-        raise ValueError(
-            "Unsupported model config format. Expected a MOUSE checkpoint saved "
-            "with save_model(...)."
-        )
-
-    state = torch.load(weights_path, map_location=map_location)
-    model = _build_model_from_config(
-        config,
-        state=state,
-        train_kernel=train_kernel,
-        decode_kernel=decode_kernel,
-        dtype=dtype,
-        train_autocast_dtype=train_autocast_dtype,
-        decode_autocast_dtype=decode_autocast_dtype,
-    )
-    model.load_state_dict(state)
-    return model
-
-
-def _build_model_from_config(
-    config: dict[str, Any],
-    *,
-    state: Mapping[str, torch.Tensor],
-    train_kernel: TrainKernel,
-    decode_kernel: DecodeKernel,
-    dtype: torch.dtype,
-    train_autocast_dtype: torch.dtype | None,
-    decode_autocast_dtype: torch.dtype | None,
-) -> "Model":
-    backbone = _build_backbone_from_config(
-        config["backbone"],
-        train_kernel=train_kernel,
-        decode_kernel=decode_kernel,
-        dtype=dtype,
-        train_autocast_dtype=train_autocast_dtype,
-        decode_autocast_dtype=decode_autocast_dtype,
-    )
-    heads_cfg = config["heads"]
-    heads = _build_heads_from_config(heads_cfg["heads"], state=state)
-    reasoner_cfg = config.get("reasoner")
-    reasoner = (
-        LatentReasoner(
-            hidden_dim=int(config["hidden_dim"]),
-            num_thoughts=int(reasoner_cfg["num_thoughts"]),
-        )
-        if reasoner_cfg is not None
-        else None
-    )
-    action_name = heads_cfg["action_source"]
-    if action_name not in heads:
-        raise ValueError(
-            f"saved action_source {action_name!r} is not among loaded heads {tuple(heads)}."
-        )
-    return Model(
-        backbone=backbone,
-        heads=heads,
-        action_source=action_name,
-        reasoner=reasoner,
-    )
-
-
-def _build_backbone_from_config(
-    config: dict[str, Any],
-    *,
-    train_kernel: TrainKernel,
-    decode_kernel: DecodeKernel,
-    dtype: torch.dtype,
-    train_autocast_dtype: torch.dtype | None,
-    decode_autocast_dtype: torch.dtype | None,
-) -> Backbone:
-    backbone_type = config.get("type")
-    if backbone_type == "identity":
-        from mouse_core.models.backbone import IdentityBackbone
-
-        identity_kwargs: dict[str, Any] = {}
-        if "num_frequencies" in config:
-            identity_kwargs["num_frequencies"] = int(config["num_frequencies"])
-        return IdentityBackbone(
-            hidden_dim=int(config["hidden_dim"]),
-            vocab_size=int(config["vocab_size"]),
-            **identity_kwargs,
-        )
-    lora_cfg = config.get("lora")
-    lora = LoRAConfig(**lora_cfg) if lora_cfg is not None else None
-    runtime: dict[str, Any] = dict(
-        train_kernel=train_kernel,
-        decode_kernel=decode_kernel,
-        dtype=dtype,
-        train_autocast_dtype=train_autocast_dtype,
-        decode_autocast_dtype=decode_autocast_dtype,
-    )
-    if backbone_type == "transformer":
-        from mouse_core.models.backbone import TransformerBackbone
-
-        return TransformerBackbone(
-            hidden_dim=config["hidden_dim"],
-            architecture=config["architecture"],
-            lora=lora,
-            **runtime,
-            **config["kwargs"],
-        )
-    raise ValueError(f"Unsupported backbone type {backbone_type!r}.")
-
-
-def _build_heads_from_config(
-    heads: list[dict[str, Any]], *, state: Mapping[str, torch.Tensor],
-) -> dict[str, BaseHead]:
-    built: dict[str, BaseHead] = {}
-    for spec in heads:
-        name = spec["name"]
-        head_type = spec["type"]
-        if head_type == "classification":
-            built[name] = ClassificationHead(
-                in_features=spec["in_features"],
-                out_features=spec["out_features"],
-                hidden_dim=spec["hidden_dim"],
-                num_layers=spec["num_layers"],
-                scale=spec.get("scale", 1.0),
-                use_norm=spec["use_norm"],
-                propagate_gradient=spec["propagate_gradient"],
-            )
-        elif head_type == "discretized_action":
-            # The table lives once in the checkpoint, as a persistent buffer.
-            table = state[f"heads.{name}.action_vectors"]
-            if tuple(table.shape) != (spec["out_features"], spec["action_dim"]):
-                raise ValueError(f"Action table shape for head {name!r} does not match its config.")
-            built[name] = DiscretizedActionHead(
-                in_features=spec["in_features"],
-                action_vectors=table,
-                hidden_dim=spec["hidden_dim"],
-                num_layers=spec["num_layers"],
-                scale=spec.get("scale", 1.0),
-                use_norm=spec["use_norm"],
-                propagate_gradient=spec["propagate_gradient"],
-            )
-        elif head_type == "regression":
-            built[name] = RegressionHead(
-                in_features=spec["in_features"],
-                out_features=spec["out_features"],
-                hidden_dim=spec["hidden_dim"],
-                num_layers=spec["num_layers"],
-                scale=spec.get("scale", 1.0),
-                use_norm=spec["use_norm"],
-                propagate_gradient=spec["propagate_gradient"],
-            )
-        else:
-            raise ValueError(f"Unsupported head type {head_type!r}.")
-    return built
 
 
 def _last_hidden(
@@ -774,9 +113,9 @@ class ModelOutput:
 
 
 class Model(nn.Module):
-    """Composable MOUSE model: backbone and heads as distinct sections.
+    """Composable MOUSE model with an optional shared projection before heads.
 
-    The model is assembled from two pluggable parts:
+    The model is assembled from pluggable parts:
 
     - ``backbone``: a :class:`~mouse_core.models.backbone.Backbone` that
       embeds a :class:`~mouse_core.data.token_batch.TokenBatch` and maps
@@ -799,6 +138,9 @@ class Model(nn.Module):
     ``action_source`` is the ``heads`` dict key ``get_action`` consults.
     Required.
     ``reasoner`` is required (pass ``None`` when unused).
+    ``projection`` optionally applies a :class:`ProjectionHead` to pooled
+    backbone states before every prediction head. It has its own optimizer
+    parameter group and Polyak rate; omit it to keep the direct readout.
 
     Full construction::
 
@@ -815,107 +157,11 @@ class Model(nn.Module):
     ``forward`` returns a :class:`ModelOutput` with ``predictions`` and
     ``last_hidden_state``.
     The delayed DQN model comes from :meth:`copy`, which names every
-    section (``heads``, ``backbone``, ``reasoner``). Copied sections are
+    section (``heads``, ``backbone``, ``reasoner``, and ``projection`` when
+    present). Copied sections are
     frozen; uncopied sections stay this model's modules.
     :func:`~mouse_core.polyak.model_polyak` interpolates only copied sections.
     """
-
-    @staticmethod
-    def _normalize_heads(
-        heads: BaseHead | list[BaseHead] | Mapping[str, BaseHead | None] | None,
-    ) -> dict[str, BaseHead]:
-        """Convert the flexible ``heads=`` argument into the internal ``name -> head`` dict.
-
-        Supported inputs:
-          - dict (caller-chosen names to head or None): passed through.
-          - single BaseHead instance: becomes the only head; name is inferred
-            from type (``action_value`` / ``action``).
-          - list/tuple of BaseHead: each gets an inferred name.
-        """
-        if heads is None:
-            return {}
-
-        # Dict form gives full control over names.
-        if isinstance(heads, Mapping):
-            filtered: dict[str, BaseHead] = {}
-            for name, h in heads.items():
-                if h is not None:
-                    if not isinstance(name, str) or not name:
-                        raise ValueError(
-                            f"head name must be a non-empty string, got {name!r}"
-                        )
-                    if not isinstance(h, BaseHead):
-                        raise TypeError(f"head {name!r} must be a BaseHead or None, got {type(h)}")
-                    filtered[name] = h
-            return filtered
-
-        # Single head instance gives an implicit single-head model.
-        if isinstance(heads, BaseHead):
-            return {Model._infer_head_name(heads): heads}
-
-        # List of heads → names inferred from type.
-        if isinstance(heads, (list, tuple)):
-            if len(heads) == 0:
-                return {}
-            result: dict[str, BaseHead] = {}
-            for h in heads:
-                if not isinstance(h, BaseHead):
-                    raise TypeError(f"items in heads list must be BaseHead instances, got {type(h)}")
-                nm = Model._infer_head_name(h)
-                if nm in result:
-                    raise ValueError(
-                        f"Multiple heads would map to the same inferred name {nm!r}. "
-                        "Use a dict form to provide distinct names, e.g. "
-                        "heads={'action_value': h1, 'action': h2}."
-                    )
-                result[nm] = h
-            return result
-
-        raise TypeError(
-            f"heads must be a BaseHead, list[BaseHead], or dict[str, BaseHead|None], "
-            f"got {type(heads)}"
-        )
-
-    @staticmethod
-    def _infer_head_name(head: BaseHead) -> str:
-        """Infer a default storage key from the head type when no dict key is given.
-
-        ``RegressionHead`` → ``action_value``, ``ClassificationHead``
-        → ``action``.
-        """
-        if isinstance(head, ClassificationHead):
-            return "action"
-        if isinstance(head, RegressionHead):
-            return "action_value"
-        raise TypeError(
-            f"Cannot infer a name for head of type {type(head).__name__}. "
-            "Use the dict form with an explicit key."
-        )
-
-    @staticmethod
-    def _head_name(heads: Mapping[str, BaseHead], head: BaseHead, *, what: str) -> str:
-        """Resolve a head instance to the storage key of that same object."""
-        if not isinstance(head, BaseHead):
-            raise TypeError(f"{what} must be a BaseHead instance, got {type(head).__name__}.")
-        for name, existing in heads.items():
-            if existing is head:
-                return name
-        raise ValueError(
-            f"{what} is not one of the heads passed to heads=; pass the same instance."
-        )
-
-    @staticmethod
-    def _require_action_source(heads: Mapping[str, BaseHead], action_source: str) -> str:
-        """Require ``action_source`` to be a key in ``heads``."""
-        if not isinstance(action_source, str) or not action_source:
-            raise TypeError(
-                f"action_source must be a non-empty string, got {action_source!r}."
-            )
-        if action_source not in heads:
-            raise ValueError(
-                f"action_source {action_source!r} is not among heads {tuple(heads)}."
-            )
-        return action_source
 
     def __init__(
         self,
@@ -924,11 +170,12 @@ class Model(nn.Module):
         heads: BaseHead | list[BaseHead] | Mapping[str, BaseHead | None],
         action_source: str,
         reasoner: LatentReasoner | None,
+        projection: ProjectionHead | None = None,
     ):
         """Construct a Model from backbone and heads.
 
-        Every argument is required. ``reasoner`` enables Coconut-style latent
-        reasoning via ``forward(batch, reasoning=...)``. Pass ``None`` when
+        All arguments except ``projection`` are required. ``reasoner`` enables
+        Coconut-style latent reasoning via ``forward(batch, reasoning=...)``. Pass ``None`` when
         unused.
         """
         super().__init__()
@@ -943,6 +190,18 @@ class Model(nn.Module):
 
         self.backbone: Backbone = backbone
 
+        if projection is not None:
+            if not isinstance(projection, ProjectionHead):
+                raise TypeError(
+                    f"projection must be a ProjectionHead, got {type(projection).__name__}."
+                )
+            if projection.in_features != hidden_dim:
+                raise ValueError(
+                    f"hidden_dim mismatch between projection ({projection.in_features}) "
+                    f"and model ({hidden_dim})."
+                )
+        self.projection: ProjectionHead | None = projection
+
         if reasoner is not None:
             if not isinstance(reasoner, LatentReasoner):
                 raise TypeError(
@@ -955,19 +214,8 @@ class Model(nn.Module):
                 )
         self.reasoner: LatentReasoner | None = reasoner
 
-        # Normalize flexible heads input (single instance, list, or dict) into the
-        # canonical internal dict form.
-        heads_dict: dict[str, BaseHead] = Model._normalize_heads(heads)
-
-        # Store heads for both state dict and typed access
-        filtered: dict[str, BaseHead] = {}
-        for name, head in heads_dict.items():
-            if head is not None:
-                if not isinstance(head, BaseHead):
-                    raise TypeError(f"head {name!r} must be a BaseHead or None, got {type(head)}")
-                filtered[name] = head
-        self.heads = nn.ModuleDict(filtered)  # for parameters/state
-        self._heads: dict[str, BaseHead] = filtered  # typed view for calling
+        self._heads = Model._normalize_heads(heads)
+        self.heads = nn.ModuleDict(self._heads)
         for name, head in self._heads.items():
             _bind_prediction_key(head, name)
 
@@ -976,299 +224,11 @@ class Model(nn.Module):
         self.hidden_dim = hidden_dim
         # Best-effort inference of action cardinality for introspection only.
         self.max_num_actions: int = 0
-        for _name, h in self.heads.items():
-            out = getattr(h, "out_features", None)
+        for head in self._heads.values():
+            out = getattr(head, "out_features", None)
             if isinstance(out, int) and out > 0:
                 self.max_num_actions = out
                 break
-
-    def copy(
-        self,
-        *,
-        heads: bool | Sequence[BaseHead],
-        backbone: bool,
-        reasoner: bool,
-    ) -> "Model":
-        """Return a model that copies the named sections and shares the rest.
-
-        ``heads``, ``backbone``, and ``reasoner`` are required.
-        ``heads=True`` copies every head. ``heads=False`` attaches this
-        model's heads. A sequence of head instances copies only those —
-        use that to leave out a policy or behavior head whose delayed
-        values nothing reads. Every instance must be one of this model's
-        heads and the list must not be empty. At least one section must
-        be copied. The copy's ``action_source`` is this model's when it
-        is among the copied or shared heads, else the first head listed
-        (the copy does not pick actions).
-
-        ``backbone=True`` deep-copies trainable backbone weights (token
-        embeddings included; a frozen LoRA base stays shared by
-        reference). ``False`` attaches this model's backbone module —
-        no second embed / backbone pass; run the copy's heads on
-        :meth:`pool` of the online :class:`ModelOutput`.
-
-        ``reasoner=True`` deep-copies the reasoner. Illegal when this
-        model has no reasoner. ``False`` is ``None`` when unused,
-        otherwise this model's reasoner module.
-
-        Copied modules are frozen and left in ``train()``. Shared
-        modules are not frozen (they belong to this model).
-        :func:`~mouse_core.polyak.model_polyak` interpolates only copied
-        sections. Construct after ``model.to(...)``. Do not call
-        ``requires_grad_`` / ``to`` on the copy: shared frozen
-        parameters (and a shared backbone / reasoner) belong to this
-        model too.
-        """
-        if type(backbone) is not bool:
-            raise TypeError(f"backbone must be a bool, got {type(backbone).__name__}.")
-        if type(reasoner) is not bool:
-            raise TypeError(f"reasoner must be a bool, got {type(reasoner).__name__}.")
-        if reasoner and self.reasoner is None:
-            raise ValueError(
-                "copy reasoner=True requires a reasoner; construct "
-                "Model(..., reasoner=LatentReasoner(...)) or pass reasoner=False."
-            )
-        if not any(p.requires_grad for p in self.parameters()):
-            raise ValueError(
-                "copy needs a trainable online model (no parameter requires grad)."
-            )
-        share_heads = False
-        if heads is True:
-            names = tuple(self._heads)
-            if not names:
-                raise ValueError("copy heads=True requires the model to have at least one head.")
-        elif heads is False:
-            names = tuple(self._heads)
-            if not names:
-                raise ValueError("copy heads=False requires the model to have at least one head.")
-            share_heads = True
-        elif isinstance(heads, (str, BaseHead)) or not isinstance(heads, Sequence):
-            raise TypeError(
-                f"copy heads must be True, False, or a sequence of head instances, "
-                f"got {type(heads).__name__}."
-            )
-        else:
-            head_list = tuple(heads)
-            if not head_list:
-                raise ValueError("copy heads must include at least one head.")
-            names = tuple(
-                Model._head_name(self._heads, head, what="copy heads")
-                for head in head_list
-            )
-            if len(set(names)) != len(names):
-                raise ValueError(f"copy heads has duplicate heads: {names}.")
-        if share_heads and not backbone and not reasoner:
-            raise ValueError(
-                "copy must copy at least one section; pass heads=True, "
-                "backbone=True, or reasoner=True."
-            )
-
-        def _copy(module: nn.Module) -> nn.Module:
-            shared = {id(p): p for p in module.parameters() if not p.requires_grad}
-            delayed = copy.deepcopy(module, memo=shared)
-            delayed.requires_grad_(False)
-            delayed.train()
-            return delayed
-
-        if share_heads:
-            copied_heads = {name: self._heads[name] for name in names}
-            action_name = self.action_source
-        else:
-            copied_heads = {name: cast(BaseHead, _copy(self._heads[name])) for name in names}
-            action_name = self.action_source if self.action_source in names else names[0]
-        copied_backbone = (
-            cast(Backbone, _copy(self.backbone)) if backbone else self.backbone
-        )
-        if self.reasoner is None:
-            copied_reasoner: LatentReasoner | None = None
-        elif reasoner:
-            copied_reasoner = cast(LatentReasoner, _copy(self.reasoner))
-        else:
-            copied_reasoner = self.reasoner
-        return Model(
-            backbone=copied_backbone,
-            heads=copied_heads,
-            action_source=action_name,
-            reasoner=copied_reasoner,
-        )
-
-    def pool(self, *, output: ModelOutput) -> torch.Tensor:
-        """Gather last-layer states at the rows heads read.
-
-        ``output.last_hidden_state`` is ``[L, D]`` (train) or
-        ``[B, T, D]`` (decode). ``output.head_output_indices`` selects
-        the head-output tokens: ``[P]`` into the packed stream, or
-        ``[B, S]`` into the decode token axis. The result is the tensor
-        :meth:`head` consumes.
-        """
-        if not isinstance(output, ModelOutput):
-            raise TypeError(
-                f"pool output must be a ModelOutput, got {type(output).__name__}."
-            )
-        return _pool_head_outputs(output.last_hidden_state, output.head_output_indices)
-
-    def to(self, *args: Any, **kwargs: Any) -> Self:
-        """Move the model to a device; never casts.
-
-        Dtypes are fixed when the pieces are built: the transformer backbone
-        takes ``dtype=`` (``torch.float32`` to fine-tune the base weights,
-        ``preferred_dtype(device=device)`` for a frozen LoRA base or inference) and
-        every other section — LoRA adapters, Identity ``embed_tokens``,
-        reasoner, heads — is float32, which ``AdamW`` and
-        ``model_polyak`` require of every
-        trainable parameter. Inputs are cast to the backbone dtype at the
-        backbone boundary and its output back to fp32 for the heads. Passing
-        a dtype here raises ``TypeError``.
-        """
-        _reject_dtype_cast("Model", *args, **kwargs)
-        return super().to(*args, **kwargs)
-
-    def half(self) -> "Model":
-        raise TypeError("Model.half() is not supported; set the backbone dtype when building it.")
-
-    def bfloat16(self) -> "Model":
-        raise TypeError("Model.bfloat16() is not supported; set the backbone dtype when building it.")
-
-    def double(self) -> "Model":
-        raise TypeError("Model.double() is not supported; set the backbone dtype when building it.")
-
-    def float(self) -> "Model":
-        raise TypeError("Model.float() is not supported; set the backbone dtype when building it.")
-
-    def _train_backbone_forward(
-        self,
-        backbone: Backbone,
-        embeds: torch.Tensor,
-        group_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        """Uncached backbone pass over the flat packed stream.
-
-        Transformer backbones run :func:`packed_forward` with the backbone's
-        ``train_kernel`` (``"varlen"``: flash varlen, CUDA bf16/fp16 q/k/v
-        only — raises otherwise; ``"padded"``: dense causal SDPA on segments
-        padded to ``max_seqlen``; ``"flex"``: FlexAttention; ``"reference"``:
-        masked SDPA, O(L^2)) and ``train_autocast_dtype`` (bf16/fp16 mixed
-        precision over fp32 weights, ``None`` for the base dtype). Backbones
-        without packed kernels (``IdentityBackbone``, generic HuggingFace
-        stacks) take the rectangular route with a dense per-sequence
-        causal mask. ``embeds`` come from ``backbone.embed`` (fp32 tables /
-        adapters) and are cast to the backbone's base dtype here.
-        """
-        embeds = embeds.to(dtype=backbone.dtype)
-        if getattr(backbone, "uses_packed", False):
-            from mouse_core.models.backbone.packed_train import packed_forward
-
-            transformer = getattr(backbone, "model", None)
-            if transformer is None:
-                raise TypeError(f"{type(backbone).__name__}.uses_packed is True but it has no .model.")
-            return packed_forward(
-                model=cast(nn.Module, transformer),
-                embeds=embeds,
-                group_ids=group_ids,
-                output_hidden_states=False,
-                checkpoint=backbone.gradient_checkpointing,
-                train_kernel=backbone.train_kernel,
-                autocast_dtype=backbone.train_autocast_dtype,
-            )
-        attention_mask = _flat_sequence_causal_mask(
-            dtype=embeds.dtype,
-            group_ids=group_ids,
-        )
-        position_ids = _flat_sequence_position_ids(group_ids=group_ids)
-        session_out = backbone(
-            embeds.unsqueeze(0),
-            output_hidden_states=False,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-        )
-        if isinstance(session_out, torch.Tensor) and session_out.ndim == 3:
-            return session_out.squeeze(0)
-        return cast(torch.Tensor, session_out)
-
-    def _pool_backbone_out(
-        self,
-        session_out: torch.Tensor,
-        head_output_indices: torch.Tensor,
-    ) -> torch.Tensor:
-        """Pool last-layer hidden states to the tensor :meth:`head` consumes."""
-        return _pool_head_outputs(session_out, head_output_indices)
-
-    def _generate_latents(
-        self,
-        *,
-        embeds: torch.Tensor,
-        group_ids: torch.Tensor,
-        plan: _InsertionPlan,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Generate latent thoughts on the autograd tape and assemble the extended stream.
-
-        Runs ``R`` extra backbone passes over the growing per-burst prefixes
-        (all bursts in lockstep; attention isolation makes dropping the other
-        sequences exact). Thought ``r``'s input embedding is the reasoner
-        adapter applied to the backbone output at the previous position, so
-        gradients flow through the whole latent chain. Returns
-        ``(ext_embeds, ext_group_ids, ext_head_output_indices,
-        token_indices)`` where ``token_indices`` maps
-        each original token to its extended-stream position.
-        """
-        reasoner = self.reasoner
-        assert reasoner is not None
-        R = plan.num_thoughts
-        device = embeds.device
-        nb = int(plan.burst_rows.size)
-
-        prefix_bounds = list(
-            zip(plan.prefix_starts.tolist(), plan.anchors.tolist())
-        )
-        thoughts: list[torch.Tensor] = []  # thought r → [nb, D]
-        for r in range(R):
-            parts: list[torch.Tensor] = []
-            seq_parts: list[torch.Tensor] = []
-            last_positions: list[int] = []
-            offset = 0
-            for j, (start, anchor) in enumerate(prefix_bounds):
-                parts.append(embeds[start:anchor])
-                seq_parts.append(group_ids[start:anchor])
-                if r > 0:
-                    parts.append(torch.stack([thoughts[q][j] for q in range(r)]))
-                    seq_parts.append(
-                        group_ids.new_full((r,), int(plan.burst_rows[j]))
-                    )
-                block = (anchor - start) + r
-                last_positions.append(offset + block - 1)
-                offset += block
-            gen_out = self._train_backbone_forward(
-                self.backbone,
-                torch.cat(parts),
-                torch.cat(seq_parts),
-            )
-            h_last = cast(torch.Tensor, gen_out)[
-                torch.as_tensor(last_positions, device=device)
-            ]
-            thoughts.append(reasoner(h_last).to(dtype=embeds.dtype))
-
-        latent_embeds = torch.stack(thoughts, dim=1).reshape(nb * R, embeds.shape[-1])
-        token_indices = torch.as_tensor(plan.token_positions, device=device)
-        latent_indices = torch.as_tensor(plan.latent_positions, device=device)
-        ext_embeds = (
-            embeds.new_zeros(plan.ext_length, embeds.shape[-1])
-            .index_copy(0, token_indices, embeds)
-            .index_copy(0, latent_indices, latent_embeds)
-        )
-        ext_group_ids = torch.as_tensor(plan.ext_group_ids, device=device)
-        ext_head_output_indices = torch.as_tensor(
-            plan.ext_head_output_indices, device=device
-        )
-        return (
-            ext_embeds,
-            ext_group_ids,
-            ext_head_output_indices,
-            token_indices,
-        )
-
-    # ------------------------------------------------------------------
-    # Forward
-    # ------------------------------------------------------------------
 
     def forward(
         self,
@@ -1291,6 +251,8 @@ class Model(nn.Module):
         a bound ``update = model_polyak(online=model, delayed=delayed_model)``
         and then ``update(tau_heads=..., tau_backbone=...)`` after each
         optimizer step. Use ``None`` for a shared section.
+        If a projection is present, also choose ``projection=True`` or
+        ``False`` in ``copy`` and pass ``tau_projection=...`` when copied.
         Online / inference: ``inputs, _, _ = pack_token_batch(steps=[eval_transform(step)],
         group_ids=[0], continuing=None)`` then ``model(inputs, use_cache=True)``
         (optionally ragged; empty-only batches raise). Pass ``out.cache``
@@ -1425,7 +387,7 @@ class Model(nn.Module):
         last_h = _last_hidden(session_out)
         return ModelOutput(
             predictions=self.head(
-                h=self._pool_backbone_out(last_h, resolved_indices),
+                h=_pool_head_outputs(last_h, resolved_indices),
             ),
             last_hidden_state=last_h,
             head_output_indices=resolved_indices,
@@ -1438,12 +400,14 @@ class Model(nn.Module):
         *,
         h: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """Run enabled heads on pooled last-layer ``h``.
+        """Apply the shared projection, then prediction heads, to backbone ``h``.
 
         Heads take ``[N, D]`` (train) or ``[B, S, D]`` (decode).
         Each head is called as a module, so its forward and backward
         hooks run.
         """
+        if self.projection is not None:
+            h = self.projection(h)
         return _run_heads(self._heads, h)
 
     def get_action(
@@ -1485,6 +449,396 @@ class Model(nn.Module):
         scores = scores - scores.max(dim=-1, keepdim=True).values
         probs = F.softmax(scores / temperature, dim=-1)
         return torch.multinomial(probs, num_samples=1).squeeze(-1)
+
+    def pool(self, *, output: ModelOutput) -> torch.Tensor:
+        """Gather last-layer states at the rows heads read.
+
+        ``output.last_hidden_state`` is ``[L, D]`` (train) or
+        ``[B, T, D]`` (decode). ``output.head_output_indices`` selects
+        the head-output tokens: ``[P]`` into the packed stream, or
+        ``[B, S]`` into the decode token axis. The result is the tensor
+        :meth:`head` consumes.
+        """
+        if not isinstance(output, ModelOutput):
+            raise TypeError(
+                f"pool output must be a ModelOutput, got {type(output).__name__}."
+            )
+        return _pool_head_outputs(output.last_hidden_state, output.head_output_indices)
+
+    def copy(
+        self,
+        *,
+        heads: bool | Sequence[BaseHead],
+        backbone: bool,
+        reasoner: bool,
+        projection: bool | None = None,
+    ) -> "Model":
+        """Return a model that copies the named sections and shares the rest.
+
+        ``heads``, ``backbone``, and ``reasoner`` are required.
+        ``heads=True`` copies every head. ``heads=False`` attaches this
+        model's heads. A sequence of head instances copies only those —
+        use that to leave out a policy or behavior head whose delayed
+        values nothing reads. Every instance must be one of this model's
+        heads and the list must not be empty. At least one section must
+        be copied. The copy's ``action_source`` is this model's when it
+        is among the copied or shared heads, else the first head listed
+        (the copy does not pick actions).
+
+        ``backbone=True`` deep-copies trainable backbone weights (token
+        embeddings included; a frozen LoRA base stays shared by
+        reference). ``False`` attaches this model's backbone module —
+        no second embed / backbone pass; run the copy's heads on
+        :meth:`pool` of the online :class:`ModelOutput`.
+
+        ``reasoner=True`` deep-copies the reasoner. Illegal when this
+        model has no reasoner. ``False`` is ``None`` when unused,
+        otherwise this model's reasoner module.
+
+        When this model has a projection, ``projection=True`` copies it
+        and ``projection=False`` shares it; an explicit choice is required.
+        Omit ``projection`` only when the model has none. The projection
+        is applied by :meth:`head`, including when reusing online states.
+
+        Copied modules are frozen and left in ``train()``. Shared
+        modules are not frozen (they belong to this model).
+        :func:`~mouse_core.polyak.model_polyak` interpolates only copied
+        sections. Construct after ``model.to(...)``. Do not call
+        ``requires_grad_`` / ``to`` on the copy: shared frozen
+        parameters (and a shared backbone / reasoner) belong to this
+        model too.
+        """
+        if type(backbone) is not bool:
+            raise TypeError(f"backbone must be a bool, got {type(backbone).__name__}.")
+        if type(reasoner) is not bool:
+            raise TypeError(f"reasoner must be a bool, got {type(reasoner).__name__}.")
+        if projection is None:
+            if self.projection is not None:
+                raise ValueError("copy requires projection=True or False when the model has a projection.")
+            projection = False
+        if type(projection) is not bool:
+            raise TypeError(f"projection must be a bool, got {type(projection).__name__}.")
+        if projection and self.projection is None:
+            raise ValueError("copy projection=True requires a projection on the model.")
+        if reasoner and self.reasoner is None:
+            raise ValueError(
+                "copy reasoner=True requires a reasoner; construct "
+                "Model(..., reasoner=LatentReasoner(...)) or pass reasoner=False."
+            )
+        if not any(p.requires_grad for p in self.parameters()):
+            raise ValueError(
+                "copy needs a trainable online model (no parameter requires grad)."
+            )
+        share_heads = False
+        if heads is True:
+            names = tuple(self._heads)
+            if not names:
+                raise ValueError("copy heads=True requires the model to have at least one head.")
+        elif heads is False:
+            names = tuple(self._heads)
+            if not names:
+                raise ValueError("copy heads=False requires the model to have at least one head.")
+            share_heads = True
+        elif isinstance(heads, (str, BaseHead)) or not isinstance(heads, Sequence):
+            raise TypeError(
+                f"copy heads must be True, False, or a sequence of head instances, "
+                f"got {type(heads).__name__}."
+            )
+        else:
+            head_list = tuple(heads)
+            if not head_list:
+                raise ValueError("copy heads must include at least one head.")
+            names = tuple(
+                Model._head_name(self._heads, head, what="copy heads")
+                for head in head_list
+            )
+            if len(set(names)) != len(names):
+                raise ValueError(f"copy heads has duplicate heads: {names}.")
+        if share_heads and not backbone and not reasoner and not projection:
+            raise ValueError(
+                "copy must copy at least one section; pass heads=True, "
+                "backbone=True, reasoner=True, or projection=True."
+            )
+
+        def _copy(module: nn.Module) -> nn.Module:
+            shared = {id(p): p for p in module.parameters() if not p.requires_grad}
+            delayed = copy.deepcopy(module, memo=shared)
+            delayed.requires_grad_(False)
+            delayed.train()
+            return delayed
+
+        if share_heads:
+            copied_heads = {name: self._heads[name] for name in names}
+            action_name = self.action_source
+        else:
+            copied_heads = {name: cast(BaseHead, _copy(self._heads[name])) for name in names}
+            action_name = self.action_source if self.action_source in names else names[0]
+        copied_backbone = (
+            cast(Backbone, _copy(self.backbone)) if backbone else self.backbone
+        )
+        if self.reasoner is None:
+            copied_reasoner: LatentReasoner | None = None
+        elif reasoner:
+            copied_reasoner = cast(LatentReasoner, _copy(self.reasoner))
+        else:
+            copied_reasoner = self.reasoner
+        copied_projection = (
+            cast(ProjectionHead, _copy(self.projection))
+            if projection and self.projection is not None
+            else self.projection
+        )
+        return Model(
+            backbone=copied_backbone,
+            heads=copied_heads,
+            action_source=action_name,
+            reasoner=copied_reasoner,
+            projection=copied_projection,
+        )
+
+    def to(self, *args: Any, **kwargs: Any) -> Self:
+        """Move the model to a device; never casts.
+
+        Dtypes are fixed when the pieces are built: the transformer backbone
+        takes ``dtype=`` (``torch.float32`` to fine-tune the base weights,
+        ``preferred_dtype(device=device)`` for a frozen LoRA base or inference) and
+        every other section — LoRA adapters, Identity ``embed_tokens``,
+        reasoner, projection, heads — is float32, which ``AdamW`` and
+        ``model_polyak`` require of every
+        trainable parameter. Inputs are cast to the backbone dtype at the
+        backbone boundary and its output back to fp32 for the projection
+        and heads. Passing a dtype here raises ``TypeError``.
+        """
+        _reject_dtype_cast("Model", *args, **kwargs)
+        return super().to(*args, **kwargs)
+
+    def half(self) -> "Model":
+        raise TypeError("Model.half() is not supported; set the backbone dtype when building it.")
+
+    def bfloat16(self) -> "Model":
+        raise TypeError("Model.bfloat16() is not supported; set the backbone dtype when building it.")
+
+    def double(self) -> "Model":
+        raise TypeError("Model.double() is not supported; set the backbone dtype when building it.")
+
+    def float(self) -> "Model":
+        raise TypeError("Model.float() is not supported; set the backbone dtype when building it.")
+
+    @staticmethod
+    def _normalize_heads(
+        heads: BaseHead | list[BaseHead] | Mapping[str, BaseHead | None] | None,
+    ) -> dict[str, BaseHead]:
+        """Convert the flexible ``heads=`` argument into the internal ``name -> head`` dict.
+
+        Supported inputs:
+          - dict (caller-chosen names to head or None): passed through.
+          - single BaseHead instance: becomes the only head; name is inferred
+            from type (``action_value`` / ``action``).
+          - list/tuple of BaseHead: each gets an inferred name.
+        """
+        if heads is None:
+            return {}
+
+        # Dict form gives full control over names.
+        if isinstance(heads, Mapping):
+            filtered: dict[str, BaseHead] = {}
+            for name, head in heads.items():
+                if head is None:
+                    continue
+                if not isinstance(name, str) or not name:
+                    raise ValueError(f"head name must be a non-empty string, got {name!r}")
+                if not isinstance(head, BaseHead):
+                    raise TypeError(f"head {name!r} must be a BaseHead or None, got {type(head)}")
+                filtered[name] = head
+            return filtered
+
+        # Single head instance gives an implicit single-head model.
+        if isinstance(heads, BaseHead):
+            return {Model._infer_head_name(heads): heads}
+
+        # List of heads → names inferred from type.
+        if isinstance(heads, (list, tuple)):
+            result: dict[str, BaseHead] = {}
+            for head in heads:
+                if not isinstance(head, BaseHead):
+                    raise TypeError(f"items in heads list must be BaseHead instances, got {type(head)}")
+                name = Model._infer_head_name(head)
+                if name in result:
+                    raise ValueError(
+                        f"Multiple heads would map to the same inferred name {name!r}. "
+                        "Use a dict form to provide distinct names, e.g. "
+                        "heads={'action_value': h1, 'action': h2}."
+                    )
+                result[name] = head
+            return result
+
+        raise TypeError(
+            f"heads must be a BaseHead, list[BaseHead], or dict[str, BaseHead|None], "
+            f"got {type(heads)}"
+        )
+
+    @staticmethod
+    def _infer_head_name(head: BaseHead) -> str:
+        """Infer a default storage key from the head type when no dict key is given.
+
+        ``RegressionHead`` → ``action_value``, ``ClassificationHead``
+        → ``action``.
+        """
+        if isinstance(head, ClassificationHead):
+            return "action"
+        if isinstance(head, RegressionHead):
+            return "action_value"
+        raise TypeError(
+            f"Cannot infer a name for head of type {type(head).__name__}. "
+            "Use the dict form with an explicit key."
+        )
+
+    @staticmethod
+    def _head_name(heads: Mapping[str, BaseHead], head: BaseHead, *, what: str) -> str:
+        """Resolve a head instance to the storage key of that same object."""
+        if not isinstance(head, BaseHead):
+            raise TypeError(f"{what} must be a BaseHead instance, got {type(head).__name__}.")
+        for name, existing in heads.items():
+            if existing is head:
+                return name
+        raise ValueError(
+            f"{what} is not one of the heads passed to heads=; pass the same instance."
+        )
+
+    @staticmethod
+    def _require_action_source(heads: Mapping[str, BaseHead], action_source: str) -> str:
+        """Require ``action_source`` to be a key in ``heads``."""
+        if not isinstance(action_source, str) or not action_source:
+            raise TypeError(
+                f"action_source must be a non-empty string, got {action_source!r}."
+            )
+        if action_source not in heads:
+            raise ValueError(
+                f"action_source {action_source!r} is not among heads {tuple(heads)}."
+            )
+        return action_source
+
+    def _train_backbone_forward(
+        self,
+        backbone: Backbone,
+        embeds: torch.Tensor,
+        group_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Uncached backbone pass over the flat packed stream.
+
+        Transformer backbones run :func:`packed_forward` with the backbone's
+        ``train_kernel`` (``"varlen"``: flash varlen, CUDA bf16/fp16 q/k/v
+        only — raises otherwise; ``"padded"``: dense causal SDPA on segments
+        padded to ``max_seqlen``; ``"flex"``: FlexAttention; ``"reference"``:
+        masked SDPA, O(L^2)) and ``train_autocast_dtype`` (bf16/fp16 mixed
+        precision over fp32 weights, ``None`` for the base dtype). Backbones
+        without packed kernels (``IdentityBackbone``, generic HuggingFace
+        stacks) take the rectangular route with a dense per-sequence
+        causal mask. ``embeds`` come from ``backbone.embed`` (fp32 tables /
+        adapters) and are cast to the backbone's base dtype here.
+        """
+        embeds = embeds.to(dtype=backbone.dtype)
+        if getattr(backbone, "uses_packed", False):
+            from mouse_core.models.backbone.packed_train import packed_forward
+
+            transformer = getattr(backbone, "model", None)
+            if transformer is None:
+                raise TypeError(f"{type(backbone).__name__}.uses_packed is True but it has no .model.")
+            return packed_forward(
+                model=cast(nn.Module, transformer),
+                embeds=embeds,
+                group_ids=group_ids,
+                output_hidden_states=False,
+                checkpoint=backbone.gradient_checkpointing,
+                train_kernel=backbone.train_kernel,
+                autocast_dtype=backbone.train_autocast_dtype,
+            )
+        attention_mask = _flat_sequence_causal_mask(
+            dtype=embeds.dtype,
+            group_ids=group_ids,
+        )
+        position_ids = _flat_sequence_position_ids(group_ids=group_ids)
+        session_out = backbone(
+            embeds.unsqueeze(0),
+            output_hidden_states=False,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+        )
+        if isinstance(session_out, torch.Tensor) and session_out.ndim == 3:
+            return session_out.squeeze(0)
+        return cast(torch.Tensor, session_out)
+
+    def _generate_latents(
+        self,
+        *,
+        embeds: torch.Tensor,
+        group_ids: torch.Tensor,
+        plan: _InsertionPlan,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Generate latent thoughts on the autograd tape and assemble the extended stream.
+
+        Runs ``R`` extra backbone passes over the growing per-burst prefixes
+        (all bursts in lockstep; attention isolation makes dropping the other
+        sequences exact). Thought ``r``'s input embedding is the reasoner
+        adapter applied to the backbone output at the previous position, so
+        gradients flow through the whole latent chain. Returns
+        ``(ext_embeds, ext_group_ids, ext_head_output_indices,
+        token_indices)`` where ``token_indices`` maps
+        each original token to its extended-stream position.
+        """
+        reasoner = self.reasoner
+        assert reasoner is not None
+        R = plan.num_thoughts
+        device = embeds.device
+        nb = int(plan.burst_rows.size)
+
+        prefix_bounds = list(
+            zip(plan.prefix_starts.tolist(), plan.anchors.tolist())
+        )
+        thoughts: list[torch.Tensor] = []  # thought r → [nb, D]
+        for r in range(R):
+            parts: list[torch.Tensor] = []
+            seq_parts: list[torch.Tensor] = []
+            last_positions: list[int] = []
+            offset = 0
+            for j, (start, anchor) in enumerate(prefix_bounds):
+                parts.append(embeds[start:anchor])
+                seq_parts.append(group_ids[start:anchor])
+                if r > 0:
+                    parts.append(torch.stack([thoughts[q][j] for q in range(r)]))
+                    seq_parts.append(
+                        group_ids.new_full((r,), int(plan.burst_rows[j]))
+                    )
+                block = (anchor - start) + r
+                last_positions.append(offset + block - 1)
+                offset += block
+            gen_out = self._train_backbone_forward(
+                self.backbone,
+                torch.cat(parts),
+                torch.cat(seq_parts),
+            )
+            h_last = cast(torch.Tensor, gen_out)[
+                torch.as_tensor(last_positions, device=device)
+            ]
+            thoughts.append(reasoner(h_last).to(dtype=embeds.dtype))
+
+        latent_embeds = torch.stack(thoughts, dim=1).reshape(nb * R, embeds.shape[-1])
+        token_indices = torch.as_tensor(plan.token_positions, device=device)
+        latent_indices = torch.as_tensor(plan.latent_positions, device=device)
+        ext_embeds = (
+            embeds.new_zeros(plan.ext_length, embeds.shape[-1])
+            .index_copy(0, token_indices, embeds)
+            .index_copy(0, latent_indices, latent_embeds)
+        )
+        ext_group_ids = torch.as_tensor(plan.ext_group_ids, device=device)
+        ext_head_output_indices = torch.as_tensor(
+            plan.ext_head_output_indices, device=device
+        )
+        return (
+            ext_embeds,
+            ext_group_ids,
+            ext_head_output_indices,
+            token_indices,
+        )
 
 
 def _last_valid_step(valid: torch.Tensor) -> torch.Tensor:

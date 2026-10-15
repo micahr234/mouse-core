@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `ProjectionHead` adds a shared, width-preserving SwiGLU MLP with mandatory input
+  RMSNorm between the backbone and prediction heads via `Model(projection=...)`.
+  It is saved with checkpoints and can be copied or shared independently with
+  `Model.copy(projection=...)`. Copied projections use their own
+  `tau_projection` in `model_polyak`; optimizer parameter groups give them
+  a separate learning rate. Training notebooks enable it with
+  `LR_PROJECTION` and, for DQN, `POLYAK_TAU_PROJECTION`.
 - `DiscretizedActionHead` produces one Q-value per row of a fixed continuous
   action table. `discrete_to_continuous` decodes IDs; `continuous_to_discrete`
   quantizes by Euclidean distance (ties choose the lowest ID). The table is a
@@ -45,6 +52,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   observations as that vector.
 
 ### Changed
+- Separate model execution from checkpoint and Hub helpers in `models.io`,
+  share SwiGLU building blocks, and remove unused helpers and `HeadSpec`.
+  Examples use consistent setup sections, constant names, and grouped model,
+  training, learning-rate, and target-interpolation settings.
+- Normalization is mandatory: transformer backbones always keep their native
+  final norm, and the projection and every prediction head each own an input
+  RMSNorm. Removed `use_norm` from constructors, head specs, and saved configs.
+  Older normalized checkpoints still load; disabled-norm checkpoints raise.
+  Prediction-head `scale` applies only to the final linear layer's initial
+  weight and bias; the projection has no scale option.
 - ``model_polyak(online=..., delayed=...)`` now binds a reusable updater.
   Call it with explicit ``tau_heads=`` and ``tau_backbone=`` after each
   optimizer step; ``None`` denotes a shared section. Parameter validation
@@ -68,13 +85,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   context when ``task_index`` changes, so a new map does not condition on
   the previous one. Example ``ClassificationHead`` initial ``scale`` is
   ``1.0``.
-- Example group prefixes state the step cap for an episode: CartPole
-  uses ``MAX_EPISODE_STEPS``, FrozenLake uses ``MAX_STEPS_PER_EPISODE``.
+- Example group prefixes state the step cap for an episode with
+  ``MAX_STEPS_PER_EPISODE`` for both CartPole and FrozenLake.
 - Example group prefixes say to predict the value of all actions at the
   end of each line, and put the step pattern on the next line.
-- Example notebooks set ``POLYAK_TAU_HEADS = 0.001`` and
-  ``POLYAK_TAU_BACKBONE = 0.1``. The n-step example copies heads only
-  and sets ``POLYAK_TAU_HEADS`` alone.
+- FrozenLake and CartPole training notebooks set ``POLYAK_TAU_BACKBONE = 0.1``,
+  ``POLYAK_TAU_PROJECTION = 0.01``, and ``POLYAK_TAU_HEADS = 0.001``.
+  The n-step example shares the backbone and copies the projection and heads,
+  so it only sets the latter two rates.
 - Text ``format=`` is an f-string. The step value is the name ``field``,
   so ``{field+1}`` and ``{field:.3f}`` both render. A const ``format=``
   has no step value: the word field is text, and ``{field}`` is
@@ -381,8 +399,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``predictions=``. DQN-family objectives also take
   ``delayed_predictions=``; ``PpoObjective`` takes
   ``value_predictions=``.
-- ``TransformerBackbone``, ``RegressionHead``, and ``ClassificationHead``
-  require ``use_norm``. ``save_model`` writes
+- ``save_model`` writes
   backbone type ``transformer`` with an ``architecture`` field
   (``llama`` / ``qwen3`` / ``hf``). Packed train dispatch is
   ``backbone.uses_packed``, not ``hasattr(model, "layers")``.
@@ -559,12 +576,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   loop as ``02`` with three ``RegressionHead``s
   (``nstep_gate(n=1, 3, 5)``), ``copy``
   of every Q head with a shared backbone, and the three losses summed.
-- ``use_norm`` (required, saved with the model) on transformer
-  backbones and on ``RegressionHead`` / ``ClassificationHead``. On
-  ``LlamaBackbone`` / ``Qwen3Backbone``, ``True`` keeps the final
-  RMSNorm and ``False`` replaces it with ``Identity`` (per-layer
-  norms stay). On a head, ``True`` prepends an input RMSNorm and
-  ``False`` skips it.
 - Tokenizer packing spec is a separate object and a separate Hub repo.
   ``save_tokenizer`` / ``load_tokenizer`` persist ``tokenizer.json``
   (fields, ``group_prefix``, ``head_output``, ``objective_fields``,
@@ -1045,7 +1056,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   RMSNorm instead of replacing it with ``nn.Identity``; ``pretrained=``
   loads its ``norm.weight`` alongside the layers, and the backbone output
   is the normalized residual stream. The heads keep their own input
-  ``RMSNorm`` (``use_norm=True``) on top of it. Backbone state dicts gain
+  its own input ``RMSNorm`` on top of it. Backbone state dicts gain
   a ``norm.weight`` tensor, so checkpoints saved before this change no
   longer load.
 - ``Model.to`` and ``Backbone.to`` move devices only and raise

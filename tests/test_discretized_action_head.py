@@ -13,7 +13,7 @@ from mouse_core.models.heads import RegressionHead
 def make_head(table: torch.Tensor) -> DiscretizedActionHead:
     return DiscretizedActionHead(
         in_features=8, action_vectors=table, hidden_dim=16, num_layers=2,
-        use_norm=True, propagate_gradient=1.0,
+        propagate_gradient=1.0,
     )
 
 
@@ -123,7 +123,7 @@ def test_head_trains_like_regression_but_table_is_fixed_and_copied() -> None:
 
     regression = RegressionHead(
         in_features=8, out_features=3, hidden_dim=16, num_layers=2,
-        use_norm=True, propagate_gradient=1.0,
+        propagate_gradient=1.0,
     )
     regression.load_state_dict({k: v for k, v in head.state_dict().items() if k != "action_vectors"})
     h = torch.randn(2, 4, 8, requires_grad=True)

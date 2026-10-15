@@ -1,6 +1,6 @@
 """AdamW over fp32 trainable parameters.
 
-Every trainable parameter in a MOUSE model is fp32: heads,
+Every trainable parameter in a MOUSE model is fp32: heads, projection,
 reasoner, and either the whole fp32 backbone (full
 fine-tuning) or the fp32 LoRA adapters
 of a frozen bf16 backbone. AdamW therefore steps the parameters
@@ -119,8 +119,9 @@ class AdamW:
     ``params`` is either a flat list, all stepped at ``lr``, or a list of
     param-group dicts. A group requires ``params`` and may set ``lr`` and
     ``weight_decay``; omitted keys use the constructor values. One group
-    per learning rate — for example the backbone at one ``lr`` and
-    the heads at another.
+    per learning rate — for example separate rates for
+    ``model.backbone.parameters()``, ``model.projection.parameters()``
+    (when present), and ``model.heads.parameters()``.
     """
 
     def __init__(

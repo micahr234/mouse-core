@@ -138,7 +138,7 @@ def main() -> None:
     backbone = TransformerBackbone(
         train_kernel="varlen",
         decode_kernel="flex",
-        dtype=dtype, use_norm=True,
+        dtype=dtype,
         hidden_dim=args.hidden,
         num_layers=args.layers,
         num_heads=args.heads,

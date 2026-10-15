@@ -9,43 +9,19 @@ Example::
     class MyHead(BaseHead):
         def __init__(self, in_features: int, out_features: int) -> None:
             super().__init__()
+            self.norm = nn.RMSNorm(in_features, eps=1e-5)
             self.linear = nn.Linear(in_features, out_features)
 
         def forward(self, h: torch.Tensor) -> torch.Tensor:
-            return self.linear(h)
+            return self.linear(self.norm(h))
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
-
-
-@dataclass(kw_only=True)
-class HeadSpec:
-    """Specification for a head to attach to a MOUSE model.
-
-    ``name`` is a caller-chosen key. It is not restricted to a built-in
-    list; the head *type* decides architecture.
-    """
-
-    name: str
-    # Common
-    hidden_dim: int | None = None
-    num_layers: int | None = None
-    scale: float | None = None
-    use_norm: bool | None = None
-    propagate_gradient: float | None = None
-
-    def __post_init__(self) -> None:
-        if self.num_layers is not None and int(self.num_layers) < 0:
-            raise ValueError(
-                f"head {self.name!r} has negative num_layers ({self.num_layers}); "
-                f"use 0 to disable or a positive integer"
-            )
 
 
 def prediction_key(*, head: BaseHead) -> str:

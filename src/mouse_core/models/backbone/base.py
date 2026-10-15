@@ -52,36 +52,6 @@ def _disable_cudnn_sdp() -> None:
         enable_cudnn_sdp(enabled=False)
 
 
-def _final_norm_attr(model: nn.Module) -> str:
-    """Name of the stack's final norm (``norm``, ``final_layernorm``, or ``ln_f``)."""
-    for name in ("norm", "final_layernorm", "ln_f"):
-        if hasattr(model, name):
-            return name
-    raise TypeError(
-        f"{type(model).__name__} has no final norm (norm / final_layernorm / ln_f)."
-    )
-
-
-def _apply_final_norm(model: nn.Module, use_norm: bool) -> None:
-    """Keep or drop the transformer's final RMSNorm / LayerNorm.
-
-    Per-layer norms (input, post-attention, Qwen3 q/k) are unchanged.
-    ``use_norm=False`` replaces that module with ``nn.Identity``.
-    """
-    if type(use_norm) is not bool:
-        raise TypeError(f"use_norm must be a bool, got {use_norm!r}.")
-    name = _final_norm_attr(model)
-    current = getattr(model, name)
-    if use_norm:
-        if isinstance(current, nn.Identity):
-            raise TypeError(
-                "use_norm=True requires the transformer final RMSNorm; "
-                f"got {type(current).__name__}."
-            )
-        return
-    setattr(model, name, nn.Identity())
-
-
 class Backbone(nn.Module, ABC):
     """Abstract base for backbones.
 
@@ -303,10 +273,8 @@ def _load_transformer_weights(
 ) -> None:
     """Load matching transformer weights into a MOUSE backbone internals.
 
-    Always loads ``embed_tokens``. The final norm is loaded when the
-    target still has ``norm.weight`` (``use_norm=True``); ``use_norm=False``
-    replaces that module with ``Identity``, so the checkpoint's
-    ``norm.weight`` is skipped.
+    Loads ``embed_tokens`` and the transformer's native final norm along
+    with its decoder layers.
 
     Warns in both directions: backbone tensors that did not receive pretrained
     weights (missing from the checkpoint or shape-mismatched, so they keep
@@ -320,22 +288,17 @@ def _load_transformer_weights(
         pretrained = AutoModel.from_pretrained(repo_id_or_path, **hub_kwargs)
     target_state = model.state_dict()
     pretrained_state = pretrained.state_dict()
-    skipped: list[str] = []
-    if "norm.weight" not in target_state:
-        skipped.append("norm")
-    skipped_prefixes = tuple(skipped)
     loadable = {
         key: value
         for key, value in pretrained_state.items()
         if key in target_state
         and target_state[key].shape == value.shape
-        and not key.startswith(skipped_prefixes)
     }
 
     not_loaded = [
         key
         for key in target_state
-        if key not in loadable and not key.startswith(skipped_prefixes)
+        if key not in loadable
     ]
     if not_loaded:
         warnings.warn(
@@ -350,7 +313,6 @@ def _load_transformer_weights(
         key
         for key in pretrained_state
         if key not in loadable
-        and not key.startswith(skipped_prefixes)
         and not _is_dropped_layer_key(key, kept_layers)
     ]
     if unconsumed:

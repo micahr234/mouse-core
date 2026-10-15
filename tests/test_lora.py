@@ -41,7 +41,7 @@ def _backbone(
     architecture: Literal["llama", "qwen3"] = "qwen3",
     dtype: torch.dtype = torch.float32,
 ):
-    return TransformerBackbone(architecture=architecture, train_kernel="reference", decode_kernel="flex", dtype=dtype, use_norm=True, hidden_dim=_HIDDEN, num_layers=2, num_heads=2, max_position_embeddings=64, vocab_size=32, lora=lora)
+    return TransformerBackbone(architecture=architecture, train_kernel="reference", decode_kernel="flex", dtype=dtype, hidden_dim=_HIDDEN, num_layers=2, num_heads=2, max_position_embeddings=64, vocab_size=32, lora=lora)
 
 
 def _model(
@@ -53,7 +53,7 @@ def _model(
     return Model(
         backbone=_backbone(lora, dtype=dtype),
         heads=(head := RegressionHead(
-            in_features=_HIDDEN, out_features=_ACTIONS, hidden_dim=_HIDDEN, num_layers=1, use_norm=True,
+            in_features=_HIDDEN, out_features=_ACTIONS, hidden_dim=_HIDDEN, num_layers=1,
             propagate_gradient=1.0,
         )),
         action_source="action_value",

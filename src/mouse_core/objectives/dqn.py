@@ -229,11 +229,6 @@ def _boltzmann_entropy(q: torch.Tensor, *, temperature: float) -> torch.Tensor:
     return _policy_entropy(log_pi.exp())
 
 
-def _shift_next(values: torch.Tensor) -> torch.Tensor:
-    """``out[t] = values[t+1]``, zero at the end."""
-    return torch.cat([values[1:], values.new_zeros(1)])
-
-
 def _affine_scan_backward(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """Solve ``g_t = a_t + b_t * g_{t+1}`` with ``g_T = 0`` for every ``t``.
 

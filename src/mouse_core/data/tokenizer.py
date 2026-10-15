@@ -14,7 +14,7 @@ per-sequence rows with :meth:`Tokenizer.pack_rows`; pack already-tokenized
 steps with :func:`~mouse_core.data.token_batch.pack_token_batch`.
 :func:`save_tokenizer` writes the packing spec as ``tokenizer.json``;
 :func:`load_tokenizer` is the one recall path. Hub upload goes to its
-own repo via :func:`~mouse_core.models.base.push_model_to_hub`
+own repo via :func:`~mouse_core.models.io.push_model_to_hub`
 (``tokenizer_repo_id=``).
 """
 
@@ -725,7 +725,7 @@ def load_tokenizer(
     else:
         from huggingface_hub import hf_hub_download
 
-        from mouse_core.models.base import _hub_repo_id_for_user
+        from mouse_core.models.io import _hub_repo_id_for_user
 
         hf_kwargs: dict[str, Any] = {"force_download": force_download, **kwargs}
         if local_dir is not None:

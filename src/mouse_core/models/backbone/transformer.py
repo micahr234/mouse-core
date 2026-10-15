@@ -25,7 +25,6 @@ from mouse_core.models.backbone.base import (
     Backbone,
     DecodeKernel,
     TrainKernel,
-    _apply_final_norm,
     _load_transformer_weights,
     _rope_parameters_from_config,
 )
@@ -169,13 +168,12 @@ class TransformerBackbone(Backbone):
     """Decoder stack with packed kernels when the layout allows, else HF forward.
 
     ``train_kernel`` (``"varlen"`` / ``"padded"`` / ``"flex"`` / ``"reference"``),
-    ``decode_kernel`` (``"flex"``), ``dtype``, and ``use_norm`` are required:
-    the uncached-forward kernel, the cached-decode kernel, the dtype of the
-    base weights (``torch.float32`` to fine-tune them,
-    ``preferred_dtype(device=device)`` for a frozen LoRA base or inference), and
-    whether to keep the transformer's final RMSNorm (``False`` replaces it
-    with ``Identity``; per-layer norms stay). ``use_norm`` is saved with
-    the model.
+    ``decode_kernel`` (``"flex"``), and ``dtype`` are required:
+    the uncached-forward kernel, the cached-decode kernel, and the dtype of
+    the base weights (``torch.float32`` to fine-tune them,
+    ``preferred_dtype(device=device)`` for a frozen LoRA base or inference).
+    The transformer's native final normalization is always retained and
+    its pretrained weights are loaded along with the decoder layers.
 
     Pass **either** ``pretrained=`` **or** ``architecture=``:
 
@@ -204,6 +202,7 @@ class TransformerBackbone(Backbone):
     architecture: Architecture
     uses_packed: bool
     model: _DecoderStack
+    _config_kwargs: dict[str, Any]
 
     def __init__(
         self,
@@ -211,7 +210,6 @@ class TransformerBackbone(Backbone):
         train_kernel: TrainKernel,
         decode_kernel: DecodeKernel,
         dtype: torch.dtype,
-        use_norm: bool,
         train_autocast_dtype: torch.dtype | None = None,
         decode_autocast_dtype: torch.dtype | None = None,
         hidden_dim: int | None = None,
@@ -225,6 +223,11 @@ class TransformerBackbone(Backbone):
         **config_kwargs: Any,
     ) -> None:
         super().__init__()
+        if "use_norm" in config_kwargs:
+            raise TypeError(
+                "TransformerBackbone no longer accepts use_norm; "
+                "the native final normalization is always retained."
+            )
         self._set_kernels(train_kernel, decode_kernel)
         if not isinstance(dtype, torch.dtype) or not dtype.is_floating_point:
             raise TypeError(f"dtype must be a floating point torch.dtype, got {dtype!r}.")
@@ -242,7 +245,6 @@ class TransformerBackbone(Backbone):
         if pretrained is not None:
             self._init_from_pretrained(
                 dtype=dtype,
-                use_norm=use_norm,
                 hidden_dim=hidden_dim,
                 pretrained=pretrained,
                 load_weights=load_weights,
@@ -253,7 +255,7 @@ class TransformerBackbone(Backbone):
         else:
             assert architecture is not None
             if config_kwargs:
-                # hf rebuild only accepts hf_config / use_norm; extras are a second path.
+                # hf rebuild only accepts hf_config; extras are a second path.
                 extra = set(config_kwargs)
                 if architecture == "hf" and extra:
                     raise TypeError(
@@ -271,7 +273,6 @@ class TransformerBackbone(Backbone):
                 self._init_hf_module(
                     model=_build_hf_from_config(hf_config),
                     dtype=dtype,
-                    use_norm=use_norm,
                     lora=lora,
                 )
             else:
@@ -279,13 +280,12 @@ class TransformerBackbone(Backbone):
                     raise TypeError(
                         f"architecture={architecture!r} requires hidden_dim plus stack "
                         "arguments (e.g. TransformerBackbone(architecture='qwen3', "
-                        "hidden_dim=128, num_layers=2, num_heads=4, use_norm=True))."
+                        "hidden_dim=128, num_layers=2, num_heads=4))."
                     )
                 self._init_named_stack(
                     architecture=architecture,
                     hidden_dim=int(hidden_dim),
                     dtype=dtype,
-                    use_norm=use_norm,
                     lora=lora,
                     config_kwargs=config_kwargs,
                 )
@@ -314,7 +314,6 @@ class TransformerBackbone(Backbone):
         architecture: Literal["llama", "qwen3"],
         hidden_dim: int,
         dtype: torch.dtype,
-        use_norm: bool,
         lora: LoRAConfig | None,
         config_kwargs: dict[str, Any],
     ) -> None:
@@ -336,8 +335,6 @@ class TransformerBackbone(Backbone):
             if architecture == "llama"
             else qwen3_config_kwargs(cast(Any, self.model))
         )
-        _apply_final_norm(_as_module(self.model), use_norm)
-        self._config_kwargs["use_norm"] = use_norm
         _as_module(self.model).to(dtype)
         self._attach_lora(_as_module(self.model), lora)
 
@@ -345,7 +342,6 @@ class TransformerBackbone(Backbone):
         self,
         *,
         dtype: torch.dtype,
-        use_norm: bool,
         hidden_dim: int | None,
         pretrained: str | Path,
         load_weights: bool,
@@ -365,7 +361,6 @@ class TransformerBackbone(Backbone):
             self._init_named_from_pretrained(
                 architecture="qwen3",
                 dtype=dtype,
-                use_norm=use_norm,
                 hidden_dim=hidden_dim,
                 pretrained=pretrained,
                 load_weights=load_weights,
@@ -378,7 +373,6 @@ class TransformerBackbone(Backbone):
             self._init_named_from_pretrained(
                 architecture="llama",
                 dtype=dtype,
-                use_norm=use_norm,
                 hidden_dim=hidden_dim,
                 pretrained=pretrained,
                 load_weights=load_weights,
@@ -406,14 +400,13 @@ class TransformerBackbone(Backbone):
                 f"hidden_dim={hidden_dim} does not match pretrained hidden size "
                 f"{_hidden_size(loaded.config)} from {str(pretrained)!r}."
             )
-        self._init_hf_module(model=loaded, dtype=dtype, use_norm=use_norm, lora=lora)
+        self._init_hf_module(model=loaded, dtype=dtype, lora=lora)
 
     def _init_named_from_pretrained(
         self,
         *,
         architecture: Literal["llama", "qwen3"],
         dtype: torch.dtype,
-        use_norm: bool,
         hidden_dim: int | None,
         pretrained: str | Path,
         load_weights: bool,
@@ -448,8 +441,6 @@ class TransformerBackbone(Backbone):
         _ensure_packed_head_dim(_as_module(self.model))
         self._config_kwargs = dict(extracted_kwargs)
         self._config_kwargs["vocab_size"] = vocab_size
-        _apply_final_norm(_as_module(self.model), use_norm)
-        self._config_kwargs["use_norm"] = use_norm
         if load_weights:
             _load_transformer_weights(
                 hub_kwargs=hub_kwargs,
@@ -464,7 +455,6 @@ class TransformerBackbone(Backbone):
         *,
         model: nn.Module,
         dtype: torch.dtype,
-        use_norm: bool,
         lora: LoRAConfig | None,
     ) -> None:
         packed = is_packed_compatible(model)
@@ -485,8 +475,7 @@ class TransformerBackbone(Backbone):
         self.model = cast(_DecoderStack, model)
         self.architecture = "hf"
         self.uses_packed = packed
-        _apply_final_norm(_as_module(self.model), use_norm)
-        self._config_kwargs = {"use_norm": use_norm, "hf_config": _hf_config_dict(_as_module(self.model))}
+        self._config_kwargs = {"hf_config": _hf_config_dict(_as_module(self.model))}
         _as_module(self.model).to(dtype)
         self._attach_lora(_as_module(self.model), lora)
 

@@ -7,7 +7,8 @@ Build after moving/copying the models, then reuse after optimizer steps::
 
 The callable retains validated parameter pairs, not parameter snapshots.
 Each call applies ``delayed.lerp_(online, tau)`` through grouped foreach
-operations. Backbone and reasoner use ``tau_backbone``; heads can use one
+operations. The projection uses ``tau_projection`` independently of the
+backbone/reasoner's ``tau_backbone``; heads can use one
 scalar or a mapping with one rate for every head carried by the delayed
 model. Pass ``None`` for shared sections (``1`` is also a no-op). Copied
 sections require a rate. Zero skips writes. Frozen shared base weights
@@ -147,6 +148,12 @@ class _ModelPolyak:
                 "build the delayed model with Model.copy(heads=..., "
                 "backbone=..., reasoner=...)."
             )
+        if (online.projection is None) != (delayed.projection is None):
+            raise ValueError(
+                "online and delayed models must have the same projection section; "
+                "build the delayed model with Model.copy(projection=..., "
+                "heads=..., backbone=..., reasoner=...)."
+            )
 
         extra = [name for name in delayed.heads if name not in online.heads]
         if extra:
@@ -177,6 +184,14 @@ class _ModelPolyak:
         ):
             copied.append(delayed.reasoner)
             backbone.append(_PolyakState(online.reasoner, delayed.reasoner, section="reasoner"))
+        projection: _PolyakState | None = None
+        if (
+            online.projection is not None
+            and delayed.projection is not None
+            and delayed.projection is not online.projection
+        ):
+            copied.append(delayed.projection)
+            projection = _PolyakState(online.projection, delayed.projection, section="projection")
         if any(p.requires_grad for module in copied for p in module.parameters()):
             raise ValueError(
                 "a copied delayed section has trainable parameters; build the "
@@ -185,12 +200,14 @@ class _ModelPolyak:
 
         self._heads = heads
         self._backbone = backbone
+        self._projection = projection
 
     def __call__(
         self,
         *,
         tau_heads: float | Mapping[str, float | None] | None,
         tau_backbone: float | None,
+        tau_projection: float | None = None,
     ) -> None:
         if isinstance(tau_heads, Mapping):
             if set(tau_heads) != set(self._heads):
@@ -209,6 +226,9 @@ class _ModelPolyak:
         backbone_tau = _check_section_tau(
             "tau_backbone", tau_backbone, copied=bool(self._backbone)
         )
+        projection_tau = _check_section_tau(
+            "tau_projection", tau_projection, copied=self._projection is not None
+        )
         # Validate every rate before writing any section.
         for name, state in self._heads.items():
             tau = checked[name]
@@ -217,6 +237,8 @@ class _ModelPolyak:
         if backbone_tau is not None:
             for state in self._backbone:
                 state.update(backbone_tau)
+        if self._projection is not None and projection_tau is not None:
+            self._projection.update(projection_tau)
 
 
 def model_polyak(*, online: Model, delayed: Model) -> _ModelPolyak:
@@ -227,6 +249,8 @@ def model_polyak(*, online: Model, delayed: Model) -> _ModelPolyak:
     use ``None`` for shared sections. ``tau_heads`` can be a scalar or a
     mapping whose keys exactly match the delayed model's heads. Each rate
     is in ``[0, 1]``. The copied reasoner follows the backbone rate.
+    A copied projection requires its own ``tau_projection`` in ``[0, 1]``;
+    use ``None`` (the default) or ``1`` for a shared or absent projection.
 
     Bind after model construction/device placement. Rebind after replacing
     parameters or changing model sections, trainability, dtype, or device.

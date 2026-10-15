@@ -42,7 +42,7 @@ def no_compiled_decoder() -> Iterator[None]:
 
 
 def _backbone(architecture: str = "qwen3", *, hidden: int = 64, layers: int = 2, heads: int = 4, kv_heads: int = 4, head_dim: int | None = None, lora: LoRAConfig | None = None, kernel: TrainKernel = "varlen", dtype: torch.dtype = torch.float32, autocast_dtype: torch.dtype | None = None):
-    kwargs: dict[str, Any] = dict(architecture=architecture, train_kernel=kernel, decode_kernel="flex", dtype=dtype, use_norm=True, train_autocast_dtype=autocast_dtype, hidden_dim=hidden, num_layers=layers, num_heads=heads, num_key_value_heads=kv_heads, lora=lora)
+    kwargs: dict[str, Any] = dict(architecture=architecture, train_kernel=kernel, decode_kernel="flex", dtype=dtype, train_autocast_dtype=autocast_dtype, hidden_dim=hidden, num_layers=layers, num_heads=heads, num_key_value_heads=kv_heads, lora=lora)
     if head_dim is not None:
         kwargs["head_dim"] = head_dim
     return TransformerBackbone(**kwargs)
@@ -352,7 +352,7 @@ def test_autocast_dtype_is_validated(no_compiled_decoder: None) -> None:
         _backbone("qwen3", autocast_dtype=torch.float32)
     with pytest.raises(ValueError, match="fp32 base"):
         TransformerBackbone(architecture="qwen3", 
-            train_kernel="reference", decode_kernel="flex", dtype=torch.bfloat16, use_norm=True,
+            train_kernel="reference", decode_kernel="flex", dtype=torch.bfloat16,
             decode_autocast_dtype=torch.bfloat16, hidden_dim=64, num_layers=1, num_heads=4,
         )
     bb = _backbone("qwen3")
@@ -588,7 +588,7 @@ def test_cuda_bf16_lora_compiled_body_matches_eager_and_trains(no_compiled_decod
     torch.manual_seed(6)
     device = torch.device("cuda")
     backbone = _backbone("qwen3", kv_heads=2, lora=LoRAConfig(rank=4, alpha=8.0), dtype=torch.bfloat16)
-    head = RegressionHead(in_features=64, out_features=4, hidden_dim=64, num_layers=1, use_norm=True, propagate_gradient=1.0)
+    head = RegressionHead(in_features=64, out_features=4, hidden_dim=64, num_layers=1, propagate_gradient=1.0)
     model = Model(backbone=backbone, heads=head, action_source="action_value", reasoner=None).to(device)
     bb = cast(TransformerBackbone, model.backbone)
     for n, p in bb.named_parameters():
@@ -677,7 +677,7 @@ def test_shape_validation(no_compiled_decoder: None) -> None:
 
 
 def test_sliding_window_config_is_rejected(no_compiled_decoder: None) -> None:
-    bb = TransformerBackbone(architecture="qwen3", train_kernel="reference", decode_kernel="flex", dtype=torch.float32, use_norm=True, hidden_dim=64, num_layers=1, num_heads=4, use_sliding_window=True)
+    bb = TransformerBackbone(architecture="qwen3", train_kernel="reference", decode_kernel="flex", dtype=torch.float32, hidden_dim=64, num_layers=1, num_heads=4, use_sliding_window=True)
     ids = torch.zeros(4, dtype=torch.long)
     with pytest.raises(ValueError, match="sliding-window"):
         packed_forward(model=bb.model, embeds=torch.zeros(4, 64), group_ids=ids, train_kernel="reference")
@@ -720,8 +720,8 @@ def test_prepare_group_id_col_matches_step_counts() -> None:
 @pytest.mark.parametrize("kernel", _CPU_KERNELS)  # fp32 backbone on both devices; strict varlen would raise
 def test_model_forward_isolates_sequences(no_compiled_decoder: None, device: str, kernel: TrainKernel) -> None:
     torch.manual_seed(2)
-    backbone = TransformerBackbone(architecture="qwen3", train_kernel=kernel, decode_kernel="flex", dtype=torch.float32, use_norm=True, hidden_dim=64, num_layers=2, num_heads=4, num_key_value_heads=4, vocab_size=32)
-    head = RegressionHead(in_features=backbone.hidden_dim, out_features=4, hidden_dim=backbone.hidden_dim, num_layers=1, use_norm=True, propagate_gradient=1.0)
+    backbone = TransformerBackbone(architecture="qwen3", train_kernel=kernel, decode_kernel="flex", dtype=torch.float32, hidden_dim=64, num_layers=2, num_heads=4, num_key_value_heads=4, vocab_size=32)
+    head = RegressionHead(in_features=backbone.hidden_dim, out_features=4, hidden_dim=backbone.hidden_dim, num_layers=1, propagate_gradient=1.0)
     model = Model(backbone=backbone, heads=head, action_source="action_value", reasoner=None).to(device).eval()
     batch = [[{"action": i % 4} for i in range(3)], [{"action": i % 4} for i in range(3)]]
     tb = batch_to_token_batch(token_tokenizer("action"), batch)
@@ -741,8 +741,8 @@ def test_model_forward_isolates_sequences(no_compiled_decoder: None, device: str
 def test_model_train_isolates_samples_as_sequences(no_compiled_decoder: None) -> None:
     """Two samples packed as two sequences match a forward of the second sample alone."""
     torch.manual_seed(11)
-    backbone = TransformerBackbone(architecture="qwen3", train_kernel="reference", decode_kernel="flex", dtype=torch.float32, use_norm=True, hidden_dim=32, num_layers=2, num_heads=4, num_key_value_heads=4, vocab_size=32)
-    head = RegressionHead(in_features=backbone.hidden_dim, out_features=4, hidden_dim=backbone.hidden_dim, num_layers=1, use_norm=True, propagate_gradient=1.0)
+    backbone = TransformerBackbone(architecture="qwen3", train_kernel="reference", decode_kernel="flex", dtype=torch.float32, hidden_dim=32, num_layers=2, num_heads=4, num_key_value_heads=4, vocab_size=32)
+    head = RegressionHead(in_features=backbone.hidden_dim, out_features=4, hidden_dim=backbone.hidden_dim, num_layers=1, propagate_gradient=1.0)
     model = Model(backbone=backbone, heads=head, action_source="action_value", reasoner=None).eval()
     task0 = [
         {"action": 0, "episode_done": 0, "task_done": 0, "task_index": 0},
@@ -764,8 +764,8 @@ def test_model_train_isolates_samples_as_sequences(no_compiled_decoder: None) ->
 
 def test_model_gradient_checkpointing_flag_reaches_backward(no_compiled_decoder: None) -> None:
     torch.manual_seed(12)
-    backbone = TransformerBackbone(architecture="qwen3", train_kernel="reference", decode_kernel="flex", dtype=torch.float32, use_norm=True, hidden_dim=32, num_layers=2, num_heads=4, vocab_size=32)
-    head = RegressionHead(in_features=32, out_features=4, hidden_dim=32, num_layers=1, use_norm=True, propagate_gradient=1.0)
+    backbone = TransformerBackbone(architecture="qwen3", train_kernel="reference", decode_kernel="flex", dtype=torch.float32, hidden_dim=32, num_layers=2, num_heads=4, vocab_size=32)
+    head = RegressionHead(in_features=32, out_features=4, hidden_dim=32, num_layers=1, propagate_gradient=1.0)
     model = Model(backbone=backbone, heads=head, action_source="action_value", reasoner=None)
     tb = batch_to_token_batch(token_tokenizer("action"), [[{"action": i % 4} for i in range(5)], [{"action": 1}]])
 
@@ -788,11 +788,11 @@ def test_model_forwards_autocast_dtype_to_packed_forward(no_compiled_decoder: No
     """A fp32 Model built with train_autocast_dtype=bf16 trains through the varlen kernel."""
     torch.manual_seed(13)
     backbone = TransformerBackbone(architecture="qwen3", 
-        train_kernel="varlen", decode_kernel="flex", dtype=torch.float32, use_norm=True,
+        train_kernel="varlen", decode_kernel="flex", dtype=torch.float32,
         train_autocast_dtype=torch.bfloat16,
         hidden_dim=32, num_layers=2, num_heads=4, vocab_size=32)
     assert backbone.train_autocast_dtype is torch.bfloat16 and backbone.decode_autocast_dtype is None
-    head = RegressionHead(in_features=32, out_features=4, hidden_dim=32, num_layers=1, use_norm=True, propagate_gradient=1.0)
+    head = RegressionHead(in_features=32, out_features=4, hidden_dim=32, num_layers=1, propagate_gradient=1.0)
     model = Model(backbone=backbone, heads=head, action_source="action_value", reasoner=None).to("cuda")
     tb = batch_to_token_batch(token_tokenizer("action"), [[{"action": i % 4} for i in range(5)], [{"action": 1}]])
     model(tb).predictions["action_value"].square().sum().backward()
