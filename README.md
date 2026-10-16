@@ -224,7 +224,7 @@ The [example notebooks](examples/) are short usage docs, not full experiments. W
 | [17 — Collect CartPole](examples/17_collect_cartpole.ipynb) | Random `CartPole-v1` rollouts into one `Datastore` per stream. `observation` is the length-4 float vector (cart position, cart velocity, pole angle, pole angular velocity). |
 | [18 — Train offline CartPole DQN](examples/18_train_offline_cartpole_dqn.ipynb) | Same offline DQN loop as `02` on the `17` dataset. Each observation element is a `numeric` field (`x`, `v`, `t`, `w`) with a Fourier add. A `token` comma sits between the action and those characters. |
 | [19 — Train online Pendulum DQN](examples/19_train_online_pendulum_dqn.ipynb) | Continuous actions in, discrete actions out: `DiscretizedActionHead` owns 33 fixed torque vectors for `Pendulum-v1`, both conversion methods, and checkpoint persistence. Applied torque enters history through numeric Fourier embeddings; category IDs go only to the DQN objective. A small CPU example with replay and a delayed model. |
-| [20 — Sequential action DQN](examples/20_train_sequential_actions_dqn.ipynb) | Joint control of multiple Pendulum instances with one shared categorical head and one decision token per torque. Compare next-component, fixed n-action, and environment-boundary backups; internal choices have discount 1. |
+| [20 — Sequential action DQN](examples/20_train_sequential_actions_dqn.ipynb) | Control Reacher-v5’s two arm joints with one shared categorical head and one decision token per torque. Compare next-component, fixed n-action, and environment-boundary backups; internal choices have discount 1. |
 | [15 — Inference](examples/15_inference.ipynb) | Evaluation: construct the example agent explicitly, then `load_model(model=agent, ...)` on the model repo and `load_tokenizer` on a separate tokenizer repo, then batched FlexAttention cached inference (`max_cache` / `start_cache`) |
 
 ### Example dependencies
@@ -235,7 +235,9 @@ The notebooks need the `examples` extra (`mouse-gym`, `repeat-task-gym`, `proced
 uv pip install -e ".[examples]" --python .venv/bin/python
 ```
 
-That pulls `gymnasium[toy-text]` → `pygame-ce`. On free-threaded Python there is often no prebuilt `pygame-ce` wheel, so the install builds from source and needs SDL2 / PortMidi headers. On Debian/Ubuntu:
+Example `20` uses `Reacher-v5`; the `examples` extra includes `gymnasium[mujoco]`. It runs without rendering and does not need a display.
+
+The extra also pulls `gymnasium[toy-text]` → `pygame-ce`. On free-threaded Python there is often no prebuilt `pygame-ce` wheel, so the install builds from source and needs SDL2 / PortMidi headers. On Debian/Ubuntu:
 
 ```bash
 sudo apt install libsdl2-dev libsdl2-image-dev libsdl2-mixer-dev libsdl2-ttf-dev libportmidi-dev libfreetype6-dev

@@ -123,11 +123,29 @@ def test_all_components_receive_reward_without_extra_discount(components):
 
 
 @pytest.mark.parametrize("mode", ["next_action", "n_actions", "next_step"])
-def test_sequential_notebook_collects_and_trains(mode):
+def test_sequential_notebook_collects_and_trains(mode, monkeypatch):
     import json
     from pathlib import Path
 
-    pytest.importorskip("gymnasium")
+    gym = pytest.importorskip("gymnasium")
+    pytest.importorskip("mujoco")
+    make = gym.make
+    applied_actions = []
+
+    def make_recorded(*args, **kwargs):
+        assert "max_episode_steps" not in kwargs
+        env = make(*args, **kwargs)
+        step = env.step
+
+        def record_step(action):
+            assert env.action_space.contains(action)
+            applied_actions.append(action.copy())
+            return step(action)
+
+        monkeypatch.setattr(env, "step", record_step)
+        return env
+
+    monkeypatch.setattr(gym, "make", make_recorded)
     path = Path(__file__).resolve().parents[1] / "examples/20_train_sequential_actions_dqn.ipynb"
     notebook = json.loads(path.read_text())
     namespace = {}
@@ -139,11 +157,21 @@ def test_sequential_notebook_collects_and_trains(mode):
             source = "".join(cell["source"])
             if index == 1:
                 source = source.replace('BACKUP_MODE = "next_step"', f'BACKUP_MODE = "{mode}"')
-                source = source.replace('MAX_STEPS_PER_EPISODE = 16', 'MAX_STEPS_PER_EPISODE = 3')
                 source = source.replace('NUM_CYCLES = 2', 'NUM_CYCLES = 1')
                 source = source.replace('TRAIN_STEPS = 2', 'TRAIN_STEPS = 1')
             exec(compile(source, f"{path}:cell {index}", "exec"), namespace)
+        assert namespace["env"].spec.id == "Reacher-v5"
+        assert namespace["OBSERVATION_DIM"] == 10
+        episode_steps = gym.spec("Reacher-v5").max_episode_steps
+        assert episode_steps is not None
+        assert namespace["MAX_STEPS_PER_EPISODE"] == episode_steps
+        assert len(applied_actions) == 2 * episode_steps
+        history = namespace["last_history"]
+        for index, applied in enumerate(applied_actions[-episode_steps:]):
+            # One vector per physical step, assembled in the recorded component order.
+            assert applied.tolist() == [history[2 * index + 1]["torque"],
+                                        history[2 * index + 2]["torque"]]
     finally:
-        for env in namespace.get("envs", []):
-            env.close()
+        if "env" in namespace:
+            namespace["env"].close()
         torch.set_num_threads(threads)

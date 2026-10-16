@@ -35,7 +35,7 @@ examples = [
     "mouse-gym @ git+https://github.com/micahr234/mouse-gym.git@main",
     "repeat-task-gym @ git+https://github.com/micahr234/repeat-task-gym.git@main",
     "procedural-frozenlake @ git+https://github.com/micahr234/procedural-frozenlake.git@main",
-    "gymnasium[toy-text]>=1.4.0",
+    "gymnasium[toy-text,mujoco]>=1.4.0",
     "jupyter>=1.1.1",
     "ipykernel>=7.4.0",
     "matplotlib>=3.11.2",
