@@ -100,6 +100,11 @@ class GrpoObjective(Objective[...]):
     reads must stay in-run: out-of-run pairs are multiplied by ``0``
     (all-zero weights → loss ``0``).
 
+    Optional ``objective_data["action_executed"]`` is a bool ``[N]`` column.
+    A false entry marks an action-independent reset transition. Its numeric
+    action is only a placeholder; the transition contributes no policy loss,
+    entropy, or KL statistics. Omit the column when every action is executed.
+
     Args:
         clip_eps: PPO-style ratio clip ε.
         ent_coef: Weight on the policy entropy bonus (subtracted from the loss).
@@ -226,6 +231,14 @@ class GrpoObjective(Objective[...]):
             device=device,
             dtype=dtype,
         )
+        # A reset can advance a task without executing a policy action. Its
+        # numeric action placeholder is not a policy sample and contributes
+        # neither a surrogate loss nor entropy/KL statistics.
+        if "action_executed" in objective_data:
+            executed = objective_data["action_executed"]
+            if executed.shape != torch.Size([N]) or executed.dtype != torch.bool:
+                raise ValueError("GRPO action_executed must be bool [N].")
+            pair_weight = pair_weight * executed[1:].to(dtype=dtype)
 
         next_actions = action[1:]
         curr_logits = logits[:-1, :]
