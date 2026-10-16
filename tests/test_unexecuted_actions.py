@@ -115,3 +115,22 @@ def test_all_unexecuted_returns_differentiable_zero(policy):
     assert loss==0
     loss.backward()
     assert q.grad.count_nonzero()==0
+
+
+@pytest.mark.parametrize('algorithm', ['dqn','grpo','ppo'])
+def test_binary_int64_action_flags_from_packed_data(algorithm):
+    batch=data();batch['action_executed']=batch['action_executed'].long()
+    q=torch.zeros(5,2,requires_grad=True)
+    kwargs=dict(objective_data=batch,group_id=torch.zeros(5,dtype=torch.long),predictions=q)
+    if algorithm=='dqn':
+        obj=objective();kwargs.update(backup_value_predictions=q,backup_action_predictions=q)
+    elif algorithm=='grpo':obj=GrpoObjective()
+    else:
+        obj=PpoObjective(reward=None,value=None,discount=None,cross_group_backups='bootstrap')
+        kwargs['value_predictions']=torch.zeros(5,requires_grad=True)
+    losses,_=obj(**kwargs)
+    loss=sum(losses.values());assert torch.isfinite(loss)
+    loss.backward();assert q.grad[1].count_nonzero()==0
+    batch['action_executed'][1]=2
+    with pytest.raises(ValueError,match='binary'):
+        obj(**kwargs)

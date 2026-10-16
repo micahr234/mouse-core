@@ -8,9 +8,11 @@ def executed_actions(columns: dict[str, torch.Tensor], action: torch.Tensor) -> 
     executed = columns.get("action_executed")
     if executed is None:
         return torch.ones_like(action, dtype=torch.bool)
-    if executed.dtype != torch.bool or executed.shape != action.shape:
-        raise ValueError("action_executed must be bool [N] matching action.")
-    return executed.to(device=action.device)
+    if executed.dtype not in (torch.bool, torch.int64) or executed.shape != action.shape:
+        raise ValueError("action_executed must be bool or binary int64 [N] matching action.")
+    if executed.dtype == torch.int64 and bool(((executed < 0) | (executed > 1)).any()):
+        raise ValueError("action_executed must be bool or binary int64 [N] matching action.")
+    return executed.to(device=action.device, dtype=torch.bool)
 
 
 def canonical_actions(columns: dict[str, torch.Tensor], action: torch.Tensor) -> torch.Tensor:
