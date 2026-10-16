@@ -5,7 +5,7 @@ from typing import Any, cast
 import json
 import pytest
 import torch
-from mouse_core.models import load_model, push_model_to_hub, save_model
+from mouse_core.models import Embedding, load_model, push_model_to_hub, save_model
 from mouse_core.models.io import _write_model_card
 from mouse_core.models.backbone import IdentityBackbone, LoRAConfig, Backbone
 from mouse_core.data import Tokenizer, load_tokenizer, save_tokenizer
@@ -42,16 +42,16 @@ _TOK = token_tokenizer("action", "episode_done")
 def test_composed_model_roundtrip(tmp_path) -> None:
     torch.manual_seed(0)
     hidden_dim = 8
-    backbone = IdentityBackbone(hidden_dim=hidden_dim, vocab_size=32)
+    backbone = IdentityBackbone(hidden_dim=hidden_dim)
     heads = MLP(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, propagate_gradient=1.0)
     model = simple_model(backbone=backbone, heads={'action_value': heads}, reasoner=None).eval()
     batch = [[{'action': 0, 'reward': 0.0, 'episode_done': 0, 'task_done': 0}, {'action': 1, 'reward': 1.0, 'episode_done': 0, 'task_done': 0}, {'action': 2, 'reward': 2.0, 'episode_done': 1, 'task_done': 0}]]
-    expected = model(batch_to_token_batch(_TOK, batch)).predictions
+    expected = model(batch_to_token_batch(_TOK, batch))["predictions"]
     save_model(model=model, path=tmp_path)
     loaded = load_model(model=fresh_model(model), repo_id_or_path=tmp_path).eval()
-    actual = loaded(batch_to_token_batch(_TOK, batch)).predictions
+    actual = loaded(batch_to_token_batch(_TOK, batch))["predictions"]
     assert torch.allclose(actual['action_value'], expected['action_value'])
-    assert loaded.encoder.hidden_dim == hidden_dim
+    assert loaded.backbone.hidden_dim == hidden_dim
     orig_sd = model.state_dict()
     loaded_sd = loaded.state_dict()
     assert set(orig_sd.keys()) == set(loaded_sd.keys()), f'state_dict key mismatch:\n  missing in loaded: {set(orig_sd.keys()) - set(loaded_sd.keys())}\n  extra in loaded:   {set(loaded_sd.keys()) - set(orig_sd.keys())}'
@@ -65,21 +65,19 @@ def test_composed_model_roundtrip(tmp_path) -> None:
 
 def test_loading_requires_a_model_and_preserves_its_runtime(tmp_path) -> None:
     source = simple_model(
-        backbone=Backbone(architecture="qwen3", train_kernel="reference", decode_kernel="flex",
-                                     dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2, vocab_size=32),
+        backbone=Backbone(architecture='qwen3', train_kernel='reference', decode_kernel='flex', dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2),
         heads={'action_value': MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.)},
          reasoner=None,
     )
     save_model(model=source, path=tmp_path)
     target = simple_model(
-        backbone=Backbone(architecture="qwen3", train_kernel="flex", decode_kernel="flex",
-                                     dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2, vocab_size=32),
+        backbone=Backbone(architecture='qwen3', train_kernel='flex', decode_kernel='flex', dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2),
         heads={'action_value': MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.)},
          reasoner=None,
     )
     loaded = load_model(model=target, repo_id_or_path=tmp_path)
     assert loaded is target
-    assert loaded.encoder.backbones[0].train_kernel == "flex"
+    assert loaded.backbone.train_kernel == "flex"
     assert next(loaded.parameters()).requires_grad
     with pytest.raises(TypeError, match="model"):
         load_model(repo_id_or_path=tmp_path)  # type: ignore[call-arg]
@@ -87,62 +85,58 @@ def test_loading_requires_a_model_and_preserves_its_runtime(tmp_path) -> None:
 
 
 def test_num_frequencies_roundtrip(tmp_path) -> None:
+    embedding = Embedding(hidden_dim=8, vocab_size=32, num_frequencies=3)
     hidden_dim = 8
-    backbone = Backbone(architecture='qwen3', train_kernel='reference', decode_kernel='flex', dtype=torch.float32, hidden_dim=hidden_dim, num_layers=1, num_heads=2, vocab_size=32, num_frequencies=3)
-    assert backbone.fourier is not None
+    backbone = Backbone(architecture='qwen3', train_kernel='reference', decode_kernel='flex', dtype=torch.float32, hidden_dim=hidden_dim, num_layers=1, num_heads=2)
+    assert embedding.fourier is not None
     with torch.no_grad():
-        backbone.fourier.proj.weight.fill_(0.25)
+        embedding.fourier.proj.weight.fill_(0.25)
     heads = MLP(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, propagate_gradient=1.0)
-    model = simple_model(backbone=backbone, heads={'action_value': heads}, reasoner=None)
+    model = simple_model(embedding=embedding, backbone=backbone, heads={'action_value': heads}, reasoner=None)
     save_model(model=model, path=tmp_path)
-    loaded = cast(Backbone, load_model(model=fresh_model(model), repo_id_or_path=tmp_path).encoder.backbones[0])
-    assert loaded.num_frequencies == 3
+    loaded_model = load_model(model=fresh_model(model), repo_id_or_path=tmp_path)
+    loaded = loaded_model.embedding
+    assert loaded_model.embedding.num_frequencies == 3
     assert loaded.fourier is not None
-    assert torch.equal(loaded.fourier.proj.weight, backbone.fourier.proj.weight)
+    assert model.embedding.fourier is not None
+    assert torch.equal(loaded.fourier.proj.weight, model.embedding.fourier.proj.weight)
     assert not any((key.endswith('bands') for key in model.state_dict()))
 
 
 def test_fourier_stays_trainable_when_lora_freezes_the_stack() -> None:
-    backbone = Backbone(
-        architecture="qwen3",
-        train_kernel="reference",
-        decode_kernel="flex",
-        dtype=torch.float32,
-        hidden_dim=8,
-        num_layers=1,
-        num_heads=2,
-        vocab_size=32,
-        num_frequencies=2,
-        lora=LoRAConfig(rank=2),
-    )
-    assert backbone.fourier is not None
-    assert backbone.fourier.proj.weight.requires_grad
+    embedding = Embedding(hidden_dim=8, vocab_size=32, num_frequencies=2)
+    backbone = Backbone(architecture='qwen3', train_kernel='reference', decode_kernel='flex', dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2, lora=LoRAConfig(rank=2))
+    assert embedding.fourier is not None
+    assert embedding.fourier.proj.weight.requires_grad
     assert any(not param.requires_grad for param in backbone.model.parameters())
 
 
 def test_identity_num_frequencies_roundtrip(tmp_path) -> None:
-    backbone = IdentityBackbone(hidden_dim=8, vocab_size=32, num_frequencies=4)
-    assert backbone.fourier is not None
+    embedding = Embedding(hidden_dim=8, vocab_size=32, num_frequencies=4)
+    backbone = IdentityBackbone(hidden_dim=8)
+    assert embedding.fourier is not None
     with torch.no_grad():
-        backbone.fourier.proj.weight.normal_()
+        embedding.fourier.proj.weight.normal_()
     heads = MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0)
-    model = simple_model(backbone=backbone, heads={'action_value': heads}, reasoner=None)
+    model = simple_model(embedding=embedding, backbone=backbone, heads={'action_value': heads}, reasoner=None)
     save_model(model=model, path=tmp_path)
-    loaded = cast(IdentityBackbone, load_model(model=fresh_model(model), repo_id_or_path=tmp_path).encoder.backbones[0])
-    assert loaded.num_frequencies == 4
+    loaded_model = load_model(model=fresh_model(model), repo_id_or_path=tmp_path)
+    loaded = loaded_model.embedding
+    assert loaded_model.embedding.num_frequencies == 4
     assert loaded.fourier is not None
-    assert torch.equal(loaded.fourier.proj.weight, backbone.fourier.proj.weight)
+    assert model.embedding.fourier is not None
+    assert torch.equal(loaded.fourier.proj.weight, model.embedding.fourier.proj.weight)
 
 
 def test_explicit_model_checkpoints_roundtrip_without_backbone_output_norm(tmp_path) -> None:
-    backbone = Backbone(architecture='qwen3', train_kernel='reference', decode_kernel='flex', dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2, vocab_size=32)
+    backbone = Backbone(architecture='qwen3', train_kernel='reference', decode_kernel='flex', dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2)
     head = MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0)
     model = simple_model(backbone=backbone, heads={'action_value': head}, reasoner=None)
     with torch.no_grad():
         head.norm.weight.fill_(3.0)
     save_model(model=model, path=tmp_path)
     loaded = load_model(model=fresh_model(model), repo_id_or_path=str(tmp_path))
-    assert isinstance(cast(Backbone, loaded.encoder.backbones[0]).model.norm, torch.nn.Identity)
+    assert isinstance(cast(Backbone, loaded.backbone).model.norm, torch.nn.Identity)
     torch.testing.assert_close(cast(MLP, loaded.heads['action_value']).norm.weight, torch.full((8,), 3.0))
     h = torch.randn(3, 8)
     torch.testing.assert_close(loaded.head(h=h)['action_value'], model.head(h=h)['action_value'])
@@ -184,18 +178,18 @@ def test_transformer_backbone_requires_kernels_and_dtype() -> None:
 def test_identity_embed_tokens_roundtrip(tmp_path) -> None:
     torch.manual_seed(0)
     hidden_dim = 8
-    backbone = IdentityBackbone(hidden_dim=hidden_dim, vocab_size=32)
+    backbone = IdentityBackbone(hidden_dim=hidden_dim)
     heads = MLP(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, propagate_gradient=1.0)
     model = simple_model(backbone=backbone, heads={'action_value': heads}, reasoner=None).eval()
     tokenizer = token_tokenizer('action', 'prev_action')
     batch = [[{'action': 0, 'prev_action': 1, 'reward': 0.5, 'grouping_id': 0}, {'action': 2, 'prev_action': 0, 'reward': 1.0, 'grouping_id': 0}]]
-    expected = model(batch_to_token_batch(tokenizer, batch)).predictions
+    expected = model(batch_to_token_batch(tokenizer, batch))["predictions"]
     save_model(model=model, path=tmp_path)
     loaded = load_model(model=fresh_model(model), repo_id_or_path=tmp_path).eval()
     assert set(model.state_dict()) == set(loaded.state_dict())
-    actual = loaded(batch_to_token_batch(tokenizer, batch)).predictions
+    actual = loaded(batch_to_token_batch(tokenizer, batch))["predictions"]
     assert torch.allclose(actual['action_value'], expected['action_value'])
-    assert torch.equal(cast(IdentityBackbone, model.encoder.backbones[0]).embed_tokens.weight, cast(IdentityBackbone, loaded.encoder.backbones[0]).embed_tokens.weight)
+    assert torch.equal(model.embedding.embed_tokens.weight, loaded.embedding.embed_tokens.weight)
 
 
 def test_model_card_requires_the_application_implementation(tmp_path) -> None:
@@ -214,7 +208,7 @@ def test_model_card_requires_the_application_implementation(tmp_path) -> None:
 
 def _lora_model(dtype: torch.dtype) -> Model:
     hidden_dim = 8
-    backbone = Backbone(architecture='qwen3', train_kernel='reference', decode_kernel='flex', dtype=dtype, hidden_dim=hidden_dim, num_layers=1, num_heads=2, lora=LoRAConfig(rank=2), vocab_size=32)
+    backbone = Backbone(architecture='qwen3', train_kernel='reference', decode_kernel='flex', dtype=dtype, hidden_dim=hidden_dim, num_layers=1, num_heads=2, lora=LoRAConfig(rank=2))
     heads = MLP(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, propagate_gradient=1.0)
     return simple_model(backbone=backbone, heads={'action_value': heads}, reasoner=None).eval()
 
@@ -222,22 +216,22 @@ def _lora_model(dtype: torch.dtype) -> Model:
 def test_backbone_dtype_applies_to_base_only_and_trainable_sections_stay_float32() -> None:
     model = _lora_model(torch.bfloat16)
     assert {p.dtype for p in model.heads.parameters()} == {torch.float32}
-    assert {p.dtype for p in model.encoder.backbones[0].parameters() if not p.requires_grad} == {torch.bfloat16}
-    assert {p.dtype for p in model.encoder.backbones[0].parameters() if p.requires_grad} == {torch.float32}
-    assert model.encoder.backbones[0].dtype == torch.bfloat16
+    assert {p.dtype for p in model.backbone.parameters() if not p.requires_grad} == {torch.bfloat16}
+    assert {p.dtype for p in model.backbone.parameters() if p.requires_grad} == {torch.float32}
+    assert model.backbone.dtype == torch.bfloat16
     batch = [[{'action': 0, 'reward': 0.5, 'episode_done': 0, 'task_done': 0}, {'action': 1, 'reward': 1.0, 'episode_done': 0, 'task_done': 0}]]
     with torch.no_grad():
-        preds = model(batch_to_token_batch(_TOK, batch)).predictions
+        preds = model(batch_to_token_batch(_TOK, batch))["predictions"]
     assert preds['action_value'].dtype == torch.float32
 
 
-@pytest.mark.parametrize('cast_fn', [lambda m: m.to(torch.bfloat16), lambda m: m.to(dtype=torch.bfloat16), lambda m: m.to('cpu', torch.bfloat16), lambda m: m.to(device='cpu', dtype=torch.bfloat16), lambda m: m.to(torch.zeros(1, dtype=torch.bfloat16)), lambda m: m.bfloat16(), lambda m: m.half(), lambda m: m.double(), lambda m: m.float(), lambda m: m.encoder.backbones[0].to(dtype=torch.bfloat16), lambda m: m.encoder.backbones[0].bfloat16()], ids=['pos-dtype', 'kw-dtype', 'pos-device-dtype', 'kw-device-dtype', 'tensor', 'bfloat16()', 'half()', 'double()', 'float()', 'backbone-to', 'backbone-bfloat16()'])
+@pytest.mark.parametrize('cast_fn', [lambda m: m.to(torch.bfloat16), lambda m: m.to(dtype=torch.bfloat16), lambda m: m.to('cpu', torch.bfloat16), lambda m: m.to(device='cpu', dtype=torch.bfloat16), lambda m: m.to(torch.zeros(1, dtype=torch.bfloat16)), lambda m: m.bfloat16(), lambda m: m.half(), lambda m: m.double(), lambda m: m.float(), lambda m: m.backbone.to(dtype=torch.bfloat16), lambda m: m.backbone.bfloat16()], ids=['pos-dtype', 'kw-dtype', 'pos-device-dtype', 'kw-device-dtype', 'tensor', 'bfloat16()', 'half()', 'double()', 'float()', 'backbone-to', 'backbone-bfloat16()'])
 def test_model_and_backbone_refuse_dtype_casts(cast_fn) -> None:
     """dtype is a backbone constructor argument; ``.to`` only moves."""
     model = _lora_model(torch.float32)
     with pytest.raises(TypeError, match='dtype'):
         cast_fn(model)
-    assert model.encoder.backbones[0].dtype == torch.float32
+    assert model.backbone.dtype == torch.float32
     model.to('cpu')
     model.to(device='cpu')
 
@@ -246,10 +240,10 @@ def test_load_model_casts_saved_weights_into_the_supplied_models_dtype(tmp_path)
     model = _lora_model(torch.bfloat16)
     save_model(model=model, path=tmp_path)
     loaded = load_model(model=_lora_model(torch.float32), repo_id_or_path=tmp_path)
-    assert loaded.encoder.backbones[0].dtype == torch.float32
-    assert {p.dtype for p in loaded.encoder.backbones[0].parameters()} == {torch.float32}
-    saved: dict[str, torch.Tensor] = {n: cast(torch.Tensor, p) for n, p in model.encoder.backbones[0].named_parameters()}
-    for n, p in loaded.encoder.backbones[0].named_parameters():
+    assert loaded.backbone.dtype == torch.float32
+    assert {p.dtype for p in loaded.backbone.parameters()} == {torch.float32}
+    saved: dict[str, torch.Tensor] = {n: cast(torch.Tensor, p) for n, p in model.backbone.named_parameters()}
+    for n, p in loaded.backbone.named_parameters():
         if not p.requires_grad:
             assert torch.equal(cast(torch.Tensor, p), saved[n].float())
 
@@ -258,17 +252,17 @@ def test_model_to_cuda_moves_without_casting() -> None:
     if not torch.cuda.is_available():
         pytest.skip('CUDA required')
     model = _lora_model(torch.bfloat16).to(torch.device('cuda'))
-    assert model.encoder.backbones[0].dtype == torch.bfloat16
-    assert {p.dtype for p in model.encoder.backbones[0].parameters() if p.requires_grad} == {torch.float32}
+    assert model.backbone.dtype == torch.bfloat16
+    assert {p.dtype for p in model.backbone.parameters() if p.requires_grad} == {torch.float32}
     assert next(model.heads.parameters()).dtype == torch.float32
     batch = [[{'action': 0, 'reward': 0.0, 'episode_done': 0, 'task_done': 0}]]
     with torch.no_grad():
-        preds = model(batch_to_token_batch(_TOK, batch), use_cache=True).predictions
+        preds = model(batch_to_token_batch(_TOK, batch), use_cache=True)["predictions"]
     assert preds['action_value'].dtype == torch.float32
 
 
 def test_save_model_does_not_write_tokenizer(tmp_path) -> None:
-    model = simple_model(backbone=IdentityBackbone(hidden_dim=8, vocab_size=32), heads=({'action_value': (head := MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0))}), reasoner=None)
+    model = simple_model(backbone=IdentityBackbone(hidden_dim=8), heads=({'action_value': (head := MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0))}), reasoner=None)
     save_model(model=model, path=tmp_path)
     assert not (tmp_path / 'tokenizer.json').exists()
 
@@ -346,8 +340,8 @@ def test_tokenizer_roundtrip_group_start_and_not_equals(tmp_path) -> None:
     assert loaded.input_fields[0].format == "hello\n"
     assert loaded.input_fields[1].when is when_reward_nonzero
     st = loaded({"action": 1, "reward": 1.0, "task_index": 0})
-    assert st.group_start_ids is not None
-    assert st.group_start_ids.tolist() == [1, 2]
+    assert st.group_start_token_ids is not None
+    assert st.group_start_token_ids.tolist() == [1, 2]
 
 
 def test_load_tokenizer_missing_file_raises(tmp_path) -> None:
@@ -356,7 +350,7 @@ def test_load_tokenizer_missing_file_raises(tmp_path) -> None:
 
 
 def test_push_model_to_hub_requires_distinct_tokenizer_repo() -> None:
-    model = simple_model(backbone=IdentityBackbone(hidden_dim=8, vocab_size=32), heads=({'action_value': (head := MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0))}), reasoner=None)
+    model = simple_model(backbone=IdentityBackbone(hidden_dim=8), heads=({'action_value': (head := MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0))}), reasoner=None)
     tokenizer = Tokenizer(input_fields=[{'type': 'text', 'input_field': 'action', 'format': '{field}', 'head_output': True}, {'type': 'text', 'input_field': 'episode_index', 'format': '{field}', 'when': when_step_index_zero}], objective_fields=[], tokenizer=IntIdTokenizer())
     with pytest.raises(ValueError, match='tokenizer_repo_id'):
         push_model_to_hub(model=model, tokenizer=tokenizer, repo_id='same-id', tokenizer_repo_id='same-id')

@@ -15,7 +15,7 @@ class _Qwen3BackboneConfig:
     """Configuration for a Qwen3 transformer stack.
 
     Builds a HuggingFace ``Qwen3Model`` with SDPA attention. ``vocab_size=``
-    is the pretrained vocab, or a stub of 1 when the table is unused.
+    is a temporary stub of 1; Backbone removes the table before use.
     """
 
     num_layers: int
@@ -83,7 +83,6 @@ def qwen3_config_kwargs(model: Any) -> dict[str, Any]:
         rms_norm_eps=getattr(cfg, "rms_norm_eps", 1e-6),
         attention_bias=getattr(cfg, "attention_bias", False),
         use_sliding_window=getattr(cfg, "use_sliding_window", False),
-        vocab_size=int(cfg.vocab_size),
     )
     rope_parameters = getattr(cfg, "rope_parameters", None)
     if rope_parameters is not None:

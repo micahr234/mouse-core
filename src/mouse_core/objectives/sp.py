@@ -108,7 +108,7 @@ class SpObjective(Objective[...]):
     Q* outside with ``best_action`` (uniform among tied maxima) and pass
     those ids, or pass dataset / behavior actions. Callers pass the tensor
     at call time (same pattern as DQN ``predictions=`` /
-    ``delayed_predictions=``); there is no ``targets_key`` batch lookup.
+    ``backup_value_predictions=``); there is no ``targets_key`` batch lookup.
 
     Rows where ``mask_key`` is True or any nonzero number are dropped. Pass
     ``mask_key="episode_ended"`` to skip steps where the wrapped episode
@@ -148,7 +148,8 @@ class SpObjective(Objective[...]):
         objective_data: dict[str, torch.Tensor],
         predictions: torch.Tensor,
         targets: torch.Tensor,
-        delayed_predictions: None = None,
+        backup_value_predictions: None = None,
+        backup_action_predictions: None = None,
         value_predictions: None = None,
     ) -> tuple[dict[str, torch.Tensor], dict[str, float | torch.Tensor]]: ...
 
@@ -157,13 +158,15 @@ class SpObjective(Objective[...]):
         *,
         objective_data: dict[str, torch.Tensor],
         predictions: torch.Tensor,
-        delayed_predictions: torch.Tensor | None = None,
+        backup_value_predictions: torch.Tensor | None = None,
+        backup_action_predictions: torch.Tensor | None = None,
         value_predictions: torch.Tensor | None = None,
         targets: torch.Tensor | None = None,
     ) -> tuple[dict[str, torch.Tensor], dict[str, float | torch.Tensor]]:
         _reject_predictions(
             "SpObjective",
-            delayed_predictions=delayed_predictions,
+            backup_value_predictions=backup_value_predictions,
+            backup_action_predictions=backup_action_predictions,
             value_predictions=value_predictions,
         )
         target_tensor = _require_prediction(

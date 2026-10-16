@@ -20,7 +20,7 @@ out. The first sample of a fill is left out too when it alone is over
 the budget, and that raises. Examples pass ``batch_size=1`` (one fill)
 and ``sample_field="task_index"``.
 
-Token ``group_ids`` and the step ``group_id`` tensor use those same
+Token ``sequence_ids`` and the step ``group_id`` tensor use those same
 ids, ``0 .. B - 1``, one contiguous block each. ``group_id`` is
 returned beside ``objective_data``, not inside it.
 
@@ -273,8 +273,8 @@ def _step_token_count(step: StepTokens, *, started: bool) -> int:
     matching :func:`~mouse_core.data.token_batch.pack_token_batch`.
     """
     extra = 0
-    if step.group_start_ids is not None and not started:
-        extra = int(step.group_start_ids.shape[0])
+    if step.group_start_token_ids is not None and not started:
+        extra = int(step.group_start_token_ids.shape[0])
     return extra + int(step.T)
 
 
@@ -312,14 +312,14 @@ def _segment_token_count(steps: list[StepTokens]) -> int:
 def _append_window(
     *,
     steps: list[StepTokens],
-    group_ids: list[int],
+    sequence_ids: list[int],
     window: list[StepTokens],
     group_id: int,
 ) -> None:
     if not window:
         return
     steps.extend(window)
-    group_ids.extend([group_id] * len(window))
+    sequence_ids.extend([group_id] * len(window))
 
 
 def _budget_of(cfg: _SnapshotConfig) -> tuple[int, str, str]:
@@ -357,7 +357,7 @@ def _fetch_budget_batch(
     rng = _batch_rng(entropy, k)
     reseed = getattr(transform, "reseed", None)
     steps: list[StepTokens] = []
-    group_ids: list[int] = []
+    sequence_ids: list[int] = []
     n_group = 0
     # One rejected segment after the ones that fit in a fill. Each
     # segment costs at least one unit, so a fill stays within this width.
@@ -400,7 +400,7 @@ def _fetch_budget_batch(
                 break
             _append_window(
                 steps=steps,
-                group_ids=group_ids,
+                sequence_ids=sequence_ids,
                 window=window,
                 group_id=n_group,
             )
@@ -409,7 +409,7 @@ def _fetch_budget_batch(
             added += 1
     return pack_token_batch(
         steps=steps,
-        group_ids=group_ids,
+        sequence_ids=sequence_ids,
         batch_size=n_group,
         continuing=None,
     )

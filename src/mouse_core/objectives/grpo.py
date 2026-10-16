@@ -86,7 +86,7 @@ class GrpoObjective(Objective[...]):
         losses, metrics = objective(
             objective_data=to_device(data=objective_data, device=device),
             group_id=group_id.to(device),
-            predictions=out.predictions["action"],
+            predictions=out["predictions"]["action"],
         )
         loss = torch.stack(tuple(losses.values())).sum()
 
@@ -142,7 +142,8 @@ class GrpoObjective(Objective[...]):
         objective_data: dict[str, torch.Tensor],
         group_id: torch.Tensor,
         predictions: torch.Tensor,
-        delayed_predictions: None = None,
+        backup_value_predictions: None = None,
+        backup_action_predictions: None = None,
         value_predictions: None = None,
         targets: None = None,
     ) -> tuple[dict[str, torch.Tensor], dict[str, float | torch.Tensor]]: ...
@@ -153,13 +154,15 @@ class GrpoObjective(Objective[...]):
         objective_data: dict[str, torch.Tensor],
         group_id: torch.Tensor,
         predictions: torch.Tensor,
-        delayed_predictions: torch.Tensor | None = None,
+        backup_value_predictions: torch.Tensor | None = None,
+        backup_action_predictions: torch.Tensor | None = None,
         value_predictions: torch.Tensor | None = None,
         targets: torch.Tensor | None = None,
     ) -> tuple[dict[str, torch.Tensor], dict[str, float | torch.Tensor]]:
         _reject_predictions(
             "GrpoObjective",
-            delayed_predictions=delayed_predictions,
+            backup_value_predictions=backup_value_predictions,
+            backup_action_predictions=backup_action_predictions,
             value_predictions=value_predictions,
             targets=targets,
         )

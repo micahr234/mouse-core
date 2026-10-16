@@ -105,7 +105,7 @@ def batch_to_packed(
             sids.append(b)
     return pack_token_batch(
         steps=steps,
-        group_ids=sids if steps else None,
+        sequence_ids=sids if steps else None,
         batch_size=len(batch),
         continuing=None,
     )
@@ -118,3 +118,11 @@ def batch_to_token_batch(
     """Tokenize a ragged ``list[list[dict]]`` to model inputs only."""
     inputs, _, _ = batch_to_packed(tokenizer, batch)
     return inputs
+
+
+def embed_batch(embedding, batch):
+    tensors = batch.to_tensors(next(embedding.parameters()).device)
+    return embedding(
+        tensors["token_ids"], numeric_values=tensors["numeric_values"],
+        numeric_mask=tensors["numeric_mask"],
+    )

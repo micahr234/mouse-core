@@ -97,7 +97,7 @@ def test_run_heads_fires_per_head_backward_hooks() -> None:
     full.register_full_backward_hook(hook("full"))
     half.register_full_backward_hook(hook("half"))
     hidden = torch.randn(3, 8, requires_grad=True)
-    model = simple_model(backbone=IdentityBackbone(hidden_dim=8, vocab_size=1), heads={"full": full, "half_head": half}, reasoner=None)
+    model = simple_model(backbone=IdentityBackbone(hidden_dim=8), heads={"full": full, "half_head": half}, reasoner=None)
     preds = model.head(h=hidden)
     (preds["full"].sum() + preds["half_head"].sum()).backward()
     full_grad = seen["full"]

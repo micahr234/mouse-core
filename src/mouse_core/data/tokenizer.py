@@ -5,13 +5,11 @@ I/O
 * **in:** ``dict`` (one step)
 * **out:** :class:`~mouse_core.data.token_batch.StepTokens`
 
-``text`` / ``token`` fields share the ``__text__`` stream.
-``token`` tokenizes a literal ``format`` to one token. ``numeric``
-fields share ``__numeric__``: ``format=`` is literal text tokenized
-to one token, and the scaled number is stored on ``values``. An ``image``
-field is named by its ``input_field``. Pack ragged
-per-sequence rows with :meth:`Tokenizer.pack_rows`; pack already-tokenized
-steps with :func:`~mouse_core.data.token_batch.pack_token_batch`.
+All fields emit into one token-ID stream. ``numeric`` fields also emit a
+scaled scalar in ``numeric_values`` and set ``numeric_mask=True``. Text,
+literal-token, and image fields set the mask to false. Pack ragged rows
+with :meth:`Tokenizer.pack_rows`; pack already-tokenized steps with
+:func:`~mouse_core.data.token_batch.pack_token_batch`.
 :func:`save_tokenizer` writes the packing spec as ``tokenizer.json``;
 :func:`load_tokenizer` is the one recall path. Hub upload goes to its
 own repo via :func:`~mouse_core.models.io.push_model_to_hub`
@@ -36,8 +34,6 @@ from mouse_core.data.modality import (
     KIND_NUMERIC,
     KIND_TEXT,
     KIND_TOKEN,
-    NAME_NUMERIC,
-    NAME_TEXT,
     _field_label,
     render_text_format,
     TokenizerModalityMeta,
@@ -48,7 +44,6 @@ from mouse_core.data.modality import (
     when_as_bool,
 )
 from mouse_core.data.token_batch import (
-    ModalityInfo,
     StepTokens,
     TokenBatch,
     pack_token_batch,
@@ -58,10 +53,7 @@ from mouse_core.data.token_batch import (
 class Tokenizer:
     """CPU packer: one step dict → :class:`StepTokens`.
 
-    Alignment is by modality **name**: ``__text__`` for ``text`` /
-    ``token`` fields, ``__numeric__`` for ``numeric``
-    fields, ``input_field`` for ``image``. ``input_fields=``
-    are the tokens fed to the transformer, emitted in list order. Each
+    ``input_fields=`` defines tokens fed to the transformer, in list order. Each
     field is its own tokenize/emit run (no BPE merge across ``text``
     fields). Exactly one input field must set ``head_output=True``: its
     tokens are the step's head-output tokens — the positions the model
@@ -89,11 +81,11 @@ class Tokenizer:
     number is mapped from ``[fourier_min, fourier_max]`` onto
     ``[-1, 1]`` and stored on that token. The format must tokenize
     to one id; zero or several raise. ``input_index`` selects one
-    element of a 1-D vector, as for ``text``. The backbone adds a
+    element of a 1-D vector, as for ``text``. The embedding adds a
     Fourier projection of that stored value when built with
     ``num_frequencies``.
     A ``token`` field has no ``input_field``. ``format=`` is literal
-    text and must tokenize to one ``__text__`` token; zero or several
+    text and must tokenize to one token ID; zero or several
     raise.
     Optional ``when=`` is a callable ``ctx → bool``. The context is the
     step dict plus injected boolean ``group_start``. Ordinary emission
@@ -165,25 +157,6 @@ class Tokenizer:
                     "callable that returns discrete token ids"
                 )
 
-        names: list[str] = []
-        mmap: dict[str, ModalityInfo] = {}
-        if has_text or has_token:
-            names.append(NAME_TEXT)
-            mmap[NAME_TEXT] = ModalityInfo(type="token")
-        if has_numeric:
-            names.append(NAME_NUMERIC)
-            mmap[NAME_NUMERIC] = ModalityInfo(type="numeric")
-        for m in meta:
-            if m.kind in (KIND_TEXT, KIND_TOKEN, KIND_NUMERIC):
-                continue
-            if m.name in mmap:
-                raise ValueError(f"duplicate tokenizer modality name {m.name!r}")
-            names.append(m.name)
-            if m.kind == KIND_IMAGE:
-                mmap[m.name] = ModalityInfo(type="image")
-            else:
-                raise ValueError(f"unsupported modality kind {m.kind!r}")
-
         self.pretrained = None if pretrained is None else str(pretrained)
         self.input_fields: tuple[TokenizerModalitySpec, ...] = tuple(specs)
         self._meta: tuple[TokenizerModalityMeta, ...] = tuple(meta)
@@ -194,9 +167,6 @@ class Tokenizer:
             who="tokenizer objective_fields",
             allow_empty=True,
         )
-        self.modality_names: tuple[str, ...] = tuple(names)
-        self.modality_map: dict[str, ModalityInfo] = mmap
-        self._name_to_index = {n: i for i, n in enumerate(self.modality_names)}
 
     def __call__(self, step: dict) -> StepTokens:
         if not isinstance(step, dict):
@@ -209,9 +179,6 @@ class Tokenizer:
             tokenizer=self.tokenizer,
             image_tokenizer=self.image_tokenizer,
             objective_fields_keep=self.objective_fields,
-            name_to_index=self._name_to_index,
-            modality_names=self.modality_names,
-            modality_map=self.modality_map,
         )
 
     def pack_rows(
@@ -245,7 +212,7 @@ class Tokenizer:
                 sids.append(i)
         inputs, _, _ = pack_token_batch(
             steps=steps,
-            group_ids=sids if steps else None,
+            sequence_ids=sids if steps else None,
             batch_size=len(rows),
             continuing=continuing,
         )
@@ -435,62 +402,32 @@ def _tokenize_step(
     tokenizer: Any,
     image_tokenizer: Any,
     objective_fields_keep: Sequence[tuple[str, str]],
-    name_to_index: dict[str, int],
-    modality_names: tuple[str, ...],
-    modality_map: dict[str, ModalityInfo],
 ) -> StepTokens:
-    modality_ids: list[int] = []
-    ids: list[int] = []
-    values: list[float] = []
-    positions: list[int] = []
-    head_output_mask: list[bool] = []
-    # Running per-modality token count within this step, so ``positions``
-    # keeps counting across separately emitted runs of the same modality.
-    next_position: dict[int, int] = {}
-
-    group_modality_ids: list[int] = []
-    group_ids: list[int] = []
-    group_values: list[float] = []
-    group_positions: list[int] = []
-    group_next_position: dict[int, int] = {}
+    token_ids: list[int] = []
+    numeric_values: list[float] = []
+    numeric_mask: list[bool] = []
+    head_token_mask: list[bool] = []
+    prefix_token_ids: list[int] = []
+    prefix_numeric_values: list[float] = []
+    prefix_numeric_mask: list[bool] = []
 
     def _emit(
-        token_ids: list[int],
-        *,
-        spec: TokenizerModalitySpec,
-        name: str,
-        to_group_start: bool,
-        token_values: list[float] | None = None,
+        emitted_ids: list[int], *, spec: TokenizerModalitySpec,
+        to_group_start: bool, numeric_value: float | None = None,
         head_output: bool = False,
     ) -> None:
-        _require_max_tokens(spec, token_ids)
-        if not token_ids:
-            return
-        mid = name_to_index[name]
-        vals = token_values if token_values is not None else [0.0] * len(token_ids)
-        if len(vals) != len(token_ids):
-            raise ValueError(
-                f"token values length {len(vals)} != token id length {len(token_ids)}"
-            )
+        _require_max_tokens(spec, emitted_ids)
+        is_numeric = numeric_value is not None
+        value = 0.0 if numeric_value is None else numeric_value
         if to_group_start:
-            pos = group_next_position.get(mid, 0)
-            for tid, val in zip(token_ids, vals, strict=True):
-                group_modality_ids.append(mid)
-                group_ids.append(tid)
-                group_values.append(val)
-                group_positions.append(pos)
-                pos += 1
-            group_next_position[mid] = pos
-            return
-        pos = next_position.get(mid, 0)
-        for tid, val in zip(token_ids, vals, strict=True):
-            modality_ids.append(mid)
-            ids.append(tid)
-            values.append(val)
-            positions.append(pos)
-            pos += 1
-            head_output_mask.append(head_output)
-        next_position[mid] = pos
+            prefix_token_ids.extend(emitted_ids)
+            prefix_numeric_values.extend([value] * len(emitted_ids))
+            prefix_numeric_mask.extend([is_numeric] * len(emitted_ids))
+        else:
+            token_ids.extend(emitted_ids)
+            numeric_values.extend([value] * len(emitted_ids))
+            numeric_mask.extend([is_numeric] * len(emitted_ids))
+            head_token_mask.extend([head_output] * len(emitted_ids))
 
     for m in meta:
         spec = m.spec
@@ -506,7 +443,6 @@ def _tokenize_step(
             _emit(
                 _tokenize_ids(tokenizer, rendered),
                 spec=spec,
-                name=NAME_TEXT,
                 to_group_start=to_group_start,
                 head_output=spec.head_output,
             )
@@ -519,14 +455,13 @@ def _tokenize_step(
             if tokenizer is None:
                 raise RuntimeError("tokenizer required to tokenize numeric runs")
             rendered = render_text_format(spec, field=None)
-            token_ids = _tokenize_ids(tokenizer, rendered)
-            _require_one_token(spec, token_ids)
+            emitted_ids = _tokenize_ids(tokenizer, rendered)
+            _require_one_token(spec, emitted_ids)
             _emit(
-                token_ids,
+                emitted_ids,
                 spec=spec,
-                name=NAME_NUMERIC,
                 to_group_start=to_group_start,
-                token_values=[scaled] * len(token_ids),
+                numeric_value=scaled,
                 head_output=spec.head_output,
             )
             continue
@@ -535,12 +470,11 @@ def _tokenize_step(
             if tokenizer is None:
                 raise RuntimeError("tokenizer required to tokenize token runs")
             rendered = render_text_format(spec, field=None)
-            token_ids = _tokenize_ids(tokenizer, rendered)
-            _require_one_token(spec, token_ids)
+            emitted_ids = _tokenize_ids(tokenizer, rendered)
+            _require_one_token(spec, emitted_ids)
             _emit(
-                token_ids,
+                emitted_ids,
                 spec=spec,
-                name=NAME_TEXT,
                 to_group_start=to_group_start,
                 head_output=spec.head_output,
             )
@@ -560,36 +494,31 @@ def _tokenize_step(
             _emit(
                 img_ids,
                 spec=spec,
-                name=m.name,
                 to_group_start=to_group_start,
                 head_output=spec.head_output,
             )
         else:
             raise ValueError(f"unsupported modality kind {m.kind!r}")
 
-    if not modality_ids:
+    if not token_ids:
         raise ValueError(
             "step has no tokens after when-gates; ensure at least one input "
             "field still produces a token"
         )
 
     group_start_kwargs: dict[str, np.ndarray] = {}
-    if group_ids:
+    if prefix_token_ids:
         group_start_kwargs = {
-            "group_start_modality_ids": np.asarray(group_modality_ids, dtype=np.int64),
-            "group_start_ids": np.asarray(group_ids, dtype=np.int64),
-            "group_start_values": np.asarray(group_values, dtype=np.float32),
-            "group_start_positions": np.asarray(group_positions, dtype=np.int64),
+            "group_start_token_ids": np.asarray(prefix_token_ids, dtype=np.int64),
+            "group_start_numeric_values": np.asarray(prefix_numeric_values, dtype=np.float32),
+            "group_start_numeric_mask": np.asarray(prefix_numeric_mask, dtype=bool),
         }
 
     return StepTokens(
-        modality_ids=np.asarray(modality_ids, dtype=np.int64),
-        ids=np.asarray(ids, dtype=np.int64),
-        values=np.asarray(values, dtype=np.float32),
-        positions=np.asarray(positions, dtype=np.int64),
-        modality_names=modality_names,
-        modality_map=dict(modality_map),
-        head_output_mask=np.asarray(head_output_mask, dtype=bool),
+        token_ids=np.asarray(token_ids, dtype=np.int64),
+        numeric_values=np.asarray(numeric_values, dtype=np.float32),
+        numeric_mask=np.asarray(numeric_mask, dtype=bool),
+        head_token_mask=np.asarray(head_token_mask, dtype=bool),
         objective_fields=copy_keep_fields(row, objective_fields_keep),
         **group_start_kwargs,
     )

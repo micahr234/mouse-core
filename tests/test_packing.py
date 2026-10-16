@@ -1,33 +1,43 @@
-"""Tests for decode-layout packing helpers."""
+"""Cached decoding preserves ragged rows and tokenizer-selected head positions."""
 from __future__ import annotations
+
+import numpy as np
+import pytest
 import torch
-from mouse_core.models.embedding.packing import left_align_content
 
-def test_left_align_content_shifts_indices() -> None:
-    embeds = torch.zeros(1, 5, 2)
-    embeds[0, 0] = 1.0
-    embeds[0, 1] = 2.0
-    embeds[0, 2] = 3.0
-    head_output_indices = torch.tensor([[2]])
-    aligned, aligned_indices = left_align_content(embeds, head_output_indices, [3])
-    assert aligned_indices.tolist() == [[4]]
-    assert torch.allclose(aligned[0, 2], torch.tensor([1.0, 1.0]))
-    assert torch.allclose(aligned[0, 3], torch.tensor([2.0, 2.0]))
-    assert torch.allclose(aligned[0, 4], torch.tensor([3.0, 3.0]))
-    assert torch.allclose(aligned[0, :2], torch.zeros(2, 2))
+from mouse_core.data.token_batch import TokenBatch, empty_token_batch
+from mouse_core.models import prepare_decode
 
 
-def test_left_align_content_empty_row_stays_zero() -> None:
-    embeds = torch.zeros(2, 4, 2)
-    embeds[0, 0] = 1.0
-    embeds[0, 1] = 2.0
-    # Empty row: indices are the all-zero pad; length must come from token_lengths.
-    head_output_indices = torch.tensor([[1, 0], [0, 0]])
-    aligned, aligned_indices = left_align_content(
-        embeds, head_output_indices, [2, 0]
+def test_prepare_decode_pads_ragged_rows_and_keeps_last_head_per_step() -> None:
+    tokens = TokenBatch(
+        token_ids=np.arange(6), numeric_values=np.zeros(6),
+        numeric_mask=np.zeros(6, dtype=bool),
+        sequence_ids=np.array([0, 0, 0, 0, 2, 2]),
+        head_token_ids=np.array([0, 1, 3, 4, 5]),
+        head_step_ids=np.array([0, 0, 1, 2, 2]), B=3,
     )
-    assert aligned_indices[0].tolist() == [3, 2]
-    assert aligned_indices[1].tolist() == [0, 0]
-    assert torch.allclose(aligned[0, 2], torch.tensor([1.0, 1.0]))
-    assert torch.allclose(aligned[0, 3], torch.tensor([2.0, 2.0]))
-    assert torch.allclose(aligned[1], torch.zeros(4, 2))
+    tensors = tokens.to_tensors("cpu")
+    embeds = torch.arange(1., 7.).unsqueeze(-1).requires_grad_()
+    padded, lengths, head_ids, valid = prepare_decode(
+        embeds=embeds, tokens=tokens, sequence_ids=tensors["sequence_ids"],
+        head_token_ids=tensors["head_token_ids"], head_step_ids=tensors["head_step_ids"],
+    )
+    assert lengths == [4, 0, 2]
+    assert padded.squeeze(-1).tolist() == [[1., 2., 3., 4.], [0., 0., 0., 0.], [0., 0., 5., 6.]]
+    assert head_ids.tolist() == [[1, 3], [0, 0], [2, 3]]
+    assert valid.tolist() == [[True, True], [False, False], [False, True]]
+    selected = padded.gather(1, head_ids.unsqueeze(-1)).squeeze(-1)
+    assert selected[valid].tolist() == [2., 4., 6.]
+    padded.sum().backward()
+    torch.testing.assert_close(embeds.grad, torch.ones_like(embeds))
+
+
+def test_prepare_decode_rejects_an_entirely_idle_batch() -> None:
+    tokens = empty_token_batch(B=2)
+    tensors = tokens.to_tensors("cpu")
+    with pytest.raises(ValueError, match="at least one non-empty row"):
+        prepare_decode(
+            embeds=torch.empty(0, 4), tokens=tokens, sequence_ids=tensors["sequence_ids"],
+            head_token_ids=tensors["head_token_ids"], head_step_ids=tensors["head_step_ids"],
+        )

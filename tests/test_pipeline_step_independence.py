@@ -84,7 +84,7 @@ def test_tokenizer_output_defaults_to_input() -> None:
         tokenizer=IntIdTokenizer(),
     )
     tokens = tokenizer({"action": 2, "reward": 0.5, "task_index": 0})
-    assert tokens.modality_names == ("__text__",)
+    assert not tokens.numeric_mask.any()
     assert tokens.objective_fields["reward"] == pytest.approx(0.5)
 
 
@@ -108,7 +108,7 @@ def test_tokenizer_renames_objective_fields() -> None:
         tokenizer=IntIdTokenizer(),
     )
     tokens = tokenizer({"act": 3, "q": 1.5, "task_index": 0})
-    assert tokens.modality_names == ("__text__",)
+    assert not tokens.numeric_mask.any()
     assert tokens.objective_fields["info_q_star"] == pytest.approx(1.5)
 
 
@@ -132,10 +132,10 @@ def test_tokenizer_full_matches_per_step_concat() -> None:
     head = [tokenizer(s) for s in rows[:3]]
     tail = [tokenizer(s) for s in rows[3:]]
     cat, cat_obj, _sid = pack_token_batch(steps=head + tail, continuing=None)
-    assert np.array_equal(full.modality_ids, cat.modality_ids)
-    assert np.array_equal(full.ids, cat.ids)
-    assert np.allclose(full.values, cat.values)
-    assert np.array_equal(full.group_ids, cat.group_ids)
-    assert np.array_equal(full.head_output_indices, cat.head_output_indices)
+    assert np.array_equal(full.numeric_mask, cat.numeric_mask)
+    assert np.array_equal(full.token_ids, cat.token_ids)
+    assert np.allclose(full.numeric_values, cat.numeric_values)
+    assert np.array_equal(full.sequence_ids, cat.sequence_ids)
+    assert np.array_equal(full.head_token_ids, cat.head_token_ids)
     for key in ("action", "observation", "reward", "episode_done", "task_done"):
         assert torch.equal(full_obj[key], cat_obj[key])

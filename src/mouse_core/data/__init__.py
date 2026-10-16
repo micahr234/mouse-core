@@ -9,7 +9,6 @@ from mouse_core.data.compose import compose
 from mouse_core.data.modality import TokenizerModalitySpec
 from mouse_core.data.tokenizer import Tokenizer, load_tokenizer, save_tokenizer
 from mouse_core.data.token_batch import (
-    ModalityInfo,
     StepTokens,
     TokenBatch,
     empty_token_batch,
@@ -29,7 +28,6 @@ __all__ = [
     "Tokenizer",
     "load_tokenizer",
     "save_tokenizer",
-    "ModalityInfo",
     "StepTokens",
     "TokenBatch",
     "pack_token_batch",

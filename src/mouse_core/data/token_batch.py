@@ -12,7 +12,7 @@ import numpy as np
 import torch
 
 
-_TensorCache = dict[tuple[int, torch.device, bool], tuple[object, dict[str, Any]]]
+_TensorCache = dict[tuple[int, torch.device, bool], tuple[object, dict[str, torch.Tensor]]]
 _tensor_cache: ContextVar[_TensorCache | None] = ContextVar("token_batch_tensors", default=None)
 
 
@@ -35,17 +35,6 @@ def reuse_token_tensors() -> Iterator[None]:
         cache.clear()
 
 
-@dataclass(frozen=True)
-class ModalityInfo:
-    """Name-keyed modality descriptor carried on StepTokens / TokenBatch."""
-
-    type: str
-    dim: int = 0
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "type", str(self.type).lower())
-
-
 def step_counts_from_group_id(
     *,
     group_id: np.ndarray | None,
@@ -65,282 +54,156 @@ def step_counts_from_group_id(
     return np.bincount(sid, minlength=B).astype(np.int64)[:B]
 
 
-def _validate_modality_table(
-    modality_names: Sequence[str],
-    modality_map: Mapping[str, ModalityInfo],
-) -> tuple[tuple[str, ...], dict[str, ModalityInfo]]:
-    names = tuple(str(n) for n in modality_names)
-    if len(names) != len(set(names)):
-        raise ValueError(f"modality_names must be unique, got {names}")
-    mmap = {str(k): v for k, v in modality_map.items()}
-    for n in names:
-        if n not in mmap:
-            raise ValueError(f"modality_map missing entry for name {n!r}")
-    for k in mmap:
-        if k not in names:
-            raise ValueError(
-                f"modality_map has extra name {k!r} not in modality_names {names}"
-            )
-    return names, mmap
-
-
 @dataclass
 class StepTokens:
-    """Tokens and step-level fields for a single environment / dataset step.
+    """One step's token IDs, numeric payloads, and tokenizer-marked head tokens.
 
-    Produced by :class:`~mouse_core.data.tokenizer.Tokenizer`. Pack many steps into
-    a :class:`TokenBatch` with :func:`pack_token_batch`.
-
-    ``modality_ids[t]`` indexes ``modality_names``; type/kind comes from
-    ``modality_map[modality_names[modality_ids[t]]]``.
-
-    ``positions[t]`` is the token's 0-based index among the tokens of the
-    same modality in this step (image patch, text run offset).
-
-    ``head_output_mask[t]`` marks the step's head-output tokens (the positions
-    the model reads Q / action outputs from). Tokenizers set it from the
-    input field flagged ``head_output=True``; every step must have at least
-    one head-output token, and may have several.
+    ``numeric_mask`` marks numeric tokens even when their scaled value is zero.
+    ``group_start_*`` arrays hold an optional prefix emitted once per sequence.
     """
 
-    modality_ids: np.ndarray  # [T] index into modality_names
-    ids: np.ndarray  # [T]
-    values: np.ndarray  # [T]
-    positions: np.ndarray  # [T] index within modality within the step
-    modality_names: tuple[str, ...]
-    modality_map: dict[str, ModalityInfo]
-    head_output_mask: np.ndarray  # [T] bool
+    token_ids: np.ndarray  # [T] vocabulary rows
+    numeric_values: np.ndarray  # [T] scaled values; zero for nonnumeric tokens
+    numeric_mask: np.ndarray  # [T] bool
+    head_token_mask: np.ndarray  # [T] bool
     objective_fields: dict[str, Any] = field(default_factory=dict)
-    group_start_modality_ids: np.ndarray | None = None
-    group_start_ids: np.ndarray | None = None
-    group_start_values: np.ndarray | None = None
-    group_start_positions: np.ndarray | None = None
+    group_start_token_ids: np.ndarray | None = None
+    group_start_numeric_values: np.ndarray | None = None
+    group_start_numeric_mask: np.ndarray | None = None
 
     def __post_init__(self) -> None:
-        names, mmap = _validate_modality_table(self.modality_names, self.modality_map)
-        object.__setattr__(self, "modality_names", names)
-        object.__setattr__(self, "modality_map", mmap)
-        t = int(np.asarray(self.modality_ids).shape[0])
-        if t == 0:
-            raise ValueError("StepTokens must contain at least one token")
-        for name in ("modality_ids", "ids", "values", "positions"):
-            arr = np.asarray(getattr(self, name))
-            if arr.shape != (t,):
-                raise ValueError(f"{name} must have shape [{t}], got {arr.shape}")
-            object.__setattr__(self, name, arr)
-        pos = np.asarray(self.positions, dtype=np.int64)
-        if pos.min(initial=0) < 0:
-            raise ValueError(f"positions must be >= 0, got min={int(pos.min())}")
-        object.__setattr__(self, "positions", pos)
-        mids = np.asarray(self.modality_ids, dtype=np.int64)
-        if mids.min(initial=0) < 0 or mids.max(initial=0) >= len(names):
-            raise ValueError(
-                f"modality_ids must be in [0, {len(names)}), got "
-                f"min={int(mids.min())} max={int(mids.max())}"
-            )
-        object.__setattr__(self, "modality_ids", mids)
-        mask = np.asarray(self.head_output_mask, dtype=bool)
-        if mask.shape != (t,):
-            raise ValueError(
-                f"head_output_mask must have shape [{t}], got {mask.shape}"
-            )
-        if not bool(mask.any()):
+        token_ids = np.asarray(self.token_ids, dtype=np.int64)
+        if token_ids.ndim != 1 or token_ids.size == 0:
+            raise ValueError("StepTokens must contain at least one token in a 1-D token_ids array")
+        for name, dtype in (("token_ids", np.int64), ("numeric_values", np.float32),
+                            ("numeric_mask", np.bool_), ("head_token_mask", np.bool_)):
+            array = np.asarray(getattr(self, name), dtype=dtype)
+            if array.shape != token_ids.shape:
+                raise ValueError(f"{name} must have shape [{token_ids.size}], got {array.shape}")
+            setattr(self, name, array)
+        if not bool(self.head_token_mask.any()):
             raise ValueError(
                 "step has no head-output tokens; the tokenizer input field "
                 "flagged head_output=True must emit at least one token on "
                 "every step (it must never be skipped)"
             )
-        object.__setattr__(self, "head_output_mask", mask)
-        group_start_arrays = (
-            self.group_start_modality_ids,
-            self.group_start_ids,
-            self.group_start_values,
-            self.group_start_positions,
-        )
-        if all(a is None for a in group_start_arrays):
+        prefix = (self.group_start_token_ids, self.group_start_numeric_values,
+                  self.group_start_numeric_mask)
+        if all(array is None for array in prefix):
             return
-        if any(a is None for a in group_start_arrays):
-            raise ValueError(
-                "group_start_modality_ids / group_start_ids / "
-                "group_start_values / group_start_positions must all be "
-                "set or all None"
-            )
-        pt = int(np.asarray(self.group_start_ids).shape[0])
-        if pt == 0:
-            raise ValueError("group_start token arrays must be non-empty when set")
-        for name in (
-            "group_start_modality_ids",
-            "group_start_ids",
-            "group_start_values",
-            "group_start_positions",
-        ):
-            arr = np.asarray(getattr(self, name))
-            if arr.shape != (pt,):
-                raise ValueError(f"{name} must have shape [{pt}], got {arr.shape}")
-            object.__setattr__(self, name, arr)
-        pmids = np.asarray(self.group_start_modality_ids, dtype=np.int64)
-        if pmids.min(initial=0) < 0 or pmids.max(initial=0) >= len(names):
-            raise ValueError(
-                f"group_start_modality_ids must be in [0, {len(names)}), got "
-                f"min={int(pmids.min())} max={int(pmids.max())}"
-            )
-        object.__setattr__(self, "group_start_modality_ids", pmids)
-        object.__setattr__(
-            self, "group_start_ids", np.asarray(self.group_start_ids, dtype=np.int64)
-        )
-        object.__setattr__(
-            self,
-            "group_start_values",
-            np.asarray(self.group_start_values, dtype=np.float32),
-        )
-        ppos = np.asarray(self.group_start_positions, dtype=np.int64)
-        if ppos.min(initial=0) < 0:
-            raise ValueError(
-                f"group_start_positions must be >= 0, got min={int(ppos.min())}"
-            )
-        object.__setattr__(self, "group_start_positions", ppos)
+        if any(array is None for array in prefix):
+            raise ValueError("group_start_token_ids / group_start_numeric_values / group_start_numeric_mask must all be set or all None")
+        prefix_ids = np.asarray(self.group_start_token_ids, dtype=np.int64)
+        if prefix_ids.ndim != 1 or prefix_ids.size == 0:
+            raise ValueError("group_start token arrays must be non-empty and 1-D")
+        for name, dtype in (("group_start_token_ids", np.int64),
+                            ("group_start_numeric_values", np.float32),
+                            ("group_start_numeric_mask", np.bool_)):
+            array = np.asarray(getattr(self, name), dtype=dtype)
+            if array.shape != prefix_ids.shape:
+                raise ValueError(f"{name} must have shape [{prefix_ids.size}], got {array.shape}")
+            setattr(self, name, array)
 
     @property
     def T(self) -> int:
-        return int(self.modality_ids.shape[0])
+        return int(self.token_ids.shape[0])
 
 
 @dataclass
 class TokenBatch:
-    """Flat concatenated token stream (no padding) plus parallel payload arrays.
+    """Packed token data for independent sequences, with no padding.
 
-    Built by :func:`pack_token_batch` from many :class:`StepTokens`. Length ``L``
-    is the total number of tokens across all sequences and steps. ``N`` is the
-    number of steps (ragged windows allowed); ``P = len(head_output_indices)``
-    is the number of head-output tokens, ``P >= N`` (every step has at least
-    one, and may have several). ``head_output_steps[p]`` maps head-output token
-    ``p`` to its step ``0..N-1``. Per-sequence step counts are derived from
-    the first head-output token of each step (see :meth:`step_counts`); they
-    are not stored separately.
+    ``token_ids``, ``numeric_values``, ``numeric_mask``, and ``sequence_ids``
+    have shape ``[L]``. IDs address the shared embedding table; numeric values
+    are scaled by the tokenizer's Fourier bounds and used only where the mask
+    is true. Sequence IDs define attention boundaries.
 
-    Token type/kind is looked up via ``modality_map[modality_names[modality_ids[i]]]``:
-
-    * text / token / image — ``ids[i]`` is a vocab row; ``values[i]`` is 0
-    * numeric — ``ids[i]`` is a vocab row of the literal ``format``;
-      ``values[i]`` is the scalar mapped from ``[fourier_min, fourier_max]``
-      onto ``[-1, 1]``
-
-    Attributes:
-        modality_ids: ``[L]`` int64 — index into ``modality_names``.
-        modality_names: interned modality names for this batch.
-        modality_map: name → :class:`ModalityInfo` (type/kind lookup).
-        ids: ``[L]`` int64 — vocab / table row id.
-        values: ``[L]`` float32 — 0 for text / token / image. For numeric,
-            the scalar mapped onto ``[-1, 1]``.
-        positions: ``[L]`` int64 — index of the token among its modality's
-            tokens within its step (see :class:`StepTokens`).
-        group_ids: ``[L]`` int64 — which of the ``B`` groups each token belongs to.
-            One group is one sample. Attention and loss do not cross it.
-        head_output_indices: ``[P]`` int64 — token index of every head-output
-            token, strictly increasing.
-        head_output_steps: ``[P]`` int64 — step id ``0..N-1`` of each
-            head-output token (dense, non-decreasing).
-        B: Number of groups.
+    ``head_token_ids`` contains the ``[P]`` positions marked by the
+    tokenizer. ``head_step_ids[p]`` identifies the corresponding step in
+    ``0..N-1``; a step may have multiple head tokens. ``B`` is the number of
+    sequences, including empty decode rows.
     """
 
-    modality_ids: np.ndarray
-    ids: np.ndarray
-    values: np.ndarray
-    positions: np.ndarray
-    modality_names: tuple[str, ...]
-    modality_map: dict[str, ModalityInfo]
-    group_ids: np.ndarray
-    head_output_indices: np.ndarray
-    head_output_steps: np.ndarray
+    token_ids: np.ndarray
+    numeric_values: np.ndarray
+    numeric_mask: np.ndarray
+    sequence_ids: np.ndarray
+    head_token_ids: np.ndarray
+    head_step_ids: np.ndarray
     B: int = 0
 
     def __post_init__(self) -> None:
-        names, mmap = _validate_modality_table(self.modality_names, self.modality_map)
-        object.__setattr__(self, "modality_names", names)
-        object.__setattr__(self, "modality_map", mmap)
-        L = int(np.asarray(self.modality_ids).shape[0])
-        for name in (
-            "modality_ids",
-            "ids",
-            "values",
-            "positions",
-            "group_ids",
-        ):
-            arr = np.asarray(getattr(self, name))
-            if arr.shape != (L,):
-                raise ValueError(f"{name} must have shape [{L}], got {arr.shape}")
-            object.__setattr__(self, name, arr)
+        token_ids = np.asarray(self.token_ids, dtype=np.int64)
+        if token_ids.ndim != 1:
+            raise ValueError("token_ids must be a 1-D array")
+        L = int(token_ids.size)
+        for name, dtype in (("token_ids", np.int64), ("numeric_values", np.float32),
+                            ("numeric_mask", np.bool_), ("sequence_ids", np.int64)):
+            array = np.asarray(getattr(self, name), dtype=dtype)
+            if array.shape != (L,):
+                raise ValueError(f"{name} must have shape [{L}], got {array.shape}")
+            setattr(self, name, array)
         if L > 0:
-            pos = np.asarray(self.positions, dtype=np.int64)
-            if int(pos.min()) < 0:
-                raise ValueError(f"positions must be >= 0, got min={int(pos.min())}")
-            mids = np.asarray(self.modality_ids, dtype=np.int64)
-            if mids.min() < 0 or mids.max() >= len(names):
+            sequence_ids = self.sequence_ids
+            if int(sequence_ids.min()) < 0 or int(sequence_ids.max()) >= self.B:
                 raise ValueError(
-                    f"modality_ids must be in [0, {len(names)}), got "
-                    f"min={int(mids.min())} max={int(mids.max())}"
+                    f"sequence_ids must be in [0, {self.B}), got "
+                    f"min={int(sequence_ids.min())} max={int(sequence_ids.max())}"
                 )
-        if L > 0:
-            sids = np.asarray(self.group_ids, dtype=np.int64)
-            if int(sids.min()) < 0 or int(sids.max()) >= self.B:
+            if bool(np.any(sequence_ids[1:] < sequence_ids[:-1])):
                 raise ValueError(
-                    f"group_ids must be in [0, {self.B}), got "
-                    f"min={int(sids.min())} max={int(sids.max())}"
+                    "sequence_ids must be non-decreasing: every sequence's tokens "
+                    "must form one contiguous block, in sequence order (the model "
+                    "walks head_token_ids row by row and pads per block)."
                 )
-            if bool(np.any(sids[1:] < sids[:-1])):
-                raise ValueError(
-                    "group_ids must be non-decreasing: every group's tokens "
-                    "must form one contiguous block, in group order (the model "
-                    "walks head_output_indices row by row and pads per block)."
-                )
-        pred = np.asarray(self.head_output_indices, dtype=np.int64).reshape(-1)
-        object.__setattr__(self, "head_output_indices", pred)
-        psteps = np.asarray(self.head_output_steps, dtype=np.int64).reshape(-1)
-        object.__setattr__(self, "head_output_steps", psteps)
-        p = int(pred.shape[0])
-        if psteps.shape != (p,):
+        head_token_ids = np.asarray(self.head_token_ids, dtype=np.int64).reshape(-1)
+        self.head_token_ids = head_token_ids
+        head_step_ids = np.asarray(self.head_step_ids, dtype=np.int64).reshape(-1)
+        self.head_step_ids = head_step_ids
+        p = int(head_token_ids.shape[0])
+        if head_step_ids.shape != (p,):
             raise ValueError(
-                f"head_output_steps must have shape [{p}] (one step id per "
-                f"head-output token), got {psteps.shape}"
+                f"head_step_ids must have shape [{p}] (one step id per "
+                f"head-output token), got {head_step_ids.shape}"
             )
         if p > 0:
             if L == 0:
-                raise ValueError("head_output_indices require L > 0 when P > 0")
-            if int(pred.min()) < 0 or int(pred.max()) >= L:
+                raise ValueError("head_token_ids require L > 0 when P > 0")
+            if int(head_token_ids.min()) < 0 or int(head_token_ids.max()) >= L:
                 raise ValueError(
-                    f"head_output_indices must be in [0, {L}), got "
-                    f"min={int(pred.min())} max={int(pred.max())}"
+                    f"head_token_ids must be in [0, {L}), got "
+                    f"min={int(head_token_ids.min())} max={int(head_token_ids.max())}"
                 )
-            if bool(np.any(pred[1:] <= pred[:-1])):
-                raise ValueError("head_output_indices must be strictly increasing")
-            diffs = np.diff(psteps)
-            if int(psteps[0]) != 0 or bool(np.any((diffs < 0) | (diffs > 1))):
+            if bool(np.any(head_token_ids[1:] <= head_token_ids[:-1])):
+                raise ValueError("head_token_ids must be strictly increasing")
+            diffs = np.diff(head_step_ids)
+            if int(head_step_ids[0]) != 0 or bool(np.any((diffs < 0) | (diffs > 1))):
                 raise ValueError(
-                    "head_output_steps must be dense non-decreasing step ids "
-                    f"starting at 0, got {psteps.tolist()}"
+                    "head_step_ids must be dense non-decreasing step ids "
+                    f"starting at 0, got {head_step_ids.tolist()}"
                 )
         counts = self.step_counts()
         if int(counts.sum()) != self.N:
             raise ValueError(
                 f"step count [{self.N}] must equal sum of per-sequence step "
-                f"counts from group_ids [{int(counts.sum())}] (B={self.B})"
+                f"counts from sequence_ids [{int(counts.sum())}] (B={self.B})"
             )
 
     @property
     def L(self) -> int:
-        return int(self.modality_ids.shape[0])
+        return int(self.token_ids.shape[0])
 
     @property
     def N(self) -> int:
         """Number of steps."""
-        if self.head_output_steps.shape[0] == 0:
+        if self.head_step_ids.shape[0] == 0:
             return 0
-        return int(self.head_output_steps[-1]) + 1
+        return int(self.head_step_ids[-1]) + 1
 
     @property
     def P(self) -> int:
         """Number of head-output tokens (``>= N``)."""
-        return int(self.head_output_indices.shape[0])
+        return int(self.head_token_ids.shape[0])
 
     @property
     def S(self) -> int:
@@ -351,19 +214,16 @@ class TokenBatch:
         return int(counts.max()) if counts.size else 0
 
     def step_counts(self) -> np.ndarray:
-        """Steps per group ``[B]``, from each step's first head-output token."""
+        """Steps per sequence ``[B]``, from each step's first head token."""
         if self.P == 0:
             return np.zeros(self.B, dtype=np.int64)
         first = np.ones(self.P, dtype=bool)
-        first[1:] = self.head_output_steps[1:] != self.head_output_steps[:-1]
-        return step_counts_from_group_id(
-            group_id=np.asarray(self.group_ids, dtype=np.int64)[
-                self.head_output_indices[first]
-            ],
-            B=self.B,
-        )
+        first[1:] = self.head_step_ids[1:] != self.head_step_ids[:-1]
+        step_sequence_ids = self.sequence_ids[self.head_token_ids[first]]
+        counts = step_counts_from_group_id(group_id=step_sequence_ids, B=self.B)
+        return counts
 
-    def to_tensors(self, device: torch.device | str | None = None) -> dict[str, Any]:
+    def to_tensors(self, device: torch.device | str | None = None) -> dict[str, torch.Tensor]:
         """Move arrays to tensors; reuse them inside ``reuse_token_tensors``."""
         dev = torch.device(device) if device is not None else torch.device("cpu")
         if dev.type == "cuda" and dev.index is None:
@@ -382,16 +242,12 @@ class TokenBatch:
             return torch.from_numpy(np.asarray(a, dtype=np.float32)).to(dev)
 
         tensors = {
-            "modality_ids": _long(self.modality_ids),
-            "ids": _long(self.ids),
-            "values": _float(self.values),
-            "positions": _long(self.positions),
-            "modality_names": self.modality_names,
-            "modality_map": self.modality_map,
-            "group_ids": _long(self.group_ids),
-            "head_output_indices": _long(self.head_output_indices),
-            "head_output_steps": _long(self.head_output_steps),
-            "B": self.B,
+            "token_ids": _long(self.token_ids),
+            "numeric_values": _float(self.numeric_values),
+            "numeric_mask": torch.from_numpy(self.numeric_mask).to(dev),
+            "sequence_ids": _long(self.sequence_ids),
+            "head_token_ids": _long(self.head_token_ids),
+            "head_step_ids": _long(self.head_step_ids),
         }
         if cache is not None:
             # Retain the batch as well, so its id cannot be recycled in scope.
@@ -399,26 +255,15 @@ class TokenBatch:
         return tensors
 
 
-def empty_token_batch(
-    *,
-    B: int = 0,
-    modality_names: Sequence[str] = (),
-    modality_map: Mapping[str, ModalityInfo] | None = None,
-) -> TokenBatch:
-    """Empty batch (L=0, N=0); all ``B`` sequences have zero step count."""
-    names, mmap = _validate_modality_table(
-        modality_names, dict(modality_map or {})
-    )
+def empty_token_batch(*, B: int = 0) -> TokenBatch:
+    """Empty batch (L=0, N=0); all ``B`` sequences have zero steps."""
     return TokenBatch(
-        modality_ids=np.zeros(0, dtype=np.int64),
-        ids=np.zeros(0, dtype=np.int64),
-        values=np.zeros(0, dtype=np.float32),
-        positions=np.zeros(0, dtype=np.int64),
-        modality_names=names,
-        modality_map=mmap,
-        group_ids=np.zeros(0, dtype=np.int64),
-        head_output_indices=np.zeros(0, dtype=np.int64),
-        head_output_steps=np.zeros(0, dtype=np.int64),
+        token_ids=np.zeros(0, dtype=np.int64),
+        numeric_values=np.zeros(0, dtype=np.float32),
+        numeric_mask=np.zeros(0, dtype=bool),
+        sequence_ids=np.zeros(0, dtype=np.int64),
+        head_token_ids=np.zeros(0, dtype=np.int64),
+        head_step_ids=np.zeros(0, dtype=np.int64),
         B=B,
     )
 
@@ -538,13 +383,12 @@ def _fields_to_tensors(fields: dict[str, np.ndarray]) -> dict[str, torch.Tensor]
 def pack_token_batch(
     *,
     steps: Sequence[StepTokens],
-    group_ids: Sequence[int] | None = None,
+    sequence_ids: Sequence[int] | None = None,
     batch_size: int | None = None,
     continuing: Sequence[bool] | None,
 ) -> tuple[TokenBatch, dict[str, torch.Tensor], torch.Tensor]:
     """Pack per-step :class:`StepTokens` into model and objective inputs.
 
-    All steps must share the same ``modality_names`` and ``modality_map``.
     Returns ``(inputs, objective_data, group_id)``. ``group_id`` is
     int64 ``[N]``, one id per step. It is not a key in ``objective_data``.
     Move ``objective_data`` with :func:`to_device` and ``group_id`` with
@@ -569,37 +413,26 @@ def pack_token_batch(
             return empty_token_batch(B=0), empty_objective, empty_group_id
         return empty_token_batch(B=batch_size), empty_objective, empty_group_id
 
-    names = steps[0].modality_names
-    mmap = steps[0].modality_map
-    for i, st in enumerate(steps):
-        if st.modality_names != names:
-            raise ValueError(
-                f"steps[{i}].modality_names {st.modality_names!r} != {names!r}"
-            )
-        if st.modality_map != mmap:
-            raise ValueError(f"steps[{i}].modality_map does not match steps[0]")
-
-    if group_ids is None:
+    if sequence_ids is None:
         seq_per_step = [0] * len(steps)
     else:
-        if len(group_ids) != len(steps):
+        if len(sequence_ids) != len(steps):
             raise ValueError(
-                f"group_ids length ({len(group_ids)}) must match "
+                f"sequence_ids length ({len(sequence_ids)}) must match "
                 f"steps ({len(steps)})"
             )
-        seq_per_step = [int(s) for s in group_ids]
+        seq_per_step = [int(s) for s in sequence_ids]
         if any(s < 0 for s in seq_per_step):
             raise ValueError(
-                f"group_ids must be >= 0, got min={min(seq_per_step)}"
+                f"sequence_ids must be >= 0, got min={min(seq_per_step)}"
             )
 
-    modality_ids: list[np.ndarray] = []
-    ids: list[np.ndarray] = []
-    values: list[np.ndarray] = []
-    positions: list[np.ndarray] = []
+    numeric_mask: list[np.ndarray] = []
+    token_ids: list[np.ndarray] = []
+    numeric_values: list[np.ndarray] = []
     seq_ids: list[np.ndarray] = []
-    head_output_indices: list[int] = []
-    head_output_steps: list[int] = []
+    head_token_ids: list[int] = []
+    head_step_ids: list[int] = []
     head_output_counts: list[int] = []
 
     inferred_B = (max(seq_per_step) + 1) if seq_per_step else 0
@@ -623,28 +456,25 @@ def pack_token_batch(
 
     offset = 0
     for step_idx, (st, sid) in enumerate(zip(steps, seq_per_step)):
-        emit_group_start = st.group_start_ids is not None and not started[sid]
+        emit_group_start = st.group_start_token_ids is not None and not started[sid]
         if emit_group_start:
-            assert st.group_start_modality_ids is not None
-            assert st.group_start_ids is not None
-            assert st.group_start_values is not None
-            assert st.group_start_positions is not None
-            pt = int(st.group_start_ids.shape[0])
-            modality_ids.append(st.group_start_modality_ids)
-            ids.append(st.group_start_ids)
-            values.append(st.group_start_values)
-            positions.append(st.group_start_positions)
+            assert st.group_start_numeric_mask is not None
+            assert st.group_start_token_ids is not None
+            assert st.group_start_numeric_values is not None
+            pt = int(st.group_start_token_ids.shape[0])
+            numeric_mask.append(st.group_start_numeric_mask)
+            token_ids.append(st.group_start_token_ids)
+            numeric_values.append(st.group_start_numeric_values)
             seq_ids.append(np.full(pt, sid, dtype=np.int64))
             offset += pt
         t = st.T
-        modality_ids.append(st.modality_ids)
-        ids.append(st.ids)
-        values.append(st.values)
-        positions.append(st.positions)
+        numeric_mask.append(st.numeric_mask)
+        token_ids.append(st.token_ids)
+        numeric_values.append(st.numeric_values)
         seq_ids.append(np.full(t, sid, dtype=np.int64))
-        ho = np.flatnonzero(st.head_output_mask)
-        head_output_indices.extend((offset + ho).tolist())
-        head_output_steps.extend([step_idx] * int(ho.size))
+        ho = np.flatnonzero(st.head_token_mask)
+        head_token_ids.extend((offset + ho).tolist())
+        head_step_ids.extend([step_idx] * int(ho.size))
         head_output_counts.append(int(ho.size))
         offset += t
         started[sid] = True
@@ -653,15 +483,12 @@ def pack_token_batch(
     fields["head_output_count"] = np.asarray(head_output_counts, dtype=np.int64)
     group_id = torch.tensor(seq_per_step, dtype=torch.int64)
     inputs = TokenBatch(
-        modality_ids=np.concatenate(modality_ids),
-        ids=np.concatenate(ids),
-        values=np.concatenate(values),
-        positions=np.concatenate(positions),
-        modality_names=names,
-        modality_map=dict(mmap),
-        group_ids=np.concatenate(seq_ids),
-        head_output_indices=np.asarray(head_output_indices, dtype=np.int64),
-        head_output_steps=np.asarray(head_output_steps, dtype=np.int64),
+        numeric_mask=np.concatenate(numeric_mask),
+        token_ids=np.concatenate(token_ids),
+        numeric_values=np.concatenate(numeric_values),
+        sequence_ids=np.concatenate(seq_ids),
+        head_token_ids=np.asarray(head_token_ids, dtype=np.int64),
+        head_step_ids=np.asarray(head_step_ids, dtype=np.int64),
         B=B,
     )
     return inputs, _fields_to_tensors(fields), group_id

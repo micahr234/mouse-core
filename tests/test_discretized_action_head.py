@@ -1,6 +1,6 @@
 from __future__ import annotations
 from tests._model_helpers import fresh_model, ExampleModel as Model
-from tests._model_helpers import copy_model, node_rates, simple_model, model_polyak
+from tests._model_helpers import copy_model, simple_model
 
 
 import pytest
@@ -19,7 +19,7 @@ def make_head(table: torch.Tensor) -> DiscretizedActionHead:
 
 
 def make_model(head: DiscretizedActionHead) -> Model:
-    return simple_model(backbone=IdentityBackbone(hidden_dim=8, vocab_size=16), heads={'action_value': head}, reasoner=None)
+    return simple_model(backbone=IdentityBackbone(hidden_dim=8), heads={'action_value': head}, reasoner=None)
 
 
 def test_vector_lookup_preserves_shape_and_does_not_alias_table() -> None:
@@ -135,15 +135,16 @@ def test_head_trains_like_regression_but_table_is_fixed_and_copied() -> None:
     delayed_head = delayed.heads['action_value']
     assert isinstance(delayed_head, DiscretizedActionHead)
     assert delayed_head.action_vectors.data_ptr() != head.action_vectors.data_ptr()
-    update = model_polyak(online=model, delayed=delayed)
-    update(tau=node_rates(delayed, heads=0.5, backbone=None))
+    with torch.no_grad():
+        for target, source in zip(delayed_head.parameters(), head.parameters(), strict=True):
+            target.lerp_(source, 0.5)
     assert torch.equal(delayed_head.action_vectors, expected_table)
     assert torch.equal(delayed_head.continuous_to_discrete(expected_table), torch.arange(3))
 
 
 def test_model_checkpoint_preserves_both_conversions_and_q_values(tmp_path) -> None:
     head = make_head(torch.tensor([[2.0, -1.0], [-2.0, 1.0], [0.0, 0.25]]))
-    model = simple_model(backbone=IdentityBackbone(hidden_dim=8, vocab_size=16), heads={'motor': head}, reasoner=None)
+    model = simple_model(backbone=IdentityBackbone(hidden_dim=8), heads={'motor': head}, reasoner=None)
     h = torch.randn(2, 8)
     expected = model.head(h=h)['motor']
     save_model(model=model, path=tmp_path)

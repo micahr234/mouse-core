@@ -12,13 +12,6 @@ from typing import Any, ClassVar, cast
 import numpy as np
 import torch
 
-# Shared text stream. ``type="text"`` / ``type="token"`` fields emit here.
-# Group-start ``when`` fields are tokenized into the same modality.
-NAME_TEXT = "__text__"
-# Shared numeric stream. ``type="numeric"`` fields emit here. The token
-# ids are still vocab rows; ``values`` carries the scaled scalar.
-NAME_NUMERIC = "__numeric__"
-
 # Step-backed ``text`` ``format=`` is an f-string. The step value is the
 # name ``field`` (``"{field+1}"``, ``"{field:.0f}"``). Consts name nothing.
 TEXT_FORMAT_KEY = "field"
@@ -38,16 +31,14 @@ class TokenizerModalitySpec:
     """How the tokenizer packs one field from a step dict.
 
     Types:
-      * ``text`` — format string → HF tokenize → ``__text__``
-      * ``token`` — literal ``format`` → one ``__text__`` token. More
-        than one token raises
-      * ``image`` — image tokenizer → discrete visual token ids
-      * ``numeric`` — literal ``format`` → one HF token → ``__numeric__``.
-        The number is stored on ``values`` for a Fourier add
+      * ``text`` — format string → tokenizer → token IDs
+      * ``token`` — literal ``format`` → exactly one token ID
+      * ``image`` — image tokenizer → discrete visual token IDs
+      * ``numeric`` — literal ``format`` → one token ID, with a scaled
+        ``numeric_values`` entry and ``numeric_mask=True``
 
-    ``text`` and ``token`` share the ``__text__`` stream. Every
-    ``numeric`` field shares ``__numeric__``. ``image`` uses
-    ``input_field`` as the modality name.
+    All token IDs address the same embedding table. Only numeric tokens
+    receive the additional Fourier projection.
 
     A ``text`` field requires ``format=``. With ``input_field=``,
     ``format=`` is an f-string and the step value is the name ``field``:
@@ -72,7 +63,7 @@ class TokenizerModalitySpec:
     ``[-1, 1]`` (no clipping) and stored on every token the format
     produced. That format must tokenize to one id; zero or several
     raise. ``fourier_min`` and ``fourier_max`` must be finite and
-    must differ. Other types reject those two arguments. The backbone
+    must differ. Other types reject those two arguments. The embedding
     adds a Fourier projection of the stored value when it is built
     with ``num_frequencies``. ``numeric`` rejects ``max_tokens``
     because the limit is one token.
@@ -574,19 +565,13 @@ class TokenizerModalityMeta:
     """Runtime metadata for one expanded tokenizer field."""
 
     spec: TokenizerModalitySpec
-    name: str
     kind: str
 
 
 def resolve_tokenizer_modalities(
     input_fields: Sequence[dict[str, Any] | TokenizerModalitySpec] | None = None,
 ) -> tuple[list[TokenizerModalitySpec], list[TokenizerModalityMeta]]:
-    """Expand tokenizer input-field specs.
-
-    ``text`` / ``token`` meta ``name`` is :data:`NAME_TEXT`.
-    ``numeric`` meta ``name`` is :data:`NAME_NUMERIC`. ``image`` is
-    keyed by ``input_field``.
-    """
+    """Validate tokenizer input-field specs and resolve their emission types."""
     raw = input_fields or []
     specs: list[TokenizerModalitySpec] = []
     for m in raw:
@@ -622,22 +607,22 @@ def resolve_tokenizer_modalities(
                 indexed_names.add(name)
         if k == "text":
             meta.append(
-                TokenizerModalityMeta(spec=spec, name=NAME_TEXT, kind=KIND_TEXT)
+                TokenizerModalityMeta(spec=spec, kind=KIND_TEXT)
             )
         elif k == "token":
             meta.append(
-                TokenizerModalityMeta(spec=spec, name=NAME_TEXT, kind=KIND_TOKEN)
+                TokenizerModalityMeta(spec=spec, kind=KIND_TOKEN)
             )
         elif k == "image":
             meta.append(
                 TokenizerModalityMeta(
-                    spec=spec, name=str(spec.input_field), kind=KIND_IMAGE
+                    spec=spec, kind=KIND_IMAGE
                 )
             )
         elif k == "numeric":
             meta.append(
                 TokenizerModalityMeta(
-                    spec=spec, name=NAME_NUMERIC, kind=KIND_NUMERIC
+                    spec=spec, kind=KIND_NUMERIC
                 )
             )
         else:

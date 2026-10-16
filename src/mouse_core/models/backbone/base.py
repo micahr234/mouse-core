@@ -1,12 +1,10 @@
 """BaseBackbone interface for MOUSE models.
 
 A backbone is a sequence processor that takes token embeddings and returns
-hidden states of the same shape. Transformer backbones train through the
-packed stream forward (:func:`~mouse_core.models.backbone.packed_train.packed_forward`
-over ``self.model``); :meth:`BaseBackbone.forward` is the rectangular ``[B, T, D]``
-forward used by non-transformer backbones; incremental decoding goes through a
-:class:`~mouse_core.models.backbone.flex_decode.FlexDecodeSession` created by
-:meth:`BaseBackbone.decode_session`.
+hidden states of the same shape. Pass flat ``[L, D]`` embeddings with explicit
+``sequence_ids`` for packed training, or rectangular ``[B, T, D]`` embeddings with
+an attention mask. Incremental decoding passes a session created by
+``decode_session`` as ``cache=`` together with per-row ``lengths``.
 
 Two ways to train a backbone, both with every trainable parameter in fp32:
 
@@ -55,8 +53,8 @@ def _disable_cudnn_sdp() -> None:
 class BaseBackbone(nn.Module, ABC):
     """Abstract base for backbones.
 
-    A backbone consumes a token embedding sequence ``[B, T, D]`` and returns
-    processed hidden states of shape ``[B, T, D]``.
+    A backbone consumes plain embedding tensors and returns feature tensors
+    of the same shape: flat ``[L, D]`` or rectangular ``[B, T, D]``.
 
     Implementations may be:
     - a full transformer (:class:`~mouse_core.models.backbone.transformer.Backbone`)
@@ -160,11 +158,10 @@ class BaseBackbone(nn.Module, ABC):
 
     @property
     def dtype(self) -> torch.dtype:
-        """Dtype of the decoder base weights; ``Model`` casts embeds to it.
+        """Dtype of the decoder base weights; the backbone casts embeds to it.
 
-        Reads ``self.model`` when present so Identity ``embed_tokens``
-        (fp32) do not hide a bf16 LoRA base. LoRA adapters are skipped.
-        A parameterless / table-only backbone
+        Reads ``self.model`` when present and skips LoRA adapters.
+        A parameterless backbone
         (:class:`~mouse_core.models.backbone.none.IdentityBackbone`) reports
         ``float32``.
         """
@@ -180,34 +177,59 @@ class BaseBackbone(nn.Module, ABC):
     def hidden_dim(self) -> int:
         """Width ``D`` of the hidden states this backbone returns."""
 
-    @abstractmethod
     def forward(
-        self,
-        embeds: torch.Tensor,
+        self, embeds: torch.Tensor, *,
+        sequence_ids: torch.Tensor | None = None,
+        cache: FlexDecodeSession | None = None,
+        lengths: list[int] | None = None,
         output_hidden_states: bool = False,
         **kwargs: Any,
     ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
-        """Run a full (uncached) forward over a token sequence.
+        """Embeddings to features, with masks/group IDs and cache passed separately.
 
-        Args:
-            embeds: Token embeddings ``[B, T, D]``.
-            output_hidden_states: Also return every layer's hidden states.
-            **kwargs: Implementation-specific options.
-
-        Returns:
-            Hidden states ``[B, T, D]``, or ``(hidden_states, layer_hiddens)``
-            when ``output_hidden_states=True``.
+        Flat ``[L, D]`` input requires ``sequence_ids`` and uses the configured
+        packed train kernel. Rectangular input uses the supplied attention
+        mask, or a decode session together with per-row ``lengths``.
         """
-        ...
+        if not isinstance(embeds, torch.Tensor):
+            raise TypeError("backbone input must be an embedding tensor.")
+        if cache is not None:
+            if sequence_ids is not None or kwargs or lengths is None:
+                raise ValueError("cached forward requires lengths and cannot take sequence_ids or attention kwargs.")
+            return cache.forward(embeds=embeds, lengths=lengths, output_hidden_states=output_hidden_states)
+        if lengths is not None:
+            raise ValueError("lengths requires a decode cache.")
+        embeds = embeds.to(dtype=self.dtype)
+        if sequence_ids is None:
+            if embeds.ndim != 3:
+                raise ValueError("flat embedding tensors require sequence_ids.")
+            return self._forward_dense(embeds, output_hidden_states=output_hidden_states, **kwargs)
+        if embeds.ndim != 2 or sequence_ids.ndim != 1 or sequence_ids.shape[0] != embeds.shape[0]:
+            raise ValueError("packed input requires embeds [L, D] and sequence_ids [L].")
+        if kwargs:
+            raise ValueError("sequence_ids supplies packed attention; do not also pass attention kwargs.")
+        if self.uses_packed:
+            from mouse_core.models.backbone.packed_train import packed_forward
+            return packed_forward(
+                model=cast(nn.Module, self.model), embeds=embeds, sequence_ids=sequence_ids,
+                output_hidden_states=output_hidden_states, checkpoint=self.gradient_checkpointing,
+                train_kernel=self.train_kernel, autocast_dtype=self.train_autocast_dtype,
+            )
+        from mouse_core.models.encoding import _flat_sequence_causal_mask, _flat_sequence_position_ids
+        out = self._forward_dense(
+            embeds.unsqueeze(0), output_hidden_states=output_hidden_states,
+            attention_mask=_flat_sequence_causal_mask(dtype=embeds.dtype, sequence_ids=sequence_ids),
+            position_ids=_flat_sequence_position_ids(sequence_ids=sequence_ids),
+        )
+        if isinstance(out, tuple):
+            return out[0].squeeze(0), tuple(layer.squeeze(0) for layer in out[1])
+        return out.squeeze(0)
 
     @abstractmethod
-    def embed(self, token_batch: Any) -> tuple[torch.Tensor, torch.Tensor]:
-        """Embed a :class:`~mouse_core.data.token_batch.TokenBatch`.
-
-        Returns ``(embeds [L, D], head_output_indices [P])``.
-        ``Backbone`` and ``IdentityBackbone`` look up
-        ``embed_tokens``.
-        """
+    def _forward_dense(
+        self, embeds: torch.Tensor, *, output_hidden_states: bool, **kwargs: Any,
+    ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+        """Implement a rectangular uncached forward over embedding tensors."""
         ...
 
     def decode_session(self, batch_size: int) -> FlexDecodeSession:
@@ -273,8 +295,8 @@ def _load_transformer_weights(
 ) -> None:
     """Load matching transformer weights into a MOUSE backbone internals.
 
-    Loads ``embed_tokens`` and decoder weights before the backbone removes
-    the pretrained output norm.
+    Loads decoder weights before removing the pretrained output norm.
+    The input token table belongs to a separately constructed Embedding.
 
     Warns in both directions: backbone tensors that did not receive pretrained
     weights (missing from the checkpoint or shape-mismatched, so they keep
@@ -286,6 +308,7 @@ def _load_transformer_weights(
 
     with _quiet_transformers_load():
         pretrained = AutoModel.from_pretrained(repo_id_or_path, **hub_kwargs)
+    pretrained.set_input_embeddings(None)
     target_state = model.state_dict()
     pretrained_state = pretrained.state_dict()
     loadable = {

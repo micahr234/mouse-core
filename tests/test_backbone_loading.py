@@ -158,7 +158,7 @@ def test_generic_hf_backbone_roundtrip(tmp_path) -> None:
     model = simple_model(backbone=backbone, heads=({'action_value': (head := MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0))}), reasoner=None)
     save_model(model=model, path=tmp_path / 'ckpt')
     loaded = load_model(model=fresh_model(model), repo_id_or_path=tmp_path / 'ckpt')
-    loaded_bb = cast(Backbone, loaded.encoder.backbones[0])
+    loaded_bb = cast(Backbone, loaded.backbone)
     assert loaded_bb.architecture == 'hf'
     assert loaded_bb.uses_packed is False
     assert loaded_bb.hidden_dim == 8

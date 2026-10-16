@@ -15,7 +15,7 @@ class SvObjective(Objective[...]):
 
     Reads ``predictions`` (shape ``[B, S, A]``) and regresses toward
     ``targets`` (same shape). Callers pass the Q target tensor at call
-    time (same pattern as DQN ``predictions=`` / ``delayed_predictions=``);
+    time (same pattern as DQN ``predictions=`` / ``backup_value_predictions=``);
     there is no ``targets_key`` batch lookup. Every finite target entry
     participates, including terminal / truncated rows — unlike
     :class:`~mouse_core.objectives.sp.SpObjective`, there is no
@@ -49,7 +49,8 @@ class SvObjective(Objective[...]):
         objective_data: dict[str, torch.Tensor],
         predictions: torch.Tensor,
         targets: torch.Tensor,
-        delayed_predictions: None = None,
+        backup_value_predictions: None = None,
+        backup_action_predictions: None = None,
         value_predictions: None = None,
     ) -> tuple[dict[str, torch.Tensor], dict[str, float | torch.Tensor]]: ...
 
@@ -58,13 +59,15 @@ class SvObjective(Objective[...]):
         *,
         objective_data: dict[str, torch.Tensor],
         predictions: torch.Tensor,
-        delayed_predictions: torch.Tensor | None = None,
+        backup_value_predictions: torch.Tensor | None = None,
+        backup_action_predictions: torch.Tensor | None = None,
         value_predictions: torch.Tensor | None = None,
         targets: torch.Tensor | None = None,
     ) -> tuple[dict[str, torch.Tensor], dict[str, float | torch.Tensor]]:
         _reject_predictions(
             "SvObjective",
-            delayed_predictions=delayed_predictions,
+            backup_value_predictions=backup_value_predictions,
+            backup_action_predictions=backup_action_predictions,
             value_predictions=value_predictions,
         )
         q_targets_raw = _require_prediction(

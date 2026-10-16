@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 from tests._model_helpers import fresh_model, ExampleModel as Model
-from tests._model_helpers import copy_model, node_rates, simple_model, model_polyak
+from tests._model_helpers import copy_model, simple_model
 
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -20,7 +20,7 @@ from tests._token_batch_helpers import batch_to_token_batch, token_tokenizer
 
 
 def _model(*, architecture: Literal['llama', 'qwen3'] | None=None, reasoning: bool=False) -> Model:
-    backbone = IdentityBackbone(hidden_dim=8, vocab_size=32) if architecture is None else Backbone(architecture=architecture, hidden_dim=8, num_layers=1, num_heads=2, vocab_size=32, train_kernel='reference', decode_kernel='flex', dtype=torch.float32)
+    backbone = IdentityBackbone(hidden_dim=8) if architecture is None else Backbone(architecture=architecture, hidden_dim=8, num_layers=1, num_heads=2, train_kernel='reference', decode_kernel='flex', dtype=torch.float32)
     return simple_model(backbone=backbone, projection=MLP(in_features=8, out_features=8, hidden_dim=12, num_layers=2), heads={'q': MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0), 'policy': MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0)}, reasoner=LatentReasoner(hidden_dim=8, num_thoughts=2) if reasoning else None)
 
 
@@ -45,13 +45,13 @@ def test_projection_runs_once_for_all_heads_and_keeps_backbone_states(reasoning:
     finally:
         handle.remove()
     assert len(calls) == 1
-    pooled = out.pool()
-    assert pooled.shape == calls[0].shape == (3, 8)
-    torch.testing.assert_close(calls[0], model.projection(pooled))
+    selected = out["last_hidden_state"][out["head_token_ids"]]
+    assert selected.shape == calls[0].shape == (3, 8)
+    torch.testing.assert_close(calls[0], model.projection(selected))
     for name, head in model.heads.items():
-        torch.testing.assert_close(out.predictions[name], head(calls[0]))
-    torch.stack([pred.square().mean() for pred in out.predictions.values()]).sum().backward()
-    for section in (model.encoder.backbones[0], model.projection, model.heads, model.encoder.reasoner):
+        torch.testing.assert_close(out["predictions"][name], head(calls[0]))
+    torch.stack([pred.square().mean() for pred in out["predictions"].values()]).sum().backward()
+    for section in (model.embedding, model.backbone, model.projection, model.heads, model.reasoner):
         if section is not None:
             assert any((p.grad is not None and p.grad.abs().sum() > 0 for p in section.parameters()))
 
@@ -62,14 +62,14 @@ def test_projection_cached_decode_matches_packed_forward(architecture: Literal["
     with torch.no_grad():
         full = model(_batch())
         first = model(_batch(0, 2), use_cache=True)
-        assert first.cache is not None
+        assert first["cache"] is not None
         try:
-            last = model(_batch(2, 3), use_cache=True, cache=first.cache)
+            last = model(_batch(2, 3), use_cache=True, cache=first["cache"])
             for name in model.heads:
-                actual = torch.cat([first.predictions[name], last.predictions[name]], dim=1)
-                torch.testing.assert_close(actual.squeeze(0), full.predictions[name], atol=1e-5, rtol=1e-5)
+                actual = torch.cat([first["predictions"][name], last["predictions"][name]], dim=1)
+                torch.testing.assert_close(actual.squeeze(0), full["predictions"][name], atol=1e-5, rtol=1e-5)
         finally:
-            first.cache.close()
+            first["cache"].close()
 
 
 def test_delayed_projection_reuses_raw_online_states() -> None:
@@ -83,17 +83,17 @@ def test_delayed_projection_reuses_raw_online_states() -> None:
         for p in model.projection.parameters():
             p.add_(0.2)
         online = model(_batch())
-        reused = delayed.head(h=online.pool())
+        reused = delayed.head(h=online["last_hidden_state"][online["head_token_ids"]])
         separate = delayed(_batch())
     for name in delayed.heads:
-        torch.testing.assert_close(reused[name], separate.predictions[name])
-        assert not torch.allclose(reused[name], online.predictions[name])
+        torch.testing.assert_close(reused[name], separate["predictions"][name])
+        assert not torch.allclose(reused[name], online["predictions"][name])
 
 
 def test_projection_learning_rate_steps_only_its_parameters() -> None:
     model = _model()
     assert model.projection is not None
-    optimizer = AdamW(params=[{'params': model.encoder.backbones[0].parameters(), 'lr': 0.0}, {'params': model.projection.parameters(), 'lr': 0.02}, {'params': model.heads.parameters(), 'lr': 0.0}], lr=0.0, fused=False)
+    optimizer = AdamW(params=[{'params': model.backbone.parameters(), 'lr': 0.0}, {'params': model.projection.parameters(), 'lr': 0.02}, {'params': model.heads.parameters(), 'lr': 0.0}], lr=0.0, fused=False)
     before = {name: p.detach().clone() for name, p in model.named_parameters()}
     for p in model.parameters():
         p.grad = torch.ones_like(p)
@@ -103,76 +103,35 @@ def test_projection_learning_rate_steps_only_its_parameters() -> None:
         torch.testing.assert_close(p, expected)
 
 
-def test_projection_polyak_rate_is_independent_and_can_change() -> None:
-    model = _model()
-    delayed = copy_model(model, heads=True, backbone=True, reasoner=False, projection=True)
-    update = model_polyak(online=model, delayed=delayed)
-    before = {name: p.detach().clone() for name, p in delayed.named_parameters()}
-    with torch.no_grad():
-        for p in model.parameters():
-            p.add_(2.0)
-    for tau in (0.0, 0.25, 1.0):
-        update(tau=node_rates(delayed, heads={'q': 0.0, 'policy': 0.0}, backbone=0.0, projection=tau))
-        for name, p in delayed.named_parameters():
-            if name.startswith('projection.'):
-                expected = before[name].lerp(dict(model.named_parameters())[name], tau)
-            else:
-                expected = before[name]
-            torch.testing.assert_close(p, expected)
-            before[name] = p.detach().clone()
-
-
-@pytest.mark.parametrize('tau', [None, -0.1, 1.1, float('nan')])
-def test_invalid_projection_tau_cannot_partially_update_model(tau: float | None) -> None:
-    model = _model()
-    delayed = copy_model(model, heads=True, backbone=True, reasoner=False, projection=True)
-    update = model_polyak(online=model, delayed=delayed)
-    before = {name: p.detach().clone() for name, p in delayed.named_parameters()}
-    with torch.no_grad():
-        for p in model.parameters():
-            p.add_(1.0)
-    with pytest.raises(ValueError, match='projection.*'):
-        update(tau=node_rates(delayed, heads=1.0, backbone=1.0, projection=tau))
-    for name, p in delayed.named_parameters():
-        assert torch.equal(p, before[name])
-
-
 def test_shared_projection_and_projection_only_copy() -> None:
     model = _model()
     shared = copy_model(model, heads=True, backbone=False, reasoner=False, projection=False)
     assert shared.projection is model.projection
-    update = model_polyak(online=model, delayed=shared)
-    update(tau=node_rates(shared, heads=0.1, backbone=None, projection=None))
-    update(tau=node_rates(shared, heads=0.1, backbone=None, projection=1.0))
-    with pytest.raises(ValueError, match='projection.* must be None or 1'):
-        update(tau=node_rates(shared, heads=0.1, backbone=None, projection=0.1))
     projection_only = copy_model(model, heads=False, backbone=False, reasoner=False, projection=True)
     assert projection_only.heads['q'] is model.heads['q']
-    model_polyak(online=model, delayed=projection_only)(tau=node_rates(projection_only, heads=None, backbone=None, projection=0.1))
+    assert projection_only.projection is not model.projection
+    for source, target in zip(model.projection.parameters(), projection_only.projection.parameters(), strict=True):
+        torch.testing.assert_close(target, source)
+        assert not target.requires_grad
 
 
-def test_projection_copy_and_pairing_require_matching_parameters() -> None:
+def test_projection_copy_validates_module_paths() -> None:
     model = _model()
     delayed = model.copy(modules=["projection", "heads"])
     assert delayed.projection is not model.projection
-    delayed.projection = MLP(in_features=8, out_features=8, hidden_dim=32).requires_grad_(False)
-    with pytest.raises(ValueError, match="shape"):
-        model_polyak(online=model, delayed=delayed)
     with pytest.raises(ValueError, match="unknown module path"):
         model.copy(modules=["missing"])
-
-
 
 
 @pytest.mark.parametrize("scale", [0.0, 0.3, 1.0])
 def test_prediction_gradient_scale_also_controls_projection(scale: float) -> None:
     torch.manual_seed(0)
     model = _model()
-    model(_batch()).predictions["q"].square().sum().backward()
+    model(_batch())["predictions"]["q"].square().sum().backward()
     reference = {name: p.grad.clone() for name, p in model.named_parameters() if p.grad is not None}
     model.zero_grad(set_to_none=True)
     cast(MLP, model.heads["q"]).propagate_gradient = scale
-    model(_batch()).predictions["q"].square().sum().backward()
+    model(_batch())["predictions"]["q"].square().sum().backward()
     for name, p in model.named_parameters():
         if name not in reference:
             continue
@@ -192,8 +151,8 @@ def test_projection_checkpoint_roundtrip(tmp_path: Path, num_layers: int) -> Non
     assert loaded.projection.num_layers == num_layers
     for name, tensor in model.state_dict().items():
         assert torch.equal(tensor, loaded.state_dict()[name])
-    for name, pred in loaded(_batch()).predictions.items():
-        torch.testing.assert_close(pred, expected.predictions[name])
+    for name, pred in loaded(_batch())["predictions"].items():
+        torch.testing.assert_close(pred, expected["predictions"][name])
 
 
 @pytest.mark.parametrize("kwargs", [
@@ -211,7 +170,6 @@ def test_projection_rejects_incompatible_backbone_width() -> None:
     model.projection = MLP(in_features=16, out_features=16, hidden_dim=16)
     with pytest.raises(RuntimeError):
         model(_batch())
-
 
 
 def test_projection_and_prediction_prenorms_run_on_head_tokens() -> None:
@@ -240,7 +198,7 @@ def test_projection_and_prediction_prenorms_run_on_head_tokens() -> None:
     finally:
         for handle in handles:
             handle.remove()
-    assert output.last_hidden_state.shape[0] > 3
+    assert output["last_hidden_state"].shape[0] > 3
     for name, gain in (('projection', 2.0), ('q', 3.0), ('policy', 4.0)):
         assert seen[name].shape == (3, 8)
         torch.testing.assert_close(seen[name], torch.nn.functional.rms_norm(seen[name + "_input"], (8,), torch.full((8,), gain), eps=1e-5))

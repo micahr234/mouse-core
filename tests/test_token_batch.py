@@ -28,7 +28,6 @@ def when_step_index_zero_or_group_start(ctx):
     return (ctx.get("step_index") == 0) | bool(ctx["group_start"])
 
 
-
 def _tok(**kwargs) -> Tokenizer:
     return Tokenizer(
         input_fields=[
@@ -61,11 +60,11 @@ def test_tokenizer_pack_rows_packs_ragged_rows() -> None:
     assert inputs.step_counts().tolist() == [2, 0, 1]
     manual, _, _sid = pack_token_batch(
         steps=[tok(step) for row in rows for step in row],
-        group_ids=[0, 0, 2],
+        sequence_ids=[0, 0, 2],
         batch_size=3,continuing=None)
-    assert inputs.ids.tolist() == manual.ids.tolist()
-    assert inputs.group_ids.tolist() == manual.group_ids.tolist()
-    assert inputs.head_output_indices.tolist() == manual.head_output_indices.tolist()
+    assert inputs.token_ids.tolist() == manual.token_ids.tolist()
+    assert inputs.sequence_ids.tolist() == manual.sequence_ids.tolist()
+    assert inputs.head_token_ids.tolist() == manual.head_token_ids.tolist()
 
 
 def test_tokenizer_pack_rows_all_empty_keeps_batch_slots() -> None:
@@ -83,7 +82,7 @@ def test_objective_column_dtype_promotes_to_float_when_any_step_is_float() -> No
         tok({"action": 1, "reward": 0.75, "task_index": 0}),
         tok({"action": 2, "reward": 0, "task_index": 0}),
     ]
-    _, objective, _sid = pack_token_batch(steps=steps, group_ids=[0, 0, 0], batch_size=1, continuing=None)
+    _, objective, _sid = pack_token_batch(steps=steps, sequence_ids=[0, 0, 0], batch_size=1, continuing=None)
     assert objective["reward"].dtype == torch.float32
     assert objective["reward"].tolist() == [1.0, 0.75, 0.0]
     assert objective["action"].dtype == torch.int64
@@ -114,11 +113,11 @@ def test_tensor_reuse_is_scoped_by_batch_and_restores_after_errors() -> None:
                 raise RuntimeError("interrupted")
         assert batch.to_tensors() is first
     assert batch.to_tensors() is not first
-    batch.ids[:] = 7
+    batch.token_ids[:] = 7
     with reuse_token_tensors():
         fresh = batch.to_tensors()
         assert fresh is not first
-        assert (fresh["ids"] == 7).all()
+        assert (fresh["token_ids"] == 7).all()
 
 
 def test_tensor_reuse_separates_inference_tensors_from_autograd_inputs() -> None:
@@ -128,18 +127,18 @@ def test_tensor_reuse_separates_inference_tensors_from_autograd_inputs() -> None
             inference = batch.to_tensors()
         normal = batch.to_tensors()
         assert normal is not inference
-        assert not normal["ids"].is_inference()
+        assert not normal["token_ids"].is_inference()
         # Embedding backward needs to save the indices, which inference-mode
         # tensors cannot do. Inference-first reuse must still allow training.
         embedding = torch.nn.Embedding(32, 4)
-        embedding(normal["ids"]).sum().backward()
+        embedding(normal["token_ids"]).sum().backward()
         assert embedding.weight.grad is not None
 
 
 def test_objective_column_stays_int_when_all_steps_are_int() -> None:
     tok = _tok()
     steps = [tok({"action": a, "reward": a, "task_index": 0}) for a in range(3)]
-    _, objective, group_id = pack_token_batch(steps=steps, group_ids=[0, 0, 0], batch_size=1, continuing=None)
+    _, objective, group_id = pack_token_batch(steps=steps, sequence_ids=[0, 0, 0], batch_size=1, continuing=None)
     assert "group_id" not in objective
     assert group_id.tolist() == [0, 0, 0]
     assert objective["reward"].dtype == torch.int64
@@ -163,7 +162,7 @@ def test_objective_vector_column_promotes_dtype() -> None:
         tok({"action": 0, "q": np.array([1, 2]), "task_index": 0}),
         tok({"action": 0, "q": np.array([0.5, 0.25]), "task_index": 0}),
     ]
-    _, objective, _sid = pack_token_batch(steps=steps, group_ids=[0, 0], batch_size=1, continuing=None)
+    _, objective, _sid = pack_token_batch(steps=steps, sequence_ids=[0, 0], batch_size=1, continuing=None)
     assert objective["q"].dtype == torch.float32
     assert objective["q"].tolist() == [[1.0, 2.0], [0.5, 0.25]]
 
@@ -187,7 +186,7 @@ def test_objective_ragged_float_vectors_pad_with_neg_inf() -> None:
         tok({"action": 0, "q": np.array([1.0, 2.0, 3.0]), "task_index": 0}),
         tok({"action": 0, "q": np.array([0.5, 0.25]), "task_index": 0}),
     ]
-    _, objective, _sid = pack_token_batch(steps=steps, group_ids=[0, 0], batch_size=1, continuing=None)
+    _, objective, _sid = pack_token_batch(steps=steps, sequence_ids=[0, 0], batch_size=1, continuing=None)
     q = objective["q"]
     assert q[0].tolist() == [1.0, 2.0, 3.0]
     assert q[1, :2].tolist() == [0.5, 0.25]
@@ -214,7 +213,7 @@ def test_objective_ragged_int_vectors_raise() -> None:
         tok({"action": 0, "q": np.array([4, 5]), "task_index": 0}),
     ]
     with pytest.raises(ValueError, match="ragged"):
-        pack_token_batch(steps=steps, group_ids=[0, 0], batch_size=1, continuing=None)
+        pack_token_batch(steps=steps, sequence_ids=[0, 0], batch_size=1, continuing=None)
 
 
 def test_objective_mixed_rank_raises() -> None:
@@ -236,9 +235,7 @@ def test_objective_mixed_rank_raises() -> None:
         tok({"action": 0, "q": 0.5, "task_index": 0}),
     ]
     with pytest.raises(ValueError, match="mixes array ranks"):
-        pack_token_batch(steps=steps, group_ids=[0, 0], batch_size=1, continuing=None)
-
-
+        pack_token_batch(steps=steps, sequence_ids=[0, 0], batch_size=1, continuing=None)
 
 
 class _FakeTokenizer:
@@ -247,91 +244,44 @@ class _FakeTokenizer:
         return {"input_ids": torch.tensor([ids], dtype=torch.long)}
 
 
-def test_positions_index_tokens_within_modality_per_step() -> None:
-    tok = Tokenizer(
-        input_fields=[
-            {"type": "text", "input_field": "action", "format": "{field}"},
-            {"type": "text", "format": "ab", "head_output": True},
-            {
-                "type": "text",
-                "input_field": "episode_index",
-                "format": "{field}",
-                "when": when_step_index_zero,
-            },
-        ],
-        tokenizer=_FakeTokenizer(),
-        objective_fields=[],
-    )
-    st = tok({"action": 1, "task_index": 0})
-    # Shared __text__ stream: token field then two-id text const.
-    assert st.positions.tolist() == [0, 1, 2]
-    inputs, _, _sid = pack_token_batch(steps=[st, st], group_ids=[0, 0], batch_size=1, continuing=None)
-    # Positions restart every step; they never accumulate across the sequence.
-    assert inputs.positions.tolist() == [0, 1, 2] * 2
-    assert inputs.to_tensors()["positions"].dtype == torch.int64
-
-
-def test_negative_positions_rejected() -> None:
-    from mouse_core.data.token_batch import TokenBatch
-
-    tok = _tok()
-    inputs, _, _sid = pack_token_batch(steps=[tok({"action": 0, "reward": 0.0, "task_index": 0})], continuing=None)
-    with pytest.raises(ValueError, match="positions must be >= 0"):
-        TokenBatch(
-            modality_ids=inputs.modality_ids,
-            ids=inputs.ids,
-            values=inputs.values,
-            positions=np.array([-1]),
-            modality_names=inputs.modality_names,
-            modality_map=inputs.modality_map,
-            group_ids=inputs.group_ids,
-            head_output_indices=inputs.head_output_indices,
-            head_output_steps=inputs.head_output_steps,
-            B=inputs.B,
-        )
-
-
-def test_interleaved_group_ids_rejected() -> None:
+def test_interleaved_sequence_ids_rejected() -> None:
     tok = _tok()
     steps = [tok({"action": 0, "reward": 0.0, "task_index": 0}) for _ in range(4)]
     with pytest.raises(ValueError, match="non-decreasing"):
-        pack_token_batch(steps=steps, group_ids=[0, 1, 0, 1], batch_size=2, continuing=None)
+        pack_token_batch(steps=steps, sequence_ids=[0, 1, 0, 1], batch_size=2, continuing=None)
 
 
-def test_group_ids_out_of_range_rejected() -> None:
+def test_sequence_ids_out_of_range_rejected() -> None:
     from mouse_core.data.token_batch import TokenBatch
 
     tok = _tok()
     steps = [tok({"action": 0, "reward": 0.0, "task_index": 0}) for _ in range(2)]
-    inputs, _, _sid = pack_token_batch(steps=steps, group_ids=[0, 1], batch_size=2, continuing=None)
+    inputs, _, _sid = pack_token_batch(steps=steps, sequence_ids=[0, 1], batch_size=2, continuing=None)
     with pytest.raises(ValueError, match=r"must be in \[0, 1\)"):
         TokenBatch(
-            modality_ids=inputs.modality_ids,
-            ids=inputs.ids,
-            values=inputs.values,
-            positions=inputs.positions,
-            modality_names=inputs.modality_names,
-            modality_map=inputs.modality_map,
-            group_ids=inputs.group_ids,
-            head_output_indices=inputs.head_output_indices,
-            head_output_steps=inputs.head_output_steps,
+            numeric_mask=inputs.numeric_mask,
+            token_ids=inputs.token_ids,
+            numeric_values=inputs.numeric_values,
+            sequence_ids=inputs.sequence_ids,
+            head_token_ids=inputs.head_token_ids,
+            head_step_ids=inputs.head_step_ids,
             B=1,
         )
 
 
-def test_contiguous_group_ids_with_gaps_accepted() -> None:
+def test_contiguous_sequence_ids_with_gaps_accepted() -> None:
     """Rows with zero steps (decode) leave gaps in the id set; that is fine."""
     tok = _tok()
     steps = [tok({"action": 0, "reward": 0.0, "task_index": 0}) for _ in range(3)]
-    inputs, _, _sid = pack_token_batch(steps=steps, group_ids=[0, 2, 2], batch_size=3, continuing=None)
+    inputs, _, _sid = pack_token_batch(steps=steps, sequence_ids=[0, 2, 2], batch_size=3, continuing=None)
     assert inputs.step_counts().tolist() == [1, 0, 2]
 
 
-def test_pack_rejects_negative_group_ids() -> None:
+def test_pack_rejects_negative_sequence_ids() -> None:
     tok = _tok()
     steps = [tok({"action": 0, "reward": 0.0, "task_index": 0})]
-    with pytest.raises(ValueError, match="group_ids must be >= 0"):
-        pack_token_batch(steps=steps, group_ids=[-1], batch_size=2, continuing=None)
+    with pytest.raises(ValueError, match="sequence_ids must be >= 0"):
+        pack_token_batch(steps=steps, sequence_ids=[-1], batch_size=2, continuing=None)
 
 
 def test_pack_rejects_objective_key_missing_on_some_steps() -> None:
@@ -342,4 +292,4 @@ def test_pack_rejects_objective_key_missing_on_some_steps() -> None:
     ]
     steps[1].objective_fields.pop("reward")
     with pytest.raises(KeyError, match="reward"):
-        pack_token_batch(steps=steps, group_ids=[0, 0], batch_size=1, continuing=None)
+        pack_token_batch(steps=steps, sequence_ids=[0, 0], batch_size=1, continuing=None)

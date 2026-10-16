@@ -54,13 +54,14 @@ _CASES: list[tuple[Objective[...], dict[str, object], tuple[str, ...]]] = [
     (
         DqnObjective(
             discount=None, reward=None, value=None, gate=None,
-            temperature=0.0, double=False, cross_group_backups="bootstrap",
+            temperature=0.0, cross_group_backups="bootstrap",
         ),
         {
             "group_id": torch.zeros(2, dtype=torch.int64),
-            "delayed_predictions": torch.zeros(2, 2),
+            "backup_value_predictions": torch.zeros(2, 2),
+            "backup_action_predictions": torch.zeros(2, 2),
         },
-        ("group_id", "delayed_predictions"),
+        ("group_id", "backup_value_predictions", "backup_action_predictions"),
     ),
     (
         PpoObjective(
@@ -113,7 +114,7 @@ def test_objectives_still_reject_unused_prediction_tensors(
         "predictions": torch.zeros(2, 2),
         **extra_inputs,
     }
-    for name in ("delayed_predictions", "value_predictions", "targets"):
+    for name in ("backup_value_predictions", "backup_action_predictions", "value_predictions", "targets"):
         if name not in required:
             with pytest.raises(TypeError, match=f"unexpected keyword argument '{name}'"):
                 objective(**{**inputs, name: torch.zeros(2, 2)})

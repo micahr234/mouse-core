@@ -16,7 +16,7 @@ class Model(nn.Module, ABC):
     """Subclass and define the computation in ``forward`` using ordinary PyTorch.
 
     Register modules as attributes, ModuleLists, or Sequentials. There is no
-    graph specification: Python defines the flow. LR and tau groups use the
+    graph specification: Python defines the flow. LR groups use the
     same dotted module paths as ``get_submodule`` and ``named_parameters``.
     """
 

@@ -1,23 +1,23 @@
 """Custom Python forwards, standard composition, and online-only persistence."""
 import json
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 import torch
 from torch import nn
 
-from mouse_core import AdamW, model_polyak
-from mouse_core.models import Model, TokenEncoder, load_model, save_model
+from mouse_core import AdamW
+from mouse_core.models import Embedding, Model, DecodeCache, prepare_decode, load_model, save_model
 from mouse_core.models.mlp import MLP
-from mouse_core.models.backbone import Backbone
+from mouse_core.models.backbone import Backbone, BaseBackbone
 
 from tests._model_helpers import ExampleModel, fresh_model
 from tests._token_batch_helpers import batch_to_token_batch, token_tokenizer
 
 
 def _backbone() -> Backbone:
-    return Backbone(architecture="qwen3", hidden_dim=8, num_layers=1, num_heads=2,
-                               vocab_size=32, train_kernel="reference", decode_kernel="flex", dtype=torch.float32)
+    return Backbone(architecture='qwen3', hidden_dim=8, num_layers=1, num_heads=2, train_kernel='reference', decode_kernel='flex', dtype=torch.float32)
 
 
 def _batch(start=0, stop=3):
@@ -28,7 +28,8 @@ def _batch(start=0, stop=3):
 class BranchedModel(Model):
     def __init__(self, projection=True, stacked=True):
         super().__init__()
-        self.encoder = TokenEncoder([_backbone() for _ in range(2 if stacked else 1)])
+        self.backbones = nn.ModuleList([_backbone() for _ in range(2 if stacked else 1)])
+        self.embedding = Embedding(hidden_dim=8, vocab_size=32)
         self.projection = (nn.Sequential(
             MLP(in_features=8, out_features=8, hidden_dim=12),
             MLP(in_features=8, hidden_dim=12, out_features=4),
@@ -42,15 +43,56 @@ class BranchedModel(Model):
 
     def get_action(self, *, out):
         # This implementation chooses continuous actions from its scalar output.
-        return out.predictions["baseline"].tanh()
+        return out["predictions"]["baseline"].tanh()
 
-    def forward(self, batch, *, cache=None, use_cache=False, residual=True):
-        encoded = self.encoder(batch, cache=cache, use_cache=use_cache)
-        h = encoded.pool().float()
+    def forward(self, batch, *, cache=None, use_cache=False, residual=True) -> dict[str, Any]:
+        if cache is not None and not use_cache:
+            raise ValueError("cache requires use_cache=True")
+        tensors = batch.to_tensors(next(self.parameters()).device)
+        token_ids = tensors["token_ids"]
+        numeric_values = tensors["numeric_values"]
+        numeric_mask = tensors["numeric_mask"]
+        sequence_ids = tensors["sequence_ids"]
+        head_token_ids = tensors["head_token_ids"]
+        head_step_ids = tensors["head_step_ids"]
+        embed = self.embedding(
+            token_ids, numeric_values=numeric_values, numeric_mask=numeric_mask,
+        )
+        head_valid_mask = None
+        if use_cache:
+            embed, lengths, head_token_ids, head_valid_mask = prepare_decode(
+                embeds=embed, tokens=batch, sequence_ids=sequence_ids,
+                head_token_ids=head_token_ids, head_step_ids=head_step_ids,
+            )
+            if cache is None:
+                sessions = []
+                try:
+                    for backbone in self.backbones:
+                        sessions.append(cast(BaseBackbone, backbone).decode_session(batch_size=batch.B))
+                except Exception:
+                    for session in sessions:
+                        session.close()
+                    raise
+                cache = DecodeCache(sessions=tuple(sessions))
+            encoded = embed
+            for backbone, session in zip(self.backbones, cache.sessions, strict=True):
+                encoded = backbone(encoded, cache=session, lengths=lengths)
+            h = encoded.gather(1, head_token_ids.unsqueeze(-1).expand(*head_token_ids.shape, encoded.shape[-1])).float()
+        else:
+            encoded = embed
+            for backbone in self.backbones:
+                encoded = backbone(encoded, sequence_ids=sequence_ids)
+            h = encoded[head_token_ids].float()
         features = self.projection(h)
         if residual:
             features = features + self.skip(h)
-        return encoded.with_predictions({"baseline": self.value(features), "action": self.policy(features)})
+        return {
+            "predictions": {"baseline": self.value(features), "action": self.policy(features)},
+            "last_hidden_state": encoded,
+            "head_token_ids": head_token_ids,
+            "head_valid_mask": head_valid_mask,
+            "cache": cache,
+        }
 
 
 @pytest.mark.parametrize("projection", [False, True])
@@ -62,32 +104,32 @@ def test_custom_forward_gradients_head_tokens_and_cache(projection, stacked):
     full = model(_batch())
     handle.remove()
     assert seen == [torch.Size([3, 8])] and _batch().L > 3
-    torch.stack([value.square().mean() for value in full.predictions.values()]).sum().backward()
-    for module in (model.encoder, model.skip, model.value, model.policy):
+    torch.stack([value.square().mean() for value in full["predictions"].values()]).sum().backward()
+    for module in (model.embedding, model.backbones, model.skip, model.value, model.policy):
         assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in module.parameters())
-    assert not torch.equal(full.predictions["baseline"], model(_batch(), residual=False).predictions["baseline"])
+    assert not torch.equal(full["predictions"]["baseline"], model(_batch(), residual=False)["predictions"]["baseline"])
     model.eval()
     with torch.no_grad():
         full = model(_batch())
         first = model(_batch(0, 2), use_cache=True)
-        assert first.cache is not None
+        assert first["cache"] is not None
         try:
-            assert len(first.cache.sessions) == (2 if stacked else 1)
-            last = model(_batch(2, 3), cache=first.cache, use_cache=True)
-            for name in full.predictions:
-                actual = torch.cat([first.predictions[name], last.predictions[name]], dim=1).squeeze(0)
-                torch.testing.assert_close(actual, full.predictions[name], atol=2e-5, rtol=2e-5)
-            first.cache.reset_rows([0])
-            reset = model(_batch(0, 1), use_cache=True, cache=first.cache)
+            assert len(first["cache"].sessions) == (2 if stacked else 1)
+            last = model(_batch(2, 3), cache=first["cache"], use_cache=True)
+            for name in full["predictions"]:
+                actual = torch.cat([first["predictions"][name], last["predictions"][name]], dim=1).squeeze(0)
+                torch.testing.assert_close(actual, full["predictions"][name], atol=2e-5, rtol=2e-5)
+            first["cache"].reset_rows([0])
+            reset = model(_batch(0, 1), use_cache=True, cache=first["cache"])
             reference = model(_batch(0, 1))
-            torch.testing.assert_close(reset.predictions["action"].squeeze(0), reference.predictions["action"], atol=2e-5, rtol=2e-5)
+            torch.testing.assert_close(reset["predictions"]["action"].squeeze(0), reference["predictions"]["action"], atol=2e-5, rtol=2e-5)
         finally:
-            first.cache.close()
+            first["cache"].close()
 
 
 def test_custom_copy_preserves_forward_and_module_rates():
     model = BranchedModel()
-    rates = {"encoder": 0., "projection.0": 0., "projection.1": 0.2,
+    rates = {"embedding": 0., "backbones": 0., "projection.0": 0., "projection.1": 0.2,
              "skip": 0., "value": 0., "policy": 0.}
     optimizer = AdamW(params=model.parameter_groups(lr=rates), lr=0., weight_decay=0., betas=(0., 0.), eps=0.)
     before = {name: p.detach().clone() for name, p in model.named_parameters()}
@@ -97,21 +139,21 @@ def test_custom_copy_preserves_forward_and_module_rates():
     for name, p in model.named_parameters():
         torch.testing.assert_close(p, before[name] - (0.2 if name.startswith("projection.1.") else 0.))
     delayed = model.copy(modules=["projection", "skip", "value", "policy"])
-    assert type(delayed) is BranchedModel and delayed.encoder is model.encoder
+    assert type(delayed) is BranchedModel and delayed.embedding is model.embedding and delayed.backbones is model.backbones
     assert all(not p.requires_grad for p in delayed.projection.parameters())
     assert all(p.requires_grad for p in model.projection.parameters())
     assert isinstance(model.projection, nn.Sequential) and isinstance(delayed.projection, nn.Sequential)
-    update = model_polyak(online=model, delayed=delayed, modules=tuple(rates))
     with torch.no_grad():
         old = {name: p.clone() for name, p in delayed.projection[1].named_parameters()}
         for p in model.projection[1].parameters():
             p.add_(1.)
-        update(tau={name: None if name == "encoder" else (0.25 if name == "projection.1" else 0.) for name in rates})
+        for target, source in zip(delayed.projection[1].parameters(), model.projection[1].parameters(), strict=True):
+            target.lerp_(source, 0.25)
         for name, p in delayed.projection[1].named_parameters():
             torch.testing.assert_close(p, old[name] + 0.25)
     output = delayed(_batch(), residual=False)
-    assert output.predictions["action"].shape == (3, 4)
-    torch.testing.assert_close(delayed.get_action(out=output), output.predictions["baseline"].tanh())
+    assert output["predictions"]["action"].shape == (3, 4)
+    torch.testing.assert_close(delayed.get_action(out=output), output["predictions"]["baseline"].tanh())
 
 
 def test_groups_reject_overlap_missing_and_unknown_modules():
@@ -124,10 +166,10 @@ def test_groups_reject_overlap_missing_and_unknown_modules():
 
 @pytest.mark.parametrize('projection', [False, True])
 def test_explicit_composition_checkpoint_roundtrip(tmp_path: Path, projection):
-    model = ExampleModel(encoder=TokenEncoder([_backbone(), _backbone()]), projection=nn.Sequential(MLP(in_features=8, out_features=8, hidden_dim=12), MLP(in_features=8, hidden_dim=12, out_features=4)) if projection else None, heads={'q': MLP(in_features=4 if projection else 8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0)}).eval()
+    model = BranchedModel(projection=projection, stacked=True).eval()
     save_model(model=model, path=tmp_path)
     loaded = load_model(model=fresh_model(model), repo_id_or_path=str(tmp_path))
-    torch.testing.assert_close(loaded(_batch()).predictions['q'], model(_batch()).predictions['q'])
+    torch.testing.assert_close(loaded(_batch())["predictions"]['action'], model(_batch())["predictions"]['action'])
     assert set(loaded.state_dict()) == set(model.state_dict())
 
 
@@ -135,7 +177,7 @@ def test_custom_checkpoint_saves_only_online_state(tmp_path: Path):
     model = BranchedModel()
     optimizer = AdamW(params=model.parameters(), lr=0.01)
     delayed = model.copy()
-    model(_batch()).predictions['baseline'].square().mean().backward()
+    model(_batch())["predictions"]['baseline'].square().mean().backward()
     optimizer.step()
     assert optimizer.state_dict()['inner']['state']
     assert any((not torch.equal(p, dict(delayed.named_parameters())[name]) for name, p in model.named_parameters()))
@@ -153,8 +195,8 @@ def test_custom_checkpoint_saves_only_online_state(tmp_path: Path):
     result = load_model(repo_id_or_path=str(tmp_path), model=restored)
     assert result is restored
     output = restored(_batch())
-    torch.testing.assert_close(output.predictions['action'], model(_batch()).predictions['action'])
-    torch.testing.assert_close(restored.get_action(out=output), output.predictions['baseline'].tanh())
+    torch.testing.assert_close(output["predictions"]['action'], model(_batch())["predictions"]['action'])
+    torch.testing.assert_close(restored.get_action(out=output), output["predictions"]['baseline'].tanh())
 
 
 def test_mlp_instances_compose_as_projection_and_scalar_prediction():

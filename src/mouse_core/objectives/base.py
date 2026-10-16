@@ -57,7 +57,7 @@ class Objective[**P](ABC):
     Subclass this and implement :meth:`__call__` to create a custom objective.
     Instantiate with hyperparameters; call with ``objective_data=`` and
     the prediction tensor for the head being trained. Objectives that read
-    another head also take that tensor: DQN takes ``delayed_predictions=``
+    another head also take that tensor: DQN takes ``backup_value_predictions=``
     and PPO takes ``value_predictions=``. Supervised objectives take
     ``targets=`` (action ids for SP, Q vectors for SV). DQN, PPO, and GRPO
     require ``group_id=`` (int64 ``[N]``) beside ``objective_data``.
@@ -82,7 +82,7 @@ class Objective[**P](ABC):
         Concrete objectives declare the required keyword-only arguments.
         ``objective_data`` holds tokenizer ``objective_fields`` keyed by
         flat step index; ``predictions`` comes from the matching head in
-        ``ModelOutput.predictions``. Additional group, prediction, and
+        the agent output dictionary. Additional group, prediction, and
         target inputs depend on the objective.
 
         Returns:

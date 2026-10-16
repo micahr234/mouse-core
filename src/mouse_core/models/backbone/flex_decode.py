@@ -186,7 +186,7 @@ def flex_block_mask(
     )
 
 
-def packed_rope_positions(*, group_ids: torch.Tensor) -> torch.Tensor:
+def packed_rope_positions(*, sequence_ids: torch.Tensor) -> torch.Tensor:
     """RoPE position of every token in a flat packed stream ``[L]``.
 
     Position = number of earlier tokens with the same ``group_id``.
@@ -196,11 +196,11 @@ def packed_rope_positions(*, group_ids: torch.Tensor) -> torch.Tensor:
     its own position counter instead of restarting at 0. Sync-free: one
     stable sort plus a cummax, no host ``.item()``.
     """
-    L = group_ids.shape[0]
-    device = group_ids.device
+    L = sequence_ids.shape[0]
+    device = sequence_ids.device
     if L == 0:
         return torch.zeros(0, dtype=torch.long, device=device)
-    seq = group_ids.to(device=device, dtype=torch.long)
+    seq = sequence_ids.to(device=device, dtype=torch.long)
     order = torch.argsort(seq, stable=True)
     sorted_seq = seq[order]
     arange = torch.arange(L, device=device)

@@ -15,7 +15,7 @@ class _LlamaBackboneConfig:
     """Configuration for a Llama transformer stack.
 
     Builds a HuggingFace ``LlamaModel`` with SDPA attention. ``vocab_size=``
-    is the pretrained vocab, or a stub of 1 when the table is unused.
+    is a temporary stub of 1; Backbone removes the table before use.
     """
 
     num_layers: int
@@ -73,7 +73,6 @@ def llama_config_kwargs(model: Any) -> dict[str, Any]:
         intermediate_size=cfg.intermediate_size,
         rms_norm_eps=getattr(cfg, "rms_norm_eps", 1e-5),
         attention_bias=getattr(cfg, "attention_bias", False),
-        vocab_size=int(cfg.vocab_size),
     )
     rope_parameters = getattr(cfg, "rope_parameters", None)
     if rope_parameters is not None:

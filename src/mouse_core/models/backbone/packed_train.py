@@ -4,7 +4,7 @@
 concatenated token stream ``embeds [L, D]``. Attention is causal within
 one ``group_id`` (one dataloader sample)::
 
-    allowed(q, k) = k <= q and group_ids[k] == group_ids[q]
+    allowed(q, k) = k <= q and sequence_ids[k] == sequence_ids[q]
 
 Groups are equality classes of ``group_id``, not necessarily
 contiguous runs: an id that recurs later in the stream attends back to
@@ -122,10 +122,10 @@ class _PackingPlan:
     position_ids: torch.Tensor
 
 
-def _packing_plan(group_ids: torch.Tensor) -> _PackingPlan:
-    L = group_ids.shape[0]
-    device = group_ids.device
-    seq = group_ids.to(torch.long)
+def _packing_plan(sequence_ids: torch.Tensor) -> _PackingPlan:
+    L = sequence_ids.shape[0]
+    device = sequence_ids.device
+    seq = sequence_ids.to(torch.long)
     order = torch.argsort(seq, stable=True)
     packed_seq = seq[order]
     arange = torch.arange(L, device=device)
@@ -437,7 +437,7 @@ def packed_forward(
     *,
     model: _PackedModel,
     embeds: torch.Tensor,
-    group_ids: torch.Tensor,
+    sequence_ids: torch.Tensor,
     train_kernel: TrainKernel,
     autocast_dtype: torch.dtype | None = None,
     output_hidden_states: Literal[False] = False,
@@ -450,7 +450,7 @@ def packed_forward(
     *,
     model: _PackedModel,
     embeds: torch.Tensor,
-    group_ids: torch.Tensor,
+    sequence_ids: torch.Tensor,
     train_kernel: TrainKernel,
     autocast_dtype: torch.dtype | None = None,
     output_hidden_states: Literal[True],
@@ -463,7 +463,7 @@ def packed_forward(
     *,
     model: _PackedModel,
     embeds: torch.Tensor,
-    group_ids: torch.Tensor,
+    sequence_ids: torch.Tensor,
     train_kernel: TrainKernel,
     autocast_dtype: torch.dtype | None = None,
     output_hidden_states: bool,
@@ -475,7 +475,7 @@ def packed_forward(
     *,
     model: _PackedModel,
     embeds: torch.Tensor,
-    group_ids: torch.Tensor,
+    sequence_ids: torch.Tensor,
     train_kernel: TrainKernel,
     autocast_dtype: torch.dtype | None = None,
     output_hidden_states: bool = False,
@@ -488,7 +488,7 @@ def packed_forward(
             ``LlamaModel``) with ``layers``, ``rotary_emb``, ``norm``.
         embeds: Token embeddings ``[L, D]`` in stream order; cast to the
             model's base dtype.
-        group_ids: ``[L]`` group id per token. One group is one sample.
+        sequence_ids: ``[L]`` group id per token. One group is one sample.
         train_kernel: ``"varlen"`` (flash varlen; requires CUDA with bf16/fp16
             q/k/v — a bf16/fp16 backbone or ``train_autocast_dtype`` — and raises
             otherwise), ``"padded"`` (dense causal SDPA on segments padded to
@@ -515,8 +515,8 @@ def packed_forward(
     if embeds.ndim != 2:
         raise ValueError(f"embeds must be [L, D], got shape {tuple(embeds.shape)}")
     L, _D = embeds.shape
-    if group_ids.shape != (L,):
-        raise ValueError("group_ids must have shape [L]")
+    if sequence_ids.shape != (L,):
+        raise ValueError("sequence_ids must have shape [L]")
     check_train_kernel(train_kernel)
 
     hf = cast(Any, model)  # HF stacks are nn.Module; pyright sees children as Tensor|Module
@@ -548,7 +548,7 @@ def packed_forward(
         out = hf.norm(x)
         return (out, (x,) * n_layers) if output_hidden_states else out
 
-    plan = _packing_plan(group_ids.to(device))
+    plan = _packing_plan(sequence_ids.to(device))
     attn_mask: torch.Tensor | None = None
     block_mask: BlockMask | None = None
     flex_fn: Callable[..., torch.Tensor] | None = None

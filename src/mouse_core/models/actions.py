@@ -29,7 +29,7 @@ def _last_valid_step(valid: torch.Tensor) -> torch.Tensor:
     """Last True index along dim=-1. Every row must have a valid head-output."""
     if valid.ndim != 2:
         raise ValueError(
-            f"head_output_valid must have shape [B, S], got {tuple(valid.shape)}"
+            f"head_valid_mask must have shape [B, S], got {tuple(valid.shape)}"
         )
     has = valid.any(dim=-1)
     if not bool(has.all()):
@@ -57,7 +57,7 @@ def _last_action_scores(
     if valid is not None and raw.ndim >= 3 and valid.shape != raw.shape[:2]:
         raise ValueError(
             f"{name} scores {tuple(raw.shape)} do not match "
-            f"head_output_valid {tuple(valid.shape)}"
+            f"head_valid_mask {tuple(valid.shape)}"
         )
     step = None if valid is None else _last_valid_step(valid)
     batch = None if step is None else torch.arange(raw.shape[0], device=raw.device)

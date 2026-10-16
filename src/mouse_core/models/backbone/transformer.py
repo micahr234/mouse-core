@@ -20,7 +20,6 @@ from typing import Any, Literal, cast
 import torch
 from torch import nn
 
-from mouse_core.data.token_batch import TokenBatch
 from mouse_core.models.backbone.base import (
     BaseBackbone,
     DecodeKernel,
@@ -32,8 +31,6 @@ from mouse_core.models.backbone.packed_train import _DecoderStack
 from mouse_core.models.backbone.flex_decode import FlexDecodeSession
 from mouse_core.models.backbone.llama import _LlamaBackboneConfig, llama_config_kwargs
 from mouse_core.models.backbone.qwen3 import _Qwen3BackboneConfig, qwen3_config_kwargs
-from mouse_core.models.backbone.embed import embed_token_ids
-from mouse_core.models.backbone.fourier import FourierFeatures, check_num_frequencies
 from mouse_core.models.lora import LoRAConfig
 
 Architecture = Literal["llama", "qwen3", "hf"]
@@ -202,14 +199,8 @@ class Backbone(BaseBackbone):
     Cached decode (``decode_session``) is the packed/flex path. Generic HF
     stacks raise there; grouping still applies on the full-sequence forward.
 
-    Token embeddings live on this module: ``pretrained=`` loads the
-    checkpoint's ``embed_tokens``; from-scratch stacks take ``vocab_size=``
-    (or a stub of 1 when the table is unused).
-
-    ``num_frequencies`` builds a Fourier module added onto ``__numeric__``
-    token embeddings. The module sits beside the decoder, so LoRA
-    freezing of ``self.model`` leaves it trainable. Omit
-    ``num_frequencies`` and a batch that contains those tokens raises.
+    Token tables and numeric Fourier features belong to an independent
+    ``Embedding`` module. This backbone owns only the decoder.
     """
 
     architecture: Architecture
@@ -232,7 +223,6 @@ class Backbone(BaseBackbone):
         hub_kwargs: dict[str, Any] | None = None,
         lora: LoRAConfig | None = None,
         hf_config: dict[str, Any] | None = None,
-        num_frequencies: int | None = None,
         **config_kwargs: Any,
     ) -> None:
         super().__init__()
@@ -252,8 +242,8 @@ class Backbone(BaseBackbone):
                 "Backbone requires pretrained= or architecture= "
                 "('llama', 'qwen3', or 'hf')."
             )
-        self.num_frequencies = check_num_frequencies(num_frequencies)
-        self.fourier: FourierFeatures | None = None
+        if {"vocab_size", "num_frequencies"} & config_kwargs.keys():
+            raise TypeError("Configure vocab_size and num_frequencies on Embedding, not Backbone.")
 
         if pretrained is not None:
             self._init_from_pretrained(
@@ -303,24 +293,6 @@ class Backbone(BaseBackbone):
                     config_kwargs=config_kwargs,
                 )
         _remove_output_norm(_as_module(self.model))
-        self._install_fourier(dtype=dtype)
-
-    def _install_fourier(self, *, dtype: torch.dtype) -> None:
-        count = self.num_frequencies
-        if count is None:
-            self.fourier = None
-            return
-        self.fourier = FourierFeatures(
-            num_frequencies=count,
-            hidden_dim=self.hidden_dim,
-        )
-        self.fourier.to(dtype=dtype)
-        self._config_kwargs["num_frequencies"] = self.num_frequencies
-
-    def _vocab_size_for_stack(self, *, config_vocab: int | None) -> int:
-        if config_vocab is None:
-            return 1
-        return int(config_vocab)
 
     def _init_named_stack(
         self,
@@ -332,14 +304,13 @@ class Backbone(BaseBackbone):
         config_kwargs: dict[str, Any],
     ) -> None:
         kwargs = dict(config_kwargs)
-        vocab_size = self._vocab_size_for_stack(config_vocab=kwargs.pop("vocab_size", None))
         if architecture == "llama":
             self.model = _LlamaBackboneConfig(**kwargs).build(
-                hidden_dim, vocab_size=vocab_size
+                hidden_dim, vocab_size=1
             )
         else:
             self.model = _Qwen3BackboneConfig(**kwargs).build(
-                hidden_dim, vocab_size=vocab_size
+                hidden_dim, vocab_size=1
             )
         self.architecture = architecture
         self.uses_packed = True
@@ -349,6 +320,7 @@ class Backbone(BaseBackbone):
             if architecture == "llama"
             else qwen3_config_kwargs(cast(Any, self.model))
         )
+        cast(Any, self.model).set_input_embeddings(None)
         _as_module(self.model).to(dtype)
         self._attach_lora(_as_module(self.model), lora)
 
@@ -429,20 +401,18 @@ class Backbone(BaseBackbone):
         config_kwargs: dict[str, Any],
     ) -> None:
         if architecture == "qwen3":
-            extracted_kwargs, extracted_hidden_dim, extracted_vocab = _qwen3_kwargs_from_pretrained(
+            extracted_kwargs, extracted_hidden_dim, _ = _qwen3_kwargs_from_pretrained(
                 repo_id_or_path=pretrained, hub_kwargs=hub_kwargs, overrides=config_kwargs
             )
-            vocab_size = self._vocab_size_for_stack(config_vocab=extracted_vocab)
             model = _Qwen3BackboneConfig(**extracted_kwargs).build(
-                extracted_hidden_dim, vocab_size=vocab_size
+                extracted_hidden_dim, vocab_size=1
             )
         else:
-            extracted_kwargs, extracted_hidden_dim, extracted_vocab = _llama_kwargs_from_pretrained(
+            extracted_kwargs, extracted_hidden_dim, _ = _llama_kwargs_from_pretrained(
                 repo_id_or_path=pretrained, hub_kwargs=hub_kwargs, overrides=config_kwargs
             )
-            vocab_size = self._vocab_size_for_stack(config_vocab=extracted_vocab)
             model = _LlamaBackboneConfig(**extracted_kwargs).build(
-                extracted_hidden_dim, vocab_size=vocab_size
+                extracted_hidden_dim, vocab_size=1
             )
         if hidden_dim is not None and int(hidden_dim) != extracted_hidden_dim:
             raise ValueError(
@@ -454,7 +424,7 @@ class Backbone(BaseBackbone):
         self.uses_packed = True
         _ensure_packed_head_dim(_as_module(self.model))
         self._config_kwargs = dict(extracted_kwargs)
-        self._config_kwargs["vocab_size"] = vocab_size
+        cast(Any, self.model).set_input_embeddings(None)
         if load_weights:
             _load_transformer_weights(
                 hub_kwargs=hub_kwargs,
@@ -490,20 +460,13 @@ class Backbone(BaseBackbone):
         self.architecture = "hf"
         self.uses_packed = packed
         self._config_kwargs = {"hf_config": _hf_config_dict(_as_module(self.model))}
+        cast(Any, self.model).set_input_embeddings(None)
         _as_module(self.model).to(dtype)
         self._attach_lora(_as_module(self.model), lora)
 
     @property
     def hidden_dim(self) -> int:
         return _hidden_size(self.model.config)
-
-    def embed(self, token_batch: TokenBatch) -> tuple[torch.Tensor, torch.Tensor]:
-        return embed_token_ids(
-            embed_tokens=cast(nn.Embedding, self.model.get_input_embeddings()),
-            token_batch=token_batch,
-            hidden_dim=self.hidden_dim,
-            fourier=self.fourier,
-        )
 
     def decode_session(self, batch_size: int) -> FlexDecodeSession:
         if not self.uses_packed:
@@ -514,10 +477,11 @@ class Backbone(BaseBackbone):
             )
         return super().decode_session(batch_size)
 
-    def forward(
+    def _forward_dense(
         self,
         embeds: torch.Tensor,
-        output_hidden_states: bool = False,
+        *,
+        output_hidden_states: bool,
         **kwargs: Any,
     ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
         out = self.model(

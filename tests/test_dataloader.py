@@ -1,4 +1,5 @@
 from __future__ import annotations
+from tests._token_batch_helpers import embed_batch
 
 """Tests for DataLoader batch sampling and transform pipeline."""
 
@@ -404,8 +405,8 @@ def _tb_signature(
         tb.B,
         tb.L,
         tb.N,
-        tuple(tb.modality_ids.tolist()),
-        tuple(tb.ids.tolist()),
+        tuple(tb.numeric_mask.tolist()),
+        tuple(tb.token_ids.tolist()),
         tuple(np.asarray(obj["action"].detach().cpu().numpy()).tolist()),
         tuple(group_id.tolist()),
     )
@@ -615,7 +616,8 @@ def test_dataloader_allows_empty_stores_until_sampling() -> None:
 def test_dataloader_transform_returns_token_batch() -> None:
     from mouse_core.models.backbone import IdentityBackbone
 
-    backbone = IdentityBackbone(hidden_dim=8, vocab_size=32)
+    from mouse_core.models import Embedding
+    embedding = Embedding(hidden_dim=8, vocab_size=32)
     loader = DataLoader(
         samples_budget=3,
         batch_size=2,
@@ -630,9 +632,10 @@ def test_dataloader_transform_returns_token_batch() -> None:
         assert int(tb.step_counts().sum()) == tb.N
         assert tb.N == 6
         assert all(int(n) == 1 for n in tb.step_counts())
-        embeds, head_output_indices = backbone.embed(tb)
+        embeds = embed_batch(embedding, tb)
+        head_token_ids = tb.to_tensors(embeds.device)["head_token_ids"]
         assert embeds.shape == (tb.L, 8)
-        assert head_output_indices.shape == (tb.N,)
+        assert head_token_ids.shape == (tb.N,)
         assert "group_id" not in obj.keys()
         assert _sid.tolist() == [0, 1, 2, 3, 4, 5]
     finally:
@@ -930,7 +933,7 @@ def _assert_whole_segments(
         assert win == list(range(win[0], win[0] + steps_per_segment))
         assert done[-1] != 0
         assert all(d == 0 for d in done[:-1])
-    token_seq = [int(x) for x in tb.group_ids]
+    token_seq = [int(x) for x in tb.sequence_ids]
     assert token_seq == sorted(token_seq)
     assert set(token_seq) == set(range(tb.B))
 
@@ -1006,10 +1009,10 @@ def test_dataloader_token_budget_does_not_split_a_segment() -> None:
     tb, obj, _sid = loader.next_batch()
     assert tb.B == 1
     _assert_whole_segments(tb, obj, _sid, steps_per_segment=2)
-    token_seq = [int(x) for x in tb.group_ids]
+    token_seq = [int(x) for x in tb.sequence_ids]
     assert token_seq == [0, 0, 0]
     assert tb.L == 3
-    step_positions = {int(i) for i in tb.head_output_indices}
+    step_positions = {int(i) for i in tb.head_token_ids}
     prefix_ids = [sid for i, sid in enumerate(token_seq) if i not in step_positions]
     assert prefix_ids == [0]
 

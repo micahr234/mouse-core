@@ -1,5 +1,5 @@
+from mouse_core.models.embedding.token import Embedding
 from mouse_core.data.token_batch import (
-    ModalityInfo,
     StepTokens,
     TokenBatch,
     empty_token_batch,
@@ -9,7 +9,7 @@ from mouse_core.data.token_batch import (
 from mouse_core.models.embedding.linear import ScaledEmbedding, ScaledLinear
 
 __all__ = [
-    "ModalityInfo",
+    "Embedding",
     "StepTokens",
     "TokenBatch",
     "empty_token_batch",

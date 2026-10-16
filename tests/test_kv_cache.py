@@ -35,7 +35,7 @@ _TOK = token_tokenizer("action", "episode_done")
 
 def _tiny_model(architecture: Literal['llama', 'qwen3']='qwen3', tokens: int=1, dtype: torch.dtype=torch.float32, train_kernel: TrainKernel='reference', **backbone_kwargs) -> Model:
     hidden_dim = 16
-    backbone = Backbone(architecture=architecture, train_kernel=train_kernel, decode_kernel='flex', dtype=dtype, hidden_dim=hidden_dim, num_layers=2, num_heads=2, vocab_size=32, **backbone_kwargs)
+    backbone = Backbone(architecture=architecture, train_kernel=train_kernel, decode_kernel='flex', dtype=dtype, hidden_dim=hidden_dim, num_layers=2, num_heads=2, **backbone_kwargs)
     head = MLP(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, propagate_gradient=1.0)
     return simple_model(backbone=backbone, heads={'action_value': head}, reasoner=None).eval()
 
@@ -53,7 +53,7 @@ def _fwd(model: Model, rows: list[list[dict]], **kwargs):
         patched,
     )
     out = model(tb, **kwargs)
-    return out.predictions, out.cache
+    return out["predictions"], out["cache"]
 
 @pytest.mark.parametrize('backbone_cls', ["qwen3", "llama"])
 def test_chunked_cached_forward_matches_full_forward(backbone_cls: Literal["llama", "qwen3"]) -> None:
@@ -140,7 +140,7 @@ def test_cuda_bf16_lora_compiled_train_matches_cached_decode() -> None:
     """LoRA + compiled decoder body: packed forward == Flex cached decode."""
     torch.manual_seed(5)
     hidden_dim = 64
-    backbone = Backbone(architecture='qwen3', train_kernel='varlen', decode_kernel='flex', dtype=torch.bfloat16, hidden_dim=hidden_dim, num_layers=2, num_heads=4, lora=LoRAConfig(rank=4, alpha=8.0), vocab_size=32)
+    backbone = Backbone(architecture='qwen3', train_kernel='varlen', decode_kernel='flex', dtype=torch.bfloat16, hidden_dim=hidden_dim, num_layers=2, num_heads=4, lora=LoRAConfig(rank=4, alpha=8.0))
     head = MLP(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, propagate_gradient=1.0)
     model = simple_model(backbone=backbone, heads={'action_value': head}, reasoner=None).eval().to(torch.device('cuda'))
     steps = _steps(8)
@@ -400,10 +400,10 @@ def test_packed_rope_positions_count_same_sequence_tokens() -> None:
     from mouse_core.models.backbone.flex_decode import packed_rope_positions
 
     seq = torch.tensor([0, 0, 0, 0, 0, 0, 1, 1, 1])
-    pos = packed_rope_positions(group_ids=seq)
+    pos = packed_rope_positions(sequence_ids=seq)
     assert pos.tolist() == [0, 1, 2, 3, 4, 5, 0, 1, 2]
     assert packed_rope_positions(
-        group_ids=torch.zeros(0, dtype=torch.long),
+        sequence_ids=torch.zeros(0, dtype=torch.long),
     ).shape == (0,)
 
 
@@ -450,7 +450,7 @@ def test_batched_cached_rollout_matches_per_row_rollout() -> None:
     assert torch.allclose(batched, reference, atol=1e-05)
 
 def test_eval_loop_get_action_model_output_matches_full_forward() -> None:
-    """09 ``run_eval``: lockstep incremental decode + ``get_action(ModelOutput)``.
+    """09 ``run_eval``: lockstep incremental decode + ``get_action(output_dict)``.
 
     Each call packs one new step per stream, carries the KV cache, and reads
     the last valid head-output. The final greedy actions must match a full
@@ -476,7 +476,7 @@ def test_eval_loop_get_action_model_output_matches_full_forward() -> None:
                 patched,
             )
             out = model(tb, cache=cache, use_cache=True)
-            cache = out.cache
+            cache = out["cache"]
             actions = model.get_action(out=out, temperature=0.0)
         assert cache is not None
         cache.close()
@@ -515,7 +515,7 @@ def test_ragged_batched_chunks_match_unbatched(backbone_cls: Literal["llama", "q
             for b, n in enumerate(lengths):
                 collected[b].append(step_preds['action_value'][b, padded_len - n:])
         assert preds is not None
-        action = model.get_action(out=preds, temperature=0.0)
+        action = model.get_action(out={"predictions": preds}, temperature=0.0)
     for b, row_preds in enumerate(collected):
         batched = torch.cat(row_preds, dim=0)
         assert batched.shape == reference[b].shape
@@ -687,7 +687,7 @@ def test_decode_mask_mod_is_module_level_and_shared() -> None:
     """Every session uses the same mask_mod function object (stable for Dynamo)."""
     from mouse_core.models.backbone.flex_decode import FlexDecodeSession, _logical_mask_mod, _physical_mask_mod
     model = _tiny_model('qwen3')
-    inner = cast(nn.Module, cast(Any, model.encoder.backbones[0]).model)
+    inner = cast(nn.Module, cast(Any, model.backbone).model)
     a = FlexDecodeSession(inner, batch_size=1)
     b = FlexDecodeSession(inner, batch_size=2)
     assert a._mask_holder is not b._mask_holder
@@ -722,7 +722,7 @@ def test_flex_decode_session_drops_without_cyclic_gc() -> None:
     import weakref
     from mouse_core.models.backbone.flex_decode import FlexDecodeSession
     model = _tiny_model('qwen3')
-    inner = cast(nn.Module, cast(Any, model.encoder.backbones[0]).model)
+    inner = cast(nn.Module, cast(Any, model.backbone).model)
     session = FlexDecodeSession(inner, batch_size=2)
     wr = weakref.ref(session)
     gc.disable()
@@ -764,8 +764,8 @@ def test_ragged_batched_decode_across_page_boundary_matches_full_forward() -> No
 def _raw_session(batch_size: int):
     from mouse_core.models.backbone.flex_decode import FlexDecodeSession
     model = _tiny_model('qwen3')
-    inner = cast(nn.Module, cast(Any, model.encoder.backbones[0]).model)
-    return (FlexDecodeSession(inner, batch_size=batch_size), model.encoder.hidden_dim)
+    inner = cast(nn.Module, cast(Any, model.backbone).model)
+    return (FlexDecodeSession(inner, batch_size=batch_size), model.backbone.hidden_dim)
 
 
 def _decode(session, counts: list[int], hidden: int) -> torch.Tensor:
@@ -918,13 +918,13 @@ def test_cuda_paged_pool_grows_in_place() -> None:
     torch.manual_seed(11)
     device = torch.device('cuda')
     model = _tiny_model('qwen3', dtype=torch.bfloat16).to(device)
-    inner = cast(nn.Module, cast(Any, model.encoder.backbones[0]).model)
+    inner = cast(nn.Module, cast(Any, model.backbone).model)
     session = FlexDecodeSession(inner, batch_size=2)
     assert session._k_store.uses_vmm
     ptr_k = session.k_cache.data_ptr()
     ptr_v = session.v_cache.data_ptr()
     page = session.page
-    hidden = model.encoder.hidden_dim
+    hidden = model.backbone.hidden_dim
     with torch.no_grad():
         _decode(session, [page - 1, 1], hidden)
         _decode(session, [2, 0], hidden)

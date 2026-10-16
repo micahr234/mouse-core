@@ -47,7 +47,7 @@ class FourierFeatures(nn.Module):
         )
         self.num_frequencies = checked
         self.register_buffer("bands", bands, persistent=False)
-        self.proj = nn.Linear(2 * checked, hidden_dim, bias=False)
+        self.proj = nn.Linear(2 * checked, hidden_dim, bias=False, dtype=torch.float32)
         nn.init.zeros_(self.proj.weight)
 
     def forward(self, values: torch.Tensor) -> torch.Tensor:
@@ -58,7 +58,7 @@ class FourierFeatures(nn.Module):
             )
         weight = self.proj.weight
         scaled = values.to(dtype=weight.dtype)
-        bands = cast(torch.Tensor, self.bands).to(device=scaled.device, dtype=scaled.dtype)
+        bands = cast(torch.Tensor, self.bands).to(dtype=scaled.dtype)
         angles = scaled.unsqueeze(-1) * bands
         features = torch.cat((angles.sin(), angles.cos()), dim=-1)
         return self.proj(features)

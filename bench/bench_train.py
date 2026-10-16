@@ -183,13 +183,13 @@ def main() -> None:
                 def fwd(kernel: TrainKernel = kernel) -> torch.Tensor:
                     with torch.no_grad():
                         return packed_forward(
-                            model=backbone.model, embeds=embeds, group_ids=seq,
+                            model=backbone.model, embeds=embeds, sequence_ids=seq,
                             train_kernel=kernel,
                         )
 
                 def fwd_bwd(kernel: TrainKernel = kernel) -> None:
                     out = packed_forward(
-                        model=backbone.model, embeds=embeds, group_ids=seq,
+                        model=backbone.model, embeds=embeds, sequence_ids=seq,
                         checkpoint=backbone.gradient_checkpointing, train_kernel=kernel,
                     )
                     out.float().square().mean().backward()
@@ -199,7 +199,7 @@ def main() -> None:
 
                 def train_step(kernel: TrainKernel = kernel) -> None:
                     out = packed_forward(
-                        model=backbone.model, embeds=embeds, group_ids=seq,
+                        model=backbone.model, embeds=embeds, sequence_ids=seq,
                         checkpoint=backbone.gradient_checkpointing, train_kernel=kernel,
                     )
                     out.float().square().mean().backward()

@@ -178,42 +178,23 @@ def _policy_entropy(pi: torch.Tensor) -> torch.Tensor:
     return -(pi * log_pi).sum(dim=-1)
 
 
-def _soft_state_value(q: torch.Tensor, *, temperature: float) -> torch.Tensor:
-    """State value of ``q`` ``[..., A]``: hard max, or SAC / soft-Q ``α logsumexp``.
-
-    ``temperature == 0`` is ``max_a Q``. Otherwise
-    ``V = α log Σ_a exp(Q_a / α)``, equal to ``E_π[Q] + α H[π]`` for
-    ``π = softmax(Q / α)``. Same ``α`` as
-    :meth:`~mouse_core.models.base.Model.get_action`.
-    """
-    alpha = float(temperature)
-    if alpha == 0.0:
-        return q.amax(dim=-1)
-    return alpha * torch.logsumexp(q / alpha, dim=-1)
-
-
-def _double_state_value(
-    *,
-    q_online: torch.Tensor,
-    q_target: torch.Tensor,
-    temperature: float,
+def _backup_state_value(
+    *, q_actions: torch.Tensor, q_backup: torch.Tensor, temperature: float,
 ) -> torch.Tensor:
-    """Double DQN state value: choose with online Q, evaluate with delayed Q.
+    """Choose from action-head scores and evaluate with backup values.
 
-    ``temperature == 0`` is ``Q_target(s, argmax_a Q_online)``. Ties take
-    the lowest index, the same rule as ``get_action(temperature=0)``.
-    ``temperature > 0`` is ``E_π[Q_target] + α H[π]`` for
-    ``π = softmax(Q_online / α)``. Online Q is detached, so the bootstrap
-    stays a constant.
+    Zero temperature uses the lowest-index argmax. Positive temperature uses
+    ``E_pi[Q_backup] + alpha H(pi)`` with ``pi = softmax(Q_actions / alpha)``.
+    Both backup inputs are detached from the training graph.
     """
-    online = q_online.detach()
+    actions, values = q_actions.detach(), q_backup.detach()
     alpha = float(temperature)
     if alpha == 0.0:
-        chosen = online.argmax(dim=-1, keepdim=True)
-        return q_target.gather(dim=-1, index=chosen).squeeze(-1)
-    log_pi = F.log_softmax(online / alpha, dim=-1)
+        chosen = actions.argmax(dim=-1, keepdim=True)
+        return values.gather(dim=-1, index=chosen).squeeze(-1)
+    log_pi = F.log_softmax(actions / alpha, dim=-1)
     pi = log_pi.exp()
-    return (pi * q_target).sum(dim=-1) + alpha * _policy_entropy(pi)
+    return (pi * values).sum(dim=-1) + alpha * _policy_entropy(pi)
 
 
 def _boltzmann_entropy(q: torch.Tensor, *, temperature: float) -> torch.Tensor:
@@ -531,12 +512,11 @@ class DqnObjective(Objective[...]):
     Instantiate with hyperparameters, then call with
     ``objective_data=``, ``group_id=`` (int64 ``[N]``, one id per step,
     returned beside ``objective_data``), the online Q tensor as ``predictions=``, the
-    delayed Q tensor as ``delayed_predictions=``. Both Q tensors come
-    from the matching head on
-    :class:`~mouse_core.models.base.Model`
-    (``model.copy()``) run on
-    the same ``TokenBatch``. The delayed tensor is detached before
-    the Bellman target, so the TD error does not backprop through it.
+    backup value Q tensor as ``backup_value_predictions=``, and action-selection
+    Q scores as ``backup_action_predictions=``. All three tensors have shape ``[P, A]``
+    on the same device. The two backup inputs are required and detached.
+    A delayed model can supply independent value and action heads, each
+    Polyak-averaged from the same online value head with its own rate.
 
     Q rows are **per head-output token** (``[P, A]``), not per step: a step may
     own several head-output tokens (tokenizer input field flagged
@@ -610,27 +590,15 @@ class DqnObjective(Objective[...]):
     truncated γ of
     ``0``, or a horizon that puts no
     weight on that value, does not depend on it, so the step stays. A
-    gate cut on a later in-run step still bootstraps. ``V`` is delayed max-Q when
-    ``temperature=0``. A
-    positive ``temperature`` (SAC / soft Q-learning ``α``) replaces that
-    with the soft value ``α log Σ_a exp(Q / α)``, equal to
-    ``E_π[Q] + α H[π]`` for the Boltzmann policy
-    ``π = softmax(Q / α)`` over the same (affine) delayed Q the TD error
-    uses. ``α → 0`` recovers hard max. Pair a non-zero ``α`` with
-    ``get_action(temperature=)`` so rollout samples that same policy.
-    ``double=False`` reads that ``V`` from delayed Q alone.
-    ``double=True`` is Double DQN (van Hasselt, Guez, and Silver, 2016):
-    the action comes from online Q and the value from delayed Q, both
-    after ``value``. ``temperature=0`` is
-    ``Q_delayed(s, argmax_a Q_online)`` (lowest index on ties, same as
-    ``get_action``). ``temperature > 0`` is
-    ``E_π[Q_delayed] + α H[π]`` for ``π = softmax(Q_online / α)``.
-    The online scores that choose the action are detached, so the TD
-    error does not train them.
-    The loss is the weighted mean of ``δ²`` on those rows, with
-    ``δ = G - Q(s, a)`` and ``G`` the backup above. One-step,
-    ``temperature=0``, and ``double=False`` make ``δ`` the residual
-    ``r + γ max_a Q_delayed(s', a) - Q(s, a)``.
+    gate cut on a later in-run step still bootstraps. At zero temperature,
+    ``V = Q_backup(s, argmax_a Q_actions(s, a))``; ties choose the lowest
+    action index. At positive temperature ``alpha``, the action scores define
+    ``pi = softmax(Q_actions / alpha)`` and
+    ``V = E_pi[Q_backup] + alpha H(pi)``. ``value`` transforms all three Q
+    tensors before target construction. The online predictions never select
+    backup actions unless the caller explicitly passes those scores.
+    The loss is the weighted mean of ``delta**2``, where
+    ``delta = G - Q(s, a)``. Both backup inputs remain outside the gradient path.
     The returned loss is a dict. ``action_value`` is the TD loss and
     trains Q.
     The trace never crosses a run break. At a ``terminated`` or
@@ -695,7 +663,7 @@ class DqnObjective(Objective[...]):
             / truncated scale and shift extras
             (``None`` skips the call);
             any ``value(value=..., **objective_data)`` returning the same
-            shape is accepted. Same callable on both networks. Does not
+            shape is accepted. Same callable on all Q inputs. Does not
             change the prediction tensors or eval ``argmax``.
         action_key: Key in ``objective_data`` that holds the integer action.
         terminated_key: Key in ``objective_data`` for mouse-gym ``terminated``.
@@ -724,15 +692,10 @@ class DqnObjective(Objective[...]):
             ``[N, N]`` is accepted. Row ``t``, column ``s`` is the continuation at
             absolute step ``s`` for the return that started at ``t``.
             See :class:`~mouse_core.objectives.transforms.Gate`.
-        temperature: SAC / soft Q-learning ``α`` (``>= 0``). Required.
-            ``0`` is hard max-Q. ``> 0`` bootstraps from
-            ``α logsumexp(Q / α)`` on delayed Q (after ``value``) and
-            logs ``metrics["entropy"]``. Same units and meaning as
-            ``get_action(temperature=)``.
-        double: Required. ``False`` bootstraps from delayed Q alone.
-            ``True`` is Double DQN: online Q chooses the action and
-            delayed Q evaluates it. ``temperature`` selects hard argmax
-            or the online Boltzmann policy, as above.
+        temperature: SAC / soft Q-learning ``alpha`` (>= 0). Required.
+            Zero selects the greedy action from ``backup_action_predictions``. Positive
+            values use that head's Boltzmann policy and entropy bonus, evaluated
+            with ``backup_value_predictions``. Same units as rollout temperature.
         cross_group_backups: Required. ``"bootstrap"``, ``"ignore"``, or
             ``"fault"``. For any horizon, the last step of a task is not
             updated when its target depends on the next step's value. It
@@ -757,7 +720,6 @@ class DqnObjective(Objective[...]):
         reward: Reward | None,
         value: Value | None,
         temperature: float,
-        double: bool,
         cross_group_backups: CrossGroupBackups,
         action_key: str = "action",
         terminated_key: str = "terminated",
@@ -767,7 +729,6 @@ class DqnObjective(Objective[...]):
         cql_scale_q_eps: float = 1.0,
     ) -> None:
         self.temperature = _require_temperature(temperature)
-        self.double = bool(double)
         self.cross_group_backups: CrossGroupBackups = _require_cross_group_backups(
             cross_group_backups
         )
@@ -788,7 +749,8 @@ class DqnObjective(Objective[...]):
         objective_data: dict[str, torch.Tensor],
         group_id: torch.Tensor,
         predictions: torch.Tensor,
-        delayed_predictions: torch.Tensor,
+        backup_value_predictions: torch.Tensor,
+        backup_action_predictions: torch.Tensor,
     ) -> tuple[dict[str, torch.Tensor], dict[str, float | torch.Tensor]]: ...
 
     @overload
@@ -798,7 +760,8 @@ class DqnObjective(Objective[...]):
         objective_data: dict[str, torch.Tensor],
         group_id: torch.Tensor,
         predictions: torch.Tensor,
-        delayed_predictions: torch.Tensor,
+        backup_value_predictions: torch.Tensor,
+        backup_action_predictions: torch.Tensor,
         value_predictions: None = None,
         targets: None = None,
     ) -> tuple[dict[str, torch.Tensor], dict[str, float | torch.Tensor]]: ...
@@ -809,7 +772,8 @@ class DqnObjective(Objective[...]):
         objective_data: dict[str, torch.Tensor],
         group_id: torch.Tensor,
         predictions: torch.Tensor,
-        delayed_predictions: torch.Tensor | None = None,
+        backup_value_predictions: torch.Tensor | None = None,
+        backup_action_predictions: torch.Tensor | None = None,
         value_predictions: torch.Tensor | None = None,
         targets: torch.Tensor | None = None,
     ) -> tuple[dict[str, torch.Tensor], dict[str, float | torch.Tensor]]:
@@ -820,23 +784,25 @@ class DqnObjective(Objective[...]):
         )
         q: torch.Tensor = predictions
         q_target: torch.Tensor = _require_prediction(
-            delayed_predictions, owner="DqnObjective", name="delayed_predictions"
+            backup_value_predictions, owner="DqnObjective", name="backup_value_predictions"
+        ).detach()
+        q_actions = _require_prediction(
+            backup_action_predictions, owner="DqnObjective", name="backup_action_predictions"
         ).detach()
 
         if q.ndim != 2:
             raise ValueError(
                 f"DQN expects action_value shape [P, A], got {tuple(q.shape)}."
             )
-        if q.dtype != torch.float32 or q_target.dtype != torch.float32:
-            raise TypeError(
-                "DQN expects float32 action_value (heads always run in fp32), got "
-                f"online {q.dtype} and delayed {q_target.dtype}."
-            )
-        if q_target.shape != q.shape:
-            raise ValueError(
-                f"DQN delayed action_value shape {tuple(q_target.shape)} must "
-                f"match online shape {tuple(q.shape)}."
-            )
+        if q.dtype != torch.float32:
+            raise TypeError(f"DQN expects float32 predictions, got {q.dtype}.")
+        for name, tensor in (("backup_value_predictions", q_target), ("backup_action_predictions", q_actions)):
+            if tensor.dtype != torch.float32:
+                raise TypeError(f"DQN expects float32 {name}, got {tensor.dtype}.")
+            if tensor.shape != q.shape:
+                raise ValueError(f"DQN {name} shape {tuple(tensor.shape)} must match predictions shape {tuple(q.shape)}.")
+            if tensor.device != q.device:
+                raise ValueError(f"DQN {name} must share the predictions device.")
         P, A = q.shape
         device = q.device
         value_dtype = q.dtype
@@ -894,6 +860,11 @@ class DqnObjective(Objective[...]):
             N=N,
         )
 
+        q_actions = _apply_value(
+            transform=self.value, name="value", value=q_actions,
+            objective_data=objective_data, step_of=step_of, N=N,
+        )
+
         pair_weight = _pair_weight(
             group_id=group_id,
             N=N,
@@ -920,15 +891,10 @@ class DqnObjective(Objective[...]):
         )
 
         q_values = q.gather(dim=-1, index=next_actions.unsqueeze(-1)).squeeze(-1)  # [P]
-        q_next = q_target[last_rows]
-        if self.double:
-            v_step = _double_state_value(
-                q_online=q[last_rows],
-                q_target=q_next,
-                temperature=self.temperature,
-            )
-        else:
-            v_step = _soft_state_value(q_next, temperature=self.temperature)
+        v_step = _backup_state_value(
+            q_actions=q_actions[last_rows], q_backup=q_target[last_rows],
+            temperature=self.temperature,
+        )
         continuation = _read_gate(
             gate=self.gate,
             objective_data=objective_data,

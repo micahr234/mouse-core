@@ -10,11 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Subclassable PyTorch `Model`: define architecture in `forward()` with ordinary
   modules, branches, residual paths, and `nn.Sequential`. Action selection
-  lives in the implementation's `get_action()`, with an optional discrete helper. `TokenEncoder` handles
-  token processing; each implementation defines its own modules and readout. No graph schema, executor, or diagram generator is needed.
+  lives in the implementation's `get_action()`, with an optional discrete helper. Each implementation calls its embedding, backbone, projection, and readout modules directly. No graph schema, executor, or diagram generator is needed.
 - One public `MLP` class replaces separate projection, regression, and classification heads;
   scalar regression uses `out_features=1`. Training notebooks expose
-  `USE_PROJECTION`, `LR_PROJECTION`, and `POLYAK_TAU_PROJECTION`.
+  `LR_PROJECTION` and `POLYAK_TAU_PROJECTION`.
 - `DiscretizedActionHead` produces one Q-value per row of a fixed continuous
   action table. `discrete_to_continuous` decodes IDs; `continuous_to_discrete`
   quantizes by Euclidean distance (ties choose the lowest ID). The table is a
@@ -26,7 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inference mode. Exiting the scope releases its cache. Model parameters
   and activations remain separate.
 - Tokenizer ``type="token"`` tokenizes a literal ``format`` to one
-  ``__text__`` token. Zero or several tokens raise. It has no
+  token ID. Zero or several tokens raise. It has no
   ``input_field`` and rejects ``max_tokens``. Example readouts use
   ``format="\n"`` and ``head_output: True``.
 - Tokenizer ``type="numeric"`` tokenizes ``format=`` as literal text
@@ -34,7 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tokens raise. The word field is text; ``{field}`` is rejected.
   ``fourier_min`` and ``fourier_max`` map
   the number from that window onto ``[-1, 1]`` with no clipping.
-  Pass ``num_frequencies`` when building the backbone and it adds a
+  Pass ``num_frequencies`` when building the embedding and it adds a
   Fourier projection of that scaled value onto those token
   embeddings. The projection starts at 0, so a pretrained token
   embedding is unchanged until it trains. Omit ``num_frequencies``
@@ -52,6 +51,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   observations as that vector.
 
 ### Changed
+- Cached decode packs directly into its final padded layout, removing an extra
+  allocation and copy. Simplify token-count bookkeeping and latent-reasoner
+  outputs; update examples and documentation for the explicit agent API.
+- Each DQN `DelayedAgent` reuses its corresponding `Agent.forward` with its own
+  modules and explicit backup heads. The n-step example now copies the embedding
+  and backbone and runs a full delayed forward, with independent interpolation
+  rates for both modules (default `0.1`).
+- Training notebooks give the embedding its own `LR_EMBEDDING`. DQN examples
+  use `POLYAK_TAU_EMBEDDING` and pass `embedding_tau` independently of the
+  backbone rate. Existing copied modules retain their previous default rates.
+- Replace modality IDs, name tables, and maps with an explicit boolean
+  `numeric_mask`, emitted by the tokenizer and preserved through packing.
+  Token inputs are now `token_ids`, `numeric_values`, `numeric_mask`,
+  `sequence_ids`, `head_token_ids`, and `head_step_ids`. Embedding accepts
+  token IDs alone, or paired numeric values/mask for Fourier features.
+  Remove unused per-modality positions and `ModalityInfo`. Cached outputs use
+  `head_valid_mask`; token-level attention and packing accept `sequence_ids`.
+- Custom agents return plain dictionaries for predictions, backbone states, token
+  indices, and optional decode state. `ModelOutput` is removed; callers use key
+  access and explicit token indexing.
+- Agents immediately unpack prepared inputs into named tensors.
+  Embedding and cached-decode helpers accept those named inputs directly.
+- Embeddings are constructed independently with `Embedding(pretrained=...)` or
+  `Embedding(vocab_size=..., hidden_dim=...)`. Token tables and numeric Fourier
+  features belong to that module; backbones own only sequence-processing weights.
+- `DelayedAgent.polyak(online=..., ...)` explicitly updates each named module with
+  `polyak_update(target=..., source=..., tau=...)`, a small parameter-loop helper.
+  The generic `model_polyak` API and its module mapping machinery are removed;
+  no updater or parameter pairs are stored. Examples construct the delayed agent
+  immediately after the online agent.
+- Custom agents move token tensors to the model device before embedding. The
+  embedding consumes prepared tensors without moving them, and cached decode
+  and reasoning reuse the prepared input metadata.
+- DQN requires `backup_value_predictions` and `backup_action_predictions` Q-score
+  tensors, with detached backup inputs; the `double` switch is removed.
+  Examples define a separate `DelayedAgent` whose `polyak()` method updates
+  value and action heads from the same online value head at independent rates.
+- Each example agent declares and calls named heads explicitly. The three-horizon
+  example uses short, medium, and long heads. Head tokens are selected with
+  explicit indexing or `gather` at the tokenizer-provided indices.
+- Model forwards explicitly call separate embedding and backbone modules with plain
+  tensors. Packed sequence IDs, masks, decode caches, and latent insertion are explicit;
+  the architecture-owning token encoder is removed. Independent embedding
+  construction loads or initializes its own token table.
+- Examples always use the projection stack, with unconditional projection
+  learning-rate and delayed-model update settings.
 - Separate model execution from checkpoint and Hub helpers in `models.io`,
   share SwiGLU building blocks, and remove unused helpers and `HeadSpec`.
   Examples use consistent setup sections, constant names, and grouped model,
@@ -90,9 +135,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Example group prefixes say to predict the value of all actions at the
   end of each line, and put the step pattern on the next line.
 - FrozenLake and CartPole training notebooks set ``POLYAK_TAU_BACKBONE = 0.1``,
-  ``POLYAK_TAU_PROJECTION = 0.01``, and ``POLYAK_TAU_HEADS = 0.001``.
-  The n-step example shares the backbone and copies the projection and heads,
-  so it only sets the latter two rates.
+  ``POLYAK_TAU_PROJECTION = 0.01``, and ``POLYAK_TAU_VALUE = 0.001``.
+  The n-step example uses the same embedding/backbone defaults and copies
+  both modules, the projection, and the value and action heads.
 - Text ``format=`` is an f-string. The step value is the name ``field``,
   so ``{field+1}`` and ``{field:.3f}`` both render. A const ``format=``
   has no step value: the word field is text, and ``{field}`` is
@@ -117,7 +162,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is true or at group start. Training discounts use
   ``gamma_terminated=0.0`` and ``gamma_truncated=0.0``, so the return
   stops at the task and continues across inner episodes. DQN notebooks
-  pass ``double=True`` and ``cross_group_backups="fault"``. The PPO
+  pass both backup prediction tensors and ``cross_group_backups="fault"``. The PPO
   notebook passes ``cross_group_backups="fault"``. A task-ending γ of
   ``0`` does not read past the group, so ``"fault"`` does not raise on
   a complete task. The ``examples`` extra installs ``repeat-task-gym``.
@@ -174,7 +219,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``examples/16_train_offline_reward_centering_dqn.ipynb`` is gone.
 - Tokenizer ``type="token"`` no longer reads an integer ``input_field``
   and emits that integer as a vocab id. ``token`` is a literal
-  ``format`` that must be one ``__text__`` token.
+  ``format`` that must be one token ID.
 - Tokenizer input fields no longer take ``output_field``. A const is
   ``format=`` with no name. An image modality is named by its
   ``input_field``. Two fields that read the same ``input_field``
@@ -391,8 +436,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   online one when listed, else the first head. ``Polyak`` interpolates
   only copied sections. ``Polyak.update`` requires a ``tau`` only for
   sections the delayed model copied; omit a shared section (or pass
-  ``None`` or ``1``). The n-step example shares the backbone and
-  delays only the Q heads.
+  ``None`` or ``1``).
 - Objectives no longer take a head instance or a prediction-key
   string. The caller indexes ``ModelOutput.predictions`` with
   ``prediction_key(head=)`` and passes that tensor as
