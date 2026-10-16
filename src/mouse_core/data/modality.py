@@ -468,19 +468,23 @@ def copy_keep_fields(
     """Copy ``input_field`` → ``output_field`` objective columns from a step.
 
     Used by :class:`~mouse_core.data.tokenizer.Tokenizer`. Every listed input
-    must be present (and not ``None``) on the step: there is no silent default,
+    must be present on the step: there is no silent default,
     since a missing objective column (``old_log_prob``, ``advantage``, …) would
     otherwise train on zeros. Vectors (any length, including 1) stay vectors;
-    scalars become ``float`` / ``int``.
+    scalars become ``float`` / ``int``. Only the ``action`` output may be
+    ``None``, meaning no action ran. Packing derives its validity mask.
     """
     out: dict[str, Any] = {}
     for in_name, out_name in pairs:
         value = row.get(in_name)
-        if value is None:
+        if in_name not in row or (value is None and out_name != "action"):
             raise KeyError(
                 f"objective_fields input {in_name!r} is missing from step "
                 f"(have {sorted(row)}); stamp it on the row before tokenizing"
             )
+        if value is None:
+            out[out_name] = None
+            continue
         if isinstance(value, torch.Tensor):
             value = value.detach().cpu().numpy()
         if isinstance(value, (list, tuple)):

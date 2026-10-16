@@ -165,7 +165,8 @@ class PpoObjective(Objective[...]):
     Discounts match ``DqnObjective``:
     ``discount(**objective_data)``.
 
-    Optional bool ``action_executed`` marks incoming actions that actually ran.
+    Packing nullable ``action`` fields derives the batch mask ``action_executed``
+    marking incoming actions that actually ran; raw rows do not need that field.
     False entries have no policy loss, entropy, or probability statistics; their
     integer placeholders and behavior log-probabilities are ignored. Value/GAE
     learning still follows these action-independent transitions and their rewards.

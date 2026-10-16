@@ -4,7 +4,12 @@ import torch
 
 
 def executed_actions(columns: dict[str, torch.Tensor], action: torch.Tensor) -> torch.Tensor:
-    """A reset frame has no incoming action; its integer slot is a placeholder."""
+    """Read the batch mask derived by packing nullable incoming actions.
+
+    Raw rows store ``action=None`` on resets. Their packed integer slot is
+    only a placeholder. Direct tensor callers may omit the mask when all
+    actions ran.
+    """
     executed = columns.get("action_executed")
     if executed is None:
         return torch.ones_like(action, dtype=torch.bool)

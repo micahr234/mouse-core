@@ -102,10 +102,12 @@ class GrpoObjective(Objective[...]):
     reads must stay in-run: out-of-run pairs are multiplied by ``0``
     (all-zero weights → loss ``0``).
 
-    Optional ``objective_data["action_executed"]`` is a bool ``[N]`` column.
+    Packing nullable ``action`` fields derives the ``[N]`` batch mask
+    ``objective_data["action_executed"]``; raw rows do not need that field.
     A false entry marks an action-independent reset transition. Its numeric
     action is only a placeholder; the transition contributes no policy loss,
-    entropy, or KL statistics. Omit the column when every action is executed.
+    entropy, or KL statistics. Direct tensor callers may omit the mask when
+    every action is executed.
 
     Args:
         clip_eps: PPO-style ratio clip ε.

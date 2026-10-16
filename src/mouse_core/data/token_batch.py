@@ -291,7 +291,10 @@ def _stack_objective_fields(steps: Sequence[StepTokens]) -> dict[str, np.ndarray
     for actions that do not exist, which objectives exclude. Ragged integer
     columns raise: there is no integer sentinel, so the caller must pad them
     explicitly or store the field as float. ``group_id`` is not a column:
-    packing returns that tensor beside this dict.
+    packing returns that tensor beside this dict. A scalar ``action`` may be
+    ``None`` for an automatic transition. Only here is it replaced with zero
+    and paired with the derived ``action_executed`` mask; source steps retain
+    their nullable actions.
     """
     n = len(steps)
     keys: set[str] = set()
@@ -303,17 +306,28 @@ def _stack_objective_fields(steps: Sequence[StepTokens]) -> dict[str, np.ndarray
             "it beside objective_data."
         )
     keys.discard("head_output_count")
+    if "action_executed" in keys:
+        raise ValueError(
+            "action_executed is derived during packing; store action=None "
+            "for an automatic transition instead."
+        )
 
     out: dict[str, np.ndarray] = {}
     for key in sorted(keys):
         raw = [st.objective_fields.get(key) for st in steps]
-        missing = [i for i, v in enumerate(raw) if v is None]
+        missing = [
+            i
+            for i, st in enumerate(steps)
+            if key not in st.objective_fields or (raw[i] is None and key != "action")
+        ]
         if missing:
             raise KeyError(
                 f"objective field {key!r} is missing on steps {missing}; "
                 "every step must provide every stacked key"
             )
         arrays = [_as_field_array(v) for v in raw]
+        if key == "action":
+            out["action_executed"] = np.asarray([v is not None for v in raw])
         present = arrays
         # Column dtype is decided by *every* step, not the first one: a single
         # float anywhere makes the column float32, so int-typed steps can
@@ -397,6 +411,10 @@ def pack_token_batch(
     Ragged float vector columns in ``objective_data`` are right-padded with
     ``-inf``, the sentinel objectives exclude as "action does not exist".
     Ragged integer columns raise — there is no integer sentinel.
+
+    Nullable scalar ``action`` fields become numeric tensors with a derived
+    ``action_executed`` mask. This mask belongs only to the batch; it is not
+    an input column or a stored field on :class:`StepTokens`.
 
     When a step carries ``group_start_*`` tokens (from input fields whose
     ``when`` callable is true with ``group_start=True`` and false with

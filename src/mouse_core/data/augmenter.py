@@ -326,6 +326,11 @@ class Augmenter:
                         f"Augmenter field {in_f!r} is missing from the step"
                     )
                 value = row[in_f]
+                if value is None and spec.type == "discrete":
+                    # No action ran. Still permute the associated value vector
+                    # below so reset-state targets use the task's action order.
+                    row[out_f] = None
+                    continue
                 value = self._apply_permutation(spec, draw, value)
                 value = self._apply_scale_shift(spec, draw, value)
                 row[out_f] = self._mask_or_value(spec, value, mask_this_step)

@@ -610,9 +610,10 @@ class DqnObjective(Objective[...]):
     ``delta = G - Q(s, a)``. Both backup inputs remain outside the gradient path.
     The returned loss is a dict. ``action_value`` is the TD loss and
     trains Q.
-    Optional bool ``objective_data["action_executed"]`` marks real incoming
-    actions. False marks an automatic transition (such as an inner reset): its
-    arbitrary integer placeholder is never validated, fitted, or used to cut a
+    Packing nullable ``action`` fields derives the batch mask
+    ``objective_data["action_executed"]`` to mark real incoming actions. False
+    marks an automatic transition (such as an inner reset): its arbitrary
+    integer placeholder is never validated, fitted, or used to cut a
     value-gap trace. No action is selected from the preceding state's Q scores.
     Backups pass through that automatic transition using its reward and supplied
     discount, within the same group only. Its outgoing Q row has zero loss weight.
