@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
+from mouse_core.sampling import check_temperature_range
 
 
 def select_discrete_action(
@@ -15,8 +16,11 @@ def select_discrete_action(
     step. ``valid`` marks real cached readouts so padding is never selected.
     The agent chooses which prediction supplies these scores.
     """
+    check_temperature_range(temperature, temperature)
     scores = _last_action_scores(scores, name="action", valid=valid)
     if num_actions is not None:
+        if type(num_actions) is not int or not 1 <= num_actions <= scores.shape[-1]:
+            raise ValueError("num_actions must select at least one available action")
         scores = scores[:, :num_actions]
     if temperature == 0.0:
         return scores.argmax(dim=-1)

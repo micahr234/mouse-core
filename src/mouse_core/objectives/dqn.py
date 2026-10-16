@@ -7,6 +7,8 @@ from typing import Literal, cast, overload
 import torch
 import torch.nn.functional as F
 
+from mouse_core.objectives._actions import canonical_actions, executed_actions
+
 from mouse_core.objectives.base import Objective, _reject_predictions, _require_prediction
 from mouse_core.objectives.transforms import (
     Discount,
@@ -608,6 +610,14 @@ class DqnObjective(Objective[...]):
     ``delta = G - Q(s, a)``. Both backup inputs remain outside the gradient path.
     The returned loss is a dict. ``action_value`` is the TD loss and
     trains Q.
+    Optional bool ``objective_data["action_executed"]`` marks real incoming
+    actions. False marks an automatic transition (such as an inner reset): its
+    arbitrary integer placeholder is never validated, fitted, or used to cut a
+    value-gap trace. No action is selected from the preceding state's Q scores.
+    Backups pass through that automatic transition using its reward and supplied
+    discount, within the same group only. Its outgoing Q row has zero loss weight.
+    Reset observations remain available as states for the next real decision.
+    Built-in n-step gates count executed decisions unless given an explicit clock.
     The trace never crosses a run break. At a ``terminated`` or
     ``truncated`` step ``γ`` is ``discount`` from those flags and
     multiplies both the bootstrap and the continued return, so a ``0``
@@ -822,7 +832,10 @@ class DqnObjective(Objective[...]):
                 f"DQN objective expects action shape [N], got {tuple(action.shape)}."
             )
         N = int(action.shape[0])
+        executed = executed_actions(objective_data, action)
+        action = canonical_actions(objective_data, action)
         _require_action_ids(action, A)
+        objective_data = {**objective_data, self.action_key: action}
 
         if N < 2:
             raise ValueError("Not enough valid q values in data.")
@@ -897,6 +910,13 @@ class DqnObjective(Objective[...]):
             identity=torch.ones(N, dtype=value_dtype, device=device),
         )
 
+        # No action is chosen from the state immediately before an automatic
+        # reset. Keep the observation in the history, but never fit or maximize
+        # its Q row. A backup passes through the automatic transition instead.
+        automatic = torch.cat([~executed[1:] & (pair_weight > 0), executed.new_zeros(1)])
+        q = q.masked_fill(automatic[step_of, None], 0)
+        q_target = q_target.masked_fill(automatic[step_of, None], 0)
+        q_actions = q_actions.masked_fill(automatic[step_of, None], 0)
         q_values = q.gather(dim=-1, index=next_actions.unsqueeze(-1)).squeeze(-1)  # [P]
         v_step = _backup_state_value(
             q_actions=q_actions[last_rows], q_backup=q_target[last_rows],
@@ -911,14 +931,20 @@ class DqnObjective(Objective[...]):
             dtype=value_dtype,
             device=device,
         )
+        continuation = torch.where(
+            automatic[None, :], torch.ones_like(continuation), continuation,
+        )
         pair_target, participate = _continuation_targets(
             reward=reward,
             discount_all=discount_all,
             v_step=v_step,  # [N]  V(s_i)
             pair_weight=pair_weight,
             continuation=continuation,
-            cross_group_backups=self.cross_group_backups,
+            cross_group_backups="ignore" if self.cross_group_backups == "fault" else self.cross_group_backups,
         )
+        pair_weight = pair_weight * executed[1:].to(dtype=pair_weight.dtype)
+        if self.cross_group_backups == "fault":
+            _raise_if_cross_group_backup(in_run=pair_weight > 0, participate=participate)
         # A non-zero factor on an off-data value drops the step from the loss
         # and from every logged metric. A zero factor leaves that value out
         # of the target, so the step keeps its in-run weight.
@@ -927,14 +953,16 @@ class DqnObjective(Objective[...]):
         td_target = _pair_values_to_rows(pair_target, step_of)  # [P]
 
         # δ = G - Q(s, a). action_value trains Q.
-        delta = td_target - q_values
+        active = row_weight > 0
+        delta = torch.where(active, td_target, 0) - torch.where(active, q_values, 0)
         td_sq = delta ** 2
 
         per_row = td_sq
         cql_penalty_mean: torch.Tensor | None = None
         if self.cql_weight > 0.0:
-            q_scale = (td_target.abs() + self.cql_scale_q_eps).detach()
-            cql_penalty = torch.logsumexp(q, dim=-1) - q_values
+            q_scale = (torch.where(active, td_target, 0).abs() + self.cql_scale_q_eps).detach()
+            cql_q = q.masked_fill(~active[:, None], 0)
+            cql_penalty = torch.logsumexp(cql_q, dim=-1) - torch.where(active, q_values, 0)
             per_row = per_row + self.cql_weight * q_scale * cql_penalty
             cql_penalty_mean = _weighted_mean(cql_penalty.detach(), row_weight)
 
@@ -955,8 +983,8 @@ class DqnObjective(Objective[...]):
             named["cql_penalty"] = cql_penalty_mean
         if self.temperature > 0.0:
             named["entropy"] = _weighted_mean(
-                _boltzmann_entropy(q.detach(), temperature=self.temperature),
-                row_weight,
+                _boltzmann_entropy(q.detach()[active], temperature=self.temperature),
+                row_weight[active],
             )
 
         # Keep scalar stats as 0-dim tensors so the train step does not

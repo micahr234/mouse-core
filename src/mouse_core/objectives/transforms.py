@@ -8,6 +8,8 @@ from typing import Protocol, cast, overload
 
 import torch
 
+from mouse_core.objectives._actions import canonical_actions, executed_actions
+
 
 class Discount(Protocol):
     """Per-step Bellman discount from unpacked ``objective_data`` columns.
@@ -404,7 +406,8 @@ def nstep_gate(*, n: int, step_key: str | None = None) -> Gate:
         t = torch.arange(N, device=q.device).unsqueeze(1)
         s = torch.arange(N, device=q.device).unsqueeze(0)
         if step_key is None:
-            distance = s - t
+            clock = executed_actions(columns, action).to(torch.int64).cumsum(0)
+            distance = clock.unsqueeze(0) - clock.unsqueeze(1)
         else:
             advanced = _step_flags(columns, key=step_key, reference=action)
             clock = advanced.to(torch.int64).cumsum(0)
@@ -521,12 +524,15 @@ def value_gap_gate(
         q: torch.Tensor,
         action: torch.Tensor,
         q_delayed: torch.Tensor,
-        **_: torch.Tensor,
+        **columns: torch.Tensor,
     ) -> torch.Tensor:
         N = _require_gate_batch(q=q, action=action)
         policy = (q_delayed if policy_delayed else q)[:-1]
         values = (q_delayed if value_delayed else q)[:-1]
-        taken = action[1:].unsqueeze(-1)
+        executed = executed_actions(columns, action)[1:]
+        taken = canonical_actions(columns, action)[1:].unsqueeze(-1)
+        policy = policy.masked_fill(~executed[:, None], 0)
+        values = values.masked_fill(~executed[:, None], 0)
         chosen = policy.argmax(dim=-1, keepdim=True)
         q_star = values.gather(dim=-1, index=chosen).squeeze(-1)
         q_taken = values.gather(dim=-1, index=taken).squeeze(-1)
@@ -539,6 +545,7 @@ def value_gap_gate(
             cont = (gap == 0).to(dtype=gap.dtype)
         else:
             cont = torch.exp2(gap / scale)
+        cont = torch.where(executed, cont, 1.0)
         cont[0] = 0
         column = torch.cat([cont, cont.new_zeros(1)])
         t = torch.arange(N, device=values.device).unsqueeze(1)

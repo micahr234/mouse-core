@@ -7,6 +7,8 @@ from typing import cast, overload
 import torch
 import torch.nn.functional as F
 
+from mouse_core.objectives._actions import canonical_actions, executed_actions
+
 from mouse_core.objectives.base import Objective, _reject_predictions
 from mouse_core.objectives.dqn import (
     _pair_weight,
@@ -209,7 +211,10 @@ class GrpoObjective(Objective[...]):
                 f"GRPO objective expects action shape [{N}], "
                 f"got {tuple(action.shape)}."
             )
+        executed = executed_actions(objective_data, action)
+        action = canonical_actions(objective_data, action)
         _require_action_ids(action, A)
+        objective_data = {**objective_data, self.action_key: action}
 
         if self.advantage_key not in objective_data.keys():
             raise KeyError(
@@ -231,17 +236,14 @@ class GrpoObjective(Objective[...]):
             device=device,
             dtype=dtype,
         )
-        # A reset can advance a task without executing a policy action. Its
-        # numeric action placeholder is not a policy sample and contributes
-        # neither a surrogate loss nor entropy/KL statistics.
-        if "action_executed" in objective_data:
-            executed = objective_data["action_executed"]
-            if executed.shape != torch.Size([N]) or executed.dtype != torch.bool:
-                raise ValueError("GRPO action_executed must be bool [N].")
-            pair_weight = pair_weight * executed[1:].to(dtype=dtype)
-
-        next_actions = action[1:]
-        curr_logits = logits[:-1, :]
+        pair_weight = pair_weight * executed[1:].to(dtype=dtype)
+        active = pair_weight > 0
+        # Slice before softmax/exp: even NaN logits or stale log-probabilities
+        # on a reset row cannot contaminate losses or gradients through 0 * NaN.
+        pair_weight = pair_weight[active]
+        advantage = advantage[active]
+        next_actions = action[1:][active]
+        curr_logits = logits[:-1, :][active]
 
         log_probs_all = F.log_softmax(curr_logits, dim=-1)
         new_log_prob = log_probs_all.gather(
@@ -255,7 +257,7 @@ class GrpoObjective(Objective[...]):
                     f"GRPO expects {self.old_log_prob_key!r} shape [{N}], "
                     f"got {tuple(old_log_prob_full.shape)}."
                 )
-            old_log_prob = old_log_prob_full[1:].to(dtype=dtype)
+            old_log_prob = old_log_prob_full[1:][active].to(dtype=dtype)
         else:
             old_log_prob = new_log_prob.detach()
 

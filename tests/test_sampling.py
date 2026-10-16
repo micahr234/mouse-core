@@ -92,3 +92,24 @@ def test_grpo_likelihood_ratio_matches_collected_task_policy(temperature):
         assert scores.grad.count_nonzero() == 0
     else:
         assert scores.grad.count_nonzero() > 0
+
+
+@pytest.mark.parametrize('temperature', [-1., float('nan'), float('inf')])
+def test_decode_selector_rejects_invalid_temperature(temperature):
+    from mouse_core.models import select_discrete_action
+    with pytest.raises(ValueError, match='temperature'):
+        select_discrete_action(scores=torch.ones(1,2), temperature=temperature)
+
+
+@pytest.mark.parametrize('count', [0, -1, 3, True])
+def test_decode_selector_rejects_invalid_action_count(count):
+    from mouse_core.models import select_discrete_action
+    with pytest.raises(ValueError, match='num_actions'):
+        select_discrete_action(scores=torch.ones(1,2), temperature=0., num_actions=count)
+
+
+def test_last_readout_rejects_misaligned_mask():
+    with pytest.raises(ValueError, match='valid must'):
+        last_action_scores(torch.zeros(2,3,4),torch.ones(2,2,dtype=torch.bool),4)
+    with pytest.raises(ValueError, match='valid must'):
+        last_action_scores(torch.zeros(2,3,4),torch.ones(2,3),4)

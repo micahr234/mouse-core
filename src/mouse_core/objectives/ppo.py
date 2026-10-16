@@ -7,6 +7,8 @@ from typing import cast, overload
 import torch
 import torch.nn.functional as F
 
+from mouse_core.objectives._actions import canonical_actions, executed_actions
+
 from mouse_core.objectives.base import Objective, _reject_predictions, _require_prediction
 from mouse_core.objectives.dqn import (
     CrossGroupBackups,
@@ -162,6 +164,11 @@ class PpoObjective(Objective[...]):
     ``boundary_value`` applies terminated / truncated scale and shift extras.
     Discounts match ``DqnObjective``:
     ``discount(**objective_data)``.
+
+    Optional bool ``action_executed`` marks incoming actions that actually ran.
+    False entries have no policy loss, entropy, or probability statistics; their
+    integer placeholders and behavior log-probabilities are ignored. Value/GAE
+    learning still follows these action-independent transitions and their rewards.
 
     ``truncated`` and ``old_log_prob`` are objective columns only — not
     tokenizer input. Stamp behavior log-probs on rollout rows
@@ -366,7 +373,10 @@ class PpoObjective(Objective[...]):
             raise ValueError(
                 f"PPO objective expects action shape [{N}], got {tuple(action.shape)}."
             )
+        executed = executed_actions(objective_data, action)
+        action = canonical_actions(objective_data, action)
         _require_action_ids(action, A)
+        objective_data = {**objective_data, self.action_key: action}
 
         reward = _apply_transform(
             transform=self.reward,
@@ -428,6 +438,11 @@ class PpoObjective(Objective[...]):
         pair_weight = pair_weight * participate
         valid = pair_weight > 0
 
+        policy_weight = pair_weight * executed[1:].to(dtype=dtype)
+        policy_valid = policy_weight > 0
+        curr_logits = curr_logits[policy_valid]
+        next_actions = next_actions[policy_valid]
+        policy_weight = policy_weight[policy_valid]
         log_probs_all = F.log_softmax(curr_logits, dim=-1)
         new_log_prob = log_probs_all.gather(
             dim=-1, index=next_actions.unsqueeze(-1)
@@ -440,13 +455,13 @@ class PpoObjective(Objective[...]):
                     f"PPO expects {self.old_log_prob_key!r} shape [{N}], "
                     f"got {tuple(old_log_prob_full.shape)}."
                 )
-            old_log_prob = old_log_prob_full[1:].to(dtype=dtype)
+            old_log_prob = old_log_prob_full[1:][policy_valid].to(dtype=dtype)
         else:
             old_log_prob = new_log_prob.detach()
 
-        adv = advantages
+        adv = advantages[policy_valid]
         if self.normalize_advantage:
-            adv_valid = adv[valid]
+            adv_valid = adv
             if adv_valid.numel() > 1:
                 adv = (adv - adv_valid.mean()) / (adv_valid.std(correction=0) + 1e-8)
             elif adv_valid.numel() == 1:
@@ -455,21 +470,21 @@ class PpoObjective(Objective[...]):
         ratio = (new_log_prob - old_log_prob).exp()
         surr1 = ratio * adv
         surr2 = ratio.clamp(1.0 - self.clip_eps, 1.0 + self.clip_eps) * adv
-        policy_loss = _weighted_mean(-torch.min(surr1, surr2), pair_weight)
+        policy_loss = _weighted_mean(-torch.min(surr1, surr2), policy_weight)
 
         value_loss = _weighted_mean((curr_values - returns.detach()) ** 2, pair_weight)
 
         entropy = _weighted_mean(
-            -(log_probs_all.exp() * log_probs_all).sum(dim=-1), pair_weight
+            -(log_probs_all.exp() * log_probs_all).sum(dim=-1), policy_weight
         )
 
         loss = policy_loss + self.vf_coef * value_loss - self.ent_coef * entropy
 
         with torch.no_grad():
             clipfrac = _weighted_mean(
-                ((ratio - 1.0).abs() > self.clip_eps).to(dtype=dtype), pair_weight
+                ((ratio - 1.0).abs() > self.clip_eps).to(dtype=dtype), policy_weight
             )
-            approx_kl = _weighted_mean(old_log_prob - new_log_prob, pair_weight)
+            approx_kl = _weighted_mean(old_log_prob - new_log_prob, policy_weight)
             ret_v = returns[valid]
             val_v = curr_values[valid]
             if ret_v.numel() > 0:
@@ -489,7 +504,7 @@ class PpoObjective(Objective[...]):
             "approx_kl": approx_kl,
             "clipfrac": clipfrac,
             "explained_variance": explained_var,
-            "advantage_mean": _weighted_mean(advantages, pair_weight),
+            "advantage_mean": _weighted_mean(advantages[policy_valid], policy_weight),
             "value_mean": _weighted_mean(curr_values, pair_weight),
         }
         metrics: dict[str, float | torch.Tensor] = dict(

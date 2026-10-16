@@ -38,6 +38,9 @@ class TaskTemperature:
 
 def last_action_scores(scores: torch.Tensor, valid: torch.Tensor | None, num_actions: int) -> torch.Tensor:
     """Last valid readout for each decode stream, restricted to legal actions."""
+    if valid is not None and scores.ndim == 3:
+        if valid.dtype != torch.bool or valid.shape != scores.shape[:2]:
+            raise ValueError("valid must be bool [batch, steps] matching scores")
     if scores.ndim == 3:
         if valid is None:
             scores = scores[:, -1]
