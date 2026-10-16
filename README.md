@@ -224,6 +224,7 @@ The [example notebooks](examples/) are short usage docs, not full experiments. W
 | [17 — Collect CartPole](examples/17_collect_cartpole.ipynb) | Random `CartPole-v1` rollouts into one `Datastore` per stream. `observation` is the length-4 float vector (cart position, cart velocity, pole angle, pole angular velocity). |
 | [18 — Train offline CartPole DQN](examples/18_train_offline_cartpole_dqn.ipynb) | Same offline DQN loop as `02` on the `17` dataset. Each observation element is a `numeric` field (`x`, `v`, `t`, `w`) with a Fourier add. A `token` comma sits between the action and those characters. |
 | [19 — Train online Pendulum DQN](examples/19_train_online_pendulum_dqn.ipynb) | Continuous actions in, discrete actions out: `DiscretizedActionHead` owns 33 fixed torque vectors for `Pendulum-v1`, both conversion methods, and checkpoint persistence. Applied torque enters history through numeric Fourier embeddings; category IDs go only to the DQN objective. A small CPU example with replay and a delayed model. |
+| [20 — Sequential action DQN](examples/20_train_sequential_actions_dqn.ipynb) | Joint control of multiple Pendulum instances with one shared categorical head and one decision token per torque. Compare next-component, fixed n-action, and environment-boundary backups; internal choices have discount 1. |
 | [15 — Inference](examples/15_inference.ipynb) | Evaluation: construct the example agent explicitly, then `load_model(model=agent, ...)` on the model repo and `load_tokenizer` on a separate tokenizer repo, then batched FlexAttention cached inference (`max_cache` / `start_cache`) |
 
 ### Example dependencies
@@ -263,3 +264,26 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 ## License 🔑
 
 GNU General Public License v3.0 — see [LICENSE](LICENSE).
+
+### Sequential components within one environment step
+
+Record each component choice as a decision row with its own head-output token.
+The next row holds the selected action ID and physical value, so subsequent
+choices condition on the earlier choices through causal history. Set reward to
+zero and done flags to false on internal rows. Mark the row reached by an actual
+environment transition with an objective bool column such as `environment_step`.
+
+Use `boundary_discount(..., step_key="environment_step")` to apply `gamma_step`
+only when the environment advances. Terminal/truncation factors still apply.
+With `DqnObjective(gate=None, ...)`, each decision bootstraps from the next
+component. `nstep_gate(n=K)` skips K decisions (the same component in the next
+step for fixed K-component actions). `nstep_gate(n=1, step_key="environment_step")`
+instead reaches the next environment boundary from every component, including
+variable-length assemblies. Increasing n in this latter form counts environment
+transitions. Rewards, actions, and markers all describe the transition **into**
+their row. Existing group-boundary behavior is unchanged.
+
+These are sampled n-step returns: intermediate actions are taken from replay,
+not maximized over. Off-policy suffix choices can therefore affect earlier
+component targets. Do not represent different components as repeated readouts
+of a single decision row: those readouts share one selected action ID.

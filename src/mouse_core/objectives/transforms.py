@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Sequence
-from typing import Protocol, cast
+from typing import Protocol, cast, overload
 
 import torch
 
@@ -201,18 +201,51 @@ def boundary_value(
     return value
 
 
+def _step_flags(
+    columns: dict[str, torch.Tensor], *, key: str, reference: torch.Tensor,
+) -> torch.Tensor:
+    if key not in columns:
+        raise ValueError(f"Missing environment-step column {key!r}.")
+    flags = _as_flag(columns[key], name=key)
+    if flags.ndim != 1 or flags.shape != reference.shape:
+        raise ValueError(f"{key} must have shape {tuple(reference.shape)}.")
+    if flags.device != reference.device:
+        raise ValueError(f"{key} must be on the same device as the objective data.")
+    return flags
+
+
+@overload
+def boundary_discount(
+    *, gamma_step: float, gamma_terminated: float, gamma_truncated: float,
+) -> Discount: ...
+
+
+@overload
+def boundary_discount(
+    *, gamma_step: float, gamma_terminated: float, gamma_truncated: float,
+    step_key: str | None,
+) -> Discount: ...
+
+
 def boundary_discount(
     *,
     gamma_step: float,
     gamma_terminated: float,
     gamma_truncated: float,
+    step_key: str | None = None,
 ) -> Discount:
     """Flag lookup: ``gamma_step`` × terminated extra × truncated extra.
 
     ``terminated`` and ``truncated`` are the mouse-gym step flags (bool, or
-    ``0`` / ``1``). Every transition is multiplied by ``gamma_step``. A flag
+    ``0`` / ``1``). By default each transition multiplies ``gamma_step``. A flag
     that is false contributes ``1``. When both flags are true the extras
     multiply; a factor of ``0.0`` zeros the whole bootstrap.
+
+    With ``step_key``, that objective column marks transitions that advance
+    the environment. Internal action-component transitions use multiplier 1;
+    only marked rows apply ``gamma_step``. Terminal extras still apply.
+    Like rewards and actions, the marker describes the transition INTO its
+    row. Internal rows must have zero reward and false boundary flags.
 
     The flags mean whatever the wrapped env uses them for. A
     ``RepeatTaskEnv`` reports the task on these flags and keeps episode ends
@@ -220,24 +253,29 @@ def boundary_discount(
     and leaves episode boundaries inside the run.
 
     Args:
-        gamma_step: Always multiplied. A running transition
+        gamma_step: Multiplied on each counted transition. A running transition
             (both flags false) uses only this factor.
         gamma_terminated: Extra factor when ``terminated`` is true.
         gamma_truncated: Extra factor when ``truncated`` is true.
             ``0.0`` zeros the bootstrap.
+        step_key: Optional bool or binary objective column marking environment
+            advancement. Omit to discount every decision row.
     """
 
     def discount(
         *,
         terminated: torch.Tensor,
         truncated: torch.Tensor,
-        **_: torch.Tensor,
+        **columns: torch.Tensor,
     ) -> torch.Tensor:
         term = _as_flag(terminated, name="terminated")
         trunc = _as_flag(truncated, name="truncated")
         gamma = torch.full(
             term.shape, gamma_step, dtype=torch.float32, device=term.device
         )
+        if step_key is not None:
+            advanced = _step_flags(columns, key=step_key, reference=term)
+            gamma = torch.where(advanced, gamma, torch.ones_like(gamma))
         gamma = torch.where(term, gamma * gamma_terminated, gamma)
         gamma = torch.where(trunc, gamma * gamma_truncated, gamma)
         return gamma
@@ -330,7 +368,7 @@ def lambda_gate(*, td_lambda: float) -> Gate:
     return gate
 
 
-def nstep_gate(*, n: int) -> Gate:
+def nstep_gate(*, n: int, step_key: str | None = None) -> Gate:
     """n-step return. The continuation is ``1`` out to lag ``n``.
 
     Returns ``[N, N]``. ``out[t, s]`` is ``1`` when ``t < s < t + n``
@@ -339,8 +377,18 @@ def nstep_gate(*, n: int) -> Gate:
     the batch keeps every later step. Fewer than 2 steps, or an
     ``action`` whose length is not ``N``, raises.
 
+    With ``step_key``, count marked environment transitions instead of rows.
+    The bool/binary marker describes the transition INTO each row. Thus
+    ``n=1`` reaches the next environment boundary from every action component,
+    even when the number of components varies. Without a marker, ``n=K``
+    reaches the same component of the next step for fixed K-component actions.
+    The objective still stops continuations at sample/group boundaries.
+    Traversed actions come from replay: this is a sampled n-step return,
+    not an exact maximization over unobserved action completions.
+
     Args:
         n: Horizon, an ``int >= 1``.
+        step_key: Optional objective column marking environment advancement.
     """
     if isinstance(n, bool) or not isinstance(n, int) or n < 1:
         raise ValueError(f"n must be an int >= 1, got {n!r}.")
@@ -350,12 +398,18 @@ def nstep_gate(*, n: int) -> Gate:
         *,
         q: torch.Tensor,
         action: torch.Tensor,
-        **_: torch.Tensor,
+        **columns: torch.Tensor,
     ) -> torch.Tensor:
         N = _require_gate_batch(q=q, action=action)
         t = torch.arange(N, device=q.device).unsqueeze(1)
         s = torch.arange(N, device=q.device).unsqueeze(0)
-        return ((s > t) & (s < t + horizon)).to(dtype=q.dtype)
+        if step_key is None:
+            distance = s - t
+        else:
+            advanced = _step_flags(columns, key=step_key, reference=action)
+            clock = advanced.to(torch.int64).cumsum(0)
+            distance = clock.unsqueeze(0) - clock.unsqueeze(1)
+        return ((s > t) & (distance < horizon)).to(dtype=q.dtype)
 
     return gate
 

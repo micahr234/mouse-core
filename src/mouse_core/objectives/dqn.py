@@ -527,6 +527,13 @@ class DqnObjective(Objective[...]):
     bootstrap reads the *last* head-output row of step ``i+1`` (the most
     informed one).
 
+    Sequential components of one environment action must use separate decision
+    rows, each with its own incoming action ID. Internal rows carry zero reward
+    and discount 1. ``boundary_discount(step_key=...)`` discounts only physical
+    transitions; ``nstep_gate(step_key=...)`` counts those transitions. Ordinary
+    one-step targets still bootstrap from the next component. Repeated output
+    tokens within one row are readouts of the SAME decision, not components.
+
     A **run** is one ``group_id`` (one dataloader sample). Neighbor
     reads (action / reward / done / next Q at ``i+1``) must stay in-run: an
     out-of-run pair still has a loss term, but it is multiplied by ``0`` so
