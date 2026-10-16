@@ -534,7 +534,7 @@ class DqnObjective(Objective[...]):
     delayed Q tensor as ``delayed_predictions=``. Both Q tensors come
     from the matching head on
     :class:`~mouse_core.models.base.Model`
-    (``model.copy(heads=True, backbone=True, reasoner=False)``) run on
+    (``model.copy()``) run on
     the same ``TokenBatch``. The delayed tensor is detached before
     the Bellman target, so the TD error does not backprop through it.
 

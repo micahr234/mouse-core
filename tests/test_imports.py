@@ -1,3 +1,4 @@
+from mouse_core.models import Model
 from mouse_core.data import (
     Augmenter,
     DataLoader,
@@ -12,7 +13,7 @@ from mouse_core.data import (
     empty_token_batch,
     to_device,
 )
-from mouse_core.models import Model, IdentityBackbone
+from mouse_core.models import IdentityBackbone
 
 
 def test_public_data_exports() -> None:
@@ -46,3 +47,15 @@ def test_condition_helpers_not_exported() -> None:
         "after_field_ne",
     ):
         assert not hasattr(data, name)
+
+
+def test_model_requires_an_implementation() -> None:
+    import pytest
+    import mouse_core.models as models
+
+    with pytest.raises(TypeError, match="abstract"):
+        Model()  # type: ignore[abstract]
+    assert not hasattr(models, "PredictionModel")
+    assert not hasattr(Model, "diagram")
+
+    assert not hasattr(Model, "get_action")

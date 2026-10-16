@@ -1,15 +1,17 @@
 """Explicit head-output tokens: flagging, packing, objectives, multi-token readout."""
 
 from __future__ import annotations
+from tests._model_helpers import ExampleModel as Model
+from tests._model_helpers import copy_model, simple_model
 
 import numpy as np
 import pytest
 import torch
 
-from mouse_core.data import Tokenizer, pack_token_batch
-from mouse_core.models import LatentReasoner, Model, ModelOutput
-from mouse_core.models.backbone import TransformerBackbone
-from mouse_core.models.heads import RegressionHead
+from mouse_core.data import Tokenizer
+from mouse_core.models import LatentReasoner, ModelOutput
+from mouse_core.models.backbone import Backbone
+from mouse_core.models.mlp import MLP
 from mouse_core.models.reasoner import _plan_insertions
 from mouse_core.objectives import DqnObjective, affine_reward, affine_value, boundary_discount
 
@@ -111,25 +113,11 @@ def _head_output_tokenizer(
 _TOK = _head_output_tokenizer("action", "observation", "episode_done")
 
 
-def _tiny_model(*, with_reasoner: bool = False) -> Model:
-    backbone = TransformerBackbone(architecture="llama",
-        train_kernel="reference", decode_kernel="flex", dtype=torch.float32,
-        hidden_dim=_HIDDEN,
-        num_layers=2,
-        num_heads=2,
-        max_position_embeddings=128,
-        vocab_size=32)
-    heads = RegressionHead(
-        in_features=_HIDDEN,
-        out_features=_ACTIONS,
-        hidden_dim=_HIDDEN,
-        num_layers=1,
-        propagate_gradient=1.0,
-    )
-    reasoner = (
-        LatentReasoner(hidden_dim=_HIDDEN, num_thoughts=2) if with_reasoner else None
-    )
-    return Model(backbone=backbone, heads=heads, action_source="action_value", reasoner=reasoner)
+def _tiny_model(*, with_reasoner: bool=False) -> Model:
+    backbone = Backbone(architecture='llama', train_kernel='reference', decode_kernel='flex', dtype=torch.float32, hidden_dim=_HIDDEN, num_layers=2, num_heads=2, max_position_embeddings=128, vocab_size=32)
+    heads = MLP(in_features=_HIDDEN, out_features=_ACTIONS, hidden_dim=_HIDDEN, num_layers=1, propagate_gradient=1.0)
+    reasoner = LatentReasoner(hidden_dim=_HIDDEN, num_thoughts=2) if with_reasoner else None
+    return simple_model(backbone=backbone, heads={'action_value': heads}, reasoner=reasoner)
 
 
 def _rows(n: int, offset: int = 0) -> list[dict]:
@@ -317,39 +305,24 @@ def test_get_action_uses_last_valid_head_output_not_last_token() -> None:
     """
     torch.manual_seed(0)
     hidden = _HIDDEN
-    backbone = TransformerBackbone(architecture="llama",
-        train_kernel="reference", decode_kernel="flex", dtype=torch.float32,
-        hidden_dim=hidden, num_layers=2, num_heads=2, max_position_embeddings=128, vocab_size=32)
-    model = Model(
-        backbone=backbone,
-        heads=(head := RegressionHead(
-            in_features=hidden, out_features=_ACTIONS, hidden_dim=hidden, num_layers=1,
-            propagate_gradient=1.0,
-        )),
-        action_source="action_value",
-        reasoner=None,
-    ).eval()
-    tok = _head_output_tokenizer("action", "observation", tail="tail")
-    rows = [
-        [{**step, "tail": (i + 3) % 8} for i, step in enumerate(_rows(3))],
-        [{**step, "tail": (i + 5) % 8} for i, step in enumerate(_rows(1, offset=2))],
-    ]
+    backbone = Backbone(architecture='llama', train_kernel='reference', decode_kernel='flex', dtype=torch.float32, hidden_dim=hidden, num_layers=2, num_heads=2, max_position_embeddings=128, vocab_size=32)
+    model = simple_model(backbone=backbone, heads=({'action_value': (head := MLP(in_features=hidden, out_features=_ACTIONS, hidden_dim=hidden, num_layers=1, propagate_gradient=1.0))}), reasoner=None).eval()
+    tok = _head_output_tokenizer('action', 'observation', tail='tail')
+    rows = [[{**step, 'tail': (i + 3) % 8} for i, step in enumerate(_rows(3))], [{**step, 'tail': (i + 5) % 8} for i, step in enumerate(_rows(1, offset=2))]]
     batch, _, _sid = batch_to_packed(tok, rows)
     with torch.no_grad():
         out = model(batch, use_cache=True)
         action = model.get_action(out=out, temperature=0.0)
-
     assert out.head_output_valid is not None
     assert out.head_output_valid.tolist() == [[True, True, True], [False, False, True]]
     last_head = out.head_output_indices[torch.arange(2), 2]
     assert (last_head != out.last_hidden_state.shape[1] - 1).all()
-
     with torch.no_grad():
         h_head = out.last_hidden_state[torch.arange(2), last_head]
-        q_head = model.head(h=h_head)["action_value"]
+        q_head = model.head(h=h_head)['action_value']
         h_tok = out.last_hidden_state[:, -1]
-        q_tok = model.head(h=h_tok)["action_value"]
-    assert not torch.allclose(q_head, q_tok, atol=1e-5)
+        q_tok = model.head(h=h_tok)['action_value']
+    assert not torch.allclose(q_head, q_tok, atol=1e-05)
     assert action.tolist() == q_head.argmax(dim=-1).tolist()
 
 
@@ -492,11 +465,9 @@ def test_reasoning_forward_and_delayed_parity_multi_head_output() -> None:
     torch.manual_seed(0)
     model = _tiny_model(with_reasoner=True).eval()
     batch, _, _sid = _packed(model)
-    delayed = model.copy(heads=True, backbone=True, reasoner=False).eval()
+    delayed = copy_model(model, heads=True, backbone=True, reasoner=False).eval()
     with torch.no_grad():
         out = model(batch, reasoning=[1, 0])
         delayed_out = delayed(batch, reasoning=[1, 0])
-    assert out.predictions["action_value"].shape == (batch.P, _ACTIONS)
-    assert torch.allclose(
-        out.predictions["action_value"], delayed_out.predictions["action_value"], atol=1e-4
-    )
+    assert out.predictions['action_value'].shape == (batch.P, _ACTIONS)
+    assert torch.allclose(out.predictions['action_value'], delayed_out.predictions['action_value'], atol=0.0001)

@@ -1,12 +1,12 @@
-"""Backbone interface for MOUSE models.
+"""BaseBackbone interface for MOUSE models.
 
 A backbone is a sequence processor that takes token embeddings and returns
 hidden states of the same shape. Transformer backbones train through the
 packed stream forward (:func:`~mouse_core.models.backbone.packed_train.packed_forward`
-over ``self.model``); :meth:`Backbone.forward` is the rectangular ``[B, T, D]``
+over ``self.model``); :meth:`BaseBackbone.forward` is the rectangular ``[B, T, D]``
 forward used by non-transformer backbones; incremental decoding goes through a
 :class:`~mouse_core.models.backbone.flex_decode.FlexDecodeSession` created by
-:meth:`Backbone.decode_session`.
+:meth:`BaseBackbone.decode_session`.
 
 Two ways to train a backbone, both with every trainable parameter in fp32:
 
@@ -52,14 +52,14 @@ def _disable_cudnn_sdp() -> None:
         enable_cudnn_sdp(enabled=False)
 
 
-class Backbone(nn.Module, ABC):
+class BaseBackbone(nn.Module, ABC):
     """Abstract base for backbones.
 
     A backbone consumes a token embedding sequence ``[B, T, D]`` and returns
     processed hidden states of shape ``[B, T, D]``.
 
     Implementations may be:
-    - a full transformer (:class:`~mouse_core.models.backbone.transformer.TransformerBackbone`)
+    - a full transformer (:class:`~mouse_core.models.backbone.transformer.Backbone`)
     - a state-space model
     - an identity (no-op) for ablations
     - any custom sequence processor
@@ -135,16 +135,16 @@ class Backbone(nn.Module, ABC):
         _reject_dtype_cast(type(self).__name__, *args, **kwargs)
         return super().to(*args, **kwargs)
 
-    def half(self) -> "Backbone":
+    def half(self) -> "BaseBackbone":
         raise TypeError(f"{type(self).__name__}.half() is not supported; pass dtype= when building it.")
 
-    def bfloat16(self) -> "Backbone":
+    def bfloat16(self) -> "BaseBackbone":
         raise TypeError(f"{type(self).__name__}.bfloat16() is not supported; pass dtype= when building it.")
 
-    def double(self) -> "Backbone":
+    def double(self) -> "BaseBackbone":
         raise TypeError(f"{type(self).__name__}.double() is not supported; pass dtype= when building it.")
 
-    def float(self) -> "Backbone":
+    def float(self) -> "BaseBackbone":
         raise TypeError(f"{type(self).__name__}.float() is not supported; pass dtype= when building it.")
 
     def _attach_lora(self, model: nn.Module, lora: LoRAConfig | None) -> None:
@@ -205,7 +205,7 @@ class Backbone(nn.Module, ABC):
         """Embed a :class:`~mouse_core.data.token_batch.TokenBatch`.
 
         Returns ``(embeds [L, D], head_output_indices [P])``.
-        ``TransformerBackbone`` and ``IdentityBackbone`` look up
+        ``Backbone`` and ``IdentityBackbone`` look up
         ``embed_tokens``.
         """
         ...
@@ -235,7 +235,7 @@ def _reject_dtype_cast(what: str, *args: Any, **kwargs: Any) -> None:
     if dtype is not None:
         raise TypeError(
             f"{what}.to() does not cast dtypes. The backbone dtype is fixed when it is built "
-            f"(e.g. TransformerBackbone(dtype=preferred_dtype(device=device), ...)); use .to(device) to move."
+            f"(e.g. Backbone(dtype=preferred_dtype(device=device), ...)); use .to(device) to move."
         )
 
 
@@ -273,8 +273,8 @@ def _load_transformer_weights(
 ) -> None:
     """Load matching transformer weights into a MOUSE backbone internals.
 
-    Loads ``embed_tokens`` and the transformer's native final norm along
-    with its decoder layers.
+    Loads ``embed_tokens`` and decoder weights before the backbone removes
+    the pretrained output norm.
 
     Warns in both directions: backbone tensors that did not receive pretrained
     weights (missing from the checkpoint or shape-mismatched, so they keep

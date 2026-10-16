@@ -8,12 +8,12 @@ import torch
 from torch import nn
 
 from mouse_core.data.token_batch import TokenBatch
-from mouse_core.models.backbone.base import Backbone
+from mouse_core.models.backbone.base import BaseBackbone
 from mouse_core.models.backbone.embed import embed_token_ids
 from mouse_core.models.backbone.fourier import FourierFeatures, check_num_frequencies
 
 
-class IdentityBackbone(Backbone):
+class IdentityBackbone(BaseBackbone):
     """A no-op backbone: returns embeddings unchanged and never produces a cache.
 
     Owns a vocab table (``hidden_dim=`` × ``vocab_size=``) used by

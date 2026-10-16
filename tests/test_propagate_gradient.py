@@ -7,12 +7,13 @@ import copy
 import pytest
 import torch
 
-from mouse_core.models.base import _run_heads
-from mouse_core.models.heads import ClassificationHead, RegressionHead
+from mouse_core.models.backbone import IdentityBackbone
+from tests._model_helpers import simple_model
+from mouse_core.models.mlp import MLP
 
 
-def _filled_head(*, propagate_gradient: float) -> RegressionHead:
-    head = RegressionHead(
+def _filled_head(*, propagate_gradient: float) -> MLP:
+    head = MLP(
         in_features=8,
         out_features=4,
         hidden_dim=8,
@@ -62,7 +63,7 @@ def test_propagate_gradient_scales_backbone_grad() -> None:
 @pytest.mark.parametrize("bad", [None, True, -0.1, 1.1, float("nan"), float("inf")])
 def test_propagate_gradient_rejects_bad_values(bad: object) -> None:
     with pytest.raises(ValueError, match="propagate_gradient"):
-        RegressionHead(
+        MLP(
             in_features=8,
             out_features=4,
             hidden_dim=8,
@@ -96,8 +97,9 @@ def test_run_heads_fires_per_head_backward_hooks() -> None:
     full.register_full_backward_hook(hook("full"))
     half.register_full_backward_hook(hook("half"))
     hidden = torch.randn(3, 8, requires_grad=True)
-    preds = _run_heads({"full": full, "half": half}, hidden)
-    (preds["full"].sum() + preds["half"].sum()).backward()
+    model = simple_model(backbone=IdentityBackbone(hidden_dim=8, vocab_size=1), heads={"full": full, "half_head": half}, reasoner=None)
+    preds = model.head(h=hidden)
+    (preds["full"].sum() + preds["half_head"].sum()).backward()
     full_grad = seen["full"]
     half_grad = seen["half"]
     assert full_grad is not None and half_grad is not None
@@ -105,7 +107,7 @@ def test_run_heads_fires_per_head_backward_hooks() -> None:
 
 
 def test_classification_head_accepts_propagate_gradient() -> None:
-    head = ClassificationHead(
+    head = MLP(
         in_features=8,
         out_features=4,
         hidden_dim=8,

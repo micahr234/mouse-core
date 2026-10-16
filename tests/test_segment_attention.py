@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 """Tests for sequence-isolated attention masks and RoPE position ids."""
+from tests._model_helpers import simple_model
 
 import torch
 
 from mouse_core.models.backbone import IdentityBackbone
-from mouse_core.models.base import Model, _flat_sequence_causal_mask, _flat_sequence_position_ids
-from mouse_core.models.heads import RegressionHead
+from mouse_core.models.encoding import _flat_sequence_causal_mask, _flat_sequence_position_ids
+from mouse_core.models.mlp import MLP
 from tests._token_batch_helpers import batch_to_packed, token_tokenizer
 
 
@@ -53,22 +54,14 @@ def test_flat_sequence_causal_mask_allows_earlier_tokens_in_the_same_sequence() 
 
 def test_model_forward_injects_group_id_and_runs_flat() -> None:
     backbone = IdentityBackbone(hidden_dim=8, vocab_size=32)
-    model = Model(
-        backbone=backbone,
-        heads=(head := RegressionHead(
-            in_features=8, out_features=4, hidden_dim=8, num_layers=1,
-            propagate_gradient=1.0,
-        )),
-        action_source="action_value",
-        reasoner=None,
-    )
-    batch = [[{"action": i % 4} for i in range(3)], [{"action": 1}, {"action": 2}]]
-    tb, objective_data, group_id = batch_to_packed(token_tokenizer("action"), batch)
+    model = simple_model(backbone=backbone, heads=({'action_value': (head := MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0))}), reasoner=None)
+    batch = [[{'action': i % 4} for i in range(3)], [{'action': 1}, {'action': 2}]]
+    tb, objective_data, group_id = batch_to_packed(token_tokenizer('action'), batch)
     predictions = model(tb).predictions
-    assert "group_id" not in objective_data.keys()
+    assert 'group_id' not in objective_data.keys()
     assert group_id.tolist() == [0, 0, 0, 1, 1]
-    assert predictions["action_value"].shape == (5, 4)
+    assert predictions['action_value'].shape == (5, 4)
     assert tb.N == 5
     assert list(tb.step_counts()) == [3, 2]
     preds2 = model(tb).predictions
-    assert preds2["action_value"].shape == (5, 4)
+    assert preds2['action_value'].shape == (5, 4)

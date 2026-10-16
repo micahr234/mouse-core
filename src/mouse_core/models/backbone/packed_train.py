@@ -381,20 +381,11 @@ def install_compiled_decoder() -> bool:
     return installed
 
 
-class _FinalNorm(Protocol):
-    """Final RMSNorm: callable, with a readable ``weight``."""
-
-    @property
-    def weight(self) -> torch.Tensor: ...
-
-    def __call__(self, hidden: torch.Tensor) -> torch.Tensor: ...
-
-
 class _DecoderStack(Protocol):
-    """Llama / Qwen3 decoder ``TransformerBackbone.model`` points at.
+    """Llama / Qwen3 decoder ``Backbone.model`` points at.
 
     Read-only properties keep ``norm`` and ``layers`` covariant, so the
-    concrete RMSNorm and ``ModuleList`` match. A generic HuggingFace module
+    concrete output module and ``ModuleList`` match. A generic HuggingFace module
     is stored with a cast.
     """
 
@@ -405,7 +396,7 @@ class _DecoderStack(Protocol):
     def layers(self) -> nn.ModuleList: ...
 
     @property
-    def norm(self) -> _FinalNorm: ...
+    def norm(self) -> nn.Module: ...
 
     def get_input_embeddings(self) -> nn.Module: ...
 
@@ -513,12 +504,12 @@ def packed_forward(
             passes ``Backbone.train_autocast_dtype``. Calling ``packed_forward``
             inside an ambient ``torch.autocast`` region raises.
         output_hidden_states: Also return every layer's output (before the
-            final norm).
+            stack's output module, which is identity for MOUSE backbones).
         checkpoint: Recompute each layer in backward instead of storing its
             activations (``Backbone.gradient_checkpointing``).
 
     Returns:
-        Final normalized hidden states ``[L, D]`` in the original stream
+        Final hidden states ``[L, D]`` in the original stream
         order, plus the per-layer tuple when ``output_hidden_states``.
     """
     if embeds.ndim != 2:

@@ -1,4 +1,4 @@
-"""Qwen3 decoder stack builder used by :class:`TransformerBackbone`."""
+"""Qwen3 decoder stack builder used by :class:`Backbone`."""
 
 from __future__ import annotations
 

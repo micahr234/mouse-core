@@ -119,9 +119,9 @@ class AdamW:
     ``params`` is either a flat list, all stepped at ``lr``, or a list of
     param-group dicts. A group requires ``params`` and may set ``lr`` and
     ``weight_decay``; omitted keys use the constructor values. One group
-    per learning rate — for example separate rates for
-    ``model.backbone.parameters()``, ``model.projection.parameters()``
-    (when present), and ``model.heads.parameters()``.
+    per learning rate. ``model.parameter_groups(lr={module_path: rate, ...})``
+    builds these groups from registered module paths, with an independent rate per
+    trainable module.
     """
 
     def __init__(

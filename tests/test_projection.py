@@ -1,8 +1,9 @@
 """Shared projection readouts, independent training rates, and checkpoints."""
 
 from __future__ import annotations
+from tests._model_helpers import fresh_model, ExampleModel as Model
+from tests._model_helpers import copy_model, node_rates, simple_model, model_polyak
 
-import json
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -10,39 +11,17 @@ import numpy as np
 import pytest
 import torch
 
-from mouse_core import AdamW, model_polyak
-from mouse_core.models import LatentReasoner, Model, ProjectionHead, load_model, save_model
-from mouse_core.models.backbone import IdentityBackbone, TransformerBackbone
-from mouse_core.models.heads import ClassificationHead, DiscretizedActionHead, RegressionHead
+from mouse_core import AdamW
+from mouse_core.models import LatentReasoner, load_model, save_model
+from mouse_core.models.mlp import MLP
+from mouse_core.models.backbone import IdentityBackbone, Backbone
+from mouse_core.models.heads import DiscretizedActionHead
 from tests._token_batch_helpers import batch_to_token_batch, token_tokenizer
 
 
-def _model(*, architecture: Literal["llama", "qwen3"] | None = None, reasoning: bool = False) -> Model:
-    backbone = (
-        IdentityBackbone(hidden_dim=8, vocab_size=32)
-        if architecture is None
-        else TransformerBackbone(
-            architecture=architecture, hidden_dim=8, num_layers=1, num_heads=2,
-            vocab_size=32, train_kernel="reference",
-            decode_kernel="flex", dtype=torch.float32,
-        )
-    )
-    return Model(
-        backbone=backbone,
-        projection=ProjectionHead(in_features=8, hidden_dim=12, num_layers=2),
-        heads={
-            "q": RegressionHead(
-                in_features=8, out_features=4, hidden_dim=8, num_layers=1,
-                propagate_gradient=1.0,
-            ),
-            "policy": ClassificationHead(
-                in_features=8, out_features=4, hidden_dim=8, num_layers=1,
-                propagate_gradient=1.0,
-            ),
-        },
-        action_source="q",
-        reasoner=LatentReasoner(hidden_dim=8, num_thoughts=2) if reasoning else None,
-    )
+def _model(*, architecture: Literal['llama', 'qwen3'] | None=None, reasoning: bool=False) -> Model:
+    backbone = IdentityBackbone(hidden_dim=8, vocab_size=32) if architecture is None else Backbone(architecture=architecture, hidden_dim=8, num_layers=1, num_heads=2, vocab_size=32, train_kernel='reference', decode_kernel='flex', dtype=torch.float32)
+    return simple_model(backbone=backbone, projection=MLP(in_features=8, out_features=8, hidden_dim=12, num_layers=2), heads={'q': MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0), 'policy': MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0)}, reasoner=LatentReasoner(hidden_dim=8, num_thoughts=2) if reasoning else None)
 
 
 def _batch(start: int = 0, stop: int = 3):
@@ -51,31 +30,30 @@ def _batch(start: int = 0, stop: int = 3):
     return batch_to_token_batch(tokenizer, rows)
 
 
-@pytest.mark.parametrize("reasoning", [False, True])
+@pytest.mark.parametrize('reasoning', [False, True])
 def test_projection_runs_once_for_all_heads_and_keeps_backbone_states(reasoning: bool) -> None:
-    model = _model(architecture="qwen3", reasoning=reasoning)
+    model = _model(architecture='qwen3', reasoning=reasoning)
     assert model.projection is not None
     calls: list[torch.Tensor] = []
 
     def record(_module, _args, out) -> None:
         assert isinstance(out, torch.Tensor)
         calls.append(out)
-
     handle = model.projection.register_forward_hook(record)
     try:
         out = model(_batch(), reasoning=np.array([1]) if reasoning else None)
     finally:
         handle.remove()
     assert len(calls) == 1
-    pooled = model.pool(output=out)
+    pooled = out.pool()
     assert pooled.shape == calls[0].shape == (3, 8)
     torch.testing.assert_close(calls[0], model.projection(pooled))
     for name, head in model.heads.items():
         torch.testing.assert_close(out.predictions[name], head(calls[0]))
     torch.stack([pred.square().mean() for pred in out.predictions.values()]).sum().backward()
-    for section in (model.backbone, model.projection, model.heads, model.reasoner):
+    for section in (model.encoder.backbones[0], model.projection, model.heads, model.encoder.reasoner):
         if section is not None:
-            assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in section.parameters())
+            assert any((p.grad is not None and p.grad.abs().sum() > 0 for p in section.parameters()))
 
 
 @pytest.mark.parametrize("architecture", ["llama", "qwen3"])
@@ -96,16 +74,16 @@ def test_projection_cached_decode_matches_packed_forward(architecture: Literal["
 
 def test_delayed_projection_reuses_raw_online_states() -> None:
     model = _model()
-    delayed = model.copy(heads=True, backbone=False, reasoner=False, projection=True)
+    delayed = copy_model(model, heads=True, backbone=False, reasoner=False, projection=True)
     assert delayed.projection is not model.projection
     assert delayed.projection is not None and model.projection is not None
-    assert all(not p.requires_grad for p in delayed.projection.parameters())
-    assert all(p.requires_grad for p in model.projection.parameters())
+    assert all((not p.requires_grad for p in delayed.projection.parameters()))
+    assert all((p.requires_grad for p in model.projection.parameters()))
     with torch.no_grad():
         for p in model.projection.parameters():
             p.add_(0.2)
         online = model(_batch())
-        reused = delayed.head(h=model.pool(output=online))
+        reused = delayed.head(h=online.pool())
         separate = delayed(_batch())
     for name in delayed.heads:
         torch.testing.assert_close(reused[name], separate.predictions[name])
@@ -115,35 +93,28 @@ def test_delayed_projection_reuses_raw_online_states() -> None:
 def test_projection_learning_rate_steps_only_its_parameters() -> None:
     model = _model()
     assert model.projection is not None
-    optimizer = AdamW(
-        params=[
-            {"params": model.backbone.parameters(), "lr": 0.0},
-            {"params": model.projection.parameters(), "lr": 0.02},
-            {"params": model.heads.parameters(), "lr": 0.0},
-        ],
-        lr=0.0, fused=False,
-    )
+    optimizer = AdamW(params=[{'params': model.encoder.backbones[0].parameters(), 'lr': 0.0}, {'params': model.projection.parameters(), 'lr': 0.02}, {'params': model.heads.parameters(), 'lr': 0.0}], lr=0.0, fused=False)
     before = {name: p.detach().clone() for name, p in model.named_parameters()}
     for p in model.parameters():
         p.grad = torch.ones_like(p)
     optimizer.step()
     for name, p in model.named_parameters():
-        expected = before[name] - (0.02 if name.startswith("projection.") else 0.0)
+        expected = before[name] - (0.02 if name.startswith('projection.') else 0.0)
         torch.testing.assert_close(p, expected)
 
 
 def test_projection_polyak_rate_is_independent_and_can_change() -> None:
     model = _model()
-    delayed = model.copy(heads=True, backbone=True, reasoner=False, projection=True)
+    delayed = copy_model(model, heads=True, backbone=True, reasoner=False, projection=True)
     update = model_polyak(online=model, delayed=delayed)
     before = {name: p.detach().clone() for name, p in delayed.named_parameters()}
     with torch.no_grad():
         for p in model.parameters():
             p.add_(2.0)
     for tau in (0.0, 0.25, 1.0):
-        update(tau_heads={"q": 0.0, "policy": 0.0}, tau_backbone=0.0, tau_projection=tau)
+        update(tau=node_rates(delayed, heads={'q': 0.0, 'policy': 0.0}, backbone=0.0, projection=tau))
         for name, p in delayed.named_parameters():
-            if name.startswith("projection."):
+            if name.startswith('projection.'):
                 expected = before[name].lerp(dict(model.named_parameters())[name], tau)
             else:
                 expected = before[name]
@@ -151,47 +122,46 @@ def test_projection_polyak_rate_is_independent_and_can_change() -> None:
             before[name] = p.detach().clone()
 
 
-@pytest.mark.parametrize("tau", [None, -0.1, 1.1, float("nan")])
+@pytest.mark.parametrize('tau', [None, -0.1, 1.1, float('nan')])
 def test_invalid_projection_tau_cannot_partially_update_model(tau: float | None) -> None:
     model = _model()
-    delayed = model.copy(heads=True, backbone=True, reasoner=False, projection=True)
+    delayed = copy_model(model, heads=True, backbone=True, reasoner=False, projection=True)
     update = model_polyak(online=model, delayed=delayed)
     before = {name: p.detach().clone() for name, p in delayed.named_parameters()}
     with torch.no_grad():
         for p in model.parameters():
             p.add_(1.0)
-    with pytest.raises(ValueError, match="tau_projection"):
-        update(tau_heads=1.0, tau_backbone=1.0, tau_projection=tau)
+    with pytest.raises(ValueError, match='projection.*'):
+        update(tau=node_rates(delayed, heads=1.0, backbone=1.0, projection=tau))
     for name, p in delayed.named_parameters():
         assert torch.equal(p, before[name])
 
 
 def test_shared_projection_and_projection_only_copy() -> None:
     model = _model()
-    shared = model.copy(heads=True, backbone=False, reasoner=False, projection=False)
+    shared = copy_model(model, heads=True, backbone=False, reasoner=False, projection=False)
     assert shared.projection is model.projection
     update = model_polyak(online=model, delayed=shared)
-    update(tau_heads=0.1, tau_backbone=None, tau_projection=None)
-    update(tau_heads=0.1, tau_backbone=None, tau_projection=1.0)
-    with pytest.raises(ValueError, match="tau_projection must be None or 1"):
-        update(tau_heads=0.1, tau_backbone=None, tau_projection=0.1)
-    projection_only = model.copy(heads=False, backbone=False, reasoner=False, projection=True)
-    assert projection_only.heads["q"] is model.heads["q"]
-    model_polyak(online=model, delayed=projection_only)(
-        tau_heads=None, tau_backbone=None, tau_projection=0.1,
-    )
+    update(tau=node_rates(shared, heads=0.1, backbone=None, projection=None))
+    update(tau=node_rates(shared, heads=0.1, backbone=None, projection=1.0))
+    with pytest.raises(ValueError, match='projection.* must be None or 1'):
+        update(tau=node_rates(shared, heads=0.1, backbone=None, projection=0.1))
+    projection_only = copy_model(model, heads=False, backbone=False, reasoner=False, projection=True)
+    assert projection_only.heads['q'] is model.heads['q']
+    model_polyak(online=model, delayed=projection_only)(tau=node_rates(projection_only, heads=None, backbone=None, projection=0.1))
 
 
-def test_projection_copy_and_pairing_require_explicit_matching_sections() -> None:
+def test_projection_copy_and_pairing_require_matching_parameters() -> None:
     model = _model()
-    with pytest.raises(ValueError, match="requires projection=True or False"):
-        model.copy(heads=True, backbone=True, reasoner=False)
-    delayed = model.copy(heads=True, backbone=True, reasoner=False, projection=True)
-    delayed.projection = None
-    with pytest.raises(ValueError, match="same projection section"):
+    delayed = model.copy(modules=["projection", "heads"])
+    assert delayed.projection is not model.projection
+    delayed.projection = MLP(in_features=8, out_features=8, hidden_dim=32).requires_grad_(False)
+    with pytest.raises(ValueError, match="shape"):
         model_polyak(online=model, delayed=delayed)
-    with pytest.raises(ValueError, match="projection=True requires a projection"):
-        delayed.copy(heads=True, backbone=True, reasoner=False, projection=True)
+    with pytest.raises(ValueError, match="unknown module path"):
+        model.copy(modules=["missing"])
+
+
 
 
 @pytest.mark.parametrize("scale", [0.0, 0.3, 1.0])
@@ -201,28 +171,24 @@ def test_prediction_gradient_scale_also_controls_projection(scale: float) -> Non
     model(_batch()).predictions["q"].square().sum().backward()
     reference = {name: p.grad.clone() for name, p in model.named_parameters() if p.grad is not None}
     model.zero_grad(set_to_none=True)
-    cast(RegressionHead, model.heads["q"]).propagate_gradient = scale
+    cast(MLP, model.heads["q"]).propagate_gradient = scale
     model(_batch()).predictions["q"].square().sum().backward()
     for name, p in model.named_parameters():
         if name not in reference:
             continue
-        factor = 1.0 if name.startswith("heads.") else scale
+        factor = 1.0 if name.startswith(('heads.action_value.', 'heads.behavior.', 'heads.q.', 'heads.policy.')) else scale
         actual = torch.zeros_like(p) if p.grad is None else p.grad
         torch.testing.assert_close(actual, reference[name] * factor)
 
 
-@pytest.mark.parametrize("num_layers", [2, 3])
+@pytest.mark.parametrize('num_layers', [2, 3])
 def test_projection_checkpoint_roundtrip(tmp_path: Path, num_layers: int) -> None:
     model = _model()
-    model.projection = ProjectionHead(in_features=8, hidden_dim=16, num_layers=num_layers)
+    model.projection = MLP(in_features=8, out_features=8, hidden_dim=16, num_layers=num_layers)
     expected = model(_batch())
     save_model(model=model, path=tmp_path)
-    config = json.loads((tmp_path / "config.json").read_text())
-    assert config["projection"] == {"in_features": 8, "hidden_dim": 16, "num_layers": num_layers}
-    loaded = load_model(
-        repo_id_or_path=str(tmp_path), train_kernel="reference", decode_kernel="flex", dtype=torch.float32,
-    )
-    assert loaded.projection is not None
+    loaded = load_model(model=fresh_model(model), repo_id_or_path=str(tmp_path))
+    assert isinstance(loaded.projection, MLP)
     assert loaded.projection.num_layers == num_layers
     for name, tensor in model.state_dict().items():
         assert torch.equal(tensor, loaded.state_dict()[name])
@@ -233,70 +199,70 @@ def test_projection_checkpoint_roundtrip(tmp_path: Path, num_layers: int) -> Non
 @pytest.mark.parametrize("kwargs", [
     {"in_features": 0, "hidden_dim": 8},
     {"in_features": 8, "hidden_dim": 0},
-    {"in_features": 8, "hidden_dim": 8, "num_layers": 1},
+    {"in_features": 8, "hidden_dim": 8, "num_layers": 0},
 ])
 def test_projection_rejects_invalid_dimensions(kwargs: dict[str, int]) -> None:
     with pytest.raises(ValueError):
-        ProjectionHead(**kwargs)
+        MLP(out_features=8, **kwargs)
 
 
 def test_projection_rejects_incompatible_backbone_width() -> None:
     model = _model()
-    with pytest.raises(ValueError, match="hidden_dim mismatch between projection"):
-        Model(
-            backbone=model.backbone, heads=model._heads, action_source="q", reasoner=None,
-            projection=ProjectionHead(in_features=16, hidden_dim=16),
-        )
+    model.projection = MLP(in_features=16, out_features=16, hidden_dim=16)
+    with pytest.raises(RuntimeError):
+        model(_batch())
+
 
 
 def test_projection_and_prediction_prenorms_run_on_head_tokens() -> None:
-    model = _model(architecture="qwen3")
+    model = _model(architecture='qwen3')
     assert model.projection is not None
     seen: dict[str, torch.Tensor] = {}
 
     def capture(name: str):
+
         def hook(_module, args) -> None:
             seen[name] = args[0].detach().clone()
         return hook
-
-    modules = {"projection": model.projection.layers}
+    modules = {'projection': cast(MLP, model.projection).layers}
     for name, head in model.heads.items():
-        modules[name] = cast(RegressionHead | ClassificationHead, head).layers
+        modules[name] = cast(MLP, head).layers
     handles = [module.register_forward_pre_hook(capture(name)) for name, module in modules.items()]
+    norms = {"projection": cast(MLP, model.projection).norm,
+             **{name: cast(MLP, head).norm for name, head in model.heads.items()}}
+    handles += [norm.register_forward_pre_hook(capture(name + "_input")) for name, norm in norms.items()]
     try:
         with torch.no_grad():
-            model.projection.input_norm.weight.fill_(2.0)
-            cast(RegressionHead, model.heads["q"]).norm.weight.fill_(3.0)
-            cast(ClassificationHead, model.heads["policy"]).norm.weight.fill_(4.0)
+            cast(MLP, model.projection).norm.weight.fill_(2.0)
+            cast(MLP, model.heads['q']).norm.weight.fill_(3.0)
+            cast(MLP, model.heads['policy']).norm.weight.fill_(4.0)
             output = model(_batch())
     finally:
         for handle in handles:
             handle.remove()
     assert output.last_hidden_state.shape[0] > 3
-    for name, gain in (("projection", 2.0), ("q", 3.0), ("policy", 4.0)):
+    for name, gain in (('projection', 2.0), ('q', 3.0), ('policy', 4.0)):
         assert seen[name].shape == (3, 8)
-        torch.testing.assert_close(
-            seen[name].square().mean(-1).sqrt(), torch.full((3,), gain), atol=1e-3, rtol=1e-3,
-        )
+        torch.testing.assert_close(seen[name], torch.nn.functional.rms_norm(seen[name + "_input"], (8,), torch.full((8,), gain), eps=1e-5))
 
 
-@pytest.mark.parametrize("head_cls", [ProjectionHead, RegressionHead, ClassificationHead, DiscretizedActionHead])
+@pytest.mark.parametrize("head_cls", [MLP, DiscretizedActionHead])
 @pytest.mark.parametrize("use_norm", [True, False])
 def test_head_norms_are_not_configurable(head_cls, use_norm: bool) -> None:
     kwargs = {"in_features": 8, "hidden_dim": 8, "num_layers": 2, "use_norm": use_norm}
     if head_cls is DiscretizedActionHead:
         kwargs.update(action_vectors=torch.tensor([[-1.0], [1.0]]), propagate_gradient=1.0)
-    elif head_cls is not ProjectionHead:
+    else:
         kwargs.update(out_features=4, propagate_gradient=1.0)
     with pytest.raises(TypeError, match="use_norm"):
         head_cls(**kwargs)
 
 
-@pytest.mark.parametrize("head_cls", [RegressionHead, ClassificationHead, DiscretizedActionHead])
+@pytest.mark.parametrize("head_cls", [MLP, DiscretizedActionHead])
 @pytest.mark.parametrize("num_layers", [1, 3])
 @pytest.mark.parametrize("scale", [0.0, 0.1])
 def test_prediction_scale_changes_only_final_linear_initialization(head_cls, num_layers: int, scale: float) -> None:
-    def build(scale: float) -> RegressionHead | ClassificationHead:
+    def build(scale: float) -> MLP:
         torch.manual_seed(42)
         kwargs: dict[str, Any] = dict(in_features=8, hidden_dim=12, num_layers=num_layers, propagate_gradient=1.0, scale=scale)
         if head_cls is DiscretizedActionHead:
@@ -317,6 +283,7 @@ def test_prediction_scale_changes_only_final_linear_initialization(head_cls, num
     torch.testing.assert_close(scaled(torch.randn(3, 8)), torch.full((3, 2), 2.0))
 
 
-def test_projection_has_no_scale_option() -> None:
-    with pytest.raises(TypeError, match="scale"):
-        ProjectionHead(in_features=8, hidden_dim=8, scale=0.1)  # type: ignore[call-arg]
+def test_feature_projection_omits_output_scale() -> None:
+    mlp = MLP(in_features=8, out_features=8, hidden_dim=8)
+    assert mlp.scale is None
+    assert type(mlp.layers[-1]) is torch.nn.Linear

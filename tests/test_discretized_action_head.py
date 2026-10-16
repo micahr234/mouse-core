@@ -1,13 +1,14 @@
 from __future__ import annotations
+from tests._model_helpers import fresh_model, ExampleModel as Model
+from tests._model_helpers import copy_model, node_rates, simple_model, model_polyak
 
-import json
 
 import pytest
 import torch
 
-from mouse_core.models import DiscretizedActionHead, Model, load_model, model_polyak, save_model
+from mouse_core.models import DiscretizedActionHead, load_model, save_model
 from mouse_core.models.backbone import IdentityBackbone
-from mouse_core.models.heads import RegressionHead
+from mouse_core.models.mlp import MLP
 
 
 def make_head(table: torch.Tensor) -> DiscretizedActionHead:
@@ -18,10 +19,7 @@ def make_head(table: torch.Tensor) -> DiscretizedActionHead:
 
 
 def make_model(head: DiscretizedActionHead) -> Model:
-    return Model(
-        backbone=IdentityBackbone(hidden_dim=8, vocab_size=16),
-        heads=head, action_source="action_value", reasoner=None,
-    )
+    return simple_model(backbone=IdentityBackbone(hidden_dim=8, vocab_size=16), heads={'action_value': head}, reasoner=None)
 
 
 def test_vector_lookup_preserves_shape_and_does_not_alias_table() -> None:
@@ -118,14 +116,10 @@ def test_head_trains_like_regression_but_table_is_fixed_and_copied() -> None:
     assert torch.equal(head.action_vectors, expected_table)
     assert head.action_vectors.dtype == torch.float32
     assert not head.action_vectors.requires_grad
-    assert "action_vectors" not in dict(head.named_parameters())
-    assert "action_vectors" in head.state_dict()
-
-    regression = RegressionHead(
-        in_features=8, out_features=3, hidden_dim=16, num_layers=2,
-        propagate_gradient=1.0,
-    )
-    regression.load_state_dict({k: v for k, v in head.state_dict().items() if k != "action_vectors"})
+    assert 'action_vectors' not in dict(head.named_parameters())
+    assert 'action_vectors' in head.state_dict()
+    regression = MLP(in_features=8, out_features=3, hidden_dim=16, num_layers=2, propagate_gradient=1.0)
+    regression.load_state_dict({k: v for k, v in head.state_dict().items() if k != 'action_vectors'})
     h = torch.randn(2, 4, 8, requires_grad=True)
     output = head(h)
     assert output.shape == (2, 4, 3)
@@ -136,52 +130,35 @@ def test_head_trains_like_regression_but_table_is_fixed_and_copied() -> None:
     optimizer.step()
     assert not torch.equal(head(h), output)
     assert torch.equal(head.action_vectors, expected_table)
-
     model = make_model(head)
-    delayed = model.copy(heads=True, backbone=False, reasoner=False)
-    delayed_head = delayed.heads["action_value"]
+    delayed = copy_model(model, heads=True, backbone=False, reasoner=False)
+    delayed_head = delayed.heads['action_value']
     assert isinstance(delayed_head, DiscretizedActionHead)
     assert delayed_head.action_vectors.data_ptr() != head.action_vectors.data_ptr()
     update = model_polyak(online=model, delayed=delayed)
-    update(tau_heads=0.5, tau_backbone=None)
+    update(tau=node_rates(delayed, heads=0.5, backbone=None))
     assert torch.equal(delayed_head.action_vectors, expected_table)
     assert torch.equal(delayed_head.continuous_to_discrete(expected_table), torch.arange(3))
 
 
 def test_model_checkpoint_preserves_both_conversions_and_q_values(tmp_path) -> None:
     head = make_head(torch.tensor([[2.0, -1.0], [-2.0, 1.0], [0.0, 0.25]]))
-    model = Model(
-        backbone=IdentityBackbone(hidden_dim=8, vocab_size=16),
-        heads={"motor": head}, action_source="motor", reasoner=None,
-    )
+    model = simple_model(backbone=IdentityBackbone(hidden_dim=8, vocab_size=16), heads={'motor': head}, reasoner=None)
     h = torch.randn(2, 8)
-    expected = model.head(h=h)["motor"]
+    expected = model.head(h=h)['motor']
     save_model(model=model, path=tmp_path)
-    assert {path.name for path in tmp_path.iterdir()} == {"config.json", "pytorch_model.bin"}
-    config = json.loads((tmp_path / "config.json").read_text())
-    spec = config["heads"]["heads"][0]
-    assert spec["type"] == "discretized_action"
-    assert spec["out_features"] == 3 and spec["action_dim"] == 2
-    assert "action_vectors" not in spec  # Saved once, in the state dict.
-    loaded = load_model(
-        repo_id_or_path=str(tmp_path), train_kernel="reference", decode_kernel="flex",
-        dtype=torch.float32,
-    )
-    restored = loaded.heads["motor"]
+    assert {path.name for path in tmp_path.iterdir()} == {'config.json', 'pytorch_model.bin'}
+    loaded = load_model(model=fresh_model(model), repo_id_or_path=str(tmp_path))
+    restored = loaded.heads['motor']
     assert isinstance(restored, DiscretizedActionHead)
-    assert torch.equal(loaded.head(h=h)["motor"], expected)
+    assert torch.equal(loaded.head(h=h)['motor'], expected)
     assert torch.equal(restored.discrete_to_continuous(torch.arange(3)), head.action_vectors)
     assert torch.equal(restored.continuous_to_discrete(head.action_vectors), torch.arange(3))
     for key, value in model.state_dict().items():
         assert torch.equal(value, loaded.state_dict()[key])
-
-    spec["action_dim"] = 99
-    (tmp_path / "config.json").write_text(json.dumps(config))
-    with pytest.raises(ValueError, match="Action table shape"):
-        load_model(
-            repo_id_or_path=str(tmp_path), train_kernel="reference", decode_kernel="flex",
-            dtype=torch.float32,
-        )
+    wrong = make_model(make_head(torch.tensor([[0., 0.], [1., 1.]])))
+    with pytest.raises(RuntimeError, match="size mismatch|Missing key"):
+        load_model(model=wrong, repo_id_or_path=str(tmp_path))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

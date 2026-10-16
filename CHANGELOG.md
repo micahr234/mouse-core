@@ -8,13 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- `ProjectionHead` adds a shared, width-preserving SwiGLU MLP with mandatory input
-  RMSNorm between the backbone and prediction heads via `Model(projection=...)`.
-  It is saved with checkpoints and can be copied or shared independently with
-  `Model.copy(projection=...)`. Copied projections use their own
-  `tau_projection` in `model_polyak`; optimizer parameter groups give them
-  a separate learning rate. Training notebooks enable it with
-  `LR_PROJECTION` and, for DQN, `POLYAK_TAU_PROJECTION`.
+- Subclassable PyTorch `Model`: define architecture in `forward()` with ordinary
+  modules, branches, residual paths, and `nn.Sequential`. Action selection
+  lives in the implementation's `get_action()`, with an optional discrete helper. `TokenEncoder` handles
+  token processing; each implementation defines its own modules and readout. No graph schema, executor, or diagram generator is needed.
+- One public `MLP` class replaces separate projection, regression, and classification heads;
+  scalar regression uses `out_features=1`. Training notebooks expose
+  `USE_PROJECTION`, `LR_PROJECTION`, and `POLYAK_TAU_PROJECTION`.
 - `DiscretizedActionHead` produces one Q-value per row of a fixed continuous
   action table. `discrete_to_continuous` decodes IDs; `continuous_to_discrete`
   quantizes by Euclidean distance (ties choose the lowest ID). The table is a
@@ -56,19 +56,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   share SwiGLU building blocks, and remove unused helpers and `HeadSpec`.
   Examples use consistent setup sections, constant names, and grouped model,
   training, learning-rate, and target-interpolation settings.
-- Normalization is mandatory: transformer backbones always keep their native
-  final norm, and the projection and every prediction head each own an input
-  RMSNorm. Removed `use_norm` from constructors, head specs, and saved configs.
-  Older normalized checkpoints still load; disabled-norm checkpoints raise.
-  Prediction-head `scale` applies only to the final linear layer's initial
-  weight and bias; the projection has no scale option.
-- ``model_polyak(online=..., delayed=...)`` now binds a reusable updater.
-  Call it with explicit ``tau_heads=`` and ``tau_backbone=`` after each
-  optimizer step; ``None`` denotes a shared section. Parameter validation
-  and pairing run once at binding, and grouped fp32 tensor operations
-  perform the interpolation. ``tau_heads`` also accepts per-head rates.
-  Rebind after changing model structure, parameters, trainability, device,
-  or dtype. Examples use the bound updater.
+- Transformer backbones remove their final output norm. Projection and
+  prediction instances retain mandatory input RMSNorms. Prediction `scale` affects
+  only the final linear initialization; projection instances omit it.
+- The concrete transformer is `Backbone`; its abstract interface is `BaseBackbone`.
+  Old backbone and head names have no compatibility aliases. Agents choose
+  predictions directly in `get_action()`, with no action-source setting.
+- Model checkpoints store only online weights and configuration, never optimizer
+  state or delayed copies. `mouse-core-model-v3` requires a constructed `model=` at load time;
+  no default architecture or reconstruction is provided.
+  There is no legacy loader.
+- `model.copy(modules=[...])` preserves the subclass and copies selected modules,
+  sharing the rest. LR and Polyak rates use standard dotted module paths.
+  Polyak parameter pairing happens once when binding.
 - ``value_gap_gate`` accepts ``beta=0`` as the hard-cutoff limit: adjusted
   gap zero continues with 1, and a negative gap cuts with 0. Ties avoid
   division by zero; negative and non-finite beta values remain invalid.
@@ -83,7 +83,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Example text fields write the episode number as ``,episode {field+1}``
   (episode index 0 renders as episode 1). The GRPO example clears a trunk
   context when ``task_index`` changes, so a new map does not condition on
-  the previous one. Example ``ClassificationHead`` initial ``scale`` is
+  the previous one. Example ``MLP`` initial ``scale`` is
   ``1.0``.
 - Example group prefixes state the step cap for an episode with
   ``MAX_STEPS_PER_EPISODE`` for both CartPole and FrozenLake.
@@ -204,7 +204,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ``best_action(q)``: integer action id per row, uniform among finite
   maxima (``-inf`` padding never selected). ``SpObjective`` callers that
   distill from Q* run this outside and pass the ids as ``targets=``.
-- ``RegressionHead`` / ``ClassificationHead`` take required
+- ``MLP`` / ``MLP`` take required
   ``propagate_gradient`` in ``[0, 1]``. ``1`` is full gradient from
   the head into the backbone; ``0`` detaches the pooled hidden state
   so the backbone gets none; values in between keep the forward value
@@ -280,7 +280,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are ``1`` and shift extras are ``0`` when the flag is false. Both
   flags can be true, and the extras multiply (shifts add). Pass it as
   ``value=``.
-- ``TransformerBackbone``: one public transformer backbone. ``pretrained=``
+- ``Backbone``: one public transformer backbone. ``pretrained=``
   inspects the Hub config. Packed Flex / varlen / padded kernels run when
   every layer is a Llama/Qwen3-shaped softmax block (including other
   packed-compatible stacks such as Qwen2). Other maskable softmax
@@ -403,8 +403,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backbone type ``transformer`` with an ``architecture`` field
   (``llama`` / ``qwen3`` / ``hf``). Packed train dispatch is
   ``backbone.uses_packed``, not ``hasattr(model, "layers")``.
-- Head classes: ``DiscreteActionValueHead`` is ``RegressionHead``,
-  ``DiscreteActionHead`` is ``ClassificationHead``.
+- Head classes: ``DiscreteActionValueHead`` is ``MLP``,
+  ``DiscreteActionHead`` is ``MLP``.
   Prediction keys are ``action_value`` and ``action``. ``save_model``
   writes head types ``regression`` and ``classification``.
 - ``Model(..., action_source=)`` is the ``heads`` dict key
@@ -424,7 +424,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``image`` fields and look up ids through the backbone ``embed_tokens``
   table. ``examples/02_train_offline_dqn.ipynb`` is the text baseline
   (reward ``{field:g}`` drops a trailing ``.0``).
-- Token embeddings live on the backbone. ``TransformerBackbone(pretrained=...)``
+- Token embeddings live on the backbone. ``Backbone(pretrained=...)``
   loads native ``embed_tokens``; from-scratch stacks take ``vocab_size=``.
   ``IdentityBackbone`` requires ``hidden_dim=`` and ``vocab_size=``.
   ``Model`` takes ``backbone=`` and ``heads=`` (no ``encoder=`` /
@@ -465,7 +465,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``metrics["watkins_greedy_frac"]``. The continuation is ``gate``;
   ``lambda_gate`` builds the λ-return, ``nstep_gate`` the n-step
   return, and ``watkins_gate`` the greedy cut.
-- ``LayerwiseRegressionHead``, ``LayerwiseDqnObjective``,
+- ``LayerwiseMLP``, ``LayerwiseDqnObjective``,
   ``effective_horizon``, ``gamma_from_horizon``,
   ``ModelOutput.hidden_states``, and
   ``examples/04_train_offline_layerwise_dqn.ipynb``.
@@ -475,7 +475,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``DecodeCache`` holds one ``FlexDecodeSession``.
 - ``examples/11_train_offline_recurrent_dqn.ipynb``.
 - ``NumericEmbedder``, ``TextEmbedder``, the ``Encoder`` ABC, and
-  ``embedder=`` on ``TransformerBackbone`` / ``IdentityBackbone``.
+  ``embedder=`` on ``Backbone`` / ``IdentityBackbone``.
   Both backbones look up a single ``embed_tokens`` table.
 - Tokenizer modality types ``discrete``, ``fourier``, ``continuous``,
   and ``learnable``. There is no custom / scratch token table.
@@ -484,12 +484,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are a backbone concern; ``tau_backbone`` interpolates them.
 - ``examples/06_train_offline_text_dqn.ipynb``. Text packing is the
   default in ``02``.
-- ``LlamaBackbone`` and ``Qwen3Backbone``. Use ``TransformerBackbone``.
+- ``LlamaBackbone`` and ``Qwen3Backbone``. Use ``Backbone``.
 - ``MaxNStepDqnObjective`` and
   ``examples/15_train_offline_max_n_step_dqn.ipynb``.
 - ``DiscreteActionValueHead``, ``DiscreteActionHead``,
   ``LayerwiseDiscreteActionValueHead``, and ``SwiGLUHead``. Use
-  ``RegressionHead`` or ``ClassificationHead``.
+  ``MLP`` or ``MLP``.
 - ``head=``, ``value_head=``, and ``behavior_head=`` on
   objectives, and ``prediction_key`` / ``predictions_key`` /
   ``value_key`` / ``behavior_key`` stored on them. Pass the
@@ -573,7 +573,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   One objective trains one head — call it once
   per head and add the losses to train several horizons.
   ``examples/13_train_offline_n_step_dqn.ipynb`` is the same offline
-  loop as ``02`` with three ``RegressionHead``s
+  loop as ``02`` with three ``MLP``s
   (``nstep_gate(n=1, 3, 5)``), ``copy``
   of every Q head with a shared backbone, and the three losses summed.
 - Tokenizer packing spec is a separate object and a separate Hub repo.

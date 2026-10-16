@@ -1,13 +1,15 @@
 from __future__ import annotations
+from tests._model_helpers import fresh_model, ExampleModel as Model
+from tests._model_helpers import simple_model
 from typing import Any, cast
 import json
 import pytest
 import torch
-from mouse_core.models import Model, load_model, push_model_to_hub, save_model
+from mouse_core.models import load_model, push_model_to_hub, save_model
 from mouse_core.models.io import _write_model_card
-from mouse_core.models.backbone import IdentityBackbone, LoRAConfig, TransformerBackbone
+from mouse_core.models.backbone import IdentityBackbone, LoRAConfig, Backbone
 from mouse_core.data import Tokenizer, load_tokenizer, save_tokenizer
-from mouse_core.models.heads import RegressionHead
+from mouse_core.models.mlp import MLP
 
 def when_episode_done_nonzero(ctx):
     return "episode_done" in ctx and ctx["episode_done"] != 0
@@ -41,15 +43,15 @@ def test_composed_model_roundtrip(tmp_path) -> None:
     torch.manual_seed(0)
     hidden_dim = 8
     backbone = IdentityBackbone(hidden_dim=hidden_dim, vocab_size=32)
-    heads = RegressionHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, propagate_gradient=1.0)
-    model = Model(backbone=backbone, heads=heads, action_source="action_value", reasoner=None).eval()
+    heads = MLP(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, propagate_gradient=1.0)
+    model = simple_model(backbone=backbone, heads={'action_value': heads}, reasoner=None).eval()
     batch = [[{'action': 0, 'reward': 0.0, 'episode_done': 0, 'task_done': 0}, {'action': 1, 'reward': 1.0, 'episode_done': 0, 'task_done': 0}, {'action': 2, 'reward': 2.0, 'episode_done': 1, 'task_done': 0}]]
     expected = model(batch_to_token_batch(_TOK, batch)).predictions
     save_model(model=model, path=tmp_path)
-    loaded = load_model(repo_id_or_path=tmp_path, train_kernel="reference", decode_kernel="flex", dtype=torch.float32).eval()
+    loaded = load_model(model=fresh_model(model), repo_id_or_path=tmp_path).eval()
     actual = loaded(batch_to_token_batch(_TOK, batch)).predictions
     assert torch.allclose(actual['action_value'], expected['action_value'])
-    assert loaded.hidden_dim == hidden_dim
+    assert loaded.encoder.hidden_dim == hidden_dim
     orig_sd = model.state_dict()
     loaded_sd = loaded.state_dict()
     assert set(orig_sd.keys()) == set(loaded_sd.keys()), f'state_dict key mismatch:\n  missing in loaded: {set(orig_sd.keys()) - set(loaded_sd.keys())}\n  extra in loaded:   {set(loaded_sd.keys()) - set(orig_sd.keys())}'
@@ -57,77 +59,51 @@ def test_composed_model_roundtrip(tmp_path) -> None:
         assert torch.equal(orig_sd[key], loaded_sd[key]), f'param {key!r} differs after save/load roundtrip'
     with (tmp_path / 'config.json').open() as fh:
         config = json.load(fh)
-    assert config['format'] == 'mouse-core-model-v1'
-    assert config['heads']['action_source'] == 'action_value'
-    assert config['backbone']['type'] == 'identity'
-    assert config['backbone']['hidden_dim'] == hidden_dim
-    assert config['backbone']['vocab_size'] == 32
-    assert 'embedder' not in config['backbone']
-    assert 'num_frequencies' not in config['backbone']
+    assert config['format'] == 'mouse-core-model-v3'
+    assert config['class'].endswith('ExampleModel')
 
 
-def test_kernels_and_dtype_are_not_saved_and_come_from_the_loader(tmp_path) -> None:
-    hidden_dim = 8
-    backbone = TransformerBackbone(architecture="qwen3", train_kernel="reference", decode_kernel="flex", dtype=torch.float32, hidden_dim=hidden_dim, num_layers=1, num_heads=2, vocab_size=32)
-    heads = RegressionHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, propagate_gradient=1.0)
-    save_model(model=Model(backbone=backbone, heads=heads, action_source="action_value", reasoner=None), path=tmp_path)
-    with (tmp_path / 'config.json').open() as fh:
-        cfg = json.load(fh)['backbone']
-    assert 'train_kernel' not in cfg and 'decode_kernel' not in cfg and 'dtype' not in cfg
-    assert cfg['type'] == 'transformer'
-    assert cfg['architecture'] == 'qwen3'
-    assert 'use_norm' not in cfg['kwargs']
-    loaded = cast(TransformerBackbone, load_model(repo_id_or_path=tmp_path, train_kernel="flex", decode_kernel="flex", dtype=torch.float32).backbone)
-    assert (loaded.train_kernel, loaded.decode_kernel) == ('flex', 'flex')
-    with pytest.raises(TypeError, match="train_kernel.*decode_kernel.*dtype"):
+def test_loading_requires_a_model_and_preserves_its_runtime(tmp_path) -> None:
+    source = simple_model(
+        backbone=Backbone(architecture="qwen3", train_kernel="reference", decode_kernel="flex",
+                                     dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2, vocab_size=32),
+        heads={'action_value': MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.)},
+         reasoner=None,
+    )
+    save_model(model=source, path=tmp_path)
+    target = simple_model(
+        backbone=Backbone(architecture="qwen3", train_kernel="flex", decode_kernel="flex",
+                                     dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2, vocab_size=32),
+        heads={'action_value': MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.)},
+         reasoner=None,
+    )
+    loaded = load_model(model=target, repo_id_or_path=tmp_path)
+    assert loaded is target
+    assert loaded.encoder.backbones[0].train_kernel == "flex"
+    assert next(loaded.parameters()).requires_grad
+    with pytest.raises(TypeError, match="model"):
         load_model(repo_id_or_path=tmp_path)  # type: ignore[call-arg]
+
 
 
 def test_num_frequencies_roundtrip(tmp_path) -> None:
     hidden_dim = 8
-    backbone = TransformerBackbone(
-        architecture="qwen3",
-        train_kernel="reference",
-        decode_kernel="flex",
-        dtype=torch.float32,
-        hidden_dim=hidden_dim,
-        num_layers=1,
-        num_heads=2,
-        vocab_size=32,
-        num_frequencies=3,
-    )
+    backbone = Backbone(architecture='qwen3', train_kernel='reference', decode_kernel='flex', dtype=torch.float32, hidden_dim=hidden_dim, num_layers=1, num_heads=2, vocab_size=32, num_frequencies=3)
     assert backbone.fourier is not None
     with torch.no_grad():
         backbone.fourier.proj.weight.fill_(0.25)
-    heads = RegressionHead(
-        in_features=hidden_dim,
-        out_features=4,
-        hidden_dim=hidden_dim,
-        num_layers=1,
-        propagate_gradient=1.0,
-    )
-    model = Model(backbone=backbone, heads=heads, action_source="action_value", reasoner=None)
+    heads = MLP(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, propagate_gradient=1.0)
+    model = simple_model(backbone=backbone, heads={'action_value': heads}, reasoner=None)
     save_model(model=model, path=tmp_path)
-    with (tmp_path / "config.json").open() as fh:
-        cfg = json.load(fh)["backbone"]
-    assert cfg["kwargs"]["num_frequencies"] == 3
-    loaded = cast(
-        TransformerBackbone,
-        load_model(
-            repo_id_or_path=tmp_path,
-            train_kernel="reference",
-            decode_kernel="flex",
-            dtype=torch.float32,
-        ).backbone,
-    )
+    loaded = cast(Backbone, load_model(model=fresh_model(model), repo_id_or_path=tmp_path).encoder.backbones[0])
     assert loaded.num_frequencies == 3
     assert loaded.fourier is not None
     assert torch.equal(loaded.fourier.proj.weight, backbone.fourier.proj.weight)
-    assert not any(key.endswith("bands") for key in model.state_dict())
+    assert not any((key.endswith('bands') for key in model.state_dict()))
 
 
 def test_fourier_stays_trainable_when_lora_freezes_the_stack() -> None:
-    backbone = TransformerBackbone(
+    backbone = Backbone(
         architecture="qwen3",
         train_kernel="reference",
         decode_kernel="flex",
@@ -149,207 +125,131 @@ def test_identity_num_frequencies_roundtrip(tmp_path) -> None:
     assert backbone.fourier is not None
     with torch.no_grad():
         backbone.fourier.proj.weight.normal_()
-    heads = RegressionHead(
-        in_features=8,
-        out_features=4,
-        hidden_dim=8,
-        num_layers=1,
-        propagate_gradient=1.0,
-    )
-    model = Model(backbone=backbone, heads=heads, action_source="action_value", reasoner=None)
+    heads = MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0)
+    model = simple_model(backbone=backbone, heads={'action_value': heads}, reasoner=None)
     save_model(model=model, path=tmp_path)
-    with (tmp_path / "config.json").open() as fh:
-        cfg = json.load(fh)["backbone"]
-    assert cfg["num_frequencies"] == 4
-    loaded = cast(
-        IdentityBackbone,
-        load_model(
-            repo_id_or_path=tmp_path,
-            train_kernel="reference",
-            decode_kernel="flex",
-            dtype=torch.float32,
-        ).backbone,
-    )
+    loaded = cast(IdentityBackbone, load_model(model=fresh_model(model), repo_id_or_path=tmp_path).encoder.backbones[0])
     assert loaded.num_frequencies == 4
     assert loaded.fourier is not None
     assert torch.equal(loaded.fourier.proj.weight, backbone.fourier.proj.weight)
 
 
-@pytest.mark.parametrize("legacy_flags", [False, True])
-def test_normalized_checkpoints_roundtrip_without_norm_options(tmp_path, legacy_flags: bool) -> None:
-    backbone = TransformerBackbone(
-        architecture="qwen3", train_kernel="reference", decode_kernel="flex",
-        dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2, vocab_size=32,
-    )
-    head = RegressionHead(
-        in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0,
-    )
-    model = Model(backbone=backbone, heads=head, action_source="action_value", reasoner=None)
+def test_explicit_model_checkpoints_roundtrip_without_backbone_output_norm(tmp_path) -> None:
+    backbone = Backbone(architecture='qwen3', train_kernel='reference', decode_kernel='flex', dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2, vocab_size=32)
+    head = MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0)
+    model = simple_model(backbone=backbone, heads={'action_value': head}, reasoner=None)
     with torch.no_grad():
-        backbone.model.norm.weight.fill_(2.0)
         head.norm.weight.fill_(3.0)
     save_model(model=model, path=tmp_path)
-    config_path = tmp_path / "config.json"
-    config = json.loads(config_path.read_text())
-    assert "use_norm" not in config["backbone"]["kwargs"]
-    assert "use_norm" not in config["heads"]["heads"][0]
-    if legacy_flags:
-        config["backbone"]["kwargs"]["use_norm"] = True
-        config["heads"]["heads"][0]["use_norm"] = True
-        config_path.write_text(json.dumps(config))
-    loaded = load_model(
-        repo_id_or_path=str(tmp_path), train_kernel="reference", decode_kernel="flex", dtype=torch.float32,
-    )
-    loaded_bb = cast(TransformerBackbone, loaded.backbone)
-    assert torch.equal(loaded_bb.model.norm.weight, torch.full((8,), 2.0))
-    loaded_head = cast(RegressionHead, loaded.heads["action_value"])
-    assert torch.equal(loaded_head.norm.weight, torch.full((8,), 3.0))
+    loaded = load_model(model=fresh_model(model), repo_id_or_path=str(tmp_path))
+    assert isinstance(cast(Backbone, loaded.encoder.backbones[0]).model.norm, torch.nn.Identity)
+    torch.testing.assert_close(cast(MLP, loaded.heads['action_value']).norm.weight, torch.full((8,), 3.0))
     h = torch.randn(3, 8)
-    torch.testing.assert_close(loaded.head(h=h)["action_value"], model.head(h=h)["action_value"])
+    torch.testing.assert_close(loaded.head(h=h)['action_value'], model.head(h=h)['action_value'])
 
 
-@pytest.mark.parametrize("section", ["backbone", "head"])
-def test_checkpoints_with_disabled_norms_are_rejected(tmp_path, section: str) -> None:
-    backbone = TransformerBackbone(
-        architecture="qwen3", train_kernel="reference", decode_kernel="flex",
-        dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2, vocab_size=32,
-    )
-    head = RegressionHead(
-        in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0,
-    )
-    save_model(model=Model(backbone=backbone, heads=head, action_source="action_value", reasoner=None), path=tmp_path)
-    config_path = tmp_path / "config.json"
-    config = json.loads(config_path.read_text())
-    spec = config["backbone"]["kwargs"] if section == "backbone" else config["heads"]["heads"][0]
-    spec["use_norm"] = False
-    config_path.write_text(json.dumps(config))
-    with pytest.raises(ValueError, match="use_norm=False"):
-        load_model(repo_id_or_path=str(tmp_path), train_kernel="reference", decode_kernel="flex", dtype=torch.float32)
+
+@pytest.mark.parametrize("version", ["mouse-core-model-v1", "mouse-core-model-v2"])
+def test_legacy_checkpoint_formats_are_rejected(tmp_path, version: str) -> None:
+    model = _lora_model(torch.float32)
+    save_model(model=model, path=tmp_path)
+    path = tmp_path / "config.json"
+    config = json.loads(path.read_text())
+    config["format"] = version
+    path.write_text(json.dumps(config))
+    with pytest.raises(ValueError, match="Unsupported model config format"):
+        load_model(model=fresh_model(model), repo_id_or_path=tmp_path)
 
 
-def test_head_requires_propagate_gradient() -> None:
-    with pytest.raises(TypeError, match="propagate_gradient"):
-        RegressionHead(
-            in_features=8, out_features=4, hidden_dim=8, num_layers=1
-        )  # type: ignore[call-arg]
+
+def test_mlp_defaults_to_full_input_gradients() -> None:
+    mlp = MLP(in_features=8, out_features=1, hidden_dim=8, num_layers=1)
+    h = torch.randn(2, 8, requires_grad=True)
+    mlp(h).sum().backward()
+    assert mlp.propagate_gradient == 1.0
+    assert h.grad is not None and h.grad.abs().sum() > 0
 
 
 def test_transformer_backbone_requires_kernels_and_dtype() -> None:
     with pytest.raises(TypeError, match="train_kernel.*decode_kernel.*dtype"):
-        TransformerBackbone(architecture="qwen3", hidden_dim=8, num_layers=1, num_heads=2)  # type: ignore[call-arg]
+        Backbone(architecture="qwen3", hidden_dim=8, num_layers=1, num_heads=2)  # type: ignore[call-arg]
     with pytest.raises(ValueError, match="train_kernel"):
-        TransformerBackbone(architecture="qwen3", train_kernel=cast(Any, "sdpa"), decode_kernel="flex", dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2)
+        Backbone(architecture="qwen3", train_kernel=cast(Any, "sdpa"), decode_kernel="flex", dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2)
     with pytest.raises(ValueError, match="decode_kernel"):
-        TransformerBackbone(architecture="qwen3", train_kernel="reference", decode_kernel=cast(Any, "sdpa"), dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2)
+        Backbone(architecture="qwen3", train_kernel="reference", decode_kernel=cast(Any, "sdpa"), dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2)
     with pytest.raises(TypeError, match="dtype"):
-        TransformerBackbone(architecture="qwen3", train_kernel="reference", decode_kernel="flex", dtype=torch.int8, hidden_dim=8, num_layers=1, num_heads=2)
+        Backbone(architecture="qwen3", train_kernel="reference", decode_kernel="flex", dtype=torch.int8, hidden_dim=8, num_layers=1, num_heads=2)
 
 
 def test_identity_embed_tokens_roundtrip(tmp_path) -> None:
     torch.manual_seed(0)
     hidden_dim = 8
     backbone = IdentityBackbone(hidden_dim=hidden_dim, vocab_size=32)
-    heads = RegressionHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, propagate_gradient=1.0)
-    model = Model(backbone=backbone, heads=heads, action_source="action_value", reasoner=None).eval()
-    tokenizer = token_tokenizer("action", "prev_action")
+    heads = MLP(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, propagate_gradient=1.0)
+    model = simple_model(backbone=backbone, heads={'action_value': heads}, reasoner=None).eval()
+    tokenizer = token_tokenizer('action', 'prev_action')
     batch = [[{'action': 0, 'prev_action': 1, 'reward': 0.5, 'grouping_id': 0}, {'action': 2, 'prev_action': 0, 'reward': 1.0, 'grouping_id': 0}]]
     expected = model(batch_to_token_batch(tokenizer, batch)).predictions
     save_model(model=model, path=tmp_path)
-    loaded = load_model(repo_id_or_path=tmp_path, train_kernel="reference", decode_kernel="flex", dtype=torch.float32).eval()
+    loaded = load_model(model=fresh_model(model), repo_id_or_path=tmp_path).eval()
     assert set(model.state_dict()) == set(loaded.state_dict())
     actual = loaded(batch_to_token_batch(tokenizer, batch)).predictions
     assert torch.allclose(actual['action_value'], expected['action_value'])
-    assert torch.equal(
-        cast(IdentityBackbone, model.backbone).embed_tokens.weight,
-        cast(IdentityBackbone, loaded.backbone).embed_tokens.weight,
-    )
+    assert torch.equal(cast(IdentityBackbone, model.encoder.backbones[0]).embed_tokens.weight, cast(IdentityBackbone, loaded.encoder.backbones[0]).embed_tokens.weight)
 
 
-def test_model_card_includes_usage_and_architecture(tmp_path) -> None:
-    model = Model(backbone=IdentityBackbone(hidden_dim=8, vocab_size=32), heads=(head := RegressionHead(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0)), action_source="action_value", reasoner=None)
-    path = tmp_path / 'README.md'
-    _write_model_card(repo_id='user/mouse-example-model', tokenizer_repo_id='user/mouse-example-tokenizer', model=model, path=path)
+def test_model_card_requires_the_application_implementation(tmp_path) -> None:
+    model = _lora_model(torch.float32)
+    path = tmp_path / "README.md"
+    _write_model_card(repo_id="user/model", tokenizer_repo_id="user/tokenizer", model=model, path=path)
     text = path.read_text()
-    assert 'library_name: mouse-core' in text
-    assert text.index('## Architecture') < text.index('### Token embeddings')
-    assert text.index('### Token embeddings') < text.index('## Install MouseCore')
-    assert text.index('## Install MouseCore') < text.index('## Load The Model')
-    assert text.index('## Load The Model') < text.index('## Run Inference')
-    assert 'What This Contains' not in text
-    assert 'pip install mouse-core' in text
-    assert 'load_model(' in text and 'train_kernel="flex"' in text and 'decode_kernel="flex"' in text and 'dtype=preferred_dtype(device=device)' in text
-    assert 'Tokenizer' in text
-    assert 'embed_tokens' in text
-    assert '"action": 0,' in text
-    assert '"reward": 0.0,' in text
-    assert 'out, step_stream, cache = model(batch)' not in text
-    assert 'compose' in text
-    assert 'pack_token_batch' in text
-    assert 'DataLoader(transform=compose(stages=(augmenter, tokenizer)))' in text
-    assert 'eval_transform = tokenizer' in text
-    assert 'load_tokenizer(' in text
-    assert 'user/mouse-example-tokenizer' in text
-    assert 'separate' in text.lower()
-    assert 'token_batch.grouper' not in text
-    assert 'boundary_values' not in text
-    assert 'Backbone: `identity`' in text
-    assert 'Heads: `action_value`' in text
+    assert "library_name: mouse-core" in text
+    assert "ExampleModel" in text
+    assert "load_model(model=model," in text
+    assert "No default architecture" in text
+    assert "user/tokenizer" in text and "separately" in text
+    assert "Optimizer state and delayed models" in text
+
 
 
 def _lora_model(dtype: torch.dtype) -> Model:
     hidden_dim = 8
-    backbone = TransformerBackbone(architecture="qwen3", train_kernel="reference", decode_kernel="flex", dtype=dtype, hidden_dim=hidden_dim, num_layers=1, num_heads=2, lora=LoRAConfig(rank=2), vocab_size=32)
-    heads = RegressionHead(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, propagate_gradient=1.0)
-    return Model(backbone=backbone, heads=heads, action_source="action_value", reasoner=None).eval()
+    backbone = Backbone(architecture='qwen3', train_kernel='reference', decode_kernel='flex', dtype=dtype, hidden_dim=hidden_dim, num_layers=1, num_heads=2, lora=LoRAConfig(rank=2), vocab_size=32)
+    heads = MLP(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, propagate_gradient=1.0)
+    return simple_model(backbone=backbone, heads={'action_value': heads}, reasoner=None).eval()
 
 
 def test_backbone_dtype_applies_to_base_only_and_trainable_sections_stay_float32() -> None:
     model = _lora_model(torch.bfloat16)
     assert {p.dtype for p in model.heads.parameters()} == {torch.float32}
-    assert {p.dtype for p in model.backbone.parameters() if not p.requires_grad} == {torch.bfloat16}
-    assert {p.dtype for p in model.backbone.parameters() if p.requires_grad} == {torch.float32}
-    assert model.backbone.dtype == torch.bfloat16
+    assert {p.dtype for p in model.encoder.backbones[0].parameters() if not p.requires_grad} == {torch.bfloat16}
+    assert {p.dtype for p in model.encoder.backbones[0].parameters() if p.requires_grad} == {torch.float32}
+    assert model.encoder.backbones[0].dtype == torch.bfloat16
     batch = [[{'action': 0, 'reward': 0.5, 'episode_done': 0, 'task_done': 0}, {'action': 1, 'reward': 1.0, 'episode_done': 0, 'task_done': 0}]]
     with torch.no_grad():
         preds = model(batch_to_token_batch(_TOK, batch)).predictions
     assert preds['action_value'].dtype == torch.float32
 
 
-@pytest.mark.parametrize(
-    "cast_fn",
-    [
-        lambda m: m.to(torch.bfloat16),
-        lambda m: m.to(dtype=torch.bfloat16),
-        lambda m: m.to("cpu", torch.bfloat16),
-        lambda m: m.to(device="cpu", dtype=torch.bfloat16),
-        lambda m: m.to(torch.zeros(1, dtype=torch.bfloat16)),
-        lambda m: m.bfloat16(),
-        lambda m: m.half(),
-        lambda m: m.double(),
-        lambda m: m.float(),
-        lambda m: m.backbone.to(dtype=torch.bfloat16),
-        lambda m: m.backbone.bfloat16(),
-    ],
-    ids=["pos-dtype", "kw-dtype", "pos-device-dtype", "kw-device-dtype", "tensor", "bfloat16()", "half()", "double()", "float()", "backbone-to", "backbone-bfloat16()"],
-)
+@pytest.mark.parametrize('cast_fn', [lambda m: m.to(torch.bfloat16), lambda m: m.to(dtype=torch.bfloat16), lambda m: m.to('cpu', torch.bfloat16), lambda m: m.to(device='cpu', dtype=torch.bfloat16), lambda m: m.to(torch.zeros(1, dtype=torch.bfloat16)), lambda m: m.bfloat16(), lambda m: m.half(), lambda m: m.double(), lambda m: m.float(), lambda m: m.encoder.backbones[0].to(dtype=torch.bfloat16), lambda m: m.encoder.backbones[0].bfloat16()], ids=['pos-dtype', 'kw-dtype', 'pos-device-dtype', 'kw-device-dtype', 'tensor', 'bfloat16()', 'half()', 'double()', 'float()', 'backbone-to', 'backbone-bfloat16()'])
 def test_model_and_backbone_refuse_dtype_casts(cast_fn) -> None:
     """dtype is a backbone constructor argument; ``.to`` only moves."""
     model = _lora_model(torch.float32)
-    with pytest.raises(TypeError, match="dtype"):
+    with pytest.raises(TypeError, match='dtype'):
         cast_fn(model)
-    assert model.backbone.dtype == torch.float32
-    model.to("cpu")  # device-only moves still work
-    model.to(device="cpu")
+    assert model.encoder.backbones[0].dtype == torch.float32
+    model.to('cpu')
+    model.to(device='cpu')
 
 
-def test_load_model_casts_saved_weights_into_requested_dtype(tmp_path) -> None:
+def test_load_model_casts_saved_weights_into_the_supplied_models_dtype(tmp_path) -> None:
     model = _lora_model(torch.bfloat16)
     save_model(model=model, path=tmp_path)
-    loaded = load_model(repo_id_or_path=tmp_path, train_kernel="reference", decode_kernel="flex", dtype=torch.float32)
-    assert loaded.backbone.dtype == torch.float32
-    assert {p.dtype for p in loaded.backbone.parameters()} == {torch.float32}
-    saved: dict[str, torch.Tensor] = {n: cast(torch.Tensor, p) for n, p in model.backbone.named_parameters()}
-    for n, p in loaded.backbone.named_parameters():
+    loaded = load_model(model=_lora_model(torch.float32), repo_id_or_path=tmp_path)
+    assert loaded.encoder.backbones[0].dtype == torch.float32
+    assert {p.dtype for p in loaded.encoder.backbones[0].parameters()} == {torch.float32}
+    saved: dict[str, torch.Tensor] = {n: cast(torch.Tensor, p) for n, p in model.encoder.backbones[0].named_parameters()}
+    for n, p in loaded.encoder.backbones[0].named_parameters():
         if not p.requires_grad:
             assert torch.equal(cast(torch.Tensor, p), saved[n].float())
 
@@ -358,8 +258,8 @@ def test_model_to_cuda_moves_without_casting() -> None:
     if not torch.cuda.is_available():
         pytest.skip('CUDA required')
     model = _lora_model(torch.bfloat16).to(torch.device('cuda'))
-    assert model.backbone.dtype == torch.bfloat16
-    assert {p.dtype for p in model.backbone.parameters() if p.requires_grad} == {torch.float32}
+    assert model.encoder.backbones[0].dtype == torch.bfloat16
+    assert {p.dtype for p in model.encoder.backbones[0].parameters() if p.requires_grad} == {torch.float32}
     assert next(model.heads.parameters()).dtype == torch.float32
     batch = [[{'action': 0, 'reward': 0.0, 'episode_done': 0, 'task_done': 0}]]
     with torch.no_grad():
@@ -368,14 +268,9 @@ def test_model_to_cuda_moves_without_casting() -> None:
 
 
 def test_save_model_does_not_write_tokenizer(tmp_path) -> None:
-    model = Model(
-        backbone=IdentityBackbone(hidden_dim=8, vocab_size=32),
-        heads=(head := RegressionHead(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0)),
-        action_source="action_value",
-        reasoner=None,
-    )
+    model = simple_model(backbone=IdentityBackbone(hidden_dim=8, vocab_size=32), heads=({'action_value': (head := MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0))}), reasoner=None)
     save_model(model=model, path=tmp_path)
-    assert not (tmp_path / "tokenizer.json").exists()
+    assert not (tmp_path / 'tokenizer.json').exists()
 
 
 def test_tokenizer_roundtrip(tmp_path) -> None:
@@ -461,34 +356,9 @@ def test_load_tokenizer_missing_file_raises(tmp_path) -> None:
 
 
 def test_push_model_to_hub_requires_distinct_tokenizer_repo() -> None:
-    model = Model(
-        backbone=IdentityBackbone(hidden_dim=8, vocab_size=32),
-        heads=(head := RegressionHead(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0)),
-        action_source="action_value",
-        reasoner=None,
-    )
-    tokenizer = Tokenizer(
-        input_fields=[{"type": "text", "input_field": "action", "format": "{field}", "head_output": True},
-            {
-                "type": "text",
-                "input_field": "episode_index",
-                "format": "{field}",
-                "when": when_step_index_zero,
-            },
-        ],
-        objective_fields=[],
-        tokenizer=IntIdTokenizer(),
-    )
-    with pytest.raises(ValueError, match="tokenizer_repo_id"):
-        push_model_to_hub(
-            model=model,
-            tokenizer=tokenizer,
-            repo_id="same-id",
-            tokenizer_repo_id="same-id",
-        )
-    with pytest.raises(TypeError, match="tokenizer_repo_id"):
-        push_model_to_hub(  # type: ignore[call-arg]
-            model=model,
-            tokenizer=tokenizer,
-            repo_id="my-model",
-        )
+    model = simple_model(backbone=IdentityBackbone(hidden_dim=8, vocab_size=32), heads=({'action_value': (head := MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0))}), reasoner=None)
+    tokenizer = Tokenizer(input_fields=[{'type': 'text', 'input_field': 'action', 'format': '{field}', 'head_output': True}, {'type': 'text', 'input_field': 'episode_index', 'format': '{field}', 'when': when_step_index_zero}], objective_fields=[], tokenizer=IntIdTokenizer())
+    with pytest.raises(ValueError, match='tokenizer_repo_id'):
+        push_model_to_hub(model=model, tokenizer=tokenizer, repo_id='same-id', tokenizer_repo_id='same-id')
+    with pytest.raises(TypeError, match='tokenizer_repo_id'):
+        push_model_to_hub(model=model, tokenizer=tokenizer, repo_id='my-model')  # type: ignore[call-arg]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 """Tests for Tokenizer (fake tokenizer / embeddings, no Hub)."""
+from tests._model_helpers import simple_model
 
 from typing import Any
 
@@ -12,9 +13,9 @@ from tests._token_batch_helpers import (
     batch_to_packed,
     batch_to_token_batch,
 )
-from mouse_core.models import Model
+
 from mouse_core.models.backbone import IdentityBackbone
-from mouse_core.models.heads import RegressionHead
+from mouse_core.models.mlp import MLP
 
 def when_episode_done_nonzero(ctx):
     return "episode_done" in ctx and ctx["episode_done"] != 0
@@ -1033,29 +1034,14 @@ def test_text_tokenizer_keeps_length_one_vector_as_vector() -> None:
 
 def test_text_model_card_describes_tokenizer(tmp_path) -> None:
     from mouse_core.models.io import _write_model_card
-
-    model = Model(
-        backbone=IdentityBackbone(hidden_dim=8, vocab_size=16),
-        heads=(head := RegressionHead(
-            in_features=8, out_features=4, hidden_dim=8, num_layers=1,
-            propagate_gradient=1.0,
-        )),
-        action_source="action_value",
-        reasoner=None,
-    )
-    path = tmp_path / "README.md"
-    _write_model_card(
-        repo_id="user/mouse-text",
-        tokenizer_repo_id="user/mouse-text-tokenizer",
-        model=model,
-        path=path,
-    )
+    model = simple_model(backbone=IdentityBackbone(hidden_dim=8, vocab_size=16), heads=({'action_value': (head := MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0))}), reasoner=None)
+    path = tmp_path / 'README.md'
+    _write_model_card(repo_id='user/mouse-text', tokenizer_repo_id='user/mouse-text-tokenizer', model=model, path=path)
     text = path.read_text()
-    assert "embed_tokens" in text
-    assert "Tokenizer" in text
-    assert "from mouse_core.data import load_tokenizer" in text
-    assert "load_tokenizer(" in text
-    assert "user/mouse-text-tokenizer" in text
+    assert 'embed_tokens' in text
+    assert 'tokenizer' in text
+    assert 'mouse_core.data.load_tokenizer' in text
+    assert 'user/mouse-text-tokenizer' in text
 
 
 

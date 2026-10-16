@@ -179,14 +179,13 @@ class PpoObjective(Objective[...]):
             ],
         )
         from mouse_core.data import to_device
-        from mouse_core.models import prediction_key
         inputs, objective_data, group_id = loader.next_batch()
         out = model(inputs)
         losses, metrics = objective(
             objective_data=to_device(data=objective_data, device=device),
             group_id=group_id.to(device),
-            predictions=out.predictions[prediction_key(head=policy_head)],
-            value_predictions=out.predictions[prediction_key(head=value_head)],
+            predictions=out.predictions["action"],
+            value_predictions=out.predictions["value"],
         )
         loss = torch.stack(tuple(losses.values())).sum()
 

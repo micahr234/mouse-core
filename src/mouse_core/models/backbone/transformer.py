@@ -1,6 +1,6 @@
 """Single public transformer backbone.
 
-``TransformerBackbone`` is the one way to attach a decoder stack. Construction
+``Backbone`` is the one way to attach a decoder stack. Construction
 is either ``pretrained=`` (Hub / local checkpoint: inspect, then packed kernels
 or HuggingFace ``forward``) or ``architecture=`` plus width (a llama / qwen3
 stack from scratch, or ``architecture="hf"`` with a saved ``hf_config``).
@@ -22,7 +22,7 @@ from torch import nn
 
 from mouse_core.data.token_batch import TokenBatch
 from mouse_core.models.backbone.base import (
-    Backbone,
+    BaseBackbone,
     DecodeKernel,
     TrainKernel,
     _load_transformer_weights,
@@ -164,7 +164,19 @@ def _hidden_size(cfg: Any) -> int:
     raise ValueError("HuggingFace config has no hidden_size / n_embd / d_model.")
 
 
-class TransformerBackbone(Backbone):
+def _remove_output_norm(model: nn.Module) -> None:
+    """Bypass decoder output norms while retaining the HF forward interface."""
+    for parent_path in ("", "decoder"):
+        parent = model if not parent_path else getattr(model, parent_path, None)
+        if not isinstance(parent, nn.Module):
+            continue
+        for name in ("norm", "ln_f", "final_layer_norm"):
+            norm = getattr(parent, name, None)
+            if isinstance(norm, nn.Module):
+                setattr(parent, name, nn.Identity())
+
+
+class Backbone(BaseBackbone):
     """Decoder stack with packed kernels when the layout allows, else HF forward.
 
     ``train_kernel`` (``"varlen"`` / ``"padded"`` / ``"flex"`` / ``"reference"``),
@@ -172,8 +184,9 @@ class TransformerBackbone(Backbone):
     the uncached-forward kernel, the cached-decode kernel, and the dtype of
     the base weights (``torch.float32`` to fine-tune them,
     ``preferred_dtype(device=device)`` for a frozen LoRA base or inference).
-    The transformer's native final normalization is always retained and
-    its pretrained weights are loaded along with the decoder layers.
+    The transformer's final normalization is removed. The backbone returns
+    the final decoder layer's residual stream; projection and prediction
+    heads own their input normalization.
 
     Pass **either** ``pretrained=`` **or** ``architecture=``:
 
@@ -225,18 +238,18 @@ class TransformerBackbone(Backbone):
         super().__init__()
         if "use_norm" in config_kwargs:
             raise TypeError(
-                "TransformerBackbone no longer accepts use_norm; "
-                "the native final normalization is always retained."
+                "Backbone no longer accepts use_norm; "
+                "the final output normalization is always removed."
             )
         self._set_kernels(train_kernel, decode_kernel)
         if not isinstance(dtype, torch.dtype) or not dtype.is_floating_point:
             raise TypeError(f"dtype must be a floating point torch.dtype, got {dtype!r}.")
         self._set_autocast(train_autocast_dtype, decode_autocast_dtype, dtype)
         if pretrained is not None and architecture is not None:
-            raise TypeError("TransformerBackbone accepts either pretrained= or architecture=, not both.")
+            raise TypeError("Backbone accepts either pretrained= or architecture=, not both.")
         if pretrained is None and architecture is None:
             raise TypeError(
-                "TransformerBackbone requires pretrained= or architecture= "
+                "Backbone requires pretrained= or architecture= "
                 "('llama', 'qwen3', or 'hf')."
             )
         self.num_frequencies = check_num_frequencies(num_frequencies)
@@ -279,7 +292,7 @@ class TransformerBackbone(Backbone):
                 if hidden_dim is None:
                     raise TypeError(
                         f"architecture={architecture!r} requires hidden_dim plus stack "
-                        "arguments (e.g. TransformerBackbone(architecture='qwen3', "
+                        "arguments (e.g. Backbone(architecture='qwen3', "
                         "hidden_dim=128, num_layers=2, num_heads=4))."
                     )
                 self._init_named_stack(
@@ -289,6 +302,7 @@ class TransformerBackbone(Backbone):
                     lora=lora,
                     config_kwargs=config_kwargs,
                 )
+        _remove_output_norm(_as_module(self.model))
         self._install_fourier(dtype=dtype)
 
     def _install_fourier(self, *, dtype: torch.dtype) -> None:
@@ -353,7 +367,7 @@ class TransformerBackbone(Backbone):
         reason = grouping_unsupported_reason(raw_cfg)
         if reason is not None:
             raise ValueError(
-                f"TransformerBackbone cannot guarantee grouping isolation for "
+                f"Backbone cannot guarantee grouping isolation for "
                 f"{str(pretrained)!r}: {reason}."
             )
         model_type = str(_cfg_get(raw_cfg, "model_type") or "").lower()
@@ -392,7 +406,7 @@ class TransformerBackbone(Backbone):
         reason = grouping_unsupported_reason(getattr(loaded, "config", None))
         if reason is not None:
             raise ValueError(
-                f"TransformerBackbone cannot guarantee grouping isolation for "
+                f"Backbone cannot guarantee grouping isolation for "
                 f"{str(pretrained)!r}: {reason}."
             )
         if hidden_dim is not None and int(hidden_dim) != _hidden_size(loaded.config):
@@ -462,7 +476,7 @@ class TransformerBackbone(Backbone):
             _ensure_packed_head_dim(model)
         elif grouping_unsupported_reason(getattr(model, "config", None)) is not None:
             raise ValueError(
-                "TransformerBackbone cannot guarantee grouping isolation for "
+                "Backbone cannot guarantee grouping isolation for "
                 f"this stack: {grouping_unsupported_reason(model.config)}."
             )
         else:
@@ -517,7 +531,7 @@ class TransformerBackbone(Backbone):
         if output_hidden_states:
             states = getattr(out, "hidden_states", None)
             if states is None:
-                raise RuntimeError("TransformerBackbone expected hidden_states but the model returned None.")
+                raise RuntimeError("Backbone expected hidden_states but the model returned None.")
             # HF includes the embedding output at index 0; drop it so the tuple is post-layer states.
             layer_states = states[1:] if len(states) > 1 else states
             return hidden, tuple(layer_states)

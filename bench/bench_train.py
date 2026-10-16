@@ -51,7 +51,7 @@ from typing import Any, cast
 
 import torch
 
-from mouse_core.models.backbone import TrainKernel, TransformerBackbone, install_compiled_decoder, packed_forward
+from mouse_core.models.backbone import TrainKernel, Backbone, install_compiled_decoder, packed_forward
 from mouse_core.models.lora import LoRAConfig
 from mouse_core.optim import AdamW
 
@@ -138,7 +138,7 @@ def main() -> None:
     lora = None if args.no_lora else LoRAConfig(rank=16, alpha=32.0)
     kernels = cast(list[TrainKernel], args.train_kernel)
     dtype = torch.float32 if lora is None else torch.bfloat16
-    backbone = TransformerBackbone(
+    backbone = Backbone(
         train_kernel=kernels[0],
         decode_kernel="flex",
         dtype=dtype,
@@ -170,10 +170,10 @@ def main() -> None:
             install_compiled_decoder()
         backbone.gradient_checkpointing = "checkpoint" in mode
         for kernel in kernels:
-            other: TrainKernel = next(
+            other = cast(TrainKernel, next(
                 (k for k in ("varlen", "flex", "padded") if k != kernel and k in kernels),
                 "varlen" if kernel != "varlen" else "flex",
-            )
+            ))
             print(f"\n### mode: {mode} | train_kernel: {kernel}")
             for wname in args.workloads:
                 seq = _workload(wname, device)

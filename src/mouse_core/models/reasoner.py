@@ -30,7 +30,7 @@ class LatentReasoner(nn.Module):
 
     ``forward`` takes the backbone output at the previous position ``[B, D]``
     and returns the input embedding of the next latent thought ``[B, D]``
-    (LayerNorm + Linear). Attach to a model with ``Model(reasoner=...)``;
+    (LayerNorm + Linear). Attach to a model with ``TokenEncoder(reasoner=...)``;
     it stays float32 under ``Model.to`` and casts the backbone output to its
     own dtype.
 

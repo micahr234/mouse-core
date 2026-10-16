@@ -1,6 +1,9 @@
 """Coconut-style latent reasoning: generation, bookkeeping, gradients, delayed copy."""
 
 from __future__ import annotations
+from tests._model_helpers import fresh_model, ExampleModel as Model
+from typing import Any, cast
+from tests._model_helpers import copy_model, simple_model
 
 import numpy as np
 import pytest
@@ -8,13 +11,12 @@ import torch
 
 from mouse_core.models import (
     LatentReasoner,
-    Model,
     load_model,
     sample_reasoning_splits,
     save_model,
 )
-from mouse_core.models.backbone import TransformerBackbone, LoRAConfig
-from mouse_core.models.heads import RegressionHead
+from mouse_core.models.backbone import Backbone, LoRAConfig
+from mouse_core.models.mlp import MLP
 from mouse_core.models.reasoner import _plan_insertions
 from tests._token_batch_helpers import batch_to_token_batch, token_tokenizer
 
@@ -24,28 +26,11 @@ _TOK = token_tokenizer("action", "observation", "episode_done")
 _TOKENS_PER_STEP = 3
 
 
-def _tiny_model(*, num_thoughts: int = 2, with_reasoner: bool = True) -> Model:
-    backbone = TransformerBackbone(architecture="llama", 
-        train_kernel="reference", decode_kernel="flex", dtype=torch.float32,
-        hidden_dim=_HIDDEN,
-        num_layers=2,
-        num_heads=2,
-        max_position_embeddings=128,
-        vocab_size=32,
-        lora=LoRAConfig(rank=4))
-    heads = RegressionHead(
-        in_features=_HIDDEN,
-        out_features=_ACTIONS,
-        hidden_dim=_HIDDEN,
-        num_layers=1,
-        propagate_gradient=1.0,
-    )
-    reasoner = (
-        LatentReasoner(hidden_dim=_HIDDEN, num_thoughts=num_thoughts)
-        if with_reasoner
-        else None
-    )
-    return Model(backbone=backbone, heads=heads, action_source="action_value", reasoner=reasoner)
+def _tiny_model(*, num_thoughts: int=2, with_reasoner: bool=True) -> Model:
+    backbone = Backbone(architecture='llama', train_kernel='reference', decode_kernel='flex', dtype=torch.float32, hidden_dim=_HIDDEN, num_layers=2, num_heads=2, max_position_embeddings=128, vocab_size=32, lora=LoRAConfig(rank=4))
+    heads = MLP(in_features=_HIDDEN, out_features=_ACTIONS, hidden_dim=_HIDDEN, num_layers=1, propagate_gradient=1.0)
+    reasoner = LatentReasoner(hidden_dim=_HIDDEN, num_thoughts=num_thoughts) if with_reasoner else None
+    return simple_model(backbone=backbone, heads={'action_value': heads}, reasoner=reasoner)
 
 
 def _rows(n: int, offset: int = 0, groups: list[int] | None = None) -> list[dict]:
@@ -153,12 +138,13 @@ def test_gradients_flow_through_latent_chain() -> None:
     model = _tiny_model().train()
     batch = _token_batch(model, _BATCH)
     predictions = model(batch, reasoning=[1, -1]).predictions
-    loss = predictions["action_value"][2].sum()  # post-burst step of sequence 0
+    loss = predictions['action_value'][2].sum()
     loss.backward()
-    proj_grad = model.reasoner.proj.weight.grad  # type: ignore[union-attr]
+    assert model.encoder.reasoner is not None
+    proj_grad = model.encoder.reasoner.proj.weight.grad
     assert proj_grad is not None and float(proj_grad.abs().sum()) > 0.0
-    q_proj = model.backbone.model.layers[0].self_attn.q_proj  # type: ignore[union-attr]
-    assert q_proj.base.weight.grad is None  # frozen base
+    q_proj = cast(Any, model.encoder.backbones[0]).model.layers[0].self_attn.q_proj
+    assert q_proj.base.weight.grad is None
     lora_grad = q_proj.lora_B.weight.grad
     assert lora_grad is not None and float(lora_grad.abs().sum()) > 0.0
 
@@ -170,7 +156,8 @@ def test_pre_burst_loss_gives_no_reasoner_gradient() -> None:
     predictions = model(batch, reasoning=[1, -1]).predictions
     loss = predictions["action_value"][0].sum()  # step before the burst
     loss.backward()
-    proj_grad = model.reasoner.proj.weight.grad  # type: ignore[union-attr]
+    assert model.encoder.reasoner is not None
+    proj_grad = model.encoder.reasoner.proj.weight.grad  # type: ignore[union-attr]
     assert proj_grad is None or float(proj_grad.abs().sum()) == 0.0
 
 
@@ -209,35 +196,32 @@ def test_delayed_model_parity_with_reasoning() -> None:
     delayed reasoning forward on the same bursts matches the online one."""
     torch.manual_seed(0)
     model = _tiny_model().eval()
-    delayed = model.copy(heads=True, backbone=True, reasoner=True).eval()
-    assert delayed.reasoner is not None and delayed.reasoner is not model.reasoner
+    delayed = copy_model(model, heads=True, backbone=True, reasoner=True).eval()
+    assert delayed.encoder.reasoner is not None and delayed.encoder.reasoner is not model.encoder.reasoner
     batch = _token_batch(model, _BATCH)
     out = model(batch, reasoning=[1, 0])
     with torch.no_grad():
         delayed_out = delayed(batch, reasoning=[1, 0])
     assert torch.equal(out.head_output_indices, delayed_out.head_output_indices)
-    assert torch.allclose(
-        out.predictions["action_value"], delayed_out.predictions["action_value"], atol=1e-5
-    )
-    assert not delayed_out.predictions["action_value"].requires_grad
+    assert torch.allclose(out.predictions['action_value'], delayed_out.predictions['action_value'], atol=1e-05)
+    assert not delayed_out.predictions['action_value'].requires_grad
 
 
 def test_delayed_reasoning_builds_no_autograd_graph() -> None:
     torch.manual_seed(0)
     model = _tiny_model().train()
-    delayed = model.copy(heads=True, backbone=True, reasoner=True)
+    delayed = copy_model(model, heads=True, backbone=True, reasoner=True)
     batch = _token_batch(model, _BATCH)
-    saved = {"n": 0}
+    saved = {'n': 0}
 
     def pack(tensor: torch.Tensor) -> torch.Tensor:
-        saved["n"] += 1
+        saved['n'] += 1
         return tensor
-
     with torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t):
         with torch.no_grad():
             delayed_out = delayed(batch, reasoning=[1, 0])
-    assert saved["n"] == 0
-    assert delayed_out.predictions["action_value"].grad_fn is None
+    assert saved['n'] == 0
+    assert delayed_out.predictions['action_value'].grad_fn is None
 
 
 def test_reasoning_states_stay_on_the_tape() -> None:
@@ -252,13 +236,11 @@ def test_save_load_roundtrip_with_reasoner(tmp_path) -> None:
     torch.manual_seed(0)
     model = _tiny_model(num_thoughts=3).eval()
     save_model(model=model, path=tmp_path)
-    loaded = load_model(repo_id_or_path=str(tmp_path), train_kernel="reference", decode_kernel="flex", dtype=torch.float32, map_location="cpu").eval()
-    assert loaded.reasoner is not None
-    assert loaded.reasoner.num_thoughts == 3
+    loaded = load_model(model=fresh_model(model), repo_id_or_path=str(tmp_path), map_location='cpu').eval()
+    assert loaded.encoder.reasoner is not None
+    assert loaded.encoder.reasoner.num_thoughts == 3
     batch = _token_batch(model, _BATCH)
     with torch.no_grad():
         original = model(batch, reasoning=[1, 0]).predictions
         reloaded = loaded(batch, reasoning=[1, 0]).predictions
-    assert torch.allclose(
-        original["action_value"], reloaded["action_value"], atol=1e-6
-    )
+    assert torch.allclose(original['action_value'], reloaded['action_value'], atol=1e-06)

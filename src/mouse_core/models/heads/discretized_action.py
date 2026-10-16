@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import torch
 
-from mouse_core.models.heads.regression import RegressionHead
+from mouse_core.models.mlp import MLP
 
 
-class DiscretizedActionHead(RegressionHead):
+class DiscretizedActionHead(MLP):
     """One Q-value per row of a fixed ``[num_actions, action_dim]`` table.
 
-    ``forward`` returns raw Q-values, just like :class:`RegressionHead`.
+    ``forward`` returns raw Q-values, just like :class:`MLP`.
     ``discrete_to_continuous`` decodes selected IDs; ``continuous_to_discrete``
     quantizes vectors to their nearest row by Euclidean distance in the
     table's original units. Ties choose the lowest ID. For differently scaled

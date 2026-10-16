@@ -1,4 +1,4 @@
-"""Llama decoder stack builder used by :class:`TransformerBackbone`."""
+"""Llama decoder stack builder used by :class:`Backbone`."""
 
 from __future__ import annotations
 
