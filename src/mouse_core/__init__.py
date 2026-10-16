@@ -4,6 +4,7 @@ from mouse_core.models import Model, load_model
 from mouse_core.data import load_tokenizer
 from mouse_core.objectives import Objective
 from mouse_core.optim import AdamW
+from mouse_core.adamp import AdamP
 from mouse_core.polyak import polyak_update
 from mouse_core.schedule import ExponentialDecay, Piecewise
 
@@ -16,6 +17,7 @@ __all__ = [
     "load_tokenizer",
     "Objective",
     "AdamW",
+    "AdamP",
     "polyak_update",
     "ExponentialDecay",
     "Piecewise",
