@@ -34,7 +34,7 @@ def _tokens(*actions):
     return batch_to_token_batch(token_tokenizer("action"), [[{"action": action} for action in actions]])
 
 
-def _example(path):
+def _example(path, **overrides):
     """Use the notebook's construction code with small local backend factories."""
     notebook = json.loads(path.read_text())
     namespace: dict[str, Any] = {**globals(), "device": torch.device("cpu")}
@@ -54,6 +54,7 @@ def _example(path):
         vocabulary={str(i): i for i in range(32)},
         action_vectors=torch.tensor([[-2.], [0.], [2.]]),
     )
+    namespace.update(overrides)
     construction = []
 
     def embedding_factory(**kwargs):

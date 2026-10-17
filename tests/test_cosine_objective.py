@@ -134,8 +134,13 @@ def test_offline_dqn_cosine_example(monkeypatch):
     assert q_head.mlp.num_layers == 1 and q_head.mlp.scale == 0.1
     assert q_head.mlp.propagate_gradient == 1.0
     transition = namespace["TransitionModel"](
-        latent_dim=8, num_actions=3, action_embedding_dim=8, num_blocks=2, block_layers=2,
+        latent_dim=8, num_actions=3, num_blocks=2,
     )
+    assert transition.action_embedding.embedding_dim == 8
+    for block in transition.blocks:
+        assert block.in_features == 8
+        assert block.num_layers == 2 and block.hidden_dim == 32 and block.scale is None
+    assert isinstance(transition.output_norm, nn.RMSNorm)
     delayed_encoder = deepcopy(encoder).requires_grad_(False).eval()
     backup_value_head = deepcopy(q_head).requires_grad_(False).eval()
     backup_action_head = deepcopy(q_head).requires_grad_(False).eval()
@@ -209,17 +214,18 @@ def test_offline_dqn_cosine_example(monkeypatch):
     assert transition.action_embedding.weight is not encoder.embedding.embed_tokens.weight
     assert "action_embedding.weight" in transition.state_dict()
 
-    # With zero residual updates, every block preserves z and its gradient.
+    # With zero residual updates, every block preserves the conditioned input before final RMSNorm.
     from copy import deepcopy
     residual = deepcopy(transition)
     with torch.no_grad():
-        for parameter in residual.parameters():
+        for parameter in residual.blocks.parameters():
             parameter.zero_()
     state = torch.randn(2, 8, requires_grad=True)
     identity = residual(state, torch.tensor([0, 1]))
-    torch.testing.assert_close(identity, state)
+    torch.testing.assert_close(identity, residual.output_norm(
+        residual.input_norm(state) + residual.action_embedding(torch.tensor([0, 1]))))
     identity.sum().backward()
-    torch.testing.assert_close(state.grad, torch.ones_like(state))
+    assert state.grad is not None and state.grad.abs().sum() > 0
 
     class Loader:
         def next_batch(self):
@@ -304,3 +310,22 @@ def test_sequential_cosine_without_pairs_does_not_call_transition(n):
     assert losses["cosine"].item() == 0
     losses["cosine"].backward()
     assert z.grad is not None
+
+
+def test_example_zero_weight_omits_transition_and_auxiliary_loss():
+    from tests.test_example_modules import _example, EXAMPLES, _tokens
+    notebook, ns = _example(EXAMPLES / "21_train_dqn_cosine.ipynb", COSINE_LOSS_WEIGHT=0.0)
+    assert ns["transition"] is None
+    source = next("".join(c["source"]) for c in notebook["cells"]
+                  if "def run_train(" in "".join(c["source"]))
+    exec(compile(source, "cosine-example", "exec"), ns)
+    assert ns["cosine_objective"] is None
+    data = dict(action=torch.tensor([0, 1]), reward=torch.tensor([0., 1.]),
+                terminated=torch.tensor([False, True]), truncated=torch.tensor([False, False]))
+    from types import SimpleNamespace
+    ns["loader"] = SimpleNamespace(next_batch=lambda: (_tokens(0, 1), data, torch.zeros(2, dtype=torch.long)))
+    loss, metrics = ns["run_train"](num_steps=1)
+    assert torch.isfinite(loss) and "cosine" not in metrics
+    optimized = {id(p) for g in ns["optimizer"].param_groups for p in g["params"]}
+    expected = {id(p) for module in (ns["encoder"], ns["q_head"]) for p in module.parameters()}
+    assert optimized == expected
