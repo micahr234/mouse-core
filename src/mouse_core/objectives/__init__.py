@@ -1,4 +1,5 @@
 from mouse_core.objectives.base import Objective
+from mouse_core.objectives.cosine import CosineObjective
 from mouse_core.objectives.dqn import CrossGroupBackups, DqnObjective
 from mouse_core.objectives.transforms import (
     Discount,
@@ -22,6 +23,7 @@ from mouse_core.objectives.sv import SvObjective
 
 __all__ = [
     "Objective",
+    "CosineObjective",
     "Discount",
     "Gate",
     "Reward",

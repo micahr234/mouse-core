@@ -3,6 +3,7 @@ import copy
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 import torch
@@ -15,7 +16,7 @@ def test_example_branches_share_random_state_and_use_terminal_rewards():
     source = next(''.join(cell['source']) for cell in notebook['cells']
                   if 'def rollout_branch(' in ''.join(cell['source']))
     names = {'rollout_branch', 'fork_group', 'stamp_advantages_with_prefix_len'}
-    definitions = [node for node in ast.parse(source).body
+    definitions: list[ast.stmt] = [node for node in ast.parse(source).body
                    if isinstance(node, ast.FunctionDef) and node.name in names]
     policy_calls = 0
 
@@ -37,14 +38,14 @@ def test_example_branches_share_random_state_and_use_terminal_rewards():
         def close(self):
             pass
 
-    namespace = dict(Model=object, BRANCHES_PER_ENV=2, copy=copy, torch=torch,
+    namespace: dict[str, Any] = dict(modules=SimpleNamespace(eval=lambda: None), Model=object, BRANCHES_PER_ENV=2, copy=copy, torch=torch,
                      act_once=act_once, step_row=lambda **kw: kw['output'],
                      group_relative_advantages=group_relative_advantages)
     exec(compile(ast.Module(body=definitions, type_ignores=[]), str(path), 'exec'), namespace)
     env = Env()
     prefix = [dict(terminated=False, truncated=False, repeat_episode_ended=False, step_index=0, reward=0)]
     branches, returns = namespace['fork_group'](
-        model=SimpleNamespace(eval=lambda: None), env=env, prefix=prefix, cursor={})
+        env=env, prefix=prefix, cursor={})
     assert env.steps == 0
     assert returns == [0.0, 1.0]
     assert all(len(rows) == 61 and rows[-1]['terminated'] for rows in branches)
@@ -74,15 +75,14 @@ def test_example_collection_starts_new_groups_without_prior_history():
         seen.append((prefix[0]['seed'], kwargs['cursor']['episode_index']))
         return [prefix, copy.deepcopy(prefix)], [0, 0]
 
-    namespace = dict(Model=object, Datastore=Datastore, SEED_OFFSET=10, BRANCHES_PER_ENV=2,
+    namespace: dict[str, Any] = dict(modules=SimpleNamespace(eval=lambda: None), Model=object, Datastore=Datastore, SEED_OFFSET=10, BRANCHES_PER_ENV=2,
                      next_episode_index=0, stores=[], make_episode_env=make_episode_env,
                      fresh_cursor=lambda: {}, step_row=lambda **kw: kw['output'],
                      fork_group=fork_group,
                      stamp_advantages_with_prefix_len=lambda **kw: kw['branches'])
     exec(compile(source, str(path), 'exec'), namespace)
-    model = SimpleNamespace(eval=lambda: None)
-    assert namespace['run_rollout'](model=model, num_envs=2) == (2, 4)
-    assert namespace['run_rollout'](model=model, num_envs=2) == (2, 4)
+    assert namespace['run_rollout'](num_envs=2) == (2, 4)
+    assert namespace['run_rollout'](num_envs=2) == (2, 4)
     assert seen == [(10, 0), (11, 1), (12, 2), (13, 3)]
     assert len(namespace['stores']) == 4
 

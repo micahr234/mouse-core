@@ -7,14 +7,16 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
+from torch import nn
 
 if TYPE_CHECKING:
     from mouse_core.data.tokenizer import Tokenizer
-    from mouse_core.models.base import Model
 
 
-def save_model(*, model: Model, path: str | Path) -> None:
+def save_model(*, model: nn.Module, path: str | Path) -> None:
     """Save online weights and identifying metadata, without training state.
+
+    Accepts an individual module or a ModuleDict of separate encoders and heads.
 
     The caller owns the model implementation and construction settings.
     Optimizers, delayed models, and Python forward code are not serialized.
@@ -29,7 +31,7 @@ def save_model(*, model: Model, path: str | Path) -> None:
     torch.save(model.state_dict(), path / "pytorch_model.bin")
 
 
-def load_model[T: Model](
+def load_model[T: nn.Module](
     *, model: T, repo_id_or_path: str | Path, force_download: bool = True,
     local_dir: str | Path | None = None, map_location: str | torch.device = "cpu",
     **kwargs: Any,
@@ -65,7 +67,7 @@ def load_model[T: Model](
 
 def push_model_to_hub(
     *,
-    model: "Model",
+    model: nn.Module,
     tokenizer: "Tokenizer",
     repo_id: str,
     commit_message: str = "Upload MOUSE model and tokenizer",
@@ -138,7 +140,7 @@ def _create_hub_repo(
     return str(repo_url), hub_repo_id
 
 
-def _write_model_card(*, model: Model, repo_id: str, path: Path) -> None:
+def _write_model_card(*, model: nn.Module, repo_id: str, path: Path) -> None:
     path.write_text(
         f"---\nlibrary_name: mouse-core\ntags:\n- mouse-core\n- reinforcement-learning\n---\n\n"
         f"# {repo_id}\n\n"
