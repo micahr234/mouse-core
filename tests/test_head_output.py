@@ -15,8 +15,8 @@ from mouse_core.models.mlp import MLP
 from mouse_core.models.reasoner import _plan_insertions
 from mouse_core.objectives import DqnObjective, affine_reward, affine_value, boundary_discount
 
-def when_episode_done_nonzero(ctx):
-    return "episode_done" in ctx and ctx["episode_done"] != 0
+def when_repeat_episode_done_nonzero(ctx):
+    return "repeat_episode_done" in ctx and ctx["repeat_episode_done"] != 0
 
 
 def when_group_start(ctx):
@@ -90,7 +90,7 @@ def _head_output_tokenizer(
     fields.append(
         {
             "type": "text",
-            "input_field": "episode_index",
+            "input_field": "repeat_episode_index",
             "format": "{field}",
             "when": when_step_index_zero,
         }
@@ -110,7 +110,7 @@ def _head_output_tokenizer(
     )
 
 
-_TOK = _head_output_tokenizer("action", "observation", "episode_done")
+_TOK = _head_output_tokenizer("action", "observation", "repeat_episode_done")
 
 
 def _tiny_model(*, with_reasoner: bool=False) -> Model:
@@ -126,8 +126,8 @@ def _rows(n: int, offset: int = 0) -> list[dict]:
             "action": (i + offset) % _ACTIONS,
             "observation": (3 * i + offset) % 16,
             "reward": float(i),
+            "repeat_episode_done": 0,
             "episode_done": 0,
-            "task_done": 0,
             "grouping_id": 0,
         }
         for i in range(n)
@@ -152,7 +152,7 @@ def test_tokenizer_requires_exactly_one_head_output_field() -> None:
             input_fields=[{"type": "text", "input_field": "action", "format": "{field}"},
                 {
                     "type": "text",
-                    "input_field": "episode_index",
+                    "input_field": "repeat_episode_index",
                     "format": "{field}",
                     "when": when_step_index_zero,
                 },
@@ -165,7 +165,7 @@ def test_tokenizer_requires_exactly_one_head_output_field() -> None:
                 {"type": "text", "input_field": "obs", "format": "{field}", "head_output": True},
                 {
                     "type": "text",
-                    "input_field": "episode_index",
+                    "input_field": "repeat_episode_index",
                     "format": "{field}",
                     "when": when_step_index_zero,
                 },
@@ -186,7 +186,7 @@ def test_step_without_head_output_token_raises() -> None:
             },
             {
                 "type": "text",
-                "input_field": "episode_index",
+                "input_field": "repeat_episode_index",
                 "format": "{field}",
                 "when": when_step_index_zero,
             },
@@ -194,11 +194,11 @@ def test_step_without_head_output_token_raises() -> None:
         tokenizer=_FakeTokenizer(),
     )
     # Head-output field present → fine.
-    st = tok({"action": 1, "reward": 0.5, "task_index": 0})
+    st = tok({"action": 1, "reward": 0.5, "episode_index": 0})
     assert st.head_token_mask.tolist() == [False] + [True] * len("0.5")
     # Head-output field missing → the step has no head-output token.
     with pytest.raises(ValueError, match="no head-output tokens"):
-        tok({"action": 1, "reward": None, "task_index": 0})
+        tok({"action": 1, "reward": None, "episode_index": 0})
 
 
 def test_head_output_rejects_when() -> None:

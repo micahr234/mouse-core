@@ -11,9 +11,8 @@ literal-token, and image fields set the mask to false. Pack ragged rows
 with :meth:`Tokenizer.pack_rows`; pack already-tokenized steps with
 :func:`~mouse_core.data.token_batch.pack_token_batch`.
 :func:`save_tokenizer` writes the packing spec as ``tokenizer.json``;
-:func:`load_tokenizer` is the one recall path. Hub upload goes to its
-own repo via :func:`~mouse_core.models.io.push_model_to_hub`
-(``tokenizer_repo_id=``).
+:func:`load_tokenizer` is the one recall path. Hub upload saves it alongside
+the model via :func:`~mouse_core.models.io.push_model_to_hub`.
 """
 
 from __future__ import annotations
@@ -606,7 +605,7 @@ def tokenizer_config(*, tokenizer: Tokenizer) -> dict[str, Any]:
 
 
 def save_tokenizer(*, tokenizer: Tokenizer, path: str | Path) -> None:
-    """Write ``tokenizer.json`` into *path* (its own directory, not the model)."""
+    """Write ``tokenizer.json`` into *path*, which may also contain model weights."""
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
     with (path / TOKENIZER_FILENAME).open("w") as fh:
@@ -633,7 +632,7 @@ def load_tokenizer(
 
     Args:
         repo_id_or_path: Local tokenizer directory or Hub repo id from
-            :func:`save_tokenizer` / ``push_model_to_hub(..., tokenizer_repo_id=)``.
+            :func:`save_tokenizer` / ``push_model_to_hub(..., repo_id=)``.
         tokenizer: Optional already-built HF tokenizer. Overrides
             ``pretrained`` in the file.
         image_tokenizer: Required when the spec has ``image`` fields.
@@ -647,7 +646,7 @@ def load_tokenizer(
         if not config_path.is_file():
             raise FileNotFoundError(
                 f"{config_path} is missing; save the tokenizer with "
-                "save_tokenizer or push_model_to_hub(..., tokenizer_repo_id=)."
+                "save_tokenizer or push_model_to_hub(..., repo_id=)."
             )
         with config_path.open() as fh:
             config = json.load(fh)
@@ -671,7 +670,7 @@ def load_tokenizer(
     if config.get("format") != TOKENIZER_FORMAT:
         raise ValueError(
             "Unsupported tokenizer config format. Expected a MOUSE tokenizer "
-            "saved with save_tokenizer or push_model_to_hub(..., tokenizer_repo_id=)."
+            "saved with save_tokenizer or push_model_to_hub(..., repo_id=)."
         )
     return Tokenizer(
         input_fields=config["input_fields"],

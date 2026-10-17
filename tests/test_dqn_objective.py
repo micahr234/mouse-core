@@ -228,7 +228,7 @@ def test_dqn_metrics_backup_matches_loss_target() -> None:
         'reward': torch.tensor([0.0, 1.0]),
         'terminated': torch.zeros(2, dtype=torch.int64),
         'truncated': torch.zeros(2, dtype=torch.int64),
-        'task_index': torch.zeros(2, dtype=torch.int64),
+        'episode_index': torch.zeros(2, dtype=torch.int64),
     }
     online = torch.zeros(2, 2, requires_grad=True)
     delayed = torch.tensor([[0.0, 0.0], [5.0, 0.0]])
@@ -406,7 +406,7 @@ def test_dqn_objective_all_out_of_run_pairs_yield_zero_loss() -> None:
     assert abs(loss["action_value"].item()) < 1e-05
     assert abs(metrics['q_values_mean']) < 1e-05
 
-def test_dqn_objective_skips_transitions_across_tasks() -> None:
+def test_dqn_objective_skips_transitions_across_episodes() -> None:
     """A pair whose steps belong to different samples is not a transition."""
     step_stream = {
             'action': torch.tensor([0, 1, 0]),
@@ -422,7 +422,7 @@ def test_dqn_objective_skips_transitions_across_tasks() -> None:
     assert abs(metrics['q_values_mean'] - 2.0) < 1e-05
 
 
-def test_pair_weight_zeros_window_cut_and_task_change() -> None:
+def test_pair_weight_zeros_window_cut_and_episode_change() -> None:
     """Last output of a sample has weight 0; an in-sample reset stays 1."""
     window = {
             'group_id': torch.tensor([0, 0, 1, 1]),
@@ -432,17 +432,17 @@ def test_pair_weight_zeros_window_cut_and_task_change() -> None:
         torch.tensor([1.0, 0.0, 1.0]),
     )
 
-    task_change = {
+    episode_change = {
             'group_id': torch.tensor([0, 0, 1]),
         }
     assert torch.equal(
-        _pair_weight(group_id=task_change["group_id"], N=3, device="cpu"),
+        _pair_weight(group_id=episode_change["group_id"], N=3, device="cpu"),
         torch.tensor([1.0, 0.0]),
     )
 
     reset = {
             'group_id': torch.tensor([0, 0, 0]),
-            'task_index': torch.tensor([0, 0, 0]),
+            'episode_index': torch.tensor([0, 0, 0]),
             'terminated': torch.tensor([0, 1, 0]),
         }
     assert torch.equal(
@@ -468,14 +468,14 @@ def test_weighted_mean_all_zero_is_zero() -> None:
 
 
 def test_dqn_same_run_episode_reset_trains_both_pairs() -> None:
-    """live→terminal→reset with the same group_id and task_index still trains."""
+    """live→terminal→reset with the same group_id and episode_index still trains."""
     step_stream = {
             'action': torch.tensor([0, 1, 0]),
             'reward': torch.tensor([0.0, 1.0, 5.0]),
             'terminated': torch.tensor([0, 1, 0]),
             'truncated': torch.tensor([0, 0, 0]),
             'group_id': torch.tensor([0, 0, 0]),
-            'task_index': torch.tensor([0, 0, 0]),
+            'episode_index': torch.tensor([0, 0, 0]),
         }
     predictions, delayed = _q(torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]]), torch.zeros(3, 2))
     loss, _ = DqnObjective( reward=_rew(), value=_val(), discount=_disc(gamma_step=0.0), temperature=0.0, gate=None, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
@@ -753,7 +753,7 @@ def test_td_lambda_truncation_gamma_carries_the_trace_discounted() -> None:
     assert abs(loss["action_value"].item() - (2601.0 + 12100.0) / 2) < 1e-03
 
 
-def test_td_lambda_task_gamma_scales_the_trace() -> None:
+def test_td_lambda_episode_gamma_scales_the_trace() -> None:
     step_stream, predictions, delayed = _lambda_fixture()
     step_stream = {key: value.clone() for key, value in step_stream.items()}
     step_stream["truncated"] = torch.tensor([0, 1, 0])
@@ -1604,11 +1604,11 @@ def test_true_terminal_stays_for_either_ignore_flag() -> None:
     episode_off = _cutoff_loss(cross_group_backups="ignore", terminated=terminal)
     assert abs(episode - 1.0) < 1e-05
     assert abs(episode_off - episode) < 1e-05
-    task = torch.tensor([0, 1])
-    task_on = _cutoff_loss(cross_group_backups="bootstrap", terminated=torch.zeros(2, dtype=torch.int64), truncated=task)
-    task_off = _cutoff_loss(cross_group_backups="ignore", terminated=torch.zeros(2, dtype=torch.int64), truncated=task)
-    assert abs(task_on - 1.0) < 1e-05
-    assert abs(task_off - task_on) < 1e-05
+    episode = torch.tensor([0, 1])
+    episode_on = _cutoff_loss(cross_group_backups="bootstrap", terminated=torch.zeros(2, dtype=torch.int64), truncated=episode)
+    episode_off = _cutoff_loss(cross_group_backups="ignore", terminated=torch.zeros(2, dtype=torch.int64), truncated=episode)
+    assert abs(episode_on - 1.0) < 1e-05
+    assert abs(episode_off - episode_on) < 1e-05
 
 
 def _long_horizon_loss(

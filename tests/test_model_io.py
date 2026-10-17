@@ -11,8 +11,8 @@ from mouse_core.models.backbone import IdentityBackbone, LoRAConfig, Backbone
 from mouse_core.data import Tokenizer, load_tokenizer, save_tokenizer
 from mouse_core.models.mlp import MLP
 
-def when_episode_done_nonzero(ctx):
-    return "episode_done" in ctx and ctx["episode_done"] != 0
+def when_repeat_episode_done_nonzero(ctx):
+    return "repeat_episode_done" in ctx and ctx["repeat_episode_done"] != 0
 
 
 def when_group_start(ctx):
@@ -36,7 +36,7 @@ from tests._token_batch_helpers import (
     token_tokenizer,
 )
 
-_TOK = token_tokenizer("action", "episode_done")
+_TOK = token_tokenizer("action", "repeat_episode_done")
 
 
 def test_composed_model_roundtrip(tmp_path) -> None:
@@ -45,7 +45,7 @@ def test_composed_model_roundtrip(tmp_path) -> None:
     backbone = IdentityBackbone(hidden_dim=hidden_dim)
     heads = MLP(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, propagate_gradient=1.0)
     model = simple_model(backbone=backbone, heads={'action_value': heads}, reasoner=None).eval()
-    batch = [[{'action': 0, 'reward': 0.0, 'episode_done': 0, 'task_done': 0}, {'action': 1, 'reward': 1.0, 'episode_done': 0, 'task_done': 0}, {'action': 2, 'reward': 2.0, 'episode_done': 1, 'task_done': 0}]]
+    batch = [[{'action': 0, 'reward': 0.0, 'repeat_episode_done': 0, 'episode_done': 0}, {'action': 1, 'reward': 1.0, 'repeat_episode_done': 0, 'episode_done': 0}, {'action': 2, 'reward': 2.0, 'repeat_episode_done': 1, 'episode_done': 0}]]
     expected = model(batch_to_token_batch(_TOK, batch))["predictions"]
     save_model(model=model, path=tmp_path)
     loaded = load_model(model=fresh_model(model), repo_id_or_path=tmp_path).eval()
@@ -195,13 +195,13 @@ def test_identity_embed_tokens_roundtrip(tmp_path) -> None:
 def test_model_card_requires_the_application_implementation(tmp_path) -> None:
     model = _lora_model(torch.float32)
     path = tmp_path / "README.md"
-    _write_model_card(repo_id="user/model", tokenizer_repo_id="user/tokenizer", model=model, path=path)
+    _write_model_card(repo_id="user/model", model=model, path=path)
     text = path.read_text()
     assert "library_name: mouse-core" in text
     assert "ExampleModel" in text
     assert "load_model(model=model," in text
     assert "No default architecture" in text
-    assert "user/tokenizer" in text and "separately" in text
+    assert "user/model" in text and "stored in this repository" in text
     assert "Optimizer state and delayed models" in text
 
 
@@ -219,7 +219,7 @@ def test_backbone_dtype_applies_to_base_only_and_trainable_sections_stay_float32
     assert {p.dtype for p in model.backbone.parameters() if not p.requires_grad} == {torch.bfloat16}
     assert {p.dtype for p in model.backbone.parameters() if p.requires_grad} == {torch.float32}
     assert model.backbone.dtype == torch.bfloat16
-    batch = [[{'action': 0, 'reward': 0.5, 'episode_done': 0, 'task_done': 0}, {'action': 1, 'reward': 1.0, 'episode_done': 0, 'task_done': 0}]]
+    batch = [[{'action': 0, 'reward': 0.5, 'repeat_episode_done': 0, 'episode_done': 0}, {'action': 1, 'reward': 1.0, 'repeat_episode_done': 0, 'episode_done': 0}]]
     with torch.no_grad():
         preds = model(batch_to_token_batch(_TOK, batch))["predictions"]
     assert preds['action_value'].dtype == torch.float32
@@ -255,7 +255,7 @@ def test_model_to_cuda_moves_without_casting() -> None:
     assert model.backbone.dtype == torch.bfloat16
     assert {p.dtype for p in model.backbone.parameters() if p.requires_grad} == {torch.float32}
     assert next(model.heads.parameters()).dtype == torch.float32
-    batch = [[{'action': 0, 'reward': 0.0, 'episode_done': 0, 'task_done': 0}]]
+    batch = [[{'action': 0, 'reward': 0.0, 'repeat_episode_done': 0, 'episode_done': 0}]]
     with torch.no_grad():
         preds = model(batch_to_token_batch(_TOK, batch), use_cache=True)["predictions"]
     assert preds['action_value'].dtype == torch.float32
@@ -272,11 +272,11 @@ def test_tokenizer_roundtrip(tmp_path) -> None:
     tokenizer = Tokenizer(
         input_fields=[
             {"type": "text", "input_field": "action", "format": "{field}"},
-            {"type": "text", "input_field": "episode_done", "format": "{field}", "required": False},
+            {"type": "text", "input_field": "repeat_episode_done", "format": "{field}", "required": False},
             {"type": "text", "input_field": "done_code", "format": "{field}", "head_output": True},
             {
                 "type": "text",
-                "input_field": "episode_index",
+                "input_field": "repeat_episode_index",
                 "format": "{field}",
                 "when": when_step_index_zero,
             },
@@ -284,8 +284,8 @@ def test_tokenizer_roundtrip(tmp_path) -> None:
         objective_fields=[
             {"input_field": "action"},
             {"input_field": "reward", "output_field": "r"},
+            {"input_field": "repeat_episode_done"},
             {"input_field": "episode_done"},
-            {"input_field": "task_done"},
         ],
         tokenizer=IntIdTokenizer(),
     )
@@ -296,14 +296,14 @@ def test_tokenizer_roundtrip(tmp_path) -> None:
     assert loaded.objective_fields == (
         ("action", "action"),
         ("reward", "r"),
+        ("repeat_episode_done", "repeat_episode_done"),
         ("episode_done", "episode_done"),
-        ("task_done", "task_done"),
     )
     assert [s.input_field for s in loaded.input_fields] == [
         "action",
-        "episode_done",
+        "repeat_episode_done",
         "done_code",
-        "episode_index",
+        "repeat_episode_index",
     ]
     assert loaded.input_fields[1].required is False
     assert loaded.input_fields[2].head_output is True
@@ -339,7 +339,7 @@ def test_tokenizer_roundtrip_group_start_and_not_equals(tmp_path) -> None:
     assert loaded.input_fields[0].input_field is None
     assert loaded.input_fields[0].format == "hello\n"
     assert loaded.input_fields[1].when is when_reward_nonzero
-    st = loaded({"action": 1, "reward": 1.0, "task_index": 0})
+    st = loaded({"action": 1, "reward": 1.0, "episode_index": 0})
     assert st.group_start_token_ids is not None
     assert st.group_start_token_ids.tolist() == [1, 2]
 
@@ -349,10 +349,28 @@ def test_load_tokenizer_missing_file_raises(tmp_path) -> None:
         load_tokenizer(repo_id_or_path=str(tmp_path))
 
 
-def test_push_model_to_hub_requires_distinct_tokenizer_repo() -> None:
+def test_push_model_and_tokenizer_share_repository(monkeypatch) -> None:
     model = simple_model(backbone=IdentityBackbone(hidden_dim=8), heads=({'action_value': (head := MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0))}), reasoner=None)
-    tokenizer = Tokenizer(input_fields=[{'type': 'text', 'input_field': 'action', 'format': '{field}', 'head_output': True}, {'type': 'text', 'input_field': 'episode_index', 'format': '{field}', 'when': when_step_index_zero}], objective_fields=[], tokenizer=IntIdTokenizer())
-    with pytest.raises(ValueError, match='tokenizer_repo_id'):
-        push_model_to_hub(model=model, tokenizer=tokenizer, repo_id='same-id', tokenizer_repo_id='same-id')
-    with pytest.raises(TypeError, match='tokenizer_repo_id'):
-        push_model_to_hub(model=model, tokenizer=tokenizer, repo_id='my-model')  # type: ignore[call-arg]
+    tokenizer = Tokenizer(input_fields=[{'type': 'text', 'input_field': 'action', 'format': '{field}', 'head_output': True}, {'type': 'text', 'input_field': 'repeat_episode_index', 'format': '{field}', 'when': when_step_index_zero}], objective_fields=[], tokenizer=IntIdTokenizer())
+    import mouse_core.models.io as io
+    import huggingface_hub
+    from pathlib import Path
+
+    created, uploads = [], []
+    def create(**kwargs):
+        created.append(kwargs)
+        return "https://huggingface.co/user/model", "user/model"
+    class Api:
+        def upload_folder(self, **kwargs):
+            directory = Path(kwargs["folder_path"])
+            assert {"config.json", "pytorch_model.bin", "tokenizer.json", "README.md"} <= {p.name for p in directory.iterdir()}
+            load_model(model=model, repo_id_or_path=directory)
+            loaded = load_tokenizer(repo_id_or_path=str(directory), tokenizer=IntIdTokenizer())
+            assert loaded is not None
+            uploads.append(kwargs)
+    monkeypatch.setattr(io, "_create_hub_repo", create)
+    monkeypatch.setattr(huggingface_hub, "HfApi", Api)
+    result = push_model_to_hub(model=model, tokenizer=tokenizer, repo_id="user/model")
+    assert result == "https://huggingface.co/user/model"
+    assert len(created) == len(uploads) == 1
+    assert uploads[0]["repo_id"] == "user/model"

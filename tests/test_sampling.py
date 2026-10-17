@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 import torch
-from mouse_core.sampling import TaskTemperature, check_temperature_range, last_action_scores, sample_tempered_actions, tempered_policy_logits
+from mouse_core.sampling import EpisodeTemperature, check_temperature_range, last_action_scores, sample_tempered_actions, tempered_policy_logits
 
 
 class RecordingRng:
@@ -22,15 +22,15 @@ class RecordingRng:
 
 def test_uniform_temperature_is_per_task_and_per_stream():
     rng = RecordingRng()
-    policy = TaskTemperature(0.2, 1.7, rng)
-    first = policy.for_task(0, 0)
-    assert all(policy.for_task(0, 0) == first for _ in range(20))
-    second = policy.for_task(1, 0)
-    third = policy.for_task(0, 1)
-    assert policy.for_task(1, 0) == second
+    policy = EpisodeTemperature(0.2, 1.7, rng)
+    first = policy.for_episode(0, 0)
+    assert all(policy.for_episode(0, 0) == first for _ in range(20))
+    second = policy.for_episode(1, 0)
+    third = policy.for_episode(0, 1)
+    assert policy.for_episode(1, 0) == second
     assert len({first, second, third}) == 3
     assert len(rng.draws) == 3
-    values = np.array([policy.for_task(0, task) for task in range(2, 5002)])
+    values = np.array([policy.for_episode(0, episode) for episode in range(2, 5002)])
     assert values.min() >= 0.2 and values.max() < 1.7
     assert values.mean() == pytest.approx(0.95, abs=0.03)
     assert values.var() == pytest.approx(1.5 ** 2 / 12, abs=0.01)
@@ -70,7 +70,7 @@ def test_last_readout_masks_padding_and_illegal_actions():
 
 
 @pytest.mark.parametrize('temperature', [0., 0.2, 0.7, 2.0])
-def test_grpo_likelihood_ratio_matches_collected_task_policy(temperature):
+def test_grpo_likelihood_ratio_matches_collected_episode_policy(temperature):
     from mouse_core.objectives import GrpoObjective
     from mouse_core.sampling import tempered_policy_logits
 
@@ -79,7 +79,7 @@ def test_grpo_likelihood_ratio_matches_collected_task_policy(temperature):
     data = {'action': torch.cat([torch.tensor([0]), actions]),
             'old_log_prob': torch.cat([torch.tensor([0.]), log_probs]),
             'advantage': torch.tensor([0., 1., -1., 1.])}
-    objective = GrpoObjective(clip_eps=0.2, ent_coef=0.01, num_actions=3)
+    objective = GrpoObjective(clip_ratio_min=0.8, clip_ratio_max=1.2, ent_coef=0.01, num_actions=3)
     losses, metrics = objective(
         objective_data=data, group_id=torch.zeros(4, dtype=torch.int64),
         predictions=tempered_policy_logits(scores, torch.full((4,), temperature)),

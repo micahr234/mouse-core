@@ -26,10 +26,10 @@ def _rng_for_key(
 
 
 def test_disabled_augmenter_returns_input_step() -> None:
-    step = {"action": 1, "reward": 2.0, "task_index": 0}
+    step = {"action": 1, "reward": 2.0, "episode_index": 0}
     augment = Augmenter(
         enabled=False,
-        seed_field="task_index",
+        seed_field="episode_index",
         fields=[
             {"type": 'linear', "input_field": 'reward', "output_field": 'reward', "scale_in_low": 0.0, "scale_out_low": 0.0, "scale_in_high": 1.0, "scale_out_high": 2.0}
         ],
@@ -38,10 +38,10 @@ def test_disabled_augmenter_returns_input_step() -> None:
 
 
 def test_linear_scale_endpoints_copy_without_mutating_input() -> None:
-    step = {"reward": 2.0, "obs_continuous": [1.0, 2.0], "task_index": 0}
+    step = {"reward": 2.0, "obs_continuous": [1.0, 2.0], "episode_index": 0}
     original = copy.deepcopy(step)
     augment = Augmenter(
-        seed_field="task_index",
+        seed_field="episode_index",
         fields=[
             {"type": 'linear', "input_field": 'reward', "output_field": 'reward', "scale_in_low": 0.0, "scale_out_low": 1.0, "scale_in_high": 1.0, "scale_out_high": 3.0},
             {"type": 'linear', "input_field": 'obs_continuous', "output_field": 'obs_continuous', "scale_in_low": 0.0, "scale_out_low": -1.0, "scale_in_high": 1.0, "scale_out_high": 2.0},
@@ -62,11 +62,11 @@ def test_mask_probabilities_apply_to_configured_fields() -> None:
         "observation": 7,
         "pixels": [10, 20],
         "step_index": 12,
-        "task_index": 0,
+        "episode_index": 0,
     }
     augment = Augmenter(
         seed=0,
-        seed_field="task_index",
+        seed_field="episode_index",
         fields=[
             {"type": 'discrete', "input_field": 'action', "output_field": 'action', "mask_prob": 1.0},
             {"type": 'linear', "input_field": 'reward', "output_field": 'reward', "mask_prob": 1.0},
@@ -84,18 +84,18 @@ def test_mask_probabilities_apply_to_configured_fields() -> None:
         "observation": 0,
         "pixels": [0, 0],
         "step_index": 0,
-        "task_index": 0,
+        "episode_index": 0,
     }
 
 
 def test_shared_action_permutation_also_permutates_action_value_targets() -> None:
-    step = {"action": 0, "prev_action": 1, "info_q_star": [10.0, 20.0, 30.0], "task_index": 0}
-    expected_perm = _rng_for_key(seed=0, seed_field="task_index", key=0).permutation(3)
+    step = {"action": 0, "prev_action": 1, "info_q_star": [10.0, 20.0, 30.0], "episode_index": 0}
+    expected_perm = _rng_for_key(seed=0, seed_field="episode_index", key=0).permutation(3)
     expected_inverse = np.empty_like(expected_perm)
     expected_inverse[expected_perm] = np.arange(len(expected_perm))
     augment = Augmenter(
         seed=0,
-        seed_field="task_index",
+        seed_field="episode_index",
         fields=[
             {
                 "type": "discrete",
@@ -115,10 +115,10 @@ def test_shared_action_permutation_also_permutates_action_value_targets() -> Non
 
 
 def test_input_vector_field_is_skipped_when_absent() -> None:
-    expected_perm = _rng_for_key(seed=0, seed_field="task_index", key=0).permutation(3)
+    expected_perm = _rng_for_key(seed=0, seed_field="episode_index", key=0).permutation(3)
     augment = Augmenter(
         seed=0,
-        seed_field="task_index",
+        seed_field="episode_index",
         fields=[
             {
                 "type": "discrete",
@@ -131,18 +131,18 @@ def test_input_vector_field_is_skipped_when_absent() -> None:
             }
         ],
     )
-    out = augment({"action": 0, "task_index": 0})
+    out = augment({"action": 0, "episode_index": 0})
     assert out["action"] == int(expected_perm[0])
     assert "info_q_star" not in out
 
 
 def test_mask_does_not_zero_vector_field() -> None:
-    expected_perm = _rng_for_key(seed=0, seed_field="task_index", key=0).permutation(3)
+    expected_perm = _rng_for_key(seed=0, seed_field="episode_index", key=0).permutation(3)
     expected_inverse = np.empty_like(expected_perm)
     expected_inverse[expected_perm] = np.arange(len(expected_perm))
     augment = Augmenter(
         seed=0,
-        seed_field="task_index",
+        seed_field="episode_index",
         fields=[
             {
                 "type": "discrete",
@@ -156,19 +156,19 @@ def test_mask_does_not_zero_vector_field() -> None:
             }
         ],
     )
-    out = augment({"action": 0, "info_q_star": [10.0, 20.0, 30.0], "task_index": 0})
+    out = augment({"action": 0, "info_q_star": [10.0, 20.0, 30.0], "episode_index": 0})
     assert out["action"] == 0
     assert out["info_q_star"] == np.take([10.0, 20.0, 30.0], expected_inverse).tolist()
 
 
 def test_vector_rename_writes_output_keeps_input() -> None:
-    expected_perm = _rng_for_key(seed=0, seed_field="task_index", key=0).permutation(3)
+    expected_perm = _rng_for_key(seed=0, seed_field="episode_index", key=0).permutation(3)
     expected_inverse = np.empty_like(expected_perm)
     expected_inverse[expected_perm] = np.arange(len(expected_perm))
     q = [10.0, 20.0, 30.0]
     augment = Augmenter(
         seed=0,
-        seed_field="task_index",
+        seed_field="episode_index",
         fields=[
             {
                 "type": "discrete",
@@ -181,7 +181,7 @@ def test_vector_rename_writes_output_keeps_input() -> None:
             }
         ],
     )
-    out = augment({"action": 0, "info_q_star": q, "task_index": 0})
+    out = augment({"action": 0, "info_q_star": q, "episode_index": 0})
     assert out["info_q_star"] == q
     assert out["q_star_aug"] == np.take(q, expected_inverse).tolist()
     assert out["action"] == int(expected_perm[0])
@@ -190,7 +190,7 @@ def test_vector_rename_writes_output_keeps_input() -> None:
 def test_vector_on_input_field_raises() -> None:
     augment = Augmenter(
         seed=0,
-        seed_field="task_index",
+        seed_field="episode_index",
         fields=[
             {
                 "type": "discrete",
@@ -202,50 +202,50 @@ def test_vector_on_input_field_raises() -> None:
         ],
     )
     with pytest.raises(ValueError, match="input_vector_field"):
-        augment({"info_q_star": [10.0, 20.0, 30.0], "task_index": 0})
+        augment({"info_q_star": [10.0, 20.0, 30.0], "episode_index": 0})
 
 
 def test_mask_decisions_vary_per_step_within_one_generation() -> None:
     augment = Augmenter(
         seed=0,
-        seed_field="task_index",
+        seed_field="episode_index",
         fields=[{"type": 'discrete', "input_field": 'action', "output_field": 'action', "mask_prob": 0.5}],
     )
     # Same seed key, same generation: masking must still be a per-step draw.
-    outs = [augment({"action": 3, "task_index": 0})["action"] for _ in range(64)]
+    outs = [augment({"action": 3, "episode_index": 0})["action"] for _ in range(64)]
     assert 0 in outs and 3 in outs
 
 
 def test_reseed_replaces_draw_cache() -> None:
     augment = Augmenter(
         seed=0,
-        seed_field="task_index",
+        seed_field="episode_index",
         fields=[
             {"type": 'discrete', "input_field": 'action', "output_field": 'action', "vocab_size": 10, "permute": True}
         ],
     )
     for key in range(5):
-        augment({"action": 0, "task_index": key})
+        augment({"action": 0, "episode_index": key})
     assert len(augment._thread_draw_cache()) == 5
     augment.reseed()
     assert len(augment._thread_draw_cache()) == 0
-    augment({"action": 0, "task_index": 0})
+    augment({"action": 0, "episode_index": 0})
     assert len(augment._thread_draw_cache()) == 1
 
 
 def test_reseed_generation_pins_thread_without_advancing_counter() -> None:
     augment = Augmenter(
         seed=0,
-        seed_field="task_index",
+        seed_field="episode_index",
         fields=[
             {"type": "discrete", "input_field": "action", "output_field": "action", "vocab_size": 10, "permute": True}
         ],
     )
     augment.reseed(generation=7)
     assert augment._generation == 0
-    out = augment({"action": 0, "task_index": 3})
+    out = augment({"action": 0, "episode_index": 3})
     assert out["action"] == int(
-        _rng_for_key(seed=0, seed_field="task_index", key=3, generation=7).permutation(10)[0]
+        _rng_for_key(seed=0, seed_field="episode_index", key=3, generation=7).permutation(10)[0]
     )
     # Another thread on a different generation neither sees nor disturbs this pin.
     seen: dict[str, int] = {}
@@ -253,24 +253,24 @@ def test_reseed_generation_pins_thread_without_advancing_counter() -> None:
     def _other() -> None:
         augment.reseed(generation=8)
         seen["gen"] = augment._generation_for_call()
-        seen["action"] = augment({"action": 0, "task_index": 3})["action"]
+        seen["action"] = augment({"action": 0, "episode_index": 3})["action"]
 
     t = threading.Thread(target=_other)
     t.start()
     t.join()
     assert seen["gen"] == 8
     assert seen["action"] == int(
-        _rng_for_key(seed=0, seed_field="task_index", key=3, generation=8).permutation(10)[0]
+        _rng_for_key(seed=0, seed_field="episode_index", key=3, generation=8).permutation(10)[0]
     )
     assert augment._generation_for_call() == 7
-    assert augment({"action": 0, "task_index": 3})["action"] == out["action"]
+    assert augment({"action": 0, "episode_index": 3})["action"] == out["action"]
 
 
 def test_multi_field_mask_uses_one_decision_per_step() -> None:
-    step = {"action": 3, "episode_done": 2, "task_index": 0}
+    step = {"action": 3, "episode_done": 2, "episode_index": 0}
     augment = Augmenter(
         seed=0,
-        seed_field="task_index",
+        seed_field="episode_index",
         fields=[{"type": 'discrete', "input_field": ('action', 'episode_done'), "output_field": ('action', 'episode_done'), "mask_prob": 0.5}],
     )
     out = augment(step)
@@ -281,16 +281,16 @@ def test_multi_field_mask_uses_one_decision_per_step() -> None:
 def test_seed_field_shares_draws_across_steps() -> None:
     augment = Augmenter(
         seed=0,
-        seed_field="task_index",
+        seed_field="episode_index",
         fields=[
             {"type": 'discrete', "input_field": 'action', "output_field": 'action', "vocab_size": 10, "permute": True}
         ],
     )
-    a = augment({"action": 0, "task_index": 7})
-    b = augment({"action": 0, "task_index": 7})
-    c = augment({"action": 0, "task_index": 8})
+    a = augment({"action": 0, "episode_index": 7})
+    b = augment({"action": 0, "episode_index": 7})
+    c = augment({"action": 0, "episode_index": 8})
     assert a["action"] == b["action"]
-    assert a["action"] == augment({"action": 0, "task_index": 7})["action"]
+    assert a["action"] == augment({"action": 0, "episode_index": 7})["action"]
     # Different seed keys use independent cached draws (may collide by chance).
     assert isinstance(c["action"], int)
 
@@ -298,33 +298,33 @@ def test_seed_field_shares_draws_across_steps() -> None:
 def test_reseed_changes_draws_for_same_key() -> None:
     augment = Augmenter(
         seed=0,
-        seed_field="task_index",
+        seed_field="episode_index",
         fields=[
             {"type": "discrete", "input_field": "action", "output_field": "action", "vocab_size": 10, "permute": True}
         ],
     )
-    before = augment({"action": 0, "task_index": 7})
+    before = augment({"action": 0, "episode_index": 7})
     assert before["action"] == int(
-        _rng_for_key(seed=0, seed_field="task_index", key=7, generation=0).permutation(10)[0]
+        _rng_for_key(seed=0, seed_field="episode_index", key=7, generation=0).permutation(10)[0]
     )
     augment.reseed()
-    after = augment({"action": 0, "task_index": 7})
+    after = augment({"action": 0, "episode_index": 7})
     assert after["action"] == int(
-        _rng_for_key(seed=0, seed_field="task_index", key=7, generation=1).permutation(10)[0]
+        _rng_for_key(seed=0, seed_field="episode_index", key=7, generation=1).permutation(10)[0]
     )
-    assert after["action"] == augment({"action": 0, "task_index": 7})["action"]
+    assert after["action"] == augment({"action": 0, "episode_index": 7})["action"]
 
 
 def test_eval_compose_omits_augmenter() -> None:
     augment = Augmenter(
         seed=0,
-        seed_field="task_index",
+        seed_field="episode_index",
         fields=[
             {"type": "discrete", "input_field": "action", "output_field": "action", "vocab_size": 10, "permute": True}
         ],
     )
     train_transform = compose(stages=(augment,))
-    step = {"action": 0, "task_index": 7}
+    step = {"action": 0, "episode_index": 7}
     assert train_transform(step) == augment(step)
     # eval is the raw step — no augmenter in the compose.
 
@@ -332,7 +332,7 @@ def test_eval_compose_omits_augmenter() -> None:
 def test_compose_reseed_forwards_to_augmenter() -> None:
     augment = Augmenter(
         seed=0,
-        seed_field="task_index",
+        seed_field="episode_index",
         fields=[
             {"type": "discrete", "input_field": "action", "output_field": "action", "vocab_size": 10, "permute": True}
         ],
@@ -341,43 +341,43 @@ def test_compose_reseed_forwards_to_augmenter() -> None:
     assert augment._generation == 0
     transform.reseed()
     assert augment._generation == 1
-    out = transform({"action": 0, "task_index": 7, "extra": 1})
+    out = transform({"action": 0, "episode_index": 7, "extra": 1})
     assert out["extra"] == 1
     assert out["action"] == int(
-        _rng_for_key(seed=0, seed_field="task_index", key=7, generation=1).permutation(10)[0]
+        _rng_for_key(seed=0, seed_field="episode_index", key=7, generation=1).permutation(10)[0]
     )
 
 
 def test_missing_seed_field_raises() -> None:
     augment = Augmenter(
-        seed_field="task_index",
+        seed_field="episode_index",
         fields=[
             {"type": 'discrete', "input_field": 'action', "output_field": 'action', "vocab_size": 10, "permute": True}
         ],
     )
-    with pytest.raises(KeyError, match="task_index"):
+    with pytest.raises(KeyError, match="episode_index"):
         augment({"action": 0})
 
 
 def test_missing_input_field_raises() -> None:
     augment = Augmenter(
-        seed_field="task_index",
+        seed_field="episode_index",
         fields=[
             {"type": 'discrete', "input_field": 'action', "output_field": 'action', "vocab_size": 10, "permute": True}
         ],
     )
     with pytest.raises(KeyError, match="action"):
-        augment({"task_index": 0})
+        augment({"episode_index": 0})
 
 
 def test_discrete_and_done_permutations_use_configured_vocab_sizes() -> None:
-    step = {"episode_done": 2, "observation": 1, "task_index": 0}
-    rng = _rng_for_key(seed=0, seed_field="task_index", key=0)
+    step = {"episode_done": 2, "observation": 1, "episode_index": 0}
+    rng = _rng_for_key(seed=0, seed_field="episode_index", key=0)
     done_perm = rng.permutation(3)
     obs_perm = rng.permutation(4)
     augment = Augmenter(
         seed=0,
-        seed_field="task_index",
+        seed_field="episode_index",
         fields=[
             {"type": 'discrete', "input_field": 'episode_done', "output_field": 'episode_done', "vocab_size": 3, "permute": True},
             {"type": 'discrete', "input_field": 'observation', "output_field": 'observation', "vocab_size": 4, "permute": True},
@@ -389,9 +389,9 @@ def test_discrete_and_done_permutations_use_configured_vocab_sizes() -> None:
 
 
 def test_image_scale_shift_clamps_to_pixel_range() -> None:
-    step = {"obs_image": [-10, 10, 300], "task_index": 0}
+    step = {"obs_image": [-10, 10, 300], "episode_index": 0}
     augment = Augmenter(
-        seed_field="task_index",
+        seed_field="episode_index",
         fields=[
             {"type": 'image', "input_field": 'obs_image', "output_field": 'obs_image', "scale_mean": 2.0, "shift_mean": 10.0}
         ]
@@ -400,9 +400,9 @@ def test_image_scale_shift_clamps_to_pixel_range() -> None:
 
 
 def test_augmenter_rename_writes_output_keeps_input() -> None:
-    step = {"reward": 1.0, "task_index": 0}
+    step = {"reward": 1.0, "episode_index": 0}
     augment = Augmenter(
-        seed_field="task_index",
+        seed_field="episode_index",
         fields=[
             {
                 "type": "linear",

@@ -250,8 +250,8 @@ def boundary_discount(
     row. Internal rows must have zero reward and false boundary flags.
 
     The flags mean whatever the wrapped env uses them for. A
-    ``RepeatTaskEnv`` reports the task on these flags and keeps episode ends
-    in the observation, so a zero task gamma stops the return at the task
+    ``RepeatTaskEnv`` reports the episode on these flags and keeps episode ends
+    in the observation, so a zero episode gamma stops the return at the episode
     and leaves episode boundaries inside the run.
 
     Args:
@@ -301,7 +301,7 @@ class Gate(Protocol):
     same place the reward and γ of that transition are stored. Entries
     with ``s <= t`` are ignored. A ``0`` bootstraps ``V`` at that step.
     The objective then zeros any continuation that would leave the run
-    (``group_id``). For any horizon, the last step of a task is not
+    (``group_id``). For any horizon, the last step of an episode is not
     updated when its target depends on the next step's value. It is
     updated when the target does not.
     ``cross_group_backups="bootstrap"`` fills ``V`` on the step before

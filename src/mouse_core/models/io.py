@@ -68,98 +68,31 @@ def push_model_to_hub(
     model: "Model",
     tokenizer: "Tokenizer",
     repo_id: str,
-    tokenizer_repo_id: str,
-    commit_message: str = "Upload MOUSE model",
-    tokenizer_commit_message: str = "Upload MOUSE tokenizer",
+    commit_message: str = "Upload MOUSE model and tokenizer",
     private: bool = False,
     clear: bool = False,
     **kwargs: Any,
-) -> tuple[str, str]:
-    """Push a MOUSE model and its tokenizer to two Hugging Face Hub repos.
-
-    The tokenizer is a separate object and a separate repository — it is
-    not written into the model checkpoint. :func:`load_model` reads
-    *repo_id*; :func:`~mouse_core.data.tokenizer.load_tokenizer` reads
-    *tokenizer_repo_id*.
-
-    Args:
-        model: The model instance to upload.
-        tokenizer: The :class:`~mouse_core.data.tokenizer.Tokenizer` used
-            to pack steps for this model. Required — a different object
-            from *model*, uploaded to *tokenizer_repo_id*.
-        repo_id: Hub repository ID for the model, e.g. ``"my-model"`` or
-            ``"your-org/your-model"``. Unscoped names are resolved under
-            the authenticated user.
-        tokenizer_repo_id: Hub repository ID for the packing spec. Must
-            differ from *repo_id*.
-        commit_message: Commit message for the model repo.
-        tokenizer_commit_message: Commit message for the tokenizer repo.
-        private: Create private repositories if they do not already exist.
-        clear: Delete all existing files in each repository before uploading.
-        **kwargs: Forwarded to ``huggingface_hub.HfApi.upload_folder``.
-
-    Returns:
-        ``(model_url, tokenizer_url)`` Hub URL strings.
-
-    Example::
-
-        model_url, tokenizer_url = push_model_to_hub(
-            model=model,
-            tokenizer=tokenizer,
-            repo_id="my-model",
-            tokenizer_repo_id="my-tokenizer",
-            clear=True,
-        )
-    """
+) -> str:
+    """Upload model weights and tokenizer.json together to one repository."""
     from huggingface_hub import HfApi
-
     from mouse_core.data.tokenizer import Tokenizer, save_tokenizer
 
     if not isinstance(tokenizer, Tokenizer):
-        raise TypeError(
-            f"push_model_to_hub requires tokenizer= to be a Tokenizer, got {type(tokenizer).__name__}."
-        )
-    if repo_id == tokenizer_repo_id:
-        raise ValueError(
-            "tokenizer_repo_id must be a different Hub repo than repo_id; "
-            f"got {repo_id!r} for both."
-        )
-    token = kwargs.get("token")
+        raise TypeError(f"tokenizer must be a Tokenizer, got {type(tokenizer).__name__}")
     model_url, hub_model_id = _create_hub_repo(
-        repo_id=repo_id, private=private, clear=clear, token=token
+        repo_id=repo_id, private=private, clear=clear, token=kwargs.get("token")
     )
-    tokenizer_url, hub_tok_id = _create_hub_repo(
-        repo_id=tokenizer_repo_id, private=private, clear=clear, token=token
-    )
-    if hub_model_id == hub_tok_id:
-        raise ValueError(
-            "tokenizer_repo_id resolved to the same Hub repo as repo_id "
-            f"({hub_model_id!r}); pass a different tokenizer_repo_id."
-        )
-    api = HfApi()
-    with tempfile.TemporaryDirectory() as model_tmp, tempfile.TemporaryDirectory() as tok_tmp:
-        save_model(model=model, path=model_tmp)
+    with tempfile.TemporaryDirectory() as directory:
+        save_model(model=model, path=directory)
+        save_tokenizer(tokenizer=tokenizer, path=directory)
         _write_model_card(
-            repo_id=hub_model_id,
-            tokenizer_repo_id=hub_tok_id,
-            model=model,
-            path=Path(model_tmp) / "README.md",
+            model=model, repo_id=hub_model_id, path=Path(directory) / "README.md"
         )
-        save_tokenizer(tokenizer=tokenizer, path=tok_tmp)
-        _write_tokenizer_card(repo_id=hub_tok_id, path=Path(tok_tmp) / "README.md")
-        api.upload_folder(
-            repo_id=hub_model_id,
-            folder_path=model_tmp,
-            commit_message=commit_message,
-            **kwargs,
+        HfApi().upload_folder(
+            repo_id=hub_model_id, folder_path=directory,
+            commit_message=commit_message, **kwargs,
         )
-        api.upload_folder(
-            repo_id=hub_tok_id,
-            folder_path=tok_tmp,
-            commit_message=tokenizer_commit_message,
-            **kwargs,
-        )
-    return model_url, tokenizer_url
+    return model_url
 
 
 def _hub_repo_id_for_user(repo_id: str, token: str | bool | None = None) -> str:
@@ -205,7 +138,7 @@ def _create_hub_repo(
     return str(repo_url), hub_repo_id
 
 
-def _write_model_card(*, model: Model, repo_id: str, tokenizer_repo_id: str, path: Path) -> None:
+def _write_model_card(*, model: Model, repo_id: str, path: Path) -> None:
     path.write_text(
         f"---\nlibrary_name: mouse-core\ntags:\n- mouse-core\n- reinforcement-learning\n---\n\n"
         f"# {repo_id}\n\n"
@@ -217,7 +150,7 @@ def _write_model_card(*, model: Model, repo_id: str, tokenizer_repo_id: str, pat
         "## Load weights\n\nConstruct your model, then load into it:\n\n"
         "```python\nfrom mouse_core.models import load_model\n\n"
         f"load_model(model=model, repo_id_or_path={repo_id!r})\nmodel.eval()\n```\n\n"
-        f"The tokenizer is stored separately in `{tokenizer_repo_id}`. Load it with "
+        f"The tokenizer is stored in this repository (`{repo_id}`). Load it with "
         "`mouse_core.data.load_tokenizer`. Kernels, dtype, and all modules are specified "
         "when constructing your model, before loading weights.\n",
         encoding="utf-8",

@@ -7,7 +7,7 @@ MOUSE is actively developed and contributions are very welcome — whether that'
 - **Bug reports** — open a GitHub issue with a minimal reproduction and the full error traceback.
 - **Feature requests** — open an issue describing the use case. If you have a design idea, sketching it out in the issue first helps align before writing code.
 - **Pull requests** — see the workflow below.
-- **Experiments and results** — if you run MOUSE on a new environment or task, sharing results (even negative ones) as an issue or discussion is valuable.
+- **Experiments and results** — if you run MOUSE on a new environment or episode, sharing results (even negative ones) as an issue or discussion is valuable.
 - **Documentation** — edits to the README or inline notebook docs are welcome.
 
 ## Development setup

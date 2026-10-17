@@ -70,7 +70,7 @@ def test_stored_mask_is_rejected_in_favor_of_nullable_action():
 def test_augmentation_preserves_none_and_permutates_reset_value_targets():
     augmenter = Augmenter(
         seed=12,
-        seed_field="task_index",
+        seed_field="episode_index",
         fields=[
             {
                 "type": "discrete",
@@ -81,7 +81,7 @@ def test_augmentation_preserves_none_and_permutates_reset_value_targets():
             }
         ],
     )
-    row = {"action": None, "q": [1.0, 3.0, 5.0, 7.0], "task_index": 0}
+    row = {"action": None, "q": [1.0, 3.0, 5.0, 7.0], "episode_index": 0}
     before = copy.deepcopy(row)
     reset = augmenter(row)
     assert reset["action"] is None
@@ -94,12 +94,12 @@ def test_augmentation_preserves_none_and_permutates_reset_value_targets():
 
 def test_null_actions_survive_disk_roundtrip_and_appending_real_actions(tmp_path):
     store = Datastore()
-    store.append(data={"action": None, "task_index": 0})
+    store.append(data={"action": None, "episode_index": 0})
     # Exercise a source whose inferred action type is initially null.
     reloaded = Datastore()
     reloaded.from_dataset(ds=store.to_dataset())
-    reloaded.append(data={"action": 0, "task_index": 0})
-    reloaded.append(data={"action": None, "task_index": 1})
+    reloaded.append(data={"action": 0, "episode_index": 0})
+    reloaded.append(data={"action": None, "episode_index": 1})
     reloaded.to_dataset().save_to_disk(str(tmp_path / "replay"))
     saved = load_from_disk(str(tmp_path / "replay"))
     assert list(saved["action"]) == [None, 0, None]
@@ -109,13 +109,13 @@ def test_null_actions_survive_disk_roundtrip_and_appending_real_actions(tmp_path
 @pytest.mark.parametrize("workers", [0, 2])
 def test_dataloader_derives_masks_without_mutating_replay(workers):
     store = Datastore()
-    for task in range(2):
+    for episode in range(2):
         for action in (None, 0, None, 1):
-            store.append(data={"action": action, "task_index": task})
+            store.append(data={"action": action, "episode_index": episode})
     before = store[:]
     loader = DataLoader(
         stores=store,
-        sample_field="task_index",
+        sample_field="episode_index",
         samples_budget=4,
         batch_size=1,
         transform=tokenizer("action"),

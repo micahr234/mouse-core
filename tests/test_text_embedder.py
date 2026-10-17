@@ -19,8 +19,8 @@ from mouse_core.models import Embedding
 from mouse_core.models.backbone import IdentityBackbone
 from mouse_core.models.mlp import MLP
 
-def when_episode_done_nonzero(ctx):
-    return "episode_done" in ctx and ctx["episode_done"] != 0
+def when_repeat_episode_done_nonzero(ctx):
+    return "repeat_episode_done" in ctx and ctx["repeat_episode_done"] != 0
 
 
 def when_group_start(ctx):
@@ -70,7 +70,7 @@ _DEFAULT_FIELDS: list[dict[str, Any]] = [
     {"type": "text", "input_field": "action", "format": "{field}"},
     {"type": "text", "input_field": "observation", "format": "{field}"},
     {"type": "text", "input_field": "reward", "format": "{field}", "when": when_reward_nonzero},
-    {"type": "text", "input_field": "episode_done", "format": "{field}", "when": when_episode_done_nonzero},
+    {"type": "text", "input_field": "repeat_episode_done", "format": "{field}", "when": when_repeat_episode_done_nonzero},
 ]
 
 
@@ -98,14 +98,14 @@ def _text_pair(hidden_dim: int = 8, **kwargs):
     image_tokenizer = kwargs.pop("image_tokenizer", None)
     objective_fields = kwargs.pop(
         "objective_fields",
-        _obj("action", "observation", "reward", "episode_done", "task_done"),
+        _obj("action", "observation", "reward", "repeat_episode_done", "episode_done"),
     )
     head_output = kwargs.pop("head_output", "action")
     if kwargs:
         raise TypeError(f"unexpected kwargs: {sorted(kwargs)}")
     fields = _tokenizer_fields(input_fields, head_output=head_output)
     if not any(
-        field.get("input_field") == "episode_index"
+        field.get("input_field") == "repeat_episode_index"
         for field in fields
     ):
         head_at = next(
@@ -116,7 +116,7 @@ def _text_pair(hidden_dim: int = 8, **kwargs):
             head_at,
             {
                 "type": "text",
-                "input_field": "episode_index",
+                "input_field": "repeat_episode_index",
                 "format": "{field}",
                 "when": when_step_index_zero,
             },
@@ -138,8 +138,8 @@ def test_text_tokenizer_when_not_equals_omits_value() -> None:
     tokenizer, backbone = _text_pair()
     batch = [
         [
-            {"observation": 1, "action": 0, "reward": 0.0, "episode_done": 0, "task_done": 0},
-            {"observation": 2, "action": 1, "reward": 1.0, "episode_done": 1, "task_done": 0},
+            {"observation": 1, "action": 0, "reward": 0.0, "repeat_episode_done": 0, "episode_done": 0},
+            {"observation": 2, "action": 1, "reward": 1.0, "repeat_episode_done": 1, "episode_done": 0},
         ]
     ]
     tb, obj, _sid = batch_to_packed(tokenizer, batch)
@@ -177,7 +177,7 @@ def test_text_tokenizer_when_not_equals_omits_value() -> None:
         emb.weight.zero_()
         emb.weight[ord("0") % 20 + 1] = 7.0
     tokenizer2, backbone2 = _text_pair(tokenizer=_CaptureTok(), embed_tokens=emb)
-    out = embed_batch(backbone2, batch_to_token_batch(tokenizer2, [[{'observation': 1, 'action': 0, 'reward': 0.0, 'episode_done': 0, 'task_done': 0}]]))
+    out = embed_batch(backbone2, batch_to_token_batch(tokenizer2, [[{'observation': 1, 'action': 0, 'reward': 0.0, 'repeat_episode_done': 0, 'episode_done': 0}]]))
     assert seen == ["0", "1"]
     matches = (out == 7.0).all(dim=-1)
     assert int(matches.sum().item()) == 1
@@ -189,7 +189,7 @@ def test_text_tokenizer_field_format_uses_str() -> None:
             {"type": "text", "input_field": "reward", "format": "{field}", "head_output": True},
             {
                 "type": "text",
-                "input_field": "episode_index",
+                "input_field": "repeat_episode_index",
                 "format": "{field}",
                 "when": when_step_index_zero,
             },
@@ -211,7 +211,7 @@ def test_text_tokenizer_field_format_spec() -> None:
             },
             {
                 "type": "text",
-                "input_field": "episode_index",
+                "input_field": "repeat_episode_index",
                 "format": "{field}",
                 "when": when_step_index_zero,
             },
@@ -233,7 +233,7 @@ def test_text_tokenizer_omitted_input_field_is_const() -> None:
             },
             {
                 "type": "text",
-                "input_field": "episode_index",
+                "input_field": "repeat_episode_index",
                 "format": "{field}",
                 "when": when_step_index_zero,
             },
@@ -279,7 +279,7 @@ def test_text_tokenizer_const_format_rejects_placeholder() -> None:
                 },
                 {
                     "type": "text",
-                    "input_field": "episode_index",
+                    "input_field": "repeat_episode_index",
                     "format": "{field}",
                     "when": when_step_index_zero,
                 },
@@ -299,7 +299,7 @@ def test_text_tokenizer_max_tokens_allows_at_limit() -> None:
             },
             {
                 "type": "text",
-                "input_field": "episode_index",
+                "input_field": "repeat_episode_index",
                 "format": "{field}",
                 "when": when_step_index_zero,
             },
@@ -323,7 +323,7 @@ def test_text_tokenizer_max_tokens_raises_when_exceeded() -> None:
             },
             {
                 "type": "text",
-                "input_field": "episode_index",
+                "input_field": "repeat_episode_index",
                 "format": "{field}",
                 "when": when_step_index_zero,
             },
@@ -348,7 +348,7 @@ def test_text_tokenizer_max_tokens_must_be_positive() -> None:
                 },
                 {
                     "type": "text",
-                    "input_field": "episode_index",
+                    "input_field": "repeat_episode_index",
                     "format": "{field}",
                     "when": when_step_index_zero,
                 },
@@ -386,7 +386,7 @@ def test_text_tokenizer_when_gates_cover_skip_literal_pattern() -> None:
             },
             {
                 "type": "text",
-                "input_field": "episode_index",
+                "input_field": "repeat_episode_index",
                 "format": "{field}",
                 "when": when_step_index_zero,
             },
@@ -455,7 +455,7 @@ def test_text_tokenizer_requires_field_format() -> None:
                 {"type": "text", "input_field": "observation", "head_output": True},
                 {
                     "type": "text",
-                    "input_field": "episode_index",
+                    "input_field": "repeat_episode_index",
                     "format": "{field}",
                     "when": when_step_index_zero,
                 },
@@ -469,14 +469,14 @@ def test_text_format_evaluates_expression_on_field() -> None:
         input_fields=[
             {
                 "type": "text",
-                "input_field": "episode_index",
+                "input_field": "repeat_episode_index",
                 "format": ",episode {field+1}",
                 "head_output": True,
             },
         ],
         tokenizer=_FakeTokenizer(),
     )
-    step = tokenizer({"episode_index": 0})
+    step = tokenizer({"repeat_episode_index": 0})
     assert step.token_ids.tolist() == _enc(",episode 1")
 
 
@@ -494,7 +494,7 @@ def test_text_tokenizer_field_format_must_use_field_placeholder() -> None:
                 },
                 {
                     "type": "text",
-                    "input_field": "episode_index",
+                    "input_field": "repeat_episode_index",
                     "format": "{field}",
                     "when": when_step_index_zero,
                 },
@@ -519,7 +519,7 @@ def test_text_tokenizer_const_and_when_gated_unescape_braces() -> None:
             {"type": "text", "format": "{{c}}", "head_output": True},
             {
                 "type": "text",
-                "input_field": "episode_index",
+                "input_field": "repeat_episode_index",
                 "format": "{field}",
                 "when": when_step_index_zero,
             },
@@ -549,7 +549,7 @@ def test_text_tokenizer_optional_missing_value_emits_nothing() -> None:
             {"type": "text", "format": "\n", "head_output": True},
             {
                 "type": "text",
-                "input_field": "episode_index",
+                "input_field": "repeat_episode_index",
                 "format": "{field}",
                 "when": when_step_index_zero,
             },
@@ -574,7 +574,7 @@ def test_text_tokenizer_required_defaults_true() -> None:
         input_fields=[{"type": "text", "input_field": "a", "format": "{field}", "head_output": True},
             {
                 "type": "text",
-                "input_field": "episode_index",
+                "input_field": "repeat_episode_index",
                 "format": "{field}",
                 "when": when_step_index_zero,
             },
@@ -638,7 +638,7 @@ def test_text_tokenizer_rejects_duplicate_field_names_across_types() -> None:
                 {"type": "text", "input_field": "value", "format": "{field}", "head_output": True},
                 {
                     "type": "text",
-                    "input_field": "episode_index",
+                    "input_field": "repeat_episode_index",
                     "format": "{field}",
                     "when": when_step_index_zero,
                 },
@@ -652,7 +652,7 @@ def test_text_tokenizer_rejects_duplicate_field_names_across_types() -> None:
                 {"type": "text", "input_field": "a", "format": "{field}", "head_output": True},
                 {
                     "type": "text",
-                    "input_field": "episode_index",
+                    "input_field": "repeat_episode_index",
                     "format": "{field}",
                     "when": when_step_index_zero,
                 },
@@ -920,7 +920,7 @@ def test_token_modality_is_single_embed_row() -> None:
         input_fields=[{"type": "text", "input_field": "action", "format": "{field}"},
             {
                 "type": "text",
-                "input_field": "episode_index",
+                "input_field": "repeat_episode_index",
                 "format": "{field}",
                 "when": when_step_index_zero,
             },
@@ -956,7 +956,7 @@ def test_text_tokenizer_tokenizes_each_field_separately() -> None:
             {"type": "text", "input_field": "action", "format": "a={field}"},
             {
                 "type": "text",
-                "input_field": "episode_index",
+                "input_field": "repeat_episode_index",
                 "format": "{field}",
                 "when": when_step_index_zero,
             },
@@ -983,7 +983,7 @@ def test_identity_embed_image_token_ids() -> None:
             {"type": "image", "input_field": "pixels"},
             {
                 "type": "text",
-                "input_field": "episode_index",
+                "input_field": "repeat_episode_index",
                 "format": "{field}",
                 "when": when_step_index_zero,
             },
@@ -1006,7 +1006,7 @@ def test_text_tokenizer_missing_objective_field_raises() -> None:
     import pytest
 
     tokenizer, _ = _text_pair(objective_fields=_obj("action", "old_log_prob"))
-    step = {"action": 1, "observation": "x", "reward": 1.0, "episode_done": 0, "grouping_id": 0}
+    step = {"action": 1, "observation": "x", "reward": 1.0, "repeat_episode_done": 0, "grouping_id": 0}
     with pytest.raises(KeyError, match="old_log_prob"):
         tokenizer(step)
 
@@ -1015,7 +1015,7 @@ def test_text_tokenizer_keeps_length_one_vector_as_vector() -> None:
     import numpy as np
 
     tokenizer, _ = _text_pair(objective_fields=_obj("action", "q"))
-    step = {"action": 1, "observation": "x", "reward": 1.0, "episode_done": 0, "grouping_id": 0, "q": np.array([0.5])}
+    step = {"action": 1, "observation": "x", "reward": 1.0, "repeat_episode_done": 0, "grouping_id": 0, "q": np.array([0.5])}
     st = tokenizer(step)
     assert isinstance(st.objective_fields["q"], np.ndarray)
     assert st.objective_fields["q"].shape == (1,)
@@ -1025,17 +1025,17 @@ def test_text_model_card_describes_tokenizer(tmp_path) -> None:
     from mouse_core.models.io import _write_model_card
     model = simple_model(backbone=IdentityBackbone(hidden_dim=8), heads=({'action_value': (head := MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0))}), reasoner=None)
     path = tmp_path / 'README.md'
-    _write_model_card(repo_id='user/mouse-text', tokenizer_repo_id='user/mouse-text-tokenizer', model=model, path=path)
+    _write_model_card(repo_id='user/mouse-text', model=model, path=path)
     text = path.read_text()
     assert 'embed_tokens' in text
     assert 'tokenizer' in text
     assert 'mouse_core.data.load_tokenizer' in text
-    assert 'user/mouse-text-tokenizer' in text
+    assert 'user/mouse-text' in text and 'stored in this repository' in text
 
 
 def _group_start_tokenizer(**kwargs):
-    prefix_format = kwargs.pop("prefix_format", "task={field}\n")
-    prefix_field = kwargs.pop("prefix_field", "task_index")
+    prefix_format = kwargs.pop("prefix_format", "episode={field}\n")
+    prefix_field = kwargs.pop("prefix_field", "episode_index")
     fields = [
         {
             "type": "text",
@@ -1046,7 +1046,7 @@ def _group_start_tokenizer(**kwargs):
         {"type": "text", "input_field": "action", "format": "{field}", "head_output": True},
         {
             "type": "text",
-            "input_field": "episode_index",
+            "input_field": "repeat_episode_index",
             "format": "{field}",
             "when": when_step_index_zero,
         },
@@ -1061,10 +1061,10 @@ def _group_start_tokenizer(**kwargs):
 
 def test_text_tokenizer_group_start_carried_on_step() -> None:
     tok = _group_start_tokenizer()
-    st = tok({"action": 1, "task_index": 7})
+    st = tok({"action": 1, "episode_index": 7})
     assert st.group_start_token_ids is not None
     assert st.group_start_numeric_mask is not None
-    expected = _FakeTokenizer()("task=7\n")["input_ids"].view(-1).tolist()
+    expected = _FakeTokenizer()("episode=7\n")["input_ids"].view(-1).tolist()
     assert st.group_start_token_ids.tolist() == expected
     assert st.group_start_numeric_mask.tolist() == [False] * len(expected)
     assert st.head_token_mask.tolist() == [True]
@@ -1075,9 +1075,9 @@ def test_pack_emits_group_start_once_per_sequence() -> None:
 
     tok = _group_start_tokenizer()
     steps = [
-        tok({"action": 1, "task_index": 0}),
-        tok({"action": 2, "task_index": 0}),
-        tok({"action": 3, "task_index": 1}),
+        tok({"action": 1, "episode_index": 0}),
+        tok({"action": 2, "episode_index": 0}),
+        tok({"action": 3, "episode_index": 1}),
     ]
     inputs, obj, _sid = pack_token_batch(steps=steps, sequence_ids=[0, 0, 0], batch_size=1, continuing=None)
     prefix = steps[0].group_start_token_ids
@@ -1102,8 +1102,8 @@ def test_pack_group_start_is_per_sequence() -> None:
 
     tok = _group_start_tokenizer()
     steps = [
-        tok({"action": 1, "task_index": 0}),
-        tok({"action": 2, "task_index": 0}),
+        tok({"action": 1, "episode_index": 0}),
+        tok({"action": 2, "episode_index": 0}),
     ]
     inputs, _, _sid = pack_token_batch(steps=steps, sequence_ids=[0, 1], batch_size=2, continuing=None)
     prefix = steps[0].group_start_token_ids
@@ -1119,7 +1119,7 @@ def test_pack_continuing_suppresses_group_start() -> None:
     from mouse_core.data import pack_token_batch
 
     tok = _group_start_tokenizer()
-    step = tok({"action": 1, "task_index": 5})
+    step = tok({"action": 1, "episode_index": 5})
     prefix = step.group_start_token_ids
     assert prefix is not None
     p = int(prefix.shape[0])
@@ -1151,7 +1151,7 @@ def test_pack_continuing_suppresses_group_start() -> None:
 
 def test_tokenizer_pack_rows_forwards_continuing() -> None:
     tok = _group_start_tokenizer()
-    row = {"action": 1, "task_index": 5}
+    row = {"action": 1, "episode_index": 5}
     st = tok(row)
     assert st.group_start_token_ids is not None
     p = int(st.group_start_token_ids.shape[0])
@@ -1168,7 +1168,7 @@ def test_text_tokenizer_group_start_missing_placeholder_raises() -> None:
 
     tok = _group_start_tokenizer(prefix_format="label={field}\n", prefix_field="label")
     with pytest.raises(KeyError, match="Required modality 'label'"):
-        tok({"action": 1, "task_index": 0})
+        tok({"action": 1, "episode_index": 0})
 
 
 def test_text_tokenizer_group_start_const_without_other_text_is_nonnumeric() -> None:
@@ -1182,7 +1182,7 @@ def test_text_tokenizer_group_start_const_without_other_text_is_nonnumeric() -> 
             {"type": "text", "input_field": "action", "format": "{field}", "head_output": True},
             {
                 "type": "text",
-                "input_field": "episode_index",
+                "input_field": "repeat_episode_index",
                 "format": "{field}",
                 "when": when_step_index_zero,
             },
@@ -1190,7 +1190,7 @@ def test_text_tokenizer_group_start_const_without_other_text_is_nonnumeric() -> 
         tokenizer=_FakeTokenizer(),
         objective_fields=[],
     )
-    st = tok({"action": 1, "task_index": 3})
+    st = tok({"action": 1, "episode_index": 3})
     assert st.group_start_token_ids is not None
     assert st.group_start_numeric_mask is not None
     assert st.T == 1
@@ -1204,7 +1204,7 @@ def test_token_pack_ignores_missing_group_start() -> None:
         input_fields=[{"type": "text", "input_field": "action", "format": "{field}", "head_output": True},
             {
                 "type": "text",
-                "input_field": "episode_index",
+                "input_field": "repeat_episode_index",
                 "format": "{field}",
                 "when": when_step_index_zero,
             },
@@ -1213,16 +1213,16 @@ def test_token_pack_ignores_missing_group_start() -> None:
         tokenizer=IntIdTokenizer(),
     )
     steps = [
-        tok({"action": 1, "task_index": 0}),
-        tok({"action": 2, "task_index": 0}),
+        tok({"action": 1, "episode_index": 0}),
+        tok({"action": 2, "episode_index": 0}),
     ]
     inputs, _, _sid = pack_token_batch(steps=steps, sequence_ids=[0, 0], batch_size=1, continuing=None)
     assert inputs.L == steps[0].T + steps[1].T
     assert steps[0].group_start_token_ids is None
 
 
-def test_episode_index_emits_only_on_step_zero() -> None:
-    """``episode_index`` is text only when ``step_index`` is 0, including a later episode."""
+def test_repeat_episode_index_emits_only_on_step_zero() -> None:
+    """``repeat_episode_index`` is text only when ``step_index`` is 0, including a later episode."""
     seen: list[str] = []
 
     class _CaptureTok:
@@ -1239,7 +1239,7 @@ def test_episode_index_emits_only_on_step_zero() -> None:
             {"type": "text", "input_field": "action", "format": "{field}"},
             {
                 "type": "text",
-                "input_field": "episode_index",
+                "input_field": "repeat_episode_index",
                 "format": ",e={field}",
                 "when": when_step_index_zero,
             },
@@ -1253,49 +1253,49 @@ def test_episode_index_emits_only_on_step_zero() -> None:
         tokenizer=_CaptureTok(),
     )
 
-    def rendered(*, episode_index: int, step_index: Any) -> list[str]:
+    def rendered(*, repeat_episode_index: int, step_index: Any) -> list[str]:
         seen.clear()
         tok(
             {
                 "action": 1,
-                "episode_index": episode_index,
+                "repeat_episode_index": repeat_episode_index,
                 "step_index": step_index,
-                "task_index": 3,
+                "episode_index": 3,
             }
         )
         return list(seen)
 
-    assert rendered(episode_index=0, step_index=0) == ["1", ",e=0", "\n"]
-    assert rendered(episode_index=0, step_index=torch.tensor(0)) == ["1", ",e=0", "\n"]
-    assert rendered(episode_index=0, step_index=1) == ["1", "\n"]
-    assert rendered(episode_index=0, step_index=2) == ["1", "\n"]
-    # Same task, later episode, its own zero step.
-    assert rendered(episode_index=4, step_index=0) == ["1", ",e=4", "\n"]
-    assert rendered(episode_index=4, step_index=5) == ["1", "\n"]
+    assert rendered(repeat_episode_index=0, step_index=0) == ["1", ",e=0", "\n"]
+    assert rendered(repeat_episode_index=0, step_index=torch.tensor(0)) == ["1", ",e=0", "\n"]
+    assert rendered(repeat_episode_index=0, step_index=1) == ["1", "\n"]
+    assert rendered(repeat_episode_index=0, step_index=2) == ["1", "\n"]
+    # Same episode, later episode, its own zero step.
+    assert rendered(repeat_episode_index=4, step_index=0) == ["1", ",e=4", "\n"]
+    assert rendered(repeat_episode_index=4, step_index=5) == ["1", "\n"]
     seen.clear()
-    tok({"action": 1, "episode_index": 2, "task_index": 3})
+    tok({"action": 1, "repeat_episode_index": 2, "episode_index": 3})
     assert seen == ["1", "\n"]
 
 
-def test_token_episode_index_emits_only_on_step_zero() -> None:
+def test_token_repeat_episode_index_emits_only_on_step_zero() -> None:
     tok = Tokenizer(
         input_fields=[
             {"type": "text", "input_field": "action", "format": "{field}", "head_output": True},
             {
                 "type": "text",
-                "input_field": "episode_index",
+                "input_field": "repeat_episode_index",
                 "format": "{field}",
                 "when": when_step_index_zero,
             },
         ],
         tokenizer=IntIdTokenizer(),
     )
-    zero = tok({"action": 1, "episode_index": 4, "step_index": 0, "task_index": 0})
+    zero = tok({"action": 1, "repeat_episode_index": 4, "step_index": 0, "episode_index": 0})
     assert zero.token_ids.tolist() == [1, 4]
     assert zero.head_token_mask.tolist() == [True, False]
-    later = tok({"action": 1, "episode_index": 4, "step_index": 2, "task_index": 0})
+    later = tok({"action": 1, "repeat_episode_index": 4, "step_index": 2, "episode_index": 0})
     assert later.token_ids.tolist() == [1]
-    again = tok({"action": 1, "episode_index": 9, "step_index": 0, "task_index": 0})
+    again = tok({"action": 1, "repeat_episode_index": 9, "step_index": 0, "episode_index": 0})
     assert again.token_ids.tolist() == [1, 9]
 
 
@@ -1307,7 +1307,7 @@ def test_when_rejects_non_callable_scalar() -> None:
             input_fields=[
                 {
                     "type": "text",
-                    "input_field": "episode_index",
+                    "input_field": "repeat_episode_index",
                     "format": "{field}",
                     "when": 0,
                     "head_output": True,
@@ -1324,7 +1324,7 @@ def test_head_output_rejects_when() -> None:
             input_fields=[
                 {
                     "type": "text",
-                    "input_field": "episode_index",
+                    "input_field": "repeat_episode_index",
                     "format": "{field}",
                     "when": when_step_index_zero,
                     "head_output": True,
@@ -1346,9 +1346,9 @@ def test_const_accepts_when() -> None:
         ],
         tokenizer=_FakeTokenizer(),
     )
-    zero = tok({"action": 1, "step_index": 0, "task_index": 0})
+    zero = tok({"action": 1, "step_index": 0, "episode_index": 0})
     assert zero.token_ids.tolist() == _FakeTokenizer()("x")["input_ids"].view(-1).tolist() + _enc("1")
-    later = tok({"action": 1, "step_index": 2, "task_index": 0})
+    later = tok({"action": 1, "step_index": 2, "episode_index": 0})
     assert later.token_ids.tolist() == _enc("1")
 
 
@@ -1358,7 +1358,7 @@ def test_when_equals_or_group_start_routes_value_to_ordinary() -> None:
         input_fields=[
             {
                 "type": "text",
-                "input_field": "episode_index",
+                "input_field": "repeat_episode_index",
                 "format": "{field}",
                 "when": when_step_index_zero_or_group_start,
             },
@@ -1367,11 +1367,11 @@ def test_when_equals_or_group_start_routes_value_to_ordinary() -> None:
         tokenizer=IntIdTokenizer(),
     )
     # step_index==0 → ordinary emit (not group_start_*), even with group_start set.
-    zero = tok({"action": 1, "episode_index": 4, "step_index": 0, "task_index": 0})
+    zero = tok({"action": 1, "repeat_episode_index": 4, "step_index": 0, "episode_index": 0})
     assert zero.token_ids.tolist() == [4, 1]
     assert zero.group_start_token_ids is None
-    # Mid-task non-zero step → only group_start branch; tokens on group_start_*.
-    later = tok({"action": 1, "episode_index": 4, "step_index": 2, "task_index": 0})
+    # Mid-episode non-zero step → only group_start branch; tokens on group_start_*.
+    later = tok({"action": 1, "repeat_episode_index": 4, "step_index": 2, "episode_index": 0})
     assert later.token_ids.tolist() == [1]
     assert later.group_start_token_ids is not None
     assert later.group_start_token_ids.tolist() == [4]

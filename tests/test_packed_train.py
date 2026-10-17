@@ -744,12 +744,12 @@ def test_model_train_isolates_samples_as_sequences(no_compiled_decoder: None) ->
     backbone = Backbone(architecture='qwen3', train_kernel='reference', decode_kernel='flex', dtype=torch.float32, hidden_dim=32, num_layers=2, num_heads=4, num_key_value_heads=4)
     head = MLP(in_features=backbone.hidden_dim, out_features=4, hidden_dim=backbone.hidden_dim, num_layers=1, propagate_gradient=1.0)
     model = simple_model(backbone=backbone, heads={'action_value': head}, reasoner=None).eval()
-    task0 = [{'action': 0, 'episode_done': 0, 'task_done': 0, 'task_index': 0}, {'action': 1, 'episode_done': 0, 'task_done': 0, 'task_index': 0}, {'action': 2, 'episode_done': 1, 'task_done': 2, 'task_index': 0}]
-    task1 = [{'action': 3, 'episode_done': 0, 'task_done': 0, 'task_index': 1}, {'action': 1, 'episode_done': 0, 'task_done': 0, 'task_index': 1}]
+    episode0 = [{'action': 0, 'repeat_episode_done': 0, 'episode_done': 0, 'episode_index': 0}, {'action': 1, 'repeat_episode_done': 0, 'episode_done': 0, 'episode_index': 0}, {'action': 2, 'repeat_episode_done': 1, 'episode_done': 2, 'episode_index': 0}]
+    episode1 = [{'action': 3, 'repeat_episode_done': 0, 'episode_done': 0, 'episode_index': 1}, {'action': 1, 'repeat_episode_done': 0, 'episode_done': 0, 'episode_index': 1}]
     with torch.no_grad():
-        tok = token_tokenizer('action', 'episode_done')
-        tb_both = batch_to_token_batch(tok, [task0, task1])
-        tb_t1 = batch_to_token_batch(tok, [task1])
+        tok = token_tokenizer('action', 'repeat_episode_done')
+        tb_both = batch_to_token_batch(tok, [episode0, episode1])
+        tb_t1 = batch_to_token_batch(tok, [episode1])
         preds_both = model(tb_both)["predictions"]
         preds_t1 = model(tb_t1)["predictions"]
     assert torch.allclose(preds_both['action_value'][3:], preds_t1['action_value'], atol=1e-05, rtol=1e-05)

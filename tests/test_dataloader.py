@@ -39,8 +39,8 @@ def _store_with_actions() -> Datastore:
             data={
                 "action": action + 1,
                 "reward": float(action),
+                "repeat_episode_done": 0,
                 "episode_done": 0,
-                "task_done": 0,
             }
         )
     return store
@@ -54,14 +54,14 @@ def _tokenizer(*, objective_fields: list[dict[str, str]] | None = None) -> Token
     keep = (
         objective_fields
         if objective_fields is not None
-        else _obj("action", "reward", "episode_done", "task_done")
+        else _obj("action", "reward", "repeat_episode_done", "episode_done")
     )
     return Tokenizer(
         input_fields=[
             {"type": "text", "input_field": "action", "format": "{field}", "head_output": True},
             {
                 "type": "text",
-                "input_field": "episode_index",
+                "input_field": "repeat_episode_index",
                 "format": "{field}",
                 "when": when_step_index_zero,
             },
@@ -120,13 +120,13 @@ def test_dataloader_requires_transform() -> None:
 
 
 def test_dataloader_applies_augmenter_before_returning_batch() -> None:
-    def _stamp_task(step: dict) -> dict:
+    def _stamp_episode(step: dict) -> dict:
         out = dict(step)
-        out.setdefault("task_index", 0)
+        out.setdefault("episode_index", 0)
         return out
 
     augmenter = Augmenter(
-        seed_field="task_index",
+        seed_field="episode_index",
         fields=[
             {
                 "type": "discrete",
@@ -142,7 +142,7 @@ def test_dataloader_applies_augmenter_before_returning_batch() -> None:
         samples_budget=3,
         batch_size=2,
         num_workers=0,
-        transform=compose(stages=(_stamp_task, augmenter, _stamp_grouping, _tokenizer())),
+        transform=compose(stages=(_stamp_episode, augmenter, _stamp_grouping, _tokenizer())),
     )
     tb, obj, _sid = loader.next_batch()
     assert isinstance(tb, TokenBatch)
@@ -150,14 +150,14 @@ def test_dataloader_applies_augmenter_before_returning_batch() -> None:
 
 
 def test_dataloader_reseeds_transform_each_batch() -> None:
-    def _stamp_task(step: dict) -> dict:
+    def _stamp_episode(step: dict) -> dict:
         out = dict(step)
-        out.setdefault("task_index", 0)
+        out.setdefault("episode_index", 0)
         return out
 
     augmenter = Augmenter(
         seed=0,
-        seed_field="task_index",
+        seed_field="episode_index",
         fields=[
             {
                 "type": "discrete",
@@ -175,7 +175,7 @@ def test_dataloader_reseeds_transform_each_batch() -> None:
         sample_field="action",
         num_workers=0,
         seed=0,
-        transform=compose(stages=(_stamp_task, augmenter, _stamp_grouping, _tokenizer())),
+        transform=compose(stages=(_stamp_episode, augmenter, _stamp_grouping, _tokenizer())),
     )
     # One-step samples. The fill keeps the first draw and reseeds the one that does not fit.
     stride = 1 * (1 + 1)
@@ -198,15 +198,15 @@ def test_dataloader_same_seed_field_on_two_sequences_uses_two_seeds() -> None:
             data={
                 "action": 0,
                 "reward": 0.0,
+                "repeat_episode_done": 0,
                 "episode_done": 0,
-                "task_done": 0,
-                "task_index": 7,
+                "episode_index": 7,
             }
         )
 
     augmenter = Augmenter(
         seed=0,
-        seed_field="task_index",
+        seed_field="episode_index",
         fields=[
             {
                 "type": "discrete",
@@ -225,7 +225,7 @@ def test_dataloader_same_seed_field_on_two_sequences_uses_two_seeds() -> None:
         stores=store,
         samples_budget=budget,
         batch_size=batch_size,
-        sample_field="task_index",
+        sample_field="episode_index",
         num_workers=0,
         seed=0,
         transform=compose(stages=(augmenter, _stamp_grouping, _tokenizer(objective_fields=_obj("action")))),
@@ -235,7 +235,7 @@ def test_dataloader_same_seed_field_on_two_sequences_uses_two_seeds() -> None:
 
     def _expected(*, generation: int) -> int:
         rng = np.random.default_rng(
-            np.random.SeedSequence([0, generation, _stable_hash("task_index", 7)])
+            np.random.SeedSequence([0, generation, _stable_hash("episode_index", 7)])
         )
         return int(rng.permutation(10)[0])
 
@@ -383,12 +383,12 @@ def test_dataloader_snapshots_loaded_source_and_appended_rows() -> None:
     store.from_dataset(
         ds=Dataset.from_list(
             [
-                {"action": 1, "reward": 0.0, "episode_done": 0, "task_done": 0},
-                {"action": 2, "reward": 0.0, "episode_done": 0, "task_done": 0},
+                {"action": 1, "reward": 0.0, "repeat_episode_done": 0, "episode_done": 0},
+                {"action": 2, "reward": 0.0, "repeat_episode_done": 0, "episode_done": 0},
             ]
         )
     )
-    store.append(data={"action": 3, "reward": 0.0, "episode_done": 0, "task_done": 0})
+    store.append(data={"action": 3, "reward": 0.0, "repeat_episode_done": 0, "episode_done": 0})
     loader = _loader(samples_budget=1, batch_size=1, num_workers=0, seed=0, stores=store)
     seen: set[int] = set()
     for _ in range(24):
@@ -434,13 +434,13 @@ def test_dataloader_seed_is_deterministic_with_workers() -> None:
 def _augmented_transform() -> Any:
     def _stamp(step: dict) -> dict:
         out = dict(step)
-        out.setdefault("task_index", step["action"] % 3)
+        out.setdefault("episode_index", step["action"] % 3)
         out.setdefault("grouping_id", 0)
         return out
 
     augment = Augmenter(
         seed=0,
-        seed_field="task_index",
+        seed_field="episode_index",
         fields=[
             {
                 "type": "discrete",
@@ -533,10 +533,10 @@ def test_dataloader_index_field_stamps_store_offset() -> None:
 def test_dataloader_refresh_picks_up_appended_rows() -> None:
     store = Datastore()
     for action in (1, 2, 3):
-        store.append(data={"action": action, "reward": 0.0, "episode_done": 0, "task_done": 0})
+        store.append(data={"action": action, "reward": 0.0, "repeat_episode_done": 0, "episode_done": 0})
     loader = _loader(samples_budget=3, batch_size=1, num_workers=0, stores=store)
     loader.next_batch()
-    store.append(data={"action": 4, "reward": 0.0, "episode_done": 0, "task_done": 0})
+    store.append(data={"action": 4, "reward": 0.0, "repeat_episode_done": 0, "episode_done": 0})
     _, obj_before, _sid = loader.next_batch()
     assert all(int(a) != 4 for a in obj_before["action"])
     loader.refresh()
@@ -551,12 +551,12 @@ def test_dataloader_refresh_picks_up_appended_rows() -> None:
 def test_dataloader_refresh_drains_prefetch_queue_and_updates_store_sizes() -> None:
     store = Datastore()
     for action in range(3):
-        store.append(data={"action": action, "reward": 0.0, "episode_done": 0, "task_done": 0})
+        store.append(data={"action": action, "reward": 0.0, "repeat_episode_done": 0, "episode_done": 0})
     loader = _loader(samples_budget=2, batch_size=1, num_workers=1, prefetch=2, stores=store)
     try:
         loader.next_batch()
         assert loader._ns == [3]
-        store.append(data={"action": 99, "reward": 0.0, "episode_done": 0, "task_done": 0})
+        store.append(data={"action": 99, "reward": 0.0, "repeat_episode_done": 0, "episode_done": 0})
         loader.refresh()
         assert loader._ns == [4]
     finally:
@@ -571,8 +571,8 @@ def test_dataloader_keeps_a_short_sample_and_packs_another_copy() -> None:
             data={
                 "action": action,
                 "reward": 0.0,
+                "repeat_episode_done": 0,
                 "episode_done": 0,
-                "task_done": 0,
                 "sample_id": 0,
             }
         )
@@ -592,7 +592,7 @@ def test_dataloader_keeps_a_short_sample_and_packs_another_copy() -> None:
 
 def test_dataloader_allows_short_stores() -> None:
     store = Datastore()
-    store.append(data={"action": 7, "reward": 1.0, "episode_done": 0, "task_done": 0})
+    store.append(data={"action": 7, "reward": 1.0, "repeat_episode_done": 0, "episode_done": 0})
     loader = _loader(samples_budget=4, batch_size=1, num_workers=0, stores=store)
     tb, obj, _sid = loader.next_batch()
     assert int(tb.step_counts()[0]) == 1
@@ -605,7 +605,7 @@ def test_dataloader_allows_empty_stores_until_sampling() -> None:
     try:
         with pytest.raises(ValueError, match="all stores are empty"):
             loader.next_batch()
-        store.append(data={"action": 1, "reward": 0.0, "episode_done": 0, "task_done": 0})
+        store.append(data={"action": 1, "reward": 0.0, "repeat_episode_done": 0, "episode_done": 0})
         loader.refresh()
         tb, _, _sid = loader.next_batch()
         assert int(tb.step_counts()[0]) == 1
@@ -658,8 +658,8 @@ def _run_store() -> Datastore:
             data={
                 "action": action,
                 "reward": 0.0,
+                "repeat_episode_done": 0,
                 "episode_done": 0,
-                "task_done": 0,
                 "sample_id": sample_id,
             }
         )
@@ -724,8 +724,8 @@ def test_dataloader_samples_uniformly_over_runs() -> None:
             data={
                 "action": i + 1,
                 "reward": 0.0,
+                "repeat_episode_done": 0,
                 "episode_done": 0,
-                "task_done": 0,
                 "sample_id": 0,
             }
         )
@@ -733,8 +733,8 @@ def test_dataloader_samples_uniformly_over_runs() -> None:
         data={
             "action": 99,
             "reward": 0.0,
+            "repeat_episode_done": 0,
             "episode_done": 0,
-            "task_done": 0,
             "sample_id": 1,
         }
     )
@@ -785,8 +785,8 @@ def test_dataloader_sample_field_must_be_scalar() -> None:
         data={
             "action": 1,
             "reward": 0.0,
+            "repeat_episode_done": 0,
             "episode_done": 0,
-            "task_done": 0,
             "vec": [1, 2],
         }
     )
@@ -808,8 +808,8 @@ def test_dataloader_samples_budget_leaves_out_a_run_that_does_not_fit() -> None:
                 data={
                     "action": sample_id * 3 + step + 1,
                     "reward": 0.0,
+                    "repeat_episode_done": 0,
                     "episode_done": 0,
-                    "task_done": 0,
                     "sample_id": sample_id,
                 }
             )
@@ -832,8 +832,8 @@ def test_dataloader_first_sample_over_budget_raises() -> None:
             data={
                 "action": step + 1,
                 "reward": 0.0,
+                "repeat_episode_done": 0,
                 "episode_done": 0,
-                "task_done": 0,
                 "sample_id": 0,
             }
         )
@@ -853,7 +853,7 @@ def when_group_start(ctx):
     return bool(ctx["group_start"])
 
 
-def _task_transform(*, group_start: bool):
+def _episode_transform(*, group_start: bool):
     fields: list[dict] = [
         {"type": "text", "input_field": "action", "format": "{field}", "head_output": True},
     ]
@@ -863,7 +863,7 @@ def _task_transform(*, group_start: bool):
         )
     tokenizer = Tokenizer(
         input_fields=fields,
-        objective_fields=_obj("action", "store_index", "task_done"),
+        objective_fields=_obj("action", "store_index", "episode_done"),
         tokenizer=IntIdTokenizer(),
     )
     return compose(stages=(_stamp_grouping, tokenizer))
@@ -871,16 +871,16 @@ def _task_transform(*, group_start: bool):
 
 def test_dataloader_samples_budget_keeps_one_run_per_fill() -> None:
     """``batch_size`` fills, each one run when the run length equals the step budget."""
-    store = _task_store(n_tasks=8, steps=4)
+    store = _episode_store(n_episodes=8, steps=4)
     loader = _loader(
         samples_budget=4,
-        sample_field="task_index",
+        sample_field="episode_index",
         batch_size=3,
         num_workers=0,
         seed=0,
         stores=store,
         index_field="store_index",
-        transform=_task_transform(group_start=False),
+        transform=_episode_transform(group_start=False),
     )
     tb, obj, _sid = loader.next_batch()
     assert tb.B == 3
@@ -888,20 +888,20 @@ def test_dataloader_samples_budget_keeps_one_run_per_fill() -> None:
     _assert_whole_segments(tb, obj, _sid, steps_per_segment=4)
 
 
-def _task_store(*, n_tasks: int, steps: int) -> Datastore:
-    """``n_tasks`` tasks of ``steps`` rows. Each task is one ``task_index`` run."""
+def _episode_store(*, n_episodes: int, steps: int) -> Datastore:
+    """``n_episodes`` episodes of ``steps`` rows. Each episode is one ``episode_index`` run."""
     store = Datastore()
-    for task in range(n_tasks):
+    for episode in range(n_episodes):
         for step in range(steps):
             store.append(
                 data={
-                    "action": task * steps + step + 1,
+                    "action": episode * steps + step + 1,
                     "reward": 0.0,
-                    "episode_done": 0,
-                    "task_done": 1 if step == steps - 1 else 0,
-                    "episode_index": 0,
+                    "repeat_episode_done": 0,
+                    "episode_done": 1 if step == steps - 1 else 0,
+                    "repeat_episode_index": 0,
                     "step_index": step,
-                    "task_index": task,
+                    "episode_index": episode,
                     "mark": 7,
                 }
             )
@@ -915,7 +915,7 @@ def _assert_whole_segments(
     *,
     steps_per_segment: int,
 ) -> None:
-    """Each sequence is one full task and ends on ``task_done``."""
+    """Each sequence is one full episode and ends on ``episode_done``."""
     assert tb.B >= 1
     assert "group_id" not in obj.keys()
     seq = [int(x) for x in group_id]
@@ -925,7 +925,7 @@ def _assert_whole_segments(
     assert seq == expected
     assert [int(c) for c in tb.step_counts()] == [steps_per_segment] * tb.B
     indices = [int(x) for x in obj["store_index"]]
-    dones = [int(x) for x in obj["task_done"]]
+    dones = [int(x) for x in obj["episode_done"]]
     for b in range(tb.B):
         start = b * steps_per_segment
         win = indices[start : start + steps_per_segment]
@@ -939,17 +939,17 @@ def _assert_whole_segments(
 
 
 def test_dataloader_token_budget_fills_the_batch_with_segments() -> None:
-    """Whole tasks are packed until the next task would pass the budget."""
-    store = _task_store(n_tasks=8, steps=2)
+    """Whole episodes are packed until the next episode would pass the budget."""
+    store = _episode_store(n_episodes=8, steps=2)
     loader = _loader(
         token_budget=4,
         batch_size=1,
         num_workers=0,
         seed=1,
-        sample_field="task_index",
+        sample_field="episode_index",
         stores=store,
         index_field="store_index",
-        transform=_task_transform(group_start=False),
+        transform=_episode_transform(group_start=False),
     )
     tb, obj, _sid = loader.next_batch()
     assert tb.B == 2
@@ -961,13 +961,13 @@ def test_dataloader_token_budget_fills_the_batch_with_segments() -> None:
         batch_size=1,
         num_workers=0,
         seed=1,
-        sample_field="task_index",
+        sample_field="episode_index",
         stores=store,
         index_field="store_index",
-        transform=_task_transform(group_start=False),
+        transform=_episode_transform(group_start=False),
     )
     tb, obj, _sid = short.next_batch()
-    # Each task is 2 tokens. Two fit in 5; the third does not, so it is left out.
+    # Each episode is 2 tokens. Two fit in 5; the third does not, so it is left out.
     assert tb.B == 2
     assert tb.L == 4
     _assert_whole_segments(tb, obj, _sid, steps_per_segment=2)
@@ -977,10 +977,10 @@ def test_dataloader_token_budget_fills_the_batch_with_segments() -> None:
         batch_size=2,
         num_workers=0,
         seed=1,
-        sample_field="task_index",
+        sample_field="episode_index",
         stores=store,
         index_field="store_index",
-        transform=_task_transform(group_start=False),
+        transform=_episode_transform(group_start=False),
     )
     tb, obj, _sid = two.next_batch()
     assert tb.B == 4
@@ -991,20 +991,20 @@ def test_dataloader_token_budget_fills_the_batch_with_segments() -> None:
 def test_dataloader_token_budget_does_not_split_a_segment() -> None:
     """A segment that does not fit is left out, group-start tokens included.
 
-    Each task is two steps. The first step emits one group-start token plus
+    Each episode is two steps. The first step emits one group-start token plus
     one action token; the second emits one action token. A segment costs 3.
     Budget 5 keeps one whole segment and drops the next.
     """
-    store = _task_store(n_tasks=6, steps=2)
+    store = _episode_store(n_episodes=6, steps=2)
     loader = _loader(
         token_budget=5,
         batch_size=1,
         num_workers=0,
         seed=2,
-        sample_field="task_index",
+        sample_field="episode_index",
         stores=store,
         index_field="store_index",
-        transform=_task_transform(group_start=True),
+        transform=_episode_transform(group_start=True),
     )
     tb, obj, _sid = loader.next_batch()
     assert tb.B == 1
@@ -1019,16 +1019,16 @@ def test_dataloader_token_budget_does_not_split_a_segment() -> None:
 
 def test_dataloader_token_budget_rejects_an_oversized_segment() -> None:
     """A segment larger than the budget is not added, and an empty batch raises."""
-    store = _task_store(n_tasks=4, steps=2)
+    store = _episode_store(n_episodes=4, steps=2)
     loader = _loader(
         token_budget=1,
         batch_size=1,
         num_workers=0,
         seed=3,
-        sample_field="task_index",
+        sample_field="episode_index",
         stores=store,
         index_field="store_index",
-        transform=_task_transform(group_start=False),
+        transform=_episode_transform(group_start=False),
     )
     with pytest.raises(ValueError, match="does not fit"):
         loader.next_batch()

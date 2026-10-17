@@ -1,4 +1,4 @@
-"""Reset placeholders must not become decisions, even inside a live task."""
+"""Reset placeholders must not become decisions, even inside a live episode."""
 import pytest
 import torch
 
@@ -84,7 +84,7 @@ def test_mask_does_not_allow_invalid_executed_actions():
             predictions=torch.zeros(5,2),backup_value_predictions=torch.zeros(5,2),backup_action_predictions=torch.zeros(5,2))
 
 
-def test_automatic_transitions_never_cross_tasks_and_multi_readouts_match():
+def test_automatic_transitions_never_cross_episodes_and_multi_readouts_match():
     batch = data()
     joined = {k:torch.cat([v,v]) for k,v in batch.items()}
     q = torch.arange(10,dtype=torch.float32).reshape(5,2)

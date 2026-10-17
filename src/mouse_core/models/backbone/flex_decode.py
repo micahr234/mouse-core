@@ -24,7 +24,7 @@ How it works:
   unmaps the VMM stores and drops the CUDA graph.
 * Attention runs through :func:`torch.nn.attention.flex_attention` with a
   BlockMask that keeps each query inside its own sequence's causal prefix.
-  One sequence is one sample, so a task change is a new sequence (or
+  One sequence is one sample, so an episode change is a new sequence (or
   :meth:`reset_rows`), not a second id inside the cache. The mask is built
   in logical coordinates (cheap: ``[B, S, max_len]``) and its block indices
   are remapped through the page table, so the kernel only visits the pages
@@ -35,7 +35,7 @@ How it works:
   rule the uncached train paths use (:func:`packed_rope_positions`), so
   decode matches a full forward (pinned by ``tests/test_kv_cache.py``).
 * :meth:`reset_rows` zeros selected ``lengths`` and frees their pages so a
-  cleared stream (e.g. task boundary) can restart at position 0 without
+  cleared stream (e.g. episode boundary) can restart at position 0 without
   rebuilding the rest of the batch.
 * Page bookkeeping is host-side (the caller already passes ``lengths`` as a
   Python list), so a decode step issues no device→host sync; new pages are

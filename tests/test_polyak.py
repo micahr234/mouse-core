@@ -14,12 +14,12 @@ from mouse_core.models.backbone import IdentityBackbone, Backbone
 from mouse_core.models.mlp import MLP
 from tests._token_batch_helpers import batch_to_token_batch, token_tokenizer
 
-_TOK = token_tokenizer("action", "episode_done")
+_TOK = token_tokenizer("action", "repeat_episode_done")
 _BATCH = [
     [
-        {"action": 0, "reward": 0.0, "episode_done": 0, "task_done": 0},
-        {"action": 1, "reward": 1.0, "episode_done": 0, "task_done": 0},
-        {"action": 2, "reward": 2.0, "episode_done": 1, "task_done": 0},
+        {"action": 0, "reward": 0.0, "repeat_episode_done": 0, "episode_done": 0},
+        {"action": 1, "reward": 1.0, "repeat_episode_done": 0, "episode_done": 0},
+        {"action": 2, "reward": 2.0, "repeat_episode_done": 1, "episode_done": 0},
     ]
 ]
 

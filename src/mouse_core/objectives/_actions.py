@@ -1,4 +1,4 @@
-"""Validity of incoming actions, separate from observation and task validity."""
+"""Validity of incoming actions, separate from observation and episode validity."""
 
 import torch
 

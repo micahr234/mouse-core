@@ -15,7 +15,7 @@ from mouse_core.objectives.transforms import (
     nstep_gate,
     value_gap_gate,
 )
-from mouse_core.objectives.grpo import GrpoObjective, group_relative_advantages
+from mouse_core.objectives.grpo import GrpoObjective, group_relative_advantages, sampling_mismatch_weights
 from mouse_core.objectives.ppo import PpoObjective, sample_discrete_action
 from mouse_core.objectives.sp import SpObjective, best_action
 from mouse_core.objectives.sv import SvObjective
@@ -39,6 +39,7 @@ __all__ = [
     "value_gap_gate",
     "GrpoObjective",
     "group_relative_advantages",
+    "sampling_mismatch_weights",
     "PpoObjective",
     "sample_discrete_action",
     "SpObjective",

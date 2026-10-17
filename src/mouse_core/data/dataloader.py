@@ -18,7 +18,7 @@ Attention and the TD / PPO / GRPO run stop where ``group_id`` changes,
 so they do not cross the field. A sample that does not fit is left
 out. The first sample of a fill is left out too when it alone is over
 the budget, and that raises. Examples pass ``batch_size=1`` (one fill)
-and ``sample_field="task_index"``.
+and ``sample_field="episode_index"``.
 
 Token ``sequence_ids`` and the step ``group_id`` tensor use those same
 ids, ``0 .. B - 1``, one contiguous block each. ``group_id`` is
@@ -64,7 +64,7 @@ Usage
         token_budget=4096,
         batch_size=1,
         transform=train_transform,
-        sample_field="task_index",
+        sample_field="episode_index",
         num_workers=0,
     )
     inputs, objective_data, group_id = loader.next_batch()

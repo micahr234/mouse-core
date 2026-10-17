@@ -72,7 +72,7 @@ def _gae_advantages(
             ``group_id``).
         gae_lambda: GAE λ.
         cross_group_backups: ``"bootstrap"``, ``"ignore"``, or ``"fault"``.
-            For any horizon, the last step of a task is not updated when
+            For any horizon, the last step of an episode is not updated when
             its advantage depends on the next step's value. It is updated
             when the advantage does not. ``"bootstrap"`` fills ``V`` on
             the step before a group boundary (a state whose next step is
@@ -219,7 +219,7 @@ class PpoObjective(Objective[...]):
             shape is accepted.
         gae_lambda: GAE λ (``1.0`` = Monte Carlo returns within the discount).
         cross_group_backups: Required. ``"bootstrap"``, ``"ignore"``, or
-            ``"fault"``. For any horizon, the last step of a task is not
+            ``"fault"``. For any horizon, the last step of an episode is not
             updated when its advantage depends on the next step's value.
             It is updated when the advantage does not. ``"bootstrap"``
             fills ``V`` on the step before a group boundary (the end of

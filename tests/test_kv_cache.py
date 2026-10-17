@@ -31,7 +31,7 @@ def _as_rect(preds: torch.Tensor) -> torch.Tensor:
         return preds.unsqueeze(0)
     return preds
 
-_TOK = token_tokenizer("action", "episode_done")
+_TOK = token_tokenizer("action", "repeat_episode_done")
 
 def _tiny_model(architecture: Literal['llama', 'qwen3']='qwen3', tokens: int=1, dtype: torch.dtype=torch.float32, train_kernel: TrainKernel='reference', **backbone_kwargs) -> Model:
     hidden_dim = 16
@@ -40,12 +40,12 @@ def _tiny_model(architecture: Literal['llama', 'qwen3']='qwen3', tokens: int=1, 
     return simple_model(backbone=backbone, heads={'action_value': head}, reasoner=None).eval()
 
 def _steps(n: int, start: int=0) -> list[dict]:
-    return [{'action': i % 4, 'reward': float(i), 'episode_done': int(i % 7 == 6), 'task_done': 0} for i in range(start, start + n)]
+    return [{'action': i % 4, 'reward': float(i), 'repeat_episode_done': int(i % 7 == 6), 'episode_done': 0} for i in range(start, start + n)]
 
 
 def _fwd(model: Model, rows: list[list[dict]], **kwargs):
     patched = [
-        [{**step, "task_index": step.get("task_index", 0)} for step in seq]
+        [{**step, "episode_index": step.get("episode_index", 0)} for step in seq]
         for seq in rows
     ]
     tb = batch_to_token_batch(
@@ -78,8 +78,8 @@ def test_recurring_grouping_id_matches_between_full_and_cached(backbone_cls: Lit
     torch.manual_seed(3)
     model = _tiny_model(backbone_cls)
     steps = _steps(6)
-    for step, task in zip(steps, (0, 0, 1, 1, 0, 0)):
-        step["task_index"] = task
+    for step, episode in zip(steps, (0, 0, 1, 1, 0, 0)):
+        step["episode_index"] = episode
     with torch.no_grad():
         full, _ = _fwd(model, [steps])
         cache = None
@@ -97,8 +97,8 @@ def test_cuda_bf16_packed_train_matches_cached_decode_with_recurring_ids() -> No
     torch.manual_seed(4)
     model = _tiny_model("qwen3", dtype=torch.bfloat16).to(torch.device('cuda'))
     steps = _steps(8)
-    for step, task in zip(steps, (0, 0, 1, 1, 0, 0, 2, 0)):
-        step["task_index"] = task
+    for step, episode in zip(steps, (0, 0, 1, 1, 0, 0, 2, 0)):
+        step["episode_index"] = episode
     with torch.no_grad():
         full, _ = _fwd(model, [steps])
         cache = None
@@ -118,8 +118,8 @@ def test_cuda_fp32_decode_is_compiled_and_matches_full_forward() -> None:
     torch.manual_seed(5)
     model = _tiny_model('qwen3', head_dim=16).to(device=torch.device('cuda'))
     steps = _steps(200)
-    for step, task in zip(steps, [0] * 100 + [1] * 60 + [0] * 40):
-        step['task_index'] = task
+    for step, episode in zip(steps, [0] * 100 + [1] * 60 + [0] * 40):
+        step['episode_index'] = episode
     with torch.no_grad():
         full, _ = _fwd(model, [steps])
         preds_a, cache = _fwd(model, [steps[:150]], use_cache=True)
@@ -144,8 +144,8 @@ def test_cuda_bf16_lora_compiled_train_matches_cached_decode() -> None:
     head = MLP(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, propagate_gradient=1.0)
     model = simple_model(backbone=backbone, heads={'action_value': head}, reasoner=None).eval().to(torch.device('cuda'))
     steps = _steps(8)
-    for step, task in zip(steps, (0, 0, 1, 1, 0, 0, 2, 0)):
-        step['task_index'] = task
+    for step, episode in zip(steps, (0, 0, 1, 1, 0, 0, 2, 0)):
+        step['episode_index'] = episode
     was = packed_train_mod._compiled_layer
     try:
         packed_train_mod._compiled_layer = None
@@ -174,8 +174,8 @@ def test_cuda_fp32_autocast_train_matches_cached_decode() -> None:
     torch.manual_seed(6)
     model = _tiny_model('qwen3', train_kernel='varlen', train_autocast_dtype=torch.bfloat16, decode_autocast_dtype=torch.bfloat16).to(torch.device('cuda'))
     steps = _steps(8)
-    for step, task in zip(steps, (0, 0, 1, 1, 0, 0, 2, 0)):
-        step['task_index'] = task
+    for step, episode in zip(steps, (0, 0, 1, 1, 0, 0, 2, 0)):
+        step['episode_index'] = episode
     with torch.no_grad():
         full, _ = _fwd(model, [steps])
         cache = None
@@ -468,7 +468,7 @@ def test_eval_loop_get_action_model_output_matches_full_forward() -> None:
         actions = None
         for s in range(5):
             patched = [
-                [{**row[s], "task_index": row[s].get("task_index", 0)}]
+                [{**row[s], "episode_index": row[s].get("episode_index", 0)}]
                 for row in rows
             ]
             tb = batch_to_token_batch(
@@ -652,7 +652,7 @@ def test_uniform_then_ragged_cached_decode() -> None:
 def test_reset_rows_restarts_one_sequence_without_rebuild(backbone_cls: Literal["llama", "qwen3"]) -> None:
     """Clearing one row's cache length must restart that row; others keep decoding.
 
-    Mimics a single env hitting a task boundary: reset that stream and continue
+    Mimics a single env hitting a episode boundary: reset that stream and continue
     the batch without dropping the shared session.
     """
     torch.manual_seed(7)
@@ -839,24 +839,24 @@ def test_decode_new_sample_matches_fresh_forward_after_reset(backbone_cls: Liter
     """A new sample starts after ``reset_rows``. Its predictions match a fresh forward."""
     torch.manual_seed(8)
     model = _tiny_model(backbone_cls)
-    task0 = [
-        {'action': 0, 'reward': 0.0, 'episode_done': 0, 'task_done': 0, 'task_index': 0},
-        {'action': 1, 'reward': 1.0, 'episode_done': 0, 'task_done': 0, 'task_index': 0},
-        {'action': 2, 'reward': 2.0, 'episode_done': 1, 'task_done': 2, 'task_index': 0},
+    episode0 = [
+        {'action': 0, 'reward': 0.0, 'repeat_episode_done': 0, 'episode_done': 0, 'episode_index': 0},
+        {'action': 1, 'reward': 1.0, 'repeat_episode_done': 0, 'episode_done': 0, 'episode_index': 0},
+        {'action': 2, 'reward': 2.0, 'repeat_episode_done': 1, 'episode_done': 2, 'episode_index': 0},
     ]
-    task1 = [
-        {'action': 3, 'reward': 3.0, 'episode_done': 0, 'task_done': 0, 'task_index': 1},
-        {'action': 1, 'reward': 4.0, 'episode_done': 0, 'task_done': 0, 'task_index': 1},
-        {'action': 0, 'reward': 5.0, 'episode_done': 0, 'task_done': 0, 'task_index': 1},
+    episode1 = [
+        {'action': 3, 'reward': 3.0, 'repeat_episode_done': 0, 'episode_done': 0, 'episode_index': 1},
+        {'action': 1, 'reward': 4.0, 'repeat_episode_done': 0, 'episode_done': 0, 'episode_index': 1},
+        {'action': 0, 'reward': 5.0, 'repeat_episode_done': 0, 'episode_done': 0, 'episode_index': 1},
     ]
     with torch.no_grad():
-        ref = _fwd(model, [task1])[0]['action_value']
+        ref = _fwd(model, [episode1])[0]['action_value']
         cache = None
-        _, cache = _fwd(model, [task0], use_cache=True)
+        _, cache = _fwd(model, [episode0], use_cache=True)
         assert cache is not None
         cache.reset_rows(rows=[0])
         collected: list[torch.Tensor] = []
-        for step in task1:
+        for step in episode1:
             preds, cache = _fwd(model, [[step]], cache=cache, use_cache=True)
             collected.append(preds['action_value'][:, -1])
         got = torch.stack(collected, dim=1)

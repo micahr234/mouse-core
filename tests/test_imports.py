@@ -37,8 +37,8 @@ def test_condition_helpers_not_exported() -> None:
     import mouse_core.data as data
 
     for name in (
-        "full_task_start",
-        "full_task_end",
+        "full_episode_start",
+        "full_episode_end",
         "when_group_start",
         "when_reward_nonzero",
         "when_episode_done_nonzero",

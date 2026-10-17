@@ -36,7 +36,7 @@ A sample is every contiguous row that shares one value in
 ``sample_field``. Each sample is one group. Attention and loss stop
 where ``group_id`` changes. Pass exactly one of ``samples_budget`` (steps) or
 ``token_budget`` (packed tokens). A sample that does not fit is left
-out. Examples pass ``batch_size=1`` and ``sample_field="task_index"``.
+out. Examples pass ``batch_size=1`` and ``sample_field="episode_index"``.
 """
 
 from __future__ import annotations

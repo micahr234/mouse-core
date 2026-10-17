@@ -10,7 +10,7 @@ with AdamW checkpoints.
 
 `mouse_core.sampling` provides:
 
-- `TaskTemperature(low, high, rng)`: draw uniformly once for each task in each
+- `EpisodeTemperature(low, high, rng)`: draw uniformly once for each episode in each
   stream. Inner episode boundaries do not change the temperature.
 - `sample_tempered_actions(scores, temperatures, rng)`: sample from temperature
   scaled scores and return actions and their behavior log-probabilities. Zero
@@ -22,5 +22,5 @@ with AdamW checkpoints.
 - `last_action_scores(scores, valid, num_actions)`: select the final valid
   readout in each decode stream and restrict it to legal actions.
 
-Task identity, online/evaluation schedules, and the choice of temperature bounds
+Episode identity, online/evaluation schedules, and the choice of temperature bounds
 remain the caller's responsibility. For greedy evaluation use zero temperature.

@@ -42,13 +42,13 @@ def _tok_in(
         for name in names
     ]
     if not any(
-        field.get("input_field") == "episode_index"
+        field.get("input_field") == "repeat_episode_index"
         for field in fields
     ):
         fields.append(
             {
                 "type": "text",
-                "input_field": "episode_index",
+                "input_field": "repeat_episode_index",
                 "format": "{field}",
                 "when": when_step_index_zero,
             }
@@ -58,12 +58,12 @@ def _tok_in(
 
 def _rows() -> list[dict]:
     return [
-        {"action": 0, "observation": 1, "reward": 0.0, "episode_done": 0, "task_done": 0, "task_index": 0, "noise": 9},
-        {"action": 1, "observation": 2, "reward": 0.5, "episode_done": 0, "task_done": 0, "task_index": 0, "noise": 8},
-        {"action": 2, "observation": 3, "reward": 1.0, "episode_done": 1, "task_done": 2, "task_index": 0, "noise": 7},
-        {"action": 0, "observation": 4, "reward": 0.0, "episode_done": 0, "task_done": 0, "task_index": 1, "noise": 6},
-        {"action": 1, "observation": 5, "reward": 0.25, "episode_done": 2, "task_done": 2, "task_index": 1, "noise": 5},
-        {"action": 3, "observation": 6, "reward": 0.0, "episode_done": 0, "task_done": 0, "task_index": 2, "noise": 4},
+        {"action": 0, "observation": 1, "reward": 0.0, "repeat_episode_done": 0, "episode_done": 0, "episode_index": 0, "noise": 9},
+        {"action": 1, "observation": 2, "reward": 0.5, "repeat_episode_done": 0, "episode_done": 0, "episode_index": 0, "noise": 8},
+        {"action": 2, "observation": 3, "reward": 1.0, "repeat_episode_done": 1, "episode_done": 2, "episode_index": 0, "noise": 7},
+        {"action": 0, "observation": 4, "reward": 0.0, "repeat_episode_done": 0, "episode_done": 0, "episode_index": 1, "noise": 6},
+        {"action": 1, "observation": 5, "reward": 0.25, "repeat_episode_done": 2, "episode_done": 2, "episode_index": 1, "noise": 5},
+        {"action": 3, "observation": 6, "reward": 0.0, "repeat_episode_done": 0, "episode_done": 0, "episode_index": 2, "noise": 4},
     ]
 
 
@@ -74,7 +74,7 @@ def test_missing_objective_fields_key_raises() -> None:
         tokenizer=IntIdTokenizer(),
     )
     with pytest.raises(KeyError, match="old_log_prob"):
-        tokenizer({"action": 1, "task_index": 0})
+        tokenizer({"action": 1, "episode_index": 0})
 
 
 def test_tokenizer_output_defaults_to_input() -> None:
@@ -83,7 +83,7 @@ def test_tokenizer_output_defaults_to_input() -> None:
         objective_fields=_io(("reward", "reward")),
         tokenizer=IntIdTokenizer(),
     )
-    tokens = tokenizer({"action": 2, "reward": 0.5, "task_index": 0})
+    tokens = tokenizer({"action": 2, "reward": 0.5, "episode_index": 0})
     assert not tokens.numeric_mask.any()
     assert tokens.objective_fields["reward"] == pytest.approx(0.5)
 
@@ -99,7 +99,7 @@ def test_tokenizer_renames_objective_fields() -> None:
             },
             {
                 "type": "text",
-                "input_field": "episode_index",
+                "input_field": "repeat_episode_index",
                 "format": "{field}",
                 "when": when_step_index_zero,
             },
@@ -107,7 +107,7 @@ def test_tokenizer_renames_objective_fields() -> None:
         objective_fields=_io(("q", "info_q_star")),
         tokenizer=IntIdTokenizer(),
     )
-    tokens = tokenizer({"act": 3, "q": 1.5, "task_index": 0})
+    tokens = tokenizer({"act": 3, "q": 1.5, "episode_index": 0})
     assert not tokens.numeric_mask.any()
     assert tokens.objective_fields["info_q_star"] == pytest.approx(1.5)
 
@@ -122,8 +122,8 @@ def test_tokenizer_full_matches_per_step_concat() -> None:
             ("action", "action"),
             ("observation", "observation"),
             ("reward", "reward"),
+            ("repeat_episode_done", "repeat_episode_done"),
             ("episode_done", "episode_done"),
-            ("task_done", "task_done"),
         ),
         tokenizer=IntIdTokenizer(),
     )
@@ -137,5 +137,5 @@ def test_tokenizer_full_matches_per_step_concat() -> None:
     assert np.allclose(full.numeric_values, cat.numeric_values)
     assert np.array_equal(full.sequence_ids, cat.sequence_ids)
     assert np.array_equal(full.head_token_ids, cat.head_token_ids)
-    for key in ("action", "observation", "reward", "episode_done", "task_done"):
+    for key in ("action", "observation", "reward", "repeat_episode_done", "episode_done"):
         assert torch.equal(full_obj[key], cat_obj[key])

@@ -558,7 +558,7 @@ class DqnObjective(Objective[...]):
     ``discount(**objective_data)``
     supplies the per-step γ that multiplies the bootstrap and the
     continued return. ``boundary_discount`` is the standard
-    ``gamma_step`` × episode-extra × task-extra lookup.
+    ``gamma_step`` × episode-extra × episode-extra lookup.
     ``gate(**objective_data, q=q, q_delayed=q_delayed)`` supplies the
     continuation. ``q`` is the detached per-step online Q.
     ``q_delayed`` is the detached per-step delayed Q. ``lambda_gate``
@@ -587,7 +587,7 @@ class DqnObjective(Objective[...]):
     return that started at ``t``, and that row is unrolled on its own.
     The objective then zeros a
     continuation that would leave the run. For any horizon, the last
-    step of a task is not updated when its target depends on the next
+    step of an episode is not updated when its target depends on the next
     step's value. It is updated when the target does not.
     ``cross_group_backups="bootstrap"`` fills ``V`` on the step before
     that group boundary (the rest of the episode is not in the sample),
@@ -715,7 +715,7 @@ class DqnObjective(Objective[...]):
             values use that head's Boltzmann policy and entropy bonus, evaluated
             with ``backup_value_predictions``. Same units as rollout temperature.
         cross_group_backups: Required. ``"bootstrap"``, ``"ignore"``, or
-            ``"fault"``. For any horizon, the last step of a task is not
+            ``"fault"``. For any horizon, the last step of an episode is not
             updated when its target depends on the next step's value. It
             is updated when the target does not. ``"bootstrap"`` fills
             ``V`` on the step before a group boundary (the end of the
@@ -728,7 +728,7 @@ class DqnObjective(Objective[...]):
             A terminated or truncated γ of ``0``, or a horizon that puts no weight on
             that value, does not depend on it, so the step stays and
             ``"fault"`` does not raise. An earlier step whose backup
-            stays inside the task stays either way.
+            stays inside the episode stays either way.
     """
 
     def __init__(

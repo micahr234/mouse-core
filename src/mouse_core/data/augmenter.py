@@ -282,7 +282,7 @@ class Augmenter:
     """Callable augmenter for one step dict.
 
     ``seed_field`` is required: permute/scale/shift draws are keyed by that
-    field's value so steps that share an id (e.g. the same task) share draws
+    field's value so steps that share an id (e.g. the same episode) share draws
     within one :meth:`reseed` generation. ``DataLoader`` gives each sampled
     sequence its own generation, so the same index on two rollouts starts
     from two seeds. Call :meth:`reseed` to advance to a new draw set for
@@ -328,7 +328,7 @@ class Augmenter:
                 value = row[in_f]
                 if value is None and spec.type == "discrete":
                     # No action ran. Still permute the associated value vector
-                    # below so reset-state targets use the task's action order.
+                    # below so reset-state targets use the episode's action order.
                     row[out_f] = None
                     continue
                 value = self._apply_permutation(spec, draw, value)

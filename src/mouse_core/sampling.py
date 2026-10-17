@@ -1,4 +1,4 @@
-"""Task-scoped temperature sampling for online collection."""
+"""Episode-scoped temperature sampling for online collection."""
 
 import math
 from collections.abc import Sequence
@@ -12,27 +12,27 @@ def check_temperature_range(low: float, high: float) -> None:
         raise ValueError("online temperature bounds must be finite and satisfy 0 <= min <= max")
 
 
-class TaskTemperature:
-    """Uniformly sample once per task per stream, including across inner episodes."""
+class EpisodeTemperature:
+    """Uniformly sample once per episode per stream, including across inner episodes."""
 
     def __init__(self, low: float, high: float, rng: np.random.Generator):
         check_temperature_range(low, high)
         self.low = low
         self.high = high
         self.rng = rng
-        self.tasks: dict[int, tuple[int, float]] = {}
+        self.episodes: dict[int, tuple[int, float]] = {}
 
-    def for_task(self, stream: int, task: int) -> float:
-        current = self.tasks.get(stream)
-        if current is None or current[0] != task:
+    def for_episode(self, stream: int, episode: int) -> float:
+        current = self.episodes.get(stream)
+        if current is None or current[0] != episode:
             temperature = float(self.rng.uniform(self.low, self.high))
-            self.tasks[stream] = (task, temperature)
-        return self.tasks[stream][1]
+            self.episodes[stream] = (episode, temperature)
+        return self.episodes[stream][1]
 
     def actions(
-        self, scores: torch.Tensor, task_ids: Sequence[int],
+        self, scores: torch.Tensor, episode_ids: Sequence[int],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        temperatures = [self.for_task(i, task) for i, task in enumerate(task_ids)]
+        temperatures = [self.for_episode(i, episode) for i, episode in enumerate(episode_ids)]
         return sample_tempered_actions(scores, temperatures, self.rng)
 
 
@@ -88,7 +88,7 @@ def sample_tempered_actions(
 
 
 def tempered_policy_logits(scores: torch.Tensor, temperatures: torch.Tensor) -> torch.Tensor:
-    """Differentiable logits for the same task policy used during collection.
+    """Differentiable logits for the same episode policy used during collection.
 
     Zero-temperature rows are point masses and have zero policy gradient.
     Finite saturation keeps entropy's 0 * log(0) term well-defined, including

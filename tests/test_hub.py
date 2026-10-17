@@ -73,11 +73,11 @@ class _FakeHfApi:
 def _store(*actions: int, name: str | None=None) -> Datastore:
     store = Datastore(name=name)
     for i, action in enumerate(actions):
-        store.append(data={'observation': {'discrete': i}, 'action': {'discrete': action}, 'reward': float(i), 'episode_done': 0, 'task_done': 0, 'step_index': i})
+        store.append(data={'observation': {'discrete': i}, 'action': {'discrete': action}, 'reward': float(i), 'repeat_episode_done': 0, 'episode_done': 0, 'step_index': i})
     return store
 
 def _loaded_store_datasets() -> dict[str, Dataset]:
-    return {'cartpole': Dataset.from_list([{'observation': {'discrete': 1}, 'action': {'discrete': 1}, 'reward': 1.0, 'episode_done': 0, 'task_done': 0, 'step_index': 0}]), 'lunar': Dataset.from_list([{'observation': {'discrete': 2}, 'action': {'discrete': 2}, 'reward': 2.0, 'episode_done': 0, 'task_done': 0, 'step_index': 0}])}
+    return {'cartpole': Dataset.from_list([{'observation': {'discrete': 1}, 'action': {'discrete': 1}, 'reward': 1.0, 'repeat_episode_done': 0, 'episode_done': 0, 'step_index': 0}]), 'lunar': Dataset.from_list([{'observation': {'discrete': 2}, 'action': {'discrete': 2}, 'reward': 2.0, 'repeat_episode_done': 0, 'episode_done': 0, 'step_index': 0}])}
 
 def _write_snapshot(root: Path, *store_names: str, split: str='train') -> Path:
     for store_name in store_names:
@@ -89,10 +89,10 @@ def _write_snapshot(root: Path, *store_names: str, split: str='train') -> Path:
 def test_align_splits_raises_on_missing_columns() -> None:
     """Absent columns are never fabricated — 0 done codes would train wrong later."""
     splits = {
-        'train': Dataset.from_list([{'action': 1, 'episode_done': 0}]),
+        'train': Dataset.from_list([{'action': 1, 'repeat_episode_done': 0}]),
         'eval': Dataset.from_list([{'action': 2}]),
     }
-    with pytest.raises(ValueError, match="missing \\['episode_done'\\]"):
+    with pytest.raises(ValueError, match="missing \\['repeat_episode_done'\\]"):
         hub._align_splits(splits)
 
 
@@ -155,7 +155,7 @@ def test_load_stores_from_hub_scopes_short_names(monkeypatch: pytest.MonkeyPatch
 
     def fake_load_dataset(path: str, **kwargs):
         calls.append((path, kwargs))
-        return {'config': Dataset.from_list([{'observation': {'discrete': 0}, 'action': {'discrete': 0}, 'reward': 0.0, 'episode_done': 0, 'task_done': 0, 'step_index': 0}])}
+        return {'config': Dataset.from_list([{'observation': {'discrete': 0}, 'action': {'discrete': 0}, 'reward': 0.0, 'repeat_episode_done': 0, 'episode_done': 0, 'step_index': 0}])}
 
     def fake_snapshot(*, repo_id: str, store_names: list[str] | None, split: str, revision: str | None, token: str | bool | None, force_download: bool=False):
         snapshot_calls.append((repo_id, store_names, split, revision, token))
@@ -174,7 +174,7 @@ def test_load_stores_from_hub_keeps_hyphenated_store_name(monkeypatch: pytest.Mo
 
     def fake_load_dataset(path: str, **kwargs):
         calls.append((path, kwargs))
-        return {'double_integrator_random': Dataset.from_list([{'observation': {'discrete': 0}, 'action': {'discrete': 0}, 'reward': 0.0, 'episode_done': 0, 'task_done': 0, 'step_index': 0}])}
+        return {'double_integrator_random': Dataset.from_list([{'observation': {'discrete': 0}, 'action': {'discrete': 0}, 'reward': 0.0, 'repeat_episode_done': 0, 'episode_done': 0, 'step_index': 0}])}
 
     def fake_snapshot(*, repo_id: str, store_names: list[str] | None, split: str, revision: str | None, token: str | bool | None, force_download: bool=False):
         return snapshot_dir
