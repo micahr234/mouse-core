@@ -1638,7 +1638,7 @@ def test_numeric_embed_adds_fourier_of_the_scaled_value() -> None:
     )
     fresh = Embedding(hidden_dim=8, vocab_size=32, num_frequencies=4)
     assert fresh.fourier is not None
-    assert torch.count_nonzero(fresh.fourier.proj.weight) == 0
+    assert torch.count_nonzero(fresh.fourier.proj.weight) > 0
     low = tokenizer({"action": 0, "observation": -0.5})
     batch, _, _ = pack_token_batch(
         steps=[low], sequence_ids=[0], batch_size=1, continuing=None
@@ -1647,13 +1647,7 @@ def test_numeric_embed_adds_fourier_of_the_scaled_value() -> None:
     mask = torch.tensor(low.numeric_mask)
     star = low.token_ids[low.numeric_mask]
     looked = fresh.embed_tokens.weight[torch.tensor(star.tolist())]
-    assert torch.allclose(embeds[mask], looked)
-
-    backbone = Embedding(hidden_dim=8, vocab_size=32, num_frequencies=4)
-    assert backbone.fourier is not None
-    with torch.no_grad():
-        backbone.embed_tokens.weight.copy_(fresh.embed_tokens.weight)
-        backbone.fourier.proj.weight.normal_()
+    assert not torch.allclose(embeds[mask], looked)
     high = tokenizer({"action": 0, "observation": 0.5})
     low_batch, _, _ = pack_token_batch(
         steps=[low], sequence_ids=[0], batch_size=1, continuing=None
@@ -1661,12 +1655,13 @@ def test_numeric_embed_adds_fourier_of_the_scaled_value() -> None:
     high_batch, _, _ = pack_token_batch(
         steps=[high], sequence_ids=[0], batch_size=1, continuing=None
     )
-    low_embeds = embed_batch(backbone, low_batch)
-    high_embeds = embed_batch(backbone, high_batch)
+    low_embeds = embed_batch(fresh, low_batch)
+    high_embeds = embed_batch(fresh, high_batch)
+    assert not torch.allclose(low_embeds[mask], high_embeds[mask])
     low_value = torch.tensor(low.numeric_values[low.numeric_mask])
     high_value = torch.tensor(high.numeric_values[high.numeric_mask])
     delta = high_embeds[mask] - low_embeds[mask]
-    fourier_delta = backbone.fourier(high_value) - backbone.fourier(low_value)
+    fourier_delta = fresh.fourier(high_value) - fresh.fourier(low_value)
     assert torch.allclose(delta, fourier_delta)
     text = ~mask
     assert torch.allclose(high_embeds[text], low_embeds[text])
@@ -1677,7 +1672,7 @@ def test_numeric_embed_adds_fourier_of_the_scaled_value() -> None:
 
     loss = low_embeds.sum()
     loss.backward()
-    grad = backbone.fourier.proj.weight.grad
+    grad = fresh.fourier.proj.weight.grad
     assert grad is not None
     assert float(grad.abs().sum()) > 0.0
 

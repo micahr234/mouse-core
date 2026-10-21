@@ -88,6 +88,34 @@ def test_embedding_supports_local_pytorch_weights_and_checks_dimensions(tmp_path
         Embedding(pretrained=tmp_path, vocab_size=7)
 
 
+@pytest.mark.parametrize("hidden_dim,num_frequencies", [(128, 1), (128, 16), (512, 16)])
+@pytest.mark.parametrize("pretrained_scale", [None, 0.02, 0.2])
+def test_fourier_initial_norm_matches_token_table(monkeypatch, hidden_dim, num_frequencies, pretrained_scale):
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(0)
+        if pretrained_scale is None:
+            embedding = Embedding(vocab_size=64, hidden_dim=hidden_dim,
+                                  num_frequencies=num_frequencies)
+        else:
+            table = torch.nn.Embedding(64, hidden_dim)
+            with torch.no_grad():
+                # A nonzero mean distinguishes RMS matching from std matching.
+                table.weight.normal_(mean=pretrained_scale, std=pretrained_scale / 4)
+            monkeypatch.setattr(
+                "mouse_core.models.embedding.token.load_token_table",
+                lambda pretrained, hub_kwargs: table,
+            )
+            embedding = Embedding(pretrained="test-table", num_frequencies=num_frequencies)
+    assert embedding.fourier is not None
+    values = torch.linspace(-0.95, 0.95, 257)
+    with torch.no_grad():
+        output = embedding.fourier(values)
+        token_norm = embedding.embed_tokens.weight.square().sum(-1).mean().sqrt()
+        fourier_norm = output.square().sum(-1).mean().sqrt()
+    assert fourier_norm.item() == pytest.approx(token_norm.item(), rel=0.15)
+    assert not torch.allclose(output[0], output[-1])
+
+
 def test_embedding_trainability_is_independent_of_backbone_lora():
     embedding = Embedding(hidden_dim=8, vocab_size=16, num_frequencies=2)
     backbone = Backbone(architecture="qwen3", hidden_dim=8, num_layers=1,

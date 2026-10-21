@@ -2,61 +2,31 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 import torch
 
 from mouse_core.models.mlp import MLP
+from mouse_core.models.cosine_linear import CosineLinear
 
 
-class DiscretizedActionHead(MLP):
-    """One Q-value per row of a fixed ``[num_actions, action_dim]`` table.
+def _action_table(action_vectors: torch.Tensor) -> torch.Tensor:
+    if not isinstance(action_vectors, torch.Tensor) or not action_vectors.is_floating_point():
+        raise TypeError("action_vectors must be a floating-point tensor.")
+    if action_vectors.ndim != 2 or min(action_vectors.shape) == 0:
+        raise ValueError("action_vectors must have nonempty shape [num_actions, action_dim].")
+    # Like the other heads, construct on CPU in float32; Model.to moves it.
+    table = action_vectors.detach().to(device="cpu", dtype=torch.float32).clone()
+    if not torch.isfinite(table).all():
+        raise ValueError("action_vectors must contain only finite float32 values.")
+    if torch.unique(table, dim=0).shape[0] != table.shape[0]:
+        raise ValueError("action_vectors must contain distinct rows in float32.")
+    return table
 
-    ``forward`` returns raw Q-values, just like :class:`MLP`.
-    ``discrete_to_continuous`` decodes selected IDs; ``continuous_to_discrete``
-    quantizes vectors to their nearest row by Euclidean distance in the
-    table's original units. Ties choose the lowest ID. For differently scaled
-    coordinates, choose suitable units before constructing the table.
 
-    The table is copied into a non-trainable float32 buffer, moves with the
-    model, and is included in its state dict and ``save_model`` checkpoint.
-    Rows must be finite and distinct after conversion to float32. Keep the
-    table and its ordering fixed throughout training, replay, and inference:
-    changing them changes the meaning of the Q-values and recorded IDs.
-
-    This table gives the categories physical meaning; it does not make the
-    Q-value projections share parameters according to action distance.
-    """
-
+class _DiscretizedActions:
     action_vectors: torch.Tensor
-
-    def __init__(
-        self,
-        *,
-        in_features: int,
-        action_vectors: torch.Tensor,
-        hidden_dim: int,
-        num_layers: int,
-        propagate_gradient: float,
-        scale: float = 1.0,
-    ) -> None:
-        if not isinstance(action_vectors, torch.Tensor) or not action_vectors.is_floating_point():
-            raise TypeError("action_vectors must be a floating-point tensor.")
-        if action_vectors.ndim != 2 or min(action_vectors.shape) == 0:
-            raise ValueError("action_vectors must have nonempty shape [num_actions, action_dim].")
-        # Like the other heads, construct on CPU in float32; Model.to moves it.
-        table = action_vectors.detach().to(device="cpu", dtype=torch.float32).clone()
-        if not torch.isfinite(table).all():
-            raise ValueError("action_vectors must contain only finite float32 values.")
-        if torch.unique(table, dim=0).shape[0] != table.shape[0]:
-            raise ValueError("action_vectors must contain distinct rows in float32.")
-        super().__init__(
-            in_features=in_features,
-            out_features=table.shape[0],
-            hidden_dim=hidden_dim,
-            num_layers=num_layers,
-            propagate_gradient=propagate_gradient,
-            scale=scale,
-        )
-        self.register_buffer("action_vectors", table)
+    out_features: int
 
     @property
     def action_dim(self) -> int:
@@ -106,3 +76,74 @@ class DiscretizedActionHead(MLP):
             compute_mode="donot_use_mm_for_euclid_dist",
         )
         return distances.argmin(dim=-1).reshape(actions.shape[:-1])
+
+
+class DiscretizedActionHead(_DiscretizedActions, MLP):
+    """One Q-value per row of a fixed ``[num_actions, action_dim]`` table.
+
+    ``forward`` returns raw Q-values, just like :class:`MLP`.
+    ``discrete_to_continuous`` decodes selected IDs; ``continuous_to_discrete``
+    quantizes vectors to their nearest row by Euclidean distance in the
+    table's original units. Ties choose the lowest ID. For differently scaled
+    coordinates, choose suitable units before constructing the table.
+
+    The table is copied into a non-trainable float32 buffer, moves with the
+    model, and is included in its state dict and ``save_model`` checkpoint.
+    Rows must be finite and distinct after conversion to float32. Keep the
+    table and its ordering fixed throughout training, replay, and inference:
+    changing them changes the meaning of the Q-values and recorded IDs.
+
+    This table gives the categories physical meaning; it does not make the
+    Q-value projections share parameters according to action distance.
+    """
+
+    action_vectors: torch.Tensor
+
+    def __init__(
+        self,
+        *,
+        in_features: int,
+        action_vectors: torch.Tensor,
+        hidden_dim: int,
+        num_layers: int,
+        propagate_gradient: float,
+        scale: float | None = None,
+        normalize_input: bool = True,
+        normalize_output: bool = False,
+        output_layer: Literal["linear", "cosine_linear"] = "linear",
+    ) -> None:
+        table = _action_table(action_vectors)
+        super().__init__(
+            in_features=in_features,
+            out_features=table.shape[0],
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            propagate_gradient=propagate_gradient,
+            scale=scale,
+            normalize_input=normalize_input,
+            normalize_output=normalize_output,
+            output_layer=output_layer,
+        )
+        self.register_buffer("action_vectors", table)
+
+
+class DiscretizedCosineLinear(_DiscretizedActions, CosineLinear):
+    """A single CosineLinear readout with a fixed table of continuous action vectors.
+
+    Shares the table validation and conversions with DiscretizedActionHead;
+    prediction has no residual blocks or MLP wrapper.
+    """
+
+    def __init__(
+        self,
+        *,
+        in_features: int,
+        action_vectors: torch.Tensor,
+        bias: bool = True,
+        eps: float = 1e-5,
+        global_affine: bool = False,
+    ) -> None:
+        table = _action_table(action_vectors)
+        super().__init__(in_features, table.shape[0], bias=bias, eps=eps,
+                         device="cpu", dtype=torch.float32, global_affine=global_affine)
+        self.register_buffer("action_vectors", table)

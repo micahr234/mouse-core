@@ -18,7 +18,8 @@ class Embedding(nn.Module):
     The table and optional numeric Fourier module belong to this stage.
     Load only the token table with ``pretrained=`` or create one with
     ``vocab_size=`` and ``hidden_dim=``. ``num_frequencies=`` adds trainable
-    numeric Fourier features. All embedding parameters are float32.
+    numeric Fourier features, initialized to match the token table RMS.
+    All embedding parameters are float32.
     The caller moves inputs to the model's device before calling this module.
     """
 
@@ -46,6 +47,10 @@ class Embedding(nn.Module):
         self.vocab_size = table.num_embeddings
         self.fourier = (None if self.num_frequencies is None else
                         FourierFeatures(num_frequencies=self.num_frequencies, hidden_dim=self.hidden_dim))
+        if self.fourier is not None:
+            with torch.no_grad():
+                token_rms = torch.linalg.vector_norm(table.weight) / table.weight.numel() ** 0.5
+                self.fourier.proj.weight.mul_(token_rms)
 
     def forward(
         self, token_ids: torch.Tensor, *, numeric_values: torch.Tensor | None = None,

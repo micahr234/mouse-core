@@ -60,13 +60,45 @@ mouse-core gives you three building blocks for in-context RL. Compose them in yo
 * **Models** (`mouse_core.models`) — ordinary PyTorch modules: subclass `Model` define the flow in `forward`, and supply every module in your implementation.
 * **Objectives** (`mouse_core.objectives`) — training losses such as DQN, PPO, GRPO, SP, and SV, plus `CosineObjective` for direct latent matching against stop-gradient targets. Add its `cosine` loss to DQN with an explicit auxiliary weight; callers own the action-conditioned transition model. `CosineObjective.latent_cosine_loss` pairs sequential encodings, applies group/reset boundaries, and runs that transition internally.
 
-Backbone loading has one public path: instantiate `Backbone`. For example, `Backbone(train_kernel="flex", decode_kernel="flex", dtype=preferred_dtype(device=device), pretrained="Qwen/Qwen3-0.6B")` reads the pretrained config, loads matching decoder weights, and exposes `backbone.hidden_dim` for the heads. Packed Flex / varlen / padded kernels run when every layer is a Llama/Qwen3-shaped softmax block; other maskable softmax decoders use HuggingFace `forward` with the sequence mask and require `train_kernel="reference"`; hybrid / linear / sliding-window stacks raise. From-scratch stacks pass `architecture="qwen3"` or `architecture="llama"` plus width. `IdentityBackbone(hidden_dim=...)` is parameterless and returns its input embeddings unchanged. Three arguments are required on every transformer backbone because they describe how the model runs on your machine, not what it is, so they are configured in your implementation: `train_kernel` for the uncached forward, `decode_kernel` for cached decode (`"flex"`, paged FlexAttention, the only kernel that reads K/V through a page table), and `dtype` for the base weights. The transformer returns its final residual stream without an output norm. Each prediction head applies its own input RMSNorm; normalization has no on/off switch. `model.to(device)` moves and never casts; every part other than the backbone base is float32.
+Backbone loading has one public path: instantiate `Backbone`. For example, `Backbone(train_kernel="flex", decode_kernel="flex", dtype=preferred_dtype(device=device), pretrained="Qwen/Qwen3-0.6B")` reads the pretrained config, loads matching decoder weights, and exposes `backbone.hidden_dim` for the heads. Packed Flex / varlen / padded kernels run when every layer is a Llama/Qwen3-shaped softmax block; other maskable softmax decoders use HuggingFace `forward` with the sequence mask and require `train_kernel="reference"`; hybrid / linear / sliding-window stacks raise. From-scratch stacks pass `architecture="qwen3"` or `architecture="llama"` plus width. `IdentityBackbone(hidden_dim=...)` is parameterless and returns its input embeddings unchanged. Three arguments are required on every transformer backbone because they describe how the model runs on your machine, not what it is, so they are configured in your implementation: `train_kernel` for the uncached forward, `decode_kernel` for cached decode (`"flex"`, paged FlexAttention, the only kernel that reads K/V through a page table), and `dtype` for the base weights. The transformer returns its final residual stream without an output norm. Each residual block uses RMSNorm before its learned transformation. The final prediction linear receives the residual stream directly, without an extra normalization layer. `model.to(device)` moves and never casts; every part other than the backbone base is float32.
 
 
 Each notebook defines an `Encoder(Model)` that builds its embedding and backbone
 internally. It returns raw backbone readouts as `out["z"]`. Separate `QHead`,
 `PolicyHead`, or `ValueHead` modules build their own MLPs and consume those encodings.
-There is no intermediate projection. The heads retain their input RMSNorm.
+These examples do not insert an intermediate projection.
+
+`MLP(num_layers=N)` starts with fixed
+`RMSNorm(in_features, eps=1e-5, elementwise_affine=False)`, followed by
+**N−1 residual blocks plus one final output linear**.
+Each block computes `x + Linear(SwiGLU(Linear(RMSNorm(x))))`: its first linear
+maps `in_features → 2 * hidden_dim`, SwiGLU splits gate/value and returns
+`hidden_dim` features, and its second linear maps back to `in_features`.
+The identity skip therefore works with any hidden or output width. A final
+`Linear(in_features, out_features)` produces raw outputs, with no extra input
+normalization or output activation. One layer is input RMSNorm → final Linear.
+Use `normalize_output=True` to append fixed RMSNorm after the final Linear,
+and `normalize_input=False` when the preceding projection already normalizes
+its output. These flags do not change the layer count or add learned parameters.
+Initialization scaling affects only the final linear; gradient scaling applies
+before the entire network, including all skip paths.
+
+Use `output_layer="cosine_linear"` on `MLP` or `DiscretizedActionHead` for a final
+`CosineLinear` readout. It computes
+`(RMSNorm(x) @ RMSNorm(weight).T / D) * alpha + beta`, normalizing each feature
+vector and each output weight row without affine parameters inside the norms.
+Ignoring epsilon, this equals `alpha * cosine(x, weight) + beta`. Trainable
+per-output `alpha` starts at one and `beta` starts at zero.
+Raw weight RMS starts near one. Normalization is differentiable on every forward,
+so no post-update projection or separate initialization scale is needed. Leave
+MLP's `scale=None` with this output layer. `CosineLinear` is also exported directly from
+`mouse_core.models`; `bias=False` omits beta. Its default epsilon is `1e-5`.
+`DiscretizedCosineLinear(in_features=D, action_vectors=table)` adds a fixed action
+table and the same ID/vector conversions as `DiscretizedActionHead`, while
+keeping prediction as a single CosineLinear layer without residual blocks.
+On either direct layer, `global_affine=True` shares scalar alpha and beta across
+all outputs; `False` keeps per-output affine parameters. Alpha starts at one and
+beta at zero in both modes.
 
 ```python
 import torch

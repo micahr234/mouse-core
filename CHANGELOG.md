@@ -35,8 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the number from that window onto ``[-1, 1]`` with no clipping.
   Pass ``num_frequencies`` when building the embedding and it adds a
   Fourier projection of that scaled value onto those token
-  embeddings. The projection starts at 0, so a pretrained token
-  embedding is unchanged until it trains. Omit ``num_frequencies``
+  embeddings. The projection starts with random weights scaled to
+  match the token table RMS, so numeric values are represented from
+  initialization. Omit ``num_frequencies``
   and a batch that contains numeric tokens raises.
   ``examples/18_train_offline_cartpole_dqn.ipynb`` uses one character
   per CartPole observation element (``x``, ``v``, ``t``, ``w``) and a
@@ -51,6 +52,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   observations as that vector.
 
 ### Changed
+- Initialize numeric Fourier projections with nonzero random weights scaled
+  to the token table RMS. The expected initial Fourier norm matches the RMS
+  token norm independently of the number of frequencies.
 - Cached decode packs directly into its final padded layout, removing an extra
   allocation and copy. Simplify token-count bookkeeping and latent-reasoner
   outputs; update examples and documentation for the explicit agent API.

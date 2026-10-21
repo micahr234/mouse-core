@@ -133,11 +133,11 @@ def test_explicit_model_checkpoints_roundtrip_without_backbone_output_norm(tmp_p
     head = MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0)
     model = simple_model(backbone=backbone, heads={'action_value': head}, reasoner=None)
     with torch.no_grad():
-        head.norm.weight.fill_(3.0)
+        head.layers[-1].weight.fill_(3.0)
     save_model(model=model, path=tmp_path)
     loaded = load_model(model=fresh_model(model), repo_id_or_path=str(tmp_path))
     assert isinstance(cast(Backbone, loaded.backbone).model.norm, torch.nn.Identity)
-    torch.testing.assert_close(cast(MLP, loaded.heads['action_value']).norm.weight, torch.full((8,), 3.0))
+    torch.testing.assert_close(cast(MLP, loaded.heads['action_value']).layers[-1].weight, torch.full((4, 8), 3.0))
     h = torch.randn(3, 8)
     torch.testing.assert_close(loaded.head(h=h)['action_value'], model.head(h=h)['action_value'])
 

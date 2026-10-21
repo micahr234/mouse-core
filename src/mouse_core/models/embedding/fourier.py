@@ -26,8 +26,8 @@ class FourierFeatures(nn.Module):
 
     Frequencies are ``pi * 2^k`` for ``k = 0 .. num_frequencies - 1``.
     Sine and cosine of ``value * frequency`` go through a bias-free
-    linear map. That map starts at 0, so the add is 0 until it trains
-    and a pretrained token embedding is unchanged at step 0.
+    linear map initialized with unit expected output RMS. ``Embedding``
+    rescales its weights to match the token table RMS at construction.
     """
 
     def __init__(self, *, num_frequencies: int, hidden_dim: int) -> None:
@@ -48,7 +48,8 @@ class FourierFeatures(nn.Module):
         self.num_frequencies = checked
         self.register_buffer("bands", bands, persistent=False)
         self.proj = nn.Linear(2 * checked, hidden_dim, bias=False, dtype=torch.float32)
-        nn.init.zeros_(self.proj.weight)
+        # Each sine/cosine pair contributes 1 to the squared feature norm.
+        nn.init.normal_(self.proj.weight, std=checked ** -0.5)
 
     def forward(self, values: torch.Tensor) -> torch.Tensor:
         if values.ndim != 1:
