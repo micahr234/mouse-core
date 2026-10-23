@@ -62,14 +62,21 @@ mouse-core gives you three building blocks for in-context RL. Compose them in yo
 
 Backbone loading has one public path: instantiate `Backbone`. For example, `Backbone(train_kernel="flex", decode_kernel="flex", dtype=preferred_dtype(device=device), pretrained="Qwen/Qwen3-0.6B")` reads the pretrained config, loads matching decoder weights, and exposes `backbone.hidden_dim` for the heads. Packed Flex / varlen / padded kernels run when every layer is a Llama/Qwen3-shaped softmax block; other maskable softmax decoders use HuggingFace `forward` with the sequence mask and require `train_kernel="reference"`; hybrid / linear / sliding-window stacks raise. From-scratch stacks pass `architecture="qwen3"` or `architecture="llama"` plus width. `IdentityBackbone(hidden_dim=...)` is parameterless and returns its input embeddings unchanged. Three arguments are required on every transformer backbone because they describe how the model runs on your machine, not what it is, so they are configured in your implementation: `train_kernel` for the uncached forward, `decode_kernel` for cached decode (`"flex"`, paged FlexAttention, the only kernel that reads K/V through a page table), and `dtype` for the base weights. The transformer returns its final residual stream without an output norm. Each residual block uses RMSNorm before its learned transformation. The final prediction linear receives the residual stream directly, without an extra normalization layer. `model.to(device)` moves and never casts; every part other than the backbone base is float32.
 
+Pass `rope_enabled=False` to `Backbone` to disable RoPE in a packed-compatible
+rotary decoder (including Llama and Qwen3). This uses identity rotations for
+dense forward, packed training, and cached decoding, while preserving causal
+masking and sequence isolation. The default is `True`. Configure it before
+creating decode sessions, and supply the same setting when reconstructing a
+model for `load_model`; Core weight exports do not reconstruct architecture.
+
 
 Each notebook defines an `Encoder(Model)` that builds its embedding and backbone
 internally. It returns raw backbone readouts as `out["z"]`. Separate `QHead`,
 `PolicyHead`, or `ValueHead` modules build their own MLPs and consume those encodings.
 These examples do not insert an intermediate projection.
 
-`MLP(num_layers=N)` starts with fixed
-`RMSNorm(in_features, eps=1e-5, elementwise_affine=False)`, followed by
+`MLP(num_layers=N)` starts with affine
+`RMSNorm(in_features, eps=1e-5, elementwise_affine=True)`, followed by
 **N−1 residual blocks plus one final output linear**.
 Each block computes `x + Linear(SwiGLU(Linear(RMSNorm(x))))`: its first linear
 maps `in_features → 2 * hidden_dim`, SwiGLU splits gate/value and returns
@@ -77,28 +84,17 @@ maps `in_features → 2 * hidden_dim`, SwiGLU splits gate/value and returns
 The identity skip therefore works with any hidden or output width. A final
 `Linear(in_features, out_features)` produces raw outputs, with no extra input
 normalization or output activation. One layer is input RMSNorm → final Linear.
-Use `normalize_output=True` to append fixed RMSNorm after the final Linear,
+Use `normalize_output=True` to append affine RMSNorm after the final Linear,
 and `normalize_input=False` when the preceding projection already normalizes
-its output. These flags do not change the layer count or add learned parameters.
+its output. These flags do not change the layer count. Every RMSNorm has its own learned
+per-feature gain initialized to one, with no additive bias.
 Initialization scaling affects only the final linear; gradient scaling applies
 before the entire network, including all skip paths.
 
-Use `output_layer="cosine_linear"` on `MLP` or `DiscretizedActionHead` for a final
-`CosineLinear` readout. It computes
-`(RMSNorm(x) @ RMSNorm(weight).T / D) * alpha + beta`, normalizing each feature
-vector and each output weight row without affine parameters inside the norms.
-Ignoring epsilon, this equals `alpha * cosine(x, weight) + beta`. Trainable
-per-output `alpha` starts at one and `beta` starts at zero.
-Raw weight RMS starts near one. Normalization is differentiable on every forward,
-so no post-update projection or separate initialization scale is needed. Leave
-MLP's `scale=None` with this output layer. `CosineLinear` is also exported directly from
-`mouse_core.models`; `bias=False` omits beta. Its default epsilon is `1e-5`.
-`DiscretizedCosineLinear(in_features=D, action_vectors=table)` adds a fixed action
-table and the same ID/vector conversions as `DiscretizedActionHead`, while
-keeping prediction as a single CosineLinear layer without residual blocks.
-On either direct layer, `global_affine=True` shares scalar alpha and beta across
-all outputs; `False` keeps per-output affine parameters. Alpha starts at one and
-beta at zero in both modes.
+`DiscretizedLinear(in_features=D, action_vectors=table)` is a direct `nn.Linear`
+readout with a fixed action table and the same ID/vector conversions as
+`DiscretizedActionHead`. It produces one unrestricted real value per action,
+with standard PyTorch weight and bias initialization.
 
 ```python
 import torch

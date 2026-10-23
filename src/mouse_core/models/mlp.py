@@ -1,16 +1,14 @@
-"""Residual MLPs with Linear or CosineLinear outputs."""
+"""Residual MLPs with linear outputs."""
 
 from __future__ import annotations
 
 import math
-from typing import Literal
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 
 from mouse_core.models.embedding.linear import ScaledLinear
-from mouse_core.models.cosine_linear import CosineLinear
 
 
 class SwiGLU(nn.Module):
@@ -43,7 +41,7 @@ class ResidualBlock(nn.Module):
 
 
 class MLP(nn.Module):
-    """N−1 residual blocks → final readout, with optional fixed RMSNorm at each end.
+    """N−1 residual blocks → final readout, with optional affine RMSNorm at each end.
 
     ``num_layers`` counts each complete Linear → SwiGLU → Linear residual
     block as one layer and includes the final output layer as one layer.
@@ -52,14 +50,11 @@ class MLP(nn.Module):
     The final linear maps to ``out_features`` without an extra norm between
     the residual stack and linear. ``normalize_input`` normalizes before the
     residual stack; ``normalize_output`` normalizes after the final linear.
-    Both use RMSNorm without affine parameters. Residual-block norms remain learned.
+    All RMSNorms have an independent learned per-feature gain and no additive bias.
 
     ``scale`` optionally scales only the final linear layer's initial weight
     and bias. Omit it for feature projections; set it on prediction instances
-    when a small initial output is useful. With ``output_layer="cosine_linear"``,
-    the final layer normalizes its features and weight rows on every forward;
-    its per-output alpha starts at one and beta at zero. Both learn.
-    CosineLinear does not accept a separate ``scale``.
+    when a small initial output is useful.
 
     ``propagate_gradient`` scales gradients into upstream modules, from zero
     (detach the input) to one (full flow), including through the skips.
@@ -77,7 +72,6 @@ class MLP(nn.Module):
         scale: float | None = None,
         normalize_input: bool = True,
         normalize_output: bool = False,
-        output_layer: Literal["linear", "cosine_linear"] = "linear",
     ) -> None:
         super().__init__()
         for name, value in (
@@ -110,31 +104,23 @@ class MLP(nn.Module):
         for name, value in (("normalize_input", normalize_input), ("normalize_output", normalize_output)):
             if type(value) is not bool:
                 raise ValueError(f"{name} must be a bool, got {value!r}.")
-        if output_layer not in ("linear", "cosine_linear"):
-            raise ValueError("output_layer must be linear or cosine_linear.")
-        self.output_layer = output_layer
         self.normalize_input = normalize_input
         self.normalize_output = normalize_output
         self.input_norm = (
-            nn.RMSNorm(in_features, eps=1e-5, elementwise_affine=False)
+            nn.RMSNorm(in_features, eps=1e-5, elementwise_affine=True)
             if normalize_input else nn.Identity()
         )
         blocks = [
             ResidualBlock(in_features=in_features, hidden_dim=hidden_dim)
             for _ in range(num_layers - 1)
         ]
-        if output_layer == "cosine_linear":
-            if scale is not None:
-                raise ValueError("scale is only supported for output_layer=linear.")
-            output = CosineLinear(in_features, out_features)
-        else:
-            output = (
-                nn.Linear(in_features, out_features) if scale is None
-                else ScaledLinear(in_features, out_features, scale=scale)
-            )
+        output = (
+            nn.Linear(in_features, out_features) if scale is None
+            else ScaledLinear(in_features, out_features, scale=scale)
+        )
         self.layers = nn.Sequential(*blocks, output)
         self.output_norm = (
-            nn.RMSNorm(out_features, eps=1e-5, elementwise_affine=False)
+            nn.RMSNorm(out_features, eps=1e-5, elementwise_affine=True)
             if normalize_output else nn.Identity()
         )
         self.to(device="cpu", dtype=torch.float32)

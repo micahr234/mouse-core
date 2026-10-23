@@ -4,12 +4,11 @@ from mouse_core.models.backbone import Backbone, BaseBackbone, IdentityBackbone
 from mouse_core.models.base import Model, preferred_dtype
 from mouse_core.models.encoding import DecodeCache, prepare_decode
 from mouse_core.models.embedding import Embedding
-from mouse_core.models.heads import DiscretizedActionHead, DiscretizedCosineLinear
+from mouse_core.models.heads import DiscretizedActionHead, DiscretizedLinear
 from mouse_core.models.io import load_model, push_model_to_hub, save_model
 from mouse_core.models.kv_policy import cache_needs_rebuild, rebuild_starts, resolve_cache_bounds
 from mouse_core.models.lora import LoRAConfig
 from mouse_core.models.mlp import MLP
-from mouse_core.models.cosine_linear import CosineLinear
 from mouse_core.models.reasoner import LatentReasoner, sample_reasoning_splits
 
 __all__ = [
@@ -23,10 +22,9 @@ __all__ = [
     "LoRAConfig",
     "LatentReasoner",
     "MLP",
-    "CosineLinear",
     "Embedding",
     "prepare_decode",
-    "DiscretizedActionHead", "DiscretizedCosineLinear",
+    "DiscretizedActionHead", "DiscretizedLinear",
     "preferred_dtype",
     "sample_reasoning_splits",
     "cache_needs_rebuild",

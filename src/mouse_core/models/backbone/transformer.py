@@ -173,6 +173,20 @@ def _remove_output_norm(model: nn.Module) -> None:
                 setattr(parent, name, nn.Identity())
 
 
+class _IdentityRotaryEmbedding(nn.Module):
+    """Position-independent cos=1, sin=0 for every attention execution path."""
+
+    def __init__(self, head_dim: int) -> None:
+        super().__init__()
+        self.head_dim = head_dim
+
+    def forward(
+        self, x: torch.Tensor, position_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        shape = (*position_ids.shape, self.head_dim)
+        return x.new_ones(shape), x.new_zeros(shape)
+
+
 class Backbone(BaseBackbone):
     """Decoder stack with packed kernels when the layout allows, else HF forward.
 
@@ -201,6 +215,11 @@ class Backbone(BaseBackbone):
 
     Token tables and numeric Fourier features belong to an independent
     ``Embedding`` module. This backbone owns only the decoder.
+
+    ``rope_enabled=False`` removes rotary position dependence from supported
+    packed stacks in dense, packed, and cached forwards. Causal masking and
+    sequence isolation remain active. Set it at construction, before creating
+    a cache. The default is ``True``; generic non-packed stacks reject ``False``.
     """
 
     architecture: Architecture
@@ -222,10 +241,13 @@ class Backbone(BaseBackbone):
         load_weights: bool = True,
         hub_kwargs: dict[str, Any] | None = None,
         lora: LoRAConfig | None = None,
+        rope_enabled: bool = True,
         hf_config: dict[str, Any] | None = None,
         **config_kwargs: Any,
     ) -> None:
         super().__init__()
+        if type(rope_enabled) is not bool:
+            raise TypeError("rope_enabled must be a boolean.")
         if "use_norm" in config_kwargs:
             raise TypeError(
                 "Backbone no longer accepts use_norm; "
@@ -293,6 +315,20 @@ class Backbone(BaseBackbone):
                     config_kwargs=config_kwargs,
                 )
         _remove_output_norm(_as_module(self.model))
+        if not rope_enabled:
+            if not self.uses_packed:
+                raise ValueError("rope_enabled=False requires a packed-compatible rotary decoder.")
+            # All execution paths share this module. Identity cos/sin preserve
+            # their tensor signatures, including CUDA graph inputs, without
+            # evaluating position-dependent frequencies or scaling q/k.
+            cast(Any, self.model).rotary_emb = _IdentityRotaryEmbedding(
+                int(self.model.config.head_dim)
+            )
+        self._config_kwargs["rope_enabled"] = rope_enabled
+
+    @property
+    def rope_enabled(self) -> bool:
+        return self._config_kwargs["rope_enabled"]
 
     def _init_named_stack(
         self,

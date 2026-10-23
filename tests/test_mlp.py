@@ -22,15 +22,13 @@ def test_output_name_is_explicit() -> None:
     model = simple_model(backbone=IdentityBackbone(hidden_dim=8), heads={"custom_action": head}, reasoner=None)
     assert tuple(model.heads) == ("custom_action",)
 
-@pytest.mark.parametrize("output_layer", ["linear", "cosine_linear"])
 @pytest.mark.parametrize("num_layers", [1, 3])
 @pytest.mark.parametrize("normalize_input,normalize_output", [(True, False), (True, True), (False, True), (False, False)])
-def test_mlp_prediction_save_load_roundtrip(tmp_path, num_layers, normalize_input, normalize_output, output_layer) -> None:
+def test_mlp_prediction_save_load_roundtrip(tmp_path, num_layers, normalize_input, normalize_output) -> None:
     torch.manual_seed(0)
     hidden_dim = 8
     head = MLP(in_features=hidden_dim, out_features=4, hidden_dim=12, num_layers=num_layers,
-               propagate_gradient=1.0, normalize_input=normalize_input, normalize_output=normalize_output,
-               output_layer=output_layer)
+               propagate_gradient=1.0, normalize_input=normalize_input, normalize_output=normalize_output)
     model = simple_model(backbone=IdentityBackbone(hidden_dim=hidden_dim), heads={'action': head}, reasoner=None).eval()
     batch = [[{'action': 0, 'reward': 0.0}, {'action': 1, 'reward': 1.0}]]
     expected = model(batch_to_token_batch(_TOK, batch))["predictions"]
@@ -51,8 +49,8 @@ def test_layer_count_includes_residual_blocks_and_final_linear(num_layers, hidde
     assert isinstance(head.input_norm, torch.nn.RMSNorm)
     assert head.input_norm.normalized_shape == (8,)
     assert head.input_norm.eps == 1e-5
-    assert head.input_norm.weight is None
-    assert not list(head.input_norm.parameters())
+    assert head.input_norm.elementwise_affine
+    torch.testing.assert_close(head.input_norm.weight, torch.ones(8))
     blocks = list(head.layers[:-1])
     assert len(blocks) == num_layers - 1
     for block in blocks:
@@ -154,7 +152,7 @@ def test_input_norm_stabilizes_outputs_under_large_feature_rescaling(num_layers)
 
 
 @pytest.mark.parametrize("num_layers", [1, 3])
-def test_output_norm_normalizes_after_the_final_linear_without_affine_parameters(num_layers):
+def test_output_norm_normalizes_after_the_final_linear_with_learned_gain(num_layers):
     torch.manual_seed(11)
     head = MLP(in_features=8, out_features=3, hidden_dim=12, num_layers=num_layers,
                normalize_input=False, normalize_output=True)
@@ -162,16 +160,24 @@ def test_output_norm_normalizes_after_the_final_linear_without_affine_parameters
     assert isinstance(head.output_norm, torch.nn.RMSNorm)
     assert head.output_norm.normalized_shape == (3,)
     assert head.output_norm.eps == 1e-5
-    assert not list(head.output_norm.parameters())
+    assert head.output_norm.elementwise_affine
+    torch.testing.assert_close(head.output_norm.weight, torch.ones(3))
     x = (10 * torch.randn(2, 5, 8)).requires_grad_()
     result = head(x)
     torch.testing.assert_close(result.square().mean(-1), torch.ones(2, 5), atol=1e-4, rtol=0)
     result.sum().backward()
     assert x.grad is not None and torch.isfinite(x.grad).all()
+    assert head.output_norm.weight.grad is not None
+    assert torch.isfinite(head.output_norm.weight.grad).all()
+    assert head.output_norm.weight.grad.abs().sum() > 0
     with torch.no_grad():
         head.layers[-1].weight.mul_(100)
         head.layers[-1].bias.mul_(100)
     torch.testing.assert_close(head(x), result, atol=1e-5, rtol=1e-4)
+    gain = torch.tensor([0.5, 1.5, 2.0])
+    with torch.no_grad():
+        head.output_norm.weight.copy_(gain)
+    torch.testing.assert_close(head(x), result * gain, atol=1e-5, rtol=1e-4)
 
 
 @pytest.mark.parametrize("field", ["normalize_input", "normalize_output"])

@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Literal
-
 import torch
+from torch import nn
 
 from mouse_core.models.mlp import MLP
-from mouse_core.models.cosine_linear import CosineLinear
 
 
 def _action_table(action_vectors: torch.Tensor) -> torch.Tensor:
@@ -110,7 +108,6 @@ class DiscretizedActionHead(_DiscretizedActions, MLP):
         scale: float | None = None,
         normalize_input: bool = True,
         normalize_output: bool = False,
-        output_layer: Literal["linear", "cosine_linear"] = "linear",
     ) -> None:
         table = _action_table(action_vectors)
         super().__init__(
@@ -122,13 +119,12 @@ class DiscretizedActionHead(_DiscretizedActions, MLP):
             scale=scale,
             normalize_input=normalize_input,
             normalize_output=normalize_output,
-            output_layer=output_layer,
         )
         self.register_buffer("action_vectors", table)
 
 
-class DiscretizedCosineLinear(_DiscretizedActions, CosineLinear):
-    """A single CosineLinear readout with a fixed table of continuous action vectors.
+class DiscretizedLinear(_DiscretizedActions, nn.Linear):
+    """A single linear readout with a fixed table of continuous action vectors.
 
     Shares the table validation and conversions with DiscretizedActionHead;
     prediction has no residual blocks or MLP wrapper.
@@ -140,10 +136,7 @@ class DiscretizedCosineLinear(_DiscretizedActions, CosineLinear):
         in_features: int,
         action_vectors: torch.Tensor,
         bias: bool = True,
-        eps: float = 1e-5,
-        global_affine: bool = False,
     ) -> None:
         table = _action_table(action_vectors)
-        super().__init__(in_features, table.shape[0], bias=bias, eps=eps,
-                         device="cpu", dtype=torch.float32, global_affine=global_affine)
+        super().__init__(in_features, table.shape[0], bias=bias, device="cpu", dtype=torch.float32)
         self.register_buffer("action_vectors", table)

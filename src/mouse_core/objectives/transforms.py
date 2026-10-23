@@ -290,8 +290,10 @@ class Gate(Protocol):
 
     Called as ``gate(**objective_data, q=q, q_delayed=q_delayed)``.
     ``q`` is the detached per-step online Q at each step's last
-    head-output row, shape ``[N, A]``, after ``value``. ``q_delayed``
-    is the detached per-step delayed Q, same layout, after ``value``.
+    head-output row, shape ``[N, A]`` or selected-action ``[N]``, after
+    ``value``. ``q_delayed`` is the detached per-step delayed Q, shape
+    ``[N, A]``, after ``value``. Gates comparing actions must use delayed
+    Q when online predictions contain only selected values.
     Extra columns must be accepted (``**_``). Does not mutate
     ``objective_data``.
 
@@ -324,11 +326,11 @@ def _require_gate_batch(*, q: torch.Tensor, action: torch.Tensor) -> int:
     """``N`` for a gate. A shorter batch raises; it is not a zero continuation.
 
     The action taken from step ``t`` is stored at index ``t + 1``, so a
-    gate needs at least two steps. ``q`` is ``[N, A]`` and ``action`` is
-    ``[N]``.
+    gate needs at least two steps. ``q`` is ``[N, A]`` or selected ``[N]``;
+    ``action`` is ``[N]``.
     """
-    if q.ndim != 2:
-        raise ValueError(f"q must have shape [N, A], got {tuple(q.shape)}.")
+    if q.ndim not in (1, 2):
+        raise ValueError(f"q must have shape [N] or [N, A], got {tuple(q.shape)}.")
     N = int(q.shape[0])
     if action.ndim != 1 or int(action.shape[0]) != N:
         raise ValueError(
@@ -433,7 +435,8 @@ def value_gap_gate(
     ``True`` reads ``q_delayed``. Ties take the lowest index, the same
     rule as ``get_action(temperature=0)``. ``value_delayed`` scores
     that action and the taken action on online ``q`` or on
-    ``q_delayed``. ``V = Q_value(s, a*)``. The signed gap is
+    ``q_delayed``. Selected-action online ``q`` requires both delayed
+    flags to be ``True``. ``V = Q_value(s, a*)``. The signed gap is
     ``Q_value(s, a_taken) - V``. ``normalize=True`` divides it by
     ``|max_a Q| + eps`` on the value Q. ``bias`` is subtracted, then the
     gap is capped at ``0``:
@@ -527,6 +530,8 @@ def value_gap_gate(
         **columns: torch.Tensor,
     ) -> torch.Tensor:
         N = _require_gate_batch(q=q, action=action)
+        if q.ndim == 1 and not (policy_delayed and value_delayed):
+            raise ValueError("Selected Q predictions require a delayed-only value-gap gate.")
         policy = (q_delayed if policy_delayed else q)[:-1]
         values = (q_delayed if value_delayed else q)[:-1]
         executed = executed_actions(columns, action)[1:]

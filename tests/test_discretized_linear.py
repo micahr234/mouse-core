@@ -1,17 +1,16 @@
 import pytest
 import torch
 
-from mouse_core.models import CosineLinear, DiscretizedCosineLinear, load_model, save_model
+from mouse_core.models import DiscretizedLinear, load_model, save_model
 from mouse_core.models.backbone import IdentityBackbone
 from tests._model_helpers import fresh_model, simple_model
 
 
-@pytest.mark.parametrize("global_affine", [False, True])
-def test_direct_cosine_linear_preserves_action_table_conversions_gradients_and_checkpoint(tmp_path, global_affine):
+def test_direct_linear_preserves_action_table_conversions_gradients_and_checkpoint(tmp_path):
     table = torch.tensor([[2., -1.], [-2., 1.], [0., 0.25]], requires_grad=True)
     original = table.detach().clone()
-    head = DiscretizedCosineLinear(in_features=8, action_vectors=table, global_affine=global_affine)
-    assert isinstance(head, CosineLinear)
+    head = DiscretizedLinear(in_features=8, action_vectors=table)
+    assert isinstance(head, torch.nn.Linear)
     assert not list(head.children())
     with torch.no_grad():
         table.fill_(99)
@@ -31,14 +30,13 @@ def test_direct_cosine_linear_preserves_action_table_conversions_gradients_and_c
     model = simple_model(backbone=IdentityBackbone(hidden_dim=8), heads={'action': head}, reasoner=None)
     save_model(model=model, path=tmp_path)
     restored = load_model(model=fresh_model(model), repo_id_or_path=tmp_path).heads['action']
-    assert isinstance(restored, DiscretizedCosineLinear)
-    assert restored.global_affine is global_affine
+    assert isinstance(restored, DiscretizedLinear)
     torch.testing.assert_close(restored(x), head(x), rtol=0, atol=0)
     torch.testing.assert_close(restored.discrete_to_continuous(ids), original[ids])
     torch.testing.assert_close(restored.continuous_to_discrete(original), torch.arange(3))
 
 
 @pytest.mark.parametrize('table', [torch.empty(0, 2), torch.ones(2, 2), torch.tensor([[float('nan')]])])
-def test_direct_cosine_linear_rejects_invalid_tables(table):
+def test_direct_linear_rejects_invalid_tables(table):
     with pytest.raises(ValueError, match='action_vectors'):
-        DiscretizedCosineLinear(in_features=8, action_vectors=table)
+        DiscretizedLinear(in_features=8, action_vectors=table)

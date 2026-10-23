@@ -483,7 +483,8 @@ def _read_gate(
     Type and shape are checked here. Values in ``[0, 1]`` are the gate's
     contract (:class:`~mouse_core.objectives.transforms.Gate`); reading that
     reduction back to the host would sync every forward. ``q_delayed`` is
-    the detached per-step delayed Q, same layout as ``q_step``.
+    the detached all-action per-step delayed Q; ``q_step`` may instead
+    contain one selected online value per step.
     """
     if gate is None:
         return torch.zeros(N, N, dtype=dtype, device=device)
@@ -515,8 +516,15 @@ class DqnObjective(Objective[...]):
     ``objective_data=``, ``group_id=`` (int64 ``[N]``, one id per step,
     returned beside ``objective_data``), the online Q tensor as ``predictions=``, the
     backup value Q tensor as ``backup_value_predictions=``, and action-selection
-    Q scores as ``backup_action_predictions=``. All three tensors have shape ``[P, A]``
-    on the same device. The two backup inputs are required and detached.
+    Q scores as ``backup_action_predictions=``. Backup tensors have shape ``[P, A]``.
+    Online predictions may be all-action ``[P, A]`` or selected-action ``[P]``:
+    each selected scalar is Q(s_i, action[i+1]), expanded over that step's
+    head-output rows. Selected predictions avoid evaluating unobserved online
+    actions. CQL and gates that read all online actions require dense predictions;
+    delayed-only value-gap gates support either form. All tensors share a device.
+    The two backup inputs are required and detached. Q statistics summarize the
+    selected online values in selected mode, and online maxima in dense mode.
+    Entropy uses the delayed action policy in selected mode.
     A delayed model can supply independent value and action heads, each
     Polyak-averaged from the same online value head with its own rate.
 
@@ -808,20 +816,26 @@ class DqnObjective(Objective[...]):
             backup_action_predictions, owner="DqnObjective", name="backup_action_predictions"
         ).detach()
 
-        if q.ndim != 2:
+        if q.ndim not in (1, 2):
             raise ValueError(
-                f"DQN expects action_value shape [P, A], got {tuple(q.shape)}."
+                f"DQN expects action_value shape [P] or [P, A], got {tuple(q.shape)}."
             )
+        selected = q.ndim == 1
+        if selected and self.cql_weight > 0.0:
+            raise ValueError("CQL requires all-action predictions [P, A].")
+        if q_target.ndim != 2 or q_target.shape[0] != q.shape[0]:
+            raise ValueError("DQN backup_value_predictions must have shape [P, A].")
+        expected_shape = q_target.shape if selected else q.shape
         if q.dtype != torch.float32:
             raise TypeError(f"DQN expects float32 predictions, got {q.dtype}.")
         for name, tensor in (("backup_value_predictions", q_target), ("backup_action_predictions", q_actions)):
             if tensor.dtype != torch.float32:
                 raise TypeError(f"DQN expects float32 {name}, got {tensor.dtype}.")
-            if tensor.shape != q.shape:
-                raise ValueError(f"DQN {name} shape {tuple(tensor.shape)} must match predictions shape {tuple(q.shape)}.")
+            if tensor.shape != expected_shape:
+                raise ValueError(f"DQN {name} shape {tuple(tensor.shape)} must match expected shape {tuple(expected_shape)}.")
             if tensor.device != q.device:
                 raise ValueError(f"DQN {name} must share the predictions device.")
-        P, A = q.shape
+        P, A = q_target.shape
         device = q.device
         value_dtype = q.dtype
 
@@ -915,10 +929,10 @@ class DqnObjective(Objective[...]):
         # reset. Keep the observation in the history, but never fit or maximize
         # its Q row. A backup passes through the automatic transition instead.
         automatic = torch.cat([~executed[1:] & (pair_weight > 0), executed.new_zeros(1)])
-        q = q.masked_fill(automatic[step_of, None], 0)
+        q = q.masked_fill(automatic[step_of] if selected else automatic[step_of, None], 0)
         q_target = q_target.masked_fill(automatic[step_of, None], 0)
         q_actions = q_actions.masked_fill(automatic[step_of, None], 0)
-        q_values = q.gather(dim=-1, index=next_actions.unsqueeze(-1)).squeeze(-1)  # [P]
+        q_values = q if selected else q.gather(dim=-1, index=next_actions.unsqueeze(-1)).squeeze(-1)  # [P]
         v_step = _backup_state_value(
             q_actions=q_actions[last_rows], q_backup=q_target[last_rows],
             temperature=self.temperature,
@@ -971,7 +985,7 @@ class DqnObjective(Objective[...]):
         td_loss_log = _weighted_mean(td_sq.detach(), row_weight)
         losses: dict[str, torch.Tensor] = {"action_value": td_loss}
 
-        curr_max_q = q.amax(dim=-1)  # [P]  max online Q at s_i
+        curr_max_q = q if selected else q.amax(dim=-1)  # [P] selected Q or max online Q
         q_mean, q_std, q_min, q_max = _in_run_stats(curr_max_q.detach(), row_weight)
         named: dict[str, torch.Tensor] = {
             "q_values_mean":   q_mean,
@@ -984,7 +998,7 @@ class DqnObjective(Objective[...]):
             named["cql_penalty"] = cql_penalty_mean
         if self.temperature > 0.0:
             named["entropy"] = _weighted_mean(
-                _boltzmann_entropy(q.detach()[active], temperature=self.temperature),
+                _boltzmann_entropy((q_actions if selected else q).detach()[active], temperature=self.temperature),
                 row_weight[active],
             )
 
