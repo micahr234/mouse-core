@@ -19,6 +19,8 @@ from mouse_core.objectives.transforms import (
     _apply_value,
     _as_flag,
     _require_transform,
+    _PreparedGate,
+    _prepare_gate,
 )
 
 
@@ -80,7 +82,7 @@ def _head_output_layout(
             )
         counts = torch.ones(N, dtype=torch.int64, device=device)
     step_of = torch.repeat_interleave(
-        torch.arange(N, dtype=torch.int64, device=device), counts
+        torch.arange(N, dtype=torch.int64, device=device), counts, output_size=P
     )
     last_rows = counts.cumsum(dim=0) - 1
     return step_of, last_rows
@@ -150,7 +152,7 @@ def _require_step_aligned_predictions(
 def _weighted_mean(values: torch.Tensor, pair_weight: torch.Tensor) -> torch.Tensor:
     """``(w * x).sum() / w.sum().clamp(min=1)``. All-zero weights yield ``0``."""
     weight = pair_weight.to(dtype=values.dtype)
-    return (weight * values).sum() / weight.sum().clamp(min=1)
+    return (weight * values).sum(dim=0) / weight.sum(dim=0).clamp(min=1)
 
 
 def _in_run_stats(
@@ -159,12 +161,14 @@ def _in_run_stats(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Mean / std / min / max over in-run pairs. All-zero weights yield zeros."""
     in_run = pair_weight > 0
-    zero = values.new_zeros(())
-    if not bool(in_run.any()):
-        return zero, zero, zero, zero
-    selected = values[in_run]
-    std = selected.std() if selected.numel() > 1 else zero
-    return selected.mean(), std, selected.min(), selected.max()
+    count = in_run.sum(dim=0)
+    selected = torch.where(in_run, values, 0)
+    mean = selected.sum(dim=0) / count.clamp_min(1)
+    centered = torch.where(in_run, values - mean, 0)
+    std = (centered.square().sum(dim=0) / (count - 1).clamp_min(1)).sqrt()
+    minimum = torch.where(in_run, values, torch.inf).amin(dim=0)
+    maximum = torch.where(in_run, values, -torch.inf).amax(dim=0)
+    return mean, std, torch.where(count > 0, minimum, 0), torch.where(count > 0, maximum, 0)
 
 
 def _require_temperature(temperature: float) -> float:
@@ -226,8 +230,8 @@ def _affine_scan_backward(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     T = int(A.shape[0])
     offset = 1
     while offset < T:
-        A_prev = F.pad(A[:-offset], (offset, 0))
-        B_prev = F.pad(B[:-offset], (offset, 0), value=1.0)
+        A_prev = torch.cat([A.new_zeros((offset,) + A.shape[1:]), A[:-offset]])
+        B_prev = torch.cat([B.new_ones((offset,) + B.shape[1:]), B[:-offset]])
         A, B = A + B * A_prev, B * B_prev
         offset *= 2
     return A.flip(0)
@@ -258,7 +262,7 @@ def _raise_if_cross_group_backup(
     """Raise when an in-run backup depends on a value past the group boundary."""
     crossed = in_run & (participate == 0)
     if bool(crossed.any()):
-        step = int(crossed.nonzero()[0])
+        step = int(crossed.nonzero()[0, 0])
         raise ValueError(
             "cross-group backup at step "
             f"{step}: the target depends on a value past the group boundary."
@@ -314,25 +318,28 @@ def _block_cutoff_factor_is_zero(
     small λ still counts. A horizon that runs past the sample with a
     ``0`` link does not put the off-data value in the target.
     """
-    rows, width = step.shape
+    rows, width = step.shape[:2]
     device = step.device
     if width == 1:
-        reached = torch.ones(rows, 1, dtype=torch.bool, device=device)
+        reached = torch.ones((rows, 1) + step.shape[2:], dtype=torch.bool, device=device)
     else:
         open_link = (step != 0).to(dtype=step.dtype)
         survived = torch.cumprod(open_link, dim=1)
         reached = torch.cat(
             [
-                torch.ones(rows, 1, dtype=torch.bool, device=device),
+                torch.ones((rows, 1) + step.shape[2:], dtype=torch.bool, device=device),
                 survived[:, :-1] != 0,
             ],
             dim=1,
         )
     row = torch.arange(rows, device=device).unsqueeze(1)
     col = torch.arange(width, device=device)
+    after = col >= row
+    if step.ndim == 3:
+        after = after.unsqueeze(-1)
     hit = (
         reached
-        & (col >= row)
+        & after
         & (alive == 0).unsqueeze(0)
         & (discount != 0).unsqueeze(0)
     )
@@ -341,7 +348,7 @@ def _block_cutoff_factor_is_zero(
 
 def _block_returns(
     *,
-    continuation: torch.Tensor,
+    continuation: torch.Tensor | _PreparedGate,
     col_mask: torch.Tensor,
     reward: torch.Tensor,
     discount: torch.Tensor,
@@ -349,7 +356,8 @@ def _block_returns(
     t0: int,
     rows: int,
     cross_group_backups: CrossGroupBackups,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    decision_count: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Returns for starts ``t0 .. t0+rows``, and which starts stay.
 
     Reads columns ``t0+1:`` of those rows into one strip. Entries before
@@ -367,41 +375,60 @@ def _block_returns(
     The second tensor is ``1`` for a start that stays and ``0`` for a
     start that drops.
     """
-    device = continuation.device
+    device = reward.device
     dtype = reward.dtype
     end = t0 + rows
     width = int(col_mask.shape[0]) - t0
     # ``step`` is mutated in place below; ``clone`` keeps the gate's matrix
     # intact (a single-row strip can be a contiguous view of it).
+    strip = continuation.block(t0, end) if isinstance(continuation, _PreparedGate) else continuation[t0:end]
+    if reward.ndim == 2 and strip.ndim == 2:
+        strip = strip.unsqueeze(-1).expand(-1, -1, reward.shape[1])
     step = (
-        continuation[t0:end, t0 + 1 :]
+        strip[:, t0 + 1 :]
         .to(dtype=dtype)
         .clone(memory_format=torch.contiguous_format)
     )
     g = discount[t0:]
     alive = col_mask[t0:]
+    if reward.ndim == 2:
+        g = g.unsqueeze(-1) if g.ndim == 1 else g
+        alive = alive.unsqueeze(-1)
     # ``alive == 0`` is a group boundary whose continuation was not sampled.
     leave_out = cross_group_backups != "bootstrap"
     boot = (1 - step) * alive if leave_out else (1 - step * alive)
     step.mul_(alive)
     term = reward[t0:] + g * boot * v_next[t0:]
+    lengths = None
+    if decision_count is not None:
+        count = decision_count[t0:]
+        if term.ndim == 3:
+            count = count.unsqueeze(-1)
+        lengths = count.unsqueeze(0).expand_as(term)
     step.mul_(g)
     if rows > 1:
         local_row = torch.arange(rows, device=device).unsqueeze(1)
         local_col = torch.arange(rows, device=device)
         before = local_col < local_row
+        if step.ndim == 3:
+            before = before.unsqueeze(-1)
         step[:, :rows] = torch.where(before, step.new_ones(()), step[:, :rows])
         # Out of place so a reward that requires grad keeps it. ``step`` does not.
         left = torch.where(before, term.new_zeros(()), term[:, :rows])
         term = torch.cat([left, term[:, rows:]], dim=1) if width > rows else left
+        if lengths is not None:
+            left_lengths = torch.where(before, 0, lengths[:, :rows])
+            lengths = torch.cat([left_lengths, lengths[:, rows:]], dim=1) if width > rows else left_lengths
     if leave_out:
         participate = _block_cutoff_factor_is_zero(step=step, alive=alive, discount=g)
     else:
-        participate = step.new_ones(rows)
+        participate = step.new_ones((rows,) + step.shape[2:])
     if width > 1:
         torch.cumprod(step, dim=1, out=step)
         term = torch.cat([term[:, :1], term[:, 1:] * step[:, :-1]], dim=1)
-    return term.sum(dim=1), participate
+        if lengths is not None:
+            lengths = torch.cat([lengths[:, :1], lengths[:, 1:] * step[:, :-1]], dim=1)
+    return term.sum(dim=1), participate, None if lengths is None else lengths.sum(dim=1)
 
 
 def _continuation_targets(
@@ -410,8 +437,10 @@ def _continuation_targets(
     discount_all: torch.Tensor,
     v_step: torch.Tensor,
     pair_weight: torch.Tensor,
-    continuation: torch.Tensor,
+    continuation: torch.Tensor | _PreparedGate,
     cross_group_backups: CrossGroupBackups,
+    backup_lengths: torch.Tensor | None = None,
+    decision_count: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return for every pair ``(t, t+1)``, and which pairs stay.
 
@@ -439,7 +468,7 @@ def _continuation_targets(
     g = discount_all[1:]  # [N-1]  γ_t
     v_next = v_step[1:]  # [N-1]  V(s_{t+1})
     N = int(reward.shape[0])
-    if tuple(continuation.shape) != (N, N):
+    if not isinstance(continuation, _PreparedGate) and tuple(continuation.shape) not in ((N, N), (N, N) + v_step.shape[1:]):
         raise ValueError(
             f"continuation must have shape [{N}, {N}], "
             f"got {tuple(continuation.shape)}."
@@ -448,11 +477,12 @@ def _continuation_targets(
     in_run = pair_weight > 0
     mask = _run_mask(pair_weight=pair_weight.to(dtype=v_step.dtype), N=N)
     col_mask = mask[1:]
-    returns = r.new_empty(T)
-    participate = r.new_empty(T)
-    for t0 in range(0, T, _CONTINUATION_ROWS):
-        rows = min(_CONTINUATION_ROWS, T - t0)
-        returns[t0 : t0 + rows], participate[t0 : t0 + rows] = _block_returns(
+    returns = r.new_empty((T,) + v_step.shape[1:])
+    participate = torch.empty_like(returns)
+    block_size = max(1, _CONTINUATION_ROWS // (v_step.shape[1] if v_step.ndim == 2 else 1))
+    for t0 in range(0, T, block_size):
+        rows = min(block_size, T - t0)
+        block_return, block_keep, block_length = _block_returns(
             continuation=continuation,
             col_mask=col_mask,
             reward=r,
@@ -461,8 +491,19 @@ def _continuation_targets(
             t0=t0,
             rows=rows,
             cross_group_backups=cross_group_backups,
+            decision_count=decision_count,
         )
+        returns[t0:t0 + rows] = block_return
+        participate[t0:t0 + rows] = block_keep
+        if backup_lengths is not None:
+            assert block_length is not None
+            backup_lengths[t0:t0 + rows] = block_length
     in_run_f = in_run.to(dtype=returns.dtype)
+    if returns.ndim == 2:
+        in_run = in_run.unsqueeze(-1)
+        in_run_f = in_run_f.unsqueeze(-1)
+    if backup_lengths is not None:
+        backup_lengths.mul_(in_run_f)
     if cross_group_backups == "fault":
         _raise_if_cross_group_backup(in_run=in_run, participate=participate)
     return returns * in_run_f, participate
@@ -500,12 +541,44 @@ def _read_gate(
     return values
 
 
+def _column_targets(
+    *, reward: torch.Tensor, discount: torch.Tensor, v_step: torch.Tensor,
+    pair_weight: torch.Tensor, columns: torch.Tensor,
+    cross_group_backups: CrossGroupBackups,
+    decision_count: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Linear-workspace targets for continuation independent of the start row."""
+    n = reward.shape[0]
+    alive = _run_mask(pair_weight=pair_weight, N=n)[1:]
+    in_run = pair_weight
+    g, c = discount[1:], columns[1:]
+    if v_step.ndim == 2:
+        alive, in_run = alive[:, None], in_run[:, None]
+        g = g[:, None] if g.ndim == 1 else g
+        c = c[:, None] if c.ndim == 1 else c
+    link = g * c * alive
+    boot = (1 - c) * alive if cross_group_backups != "bootstrap" else 1 - c * alive
+    direct = reward[1:] + g * boot * v_step[1:]
+    returns = _affine_scan_backward(direct, link)
+    if cross_group_backups == "bootstrap":
+        participate = torch.ones_like(returns)
+    else:
+        participate = _zero_off_data_factor_scan(
+            discount=g, in_sample=alive > 0, carries=(c * alive) != 0,
+        ).expand_as(returns)
+    lengths = None
+    if decision_count is not None:
+        count = decision_count[:, None] if v_step.ndim == 2 else decision_count
+        lengths = _affine_scan_backward(count.expand_as(returns), link) * in_run
+    return returns * in_run, participate, lengths
+
+
 def _pair_values_to_rows(
     pair_values: torch.Tensor,
     step_of: torch.Tensor,
 ) -> torch.Tensor:
     """Broadcast ``[N-1]`` per-pair values onto head-output rows ``[P]``."""
-    padded = torch.cat([pair_values, pair_values.new_zeros(1)])
+    padded = torch.cat([pair_values, pair_values.new_zeros((1,) + pair_values.shape[1:])])
     return padded[step_of]
 
 
@@ -527,6 +600,18 @@ class DqnObjective(Objective[...]):
     Entropy uses the delayed action policy in selected mode.
     A delayed model can supply independent value and action heads, each
     Polyak-averaged from the same online value head with its own rate.
+
+    Multiple heads use backups ``[P, K, A]`` and online predictions
+    ``[P, K, A]`` or selected ``[P, K]``. Losses and scalar statistics then
+    have shape ``[K]``; backup and backup_weight have shape ``[P, K]``.
+    A reward transform may return shared ``[N]`` or head-specific ``[N, K]``.
+    Gates may return shared ``[N, N]`` or head-specific ``[N, N, K]``.
+    The objective does not average across heads; callers choose that reduction.
+    ``include_statistics=False`` skips optional Q/entropy/loss diagnostics and
+    the variable-size in_run_backup selection, which synchronizes CUDA.
+    ``return_backup_lengths=True`` adds detached ``backup_length`` in the same
+    shape as backup: the discounted expected number of executed decisions.
+    This reuses the target's continuation and excludes automatic reset frames.
 
     Q rows are **per head-output token** (``[P, A]``), not per step: a step may
     own several head-output tokens (tokenizer input field flagged
@@ -653,9 +738,9 @@ class DqnObjective(Objective[...]):
     the matching per-row weight (``0`` when the step is out of the loss
     and out of logged metrics). ``metrics["in_run_backup"]`` is
     ``backup`` on the rows with ``backup_weight > 0``.
-    All of these are detached. The
-    continuation matrix stays the one ``[N, N]`` the gate returned. Rows
-    are cumprod'd in blocks, and that read does not sync the host.
+    All of these are detached. Built-in column gates use a parallel affine
+    scan with linear workspace. Start-dependent gates are evaluated in bounded
+    strips, avoiding a dense per-head continuation matrix.
 
     Those columns arrive in ``objective_data`` only if they are listed in the
     tokenizer ``objective_fields`` keep-list (input fields are not auto-copied).
@@ -790,6 +875,8 @@ class DqnObjective(Objective[...]):
         backup_action_predictions: torch.Tensor,
         value_predictions: None = None,
         targets: None = None,
+        include_statistics: bool = True,
+        return_backup_lengths: bool = False,
     ) -> tuple[dict[str, torch.Tensor], dict[str, float | torch.Tensor]]: ...
 
     def __call__(
@@ -802,6 +889,8 @@ class DqnObjective(Objective[...]):
         backup_action_predictions: torch.Tensor | None = None,
         value_predictions: torch.Tensor | None = None,
         targets: torch.Tensor | None = None,
+        include_statistics: bool = True,
+        return_backup_lengths: bool = False,
     ) -> tuple[dict[str, torch.Tensor], dict[str, float | torch.Tensor]]:
         _reject_predictions(
             "DqnObjective",
@@ -816,26 +905,28 @@ class DqnObjective(Objective[...]):
             backup_action_predictions, owner="DqnObjective", name="backup_action_predictions"
         ).detach()
 
-        if q.ndim not in (1, 2):
-            raise ValueError(
-                f"DQN expects action_value shape [P] or [P, A], got {tuple(q.shape)}."
-            )
-        selected = q.ndim == 1
+        if q.ndim not in (1, 2, 3):
+            raise ValueError("DQN predictions must have shape [P], [P, A], [P, K], or [P, K, A].")
+        if q_target.ndim not in (2, 3) or q_target.shape[0] != q.shape[0]:
+            raise ValueError("DQN backup_value_predictions must have shape [P, A] or [P, K, A].")
+        selected = q.ndim == q_target.ndim - 1
+        if q.shape != (q_target.shape[:-1] if selected else q_target.shape):
+            raise ValueError("DQN predictions must match backup_value_predictions, optionally without the action dimension.")
         if selected and self.cql_weight > 0.0:
-            raise ValueError("CQL requires all-action predictions [P, A].")
-        if q_target.ndim != 2 or q_target.shape[0] != q.shape[0]:
-            raise ValueError("DQN backup_value_predictions must have shape [P, A].")
-        expected_shape = q_target.shape if selected else q.shape
+            raise ValueError("CQL requires all-action predictions [P, A] or [P, K, A].")
         if q.dtype != torch.float32:
             raise TypeError(f"DQN expects float32 predictions, got {q.dtype}.")
         for name, tensor in (("backup_value_predictions", q_target), ("backup_action_predictions", q_actions)):
             if tensor.dtype != torch.float32:
                 raise TypeError(f"DQN expects float32 {name}, got {tensor.dtype}.")
-            if tensor.shape != expected_shape:
-                raise ValueError(f"DQN {name} shape {tuple(tensor.shape)} must match expected shape {tuple(expected_shape)}.")
+            if tensor.shape != q_target.shape:
+                raise ValueError(f"DQN {name} shape {tuple(tensor.shape)} must match expected shape {tuple(q_target.shape)}.")
             if tensor.device != q.device:
                 raise ValueError(f"DQN {name} must share the predictions device.")
-        P, A = q_target.shape
+        P, A = q_target.shape[0], q_target.shape[-1]
+        heads = q_target.shape[1] if q_target.ndim == 3 else None
+        if heads is not None and heads < 1:
+            raise ValueError("DQN needs at least one head.")
         device = q.device
         value_dtype = q.dtype
 
@@ -863,6 +954,7 @@ class DqnObjective(Objective[...]):
             dtype=value_dtype,
             device=device,
             identity=objective_data["reward"],
+            heads=heads,
         )
 
         _require_done_flags(
@@ -929,43 +1021,62 @@ class DqnObjective(Objective[...]):
         # reset. Keep the observation in the history, but never fit or maximize
         # its Q row. A backup passes through the automatic transition instead.
         automatic = torch.cat([~executed[1:] & (pair_weight > 0), executed.new_zeros(1)])
-        q = q.masked_fill(automatic[step_of] if selected else automatic[step_of, None], 0)
-        q_target = q_target.masked_fill(automatic[step_of, None], 0)
-        q_actions = q_actions.masked_fill(automatic[step_of, None], 0)
-        q_values = q if selected else q.gather(dim=-1, index=next_actions.unsqueeze(-1)).squeeze(-1)  # [P]
+        online_mask = automatic[step_of].reshape((P,) + (1,) * (q.ndim - 1))
+        backup_mask = automatic[step_of].reshape((P,) + (1,) * (q_target.ndim - 1))
+        q = q.masked_fill(online_mask, 0)
+        q_target = q_target.masked_fill(backup_mask, 0)
+        q_actions = q_actions.masked_fill(backup_mask, 0)
+        gather_action = next_actions.reshape((P,) + (1,) * (q_target.ndim - 1))
+        gather_action = gather_action.expand(*q_target.shape[:-1], 1)
+        q_values = q if selected else q.gather(dim=-1, index=gather_action).squeeze(-1)
         v_step = _backup_state_value(
             q_actions=q_actions[last_rows], q_backup=q_target[last_rows],
             temperature=self.temperature,
         )
-        continuation = _read_gate(
-            gate=self.gate,
-            objective_data=objective_data,
-            q_step=q[last_rows].detach(),
-            q_delayed=q_target[last_rows].detach(),
-            N=N,
-            dtype=value_dtype,
-            device=device,
-        )
-        continuation = torch.where(
-            automatic[None, :], torch.ones_like(continuation), continuation,
-        )
-        pair_target, participate = _continuation_targets(
-            reward=reward,
-            discount_all=discount_all,
-            v_step=v_step,  # [N]  V(s_i)
-            pair_weight=pair_weight,
-            continuation=continuation,
-            cross_group_backups="ignore" if self.cross_group_backups == "fault" else self.cross_group_backups,
-        )
+        if heads is not None and reward.ndim == 1:
+            reward = reward[:, None].expand(-1, heads)
+        with torch.no_grad():
+            prepared = (_PreparedGate(n=N, columns=q.new_zeros(N)) if self.gate is None else
+                        _prepare_gate(self.gate, **objective_data,
+                                      q=q[last_rows].detach(), q_delayed=q_target[last_rows].detach()))
+            if prepared.columns is not None:
+                columns = prepared.columns.to(dtype=value_dtype, device=device)
+                mask = automatic[:, None] if columns.ndim == 2 else automatic
+                columns = torch.where(mask, 1.0, columns)
+                prepared = _PreparedGate(n=N, columns=columns)
+            else:
+                original = prepared
+                def block(start: int, end: int) -> torch.Tensor:
+                    result = original.block(start, end).to(dtype=value_dtype, device=device)
+                    mask = automatic[None, :, None] if result.ndim == 3 else automatic[None, :]
+                    return torch.where(mask, 1.0, result)
+                prepared = _PreparedGate(n=N, block=block)
+        decision_count = (pair_weight * executed[1:]) if return_backup_lengths else None
+        backup_lengths = None
+        if prepared.columns is not None:
+            pair_target, participate, backup_lengths = _column_targets(
+                reward=reward, discount=discount_all, v_step=v_step,
+                pair_weight=pair_weight, columns=prepared.columns,
+                cross_group_backups=self.cross_group_backups,
+                decision_count=decision_count,
+            )
+        else:
+            if return_backup_lengths:
+                backup_lengths = reward.new_empty((N - 1,) + v_step.shape[1:])
+            pair_target, participate = _continuation_targets(
+                reward=reward, discount_all=discount_all, v_step=v_step,
+                pair_weight=pair_weight, continuation=prepared,
+                cross_group_backups="ignore" if self.cross_group_backups == "fault" else self.cross_group_backups,
+                backup_lengths=backup_lengths, decision_count=decision_count,
+            )
         pair_weight = pair_weight * executed[1:].to(dtype=pair_weight.dtype)
+        if heads is not None:
+            pair_weight = pair_weight[:, None]
         if self.cross_group_backups == "fault":
             _raise_if_cross_group_backup(in_run=pair_weight > 0, participate=participate)
-        # A non-zero factor on an off-data value drops the step from the loss
-        # and from every logged metric. A zero factor leaves that value out
-        # of the target, so the step keeps its in-run weight.
         pair_weight = pair_weight * participate
-        row_weight = torch.cat([pair_weight, pair_weight.new_zeros(1)])[step_of]  # [P]
-        td_target = _pair_values_to_rows(pair_target, step_of)  # [P]
+        row_weight = _pair_values_to_rows(pair_weight, step_of)
+        td_target = _pair_values_to_rows(pair_target, step_of)
 
         # δ = G - Q(s, a). action_value trains Q.
         active = row_weight > 0
@@ -976,40 +1087,34 @@ class DqnObjective(Objective[...]):
         cql_penalty_mean: torch.Tensor | None = None
         if self.cql_weight > 0.0:
             q_scale = (torch.where(active, td_target, 0).abs() + self.cql_scale_q_eps).detach()
-            cql_q = q.masked_fill(~active[:, None], 0)
+            cql_q = q.masked_fill(~active[..., None], 0)
             cql_penalty = torch.logsumexp(cql_q, dim=-1) - torch.where(active, q_values, 0)
             per_row = per_row + self.cql_weight * q_scale * cql_penalty
-            cql_penalty_mean = _weighted_mean(cql_penalty.detach(), row_weight)
+            if include_statistics:
+                cql_penalty_mean = _weighted_mean(cql_penalty.detach(), row_weight)
 
         td_loss = _weighted_mean(per_row, row_weight)
-        td_loss_log = _weighted_mean(td_sq.detach(), row_weight)
         losses: dict[str, torch.Tensor] = {"action_value": td_loss}
 
-        curr_max_q = q if selected else q.amax(dim=-1)  # [P] selected Q or max online Q
-        q_mean, q_std, q_min, q_max = _in_run_stats(curr_max_q.detach(), row_weight)
-        named: dict[str, torch.Tensor] = {
-            "q_values_mean":   q_mean,
-            "q_values_std":    q_std,
-            "q_values_min":    q_min,
-            "q_values_max":    q_max,
-            "action_value":    td_loss_log,
+        metrics: dict[str, float | torch.Tensor] = {
+            "backup": td_target.detach(), "backup_weight": row_weight.detach(),
         }
-        if cql_penalty_mean is not None:
-            named["cql_penalty"] = cql_penalty_mean
-        if self.temperature > 0.0:
-            named["entropy"] = _weighted_mean(
-                _boltzmann_entropy((q_actions if selected else q).detach()[active], temperature=self.temperature),
-                row_weight[active],
-            )
-
-        # Keep scalar stats as 0-dim tensors so the train step does not
-        # host-sync via ``tolist()``; loggers can ``.item()`` at log time.
-        metrics: dict[str, float | torch.Tensor] = dict(named)
-        # Same G and row weight the loss used — callers log these
-        # instead of rebuilding the backup. ``in_run_backup`` is the
-        # rows with a positive weight, already selected.
-        metrics["backup"] = td_target.detach()
-        metrics["backup_weight"] = row_weight.detach()
-        in_run = metrics["backup_weight"] > 0
-        metrics["in_run_backup"] = metrics["backup"][in_run]
+        if backup_lengths is not None:
+            metrics["backup_length"] = _pair_values_to_rows(backup_lengths, step_of).detach()
+        if include_statistics:
+            metrics["in_run_backup"] = td_target.detach()[active]
+            curr_max_q = q if selected else q.amax(dim=-1)
+            q_mean, q_std, q_min, q_max = _in_run_stats(curr_max_q.detach(), row_weight)
+            metrics.update({
+                "q_values_mean": q_mean, "q_values_std": q_std,
+                "q_values_min": q_min, "q_values_max": q_max,
+                "action_value": _weighted_mean(td_sq.detach(), row_weight),
+            })
+            if cql_penalty_mean is not None:
+                metrics["cql_penalty"] = cql_penalty_mean
+            if self.temperature > 0.0:
+                entropy_q = (q_actions if selected else q).detach().masked_fill(~active[..., None], 0)
+                metrics["entropy"] = _weighted_mean(
+                    _boltzmann_entropy(entropy_q, temperature=self.temperature), row_weight,
+                )
         return losses, metrics

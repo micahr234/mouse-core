@@ -200,6 +200,33 @@ Register a `LatentReasoner` on the model and call `reasoner.insert(embeds=embed,
 
 DQN takes three explicit prediction tensors: the online `predictions`, `backup_value_predictions`, and `backup_action_predictions`. Both backup inputs are detached float32 Q-score tensors with the same `[P, A]` shape. At zero temperature, the action scores choose the argmax and the value scores evaluate it. At positive temperature, the action scores define the Boltzmann policy, and the target uses its expected backup value plus entropy. The separate backup value and backup action heads are separate frozen modules with independent Polyak rates toward the same online Q head. There is no `double` switch.
 
+A single `DqnObjective` also evaluates multiple Q heads in one call. Pass backup tensors
+with shape `[P, K, A]` and online predictions with shape `[P, K, A]` (all actions)
+or `[P, K]` (selected actions). Rewards may be shared `[N]` or supplied by a
+reward callable as `[N, K]`. The returned losses have shape `[K]`; the caller
+chooses how to reduce them. For example, after constructing `objective`:
+
+```python
+losses, metrics = objective(
+    objective_data=objective_data,
+    group_id=group_id,
+    predictions=online_q,                 # [P, K, A] or selected [P, K]
+    backup_value_predictions=backup_q,    # [P, K, A]
+    backup_action_predictions=action_q,   # [P, K, A]
+    include_statistics=False,
+    return_backup_lengths=True,
+)
+loss = losses["action_value"].mean()
+```
+
+The fixed-size `backup`, `backup_weight`, and optional `backup_length` metrics
+have shape `[P, K]`. Backup lengths count discounted executed decisions and
+exclude automatic reset frames. `include_statistics=False` skips unused Q and
+entropy statistics, including the variable-size `in_run_backup` selection that
+requires CUDA synchronization. The default `True` retains those diagnostics.
+Built-in lambda and value-gap gates share a compact parallel scan across heads;
+n-step and combined gates use bounded strips instead of allocating `[N, N, K]`.
+
 For continuous environments with discrete DQN outputs, `DiscretizedActionHead(action_vectors=table, ...)` extends `MLP` with a float tensor of shape `[num_actions, action_dim]` and infers its output width. `head.discrete_to_continuous(ids)` maps selected IDs to full vectors; `head.continuous_to_discrete(vectors)` selects the nearest table row by Euclidean distance in the original units (ties choose the lowest ID). The latter is lossy for off-table inputs. The fixed table is a model buffer, copied with delayed heads, moved with the model, and saved/restored by `save_model`/`load_model`. Keep its rows and ordering fixed. Example `19` selects discrete IDs from the separate Q head and converts them to continuous vectors for the environment. The table does not impose similarity between neighboring actions' Q-values.
 
 For one online/delayed forward pair, `with reuse_token_tensors():` (from `mouse_core.data`) converts each `TokenBatch` once per device and inference mode. Treat the batch and returned tensors as read-only inside the scope. The cache ends with the scope; later batches/scopes convert afresh. This reuses input tensors only: each model still computes its own activations through its own weights.

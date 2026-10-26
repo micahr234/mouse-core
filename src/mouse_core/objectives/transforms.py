@@ -29,7 +29,8 @@ class Reward(Protocol):
     Called as ``reward(**objective_data)``. Named arguments are the
     column tensors. Extra columns must be accepted (``**_``). Must
     return a floating tensor of shape ``[N]`` — the per-step reward
-    used in the TD / GAE target. Does not mutate ``objective_data``.
+    used in the TD / GAE target. Batched DQN also accepts ``[N, K]``
+    for independently scaled head rewards. Does not mutate ``objective_data``.
     """
 
     def __call__(self, **columns: torch.Tensor) -> torch.Tensor: ...
@@ -292,7 +293,9 @@ class Gate(Protocol):
     ``q`` is the detached per-step online Q at each step's last
     head-output row, shape ``[N, A]`` or selected-action ``[N]``, after
     ``value``. ``q_delayed`` is the detached per-step delayed Q, shape
-    ``[N, A]``, after ``value``. Gates comparing actions must use delayed
+    ``[N, A]``, after ``value``. Batched heads use ``[N, K, A]``
+    or selected ``[N, K]`` and may return shared ``[N, N]`` or independent
+    ``[N, N, K]`` continuations. Gates comparing actions must use delayed
     Q when online predictions contain only selected values.
     Extra columns must be accepted (``**_``). Does not mutate
     ``objective_data``.
@@ -322,6 +325,59 @@ class Gate(Protocol):
     def __call__(self, **columns: torch.Tensor) -> torch.Tensor: ...
 
 
+class _PreparedGate:
+    """Continuation columns or lazily materialized strips, shared across heads."""
+
+    def __init__(self, *, n: int, columns: torch.Tensor | None = None,
+                 block: Callable[[int, int], torch.Tensor] | None = None) -> None:
+        self.n, self.columns, self._block = n, columns, block
+
+    def block(self, start: int, end: int) -> torch.Tensor:
+        if self.columns is None:
+            assert self._block is not None
+            return self._block(start, end)
+        column = self.columns
+        rows = torch.arange(start, end, device=column.device)[:, None]
+        cols = torch.arange(self.n, device=column.device)[None, :]
+        mask = cols > rows
+        if column.ndim == 2:
+            mask = mask[..., None]
+        return torch.where(mask, column[None], 0)
+
+
+class _StructuredGate:
+    def __init__(self, prepare: Callable[..., _PreparedGate]) -> None:
+        self.prepare = prepare
+
+    def __call__(self, **columns: torch.Tensor) -> torch.Tensor:
+        prepared = self.prepare(**columns)
+        return prepared.block(0, prepared.n)
+
+
+def _prepare_gate(gate: Gate, **columns: torch.Tensor) -> _PreparedGate:
+    if isinstance(gate, _StructuredGate):
+        return gate.prepare(**columns)
+    matrix = gate(**columns)
+    n = columns["q"].shape[0]
+    delayed = columns.get("q_delayed")
+    heads = delayed.shape[1] if delayed is not None and delayed.ndim == 3 else None
+    if not isinstance(matrix, torch.Tensor):
+        raise TypeError(f"gate must return a Tensor, got {type(matrix)}.")
+    if matrix.shape != (n, n) and (heads is None or matrix.shape != (n, n, heads)):
+        raise ValueError(f"gate must return shape [{n}, {n}]" +
+                         (f" or [{n}, {n}, {heads}]" if heads is not None else "") +
+                         f", got {tuple(matrix.shape)}.")
+    return _PreparedGate(n=n, block=lambda start, end: matrix[start:end])
+
+
+def _gate_product(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+    if left.ndim < right.ndim:
+        left = left.unsqueeze(-1)
+    elif right.ndim < left.ndim:
+        right = right.unsqueeze(-1)
+    return left * right
+
+
 def _require_gate_batch(*, q: torch.Tensor, action: torch.Tensor) -> int:
     """``N`` for a gate. A shorter batch raises; it is not a zero continuation.
 
@@ -329,8 +385,8 @@ def _require_gate_batch(*, q: torch.Tensor, action: torch.Tensor) -> int:
     gate needs at least two steps. ``q`` is ``[N, A]`` or selected ``[N]``;
     ``action`` is ``[N]``.
     """
-    if q.ndim not in (1, 2):
-        raise ValueError(f"q must have shape [N] or [N, A], got {tuple(q.shape)}.")
+    if q.ndim not in (1, 2, 3):
+        raise ValueError(f"q must have shape [N], [N, A], [N, K], or [N, K, A], got {tuple(q.shape)}.")
     N = int(q.shape[0])
     if action.ndim != 1 or int(action.shape[0]) != N:
         raise ValueError(
@@ -357,19 +413,16 @@ def lambda_gate(*, td_lambda: float) -> Gate:
         raise ValueError(f"td_lambda must be in [0, 1], got {td_lambda}.")
     lam = float(td_lambda)
 
-    def gate(
+    def prepare(
         *,
         q: torch.Tensor,
         action: torch.Tensor,
         **_: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> _PreparedGate:
         N = _require_gate_batch(q=q, action=action)
-        t = torch.arange(N, device=q.device).unsqueeze(1)
-        s = torch.arange(N, device=q.device).unsqueeze(0)
-        fill = q.new_full((), lam)
-        return torch.where(s > t, fill, fill.new_zeros(()))
+        return _PreparedGate(n=N, columns=q.new_full((N,), lam))
 
-    return gate
+    return _StructuredGate(prepare)
 
 
 def nstep_gate(*, n: int, step_key: str | None = None) -> Gate:
@@ -398,25 +451,26 @@ def nstep_gate(*, n: int, step_key: str | None = None) -> Gate:
         raise ValueError(f"n must be an int >= 1, got {n!r}.")
     horizon = n
 
-    def gate(
+    def prepare(
         *,
         q: torch.Tensor,
         action: torch.Tensor,
         **columns: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> _PreparedGate:
         N = _require_gate_batch(q=q, action=action)
-        t = torch.arange(N, device=q.device).unsqueeze(1)
         s = torch.arange(N, device=q.device).unsqueeze(0)
         if step_key is None:
             clock = executed_actions(columns, action).to(torch.int64).cumsum(0)
-            distance = clock.unsqueeze(0) - clock.unsqueeze(1)
         else:
             advanced = _step_flags(columns, key=step_key, reference=action)
             clock = advanced.to(torch.int64).cumsum(0)
-            distance = clock.unsqueeze(0) - clock.unsqueeze(1)
-        return ((s > t) & (distance < horizon)).to(dtype=q.dtype)
+        def block(start: int, end: int) -> torch.Tensor:
+            t = torch.arange(start, end, device=q.device).unsqueeze(1)
+            distance = clock.unsqueeze(0) - clock[start:end].unsqueeze(1)
+            return ((s > t) & (distance < horizon)).to(dtype=q.dtype)
+        return _PreparedGate(n=N, block=block)
 
-    return gate
+    return _StructuredGate(prepare)
 
 
 def value_gap_gate(
@@ -457,7 +511,8 @@ def value_gap_gate(
     when ``normalize`` is ``False``. When the two flags agree, ``V`` is
     ``max_a`` of that Q, so a taken action tied with the max has signed
     gap ``0`` before ``bias``. The bootstrap state value stays the
-    delayed one the objective already computes. Returns ``[N, N]``.
+    delayed one the objective already computes. Returns ``[N, N]`` for
+    one head or ``[N, N, K]`` for batched heads.
     Column ``s`` is that continuation through step ``s`` for every
     earlier start. Column ``0`` and the last column are ``0`` (no action
     leaves the batch). A gap of ``0`` continues with ``c = 1``. A gap of
@@ -522,22 +577,25 @@ def value_gap_gate(
             raise ValueError("eps is used only when normalize is True.")
         floor = None
 
-    def gate(
+    def prepare(
         *,
         q: torch.Tensor,
         action: torch.Tensor,
         q_delayed: torch.Tensor,
         **columns: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> _PreparedGate:
         N = _require_gate_batch(q=q, action=action)
-        if q.ndim == 1 and not (policy_delayed and value_delayed):
+        if q.ndim == q_delayed.ndim - 1 and not (policy_delayed and value_delayed):
             raise ValueError("Selected Q predictions require a delayed-only value-gap gate.")
         policy = (q_delayed if policy_delayed else q)[:-1]
         values = (q_delayed if value_delayed else q)[:-1]
         executed = executed_actions(columns, action)[1:]
-        taken = canonical_actions(columns, action)[1:].unsqueeze(-1)
-        policy = policy.masked_fill(~executed[:, None], 0)
-        values = values.masked_fill(~executed[:, None], 0)
+        taken = canonical_actions(columns, action)[1:]
+        mask = executed.reshape((-1,) + (1,) * (policy.ndim - 1))
+        taken = taken.reshape((-1,) + (1,) * (policy.ndim - 1))
+        taken = taken.expand(*policy.shape[:-1], 1)
+        policy = policy.masked_fill(~mask, 0)
+        values = values.masked_fill(~mask, 0)
         chosen = policy.argmax(dim=-1, keepdim=True)
         q_star = values.gather(dim=-1, index=chosen).squeeze(-1)
         q_taken = values.gather(dim=-1, index=taken).squeeze(-1)
@@ -550,14 +608,12 @@ def value_gap_gate(
             cont = (gap == 0).to(dtype=gap.dtype)
         else:
             cont = torch.exp2(gap / scale)
-        cont = torch.where(executed, cont, 1.0)
+        cont = torch.where(executed.reshape((-1,) + (1,) * (cont.ndim - 1)), cont, 1.0)
         cont[0] = 0
-        column = torch.cat([cont, cont.new_zeros(1)])
-        t = torch.arange(N, device=values.device).unsqueeze(1)
-        s = torch.arange(N, device=values.device).unsqueeze(0)
-        return torch.where(s > t, column, column.new_zeros(()))
+        column = torch.cat([cont, cont.new_zeros((1,) + cont.shape[1:])])
+        return _PreparedGate(n=N, columns=column)
 
-    return gate
+    return _StructuredGate(prepare)
 
 
 def general_gate(*, gates: Sequence[Gate]) -> Gate:
@@ -582,33 +638,27 @@ def general_gate(*, gates: Sequence[Gate]) -> Gate:
             raise TypeError(f"gates must be callables, got {type(item)}.")
     chosen = tuple(gates)
 
-    def gate(
+    def prepare(
         *,
         q: torch.Tensor,
         action: torch.Tensor,
         **columns: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> _PreparedGate:
         N = _require_gate_batch(q=q, action=action)
+        prepared = [_prepare_gate(item, q=q, action=action, **columns) for item in chosen]
+        if all(item.columns is not None for item in prepared):
+            acc = cast(torch.Tensor, prepared[0].columns)
+            for item in prepared[1:]:
+                acc = _gate_product(acc, cast(torch.Tensor, item.columns))
+            return _PreparedGate(n=N, columns=acc)
+        def block(start: int, end: int) -> torch.Tensor:
+            acc = prepared[0].block(start, end)
+            for item in prepared[1:]:
+                acc = _gate_product(acc, item.block(start, end))
+            return acc
+        return _PreparedGate(n=N, block=block)
 
-        def matrix_of(item: Gate) -> torch.Tensor:
-            matrix = item(q=q, action=action, **columns)
-            if not isinstance(matrix, torch.Tensor):
-                raise TypeError(
-                    f"gate must return a Tensor, got {type(matrix)}."
-                )
-            if matrix.shape != (N, N):
-                raise ValueError(
-                    f"gate must return shape [{N}, {N}], got {tuple(matrix.shape)}."
-                )
-            return matrix
-
-        acc = matrix_of(chosen[0])
-        for item in chosen[1:]:
-            # Out-of-place: a gate may return a cached tensor it owns.
-            acc = acc * matrix_of(item)
-        return acc
-
-    return gate
+    return _StructuredGate(prepare)
 
 
 def _require_transform(
@@ -630,6 +680,7 @@ def _apply_transform(
     dtype: torch.dtype,
     device: torch.device | str,
     identity: torch.Tensor,
+    heads: int | None = None,
 ) -> torch.Tensor:
     """Evaluate ``transform`` on unpacked ``objective_data`` and cast.
 
@@ -638,9 +689,11 @@ def _apply_transform(
     values = identity if transform is None else transform(**objective_data)
     if not isinstance(values, torch.Tensor):
         raise TypeError(f"{name} must return a Tensor, got {type(values)}.")
-    if values.shape != torch.Size([N]):
+    if values.shape != torch.Size([N]) and (heads is None or values.shape != (N, heads)):
         raise ValueError(
-            f"{name} must return shape [{N}], got {tuple(values.shape)}."
+            f"{name} must return shape [{N}]"
+            + (f" or [{N}, {heads}]" if heads is not None else "")
+            + f", got {tuple(values.shape)}."
         )
     return values.to(dtype=dtype, device=device)
 
