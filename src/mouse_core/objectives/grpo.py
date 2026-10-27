@@ -22,7 +22,7 @@ from mouse_core.objectives.dqn import (
 def group_relative_advantages(
     *,
     rewards: torch.Tensor,
-    eps: float = 1e-8,
+    eps: float = 1e-4,
     scaling: str = "group",
     batch_rewards: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -363,7 +363,8 @@ class GrpoObjective(Objective[...]):
 
         with torch.no_grad():
             clipfrac = _weighted_mean(
-                ((ratio < self.clip_ratio_min) | (ratio > self.clip_ratio_max)).to(dtype=dtype), pair_weight
+                (((ratio < self.clip_ratio_min) & (advantage < 0))
+                 | ((ratio > self.clip_ratio_max) & (advantage > 0))).to(dtype=dtype), pair_weight
             )
             approx_kl = _weighted_mean(old_log_prob - new_log_prob, pair_weight)
 

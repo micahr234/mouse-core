@@ -116,6 +116,8 @@ def test_action_executed_requires_aligned_boolean_column(executed):
 
 @pytest.mark.parametrize('ratio,advantage,expected_loss,clipped', [
     (0.8, -2.0, 1.8, True),
+    (0.8, 2.0, -1.6, False),
+    (1.6, -2.0, 3.2, False),
     (0.95, -2.0, 1.9, False),
     (1.3, 2.0, -2.6, False),
     (1.6, 2.0, -2.8, True),
@@ -144,8 +146,8 @@ def test_invalid_policy_ratio_bounds(lower, upper):
         GrpoObjective(clip_ratio_min=lower, clip_ratio_max=upper)
 
 @pytest.mark.parametrize('scaling,expected', [
-    ('group', [-1., 1.]), ('none', [-2., 2.]),
-    ('batch', [-0.89442719, 0.89442719]),
+    ('group', [-2./2.0001, 2./2.0001]), ('none', [-2., 2.]),
+    ('batch', [-2./(5**.5 + 1e-4), 2./(5**.5 + 1e-4)]),
 ])
 def test_reward_scaling_keeps_group_baseline(scaling, expected):
     from mouse_core.objectives import group_relative_advantages
@@ -160,10 +162,10 @@ def test_batch_scaling_requires_collection_rewards():
         group_relative_advantages(rewards=torch.tensor([1., 2.]), scaling='batch')
 
 @pytest.mark.parametrize('rewards,expected', [
-    ([0., 0., 0., 1.], [-1., -1., -1., 3.]),
+    ([0., 0., 0., 1.], [-.25/.2501, -.25/.2501, -.25/.2501, .75/.2501]),
     ([0., 0.], [0., 0.]),
     ([2., 2.], [0., 0.]),
-    ([1., 5.], [-2./3., 2./3.]),
+    ([1., 5.], [-2./3.0001, 2./3.0001]),
 ])
 def test_maxrl_reward_scaling(rewards, expected):
     actual = group_relative_advantages(rewards=torch.tensor(rewards), scaling='maxrl')
@@ -189,7 +191,7 @@ def test_policy_importance_sampling_level_separates_branches_and_skips_resets(le
     objective = GrpoObjective(ent_coef=0., importance_sampling_level=level)
     losses, metrics = objective(objective_data=data, group_id=torch.tensor([0,0,0,0,1,1]), predictions=logits)
     assert losses['grpo'].item() == pytest.approx(expected)
-    assert metrics['clipfrac'] == pytest.approx(1. if level == 'action' else 1./3.)
+    assert metrics['clipfrac'] == pytest.approx(2./3. if level == 'action' else 1./3.)
     losses['grpo'].backward()
     if level == 'episode':
         assert logits.grad[0,0].item() == pytest.approx(-1./6.)
@@ -201,3 +203,17 @@ def test_policy_importance_sampling_level_separates_branches_and_skips_resets(le
 def test_invalid_policy_importance_sampling_level():
     with pytest.raises(ValueError, match='importance_sampling_level'):
         GrpoObjective(importance_sampling_level='invalid')
+
+
+@pytest.mark.parametrize("scaling", ["group", "batch", "maxrl"])
+def test_small_rewards_use_stabilizer(scaling):
+    rewards = torch.tensor([0., 2e-6], dtype=torch.float64)
+    actual = group_relative_advantages(rewards=rewards, scaling=scaling, batch_rewards=rewards)
+    torch.testing.assert_close(actual, torch.tensor([-1e-6 / 1.01e-4, 1e-6 / 1.01e-4], dtype=torch.float64))
+
+
+def test_zero_advantage_does_not_count_as_clipped():
+    data = {"action": torch.zeros(2, dtype=torch.long), "old_log_prob": torch.zeros(2),
+            "advantage": torch.zeros(2)}
+    _, metrics = GrpoObjective()(objective_data=data, group_id=_group_id(data), predictions=torch.zeros(2, 2))
+    assert metrics["clipfrac"] == 0.
