@@ -685,7 +685,7 @@ def _lambda_fixture() -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tens
             "terminated": torch.zeros(3, dtype=torch.int64),
             "truncated": torch.zeros(3, dtype=torch.int64),
             "group_id": torch.zeros(3, dtype=torch.int64),
-            "info_q_star": torch.tensor(
+            "q_star": torch.tensor(
                 [[10.0, 0.0], [0.0, 10.0], [0.0, 10.0]]
             ),
         }

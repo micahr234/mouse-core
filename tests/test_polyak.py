@@ -2,8 +2,7 @@ from __future__ import annotations
 from tests._model_helpers import ExampleModel as Model
 from tests._model_helpers import copy_model, simple_model
 
-from collections.abc import Callable
-from typing import Any, cast
+from typing import Any
 
 import pytest
 import torch
@@ -280,56 +279,42 @@ def test_selected_tokens_and_head_match_delayed_heads_on_shared_backbone() -> No
     assert torch.allclose(preds['action_value'], out["predictions"]['action_value'])
 
 
-# ---- forward contract -------------------------------------------------------
+# ---- parameter updates ------------------------------------------------------
 
 
-def test_forward_returns_plain_dictionary() -> None:
-    torch.manual_seed(0)
-    model = _tiny_model().eval()
-    batch = _token_batch(model)
-    with torch.no_grad():
-        out = model(batch)
-    assert type(out) is dict
-    assert out["last_hidden_state"].shape == (batch.L, model.backbone.hidden_dim)
-    assert out["head_token_ids"].shape == (batch.P,)
-    assert out["cache"] is None
+@pytest.mark.parametrize("tau", [0., 0.25, 1.])
+def test_polyak_matches_names_independent_of_registration_order(tau):
+    from mouse_core import polyak_update
+    target, source = nn.Module(), nn.Module()
+    target.register_parameter("first", nn.Parameter(torch.tensor([1., 2.])))
+    target.register_parameter("second", nn.Parameter(torch.tensor([3., 4.])))
+    source.register_parameter("second", nn.Parameter(torch.tensor([7., 8.])))
+    source.register_parameter("first", nn.Parameter(torch.tensor([5., 6.])))
+    target.register_buffer("counter", torch.tensor(1))
+    source.register_buffer("counter", torch.tensor(9))
+    before = {name: p.detach().clone() for name, p in target.named_parameters()}
+    polyak_update(target=target, source=source, tau=tau)
+    for name, p in target.named_parameters():
+        torch.testing.assert_close(p, before[name] + 4 * tau)
+    assert target.counter == 1
 
 
-def test_last_hidden_state_stays_on_the_tape() -> None:
-    torch.manual_seed(0)
-    model = _tiny_model().train()
-    out = model(_token_batch(model))
-    assert out["last_hidden_state"].requires_grad
-    assert out["predictions"]["action_value"].requires_grad
-
-
-def _assert_no_autograd_graph(fn: Callable[[], Any]) -> Any:
-    saved = {"n": 0}
-
-    def pack(tensor: torch.Tensor) -> torch.Tensor:
-        saved["n"] += 1
-        return tensor
-
-    with torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t):
-        result = fn()
-    assert saved["n"] == 0
-    return result
-
-
-def test_delayed_forward_under_no_grad_builds_no_graph_in_train_mode() -> None:
-    torch.manual_seed(0)
-    model = _tiny_model().train()
-    delayed = copy_model(model, heads=True, backbone=True, reasoner=False)
-    batch = _token_batch(model)
-
-    def run():
-        with torch.no_grad():
-            return delayed(batch)
-    delayed_out = _assert_no_autograd_graph(run)
-    assert delayed_out["predictions"]['action_value'].grad_fn is None
-
-
-def test_forward_rejects_non_token_batch() -> None:
-    model = _tiny_model().eval()
-    with pytest.raises(TypeError, match="TokenBatch"):
-        model(torch.zeros(3, 8))  # type: ignore[arg-type]
+@pytest.mark.parametrize("mismatch", ["names", "broadcast_shape", "count", "dtype", "integer"])
+def test_polyak_rejects_mismatch_before_updating_any_parameter(mismatch):
+    from mouse_core import polyak_update
+    target, source = nn.Module(), nn.Module()
+    target.register_parameter("first", nn.Parameter(torch.zeros(2)))
+    source.register_parameter("first", nn.Parameter(torch.ones(2)))
+    dtype = torch.int64 if mismatch == "integer" else torch.float32
+    target.register_parameter("second", nn.Parameter(torch.zeros(2, 3, dtype=dtype), requires_grad=False))
+    if mismatch != "count":
+        source.register_parameter(
+            "other" if mismatch == "names" else "second",
+            nn.Parameter(torch.ones(1 if mismatch == "broadcast_shape" else 2, 3,
+                                    dtype=torch.float64 if mismatch == "dtype" else dtype), requires_grad=False),
+        )
+    before = {name: p.detach().clone() for name, p in target.named_parameters()}
+    with pytest.raises(ValueError, match="Polyak"):
+        polyak_update(target=target, source=source, tau=0.5)
+    for name, p in target.named_parameters():
+        torch.testing.assert_close(p, before[name])

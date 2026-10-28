@@ -4,12 +4,23 @@ from __future__ import annotations
 
 import copy
 import math
+from typing import TypedDict
 
 import numpy as np
 import pytest
 import torch
 
 from mouse_core.adamp import AdamP
+
+
+class _Settings(TypedDict, total=False):
+    lr: float
+    betas: tuple[float, float]
+    eps: float
+    weight_decay: float
+    delta: float
+    wd_ratio: float
+    nesterov: bool
 
 
 def _reference(p, g, m, v, step, *, lr, betas, eps, weight_decay, delta, wd_ratio, nesterov):
@@ -51,7 +62,7 @@ def test_adamp_matches_numpy(initial, gradient, nesterov, fused):
         pytest.skip("CUDA required")
     device = "cuda" if fused else "cpu"
     p = torch.nn.Parameter(torch.tensor(initial, dtype=torch.float32, device=device))
-    kwargs = dict(lr=0.03, betas=(0.8, 0.95), eps=1e-8, weight_decay=0.2,
+    kwargs = _Settings(lr=0.03, betas=(0.8, 0.95), eps=1e-8, weight_decay=0.2,
                   delta=0.1, wd_ratio=0.1, nesterov=nesterov)
     opt = AdamP(params=[p], fused=fused, **kwargs)
     ref = np.array(initial, dtype=np.float64)
@@ -119,7 +130,7 @@ def test_fused_batched_shapes_and_new_gradient_storage(shape):
     torch.manual_seed(42)
     ps = [torch.nn.Parameter(torch.randn(shape, device="cuda")) for _ in range(3)]
     qs = [torch.nn.Parameter(p.detach().clone()) for p in ps]
-    kwargs = dict(lr=0.002, betas=(0.9, 0.999), weight_decay=0.03, nesterov=True)
+    kwargs = _Settings(lr=0.002, betas=(0.9, 0.999), weight_decay=0.03, nesterov=True)
     fused = AdamP(params=ps, fused=True, **kwargs)
     eager = AdamP(params=qs, fused=False, **kwargs)
     for step in range(5):
@@ -166,7 +177,7 @@ def test_fused_small_norms_and_cpu_checkpoint(epsilon):
     torch.manual_seed(14)
     p = torch.nn.Parameter(torch.randn(5, 7, device="cuda") * 1e-8)
     q = torch.nn.Parameter(p.detach().cpu())
-    kwargs = dict(lr=1e-4, eps=epsilon, weight_decay=0.1)
+    kwargs = _Settings(lr=1e-4, eps=epsilon, weight_decay=0.1)
     fused, eager = AdamP(params=[p], fused=True, **kwargs), AdamP(params=[q], fused=False, **kwargs)
     for _ in range(3):
         p.grad = torch.randn_like(p) * 1e-8

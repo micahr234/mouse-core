@@ -24,6 +24,9 @@ def select_discrete_action(
         scores = scores[:, :num_actions]
     if temperature == 0.0:
         return scores.argmax(dim=-1)
+    # Match collection's float64 arithmetic: tiny temperatures can underflow
+    # in fp32, and centering finite fp32 extremes can otherwise overflow.
+    scores = scores.to(torch.float64)
     scores = scores - scores.max(dim=-1, keepdim=True).values
     probs = F.softmax(scores / temperature, dim=-1)
     return torch.multinomial(probs, num_samples=1).squeeze(-1)
@@ -31,9 +34,9 @@ def select_discrete_action(
 
 def _last_valid_step(valid: torch.Tensor) -> torch.Tensor:
     """Last True index along dim=-1. Every row must have a valid head-output."""
-    if valid.ndim != 2:
+    if valid.ndim != 2 or valid.dtype != torch.bool:
         raise ValueError(
-            f"head_valid_mask must have shape [B, S], got {tuple(valid.shape)}"
+            f"head_valid_mask must be bool [B, S], got {valid.dtype} {tuple(valid.shape)}"
         )
     has = valid.any(dim=-1)
     if not bool(has.all()):
@@ -58,7 +61,8 @@ def _last_action_scores(
     ``[B, S]`` mask; omitted, the last step column is used (left-padded
     decode).
     """
-    if valid is not None and raw.ndim >= 3 and valid.shape != raw.shape[:2]:
+    expected_mask_shape = raw.shape[:2] if raw.ndim == 3 else (1, 1)
+    if valid is not None and valid.shape != expected_mask_shape:
         raise ValueError(
             f"{name} scores {tuple(raw.shape)} do not match "
             f"head_valid_mask {tuple(valid.shape)}"
@@ -78,5 +82,4 @@ def _last_action_scores(
             )
         return raw[-1].unsqueeze(0)
     raise ValueError(f"{name} expects [B, S, A] or [N, A], got {tuple(raw.shape)}")
-
 

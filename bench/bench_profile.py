@@ -93,13 +93,12 @@ def _print_summary(prof: profile, *, label: str, steps: int, cuda: bool) -> None
     cpu_ms = cpu_us / 1e3
     device_ms = device_us / 1e3
     ratio = (cpu_ms / device_ms) if device_ms > 0 else float("inf")
-    gpu_pct = (100.0 * device_ms / cpu_ms) if cpu_ms > 0 and cuda else 0.0
     print(
         f"  profile {label} | {steps} steps | "
         f"CPU {cpu_ms:8.1f} ms ({cpu_ms / steps:7.2f} ms/step) | "
         + (
             f"CUDA {device_ms:8.1f} ms ({device_ms / steps:7.2f} ms/step) | "
-            f"CPU/CUDA {ratio:5.2f} | GPU~{gpu_pct:4.0f}%"
+            f"CPU/CUDA {ratio:5.2f}"
             if cuda
             else "CPU only"
         )

@@ -160,7 +160,7 @@ def test_projection_checkpoint_roundtrip(tmp_path: Path, num_layers: int) -> Non
     {"in_features": 8, "hidden_dim": 0},
     {"in_features": 8, "hidden_dim": 8, "num_layers": 0},
 ])
-def test_projection_rejects_invalid_dimensions(kwargs: dict[str, int]) -> None:
+def test_projection_rejects_invalid_dimensions(kwargs: dict[str, Any]) -> None:
     with pytest.raises(ValueError):
         MLP(out_features=8, **kwargs)
 
@@ -186,14 +186,15 @@ def test_projection_and_prediction_prenorms_run_on_head_tokens() -> None:
     for name, head in model.heads.items():
         modules[name] = cast(MLP, head).layers
     handles = [module.register_forward_pre_hook(capture(name)) for name, module in modules.items()]
-    norms = {"projection": cast(MLP, model.projection).norm,
-             **{name: cast(MLP, head).norm for name, head in model.heads.items()}}
+    norms = {"projection": cast(MLP, model.projection).input_norm,
+             **{name: cast(MLP, head).input_norm for name, head in model.heads.items()}}
     handles += [norm.register_forward_pre_hook(capture(name + "_input")) for name, norm in norms.items()]
     try:
         with torch.no_grad():
-            cast(MLP, model.projection).norm.weight.fill_(2.0)
-            cast(MLP, model.heads['q']).norm.weight.fill_(3.0)
-            cast(MLP, model.heads['policy']).norm.weight.fill_(4.0)
+            for name, gain in (("projection", 2.0), ("q", 3.0), ("policy", 4.0)):
+                norm = norms[name]
+                assert isinstance(norm, torch.nn.RMSNorm)
+                norm.weight.fill_(gain)
             output = model(_batch())
     finally:
         for handle in handles:

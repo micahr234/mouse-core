@@ -160,7 +160,7 @@ def test_offline_dqn_cosine_example(monkeypatch):
         "reward": torch.tensor([0., 1., 0., 0., 1.]),
         "terminated": torch.tensor([False, False, True, False, True]),
         "truncated": torch.zeros(5, dtype=torch.bool),
-        "repeat_episode_start": torch.tensor([True, False, False, True, False]),
+        "episode_reset": torch.tensor([True, False, False, True, False]),
     }
     group_id = torch.tensor([0, 0, 0, 1, 1])
     out, target = encoder(tokens), delayed_encoder(tokens)
@@ -171,7 +171,7 @@ def test_offline_dqn_cosine_example(monkeypatch):
     )
     losses, _ = namespace["cosine_objective"].latent_cosine_loss(
         transition=transition, predictions=out["z"], targets=target["z"],
-        reset_key="repeat_episode_start", objective_data=data, group_id=group_id,
+        reset_key="episode_reset", objective_data=data, group_id=group_id,
     )
     for loss, trained, untrained in (
         (torch.stack(tuple(dqn_losses.values())).sum(), (encoder.embedding, encoder.backbone, q_head), (transition,)),
@@ -191,7 +191,7 @@ def test_offline_dqn_cosine_example(monkeypatch):
     handle = transition.register_forward_pre_hook(lambda module, args: captured.append(args))
     namespace["cosine_objective"].latent_cosine_loss(
         transition=transition, predictions=out["z"], targets=target["z"],
-        reset_key="repeat_episode_start", objective_data=data,
+        reset_key="episode_reset", objective_data=data,
         group_id=torch.zeros_like(group_id),
     )
     handle.remove()
@@ -239,7 +239,7 @@ def test_offline_dqn_cosine_example(monkeypatch):
     # No valid adjacent pairs contributes a differentiable zero.
     empty, _ = namespace["cosine_objective"].latent_cosine_loss(
         transition=transition, predictions=encoder(tokens)["z"], targets=delayed_encoder(tokens)["z"],
-        reset_key="repeat_episode_start",
+        reset_key="episode_reset",
         objective_data=data, group_id=torch.arange(5),
     )
     assert empty["cosine"].item() == 0
@@ -310,6 +310,30 @@ def test_sequential_cosine_without_pairs_does_not_call_transition(n):
     assert losses["cosine"].item() == 0
     losses["cosine"].backward()
     assert z.grad is not None
+
+
+def test_sequential_cosine_skips_unexecuted_placeholder_actions():
+    z = torch.randn(3, 2, requires_grad=True)
+    captured = []
+
+    def transition(state, action):
+        captured.append(action)
+        return state
+
+    losses, _ = CosineObjective(mask_key=None).latent_cosine_loss(
+        objective_data={
+            "action": torch.tensor([999, 999, 1]),
+            "action_executed": torch.tensor([False, False, True]),
+            "terminated": torch.zeros(3, dtype=torch.bool),
+            "truncated": torch.zeros(3, dtype=torch.bool),
+        },
+        predictions=z, targets=z.detach(), group_id=torch.zeros(3, dtype=torch.int64),
+        transition=transition, reset_key=None,
+    )
+    torch.testing.assert_close(captured[0], torch.tensor([1]))
+    losses["cosine"].backward()
+    assert z.grad is not None
+    torch.testing.assert_close(z.grad[0], torch.zeros(2))
 
 
 def test_example_zero_weight_omits_transition_and_auxiliary_loss():

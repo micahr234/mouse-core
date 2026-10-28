@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from mouse_core.objectives import SpObjective, best_action
@@ -69,19 +70,14 @@ def test_sp_objective_ce_rejects_out_of_range_actions() -> None:
         raise AssertionError("expected ValueError for out-of-range action")
 
 
-def test_sp_objective_requires_targets() -> None:
-    objective_data = {"episode_ended": _ended(1, 1)}
-    predictions = torch.tensor([[[0.0, 1.0]]])
-    try:
-        SpObjective(mask_key="episode_ended")(
-            objective_data=objective_data,
-            predictions=predictions,
-            targets=None,  # type: ignore[arg-type]
+@pytest.mark.parametrize("target", [0.9, 1.9, True])
+def test_sp_objective_rejects_noninteger_action_labels(target) -> None:
+    with pytest.raises(TypeError, match="integer"):
+        SpObjective(mask_key=None)(
+            objective_data={},
+            predictions=torch.tensor([[0.0, 1.0]]),
+            targets=torch.tensor([target]),
         )
-    except TypeError as exc:
-        assert "targets" in str(exc)
-    else:
-        raise AssertionError("expected TypeError for missing targets")
 
 
 def test_best_action_unique_max_is_deterministic() -> None:
@@ -134,12 +130,21 @@ def test_sp_ce_ignores_padded_student_logits() -> None:
     assert logits.grad[0, -1].item() == 0.0
 
 
-def test_sp_objective_accepts_direct_action_ids() -> None:
-    objective_data = {"episode_ended": _ended(1, 1)}
-    predictions = torch.tensor([[[0.0, 1.0]]])
-    loss, _ = SpObjective(mask_key="episode_ended")(
-        objective_data=objective_data,
-        predictions=predictions,
-        targets=torch.tensor([[1]]),
-    )
-    assert loss["action"].item() > 0.0
+def test_sp_ce_excludes_padding_even_when_valid_logits_are_extremely_negative() -> None:
+    logits = torch.full((1, 3), torch.finfo(torch.float32).min / 2)
+    invalid = torch.tensor([[False, False, True]])
+    expected = sp_ce(torch.tensor([0]), logits[:, :2], label_smoothing=0.1)
+    actual = sp_ce(torch.tensor([0]), logits, invalid=invalid, label_smoothing=0.1)
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("invalid", [[[True, True]], [[False, True]]])
+def test_sp_ce_rejects_targeting_an_invalid_action(invalid) -> None:
+    with pytest.raises(ValueError, match="invalid action"):
+        sp_ce(torch.tensor([1]), torch.zeros(1, 2), invalid=torch.tensor(invalid))
+
+
+@pytest.mark.parametrize("smoothing", [-0.1, 1.1, float("nan")])
+def test_sp_ce_rejects_invalid_label_smoothing(smoothing) -> None:
+    with pytest.raises(ValueError, match="label_smoothing"):
+        sp_ce(torch.tensor([0]), torch.zeros(1, 2), label_smoothing=smoothing)

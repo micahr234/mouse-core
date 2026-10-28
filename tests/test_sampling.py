@@ -1,4 +1,5 @@
 import numpy as np
+from typing import cast
 import pytest
 import torch
 from mouse_core.sampling import EpisodeTemperature, check_temperature_range, last_action_scores, sample_tempered_actions, tempered_policy_logits
@@ -22,7 +23,7 @@ class RecordingRng:
 
 def test_uniform_temperature_is_per_task_and_per_stream():
     rng = RecordingRng()
-    policy = EpisodeTemperature(0.2, 1.7, rng)
+    policy = EpisodeTemperature(0.2, 1.7, cast(np.random.Generator, rng))
     first = policy.for_episode(0, 0)
     assert all(policy.for_episode(0, 0) == first for _ in range(20))
     second = policy.for_episode(1, 0)
@@ -45,7 +46,7 @@ def test_invalid_temperature_ranges(bounds):
 def test_tempered_actions_use_correct_probabilities_and_log_probs():
     rng = RecordingRng()
     scores = torch.tensor([[0., 1., 2.], [0., 1., 2.], [0., 1., 2.]])
-    actions, logs = sample_tempered_actions(scores, [0., 0.5, 2.], rng)
+    actions, logs = sample_tempered_actions(scores, [0., 0.5, 2.], cast(np.random.Generator, rng))
     assert actions[0] == 2 and logs[0] == 0
     assert len(rng.probabilities) == 2  # Greedy consumes no random action draw.
     for i, temperature in enumerate((0.5, 2.), start=1):
@@ -87,6 +88,7 @@ def test_grpo_likelihood_ratio_matches_collected_episode_policy(temperature):
     assert metrics['approx_kl'] == pytest.approx(0., abs=1e-7)
     assert metrics['clipfrac'] == 0
     losses['grpo'].backward()
+    assert scores.grad is not None
     assert torch.isfinite(scores.grad).all()
     if temperature == 0:
         assert scores.grad.count_nonzero() == 0
@@ -113,3 +115,33 @@ def test_last_readout_rejects_misaligned_mask():
         last_action_scores(torch.zeros(2,3,4),torch.ones(2,2,dtype=torch.bool),4)
     with pytest.raises(ValueError, match='valid must'):
         last_action_scores(torch.zeros(2,3,4),torch.ones(2,3),4)
+
+
+@pytest.mark.parametrize('temperature', [1e-200, 0.1])
+def test_decode_selector_handles_tiny_temperature_and_large_finite_scores(temperature, monkeypatch):
+    from mouse_core.models import select_discrete_action
+    probabilities = []
+
+    def sample(probs, num_samples):
+        probabilities.append(probs)
+        return probs.argmax(-1, keepdim=True)
+
+    monkeypatch.setattr(torch, 'multinomial', sample)
+    limit = torch.finfo(torch.float32).max
+    actions = select_discrete_action(
+        scores=torch.tensor([[[-limit, limit]], [[1., 2.]]]), temperature=temperature,
+    )
+    assert actions.tolist() == [1, 1]
+    expected = torch.tensor([[0., 1.], [0., 1.]], dtype=torch.float64)
+    expected[1] = (torch.tensor([1., 2.], dtype=torch.float64) / temperature).softmax(-1)
+    torch.testing.assert_close(probabilities[0], expected)
+
+
+@pytest.mark.parametrize('scores,valid', [
+    (torch.zeros(1, 2, 3), torch.tensor([[1., 0.5]])),
+    (torch.zeros(1, 3), torch.ones(2, 1, dtype=torch.bool)),
+])
+def test_decode_selector_rejects_invalid_readout_masks(scores, valid):
+    from mouse_core.models import select_discrete_action
+    with pytest.raises(ValueError, match='head_valid_mask'):
+        select_discrete_action(scores=scores, temperature=0., valid=valid)

@@ -117,10 +117,13 @@ class LoRALinear(nn.Module):
         self.rank = config.rank
         self.scale = config.alpha / config.rank
         self.dropout_p = config.dropout
-        self.lora_A = nn.Linear(base.in_features, config.rank, bias=False, dtype=torch.float32)
-        self.lora_B = nn.Linear(config.rank, base.out_features, bias=False, dtype=torch.float32)
+        self.lora_A = nn.Linear(base.in_features, config.rank, bias=False,
+                                device=base.weight.device, dtype=torch.float32)
+        self.lora_B = nn.Linear(config.rank, base.out_features, bias=False,
+                                device=base.weight.device, dtype=torch.float32)
         nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
         nn.init.zeros_(self.lora_B.weight)
+        self.train(base.training)
 
     @property
     def in_features(self) -> int:
@@ -161,17 +164,22 @@ def apply_lora(*, model: nn.Module, config: LoRAConfig) -> int:
         Number of modules wrapped.
 
     Raises:
-        ValueError: When no ``nn.Linear`` exists under ``model``.
+        ValueError: When no ``nn.Linear`` exists under ``model`` or LoRA has
+            already been attached. Validation leaves trainability unchanged.
     """
-    model.requires_grad_(False)
-    wrapped = 0
-    for parent in list(model.modules()):
-        if isinstance(parent, LoRALinear):
-            continue
-        for name, child in list(parent.named_children()):
-            if isinstance(child, nn.Linear):
-                setattr(parent, name, LoRALinear(child, config))
-                wrapped += 1
-    if wrapped == 0:
+    parents = list(model.modules())
+    if any(isinstance(parent, LoRALinear) for parent in parents):
+        raise ValueError("model already contains LoRA adapters.")
+    # named_children() deduplicates aliases; replace every registered reference
+    # while keeping shared linears tied to the same adapter.
+    linears = [(parent, name, child) for parent in parents
+               for name, child in parent._modules.items() if isinstance(child, nn.Linear)]
+    if not linears:
         raise ValueError(f"no nn.Linear found under {type(model).__name__}.")
-    return wrapped
+    model.requires_grad_(False)
+    replacements: dict[int, LoRALinear] = {}
+    for parent, name, child in linears:
+        if id(child) not in replacements:
+            replacements[id(child)] = LoRALinear(child, config)
+        setattr(parent, name, replacements[id(child)])
+    return len(replacements)

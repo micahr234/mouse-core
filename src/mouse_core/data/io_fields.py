@@ -33,11 +33,11 @@ def coerce_io_fields(
             raise TypeError(
                 f"{who} fields use input_field= (optional output_field=; not field=)"
             )
-        unknown = set(data) - {"input_field", "output_field"}
+        unknown = set(data) - {"input_field", "output_field", "missing_value"}
         if unknown:
             raise TypeError(
                 f"{who} field spec unknown keys {sorted(unknown)}; "
-                "only input_field= and output_field= are allowed"
+                "only input_field=, output_field=, and missing_value= are allowed"
             )
         try:
             in_name = data["input_field"]

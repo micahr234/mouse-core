@@ -1,14 +1,18 @@
 from __future__ import annotations
+from tests._event_fixtures import encode_measurement, measurement_events
 from tests._model_helpers import fresh_model, ExampleModel as Model
 from tests._model_helpers import simple_model
 from typing import Any, cast
+from types import ModuleType
 import json
+import sys
 import pytest
 import torch
 from mouse_core.models import Embedding, load_model, push_model_to_hub, save_model
 from mouse_core.models.io import _write_model_card
 from mouse_core.models.backbone import IdentityBackbone, LoRAConfig, Backbone
-from mouse_core.data import Tokenizer, load_tokenizer, save_tokenizer
+from mouse_core.data import Tokenizer, load_tokenizer, save_tokenizer, pack_token_batch
+from mouse_core.objectives import SvObjective
 from mouse_core.models.mlp import MLP
 
 def when_repeat_episode_done_nonzero(ctx):
@@ -17,6 +21,59 @@ def when_repeat_episode_done_nonzero(ctx):
 
 def when_group_start(ctx):
     return bool(ctx["group_start"])
+
+
+def test_inline_conditions_reload_in_a_fresh_notebook(tmp_path, monkeypatch):
+    source = 'def on_start(ctx):\n    return bool(ctx["group_start"])\n'
+    training = ModuleType('__main__')
+    exec(source, training.__dict__)
+    monkeypatch.setitem(sys.modules, '__main__', training)
+    tokenizer = Tokenizer(
+        input_fields=[
+            {'type': 'token', 'format': '2', 'when': training.on_start},
+            {'type': 'token', 'format': '1', 'head_output': True},
+        ],
+        tokenizer=IntIdTokenizer(),
+    )
+    save_tokenizer(tokenizer=tokenizer, path=tmp_path)
+    inference = ModuleType('__main__')
+    monkeypatch.setitem(sys.modules, '__main__', inference)
+    with pytest.raises(ValueError, match="Define tokenizer condition 'on_start'"):
+        load_tokenizer(repo_id_or_path=str(tmp_path), tokenizer=IntIdTokenizer())
+    exec(source, inference.__dict__)
+    restored = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizer=IntIdTokenizer())
+    assert isinstance(restored, Tokenizer)
+    assert restored.input_fields[0].when is inference.on_start
+    assert restored.input_fields[0].when is not training.on_start
+    assert restored.pack_rows(rows=[measurement_events(payloads) for payloads in [[{}]]], continuing=None).token_ids.tolist() == [2, 1]
+    assert restored.pack_rows(rows=[measurement_events(payloads) for payloads in [[{}]]], continuing=[True]).token_ids.tolist() == [1]
+
+
+@pytest.mark.parametrize('module', ['__main__', 'missing_notebook_predicate_module'])
+def test_unsavable_predicate_does_not_overwrite_a_saved_tokenizer(tmp_path, module):
+    good = Tokenizer(
+        input_fields=[{'type': 'token', 'format': '1', 'head_output': True}],
+        tokenizer=IntIdTokenizer(),
+    )
+    save_tokenizer(tokenizer=good, path=tmp_path)
+    before = (tmp_path / 'tokenizer.json').read_bytes()
+    namespace: dict[str, Any] = {'__name__': module}
+    exec('def on_start(ctx):\n    return bool(ctx["group_start"])\n', namespace)
+    bad = Tokenizer(
+        input_fields=[
+            {'type': 'token', 'format': '2', 'when': namespace['on_start']},
+            {'type': 'token', 'format': '1', 'head_output': True},
+        ],
+        tokenizer=IntIdTokenizer(),
+    )
+    # The condition is usable live, but its import path cannot survive a fresh process.
+    assert bad.pack_rows(rows=[measurement_events(payloads) for payloads in [[{}]]], continuing=None).token_ids.tolist() == [2, 1]
+    with pytest.raises(TypeError, match='importable'):
+        save_tokenizer(tokenizer=bad, path=tmp_path)
+    assert (tmp_path / 'tokenizer.json').read_bytes() == before
+    restored = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizer=IntIdTokenizer())
+    assert isinstance(restored, Tokenizer)
+    assert encode_measurement(restored, {}).token_ids.tolist() == [1]
 
 
 def when_reward_nonzero(ctx):
@@ -133,7 +190,9 @@ def test_explicit_model_checkpoints_roundtrip_without_backbone_output_norm(tmp_p
     head = MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0)
     model = simple_model(backbone=backbone, heads={'action_value': head}, reasoner=None)
     with torch.no_grad():
-        head.layers[-1].weight.fill_(3.0)
+        output = head.layers[-1]
+        assert isinstance(output, torch.nn.Linear)
+        output.weight.fill_(3.0)
     save_model(model=model, path=tmp_path)
     loaded = load_model(model=fresh_model(model), repo_id_or_path=str(tmp_path))
     assert isinstance(cast(Backbone, loaded.backbone).model.norm, torch.nn.Identity)
@@ -272,7 +331,7 @@ def test_tokenizer_roundtrip(tmp_path) -> None:
     tokenizer = Tokenizer(
         input_fields=[
             {"type": "text", "input_field": "action", "format": "{field}"},
-            {"type": "text", "input_field": "repeat_episode_done", "format": "{field}", "required": False},
+            {"type": "text", "input_field": "repeat_episode_done", "format": "{field}"},
             {"type": "text", "input_field": "done_code", "format": "{field}", "head_output": True},
             {
                 "type": "text",
@@ -292,6 +351,7 @@ def test_tokenizer_roundtrip(tmp_path) -> None:
     save_tokenizer(tokenizer=tokenizer, path=tmp_path)
     assert (tmp_path / "tokenizer.json").is_file()
     loaded = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizer=IntIdTokenizer())
+    assert isinstance(loaded, Tokenizer)
     assert loaded.pretrained is None
     assert loaded.objective_fields == (
         ("action", "action"),
@@ -305,7 +365,7 @@ def test_tokenizer_roundtrip(tmp_path) -> None:
         "done_code",
         "repeat_episode_index",
     ]
-    assert loaded.input_fields[1].required is False
+    assert "required" not in (tmp_path / "tokenizer.json").read_text()
     assert loaded.input_fields[2].head_output is True
     assert loaded.input_fields[3].when is when_step_index_zero
     assert sum(1 for s in loaded.input_fields if s.head_output) == 1
@@ -335,11 +395,12 @@ def test_tokenizer_roundtrip_group_start_and_not_equals(tmp_path) -> None:
     )
     save_tokenizer(tokenizer=tokenizer, path=tmp_path)
     loaded = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizer=_Tok())
+    assert isinstance(loaded, Tokenizer)
     assert loaded.input_fields[0].when is when_group_start
     assert loaded.input_fields[0].input_field is None
     assert loaded.input_fields[0].format == "hello\n"
     assert loaded.input_fields[1].when is when_reward_nonzero
-    st = loaded({"action": 1, "reward": 1.0, "episode_index": 0})
+    st = encode_measurement(loaded, {"action": 1, "reward": 1.0, "episode_index": 0})
     assert st.group_start_token_ids is not None
     assert st.group_start_token_ids.tolist() == [1, 2]
 
@@ -366,6 +427,7 @@ def test_push_model_and_tokenizer_share_repository(monkeypatch) -> None:
             assert {"config.json", "pytorch_model.bin", "tokenizer.json", "README.md"} <= {p.name for p in directory.iterdir()}
             load_model(model=model, repo_id_or_path=directory)
             loaded = load_tokenizer(repo_id_or_path=str(directory), tokenizer=IntIdTokenizer())
+            assert isinstance(loaded, Tokenizer)
             assert loaded is not None
             uploads.append(kwargs)
     monkeypatch.setattr(io, "_create_hub_repo", create)
@@ -374,3 +436,52 @@ def test_push_model_and_tokenizer_share_repository(monkeypatch) -> None:
     assert result == "https://huggingface.co/user/model"
     assert len(created) == len(uploads) == 1
     assert uploads[0]["repo_id"] == "user/model"
+
+
+def test_explicit_missing_labels_roundtrip_without_inserting_input_tokens(tmp_path):
+    tokenizer = Tokenizer(tokenizer=IntIdTokenizer(), input_fields=[
+        {'type': 'numeric', 'input_field': 'reward',
+         'format': '2', 'fourier_min': 0., 'fourier_max': 10.},
+        {'type': 'token', 'format': '1', 'head_output': True},
+    ], objective_fields=[
+        {'input_field': 'reward', 'output_field': 'return_reward', 'missing_value': 0.},
+        {'input_field': 'action', 'missing_value': None},
+    ])
+    save_tokenizer(tokenizer=tokenizer, path=tmp_path)
+    restored = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizer=IntIdTokenizer())
+    assert isinstance(restored, Tokenizer)
+    row = {}
+    for encoder in (tokenizer, restored):
+        missing = encode_measurement(encoder, row)
+        assert missing.token_ids.tolist() == [1]
+        assert missing.objective_fields == {'return_reward': 0., 'action': None}
+        present = encode_measurement(encoder, {'reward': 5., 'action': 0})
+        assert present.token_ids.tolist() == [2, 1]
+        assert present.objective_fields == {'return_reward': 5., 'action': 0}
+    assert row == {}
+
+
+def test_missing_vector_targets_roundtrip_and_do_not_train_unlabelled_rows(tmp_path):
+    tokenizer = Tokenizer(tokenizer=IntIdTokenizer(), input_fields=[
+        {'type': 'token', 'format': '1', 'head_output': True},
+    ], objective_fields=[{'input_field': 'q_star', 'missing_value': []}])
+    save_tokenizer(tokenizer=tokenizer, path=tmp_path)
+    restored = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizer=IntIdTokenizer())
+    assert isinstance(restored, Tokenizer)
+    rows = [{'q_star': [1., 2.]}, {}, {'q_star': [3., 4.]}]
+    for encoder in (tokenizer, restored):
+        steps = [encode_measurement(encoder, row) for row in rows]
+        assert steps[1].objective_fields['q_star'].size == 0
+        inputs, labels, _ = pack_token_batch(
+            steps=steps, sequence_ids=[0, 0, 0], batch_size=1, continuing=None)
+        assert inputs.N == 3
+        assert torch.isneginf(labels['q_star'][1]).all()
+        predictions = torch.zeros((3, 2), requires_grad=True)
+        losses, _ = SvObjective(loss_type='mse')(
+            objective_data=labels, predictions=predictions, targets=labels['q_star'])
+        assert losses['value'].item() == pytest.approx(7.5)
+        losses['value'].backward()
+        assert predictions.grad is not None
+        assert predictions.grad[1].count_nonzero() == 0
+        assert predictions.grad[[0, 2]].count_nonzero() == 4
+    assert rows[1] == {}

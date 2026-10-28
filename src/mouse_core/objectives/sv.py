@@ -74,13 +74,14 @@ class SvObjective(Objective[...]):
             targets, owner="SvObjective", name="targets"
         )
         logits: torch.Tensor = predictions
+        if logits.ndim < 1 or q_targets_raw.shape != logits.shape:
+            raise ValueError("SvObjective: predictions and targets must have the same shape [..., A].")
+        if logits.numel() == 0:
+            raise ValueError("SvObjective: batch is empty (no tokens or actions).")
 
         A = logits.shape[-1]
         logits = logits.reshape(-1, A)
         q_targets = q_targets_raw.reshape(-1, A).to(dtype=logits.dtype)
-
-        if q_targets.shape[0] == 0:
-            raise ValueError("SvObjective: batch is empty (no tokens).")
 
         finite_mask = torch.isfinite(q_targets)
         if not finite_mask.any():

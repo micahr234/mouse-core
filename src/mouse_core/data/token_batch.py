@@ -16,6 +16,16 @@ _TensorCache = dict[tuple[int, torch.device, bool], tuple[object, dict[str, torc
 _tensor_cache: ContextVar[_TensorCache | None] = ContextVar("token_batch_tensors", default=None)
 
 
+def _sequence_id_array(value) -> np.ndarray:
+    """Preserve sequence identity; coercing floats can merge separate groups."""
+    array = np.asarray(value)
+    if array.size and array.dtype.kind not in "iu":
+        raise ValueError("sequence_ids must contain integer ids")
+    if array.dtype.kind == "u" and array.size and array.max() > np.iinfo(np.int64).max:
+        raise ValueError("sequence_ids exceed the int64 range")
+    return array.astype(np.int64, copy=False)
+
+
 @contextmanager
 def reuse_token_tensors() -> Iterator[None]:
     """Reuse batch conversions within one online/delayed forward pair.
@@ -60,6 +70,8 @@ class StepTokens:
 
     ``numeric_mask`` marks numeric tokens even when their scaled value is zero.
     ``group_start_*`` arrays hold an optional prefix emitted once per sequence.
+    A passive step can contain no head tokens, or even no input tokens, while
+    retaining its objective labels.
     """
 
     token_ids: np.ndarray  # [T] vocabulary rows
@@ -73,20 +85,14 @@ class StepTokens:
 
     def __post_init__(self) -> None:
         token_ids = np.asarray(self.token_ids, dtype=np.int64)
-        if token_ids.ndim != 1 or token_ids.size == 0:
-            raise ValueError("StepTokens must contain at least one token in a 1-D token_ids array")
+        if token_ids.ndim != 1:
+            raise ValueError("StepTokens requires a 1-D token_ids array")
         for name, dtype in (("token_ids", np.int64), ("numeric_values", np.float32),
                             ("numeric_mask", np.bool_), ("head_token_mask", np.bool_)):
             array = np.asarray(getattr(self, name), dtype=dtype)
             if array.shape != token_ids.shape:
                 raise ValueError(f"{name} must have shape [{token_ids.size}], got {array.shape}")
             setattr(self, name, array)
-        if not bool(self.head_token_mask.any()):
-            raise ValueError(
-                "step has no head-output tokens; the tokenizer input field "
-                "flagged head_output=True must emit at least one token on "
-                "every step (it must never be skipped)"
-            )
         prefix = (self.group_start_token_ids, self.group_start_numeric_values,
                   self.group_start_numeric_mask)
         if all(array is None for array in prefix):
@@ -121,7 +127,9 @@ class TokenBatch:
     ``head_token_ids`` contains the ``[P]`` positions marked by the
     tokenizer. ``head_step_ids[p]`` identifies the corresponding step in
     ``0..N-1``; a step may have multiple head tokens. ``B`` is the number of
-    sequences, including empty decode rows.
+    sequences, including empty decode rows. ``step_sequence_ids`` records the
+    sequence of every step, including steps without readouts. Omitting it
+    retains the legacy dense-head layout.
     """
 
     token_ids: np.ndarray
@@ -131,6 +139,7 @@ class TokenBatch:
     head_token_ids: np.ndarray
     head_step_ids: np.ndarray
     B: int = 0
+    step_sequence_ids: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         token_ids = np.asarray(self.token_ids, dtype=np.int64)
@@ -139,7 +148,8 @@ class TokenBatch:
         L = int(token_ids.size)
         for name, dtype in (("token_ids", np.int64), ("numeric_values", np.float32),
                             ("numeric_mask", np.bool_), ("sequence_ids", np.int64)):
-            array = np.asarray(getattr(self, name), dtype=dtype)
+            array = (_sequence_id_array(self.sequence_ids) if name == "sequence_ids"
+                     else np.asarray(getattr(self, name), dtype=dtype))
             if array.shape != (L,):
                 raise ValueError(f"{name} must have shape [{L}], got {array.shape}")
             setattr(self, name, array)
@@ -177,11 +187,29 @@ class TokenBatch:
             if bool(np.any(head_token_ids[1:] <= head_token_ids[:-1])):
                 raise ValueError("head_token_ids must be strictly increasing")
             diffs = np.diff(head_step_ids)
-            if int(head_step_ids[0]) != 0 or bool(np.any((diffs < 0) | (diffs > 1))):
+            if int(head_step_ids[0]) < 0 or bool(np.any(diffs < 0)) or (
+                self.step_sequence_ids is None and (int(head_step_ids[0]) != 0 or bool(np.any(diffs > 1)))
+            ):
                 raise ValueError(
                     "head_step_ids must be dense non-decreasing step ids "
                     f"starting at 0, got {head_step_ids.tolist()}"
                 )
+            head_sequences = self.sequence_ids[head_token_ids]
+            if np.any((diffs == 0) & (head_sequences[1:] != head_sequences[:-1])):
+                raise ValueError("All head tokens of a step must belong to one sequence")
+        if self.step_sequence_ids is None:
+            first = np.ones(p, dtype=bool)
+            first[1:] = head_step_ids[1:] != head_step_ids[:-1]
+            self.step_sequence_ids = self.sequence_ids[head_token_ids[first]]
+        else:
+            ids = _sequence_id_array(self.step_sequence_ids)
+            if ids.ndim != 1 or (ids.size and (ids.min() < 0 or ids.max() >= self.B
+                                               or np.any(np.diff(ids) < 0))):
+                raise ValueError("step_sequence_ids must be ordered sequence IDs in [0, B)")
+            if p and (head_step_ids[-1] >= ids.size
+                      or np.any(ids[head_step_ids] != self.sequence_ids[head_token_ids])):
+                raise ValueError("head_step_ids must identify steps in the matching sequence")
+            self.step_sequence_ids = ids
         counts = self.step_counts()
         if int(counts.sum()) != self.N:
             raise ValueError(
@@ -196,13 +224,12 @@ class TokenBatch:
     @property
     def N(self) -> int:
         """Number of steps."""
-        if self.head_step_ids.shape[0] == 0:
-            return 0
-        return int(self.head_step_ids[-1]) + 1
+        assert self.step_sequence_ids is not None
+        return int(self.step_sequence_ids.size)
 
     @property
     def P(self) -> int:
-        """Number of head-output tokens (``>= N``)."""
+        """Number of head-output tokens; passive steps contribute none."""
         return int(self.head_token_ids.shape[0])
 
     @property
@@ -214,14 +241,8 @@ class TokenBatch:
         return int(counts.max()) if counts.size else 0
 
     def step_counts(self) -> np.ndarray:
-        """Steps per sequence ``[B]``, from each step's first head token."""
-        if self.P == 0:
-            return np.zeros(self.B, dtype=np.int64)
-        first = np.ones(self.P, dtype=bool)
-        first[1:] = self.head_step_ids[1:] != self.head_step_ids[:-1]
-        step_sequence_ids = self.sequence_ids[self.head_token_ids[first]]
-        counts = step_counts_from_group_id(group_id=step_sequence_ids, B=self.B)
-        return counts
+        """Steps per sequence, including steps without readouts."""
+        return step_counts_from_group_id(group_id=self.step_sequence_ids, B=self.B)
 
     def to_tensors(self, device: torch.device | str | None = None) -> dict[str, torch.Tensor]:
         """Move arrays to tensors; reuse them inside ``reuse_token_tensors``."""
@@ -439,7 +460,10 @@ def pack_token_batch(
                 f"sequence_ids length ({len(sequence_ids)}) must match "
                 f"steps ({len(steps)})"
             )
-        seq_per_step = [int(s) for s in sequence_ids]
+        ids = _sequence_id_array(sequence_ids)
+        if ids.ndim != 1:
+            raise ValueError("sequence_ids must be a 1-D sequence")
+        seq_per_step = ids.tolist()
         if any(s < 0 for s in seq_per_step):
             raise ValueError(
                 f"sequence_ids must be >= 0, got min={min(seq_per_step)}"
@@ -507,6 +531,7 @@ def pack_token_batch(
         sequence_ids=np.concatenate(seq_ids),
         head_token_ids=np.asarray(head_token_ids, dtype=np.int64),
         head_step_ids=np.asarray(head_step_ids, dtype=np.int64),
+        step_sequence_ids=np.asarray(seq_per_step, dtype=np.int64),
         B=B,
     )
     return inputs, _fields_to_tensors(fields), group_id

@@ -1,6 +1,10 @@
 """A nullable stored action becomes a validity mask only at the tensor boundary."""
 
+from functools import partial
+from tests._event_fixtures import encode_measurement
+
 import copy
+import json
 from typing import Any
 
 import numpy as np
@@ -12,7 +16,11 @@ from mouse_core.data import (
     Augmenter,
     DataLoader,
     Datastore,
+    EventLog,
+    EventTransform,
+    environment_episode_ranges,
     Tokenizer,
+    environment_decisions,
     pack_token_batch,
 )
 from mouse_core.objectives import (
@@ -22,6 +30,7 @@ from mouse_core.objectives import (
     boundary_discount,
 )
 from tests._token_batch_helpers import IntIdTokenizer
+from mouse_core.data.dataloader import _require_free_threading
 
 
 def tokenizer(*fields):
@@ -35,7 +44,7 @@ def tokenizer(*fields):
 @pytest.mark.parametrize("actions", [[None, 0, None, 2], [None, None], [0, 2]])
 def test_only_packing_introduces_action_mask(actions):
     rows = [{"action": action, "reward": 0.0} for action in actions]
-    steps = [tokenizer("action", "reward")(row) for row in rows]
+    steps = [encode_measurement(tokenizer("action", "reward"), row) for row in rows]
     _, data, _ = pack_token_batch(steps=steps, continuing=None)
     assert data["action"].dtype == torch.int64
     assert data["action"].tolist() == [0 if a is None else a for a in actions]
@@ -48,19 +57,19 @@ def test_only_packing_introduces_action_mask(actions):
 @pytest.mark.parametrize("row", [{}, {"action": None, "reward": None}])
 def test_missing_action_and_null_reward_are_still_errors(row):
     with pytest.raises(KeyError):
-        tokenizer("action", "reward")(row)
+        encode_measurement(tokenizer("action", "reward"), row)
 
 
 def test_missing_packed_action_is_not_treated_as_explicit_none():
     tok = tokenizer("action")
-    steps = [tok({"action": None}), tok({"action": 0})]
+    steps = [encode_measurement(tok, {"action": None}), encode_measurement(tok, {"action": 0})]
     del steps[1].objective_fields["action"]
     with pytest.raises(KeyError, match="action"):
         pack_token_batch(steps=steps, continuing=None)
 
 
 def test_stored_mask_is_rejected_in_favor_of_nullable_action():
-    step = tokenizer("action", "action_executed")(
+    step = encode_measurement(tokenizer("action", "action_executed"),
         {"action": 0, "action_executed": False}
     )
     with pytest.raises(ValueError, match="derived during packing"):
@@ -92,35 +101,70 @@ def test_augmentation_preserves_none_and_permutates_reset_value_targets():
     assert row == before
 
 
-def test_null_actions_survive_disk_roundtrip_and_appending_real_actions(tmp_path):
-    store = Datastore()
-    store.append(data={"action": None, "episode_index": 0})
-    # Exercise a source whose inferred action type is initially null.
+def reset_stream():
+    log = EventLog()
+    for episode in range(2):
+        log.event(provider='coordinator', episode_index=episode, payload={
+            'episode_start': True,
+        })
+        log.event(provider='environment', episode_index=episode, payload={
+            'terminated': False,
+            'truncated': False,
+            "action_requested": True,
+        })
+        log.event(provider='coordinator', episode_index=episode, payload={
+        })
+        log.event(provider='agent', episode_index=episode, payload={
+            'action': 0,
+        })
+        log.event(provider='environment', episode_index=episode, payload={
+            'terminated': False,
+            'truncated': False,
+        })
+        log.event(provider='coordinator', episode_index=episode, payload={
+        })
+        log.event(provider='environment', episode_index=episode, payload={
+            'terminated': False,
+            'truncated': False,
+            "action_requested": True,
+        })
+        log.event(provider='coordinator', episode_index=episode, payload={
+        })
+        log.event(provider='agent', episode_index=episode, payload={
+            'action': 1,
+        })
+        log.event(provider='environment', episode_index=episode, payload={
+            'terminated': True,
+            'truncated': False,
+        })
+    return log.to_store()
+
+
+def test_resets_persist_without_null_agent_events(tmp_path):
+    store = reset_stream()
+    store.to_dataset().save_to_disk(str(tmp_path / "replay"))
     reloaded = Datastore()
-    reloaded.from_dataset(ds=store.to_dataset())
-    reloaded.append(data={"action": 0, "episode_index": 0})
-    reloaded.append(data={"action": None, "episode_index": 1})
-    reloaded.to_dataset().save_to_disk(str(tmp_path / "replay"))
-    saved = load_from_disk(str(tmp_path / "replay"))
-    assert list(saved["action"]) == [None, 0, None]
-    assert "action_executed" not in saved.column_names
+    reloaded.from_dataset(ds=load_from_disk(str(tmp_path / "replay")))
+    assert [r.get('action') for r in list(environment_decisions(reloaded[:]))] == [None, 0, None, 1] * 2
+    actions = [json.loads(e['payload'])['action'] for e in reloaded[:] if e['provider'] == 'agent']
+    assert actions == [0,1]*2
+    assert 'action' not in reloaded.to_dataset().column_names
 
 
 @pytest.mark.parametrize("workers", [0, 2])
 def test_dataloader_derives_masks_without_mutating_replay(workers):
-    store = Datastore()
-    for episode in range(2):
-        for action in (None, 0, None, 1):
-            store.append(data={"action": action, "episode_index": episode})
+    if workers:
+        try:
+            _require_free_threading()
+        except RuntimeError as error:
+            pytest.skip(str(error))
+    store = reset_stream()
     before = store[:]
     loader = DataLoader(
-        stores=store,
-        sample_field="episode_index",
-        samples_budget=4,
-        batch_size=1,
-        transform=tokenizer("action"),
-        num_workers=workers,
-        seed=4,
+        stores=store, sample_ranges=environment_episode_ranges, events_budget=10,
+        batch_size=1, transform=EventTransform(encode=partial(encode_measurement, Tokenizer(
+            tokenizer=IntIdTokenizer(), input_fields=[{"type": "text", "format": "1", "head_output": True}],
+            objective_fields=[{"input_field": "action", "missing_value": None}]))), num_workers=workers, seed=4,
     )
     try:
         _, data, _ = loader.next_batch()
@@ -148,7 +192,7 @@ def test_nullable_rows_through_objective_ignore_automatic_decisions(algorithm):
     ]
     tok = tokenizer(*rows[0])
     _, data, groups = pack_token_batch(
-        steps=[tok(row) for row in rows], continuing=None
+        steps=[encode_measurement(tok, row) for row in rows], continuing=None
     )
     predictions = torch.tensor(
         [[1.0, 2.0], [float("nan")] * 2, [3.0, 4.0], [5.0, 6.0], [9.0, 10.0]],

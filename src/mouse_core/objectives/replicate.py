@@ -10,7 +10,9 @@ class ReplicateObjective(Objective[...]):
     Supply only valid action columns, including actions absent from the dataset.
     """
 
-    def __call__(self, *, predictions: torch.Tensor, targets: torch.Tensor):
+    def __call__(
+        self, *, predictions: torch.Tensor, targets: torch.Tensor,
+    ) -> tuple[dict[str, torch.Tensor], dict[str, float | torch.Tensor]]:
         if predictions.ndim != 2 or predictions.shape != targets.shape or predictions.numel() == 0:
             raise ValueError("Replication requires matching nonempty [states, actions] tensors.")
         loss = (predictions.float() - targets.detach().float()).square().mean()

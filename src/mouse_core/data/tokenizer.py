@@ -1,13 +1,13 @@
-"""Tokenizer — one step dict → StepTokens (text / token / image / numeric).
+"""Tokenizer — independent events → token arrays → marked StepTokens.
 
 I/O
 ---
-* **in:** ``dict`` (one step)
-* **out:** :class:`~mouse_core.data.token_batch.StepTokens`
+* ``tokenizer(event)`` emits token arrays from one provider/payload event.
+* ``tokenizer.encode(events)`` assembles complete steps by their markers.
 
 All fields emit into one token-ID stream. ``numeric`` fields also emit a
 scaled scalar in ``numeric_values`` and set ``numeric_mask=True``. Text,
-literal-token, and image fields set the mask to false. Pack ragged rows
+literal-token, and image fields set the mask to false. Pack ragged event sequences
 with :meth:`Tokenizer.pack_rows`; pack already-tokenized steps with
 :func:`~mouse_core.data.token_batch.pack_token_batch`.
 :func:`save_tokenizer` writes the packing spec as ``tokenizer.json``;
@@ -19,14 +19,17 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Sequence
-from dataclasses import asdict
+from collections.abc import Mapping
+from copy import deepcopy
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
 
+from mouse_core.data.events import EventLog, INDEX_FIELDS
+from mouse_core.data.step_sampling import _StepBoundary
 from mouse_core.data.io_fields import coerce_io_fields
 from mouse_core.data.modality import (
     KIND_IMAGE,
@@ -35,7 +38,6 @@ from mouse_core.data.modality import (
     KIND_TOKEN,
     _field_label,
     render_text_format,
-    TokenizerModalityMeta,
     TokenizerModalitySpec,
     copy_keep_fields,
     resolve_tokenizer_modalities,
@@ -49,173 +51,219 @@ from mouse_core.data.token_batch import (
 )
 
 
+def _objective_config(objective_fields):
+    pairs = coerce_io_fields(
+        objective_fields or (),
+        who="tokenizer objective_fields",
+        allow_empty=True,
+    )
+    missing_values = {}
+    for spec, (_, output_name) in zip(objective_fields or (), pairs):
+        if "missing_value" in spec:
+            value = spec["missing_value"]
+            if value is None:
+                if output_name != "action":
+                    raise ValueError("Only action labels may use missing_value=None")
+            elif isinstance(value, list) and not value:
+                value = []
+            elif not isinstance(value, (bool, int, float)) or not math.isfinite(value):
+                raise ValueError("objective missing_value must be a finite numeric scalar or an empty list")
+            missing_values[output_name] = value
+    return pairs, missing_values
+
+
+def _register_special_tokens(tokenizer, specs):
+    tokens = list(dict.fromkeys(render_text_format(spec, field=None) for spec in specs if spec.special))
+    if tokens:
+        tokenizer.add_tokens(tokens, special_tokens=True)
+    result = {}
+    for token in tokens:
+        ids = _tokenize_ids(tokenizer, token)
+        if len(ids) != 1:
+            raise ValueError(f"Special token {token!r} must encode to exactly one ID")
+        result[token] = ids[0]
+    return result
+
+
 class Tokenizer:
-    """CPU packer: one step dict → :class:`StepTokens`.
+    """Encode each event using an ordered field list, then assemble marked steps.
 
-    ``input_fields=`` defines tokens fed to the transformer, in list order. Each
-    field is its own tokenize/emit run (no BPE merge across ``text``
-    fields). Exactly one input field must set ``head_output=True``: its
-    tokens are the step's head-output tokens — the positions the model
-    reads Q / action outputs from. Every step must emit at least one
-    (never gate that field off); a step may emit several (e.g. a
-    ``text`` run with more than one id), and the DQN objectives then
-    train each of them toward the same per-step target.
+    ``tokenizer(event)`` returns an event's token arrays, possibly empty. It does
+    not interpret provider roles. Each field's ``provider=None`` matches all
+    events; a named provider filters that field. ``head_output=True`` marks
+    exactly the tokens that field emits, including optional special tokens.
+    Matching fields emit in ``input_fields`` order, regardless of payload key
+    order. Each field is tokenized separately; text never merges across fields
+    or events, and earlier events never supply missing input values.
+    No readout is appended implicitly. ``encode(events)`` groups
+    those arrays using ``step_field`` and returns completed ``StepTokens`` for
+    a finalized sample. Pass ``transform=tokenizer.encode`` to a data loader.
 
-    A ``text`` field requires ``format=``. ``input_field=`` binds the
-    step value to the name ``field`` in an f-string (``{field+1}``,
-    ``{field:.3f}``). Omit ``input_index``
-    and that value is one scalar. Set ``input_index`` and the field
-    reads that element of a 1-D vector and renders it the same way.
-    Repeat the ``input_field`` with a different ``input_index`` for
-    each element; each piece is its own tokenize call, in
-    ``input_fields`` order. Brackets and commas are ordinary text (a
-    const field, or characters in ``format``).
-    Omit ``input_field=`` and the field is a const: ``format=`` is the
-    literal string. The word field is text. ``{field}`` is still a
-    placeholder and is rejected. ``{{`` / ``}}`` is a literal brace,
-    as in every ``format=``.
-    A ``numeric`` field requires ``input_field=``, ``format=``,
-    ``fourier_min=``, and ``fourier_max=``. ``format=`` is literal
-    text (the word field is text; ``{field}`` is rejected). The
-    number is mapped from ``[fourier_min, fourier_max]`` onto
-    ``[-1, 1]`` and stored on that token. The format must tokenize
-    to one id; zero or several raise. ``input_index`` selects one
-    element of a 1-D vector, as for ``text``. The embedding adds a
-    Fourier projection of that stored value when built with
-    ``num_frequencies``.
-    A ``token`` field has no ``input_field``. ``format=`` is literal
-    text and must tokenize to one token ID; zero or several
-    raise.
-    Optional ``when=`` is a callable ``ctx → bool``. The context is the
-    step dict plus injected boolean ``group_start``. Ordinary emission
-    uses ``group_start=False``; pack-time ``group_start_*`` uses
-    ``True``. Combine reasons with ``|`` / ``or`` inside the callable
-    (named module-level callables defined by the caller).
-    Omit ``when``
-    (``None``) and the field always emits on the ordinary run. A
-    ``required=False`` field whose value is missing / ``None`` emits
-    nothing. ``max_tokens=`` (``text`` / ``image``) raises if that run
-    is longer. ``objective_fields=`` is a list of ``{input_field}``
-    dicts (optional ``output_field``; defaults to the input name) copied
-    into ``StepTokens.objective_fields`` (input fields are not
-    auto-copied). Sample boundaries are a dataloader concern
-    (``sample_field``); this tokenizer does not read them.
+    A changed marker starts a step before that event. Missing markers continue
+    the current step; the first event requires a marker. ``episode_field``
+    separates repeated step indices in different episodes. Use ``stream()``
+    for chunks that can end mid-step, and explicitly flush a completed tail.
 
-    TD / PPO / GRPO objectives read ``action``, ``reward``,
-    ``terminated``, and ``truncated`` from that keep-list (plus extras
-    such as ``old_log_prob``). ``terminated`` and ``truncated`` are
-    objective columns only — they are not interpolated into a field
-    format and are not fed to the transformer.
+    Objective fields select payload fields or envelope metadata. A qualified
+    name such as ``agent.action`` selects one provider's payload. Repeated
+    labels use the last value in the step. Missing defaults apply only when
+    the complete step has no value. No labels or metadata are implicit inputs.
     """
 
-    def __init__(
-        self,
-        *,
-        input_fields: Sequence[dict[str, Any] | TokenizerModalitySpec] | None = None,
-        tokenizer=None,
-        image_tokenizer=None,
-        objective_fields: Sequence[dict[str, Any]] | None = None,
-        pretrained: str | Path | None = None,
-        hub_kwargs: dict | None = None,
-    ) -> None:
-        specs, meta = resolve_tokenizer_modalities(input_fields)
-        has_text = any(m.kind == KIND_TEXT for m in meta)
-        has_token = any(m.kind == KIND_TOKEN for m in meta)
-        has_image = any(m.kind == KIND_IMAGE for m in meta)
-        has_numeric = any(m.kind == KIND_NUMERIC for m in meta)
-
-        flagged = [
-            m.spec.input_field or "const" for m in meta if m.spec.head_output
-        ]
-        if len(flagged) != 1:
-            raise ValueError(
-                "Tokenizer requires exactly one input field with "
-                "head_output=True (its tokens are the step's head-output tokens "
-                f"— the Q / action readout positions); got {flagged or 'none'}"
-            )
-
-        needs_tokenizer = has_text or has_numeric or has_token
-        if tokenizer is not None:
-            tok = tokenizer
-        elif pretrained is not None and needs_tokenizer:
-            from transformers import AutoTokenizer
-
-            tok = AutoTokenizer.from_pretrained(pretrained, **dict(hub_kwargs or {}))
-        elif needs_tokenizer:
-            raise TypeError(
-                "Tokenizer with text, numeric, or token input_fields requires "
-                "tokenizer= or pretrained="
-            )
-        else:
-            tok = None
-
-        if has_image:
-            if image_tokenizer is None or not callable(image_tokenizer):
-                raise TypeError(
-                    "Tokenizer with image input_fields requires image_tokenizer= "
-                    "callable that returns discrete token ids"
-                )
-
+    def __init__(self, *, input_fields, step_field="step_index",
+                 episode_field="episode_index", tokenizer: Any = None, image_tokenizer=None,
+                 objective_fields=None, pretrained=None, hub_kwargs=None):
+        _StepBoundary(step_field, episode_field)
+        self.step_field = step_field
+        self.episode_field = episode_field
         self.pretrained = None if pretrained is None else str(pretrained)
-        self.input_fields: tuple[TokenizerModalitySpec, ...] = tuple(specs)
-        self._meta: tuple[TokenizerModalityMeta, ...] = tuple(meta)
-        self.tokenizer = tok
         self.image_tokenizer = image_tokenizer
-        self.objective_fields: tuple[tuple[str, str], ...] = coerce_io_fields(
-            objective_fields or (),
-            who="tokenizer objective_fields",
-            allow_empty=True,
-        )
+        self.objective_fields, self.objective_missing_values = _objective_config(objective_fields)
+        self.input_fields = tuple(field if isinstance(field, TokenizerModalitySpec) else TokenizerModalitySpec(**field)
+                                  for field in input_fields)
+        self._provider_meta = {}
+        for provider in dict.fromkeys(spec.provider for spec in self.input_fields):
+            fields = [spec for spec in self.input_fields if spec.provider == provider]
+            _, meta = resolve_tokenizer_modalities(fields)
+            if any(m.kind == KIND_IMAGE for m in meta) and not callable(image_tokenizer):
+                raise TypeError("Image event fields require image_tokenizer= callable returning discrete token ids")
+            self._provider_meta[provider] = tuple(meta)
+        meta_by_spec = {id(meta.spec): meta for group in self._provider_meta.values() for meta in group}
+        self._meta = tuple(meta_by_spec[id(spec)] for spec in self.input_fields)
+        needs_tokenizer = any(m.kind in (KIND_TEXT, KIND_TOKEN, KIND_NUMERIC) for m in self._meta)
+        if tokenizer is None and needs_tokenizer:
+            if pretrained is None:
+                raise TypeError("Tokenizer with text, numeric, or token fields requires tokenizer= or pretrained=")
+            from transformers import AutoTokenizer
+            tokenizer = AutoTokenizer.from_pretrained(pretrained, **dict(hub_kwargs or {}))
+        self.tokenizer: Any = tokenizer
+        self.special_token_ids = _register_special_tokens(tokenizer, self.input_fields)
 
-    def __call__(self, step: dict) -> StepTokens:
-        if not isinstance(step, dict):
-            raise TypeError(
-                f"Tokenizer expects a step dict, got {type(step).__name__}"
-            )
-        return _tokenize_step(
-            row=step,
-            meta=self._meta,
-            tokenizer=self.tokenizer,
-            image_tokenizer=self.image_tokenizer,
-            objective_fields_keep=self.objective_fields,
-        )
+    def __call__(self, event: Mapping) -> dict[str, np.ndarray]:
+        """Encode matching fields from one decoded event, without adding a step."""
+        if not isinstance(event, Mapping) or not {"provider", "payload"} <= event.keys():
+            raise TypeError("Tokenizer expects a provider/payload event")
+        provider = event["provider"]
+        meta = tuple(m for m in self._meta if m.spec.provider is None or m.spec.provider == provider)
+        field_ids = {id(m.spec): index for index, m in enumerate(self._meta)}
+        payload = event["payload"]
+        if meta and not isinstance(payload, Mapping):
+            raise TypeError("Configured event input fields require an object payload")
+        values = _tokenize_fields(row=payload, meta=meta, tokenizer=self.tokenizer,
+                                  image_tokenizer=self.image_tokenizer, field_ids=field_ids)
+        return values
 
-    def pack_rows(
-        self,
-        *,
-        rows: Sequence[Sequence[dict]],
-        continuing: Sequence[bool] | None,
-    ) -> TokenBatch:
-        """Tokenize ragged per-sequence rows into packed model inputs.
+    def stream(self, *, include_objectives: bool = True) -> EventTokenStream:
+        return EventTokenStream(self, include_objectives=include_objectives)
 
-        ``rows`` holds one list of step dicts per sequence; entries may be
-        empty (incremental decode where a sequence contributes no new
-        steps). Each step goes through this tokenizer, then
-        :func:`~mouse_core.data.token_batch.pack_token_batch` with
-        ``batch_size=len(rows)`` — empty sequences keep their batch slot.
-        Returns the :class:`~mouse_core.data.token_batch.TokenBatch` only;
-        objective columns are for training, which packs via ``DataLoader``.
+    def encode(self, events, *, include_objectives: bool = True) -> list[StepTokens]:
+        """Encode a finalized sample of raw events or persisted JSON payloads.
 
-        ``continuing`` is length ``len(rows)``. ``True`` means that
-        sequence already has cached tokens, so ``group_start`` fields are
-        not emitted again. Pass ``None`` when no sequence has cached steps
-        (fresh sequences / full prefill). Without ``group_start`` fields
-        the value has no effect. Each row list must be one sample: do not
-        mix transitions that a dataloader ``sample_field`` would split.
+        The sample must contain complete steps. Unlike ``stream.push``, this
+        method flushes the final step at the end of the supplied sequence.
         """
-        steps: list[StepTokens] = []
-        sids: list[int] = []
-        for i, row_steps in enumerate(rows):
-            for step in row_steps:
-                steps.append(self(step))
-                sids.append(i)
-        inputs, _, _ = pack_token_batch(
-            steps=steps,
-            sequence_ids=sids if steps else None,
-            batch_size=len(rows),
-            continuing=continuing,
-        )
+        stream = self.stream(include_objectives=include_objectives)
+        steps = []
+        for event in events:
+            completed = stream.push(event, encoded_payload=not isinstance(events, EventLog))
+            if completed is not None:
+                steps.append(completed)
+        last = stream.flush()
+        if last is not None:
+            steps.append(last)
+        return steps
+
+    def pack_rows(self, *, rows, continuing) -> TokenBatch:
+        """Pack complete event steps per sequence for inference, without labels."""
+        steps, sids = [], []
+        for index, events in enumerate(rows):
+            encoded = self.encode(events, include_objectives=False)
+            steps.extend(encoded)
+            sids.extend([index] * len(encoded))
+        inputs, _, _ = pack_token_batch(steps=steps, sequence_ids=sids if steps else None,
+                                        batch_size=len(rows), continuing=continuing)
         return inputs
+
+
+class EventTokenStream:
+    """Per-sequence token accumulator. Each push tokenizes exactly one event.
+
+    A new marker returns the preceding step. ``flush()`` explicitly completes
+    the current step; merely ending an input chunk does not. Create a separate
+    stream per sequence; the Tokenizer itself has no mutable stream state.
+    """
+
+    def __init__(self, tokenizer: Tokenizer, *, include_objectives: bool = True):
+        self.tokenizer = tokenizer
+        self.include_objectives = include_objectives
+        self._boundary = _StepBoundary(tokenizer.step_field, tokenizer.episode_field)
+        self._pieces: list[dict[str, np.ndarray]] = []
+        self._labels: dict[str, Any] = {}
+
+    def push(self, event: Mapping, *, encoded_payload: bool = False) -> StepTokens | None:
+        if not isinstance(event, Mapping) or not {"provider", "payload"} <= event.keys():
+            raise TypeError("Tokenizer expects a provider/payload event")
+        event = {key: value for key, value in event.items()
+                 if key not in INDEX_FIELDS or value is not None}
+        if encoded_payload and isinstance(event["payload"], str):
+            event = {**event, "payload": json.loads(event["payload"])}
+        piece = self.tokenizer(event)
+        boundary = replace(self._boundary)
+        changed = boundary.advance(event)
+        if not changed and not self._pieces:
+            raise ValueError("Cannot append events to a flushed step; start a new step marker")
+        completed = self._finish() if changed and self._pieces else None
+        labels = {} if changed else dict(self._labels)
+        if self.include_objectives:
+            payload = event["payload"]
+            for name, _ in self.tokenizer.objective_fields:
+                provider, separator, field = name.partition(".")
+                if separator and provider == event["provider"] and isinstance(payload, Mapping):
+                    if field in payload:
+                        labels[name] = deepcopy(payload[field])
+                elif not separator:
+                    if name in event and isinstance(payload, Mapping) and name in payload:
+                        raise ValueError(f"Event envelope and payload both supply objective field {name!r}")
+                    if isinstance(payload, Mapping) and name in payload:
+                        labels[name] = deepcopy(payload[name])
+                    elif name in event:
+                        labels[name] = deepcopy(event[name])
+        if changed:
+            self._pieces = []
+        self._boundary = boundary
+        self._labels = labels
+        self._pieces.append(piece)
+        return completed
+
+    def _finish(self) -> StepTokens:
+        pieces = self._pieces
+        values = {name: np.concatenate([piece[name] for piece in pieces]) for name in
+                  ("token_ids", "numeric_values", "numeric_mask", "head_token_mask")}
+        prefixes = []
+        seen_fields = set()
+        for piece in pieces:
+            if "group_start_token_ids" not in piece:
+                continue
+            ids = piece["group_start_field_ids"]
+            keep = np.asarray([int(index) not in seen_fields for index in ids], dtype=bool)
+            seen_fields.update(ids.tolist())
+            prefixes.append({name: piece[name][keep] for name in
+                             ("group_start_token_ids", "group_start_numeric_values", "group_start_numeric_mask")})
+        if prefixes:
+            values.update({name: np.concatenate([piece[name] for piece in prefixes]) for name in
+                           ("group_start_token_ids", "group_start_numeric_values", "group_start_numeric_mask")})
+        objective = copy_keep_fields(self._labels,
+                                    self.tokenizer.objective_fields if self.include_objectives else (),
+                                    missing_values=self.tokenizer.objective_missing_values)
+        return StepTokens(**values, objective_fields=objective)
+
+    def flush(self) -> StepTokens | None:
+        if not self._pieces:
+            return None
+        completed = self._finish()
+        self._pieces = []
+        self._labels = {}
+        return completed
 
 
 def _field_text_value(spec: TokenizerModalitySpec, row: dict[str, Any]) -> str | None:
@@ -224,10 +272,14 @@ def _field_text_value(spec: TokenizerModalitySpec, row: dict[str, Any]) -> str |
         return render_text_format(spec, field=None)
     raw = row.get(spec.input_field)
     if raw is None:
-        if spec.required:
-            raise KeyError(f"Required modality {spec.input_field!r} is missing")
         return None
     value = _text_scalar(spec, raw)
+    if spec.lookup is not None:
+        if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
+            raise TypeError(f"lookup field {_field_label(spec)!r} requires an integer ID")
+        if not 0 <= value < len(spec.lookup):
+            raise ValueError(f"lookup field {_field_label(spec)!r} ID {value} is outside [0, {len(spec.lookup)})")
+        value = spec.lookup[int(value)]
     return render_text_format(spec, field=value)
 
 
@@ -238,8 +290,6 @@ def _numeric_scaled(spec: TokenizerModalitySpec, row: dict[str, Any]) -> float |
         raise RuntimeError("numeric field is missing input_field")
     raw = row.get(in_name)
     if raw is None:
-        if spec.required:
-            raise KeyError(f"Required modality {in_name!r} is missing")
         return None
     scalar = _text_scalar(spec, raw)
     who = _field_label(spec)
@@ -394,14 +444,7 @@ def _image_token_ids(image_tokenizer: Any, value: Any, *, in_name: str) -> list[
     return img_ids
 
 
-def _tokenize_step(
-    *,
-    row: dict,
-    meta: Sequence[TokenizerModalityMeta],
-    tokenizer: Any,
-    image_tokenizer: Any,
-    objective_fields_keep: Sequence[tuple[str, str]],
-) -> StepTokens:
+def _tokenize_fields(*, row, meta, tokenizer, image_tokenizer, field_ids=None):
     token_ids: list[int] = []
     numeric_values: list[float] = []
     numeric_mask: list[bool] = []
@@ -409,6 +452,7 @@ def _tokenize_step(
     prefix_token_ids: list[int] = []
     prefix_numeric_values: list[float] = []
     prefix_numeric_mask: list[bool] = []
+    prefix_field_ids: list[int] = []
 
     def _emit(
         emitted_ids: list[int], *, spec: TokenizerModalitySpec,
@@ -419,6 +463,8 @@ def _tokenize_step(
         is_numeric = numeric_value is not None
         value = 0.0 if numeric_value is None else numeric_value
         if to_group_start:
+            if field_ids is not None:
+                prefix_field_ids.extend([field_ids[id(spec)]] * len(emitted_ids))
             prefix_token_ids.extend(emitted_ids)
             prefix_numeric_values.extend([value] * len(emitted_ids))
             prefix_numeric_mask.extend([is_numeric] * len(emitted_ids))
@@ -466,6 +512,8 @@ def _tokenize_step(
             continue
 
         if m.kind == KIND_TOKEN:
+            if spec.input_field is not None and row.get(spec.input_field) is None:
+                continue
             if tokenizer is None:
                 raise RuntimeError("tokenizer required to tokenize token runs")
             rendered = render_text_format(spec, field=None)
@@ -482,10 +530,6 @@ def _tokenize_step(
         in_name = str(spec.input_field)
         value = row.get(in_name)
         if value is None:
-            if spec.required:
-                raise KeyError(
-                    f"Required input field {in_name!r} is missing from step"
-                )
             continue
 
         if m.kind == KIND_IMAGE:
@@ -499,12 +543,6 @@ def _tokenize_step(
         else:
             raise ValueError(f"unsupported modality kind {m.kind!r}")
 
-    if not token_ids:
-        raise ValueError(
-            "step has no tokens after when-gates; ensure at least one input "
-            "field still produces a token"
-        )
-
     group_start_kwargs: dict[str, np.ndarray] = {}
     if prefix_token_ids:
         group_start_kwargs = {
@@ -513,12 +551,14 @@ def _tokenize_step(
             "group_start_numeric_mask": np.asarray(prefix_numeric_mask, dtype=bool),
         }
 
-    return StepTokens(
+    if prefix_field_ids:
+        group_start_kwargs["group_start_field_ids"] = np.asarray(prefix_field_ids, dtype=np.int64)
+
+    return dict(
         token_ids=np.asarray(token_ids, dtype=np.int64),
         numeric_values=np.asarray(numeric_values, dtype=np.float32),
         numeric_mask=np.asarray(numeric_mask, dtype=bool),
         head_token_mask=np.asarray(head_token_mask, dtype=bool),
-        objective_fields=copy_keep_fields(row, objective_fields_keep),
         **group_start_kwargs,
     )
 
@@ -546,7 +586,7 @@ def _when_routes(
     return ordinary, to_group_start
 
 
-TOKENIZER_FORMAT = "mouse-core-tokenizer-v1"
+TOKENIZER_FORMAT = "mouse-core-tokenizer-v2"
 TOKENIZER_FILENAME = "tokenizer.json"
 
 
@@ -572,44 +612,55 @@ def _jsonable_when(when: Any) -> str:
     return when_ref(when)
 
 
-def tokenizer_config(*, tokenizer: Tokenizer) -> dict[str, Any]:
-    """Public packing spec for :func:`save_tokenizer` / :func:`load_tokenizer`."""
+def _input_fields_config(specs):
     input_fields: list[dict[str, Any]] = []
-    for spec in tokenizer.input_fields:
+    for spec in specs:
         data = asdict(spec)
         field: dict[str, Any] = {}
         for key, value in data.items():
             if key.startswith("_") or value is None:
                 continue
-            if key == "head_output" and value is False:
-                continue
-            if key == "required" and value is True:
+            if key in ("head_output", "special") and value is False:
                 continue
             if key == "when":
                 field[key] = _jsonable_when(value)
                 continue
             field[key] = _jsonable(value)
         input_fields.append(field)
-    objective_fields: list[dict[str, str]] = []
+    return input_fields
+
+
+def tokenizer_config(*, tokenizer: Tokenizer) -> dict[str, Any]:
+    """Public tokenization specification, including event payload schemas."""
+    objective_fields: list[dict[str, Any]] = []
     for in_name, out_name in tokenizer.objective_fields:
-        entry = {"input_field": in_name}
+        entry: dict[str, Any] = {"input_field": in_name}
         if out_name != in_name:
             entry["output_field"] = out_name
+        if out_name in tokenizer.objective_missing_values:
+            entry["missing_value"] = tokenizer.objective_missing_values[out_name]
         objective_fields.append(entry)
-    return {
+    result = {
         "format": TOKENIZER_FORMAT,
         "pretrained": tokenizer.pretrained,
-        "input_fields": input_fields,
         "objective_fields": objective_fields,
     }
+
+    result["step_field"] = tokenizer.step_field
+    result["episode_field"] = tokenizer.episode_field
+    result["input_fields"] = _input_fields_config(tokenizer.input_fields)
+    if tokenizer.special_token_ids:
+        result["special_token_ids"] = tokenizer.special_token_ids
+    return result
 
 
 def save_tokenizer(*, tokenizer: Tokenizer, path: str | Path) -> None:
     """Write ``tokenizer.json`` into *path*, which may also contain model weights."""
+    config = tokenizer_config(tokenizer=tokenizer)
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
     with (path / TOKENIZER_FILENAME).open("w") as fh:
-        json.dump(tokenizer_config(tokenizer=tokenizer), fh, indent=2, sort_keys=True)
+        json.dump(config, fh, indent=2)
         fh.write("\n")
 
 
@@ -672,10 +723,16 @@ def load_tokenizer(
             "Unsupported tokenizer config format. Expected a MOUSE tokenizer "
             "saved with save_tokenizer or push_model_to_hub(..., repo_id=)."
         )
-    return Tokenizer(
+    result = Tokenizer(
         input_fields=config["input_fields"],
+        step_field=config["step_field"],
+        episode_field=config["episode_field"],
         objective_fields=config.get("objective_fields") or (),
         pretrained=config.get("pretrained"),
         tokenizer=tokenizer,
         image_tokenizer=image_tokenizer,
+        hub_kwargs=kwargs,
     )
+    if result.special_token_ids != config.get("special_token_ids", {}):
+        raise ValueError("Special token IDs differ from the saved tokenizer vocabulary")
+    return result

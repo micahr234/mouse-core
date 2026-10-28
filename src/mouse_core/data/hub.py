@@ -1,6 +1,6 @@
 """Hugging Face Hub utilities for pushing Datastore data.
 
-Pushes write the raw rows (whatever shape you stored) using standard
+Pushes write sparse source events from event-only Datastores using standard
 ``DatasetDict.push_to_hub`` with ``config_name`` for subsets/bins.
 
 When ``clear=True`` (the default), the existing dataset repository is
@@ -319,7 +319,10 @@ def _write_store_dataset_repo(
     def write_one(config_name: str, ds: Dataset) -> None:
         config_dir = root / "data" / config_name
         config_dir.mkdir(parents=True, exist_ok=True)
-        ds.to_parquet(config_dir / f"{split}-00000-of-00001.parquet")
+        import pyarrow.parquet as pq
+        # Flatten selected-row indices before writing the underlying Arrow table.
+        table = ds.flatten_indices().data.table if ds._indices is not None else ds.data.table
+        pq.write_table(table, config_dir / f"{split}-00000-of-00001.parquet", compression="zstd", compression_level=9)
 
     for config_name, ds in prepared:
         write_one(config_name, ds)

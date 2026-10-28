@@ -1,15 +1,15 @@
-"""DataLoader — sample contiguous runs, apply a per-step transform, pack.
+"""DataLoader — sample ordered event sequences, tokenize complete samples, pack.
 
-A ``Datastore`` is a flat sequence of arbitrary rows. Pass exactly one
-of ``samples_budget`` or ``token_budget``, plus ``batch_size``:
+A ``Datastore`` stores source events for sampling. Pass exactly one
+of ``events_budget`` or ``token_budget``, plus ``batch_size``:
 
-* ``samples_budget`` — ``batch_size`` fills. That count does not depend
+* ``events_budget`` — ``batch_size`` fills. That count does not depend
   on the budget. Each fill adds whole samples until the next one would
-  pass that many steps.
+  pass that many source events.
 * ``token_budget`` — the same fills, counting packed tokens instead of
-  steps.
+  events.
 
-``sample_field`` names a scalar column. A sample is a maximal contiguous
+``sample_field`` names an envelope column or an explicit ``payload.<key>`` field. A sample is a maximal contiguous
 run of rows that share one value in that column: the run starts where
 the value changes (or at the first row) and ends at the next change.
 Each sample the loader keeps is one group. Every sample in a batch
@@ -18,19 +18,19 @@ Attention and the TD / PPO / GRPO run stop where ``group_id`` changes,
 so they do not cross the field. A sample that does not fit is left
 out. The first sample of a fill is left out too when it alone is over
 the budget, and that raises. Examples pass ``batch_size=1`` (one fill)
-and ``sample_field="episode_index"``.
+and ``sample_ranges=environment_episode_ranges``.
 
 Token ``sequence_ids`` and the step ``group_id`` tensor use those same
 ids, ``0 .. B - 1``, one contiguous block each. ``group_id`` is
 returned beside ``objective_data``, not inside it.
 
 The loader is stage-agnostic: compose augmenter / tokenizer
-(or any ``dict → StepTokens`` callable) outside and pass the result as
+(or any ``list[event] → list[StepTokens]`` callable) outside and pass the result as
 ``transform=``. Before each sampled segment of batch ``k``, if
 ``transform`` defines ``reseed()``, it is called with a generation
 unique to that segment. The generation is
 ``k * batch_size * (budget + 1) + fill * (budget + 1) + attempt``,
-where ``budget`` is ``samples_budget`` or ``token_budget``. Each
+where ``budget`` is ``events_budget`` or ``token_budget``. Each
 segment costs at least one unit, so a fill draws at most ``budget + 1``
 generations (the segments that fit, plus one that does not) and the
 next batch does not collide. An
@@ -58,13 +58,13 @@ Usage
 -----
 ::
 
-    train_transform = compose(stages=(augmenter, tokenizer))
+    train_transform = EventTransform(encode=compose(stages=(augmenter, tokenizer)))
     loader = DataLoader(
         stores=store,
         token_budget=4096,
         batch_size=1,
         transform=train_transform,
-        sample_field="episode_index",
+        sample_ranges=environment_episode_ranges,
         num_workers=0,
     )
     inputs, objective_data, group_id = loader.next_batch()
@@ -72,6 +72,7 @@ Usage
 
 from __future__ import annotations
 
+import json
 import queue
 import sys
 import sysconfig
@@ -83,6 +84,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from mouse_core.data.datastore import _normalize_value
+from mouse_core.data.step_sampling import _step_spans, _validate_step_ranges
 from mouse_core.data.token_batch import StepTokens, TokenBatch, pack_token_batch
 
 if TYPE_CHECKING:
@@ -91,7 +93,7 @@ if TYPE_CHECKING:
     from mouse_core.data.datastore import Datastore
 
 
-StepTransform = Callable[[dict], StepTokens]
+EventSequenceTransform = Callable[[list[dict]], list[StepTokens]]
 
 _FREE_THREADING_HINT = (
     "DataLoader(num_workers>0) requires a free-threaded CPython build with the "
@@ -118,11 +120,11 @@ class _SnapshotConfig:
     datasets: tuple[Any, ...]
     ns: tuple[int, ...]
     probs: np.ndarray
-    samples_budget: int | None
+    events_budget: int | None
     batch_size: int | None
     token_budget: int | None
     index_field: str | None
-    sample_field: str
+    sample_field: str | None
     runs: tuple[np.ndarray, ...]
 
 
@@ -186,12 +188,17 @@ def _sample_runs(*, ds: Any, sample_field: str) -> np.ndarray:
     n = len(ds)
     if n == 0:
         return np.zeros((0, 2), dtype=np.int64)
-    if sample_field not in ds.column_names:
-        raise KeyError(
-            f"sample_field {sample_field!r} is not a column; "
-            f"store has {sorted(ds.column_names)}"
-        )
-    values = np.asarray(_ColumnView(ds=ds, offset=0, n=n)[sample_field])
+    if sample_field.startswith("payload."):
+        key = sample_field.removeprefix("payload.")
+        try:
+            values = np.empty(n, dtype=object)
+            values[:] = [json.loads(payload)[key] for payload in ds["payload"]]
+        except KeyError as exc:
+            raise KeyError(f"sample_field {sample_field!r} is missing from an event payload") from exc
+    else:
+        if sample_field not in ds.column_names:
+            raise KeyError(f"sample_field {sample_field!r} is not a column; store has {sorted(ds.column_names)}")
+        values = np.asarray(_ColumnView(ds=ds, offset=0, n=n)[sample_field])
     if values.shape != (n,):
         raise ValueError(
             f"sample_field {sample_field!r} must be a scalar column of length {n}, "
@@ -213,6 +220,34 @@ def _sample_runs(*, ds: Any, sample_field: str) -> np.ndarray:
     return np.stack([starts, ends], axis=1)
 
 
+def _event_sample_ranges(*, ds, sample_field, sample_ranges, step_field=None,
+                         episode_field: str | None = "episode_index") -> np.ndarray:
+    """Validate source-event windows chosen by a domain's sampling policy."""
+    # Old unindexed stores retain their explicit domain sampling policy. Newly
+    # collected indexed datasets always enforce step boundaries, even for a
+    # caller-supplied range function.
+    if step_field is None and "step_index" in ds.column_names:
+        step_field = "step_index"
+    ranges: np.ndarray
+    if sample_ranges is None:
+        if step_field is not None and sample_field == step_field:
+            ranges = np.asarray([(start, end) for start, end, _ in
+                                 _step_spans(ds, step_field=step_field, episode_field=episode_field)])
+        else:
+            ranges = _sample_runs(ds=ds, sample_field=sample_field)
+    else:
+        ranges = np.asarray(list(sample_ranges(ds)))
+    if ranges.size == 0:
+        return np.zeros((0, 2), dtype=np.int64)
+    if ranges.ndim != 2 or ranges.shape[1] != 2 or ranges.dtype.kind not in "iu":
+        raise ValueError("sample_ranges must return integer (start, exclusive_end) event offsets")
+    if np.any(ranges[:, 0] < 0) or np.any(ranges[:, 1] > len(ds)) or np.any(ranges[:, 0] >= ranges[:, 1]):
+        raise ValueError("sample_ranges must select nonempty windows within the event log")
+    if step_field is not None:
+        _validate_step_ranges(ds, ranges, step_field=step_field, episode_field=episode_field)
+    return ranges.astype(np.int64)
+
+
 def _rows_from_slice(
     *,
     ds: Any,
@@ -228,6 +263,8 @@ def _rows_from_slice(
     ]
     if index_field is not None:
         for i, row in enumerate(rows):
+            if index_field in row:
+                raise ValueError("Event overlays cannot replace source fields")
             row[index_field] = start + i
     return rows
 
@@ -238,7 +275,7 @@ def _fetch_sequence(
 ) -> tuple[Any, int, int]:
     """Choose one sample. Return ``(dataset, start, exclusive_end)``."""
     if sum(cfg.ns) == 0:
-        raise ValueError("Cannot sample batches: all stores are empty.")
+        raise ValueError("Cannot sample batches: no eligible samples in the stores.")
     store_idx = int(rng.choice(len(cfg.datasets), p=cfg.probs))
     ds = cfg.datasets[store_idx]
     runs = cfg.runs[store_idx]
@@ -259,7 +296,7 @@ def _sequence_generation(*, batch_index: int, sequence_index: int, stride: int) 
     """Unique augmenter generation for one sampled segment of batch ``k``.
 
     ``stride`` is ``batch_size * (budget + 1)``. The budget is
-    ``samples_budget`` or ``token_budget``. Each segment costs at least
+    ``events_budget`` or ``token_budget``. Each segment costs at least
     one unit, so a fill draws at most ``budget + 1`` generations and the
     next batch does not collide.
     """
@@ -278,25 +315,20 @@ def _step_token_count(step: StepTokens, *, started: bool) -> int:
     return extra + int(step.T)
 
 
-def _take_window_steps(
+def _tokenize_event_window(
     *,
     ds: Any,
     start: int,
     end: int,
     index_field: str | None,
-    transform: StepTransform,
+    transform: EventSequenceTransform,
 ) -> list[StepTokens]:
-    """Every step of ``[start, end)``. The window is not trimmed."""
-    kept: list[StepTokens] = []
-    i = start
-    while i < end:
-        chunk_end = min(end, i + 32)
-        chunk = _rows_from_slice(
-            ds=ds, start=i, end=chunk_end, index_field=index_field
-        )
-        kept.extend(transform(row) for row in chunk)
-        i = chunk_end
-    return kept
+    """Tokenize one complete ordered event sample, without trimming it."""
+    events = _rows_from_slice(ds=ds, start=start, end=end, index_field=index_field)
+    encoded = transform(events)
+    if not isinstance(encoded, list) or not encoded or not all(isinstance(item, StepTokens) for item in encoded):
+        raise TypeError("Event transform must return a nonempty list of StepTokens readouts")
+    return encoded
 
 
 def _segment_token_count(steps: list[StepTokens]) -> int:
@@ -326,29 +358,22 @@ def _budget_of(cfg: _SnapshotConfig) -> tuple[int, str, str]:
     """``(limit, parameter name, unit)`` for the active budget."""
     if cfg.token_budget is not None:
         return cfg.token_budget, "token_budget", "packed tokens"
-    assert cfg.samples_budget is not None
-    return cfg.samples_budget, "samples_budget", "steps"
-
-
-def _segment_cost(steps: list[StepTokens], *, count_tokens: bool) -> int:
-    """Steps in the segment, or packed tokens when ``count_tokens``."""
-    if count_tokens:
-        return _segment_token_count(steps)
-    return len(steps)
+    assert cfg.events_budget is not None
+    return cfg.events_budget, "events_budget", "source events"
 
 
 def _fetch_budget_batch(
     cfg: _SnapshotConfig,
     entropy: int,
     k: int,
-    transform: StepTransform,
+    transform: EventSequenceTransform,
 ) -> tuple[TokenBatch, dict[str, torch.Tensor], torch.Tensor]:
     """Fill batch ``k`` ``batch_size`` times up to the active budget.
 
     Each fill samples whole segments. The next segment is measured, and
     if it does not fit entirely it is left out and that fill stops. A
     fill whose first segment does not fit raises. ``token_budget``
-    measures packed tokens. ``samples_budget`` measures steps. Each
+    measures packed tokens. ``events_budget`` measures source events. Each
     kept segment gets the next ``group_id``, unique in this batch.
     """
     assert cfg.batch_size is not None
@@ -378,14 +403,14 @@ def _fetch_budget_batch(
                     )
                 )
             attempt += 1
-            window = _take_window_steps(
+            window = _tokenize_event_window(
                 ds=ds,
                 start=start,
                 end=end,
                 index_field=cfg.index_field,
                 transform=transform,
             )
-            cost = _segment_cost(window, count_tokens=count_tokens)
+            cost = _segment_token_count(window) if count_tokens else end - start
             if cost < 1:
                 raise ValueError(
                     f"Sampled segment produced no {unit} "
@@ -419,7 +444,7 @@ def _fetch_one_batch(
     cfg: _SnapshotConfig,
     entropy: int,
     k: int,
-    transform: StepTransform,
+    transform: EventSequenceTransform,
 ) -> tuple[TokenBatch, dict[str, torch.Tensor], torch.Tensor]:
     """Build batch ``k``."""
     return _fetch_budget_batch(cfg, entropy, k, transform)
@@ -469,7 +494,7 @@ def _worker_loop(
     counter: _BatchCounter,
     cfg: _SnapshotConfig,
     entropy: int,
-    transform: StepTransform,
+    transform: EventSequenceTransform,
 ) -> None:
     """Prefetch loop run inside a worker thread: claim ``k``, build batch ``k``, enqueue ``(k, item)``."""
     while not stop_event.is_set():
@@ -488,15 +513,15 @@ def _worker_loop(
 
 
 class DataLoader:
-    """Sample contiguous field-runs, map ``transform`` over steps, pack.
+    """Sample contiguous event sequences, tokenize each whole sample, pack.
 
     Parameters
     ----------
     stores :
         A single ``Datastore`` or a list of them. Each store is snapshotted
         at construction (and on :meth:`refresh`) via ``Datastore.to_dataset()``.
-    samples_budget :
-        Steps per fill. Whole samples are added until the next sample
+    events_budget :
+        Source events per fill. Whole samples are added until the next sample
         would pass the budget. A sample that does not fit is left out.
         The first sample of a fill is left out too when it alone is over
         the budget, and that raises. Pass this or ``token_budget``, not
@@ -505,6 +530,18 @@ class DataLoader:
         Scalar column that defines a sample. A sample is every contiguous
         row that shares one value in this column. Each sample is one
         sequence, so attention and loss do not cross a value change.
+    sample_ranges :
+        Alternative callable receiving the raw event dataset and returning
+        (start, exclusive_end) event offsets. Supports overlapping windows;
+        indexed datasets require whole steps within one episode. Use
+        ``environment_episode_ranges`` for complete episodes or
+        ``partial(step_sample_ranges, steps_per_sample=N)`` for N whole steps.
+        Pass this or sample_field.
+    step_field / episode_field :
+        Boundary fields for validating sample ranges, including ``payload.key``
+        paths. The standard ``step_index`` column is detected automatically;
+        set ``step_field`` explicitly for custom markers. ``episode_field``
+        defaults to ``episode_index``. Use the same fields as Tokenizer.
     batch_size :
         How many times the budget is filled in the returned batch.
         Independent of either budget. Examples pass ``1``.
@@ -513,13 +550,13 @@ class DataLoader:
         group-start tokens). Whole samples are added until the next
         sample would pass the budget. A sample that does not fit is left
         out. The first sample of a fill is left out too when it alone is
-        over the budget, and that raises. Pass this or ``samples_budget``,
+        over the budget, and that raises. Pass this or ``events_budget``,
         not both. Requires ``sample_field`` and ``batch_size``.
     transform :
-        Required ``dict → StepTokens`` callable applied to every step.
+        Required ``list[event] → list[StepTokens]`` callable applied once per sample.
         Compose pipeline stages outside the loader; packing is loader-owned.
     index_field :
-        Optional key. When set, each fetched step is stamped with its absolute
+        Optional key. When set, each source event is stamped with its absolute
         store offset under this name before ``transform`` runs.
     weights / weight_mode / prefetch / num_workers :
         Sampling and worker controls. ``num_workers`` is required: ``0`` is
@@ -534,11 +571,14 @@ class DataLoader:
         self,
         *,
         stores: Datastore | list[Datastore],
-        transform: StepTransform,
-        samples_budget: int | None = None,
+        transform: EventSequenceTransform,
+        events_budget: int | None = None,
         token_budget: int | None = None,
         batch_size: int | None = None,
-        sample_field: str,
+        sample_field: str | None = None,
+        sample_ranges: Callable | None = None,
+        step_field: str | None = None,
+        episode_field: str | None = "episode_index",
         index_field: str | None = None,
         weights: list[float] | None = None,
         weight_mode: str = "per_store",
@@ -567,27 +607,30 @@ class DataLoader:
         if not callable(transform):
             raise TypeError(
                 "DataLoader requires transform= "
-                "(callable dict → StepTokens, e.g. compose(...))."
+                "(callable list[event] → list[StepTokens], e.g. compose(...))."
             )
-        if weight_mode not in ("per_store", "per_step"):
-            raise ValueError(f"weight_mode must be 'per_store' or 'per_step', got {weight_mode!r}")
-        if (samples_budget is None) == (token_budget is None):
+        if weight_mode not in ("per_store", "per_event"):
+            raise ValueError(f"weight_mode must be 'per_store' or 'per_event', got {weight_mode!r}")
+        if (events_budget is None) == (token_budget is None):
             raise ValueError(
-                "Pass exactly one of samples_budget or token_budget."
+                "Pass exactly one of events_budget or token_budget."
             )
-        if samples_budget is not None and samples_budget < 1:
-            raise ValueError(f"samples_budget must be >= 1, got {samples_budget}.")
+        if events_budget is not None and events_budget < 1:
+            raise ValueError(f"events_budget must be >= 1, got {events_budget}.")
         if token_budget is not None and token_budget < 1:
             raise ValueError(f"token_budget must be >= 1, got {token_budget}.")
         if batch_size is None:
             raise ValueError("batch_size is required.")
         if batch_size < 1:
             raise ValueError(f"batch_size must be >= 1, got {batch_size}.")
-        if not isinstance(sample_field, str) or not sample_field:
-            raise ValueError(
-                "sample_field must be a non-empty column name, "
-                f"got {sample_field!r}."
-            )
+        if (sample_field is None) == (sample_ranges is None):
+            raise ValueError("Pass exactly one of sample_field or sample_ranges")
+        if sample_field is not None and (not isinstance(sample_field, str) or not sample_field):
+            raise ValueError("sample_field must be a non-empty column name")
+        if sample_ranges is not None and not callable(sample_ranges):
+            raise TypeError("sample_ranges must be callable")
+        if index_field in ("provider", "payload"):
+            raise ValueError("index_field cannot overwrite provider or payload")
         if prefetch < 1:
             raise ValueError(f"prefetch must be >= 1, got {prefetch}.")
         if weights is not None:
@@ -603,10 +646,13 @@ class DataLoader:
             _require_free_threading()
 
         self.stores = stores
-        self.samples_budget = samples_budget
+        self.events_budget = events_budget
         self.batch_size = batch_size
         self.token_budget = token_budget
         self.sample_field = sample_field
+        self.sample_ranges = sample_ranges
+        self.step_field = step_field
+        self.episode_field = episode_field
         self.weight_mode = weight_mode
         self.seed = seed
         self.transform = transform
@@ -692,7 +738,7 @@ class DataLoader:
             f"{s.name or '?'}({n})" for s, n in zip(self.stores, self._ns)
         )
         return (
-            f"DataLoader(stores=[{store_info}], samples_budget={self.samples_budget}, "
+            f"DataLoader(stores=[{store_info}], events_budget={self.events_budget}, "
             f"token_budget={self.token_budget}, B={self.batch_size}, "
             f"sample_field={self.sample_field!r}, seed={self.seed})"
         )
@@ -702,7 +748,7 @@ class DataLoader:
             datasets=tuple(self._datasets),
             ns=tuple(self._ns),
             probs=self._probs.copy(),
-            samples_budget=self.samples_budget,
+            events_budget=self.events_budget,
             batch_size=self.batch_size,
             token_budget=self.token_budget,
             index_field=self.index_field,
@@ -762,14 +808,17 @@ class DataLoader:
 
     def _resnapshot_stores(self) -> None:
         self._datasets = [s.to_dataset() for s in self.stores]
-        self._ns = [len(ds) for ds in self._datasets]
         self._runs = tuple(
-            _sample_runs(ds=ds, sample_field=self.sample_field) for ds in self._datasets
+            _event_sample_ranges(ds=ds, sample_field=self.sample_field, sample_ranges=self.sample_ranges,
+                                 step_field=self.step_field, episode_field=self.episode_field)
+            for ds in self._datasets
         )
+
+        self._ns = [len(ds) if len(runs) else 0 for ds, runs in zip(self._datasets, self._runs)]
 
         w = self._weights.copy()
         ns = np.array(self._ns, dtype=float)
-        if self.weight_mode == "per_step":
+        if self.weight_mode == "per_event":
             w = w * ns
         else:
             w = w * (ns > 0)

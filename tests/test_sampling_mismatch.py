@@ -41,6 +41,7 @@ def test_mismatch_weight_is_detached_and_separate_from_policy_clipping():
     assert metrics['clipfrac'] == 0.
     loss['grpo'].backward()
     assert weights.grad is None
+    assert logits.grad is not None
     assert logits.grad[0, 0].item() == pytest.approx(-3.)
 
 

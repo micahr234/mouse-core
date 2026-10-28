@@ -163,11 +163,14 @@ def sample_reasoning_splits(
     rng = generator if generator is not None else np.random.default_rng()
     counts = batch.step_counts()
     splits = np.full(batch.B, -1, dtype=np.int64)
+    offset = 0
     for b in range(batch.B):
         n = int(counts[b])
-        # Every step but the last has a next step in the same sample.
-        if n >= 2:
-            splits[b] = int(rng.integers(0, n - 1))
+        eligible = np.unique(batch.head_step_ids[(batch.head_step_ids >= offset) &
+                                                 (batch.head_step_ids < offset + n - 1)]) - offset
+        if eligible.size:
+            splits[b] = int(rng.choice(eligible))
+        offset += n
     return splits
 
 
@@ -175,10 +178,12 @@ def _first_head_output_rows(batch: TokenBatch) -> np.ndarray:
     """Row index into ``head_token_ids`` of each step's first head-output token."""
     head_step_ids = np.asarray(batch.head_step_ids, dtype=np.int64)
     if head_step_ids.size == 0:
-        return np.zeros(0, dtype=np.int64)
+        return np.full(batch.N, -1, dtype=np.int64)
     first = np.ones(head_step_ids.size, dtype=bool)
     first[1:] = head_step_ids[1:] != head_step_ids[:-1]
-    return np.flatnonzero(first)
+    rows = np.full(batch.N, -1, dtype=np.int64)
+    rows[head_step_ids[first]] = np.flatnonzero(first)
+    return rows
 
 
 @dataclass
@@ -245,7 +250,10 @@ def _plan_insertions(
     # are inserted immediately before it. Anchors are strictly increasing
     # because sequences occupy contiguous, ordered token blocks.
     first_rows = _first_head_output_rows(batch)
-    anchors = pred[first_rows[offsets[burst_rows] + splits[burst_rows]]]
+    selected_rows = first_rows[offsets[burst_rows] + splits[burst_rows]]
+    if np.any(selected_rows < 0):
+        raise ValueError("A reasoning split requires an action-request readout")
+    anchors = pred[selected_rows]
     prefix_starts = np.searchsorted(seq, burst_rows, side="left")
     if bool(np.any(anchors == prefix_starts)):
         b = int(burst_rows[int(np.flatnonzero(anchors == prefix_starts)[0])])

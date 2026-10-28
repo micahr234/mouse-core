@@ -53,7 +53,9 @@ def _head_output_layout(
     """Map head-output rows to steps: ``(step_of [P], last_rows [N])``.
 
     ``step_of[p]`` is the step of head-output row ``p``; ``last_rows[i]`` is
-    the row of step ``i``'s last head-output token (the bootstrap read). Reads
+    the row of step ``i``'s last head-output token (the bootstrap read).
+    A missing readout uses sentinel ``P``; ``_step_predictions`` supplies its
+    zero placeholder, and return construction continues through that step. Reads
     the ``head_output_count`` column stamped by ``pack_token_batch``; when the
     column is absent every step must have exactly one head-output token (``P == N``).
     """
@@ -65,8 +67,8 @@ def _head_output_layout(
             raise ValueError(
                 f"head_output_count must have shape [{N}], got {tuple(counts.shape)}."
             )
-        if bool((counts < 1).any()):
-            raise ValueError("head_output_count entries must be >= 1.")
+        if bool((counts < 0).any()):
+            raise ValueError("head_output_count entries must be >= 0.")
         if int(counts.sum()) != P:
             raise ValueError(
                 f"head_output_count sums to {int(counts.sum())} but predictions "
@@ -84,8 +86,38 @@ def _head_output_layout(
     step_of = torch.repeat_interleave(
         torch.arange(N, dtype=torch.int64, device=device), counts, output_size=P
     )
-    last_rows = counts.cumsum(dim=0) - 1
+    last_rows = torch.where(counts > 0, counts.cumsum(dim=0) - 1, P)
     return step_of, last_rows
+
+
+def _step_predictions(predictions: torch.Tensor, last_rows: torch.Tensor) -> torch.Tensor:
+    """Scatter real readouts onto the step clock; absent values are placeholders."""
+    return torch.cat([predictions, predictions.new_zeros((1,) + predictions.shape[1:])])[last_rows]
+
+
+def _expand_policy_readouts(objective_data, predictions, *, who):
+    counts = objective_data.get("head_output_count")
+    if counts is None:
+        return predictions, objective_data, torch.ones(predictions.shape[0], dtype=torch.bool, device=predictions.device)
+    if counts.ndim != 1 or counts.dtype != torch.int64 or bool(((counts < 0) | (counts > 1)).any()):
+        raise ValueError(f"{who} expects one prediction row per step with a readout (zero or one per step)")
+    step_of, last_rows = _head_output_layout(objective_data, N=counts.numel(), P=predictions.shape[0], device=predictions.device)
+    return (_step_predictions(predictions, last_rows),
+            {**objective_data, "head_output_count": torch.ones_like(counts)}, counts.to(predictions.device) > 0)
+
+
+def _validate_request_actions(readout, executed, group_id):
+    if bool(((group_id[:-1] == group_id[1:]) & executed[1:] & ~readout[:-1]).any()):
+        raise ValueError("An executed action requires a readout on its preceding step")
+
+
+def _validate_missing_bootstrap(readout, discount, group_id, mode):
+    if mode != "bootstrap":
+        return
+    last = torch.ones_like(readout)
+    last[:-1] = group_id[:-1] != group_id[1:]
+    if bool((last & ~readout & (discount != 0)).any()):
+        raise ValueError("Cannot bootstrap from a final step without an action-request readout; use zero ending discount, ignore, or fault")
 
 
 def _pair_weight(
@@ -139,8 +171,11 @@ def _require_step_aligned_predictions(
     if "head_output_count" not in objective_data.keys():
         return
     counts = objective_data["head_output_count"]
+    if counts.dtype != torch.int64:
+        raise TypeError(f"head_output_count must be int64, got {counts.dtype}.")
     total = int(counts.sum())
-    if counts.shape != torch.Size([n_steps]) or total != n_pred or n_pred != n_steps:
+    if (counts.shape != torch.Size([n_steps]) or total != n_pred
+            or n_pred != n_steps or bool((counts != 1).any())):
         raise ValueError(
             f"{who} expects one prediction row per step "
             f"(got {n_pred} prediction rows, {n_steps} steps, "
@@ -160,6 +195,9 @@ def _in_run_stats(
     pair_weight: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Mean / std / min / max over in-run pairs. All-zero weights yield zeros."""
+    if values.shape[0] == 0:
+        zero = values.sum(dim=0)
+        return zero, zero, zero, zero
     in_run = pair_weight > 0
     count = in_run.sum(dim=0)
     selected = torch.where(in_run, values, 0)
@@ -731,7 +769,7 @@ class DqnObjective(Objective[...]):
     ``-beta`` continues at ``1/2``. A larger ``beta`` is a softer cut.
     A negative gap moves the return toward the delayed state value.
     ``value_gap_gate`` reads online Q, delayed Q, or both. It leaves
-    oracle columns such as ``info_q_star`` unread. ``metrics["entropy"]`` is the in-run mean of
+    oracle columns such as ``q_star`` unread. ``metrics["entropy"]`` is the in-run mean of
     ``H[softmax(Q / α)]`` on online Q when ``temperature > 0``.
     ``metrics["backup"]`` is the per-row Bellman target ``G`` (``[P]``)
     the taken action is regressed to. ``metrics["backup_weight"]`` is
@@ -1020,7 +1058,10 @@ class DqnObjective(Objective[...]):
         # No action is chosen from the state immediately before an automatic
         # reset. Keep the observation in the history, but never fit or maximize
         # its Q row. A backup passes through the automatic transition instead.
-        automatic = torch.cat([~executed[1:] & (pair_weight > 0), executed.new_zeros(1)])
+        readout = last_rows < P
+        _validate_request_actions(readout, executed, group_id)
+        _validate_missing_bootstrap(readout, discount_all, group_id, self.cross_group_backups)
+        automatic = torch.cat([~executed[1:] & (pair_weight > 0), executed.new_zeros(1)]) | ~readout
         online_mask = automatic[step_of].reshape((P,) + (1,) * (q.ndim - 1))
         backup_mask = automatic[step_of].reshape((P,) + (1,) * (q_target.ndim - 1))
         q = q.masked_fill(online_mask, 0)
@@ -1030,7 +1071,7 @@ class DqnObjective(Objective[...]):
         gather_action = gather_action.expand(*q_target.shape[:-1], 1)
         q_values = q if selected else q.gather(dim=-1, index=gather_action).squeeze(-1)
         v_step = _backup_state_value(
-            q_actions=q_actions[last_rows], q_backup=q_target[last_rows],
+            q_actions=_step_predictions(q_actions, last_rows), q_backup=_step_predictions(q_target, last_rows),
             temperature=self.temperature,
         )
         if heads is not None and reward.ndim == 1:
@@ -1038,7 +1079,7 @@ class DqnObjective(Objective[...]):
         with torch.no_grad():
             prepared = (_PreparedGate(n=N, columns=q.new_zeros(N)) if self.gate is None else
                         _prepare_gate(self.gate, **objective_data,
-                                      q=q[last_rows].detach(), q_delayed=q_target[last_rows].detach()))
+                                      q=_step_predictions(q, last_rows).detach(), q_delayed=_step_predictions(q_target, last_rows).detach()))
             if prepared.columns is not None:
                 columns = prepared.columns.to(dtype=value_dtype, device=device)
                 mask = automatic[:, None] if columns.ndim == 2 else automatic

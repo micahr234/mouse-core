@@ -349,8 +349,40 @@ def test_ppo_requires_cross_group_backups_argument() -> None:
         )
 
 
-def test_ppo_rejects_multi_head_output_rows() -> None:
+@pytest.mark.parametrize("counts", [[2, 2, 1, 1], [0, 2, 1, 1]])
+def test_ppo_rejects_multi_head_output_rows(counts) -> None:
     objective_data, predictions = _ppo_batch(n=4)
-    objective_data["head_output_count"] = torch.tensor([2, 2, 1, 1])
+    objective_data["head_output_count"] = torch.tensor(counts)
     with pytest.raises(ValueError, match="one prediction row per step"):
         _ppo()(objective_data=objective_data, predictions=predictions)
+
+
+def test_ppo_explained_variance_is_invariant_to_constant_value_bias() -> None:
+    data = {
+        "action": torch.zeros(3, dtype=torch.int64),
+        "reward": torch.tensor([0.0, 1.0, 2.0]),
+        "terminated": torch.zeros(3, dtype=torch.bool),
+        "truncated": torch.zeros(3, dtype=torch.bool),
+    }
+    _, metrics = _ppo(discount=_disc(gamma_step=0.0))(
+        objective_data=data,
+        predictions={"action": torch.zeros(3, 2), "value": torch.tensor([5.0, 6.0, 0.0])},
+    )
+    assert metrics["value_loss"] == pytest.approx(16.0)
+    assert metrics["explained_variance"] == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("num_actions", [-1, 0, 4])
+def test_sample_discrete_action_rejects_invalid_action_count(num_actions) -> None:
+    with pytest.raises(ValueError, match="num_actions"):
+        sample_discrete_action(logits=torch.zeros(2, 3), num_actions=num_actions)
+
+
+def test_ppo_behavior_log_probabilities_are_fixed_targets() -> None:
+    data, predictions = _ppo_batch(n=4)
+    old_log_prob = data['old_log_prob'].requires_grad_()
+    predictions['action'].requires_grad_()
+    losses, _ = _ppo(normalize_advantage=False)(objective_data=data, predictions=predictions)
+    losses['ppo'].backward()
+    assert old_log_prob.grad is None
+    assert predictions['action'].grad is not None

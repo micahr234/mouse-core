@@ -26,28 +26,14 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from datasets import Dataset
 
 
-from mouse_core.data import Augmenter, DataLoader, Datastore, Tokenizer, compose
+from mouse_core.data import Augmenter, DataLoader, Datastore, EventLog, Tokenizer, compose
 from mouse_core.data.token_batch import TokenBatch
 
 
-def on_episode_terminated(ctx):
-    return "episode_terminated" in ctx and bool(ctx["episode_terminated"])
-
-def on_episode_truncated(ctx):
-    return "episode_truncated" in ctx and bool(ctx["episode_truncated"])
-
 def on_group_start(ctx):
     return bool(ctx["group_start"])
-
-def on_reward_nonzero(ctx):
-    return "reward" in ctx and ctx["reward"] != 0.0
-
-def on_episode_start(ctx):
-    return bool(ctx.get("episode_start")) | bool(ctx["group_start"])
-
 
 _BENCH_DIR = Path(__file__).resolve().parent
 if str(_BENCH_DIR) not in sys.path:
@@ -65,18 +51,19 @@ _WORKLOADS: dict[str, tuple[int, int]] = {
 _MAX_ACTIONS = 4
 _MAX_OBS = 64
 _STEPS_PER_EPISODE = 8
-_EPISODES_PER_TASK = 4  # max task = 32 steps; keep ≤ shortest --workloads S
+_EPISODES_PER_TASK = 10  # 80 observations per task; fits the shortest event budget
 _group_prefix = (
     "Your job is to predict the future sum of rewards in FrozenLake. "
     "Navigate a grid; reach the goal for reward; a hole ends the "
-    "episode with none. Each episode lasts at most 30 steps. You have 20 episodes to solve the task. The "
+    f"episode with none. Each episode lasts at most {_STEPS_PER_EPISODE - 1} steps. "
+    f"You have {_EPISODES_PER_TASK} episodes to solve the task. The "
     "grid is permuted, so squares are not in order; action ids may be "
     "remapped.\n"
     "Strategy: explore; keep a mental map of what has and has not been "
     "explored; avoid holes you have already fallen in; once you have a "
     "path to the goal, repeat it.\n"
-    "At the end of each line, predict the value of all actions. Format:\n"
-    "action,observation[,r=reward][,terminated][,truncated][,episode N].\n"
+    "At each action-request newline, predict the value of all actions. Format:\n"
+    "action,observation[,r=reward][,terminated][,truncated].\n"
 )
 
 
@@ -87,60 +74,48 @@ def _free_threading_ok() -> bool:
     return not (callable(is_gil_enabled) and is_gil_enabled())
 
 
-def _synthetic_rows(n: int, *, seed: int) -> list[dict[str, Any]]:
-    rng = np.random.default_rng(seed)
-    rows: list[dict[str, Any]] = []
-    task = 0
-    episode = 0
-    ep_step = 0
-    for _ in range(n):
-        episode_truncated = ep_step + 1 >= _STEPS_PER_EPISODE
-        task_truncated = episode_truncated and episode + 1 >= _EPISODES_PER_TASK
-        rows.append(
-            {
-                "action": int(rng.integers(0, _MAX_ACTIONS)),
-                "observation": int(rng.integers(0, _MAX_OBS)),
-                "reward": float(rng.random()),
-                "terminated": False,
-                "truncated": task_truncated,
-                "episode_terminated": False,
-                "episode_truncated": episode_truncated,
-                "episode_ended": episode_truncated,
-                "episode_start": ep_step == 0,
-                "task_index": task,
-                "episode_index": episode,
-                "step_index": ep_step,
-                "info_q_star": rng.random(_MAX_ACTIONS, dtype=np.float32).tolist(),
-            }
-        )
-        ep_step += 1
-        if episode_truncated:
-            ep_step = 0
-            episode += 1
-        if task_truncated:
-            episode = 0
-            task += 1
-    return rows
-
-
 def _stores(*, n_stores: int, steps: int) -> list[Datastore]:
-    stores: list[Datastore] = []
-    for i in range(n_stores):
-        store = Datastore(name=f"synth_{i}")
-        store.from_dataset(ds=Dataset.from_list(_synthetic_rows(steps, seed=i)))
-        stores.append(store)
+    stores = []
+    for stream in range(n_stores):
+        rng = np.random.default_rng(stream)
+        log = EventLog(name=f"synth_{stream}")
+        for index in range(steps):
+            task, within_task = divmod(index, _STEPS_PER_EPISODE * _EPISODES_PER_TASK)
+            repeat, repeat_step = divmod(within_task, _STEPS_PER_EPISODE)
+            repeat_ended = repeat_step == _STEPS_PER_EPISODE - 1
+            task_ended = repeat_ended and repeat == _EPISODES_PER_TASK - 1
+            if within_task == 0:
+                log.event(provider="coordinator", episode_index=task, step_index=within_task, payload={
+                    'episode_start': True,
+                })
+            if repeat_step > 0:
+                log.event(provider='agent', episode_index=task, step_index=within_task, payload={
+                    'action': int(rng.integers(0, _MAX_ACTIONS)),
+                })
+            reward = 0.0 if repeat_step == 0 else float(rng.random())
+            log.event(provider='environment', episode_index=task, step_index=within_task, payload={
+                **({'action_requested': True} if not repeat_ended else {}),
+                'observation': int(rng.integers(0, _MAX_OBS)),
+                'task_index': task,
+                **({'inner_truncated': True} if repeat_ended else {}),
+                **({'q_star': rng.random(_MAX_ACTIONS, dtype=np.float32).tolist()} if not repeat_ended else {}),
+                **({'reward': reward} if reward != 0 else {}),
+                **({'truncated': True} if task_ended else {}),
+            })
+
+        stores.append(log.to_store())
     return stores
 
 
 def _train_transform() -> Any:
     augmenter = Augmenter(
-        seed_field="task_index",
+        seed_field="episode_index",
         seed=0,
         fields=[
             {
                 "type": "discrete",
                 "input_field": "action",
-                "input_vector_field": "info_q_star",
+                "input_vector_field": "q_star",
                 "vocab_size": _MAX_ACTIONS,
                 "permute": True,
             },
@@ -159,47 +134,39 @@ def _train_transform() -> Any:
                 "format": _group_prefix,
                 "when": on_group_start,
             },
-            {"type": "text", "input_field": "action", "format": "{field},"},
+            {"type": "text", "input_field": "action", "lookup": ["a", "b", "c", "d"], "format": "{field},"},
             {"type": "text", "input_field": "observation", "format": "{field},"},
             {
                 "type": "text",
                 "input_field": "reward",
                 "format": "r={field:g},",
-                "when": on_reward_nonzero,
             },
             {
                 "type": "text",
-                "input_field": "episode_terminated",
                 "format": ",terminated",
-                "when": on_episode_terminated,
+                "input_field": "inner_terminated",
             },
             {
                 "type": "text",
-                "input_field": "episode_truncated",
                 "format": ",truncated",
-                "when": on_episode_truncated,
-            },
-            {
-                "type": "text",
-                "input_field": "episode_index",
-                "format": ",episode {field+1}",
-                "when": on_episode_start,
+                "input_field": "inner_truncated",
             },
             {
                 "type": "token",
+                "input_field": "action_requested",
                 "format": "\n",
                 "head_output": True,
             },
         ],
         objective_fields=[
-            {"input_field": "action"},
-            {"input_field": "reward"},
-            {"input_field": "terminated"},
-            {"input_field": "truncated"},
+            {"input_field": "action", "missing_value": None},
+            {"input_field": "reward", "missing_value": 0.0},
+            {"input_field": "terminated", "missing_value": False},
+            {"input_field": "truncated", "missing_value": False},
         ],
         pretrained="Qwen/Qwen3-0.6B",
     )
-    return compose(stages=(augmenter, tokenizer))
+    return compose(stages=(augmenter.events, tokenizer.encode))
 
 
 def _timed(fn: Callable[[], Any], iters: int) -> tuple[float, float, float]:
@@ -252,9 +219,9 @@ def main() -> None:
         for n_workers in args.workers:
             loader = DataLoader(
                 stores=stores,
-                samples_budget=seq_len,
+                events_budget=3 * seq_len,
                 batch_size=batch_size,
-                sample_field="task_index",
+                sample_field="episode_index",
                 transform=transform,
                 prefetch=args.prefetch,
                 num_workers=n_workers,

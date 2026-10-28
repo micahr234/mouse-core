@@ -2,7 +2,7 @@
 
 Measures, per workload: prefill of a context into an empty paged KV pool,
 then a decode step of ``--step`` new tokens per row against that history.
-Reports median wall time, peak allocated memory above the parameter
+Reports median CUDA-event time, peak allocated memory above the parameter
 baseline, tokens/second, and first-call (compile / page-grow / incremental
 CUDA-graph capture) time. ``--profile`` adds a ``torch.profiler`` CPU/CUDA
 breakdown after warmup. Decode is ``decode_kernel="flex"`` only.
@@ -181,8 +181,8 @@ def main() -> None:
 
         iters = args.iters if tokens <= 4096 * 4 else max(3, args.iters // 2)
         first_p, med_p, lo_p, hi_p, peak_p = _timed(prefill, iters)
-        # Prefill left the cache empty (last timed call resets then fills).
-        # Grow once so decode-step timings are against a full context, not an empty pool.
+        # Restore the requested context before measuring incremental decoding.
+        # Each timed decode appends tokens, so its context grows across iterations.
         session.reset_rows()
         session.forward(embeds=prefill_embeds, lengths=prefill_lens)
         first_d, med_d, lo_d, hi_d, peak_d = _timed(decode_step, iters)
@@ -205,6 +205,7 @@ def main() -> None:
                 decode_step, label=f"{wname} decode S={step_s}", steps=iters,
                 cuda=True, trace_dir=args.profile_trace,
             )
+        session.close()
         del session, prefill_embeds, step_embeds
         torch.cuda.empty_cache()
 

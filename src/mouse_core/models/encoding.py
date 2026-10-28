@@ -52,13 +52,13 @@ def prepare_decode(
     trailing columns; empty rows have zero lengths and no valid heads.
     Cache creation and backbone execution remain in the agent's forward.
     """
-    if tokens.B > 0 and tokens.N == 0:
+    if tokens.B > 0 and tokens.L == 0:
         raise ValueError("cached decode requires at least one non-empty row in batch.")
 
     last_head_in_step = torch.ones_like(head_step_ids, dtype=torch.bool)
     last_head_in_step[:-1] = head_step_ids[1:] != head_step_ids[:-1]
     step_head_token_ids = head_token_ids[last_head_in_step]
-    step_counts = tokens.step_counts().tolist()
+    step_counts = torch.bincount(sequence_ids[step_head_token_ids], minlength=tokens.B).tolist()
     token_lengths = torch.bincount(sequence_ids, minlength=tokens.B).tolist()
     max_steps = max(step_counts, default=0)
     max_tokens = max(token_lengths, default=0)

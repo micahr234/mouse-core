@@ -9,6 +9,8 @@ import torch
 import torch.nn.functional as F
 
 from mouse_core.objectives.base import Objective
+from mouse_core.objectives.dqn import _expand_policy_readouts
+from mouse_core.objectives._actions import executed_actions
 
 
 class CosineObjective(Objective[...]):
@@ -93,7 +95,10 @@ class CosineObjective(Objective[...]):
         row i+1 belongs to the transition from i to i+1. Exclude group breaks,
         transitions out of terminated/truncated rows, and transitions into
         reset rows identified by ``reset_key`` (None disables that check).
-        Terminal observations remain valid targets. ``mask_key``, if configured,
+        When ``action_executed`` is present, action-independent transitions
+        are also excluded; their action slots are only placeholders.
+        Only pairs with readouts at both ends are eligible; a terminal
+        observation without a readout has no latent target. ``mask_key``, if configured,
         skips source rows. No valid pairs returns a differentiable zero without
         calling the transition. Targets are detached by the cosine loss.
         """
@@ -105,6 +110,8 @@ class CosineObjective(Objective[...]):
             raise TypeError("predictions and targets must be floating-point encodings.")
         if predictions.device != targets.device:
             raise ValueError("predictions and targets must share a device.")
+        predictions, _, readout = _expand_policy_readouts(objective_data, predictions, who="Cosine")
+        targets, _, _ = _expand_policy_readouts(objective_data, targets, who="Cosine")
         n = predictions.shape[0]
 
         def column(name: str, value: torch.Tensor) -> torch.Tensor:
@@ -119,6 +126,7 @@ class CosineObjective(Objective[...]):
         terminated = column("terminated", objective_data["terminated"]).bool()
         truncated = column("truncated", objective_data["truncated"]).bool()
         valid = (groups[:-1] == groups[1:]) & ~terminated[:-1] & ~truncated[:-1]
+        valid &= executed_actions(objective_data, actions)[1:] & readout[:-1] & readout[1:]
         if reset_key is not None:
             valid &= ~column(reset_key, objective_data[reset_key])[1:].bool()
         if self.mask_key is not None:

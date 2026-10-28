@@ -2,6 +2,7 @@
 import pytest
 import torch
 
+from mouse_core.data import pack_token_batch
 from mouse_core.objectives import DqnObjective, boundary_discount, nstep_gate
 
 
@@ -131,17 +132,26 @@ def test_sequential_notebook_collects_and_trains(mode, monkeypatch):
     pytest.importorskip("mujoco")
     make = gym.make
     applied_actions = []
+    physical_observations = []
 
     def make_recorded(*args, **kwargs):
         assert "max_episode_steps" not in kwargs
         env = make(*args, **kwargs)
-        step = env.step
+        reset, step = env.reset, env.step
+
+        def record_reset(**kwargs):
+            output = reset(**kwargs)
+            physical_observations.append(output[0].copy())
+            return output
 
         def record_step(action):
             assert env.action_space.contains(action)
             applied_actions.append(action.copy())
-            return step(action)
+            output = step(action)
+            physical_observations.append(output[0].copy())
+            return output
 
+        monkeypatch.setattr(env, "reset", record_reset)
         monkeypatch.setattr(env, "step", record_step)
         return env
 
@@ -166,11 +176,57 @@ def test_sequential_notebook_collects_and_trains(mode, monkeypatch):
         assert episode_steps is not None
         assert namespace["MAX_STEPS_PER_EPISODE"] == episode_steps
         assert len(applied_actions) == 2 * episode_steps
-        history = namespace["last_history"]
+        from mouse_core.data import environment_decisions
+        raw_history = namespace["last_history"]
+        history = list(environment_decisions(raw_history))
+        assert len(history) == 2 * episode_steps + 1
+        assert [row["step_index"] for row in history] == list(range(len(history)))
+        replay = list(environment_decisions(namespace["store"].to_dataset()))
+        assert replay[-len(history):] == history
+        assert [row["episode_index"] for row in replay if row.get("episode_start", False)] == [0, 1]
+        assert namespace["tracker"].episode_index == 1
+        assert namespace["tracker"].step_index == 2 * episode_steps
+        assert namespace["tracker"].ended
+        events = namespace["store"][:]
+        assert all(set(event) == {"provider", "payload", "episode_index", "step_index"} for event in events)
+        assert all(not {"torque", "shoulder_torque", "elbow_torque"} & json.loads(event["payload"]).keys()
+                   for event in events if event["provider"] == "environment")
+        observation_fields = (
+            "shoulder_cos", "elbow_cos", "shoulder_sin", "elbow_sin",
+            "target_x", "target_y", "shoulder_velocity", "elbow_velocity",
+            "fingertip_offset_x", "fingertip_offset_y",
+        )
+        physical_episode = physical_observations[-(episode_steps + 1):]
+        for index, row in enumerate(history):
+            assert "observation" not in row
+            assert [row[field] for field in observation_fields] == physical_episode[index // 2].tolist()
+        for index, event in enumerate(event for event in events if event['provider'] == 'agent'):
+            payload = json.loads(event['payload'])
+            field = ("shoulder_torque", "elbow_torque")[index % 2]
+            assert set(payload) == {"action", field}
+        objective = namespace["objective"]
+        assert objective.cross_group_backups == "fault"
+        assert history[-1]["truncated"] and "terminated" not in history[-1]
+        _, data, groups = pack_token_batch(
+            steps=namespace["tokenizer"].encode(raw_history),
+            sequence_ids=[0] * len(history), batch_size=1, continuing=None,
+        )
+        assert objective.discount(**data)[-1] == 0
+        values = torch.full((int(data["head_output_count"].sum()), namespace["MAX_ACTIONS"]), 1000.)
+        _, metrics = objective(objective_data=data, group_id=groups,
+            predictions=values, backup_value_predictions=values,
+            backup_action_predictions=values)
+        # The final executed action learns its actual reward, with no value
+        # beyond the finite horizon. An incomplete episode must still fault.
+        assert metrics["backup"][-1].item() == pytest.approx(history[-1]["reward"])
+        with pytest.raises(ValueError, match="cross-group backup"):
+            objective(objective_data={key: value[:-1] for key, value in data.items()},
+                group_id=groups[:-1], predictions=values,
+                backup_value_predictions=values, backup_action_predictions=values)
         for index, applied in enumerate(applied_actions[-episode_steps:]):
             # One vector per physical step, assembled in the recorded component order.
-            assert applied.tolist() == [history[2 * index + 1]["torque"],
-                                        history[2 * index + 2]["torque"]]
+            assert applied.tolist() == [history[2 * index + 1]["shoulder_torque"],
+                                        history[2 * index + 2]["elbow_torque"]]
     finally:
         if "env" in namespace:
             namespace["env"].close()

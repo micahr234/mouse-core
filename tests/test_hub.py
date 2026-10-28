@@ -5,6 +5,7 @@ import tempfile
 import pytest
 from datasets import Dataset
 from mouse_core.data import Datastore
+from tests._event_fixtures import measurement_store, append_measurement
 from mouse_core.data import hub
 
 class _FakeRepoUrl:
@@ -71,13 +72,13 @@ class _FakeHfApi:
         return {'name': 'user'}
 
 def _store(*actions: int, name: str | None=None) -> Datastore:
-    store = Datastore(name=name)
+    store = measurement_store(name=name)
     for i, action in enumerate(actions):
-        store.append(data={'observation': {'discrete': i}, 'action': {'discrete': action}, 'reward': float(i), 'repeat_episode_done': 0, 'episode_done': 0, 'step_index': i})
+        append_measurement(store, fields={'observation': {'discrete': i}, 'action': {'discrete': action}, 'reward': float(i), 'repeat_episode_done': 0, 'episode_done': 0, 'step_index': i})
     return store
 
 def _loaded_store_datasets() -> dict[str, Dataset]:
-    return {'cartpole': Dataset.from_list([{'observation': {'discrete': 1}, 'action': {'discrete': 1}, 'reward': 1.0, 'repeat_episode_done': 0, 'episode_done': 0, 'step_index': 0}]), 'lunar': Dataset.from_list([{'observation': {'discrete': 2}, 'action': {'discrete': 2}, 'reward': 2.0, 'repeat_episode_done': 0, 'episode_done': 0, 'step_index': 0}])}
+    return {'cartpole': _store(1).to_dataset(), 'lunar': _store(2).to_dataset()}
 
 def _write_snapshot(root: Path, *store_names: str, split: str='train') -> Path:
     for store_name in store_names:
@@ -155,7 +156,7 @@ def test_load_stores_from_hub_scopes_short_names(monkeypatch: pytest.MonkeyPatch
 
     def fake_load_dataset(path: str, **kwargs):
         calls.append((path, kwargs))
-        return {'config': Dataset.from_list([{'observation': {'discrete': 0}, 'action': {'discrete': 0}, 'reward': 0.0, 'repeat_episode_done': 0, 'episode_done': 0, 'step_index': 0}])}
+        return {'config': _store(0).to_dataset()}
 
     def fake_snapshot(*, repo_id: str, store_names: list[str] | None, split: str, revision: str | None, token: str | bool | None, force_download: bool=False):
         snapshot_calls.append((repo_id, store_names, split, revision, token))
@@ -174,7 +175,7 @@ def test_load_stores_from_hub_keeps_hyphenated_store_name(monkeypatch: pytest.Mo
 
     def fake_load_dataset(path: str, **kwargs):
         calls.append((path, kwargs))
-        return {'double_integrator_random': Dataset.from_list([{'observation': {'discrete': 0}, 'action': {'discrete': 0}, 'reward': 0.0, 'repeat_episode_done': 0, 'episode_done': 0, 'step_index': 0}])}
+        return {'double_integrator_random': _store(0).to_dataset()}
 
     def fake_snapshot(*, repo_id: str, store_names: list[str] | None, split: str, revision: str | None, token: str | bool | None, force_download: bool=False):
         return snapshot_dir
@@ -282,3 +283,12 @@ def test_push_stores_to_hub_requires_unique_store_names() -> None:
 def test_push_stores_to_hub_rejects_url_unsafe_names(bad_name: str) -> None:
     with pytest.raises(ValueError, match='safe as Hugging Face'):
         hub.push_stores_to_hub(repo_id='test-dataset', stores=[_store(1, name=bad_name)])
+
+
+def test_hub_loader_rejects_flat_step_datasets(monkeypatch, tmp_path):
+    snapshot = _write_snapshot(tmp_path, 'flat')
+    monkeypatch.setattr(hub, '_snapshot_store_repo', lambda **kwargs: snapshot)
+    monkeypatch.setattr(hub, 'load_dataset', lambda *args, **kwargs: {
+        'flat': Dataset.from_list([{'observation': 1, 'action': 0, 'reward': 1.}])})
+    with pytest.raises(ValueError, match='only event logs'):
+        hub.load_stores_from_hub(repo_id='owner/flat', store_names=['flat'])

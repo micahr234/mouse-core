@@ -1,4 +1,4 @@
-"""Shared helpers: list[list[dict]] → TokenBatch via per-step compose + pack."""
+"""Encode synthetic measurement payloads as events, then pack model test batches."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from typing import Any, cast
 import torch
 
 from mouse_core.data import Tokenizer, pack_token_batch
+from tests._event_fixtures import encode_measurement
 from mouse_core.data.token_batch import StepTokens, TokenBatch
 
 def when_episode_done_nonzero(ctx):
@@ -93,7 +94,7 @@ def token_tokenizer(
 
 
 def batch_to_packed(
-    tokenizer: Callable[[dict], StepTokens],
+    tokenizer: Tokenizer | Callable[[dict], StepTokens],
     batch: list[list[dict]],
 ) -> tuple[TokenBatch, dict[str, torch.Tensor], torch.Tensor]:
     """Tokenize a ragged ``list[list[dict]]`` into ``(inputs, objective_data, group_id)``."""
@@ -101,7 +102,7 @@ def batch_to_packed(
     sids: list[int] = []
     for b, seq in enumerate(batch):
         for step in seq:
-            steps.append(tokenizer(step))
+            steps.append(encode_measurement(tokenizer, step) if isinstance(tokenizer, Tokenizer) else tokenizer(step))
             sids.append(b)
     return pack_token_batch(
         steps=steps,
@@ -112,7 +113,7 @@ def batch_to_packed(
 
 
 def batch_to_token_batch(
-    tokenizer: Callable[[dict], StepTokens],
+    tokenizer: Tokenizer | Callable[[dict], StepTokens],
     batch: list[list[dict]],
 ) -> TokenBatch:
     """Tokenize a ragged ``list[list[dict]]`` to model inputs only."""

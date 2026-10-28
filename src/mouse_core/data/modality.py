@@ -44,15 +44,27 @@ class TokenizerModalitySpec:
     ``format=`` is an f-string and the step value is the name ``field``:
     ``{field}``, ``{field+1}``, ``{field:.0f}``. Expressions may use
     ``field`` with operators and format specs. They may not call
-    functions or use any other name. Omit ``input_field=`` and the
+    functions or use any other name. A literal format with ``input_field=``
+    emits a fixed marker only when that field is
+    present and non-None; it does not test the value's truthiness.
+    Omit ``input_field=`` and the
     field is a const: ``format=`` is the literal string to tokenize
     (the word field is text; ``{field}`` is still a placeholder and is
     rejected). Write ``{{`` / ``}}`` for a literal brace. ``image``
     does not accept ``format=``.
 
-    A ``token`` field has no ``input_field``. ``format=`` is the
-    literal text to tokenize, and it must be one token or the
-    tokenizer raises. It rejects ``max_tokens``, ``input_index``,
+    A text field may set ``lookup=["a", "b", "c", "d"]`` to map integer
+    IDs to strings before formatting. For example, ID 2 becomes ``"c"``
+    with ``format="{field}"``. Lookup runs after ``input_index`` selection;
+    missing inputs still emit nothing, while invalid IDs raise. Source
+    payloads and objective labels retain their original numeric values.
+    This renders ordinary text without registering vocabulary entries.
+
+    A ``token`` field emits its literal ``format`` as one token. With an
+    optional ``input_field``, it emits only when that
+    field is present and non-None, just like an optional literal text field.
+    ``special=True`` registers the literal as an atomic special token.
+    Grow the model embedding before training to include newly registered IDs. It rejects ``max_tokens``, ``input_index``,
     and Fourier bounds.
 
     A ``numeric`` field requires ``input_field=``, ``format=``,
@@ -89,20 +101,18 @@ class TokenizerModalitySpec:
     Named callables round-trip via ``module:qualname``; define them
     inline in the notebook or caller. Omit ``when``
     (``None``) and the field always emits on the ordinary run.
-    ``head_output`` fields cannot set ``when`` (they must emit on every
-    step).
+    ``head_output`` fields cannot set ``when``. Bind an ``input_field`` to
+    emit a readout only when that field is present and non-None.
 
-    ``required`` (default ``True``) means the step must carry
-    ``input_field``; a missing / ``None`` value raises. With
-    ``required=False`` a missing value emits nothing. Const text fields
-    have no ``input_field``; they reject ``required=False``. Consts may
+    A missing or ``None`` input value emits nothing. Present values are
+    validated normally. Const text fields have no ``input_field`` and may
     still use ``when=``.
 
-    Exactly one input field must set ``head_output=True``: its tokens are
-    the step's **head-output tokens** — the positions the model reads Q /
-    action outputs from. A step may emit several (e.g. a ``text`` run
-    with more than one id); every step must emit at least one, so the
-    head-output field must not be gated off on every step.
+    ``head_output=True`` marks prediction positions. Tokenizer permits
+    steps without readouts, including passive and terminal steps. Multiple
+    fields may emit prediction positions in the same event.
+    In Tokenizer, ``provider=None`` matches any provider; a string limits
+    the field to events from that provider. Fields emit in list order.
 
     Optional ``max_tokens=`` raises if that field emits more ids than
     the limit. Only ``text`` and ``image`` accept it. ``token`` and
@@ -116,15 +126,17 @@ class TokenizerModalitySpec:
     """
 
     type: str
+    provider: str | None = None
+    special: bool = False
     input_field: str | None = None
     input_index: int | None = None
+    lookup: Sequence[str] | None = None
     format: str | None = None
     fourier_min: float | None = None
     fourier_max: float | None = None
     _format_code: CodeType | None = field(default=None, init=False, repr=False, compare=False)
     max_tokens: int | None = None
     when: WhenFn | None = None
-    required: bool = True
     head_output: bool = False
 
     _VALID_TYPES: ClassVar[tuple[str, ...]] = (
@@ -135,6 +147,10 @@ class TokenizerModalitySpec:
     )
 
     def __post_init__(self) -> None:
+        if type(self.special) is not bool or (self.special and (self.type or "").lower() != "token"):
+            raise ValueError("special=True is supported only for token fields")
+        if self.provider is not None and (not isinstance(self.provider, str) or not self.provider):
+            raise ValueError("provider must be a nonempty string")
         k = (self.type or "").lower()
         if k not in self._VALID_TYPES:
             raise ValueError(
@@ -142,6 +158,14 @@ class TokenizerModalitySpec:
                 f"expected one of {self._VALID_TYPES}"
             )
         object.__setattr__(self, "type", k)
+        if self.lookup is not None:
+            if k != "text" or not self.input_field:
+                raise TypeError("lookup requires a text field with input_field=")
+            if not isinstance(self.lookup, (list, tuple)) or not self.lookup:
+                raise ValueError("lookup must be a nonempty list or tuple of strings")
+            if any(not isinstance(value, str) or not value for value in self.lookup):
+                raise ValueError("lookup entries must be nonempty strings")
+            object.__setattr__(self, "lookup", tuple(self.lookup))
         if k == "text":
             self._reject_fourier_bounds(k)
             self._init_text()
@@ -182,7 +206,10 @@ class TokenizerModalitySpec:
         self._reject_fourier_bounds("token")
         self._reject_input_index("token")
         self._reject_max_tokens("token")
-        self._reject_no_input_knobs("token")
+        if self.input_field is None:
+            self._reject_no_input_knobs("token")
+        elif not isinstance(self.input_field, str) or not self.input_field:
+            raise ValueError("token input_field must be a nonempty string")
         if not self.format:
             raise ValueError(
                 "token field requires format= (a literal string, no placeholders)"
@@ -252,14 +279,9 @@ class TokenizerModalitySpec:
             )
 
     def _reject_no_input_knobs(self, kind: str) -> None:
-        """Fields with no ``input_field`` have no step value to require."""
+        """Reject input fields on constant modalities."""
         if self.input_field is not None:
             raise TypeError(f"{kind} tokenizer modalities have no input_field=")
-        if self.required is not True:
-            raise TypeError(
-                f"{kind} tokenizer modalities do not accept required=False "
-                "(no input_field)"
-            )
 
 
 def _compile_text_format(
@@ -301,7 +323,8 @@ def _compile_text_format(
             names.append(node.id)
     if allow_field:
         others = sorted({name for name in names if name != TEXT_FORMAT_KEY})
-        if others or TEXT_FORMAT_KEY not in names:
+        has_placeholders = any(isinstance(node, ast.FormattedValue) for node in ast.walk(tree))
+        if others or has_placeholders and TEXT_FORMAT_KEY not in names:
             extra = f" Got {others}." if others else ""
             raise ValueError(
                 f"text modality {label!r} format= is an f-string and the "
@@ -464,20 +487,27 @@ def values_equal(a: Any, b: Any) -> bool:
 def copy_keep_fields(
     row: dict,
     pairs: Sequence[tuple[str, str]],
+    *,
+    missing_values: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Copy ``input_field`` → ``output_field`` objective columns from a step.
 
-    Used by :class:`~mouse_core.data.tokenizer.Tokenizer`. Every listed input
-    must be present on the step: there is no silent default,
-    since a missing objective column (``old_log_prob``, ``advantage``, …) would
-    otherwise train on zeros. Vectors (any length, including 1) stay vectors;
+    Used by :class:`~mouse_core.data.tokenizer.Tokenizer`. Each input must be
+    present or have an explicitly configured missing value. This prevents an
+    absent objective column (``old_log_prob``, ``advantage``, …) from silently
+    training on zeros. Vectors (any length, including 1) stay vectors;
     scalars become ``float`` / ``int``. Only the ``action`` output may be
     ``None``, meaning no action ran. Packing derives its validity mask.
     """
     out: dict[str, Any] = {}
     for in_name, out_name in pairs:
-        value = row.get(in_name)
-        if in_name not in row or (value is None and out_name != "action"):
+        if in_name in row:
+            value = row[in_name]
+        elif out_name in missing_values:
+            value = missing_values[out_name]
+        else:
+            raise KeyError(f"objective_fields input {in_name!r} is missing from step")
+        if value is None and out_name != "action":
             raise KeyError(
                 f"objective_fields input {in_name!r} is missing from step "
                 f"(have {sorted(row)}); stamp it on the row before tokenizing"

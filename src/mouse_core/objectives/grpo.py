@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from mouse_core.objectives._actions import canonical_actions, executed_actions
 
+from mouse_core.objectives.dqn import _expand_policy_readouts, _validate_request_actions, _validate_missing_bootstrap
 from mouse_core.objectives.base import Objective, _reject_predictions
 from mouse_core.objectives.dqn import (
     _pair_weight,
@@ -149,7 +150,8 @@ class GrpoObjective(Objective[...]):
         loss = torch.stack(tuple(losses.values())).sum()
 
     ``old_log_prob`` and ``advantage`` are objective columns only — not
-    tokenizer input fields.
+    tokenizer input fields. Both are detached fixed training targets;
+    gradients flow only through the current policy predictions.
 
     Timing matches :class:`~mouse_core.objectives.dqn.DqnObjective`: token
     ``i`` is state ``s_i``; action / behavior log-prob / advantage at ``i+1``
@@ -252,6 +254,8 @@ class GrpoObjective(Objective[...]):
                 f"GRPO expects policy logits shape [N, A], "
                 f"got {tuple(logits.shape)}."
             )
+        original_data = objective_data
+        logits, objective_data, readout = _expand_policy_readouts(objective_data, logits, who="GRPO")
         N, A = logits.shape
         device = cast(torch.device, logits.device)
         dtype = cast(torch.dtype, logits.dtype)
@@ -284,6 +288,7 @@ class GrpoObjective(Objective[...]):
                 f"got {tuple(action.shape)}."
             )
         executed = executed_actions(objective_data, action)
+        _validate_request_actions(readout, executed, group_id)
         action = canonical_actions(objective_data, action)
         _require_action_ids(action, A)
         objective_data = {**objective_data, self.action_key: action}
@@ -300,7 +305,7 @@ class GrpoObjective(Objective[...]):
                 f"GRPO expects {self.advantage_key!r} shape [{N}], "
                 f"got {tuple(advantage_full.shape)}."
             )
-        advantage = advantage_full[1:].to(dtype=dtype)
+        advantage = advantage_full[1:].detach().to(dtype=dtype)
 
         pair_weight = _pair_weight(
             group_id=group_id,
@@ -308,7 +313,7 @@ class GrpoObjective(Objective[...]):
             device=device,
             dtype=dtype,
         )
-        pair_weight = pair_weight * executed[1:].to(dtype=dtype)
+        pair_weight = pair_weight * executed[1:].to(dtype=dtype) * readout[:-1]
         active = pair_weight > 0
         # Slice before softmax/exp: even NaN logits or stale log-probabilities
         # on a reset row cannot contaminate losses or gradients through 0 * NaN.
@@ -331,7 +336,7 @@ class GrpoObjective(Objective[...]):
                     f"GRPO expects {self.old_log_prob_key!r} shape [{N}], "
                     f"got {tuple(old_log_prob_full.shape)}."
                 )
-            old_log_prob = old_log_prob_full[1:][active].to(dtype=dtype)
+            old_log_prob = old_log_prob_full[1:][active].detach().to(dtype=dtype)
         else:
             old_log_prob = new_log_prob.detach()
 

@@ -22,7 +22,7 @@ class _Compose:
     def reseed(self, *, generation: int | None = None) -> None:
         """Call ``reseed(generation=...)`` on every stage that defines it."""
         for stage in self._stages:
-            fn = getattr(stage, "reseed", None)
+            fn = getattr(stage, "reseed", None) or getattr(getattr(stage, "__self__", None), "reseed", None)
             if callable(fn):
                 fn(generation=generation)
 
@@ -35,7 +35,7 @@ def compose(*, stages: Sequence[Callable[[Any], Any]]) -> _Compose:
     :class:`~mouse_core.data.augmenter.Augmenter`). ``DataLoader`` calls it
     once per sampled segment with a generation unique to that segment:
     ``batch_index * batch_size * (budget + 1) + fill * (budget + 1) + attempt``,
-    where ``budget`` is ``samples_budget`` or ``token_budget``.
+    where ``budget`` is ``events_budget`` or ``token_budget``.
 
     Train includes the augmenter; eval leaves it out so the model sees raw
     values::

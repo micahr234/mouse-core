@@ -1,6 +1,7 @@
 """Explicit head-output tokens: flagging, packing, objectives, multi-token readout."""
 
 from __future__ import annotations
+from tests._event_fixtures import encode_measurement
 from tests._model_helpers import ExampleModel as Model
 from tests._model_helpers import copy_model, simple_model
 
@@ -146,34 +147,17 @@ def _packed(model: Model):
 # ---------------------------------------------------------------------------
 
 
-def test_tokenizer_requires_exactly_one_head_output_field() -> None:
-    with pytest.raises(ValueError, match="exactly one input field with"):
-        Tokenizer(
-            input_fields=[{"type": "text", "input_field": "action", "format": "{field}"},
-                {
-                    "type": "text",
-                    "input_field": "repeat_episode_index",
-                    "format": "{field}",
-                    "when": when_step_index_zero,
-                },
-            ],
-        )
-    with pytest.raises(ValueError, match="exactly one input field with"):
-        Tokenizer(
-            input_fields=[
-                {"type": "text", "input_field": "action", "format": "{field}", "head_output": True},
-                {"type": "text", "input_field": "obs", "format": "{field}", "head_output": True},
-                {
-                    "type": "text",
-                    "input_field": "repeat_episode_index",
-                    "format": "{field}",
-                    "when": when_step_index_zero,
-                },
-            ],
-        )
+@pytest.mark.parametrize('head', [False, True])
+def test_tokenizer_supports_zero_or_multiple_head_fields(head) -> None:
+    tok = Tokenizer(tokenizer=_FakeTokenizer(), input_fields=[
+        dict(type='text', input_field=name, format='{field}', head_output=head)
+        for name in ('action', 'obs')
+    ])
+    step = encode_measurement(tok, {'action': 1, 'obs': 2})
+    assert step.head_token_mask.tolist() == [head, head]
 
 
-def test_step_without_head_output_token_raises() -> None:
+def test_step_without_head_output_token_is_retained() -> None:
     tok = Tokenizer(
         input_fields=[
             {"type": "text", "input_field": "action", "format": "{field}"},
@@ -181,7 +165,6 @@ def test_step_without_head_output_token_raises() -> None:
                 "type": "text",
                 "input_field": "reward",
                 "format": "{field}",
-                "required": False,
                 "head_output": True,
             },
             {
@@ -194,11 +177,11 @@ def test_step_without_head_output_token_raises() -> None:
         tokenizer=_FakeTokenizer(),
     )
     # Head-output field present → fine.
-    st = tok({"action": 1, "reward": 0.5, "episode_index": 0})
+    st = encode_measurement(tok, {"action": 1, "reward": 0.5, "episode_index": 0})
     assert st.head_token_mask.tolist() == [False] + [True] * len("0.5")
     # Head-output field missing → the step has no head-output token.
-    with pytest.raises(ValueError, match="no head-output tokens"):
-        tok({"action": 1, "reward": None, "episode_index": 0})
+    passive = encode_measurement(tok, {"action": 1, "reward": None, "episode_index": 0})
+    assert passive.token_ids.size == 1 and not passive.head_token_mask.any()
 
 
 def test_head_output_rejects_when() -> None:
@@ -410,7 +393,7 @@ def test_dqn_duplicated_rows_match_single_head_output() -> None:
     )
     assert torch.allclose(base_loss["action_value"], dup_loss["action_value"], atol=1e-6)
     for key in ("q_values_mean", "q_values_min", "q_values_max"):
-        assert base_metrics[key] == pytest.approx(dup_metrics[key], abs=1e-6)
+        torch.testing.assert_close(base_metrics[key], dup_metrics[key], rtol=1e-6, atol=1e-6)
 
 
 def test_dqn_multi_head_output_shares_step_target() -> None:

@@ -32,6 +32,7 @@ from __future__ import annotations
 import hashlib
 import threading
 from collections.abc import Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -90,25 +91,31 @@ class _ScalarDraw:
 
 @dataclass(frozen=True)
 class SequenceAugmentFieldSpec:
-    """Specification for augmenting one raw step-record field.
+    """Specification for augmenting a sparse event payload or legacy row field.
 
     Each spec has required ``input_field`` and a ``type``. Omitted
     ``output_field`` defaults to ``input_field``. Different names write
     outputs and leave inputs.
     Augmentation ``type`` values describe raw-data behavior, not embedding.
+    ``provider=None`` matches any event; a string filters the field to that
+    provider. Use ``Augmenter.events`` before ``Tokenizer.encode``.
+    Optional fields do not create missing payload values.
 
     For ``type='discrete'`` with ``permute=True``, ``input_field`` values are
     ids in ``[0, vocab_size)`` remapped by the sampled permutation.
     ``input_vector_field`` names optional id-indexed vectors (for example
-    ``info_q_star``) that share that permutation: each vector is reordered so
+    ``q_star``) that share that permutation: each vector is reordered so
     ``values[perm[i]]`` stays aligned with remapped ids. Omitted
     ``output_vector_field`` defaults to ``input_vector_field``. Different
     names write outputs and leave inputs.
     Vector layout is never inferred from array shape.
+    Missing or ``None`` fields are skipped without inserting outputs;
+    associated value vectors are still transformed when present.
     """
 
     type: Literal["discrete", "linear", "image"]
     input_field: str | Sequence[str]
+    provider: str | None = None
     output_field: str | Sequence[str] | None = None
     input_vector_field: str | Sequence[str] | None = None
     output_vector_field: str | Sequence[str] | None = None
@@ -130,6 +137,8 @@ class SequenceAugmentFieldSpec:
     mask_value: Any = None
 
     def __post_init__(self) -> None:
+        if self.provider is not None and (not isinstance(self.provider, str) or not self.provider):
+            raise ValueError("provider must be a nonempty string or None")
         kind = self.type.lower()
         if kind not in ("discrete", "linear", "image"):
             raise ValueError(
@@ -271,6 +280,7 @@ class SequenceAugmentFieldSpec:
         return (
             self.permute
             or self.mask_prob > 0.0
+            or self.input_fields != self.output_fields
             or linear_scale != 1.0
             or linear_shift != 0.0
             or (self.type == "image" and self.scale_spec().is_active(1.0))
@@ -279,7 +289,13 @@ class SequenceAugmentFieldSpec:
 
 
 class Augmenter:
-    """Callable augmenter for one step dict.
+    """Augment sparse event payloads or individual legacy row dictionaries.
+
+    ``events(events)`` preserves the source envelope and transforms each
+    payload independently. Field ``provider=None`` matches all events, while
+    named providers limit a transform. Missing or ``None`` fields are skipped.
+    Compose ``augmenter.events`` with
+    ``tokenizer.encode``; reseeding is forwarded through bound methods.
 
     ``seed_field`` is required: permute/scale/shift draws are keyed by that
     field's value so steps that share an id (e.g. the same episode) share draws
@@ -311,34 +327,60 @@ class Augmenter:
         self._lock = threading.Lock()
         self._tls = threading.local()
 
-    def __call__(self, step: dict) -> dict:
+    def __deepcopy__(self, memo):
+        """Copy configuration and calling-thread draws without sharing locks."""
+        clone = type(self).__new__(type(self))
+        memo[id(self)] = clone
+        for key, value in self.__dict__.items():
+            if key not in {"_lock", "_tls"}:
+                setattr(clone, key, deepcopy(value, memo))
+        clone._lock = threading.Lock()
+        clone._tls = threading.local()
+        clone._tls.__dict__.update(deepcopy(self._tls.__dict__, memo))
+        return clone
+
+    def __call__(self, step: dict, *, provider: str | None = None) -> dict:
         """Return an augmented copy of ``step``."""
         if not (self.enabled and any(spec.is_active() for spec in self.fields)):
             return step
         row = dict(step)
         draws = self._draws_for_step(row)
         for index, spec in enumerate(self.fields):
+            if spec.provider is not None and spec.provider != provider:
+                continue
             draw = draws[index]
             mask_this_step = self._sample_mask(spec)
             for in_f, out_f in zip(spec.input_fields, spec.output_fields):
-                if in_f not in row:
-                    raise KeyError(
-                        f"Augmenter field {in_f!r} is missing from the step"
-                    )
-                value = row[in_f]
-                if value is None and spec.type == "discrete":
-                    # No action ran. Still permute the associated value vector
-                    # below so reset-state targets use the episode's action order.
-                    row[out_f] = None
+                value = row.get(in_f)
+                if value is None:
                     continue
                 value = self._apply_permutation(spec, draw, value)
                 value = self._apply_scale_shift(spec, draw, value)
                 row[out_f] = self._mask_or_value(spec, value, mask_this_step)
             for in_f, out_f in zip(spec.input_vector_fields, spec.output_vector_fields):
-                if in_f not in row:
+                if row.get(in_f) is None:
                     continue
                 row[out_f] = self._apply_value_permutation(spec, draw, row[in_f])
         return row
+
+    def events(self, events):
+        """Augment event payloads with draws keyed by their envelope seed field.
+
+        Missing or ``None`` fields are skipped. Events are never
+        merged, and their source data and sampling indices remain unchanged.
+        """
+        from mouse_core.data.event_transform import _record
+        from mouse_core.data.events import EventLog
+        result = []
+        for source in events:
+            event = _record(source, encoded_payload=not isinstance(events, EventLog))
+            payload = event["payload"]
+            if self.seed_field in payload:
+                raise ValueError("Event augmentation seed must come from the event envelope")
+            row = self({**payload, self.seed_field: event[self.seed_field]}, provider=event["provider"])
+            row.pop(self.seed_field, None)
+            result.append({**event, "payload": row})
+        return result
 
     def reseed(self, *, generation: int | None = None) -> None:
         """Move the calling thread to a new draw set for every ``seed_field`` key.
@@ -365,6 +407,7 @@ class Augmenter:
             gen = int(generation)
         self._tls.generation = gen
         self._tls.draw_cache = {}
+        self._tls.mask_rng = None
 
     def fork(self, *, seed: int | None = None) -> Augmenter:
         """Create an equivalent augmenter with a different base seed."""
@@ -462,6 +505,10 @@ class Augmenter:
                 f"Cannot permute {spec.input_field!r} as an id; got array of "
                 f"shape {arr.shape}. Put id-indexed vectors on "
                 "input_vector_field=/output_vector_field=."
+            )
+        if arr.dtype.kind not in "iu":
+            raise ValueError(
+                f"Cannot permute {spec.input_field!r} value {value!r}; expected an integer id."
             )
         idx = int(value)
         if idx < 0 or idx >= len(perm):

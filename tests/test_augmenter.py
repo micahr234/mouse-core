@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import threading
+from typing import Any
 
 import numpy as np
 import pytest
@@ -89,7 +90,7 @@ def test_mask_probabilities_apply_to_configured_fields() -> None:
 
 
 def test_shared_action_permutation_also_permutates_action_value_targets() -> None:
-    step = {"action": 0, "prev_action": 1, "info_q_star": [10.0, 20.0, 30.0], "episode_index": 0}
+    step = {"action": 0, "prev_action": 1, "q_star": [10.0, 20.0, 30.0], "episode_index": 0}
     expected_perm = _rng_for_key(seed=0, seed_field="episode_index", key=0).permutation(3)
     expected_inverse = np.empty_like(expected_perm)
     expected_inverse[expected_perm] = np.arange(len(expected_perm))
@@ -101,8 +102,8 @@ def test_shared_action_permutation_also_permutates_action_value_targets() -> Non
                 "type": "discrete",
                 "input_field": ("action", "prev_action"),
                 "output_field": ("action", "prev_action"),
-                "input_vector_field": "info_q_star",
-                "output_vector_field": "info_q_star",
+                "input_vector_field": "q_star",
+                "output_vector_field": "q_star",
                 "vocab_size": 3,
                 "permute": True,
             }
@@ -111,7 +112,7 @@ def test_shared_action_permutation_also_permutates_action_value_targets() -> Non
     out = augment(step)
     assert out["action"] == int(expected_perm[0])
     assert out["prev_action"] == int(expected_perm[1])
-    assert out["info_q_star"] == np.take([10.0, 20.0, 30.0], expected_inverse).tolist()
+    assert out["q_star"] == np.take([10.0, 20.0, 30.0], expected_inverse).tolist()
 
 
 def test_input_vector_field_is_skipped_when_absent() -> None:
@@ -124,8 +125,8 @@ def test_input_vector_field_is_skipped_when_absent() -> None:
                 "type": "discrete",
                 "input_field": "action",
                 "output_field": "action",
-                "input_vector_field": "info_q_star",
-                "output_vector_field": "info_q_star",
+                "input_vector_field": "q_star",
+                "output_vector_field": "q_star",
                 "vocab_size": 3,
                 "permute": True,
             }
@@ -133,7 +134,7 @@ def test_input_vector_field_is_skipped_when_absent() -> None:
     )
     out = augment({"action": 0, "episode_index": 0})
     assert out["action"] == int(expected_perm[0])
-    assert "info_q_star" not in out
+    assert "q_star" not in out
 
 
 def test_mask_does_not_zero_vector_field() -> None:
@@ -148,17 +149,17 @@ def test_mask_does_not_zero_vector_field() -> None:
                 "type": "discrete",
                 "input_field": "action",
                 "output_field": "action",
-                "input_vector_field": "info_q_star",
-                "output_vector_field": "info_q_star",
+                "input_vector_field": "q_star",
+                "output_vector_field": "q_star",
                 "vocab_size": 3,
                 "permute": True,
                 "mask_prob": 1.0,
             }
         ],
     )
-    out = augment({"action": 0, "info_q_star": [10.0, 20.0, 30.0], "episode_index": 0})
+    out = augment({"action": 0, "q_star": [10.0, 20.0, 30.0], "episode_index": 0})
     assert out["action"] == 0
-    assert out["info_q_star"] == np.take([10.0, 20.0, 30.0], expected_inverse).tolist()
+    assert out["q_star"] == np.take([10.0, 20.0, 30.0], expected_inverse).tolist()
 
 
 def test_vector_rename_writes_output_keeps_input() -> None:
@@ -174,15 +175,15 @@ def test_vector_rename_writes_output_keeps_input() -> None:
                 "type": "discrete",
                 "input_field": "action",
                 "output_field": "action",
-                "input_vector_field": "info_q_star",
+                "input_vector_field": "q_star",
                 "output_vector_field": "q_star_aug",
                 "vocab_size": 3,
                 "permute": True,
             }
         ],
     )
-    out = augment({"action": 0, "info_q_star": q, "episode_index": 0})
-    assert out["info_q_star"] == q
+    out = augment({"action": 0, "q_star": q, "episode_index": 0})
+    assert out["q_star"] == q
     assert out["q_star_aug"] == np.take(q, expected_inverse).tolist()
     assert out["action"] == int(expected_perm[0])
 
@@ -194,15 +195,15 @@ def test_vector_on_input_field_raises() -> None:
         fields=[
             {
                 "type": "discrete",
-                "input_field": "info_q_star",
-                "output_field": "info_q_star",
+                "input_field": "q_star",
+                "output_field": "q_star",
                 "vocab_size": 3,
                 "permute": True,
             }
         ],
     )
     with pytest.raises(ValueError, match="input_vector_field"):
-        augment({"info_q_star": [10.0, 20.0, 30.0], "episode_index": 0})
+        augment({"q_star": [10.0, 20.0, 30.0], "episode_index": 0})
 
 
 def test_mask_decisions_vary_per_step_within_one_generation() -> None:
@@ -216,21 +217,25 @@ def test_mask_decisions_vary_per_step_within_one_generation() -> None:
     assert 0 in outs and 3 in outs
 
 
-def test_reseed_replaces_draw_cache() -> None:
+def test_reseed_replays_masks_and_permutations_for_the_same_generation() -> None:
     augment = Augmenter(
         seed=0,
         seed_field="episode_index",
         fields=[
-            {"type": 'discrete', "input_field": 'action', "output_field": 'action', "vocab_size": 10, "permute": True}
+            {"type": "discrete", "input_field": "action", "vocab_size": 10,
+             "permute": True, "mask_prob": 0.5, "mask_value": -1}
         ],
     )
-    for key in range(5):
-        augment({"action": 0, "episode_index": key})
-    assert len(augment._thread_draw_cache()) == 5
-    augment.reseed()
-    assert len(augment._thread_draw_cache()) == 0
-    augment({"action": 0, "episode_index": 0})
-    assert len(augment._thread_draw_cache()) == 1
+    def sequence():
+        return [augment({"action": i % 10, "episode_index": i // 8})["action"]
+                for i in range(64)]
+
+    augment.reseed(generation=7)
+    first = sequence()
+    augment.reseed(generation=7)
+    assert sequence() == first
+    augment.reseed(generation=8)
+    assert sequence() != first
 
 
 def test_reseed_generation_pins_thread_without_advancing_counter() -> None:
@@ -315,20 +320,6 @@ def test_reseed_changes_draws_for_same_key() -> None:
     assert after["action"] == augment({"action": 0, "episode_index": 7})["action"]
 
 
-def test_eval_compose_omits_augmenter() -> None:
-    augment = Augmenter(
-        seed=0,
-        seed_field="episode_index",
-        fields=[
-            {"type": "discrete", "input_field": "action", "output_field": "action", "vocab_size": 10, "permute": True}
-        ],
-    )
-    train_transform = compose(stages=(augment,))
-    step = {"action": 0, "episode_index": 7}
-    assert train_transform(step) == augment(step)
-    # eval is the raw step — no augmenter in the compose.
-
-
 def test_compose_reseed_forwards_to_augmenter() -> None:
     augment = Augmenter(
         seed=0,
@@ -359,15 +350,25 @@ def test_missing_seed_field_raises() -> None:
         augment({"action": 0})
 
 
-def test_missing_input_field_raises() -> None:
+def test_missing_input_field_is_skipped() -> None:
     augment = Augmenter(
         seed_field="episode_index",
         fields=[
             {"type": 'discrete', "input_field": 'action', "output_field": 'action', "vocab_size": 10, "permute": True}
         ],
     )
-    with pytest.raises(KeyError, match="action"):
-        augment({"episode_index": 0})
+    assert augment({"episode_index": 0}) == {"episode_index": 0}
+
+
+@pytest.mark.parametrize('kind', ['discrete', 'linear', 'image'])
+@pytest.mark.parametrize('payload', [{}, {'value': None, 'q': None}])
+def test_absent_or_none_inputs_do_not_create_augmented_outputs(kind, payload):
+    field: dict[str, Any] = dict(type=kind, input_field='value', output_field='augmented')
+    if kind == 'discrete':
+        field.update(vocab_size=4, permute=True, input_vector_field='q', output_vector_field='augmented_q')
+    augment = Augmenter(seed_field='episode_index', fields=[field])
+    row = {'episode_index': 0, **payload}
+    assert augment(row) == row
 
 
 def test_discrete_and_done_permutations_use_configured_vocab_sizes() -> None:
@@ -399,7 +400,8 @@ def test_image_scale_shift_clamps_to_pixel_range() -> None:
     assert augment(step)["obs_image"] == [0, 30, 255]
 
 
-def test_augmenter_rename_writes_output_keeps_input() -> None:
+@pytest.mark.parametrize("scale", [1.0, 2.0])
+def test_augmenter_rename_writes_output_keeps_input(scale) -> None:
     step = {"reward": 1.0, "episode_index": 0}
     augment = Augmenter(
         seed_field="episode_index",
@@ -411,13 +413,22 @@ def test_augmenter_rename_writes_output_keeps_input() -> None:
                 "scale_in_low": 0.0,
                 "scale_out_low": 0.0,
                 "scale_in_high": 1.0,
-                "scale_out_high": 2.0,
+                "scale_out_high": scale,
             }
         ]
     )
     out = augment(step)
     assert out["reward"] == 1.0
-    assert out["reward_aug"] == 2.0
+    assert out["reward_aug"] == scale
+
+
+@pytest.mark.parametrize("action", [1.5, -0.5, "1", True])
+def test_permutation_rejects_noninteger_action_ids(action):
+    augment = Augmenter(seed=0, seed_field="episode_index", fields=[
+        {"type": "discrete", "input_field": "action", "vocab_size": 3, "permute": True}
+    ])
+    with pytest.raises(ValueError, match="integer id"):
+        augment({"action": action, "episode_index": 0})
 
 
 def test_invalid_mask_probability_raises() -> None:
@@ -466,21 +477,21 @@ def test_input_vector_field_requires_permute() -> None:
             output_field="action",
             type="discrete",
             vocab_size=3,
-            input_vector_field="info_q_star",
-            output_vector_field="info_q_star",
+            input_vector_field="q_star",
+            output_vector_field="q_star",
         )
 
 
 def test_input_vector_field_must_not_overlap_input_field() -> None:
     with pytest.raises(ValueError, match="also appear on input_field"):
         SequenceAugmentFieldSpec(
-            input_field=("action", "info_q_star"),
-            output_field=("action", "info_q_star"),
+            input_field=("action", "q_star"),
+            output_field=("action", "q_star"),
             type="discrete",
             vocab_size=3,
             permute=True,
-            input_vector_field="info_q_star",
-            output_vector_field="info_q_star",
+            input_vector_field="q_star",
+            output_vector_field="q_star",
         )
 
 
@@ -490,10 +501,10 @@ def test_output_vector_field_defaults_to_input() -> None:
         type="discrete",
         vocab_size=3,
         permute=True,
-        input_vector_field="info_q_star",
+        input_vector_field="q_star",
     )
     assert spec.output_field == "action"
-    assert spec.output_vector_field == "info_q_star"
+    assert spec.output_vector_field == "q_star"
 
 
 def test_output_vector_field_requires_input() -> None:
@@ -503,7 +514,7 @@ def test_output_vector_field_requires_input() -> None:
             type="discrete",
             vocab_size=3,
             permute=True,
-            output_vector_field="info_q_star",
+            output_vector_field="q_star",
         )
 
 
@@ -515,6 +526,19 @@ def test_vector_field_arity_mismatch() -> None:
             type="discrete",
             vocab_size=3,
             permute=True,
-            input_vector_field=("info_q_star", "info_q_star_2"),
-            output_vector_field="info_q_star",
+            input_vector_field=("q_star", "q_star_2"),
+            output_vector_field="q_star",
         )
+
+
+def test_optional_action_stays_absent_while_value_labels_are_permuted():
+    augment = Augmenter(seed=12, seed_field='episode_index', fields=[{
+        'type': 'discrete', 'input_field': 'action',
+        'input_vector_field': 'q', 'vocab_size': 4, 'permute': True,
+    }])
+    row = {'episode_index': 0, 'q': [1., 3., 5., 7.]}
+    reset = augment(row)
+    assert 'action' not in reset and 'action' not in row
+    for action, value in enumerate(row['q']):
+        active = augment({**row, 'action': action})
+        assert reset['q'][active['action']] == value

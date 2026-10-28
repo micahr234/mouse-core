@@ -1,3 +1,6 @@
+from mouse_core.data.event_transform import EventTransform, environment_decisions, environment_episode_ranges, latest_environment_decision
+from mouse_core.data.events import EventLog
+from mouse_core.data.step_sampling import step_sample_ranges
 from mouse_core.data.dataloader import DataLoader
 from mouse_core.data.epoch_loader import EpochDataLoader
 from mouse_core.data.datastore import Datastore
@@ -8,7 +11,7 @@ from mouse_core.data.augmenter import (
 )
 from mouse_core.data.compose import compose
 from mouse_core.data.modality import TokenizerModalitySpec
-from mouse_core.data.tokenizer import Tokenizer, load_tokenizer, save_tokenizer
+from mouse_core.data.tokenizer import Tokenizer, EventTokenStream, load_tokenizer, save_tokenizer
 from mouse_core.data.token_batch import (
     StepTokens,
     TokenBatch,
@@ -28,6 +31,13 @@ __all__ = [
     "SequenceAugmentFieldSpec",
     "TokenizerModalitySpec",
     "Tokenizer",
+    "EventTokenStream",
+    "step_sample_ranges",
+    "EventTransform",
+    "environment_decisions",
+    "environment_episode_ranges",
+    "latest_environment_decision",
+    "EventLog",
     "load_tokenizer",
     "save_tokenizer",
     "StepTokens",

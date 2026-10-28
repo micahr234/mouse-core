@@ -10,10 +10,17 @@ import torch.nn.functional as F
 from mouse_core.objectives.base import Objective, _reject_predictions, _require_prediction
 
 
+def _integer_actions(actions: torch.Tensor) -> torch.Tensor:
+    """Convert integer storage types without silently truncating action labels."""
+    if actions.is_floating_point() or actions.is_complex() or actions.dtype == torch.bool:
+        raise TypeError("target actions must have an integer dtype.")
+    return actions.to(dtype=torch.int64)
+
+
 def best_action(q_targets: torch.Tensor) -> torch.Tensor:
     """Index of a uniformly random finite maximizer per row.
 
-    Callers that distill from a Q vector (e.g. ``info_q_star``) run this
+    Callers that distill from a Q vector (e.g. ``q_star``) run this
     outside ``SpObjective`` and pass the resulting action ids as
     ``targets=``.
 
@@ -47,6 +54,9 @@ def sp_ce(
             hard label.
         invalid: Optional ``[N, A]`` bool; ``True`` marks a padded action.
     """
+    if not 0.0 <= label_smoothing <= 1.0:
+        raise ValueError("label_smoothing must be in [0, 1].")
+    target_actions = _integer_actions(target_actions)
     if target_actions.ndim != 1:
         raise ValueError(
             f"sp_ce target_actions must be 1-D [N], got shape {tuple(target_actions.shape)}."
@@ -70,7 +80,8 @@ def sp_ce(
             raise TypeError(
                 f"sp_ce invalid must be bool, got {invalid.dtype}."
             )
-    fill = torch.finfo(logits.dtype).min / 4
+        if bool(invalid.gather(dim=-1, index=target_actions.unsqueeze(-1)).any()):
+            raise ValueError("sp_ce target labels must not select an invalid action.")
     if invalid is None:
         log_probs = F.log_softmax(logits, dim=-1)
         nll = -log_probs.gather(dim=-1, index=target_actions.unsqueeze(-1)).squeeze(-1)
@@ -78,12 +89,12 @@ def sp_ce(
             smooth = -log_probs.mean(dim=-1)
             nll = (1.0 - label_smoothing) * nll + label_smoothing * smooth
         return nll.mean()
-    log_probs = F.log_softmax(logits.masked_fill(invalid, fill), dim=-1)
+    log_probs = F.log_softmax(logits.masked_fill(invalid, -torch.inf), dim=-1)
     nll = -log_probs.gather(dim=-1, index=target_actions.unsqueeze(-1)).squeeze(-1)
     if label_smoothing > 0.0:
         valid = (~invalid).to(dtype=log_probs.dtype)
         num_valid = valid.sum(dim=-1).clamp(min=1.0)
-        smooth = -(log_probs * valid).sum(dim=-1) / num_valid
+        smooth = -log_probs.masked_fill(invalid, 0).sum(dim=-1) / num_valid
         nll = (1.0 - label_smoothing) * nll + label_smoothing * smooth
     return nll.mean()
 
@@ -191,7 +202,7 @@ class SpObjective(Objective[...]):
                 f"SpObjective: targets must have shape "
                 f"{tuple(leading)} or {(*leading, 1)}, got {tuple(target_tensor.shape)}."
             )
-        target_actions = target_tensor.reshape(-1).to(dtype=torch.long)
+        target_actions = _integer_actions(target_tensor).reshape(-1)
         if not valid_rows.any():
             raise ValueError(
                 "SpObjective: no rows left after applying the skip mask."

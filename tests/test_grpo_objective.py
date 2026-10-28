@@ -72,6 +72,32 @@ def test_grpo_objective_all_out_of_run_pairs_yield_zero_loss() -> None:
     assert abs(metrics['advantage_mean']) < 1e-05
 
 
+def test_grpo_rejects_compensating_missing_and_extra_head_rows() -> None:
+    data = {
+        "action": torch.zeros(3, dtype=torch.int64),
+        "advantage": torch.ones(3),
+        "head_output_count": torch.tensor([0, 2, 1]),
+    }
+    with pytest.raises(ValueError, match="one prediction row per step"):
+        GrpoObjective()(objective_data=data, group_id=torch.zeros(3, dtype=torch.int64),
+                        predictions=torch.zeros(3, 2))
+
+
+def test_grpo_behavior_log_probabilities_and_advantages_are_fixed_targets() -> None:
+    logits = torch.zeros(3, 2, requires_grad=True)
+    old_log_prob = torch.full((3,), -0.7, requires_grad=True)
+    advantage = torch.tensor([0., 1., -1.], requires_grad=True)
+    losses, _ = GrpoObjective(ent_coef=0.0)(
+        objective_data={'action': torch.zeros(3, dtype=torch.int64),
+                        'old_log_prob': old_log_prob, 'advantage': advantage},
+        group_id=torch.zeros(3, dtype=torch.int64), predictions=logits,
+    )
+    losses['grpo'].backward()
+    assert old_log_prob.grad is None
+    assert advantage.grad is None
+    assert logits.grad is not None and logits.grad.abs().sum() > 0
+
+
 def test_ignored_reset_action_has_no_policy_gradient_or_metrics():
     data = {
         'action': torch.tensor([0, 1, 0, 1]),
@@ -135,6 +161,7 @@ def test_asymmetric_policy_ratio_clipping(ratio, advantage, expected_loss, clipp
     assert losses['grpo'].item() == pytest.approx(expected_loss)
     assert metrics['clipfrac'] == float(clipped)
     losses['grpo'].backward()
+    assert logits.grad is not None
     assert bool(logits.grad.abs().sum() > 0) == (not clipped)
 
 
@@ -193,6 +220,7 @@ def test_policy_importance_sampling_level_separates_branches_and_skips_resets(le
     assert losses['grpo'].item() == pytest.approx(expected)
     assert metrics['clipfrac'] == pytest.approx(2./3. if level == 'action' else 1./3.)
     losses['grpo'].backward()
+    assert logits.grad is not None
     if level == 'episode':
         assert logits.grad[0,0].item() == pytest.approx(-1./6.)
         assert logits.grad[2,0].item() == pytest.approx(-1./6.)

@@ -129,12 +129,17 @@ def test_input_norm_precedes_residual_blocks_without_an_extra_final_norm(num_lay
     head = MLP(in_features=8, out_features=3, hidden_dim=12, num_layers=num_layers)
     with torch.no_grad():
         for block in head.layers[:-1]:
+            assert isinstance(block, ResidualBlock)
             block.output_linear.weight.zero_()
             block.output_linear.bias.zero_()
         if num_layers > 1:
-            head.layers[-2].output_linear.bias.fill_(2.0)
+            block = head.layers[-2]
+            assert isinstance(block, ResidualBlock)
+            block.output_linear.bias.fill_(2.0)
     x = torch.randn(2, 8) * torch.tensor([[0.01], [100.]])
     output = head.layers[-1]
+    assert isinstance(output, torch.nn.Linear)
+    assert isinstance(head.input_norm, torch.nn.RMSNorm)
     features = torch.nn.functional.rms_norm(x, (8,), head.input_norm.weight, eps=1e-5)
     if num_layers > 1:
         features = features + 2.0
@@ -171,8 +176,10 @@ def test_output_norm_normalizes_after_the_final_linear_with_learned_gain(num_lay
     assert torch.isfinite(head.output_norm.weight.grad).all()
     assert head.output_norm.weight.grad.abs().sum() > 0
     with torch.no_grad():
-        head.layers[-1].weight.mul_(100)
-        head.layers[-1].bias.mul_(100)
+        output = head.layers[-1]
+        assert isinstance(output, torch.nn.Linear) and output.bias is not None
+        output.weight.mul_(100)
+        output.bias.mul_(100)
     torch.testing.assert_close(head(x), result, atol=1e-5, rtol=1e-4)
     gain = torch.tensor([0.5, 1.5, 2.0])
     with torch.no_grad():
@@ -191,8 +198,10 @@ def test_normalization_options_require_booleans(field, value):
 def test_final_linear_has_no_output_activation(num_layers):
     head = MLP(in_features=8, out_features=3, hidden_dim=12, num_layers=num_layers)
     with torch.no_grad():
-        head.layers[-1].weight.zero_()
-        head.layers[-1].bias.fill_(-3.0)
+        output = head.layers[-1]
+        assert isinstance(output, torch.nn.Linear) and output.bias is not None
+        output.weight.zero_()
+        output.bias.fill_(-3.0)
     result = head(torch.randn(2, 8, dtype=torch.bfloat16))
     assert result.dtype == torch.float32
     torch.testing.assert_close(result, torch.full((2, 3), -3.0), rtol=0, atol=0)

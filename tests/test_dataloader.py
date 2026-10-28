@@ -1,5 +1,8 @@
 from __future__ import annotations
+from functools import partial
+from tests._event_fixtures import encode_measurement
 from tests._token_batch_helpers import embed_batch
+from tests._event_fixtures import measurement_store, append_measurement, measurement_replay
 
 """Tests for DataLoader batch sampling and transform pipeline."""
 
@@ -17,6 +20,7 @@ from datasets import Dataset
 from mouse_core.data import (
     Augmenter,
     DataLoader,
+    EventTransform,
     Datastore,
     Tokenizer,
     compose,
@@ -33,16 +37,14 @@ def when_step_index_zero(ctx):
 
 
 def _store_with_actions() -> Datastore:
-    store = Datastore()
+    store = measurement_store()
     for action in range(8):
-        store.append(
-            data={
+        append_measurement(store, fields={
                 "action": action + 1,
                 "reward": float(action),
                 "repeat_episode_done": 0,
                 "episode_done": 0,
-            }
-        )
+            })
     return store
 
 
@@ -78,7 +80,7 @@ def _stamp_grouping(step: dict) -> dict:
 
 
 def _transform(**kwargs):
-    return compose(stages=(_stamp_grouping, _tokenizer(**kwargs)))
+    return compose(stages=(_stamp_grouping, partial(encode_measurement, _tokenizer(**kwargs))))
 
 
 def _loader(**kwargs) -> DataLoader:
@@ -86,6 +88,9 @@ def _loader(**kwargs) -> DataLoader:
     kwargs.setdefault("transform", _transform())
     kwargs.setdefault("stores", _store_with_actions())
     kwargs.setdefault("num_workers", 0)
+    if kwargs["sample_field"]:
+        kwargs["sample_field"] = "payload." + kwargs["sample_field"]
+    kwargs["transform"] = EventTransform(encode=kwargs["transform"], decode=measurement_replay)
     return DataLoader(**kwargs)
 
 
@@ -99,10 +104,10 @@ def _free_threading_ok() -> bool:
 def test_dataloader_requires_num_workers() -> None:
     with pytest.raises(TypeError, match="num_workers"):
         DataLoader(  # type: ignore[call-arg]
-            samples_budget=3,
+            events_budget=3,
             batch_size=1,
-            sample_field="action",
-            transform=_transform(),
+            sample_field='payload.action',
+            transform=EventTransform(encode=_transform(), decode=measurement_replay),
             stores=_store_with_actions(),
         )
 
@@ -110,9 +115,9 @@ def test_dataloader_requires_num_workers() -> None:
 def test_dataloader_requires_transform() -> None:
     with pytest.raises(TypeError, match="transform"):
         DataLoader(
-            samples_budget=3,
+            events_budget=3,
             batch_size=1,
-            sample_field="action",
+            sample_field='payload.action',
             num_workers=0,
             transform=None,  # type: ignore[arg-type]
             stores=_store_with_actions(),
@@ -139,10 +144,10 @@ def test_dataloader_applies_augmenter_before_returning_batch() -> None:
         seed=0,
     )
     loader = _loader(
-        samples_budget=3,
+        events_budget=3,
         batch_size=2,
         num_workers=0,
-        transform=compose(stages=(_stamp_episode, augmenter, _stamp_grouping, _tokenizer())),
+        transform=compose(stages=(_stamp_episode, augmenter, _stamp_grouping, partial(encode_measurement, _tokenizer()))),
     )
     tb, obj, _sid = loader.next_batch()
     assert isinstance(tb, TokenBatch)
@@ -170,12 +175,12 @@ def test_dataloader_reseeds_transform_each_batch() -> None:
     )
     assert augmenter._generation == 0
     loader = _loader(
-        samples_budget=1,
+        events_budget=1,
         batch_size=1,
         sample_field="action",
         num_workers=0,
         seed=0,
-        transform=compose(stages=(_stamp_episode, augmenter, _stamp_grouping, _tokenizer())),
+        transform=compose(stages=(_stamp_episode, augmenter, _stamp_grouping, partial(encode_measurement, _tokenizer()))),
     )
     # One-step samples. The fill keeps the first draw and reseeds the one that does not fit.
     stride = 1 * (1 + 1)
@@ -192,17 +197,15 @@ def test_dataloader_reseeds_transform_each_batch() -> None:
 
 def test_dataloader_same_seed_field_on_two_sequences_uses_two_seeds() -> None:
     """Same index on two rollouts in one batch must start from different seeds."""
-    store = Datastore()
+    store = measurement_store()
     for _ in range(8):
-        store.append(
-            data={
+        append_measurement(store, fields={
                 "action": 0,
                 "reward": 0.0,
                 "repeat_episode_done": 0,
                 "episode_done": 0,
                 "episode_index": 7,
-            }
-        )
+            })
 
     augmenter = Augmenter(
         seed=0,
@@ -223,12 +226,12 @@ def test_dataloader_same_seed_field_on_two_sequences_uses_two_seeds() -> None:
     per_fill = budget + 1
     loader = DataLoader(
         stores=store,
-        samples_budget=budget,
+        events_budget=budget,
         batch_size=batch_size,
-        sample_field="episode_index",
+        sample_field='payload.episode_index',
         num_workers=0,
         seed=0,
-        transform=compose(stages=(augmenter, _stamp_grouping, _tokenizer(objective_fields=_obj("action")))),
+        transform=EventTransform(encode=compose(stages=(augmenter, _stamp_grouping, partial(encode_measurement, _tokenizer(objective_fields=_obj("action"))))), decode=measurement_replay),
     )
     _, obj, group_id = loader.next_batch()
     actions = obj["action"]
@@ -265,20 +268,20 @@ class _ThreadMarkerTransform:
         thread_name = threading.current_thread().name
         row = {**step, "transform_thread": thread_name}
         self.captured.append(row)
-        return self.base(self.grouper(row))
+        return encode_measurement(self.base, self.grouper(row))
 
 
 @pytest.mark.skipif(not _free_threading_ok(), reason="free-threading (GIL disabled) required")
 def test_dataloader_runs_transform_in_worker_thread() -> None:
     marker = _ThreadMarkerTransform(_tokenizer(objective_fields=_obj("action", "reward")))
     loader = DataLoader(
-        samples_budget=3,
+        events_budget=3,
         batch_size=2,
-        sample_field="action",
+        sample_field='payload.action',
         num_workers=1,
         prefetch=1,
         seed=0,
-        transform=marker,
+        transform=EventTransform(encode=marker, decode=measurement_replay),
         stores=_store_with_actions(),
     )
     try:
@@ -304,16 +307,16 @@ def test_dataloader_worker_error_surfaces_even_with_full_prefetch_queue() -> Non
             n = calls
         if n > 6:
             raise ValueError("boom from worker")
-        return tokenizer(_stamp_grouping(step))
+        return encode_measurement(tokenizer, _stamp_grouping(step))
 
     loader = DataLoader(
-        samples_budget=1,
+        events_budget=1,
         batch_size=1,
-        sample_field="action",
+        sample_field='payload.action',
         num_workers=1,
         prefetch=2,
         seed=0,
-        transform=_failing,
+        transform=EventTransform(encode=_failing, decode=measurement_replay),
         stores=_store_with_actions(),
     )
     try:
@@ -329,27 +332,27 @@ def test_dataloader_worker_error_surfaces_even_with_full_prefetch_queue() -> Non
 def test_dataloader_validates_batch_size_length_and_prefetch() -> None:
     store = _store_with_actions()
     with pytest.raises(ValueError, match="batch_size must be >= 1"):
-        _loader(samples_budget=3, batch_size=0, num_workers=0, stores=store)
+        _loader(events_budget=3, batch_size=0, num_workers=0, stores=store)
     with pytest.raises(ValueError, match="exactly one"):
         _loader(batch_size=1, num_workers=0, stores=store)
     with pytest.raises(ValueError, match="batch_size is required"):
-        _loader(samples_budget=3, num_workers=0, stores=store)
+        _loader(events_budget=3, num_workers=0, stores=store)
     with pytest.raises(ValueError, match="batch_size is required"):
         _loader(token_budget=4, num_workers=0, stores=store)
     with pytest.raises(ValueError, match="exactly one"):
         _loader(
-            samples_budget=3,
+            events_budget=3,
             token_budget=8,
             batch_size=1,
             num_workers=0,
             stores=store,
         )
-    with pytest.raises(TypeError, match="sample_field"):
+    with pytest.raises(ValueError, match="sample_field"):
         DataLoader(  # type: ignore[call-arg] -- intentionally omit required argument
             token_budget=4,
             batch_size=1,
             num_workers=0,
-            transform=_transform(),
+            transform=EventTransform(encode=_transform(), decode=measurement_replay),
             stores=store,
         )
     with pytest.raises(ValueError, match="sample_field"):
@@ -361,35 +364,31 @@ def test_dataloader_validates_batch_size_length_and_prefetch() -> None:
             num_workers=0,
             stores=store,
         )
-    with pytest.raises(ValueError, match="samples_budget must be >= 1"):
-        _loader(samples_budget=0, batch_size=1, num_workers=0, stores=store)
+    with pytest.raises(ValueError, match="events_budget must be >= 1"):
+        _loader(events_budget=0, batch_size=1, num_workers=0, stores=store)
     with pytest.raises(ValueError, match="prefetch must be >= 1"):
-        _loader(samples_budget=3, batch_size=1, num_workers=0, prefetch=0, stores=store)
+        _loader(events_budget=3, batch_size=1, num_workers=0, prefetch=0, stores=store)
 
 
 def test_dataloader_num_workers_requires_free_threading() -> None:
     store = _store_with_actions()
     with patch.object(sysconfig, "get_config_var", return_value=0):
         with pytest.raises(RuntimeError, match="free-threaded"):
-            _loader(samples_budget=3, batch_size=1, num_workers=1, stores=store)
+            _loader(events_budget=3, batch_size=1, num_workers=1, stores=store)
     if sysconfig.get_config_var("Py_GIL_DISABLED"):
         with patch.object(sys, "_is_gil_enabled", return_value=True):
             with pytest.raises(RuntimeError, match="free-threaded|GIL"):
-                _loader(samples_budget=3, batch_size=1, num_workers=1, stores=store)
+                _loader(events_budget=3, batch_size=1, num_workers=1, stores=store)
 
 
 def test_dataloader_snapshots_loaded_source_and_appended_rows() -> None:
-    store = Datastore()
-    store.from_dataset(
-        ds=Dataset.from_list(
-            [
-                {"action": 1, "reward": 0.0, "repeat_episode_done": 0, "episode_done": 0},
-                {"action": 2, "reward": 0.0, "repeat_episode_done": 0, "episode_done": 0},
-            ]
-        )
-    )
-    store.append(data={"action": 3, "reward": 0.0, "repeat_episode_done": 0, "episode_done": 0})
-    loader = _loader(samples_budget=1, batch_size=1, num_workers=0, seed=0, stores=store)
+    store = measurement_store()
+    source = measurement_store()
+    for action in (1, 2):
+        append_measurement(source, fields={"action": action, "reward": 0.0, "repeat_episode_done": 0, "episode_done": 0})
+    store.from_dataset(ds=source.to_dataset())
+    append_measurement(store, fields={"action": 3, "reward": 0.0, "repeat_episode_done": 0, "episode_done": 0})
+    loader = _loader(events_budget=1, batch_size=1, num_workers=0, seed=0, stores=store)
     seen: set[int] = set()
     for _ in range(24):
         _, obj, _sid = loader.next_batch()
@@ -414,16 +413,16 @@ def _tb_signature(
 
 def test_dataloader_seed_is_deterministic() -> None:
     store = _store_with_actions()
-    loader_a = _loader(samples_budget=3, batch_size=2, num_workers=0, seed=42, stores=store)
-    loader_b = _loader(samples_budget=3, batch_size=2, num_workers=0, seed=42, stores=store)
+    loader_a = _loader(events_budget=3, batch_size=2, num_workers=0, seed=42, stores=store)
+    loader_b = _loader(events_budget=3, batch_size=2, num_workers=0, seed=42, stores=store)
     assert _tb_signature(loader_a.next_batch()) == _tb_signature(loader_b.next_batch())
 
 
 @pytest.mark.skipif(not _free_threading_ok(), reason="free-threading (GIL disabled) required")
 def test_dataloader_seed_is_deterministic_with_workers() -> None:
     store = _store_with_actions()
-    loader_a = _loader(samples_budget=3, batch_size=2, num_workers=1, seed=42, stores=store)
-    loader_b = _loader(samples_budget=3, batch_size=2, num_workers=1, seed=42, stores=store)
+    loader_a = _loader(events_budget=3, batch_size=2, num_workers=1, seed=42, stores=store)
+    loader_b = _loader(events_budget=3, batch_size=2, num_workers=1, seed=42, stores=store)
     try:
         assert _tb_signature(loader_a.next_batch()) == _tb_signature(loader_b.next_batch())
     finally:
@@ -451,7 +450,7 @@ def _augmented_transform() -> Any:
             }
         ],
     )
-    return compose(stages=(_stamp, augment, _tokenizer(objective_fields=_obj("action"))))
+    return compose(stages=(_stamp, augment, partial(encode_measurement, _tokenizer(objective_fields=_obj("action")))))
 
 
 def _signatures(loader: DataLoader, n: int) -> list[tuple]:
@@ -462,7 +461,7 @@ def test_dataloader_batch_k_is_independent_of_num_workers() -> None:
     """Sync and threaded loaders with the same seed yield the identical ordered stream."""
     store = _store_with_actions()
     sync = _loader(
-        samples_budget=3, batch_size=2, num_workers=0, seed=7, stores=store,
+        events_budget=3, batch_size=2, num_workers=0, seed=7, stores=store,
         transform=_augmented_transform(),
     )
     expected = _signatures(sync, 12)
@@ -470,7 +469,7 @@ def test_dataloader_batch_k_is_independent_of_num_workers() -> None:
     if not _free_threading_ok():
         return
     threaded = _loader(
-        samples_budget=3, batch_size=2, num_workers=4, prefetch=2, seed=7, stores=store,
+        events_budget=3, batch_size=2, num_workers=4, prefetch=2, seed=7, stores=store,
         transform=_augmented_transform(),
     )
     try:
@@ -482,10 +481,10 @@ def test_dataloader_batch_k_is_independent_of_num_workers() -> None:
 @pytest.mark.skipif(not _free_threading_ok(), reason="free-threading (GIL disabled) required")
 def test_dataloader_refresh_resumes_numbering_at_next_unseen_batch() -> None:
     store = _store_with_actions()
-    reference = _loader(samples_budget=3, batch_size=2, num_workers=0, seed=3, stores=store)
+    reference = _loader(events_budget=3, batch_size=2, num_workers=0, seed=3, stores=store)
     expected = _signatures(reference, 8)
     loader = _loader(
-        samples_budget=3, batch_size=2, num_workers=3, prefetch=4, seed=3, stores=store
+        events_budget=3, batch_size=2, num_workers=3, prefetch=4, seed=3, stores=store
     )
     try:
         got = _signatures(loader, 3)
@@ -499,8 +498,8 @@ def test_dataloader_refresh_resumes_numbering_at_next_unseen_batch() -> None:
 
 def test_dataloader_unseeded_stream_is_still_ordered_and_fresh() -> None:
     store = _store_with_actions()
-    a = _loader(samples_budget=3, batch_size=2, num_workers=0, stores=store)
-    b = _loader(samples_budget=3, batch_size=2, num_workers=0, stores=store)
+    a = _loader(events_budget=3, batch_size=2, num_workers=0, stores=store)
+    b = _loader(events_budget=3, batch_size=2, num_workers=0, stores=store)
     assert a.seed is None and b.seed is None
     assert a._entropy != b._entropy
     a.next_batch()
@@ -517,13 +516,13 @@ def test_dataloader_index_field_stamps_store_offset() -> None:
 
     loader = DataLoader(
         stores=store,
-        samples_budget=3,
+        events_budget=3,
         batch_size=1,
-        sample_field="action",
+        sample_field='payload.action',
         num_workers=0,
         seed=0,
         index_field="store_index",
-        transform=transform,
+        transform=EventTransform(encode=transform, decode=measurement_replay),
     )
     loader.next_batch()
     assert seen
@@ -531,12 +530,12 @@ def test_dataloader_index_field_stamps_store_offset() -> None:
 
 
 def test_dataloader_refresh_picks_up_appended_rows() -> None:
-    store = Datastore()
+    store = measurement_store()
     for action in (1, 2, 3):
-        store.append(data={"action": action, "reward": 0.0, "repeat_episode_done": 0, "episode_done": 0})
-    loader = _loader(samples_budget=3, batch_size=1, num_workers=0, stores=store)
+        append_measurement(store, fields={"action": action, "reward": 0.0, "repeat_episode_done": 0, "episode_done": 0})
+    loader = _loader(events_budget=3, batch_size=1, num_workers=0, stores=store)
     loader.next_batch()
-    store.append(data={"action": 4, "reward": 0.0, "repeat_episode_done": 0, "episode_done": 0})
+    append_measurement(store, fields={"action": 4, "reward": 0.0, "repeat_episode_done": 0, "episode_done": 0})
     _, obj_before, _sid = loader.next_batch()
     assert all(int(a) != 4 for a in obj_before["action"])
     loader.refresh()
@@ -549,14 +548,14 @@ def test_dataloader_refresh_picks_up_appended_rows() -> None:
 
 @pytest.mark.skipif(not _free_threading_ok(), reason="free-threading (GIL disabled) required")
 def test_dataloader_refresh_drains_prefetch_queue_and_updates_store_sizes() -> None:
-    store = Datastore()
+    store = measurement_store()
     for action in range(3):
-        store.append(data={"action": action, "reward": 0.0, "repeat_episode_done": 0, "episode_done": 0})
-    loader = _loader(samples_budget=2, batch_size=1, num_workers=1, prefetch=2, stores=store)
+        append_measurement(store, fields={"action": action, "reward": 0.0, "repeat_episode_done": 0, "episode_done": 0})
+    loader = _loader(events_budget=2, batch_size=1, num_workers=1, prefetch=2, stores=store)
     try:
         loader.next_batch()
         assert loader._ns == [3]
-        store.append(data={"action": 99, "reward": 0.0, "repeat_episode_done": 0, "episode_done": 0})
+        append_measurement(store, fields={"action": 99, "reward": 0.0, "repeat_episode_done": 0, "episode_done": 0})
         loader.refresh()
         assert loader._ns == [4]
     finally:
@@ -565,19 +564,17 @@ def test_dataloader_refresh_drains_prefetch_queue_and_updates_store_sizes() -> N
 
 def test_dataloader_keeps_a_short_sample_and_packs_another_copy() -> None:
     """A sample shorter than the step budget is kept whole. Another copy is added while it fits."""
-    store = Datastore()
+    store = measurement_store()
     for action in (1, 2, 3):
-        store.append(
-            data={
+        append_measurement(store, fields={
                 "action": action,
                 "reward": 0.0,
                 "repeat_episode_done": 0,
                 "episode_done": 0,
                 "sample_id": 0,
-            }
-        )
+            })
     loader = _loader(
-        samples_budget=8,
+        events_budget=8,
         sample_field="sample_id",
         batch_size=1,
         num_workers=0,
@@ -591,21 +588,21 @@ def test_dataloader_keeps_a_short_sample_and_packs_another_copy() -> None:
 
 
 def test_dataloader_allows_short_stores() -> None:
-    store = Datastore()
-    store.append(data={"action": 7, "reward": 1.0, "repeat_episode_done": 0, "episode_done": 0})
-    loader = _loader(samples_budget=4, batch_size=1, num_workers=0, stores=store)
+    store = measurement_store()
+    append_measurement(store, fields={"action": 7, "reward": 1.0, "repeat_episode_done": 0, "episode_done": 0})
+    loader = _loader(events_budget=4, batch_size=1, num_workers=0, stores=store)
     tb, obj, _sid = loader.next_batch()
     assert int(tb.step_counts()[0]) == 1
     assert int(obj["action"][0]) == 7
 
 
 def test_dataloader_allows_empty_stores_until_sampling() -> None:
-    store = Datastore()
-    loader = _loader(samples_budget=2, batch_size=1, num_workers=0, stores=store)
+    store = measurement_store()
+    loader = _loader(events_budget=2, batch_size=1, num_workers=0, stores=store)
     try:
-        with pytest.raises(ValueError, match="all stores are empty"):
+        with pytest.raises(ValueError, match="no eligible samples"):
             loader.next_batch()
-        store.append(data={"action": 1, "reward": 0.0, "repeat_episode_done": 0, "episode_done": 0})
+        append_measurement(store, fields={"action": 1, "reward": 0.0, "repeat_episode_done": 0, "episode_done": 0})
         loader.refresh()
         tb, _, _sid = loader.next_batch()
         assert int(tb.step_counts()[0]) == 1
@@ -619,11 +616,11 @@ def test_dataloader_transform_returns_token_batch() -> None:
     from mouse_core.models import Embedding
     embedding = Embedding(hidden_dim=8, vocab_size=32)
     loader = DataLoader(
-        samples_budget=3,
+        events_budget=3,
         batch_size=2,
-        sample_field="action",
+        sample_field='payload.action',
         num_workers=0,
-        transform=compose(stages=(_stamp_grouping, token_tokenizer("action"))),
+        transform=EventTransform(encode=compose(stages=(_stamp_grouping, partial(encode_measurement, token_tokenizer("action")))), decode=measurement_replay),
         stores=_store_with_actions(),
     )
     try:
@@ -644,7 +641,7 @@ def test_dataloader_transform_returns_token_batch() -> None:
 
 def _run_store() -> Datastore:
     """Three contiguous ``sample_id`` runs, lengths 2, 3, and 1."""
-    store = Datastore()
+    store = measurement_store()
     rows = (
         (10, 0),
         (11, 0),
@@ -654,15 +651,13 @@ def _run_store() -> Datastore:
         (15, 2),
     )
     for action, sample_id in rows:
-        store.append(
-            data={
+        append_measurement(store, fields={
                 "action": action,
                 "reward": 0.0,
                 "repeat_episode_done": 0,
                 "episode_done": 0,
                 "sample_id": sample_id,
-            }
-        )
+            })
     return store
 
 
@@ -670,9 +665,9 @@ def _index_transform():
     return compose(
         stages=(
             _stamp_grouping,
-            _tokenizer(
+            partial(encode_measurement, _tokenizer(
                 objective_fields=_obj("action", "store_index", "sample_id")
-            ),
+            )),
         )
     )
 
@@ -695,7 +690,7 @@ def test_dataloader_sample_is_a_contiguous_equal_run() -> None:
     """Every packed sequence is one maximal run of equal ``sample_field`` values."""
     store = _run_store()
     loader = _loader(
-        samples_budget=3,
+        events_budget=3,
         sample_field="sample_id",
         batch_size=1,
         num_workers=0,
@@ -718,28 +713,24 @@ def test_dataloader_sample_is_a_contiguous_equal_run() -> None:
 
 def test_dataloader_samples_uniformly_over_runs() -> None:
     """The first draw of a fill is uniform over runs, including a one-row run."""
-    store = Datastore()
+    store = measurement_store()
     for i in range(20):
-        store.append(
-            data={
+        append_measurement(store, fields={
                 "action": i + 1,
                 "reward": 0.0,
                 "repeat_episode_done": 0,
                 "episode_done": 0,
                 "sample_id": 0,
-            }
-        )
-    store.append(
-        data={
+            })
+    append_measurement(store, fields={
             "action": 99,
             "reward": 0.0,
             "repeat_episode_done": 0,
             "episode_done": 0,
             "sample_id": 1,
-        }
-    )
+        })
     loader = _loader(
-        samples_budget=20,
+        events_budget=20,
         sample_field="sample_id",
         batch_size=1,
         num_workers=0,
@@ -771,7 +762,7 @@ def test_dataloader_missing_sample_field_raises() -> None:
     store = _store_with_actions()
     with pytest.raises(KeyError, match="missing"):
         _loader(
-            samples_budget=2,
+            events_budget=2,
             sample_field="missing",
             batch_size=1,
             num_workers=0,
@@ -780,19 +771,17 @@ def test_dataloader_missing_sample_field_raises() -> None:
 
 
 def test_dataloader_sample_field_must_be_scalar() -> None:
-    store = Datastore()
-    store.append(
-        data={
+    store = measurement_store()
+    append_measurement(store, fields={
             "action": 1,
             "reward": 0.0,
             "repeat_episode_done": 0,
             "episode_done": 0,
             "vec": [1, 2],
-        }
-    )
+        })
     with pytest.raises(ValueError, match="scalar"):
         _loader(
-            samples_budget=1,
+            events_budget=1,
             sample_field="vec",
             batch_size=1,
             num_workers=0,
@@ -800,21 +789,19 @@ def test_dataloader_sample_field_must_be_scalar() -> None:
         )
 
 
-def test_dataloader_samples_budget_leaves_out_a_run_that_does_not_fit() -> None:
-    store = Datastore()
+def test_dataloader_events_budget_leaves_out_a_run_that_does_not_fit() -> None:
+    store = measurement_store()
     for sample_id in range(4):
         for step in range(3):
-            store.append(
-                data={
+            append_measurement(store, fields={
                     "action": sample_id * 3 + step + 1,
                     "reward": 0.0,
                     "repeat_episode_done": 0,
                     "episode_done": 0,
                     "sample_id": sample_id,
-                }
-            )
+                })
     loader = _loader(
-        samples_budget=5,
+        events_budget=5,
         sample_field="sample_id",
         batch_size=1,
         num_workers=0,
@@ -826,19 +813,17 @@ def test_dataloader_samples_budget_leaves_out_a_run_that_does_not_fit() -> None:
 
 
 def test_dataloader_first_sample_over_budget_raises() -> None:
-    store = Datastore()
+    store = measurement_store()
     for step in range(3):
-        store.append(
-            data={
+        append_measurement(store, fields={
                 "action": step + 1,
                 "reward": 0.0,
                 "repeat_episode_done": 0,
                 "episode_done": 0,
                 "sample_id": 0,
-            }
-        )
+            })
     loader = _loader(
-        samples_budget=2,
+        events_budget=2,
         sample_field="sample_id",
         batch_size=1,
         num_workers=0,
@@ -866,14 +851,14 @@ def _episode_transform(*, group_start: bool):
         objective_fields=_obj("action", "store_index", "episode_done"),
         tokenizer=IntIdTokenizer(),
     )
-    return compose(stages=(_stamp_grouping, tokenizer))
+    return compose(stages=(_stamp_grouping, partial(encode_measurement, tokenizer)))
 
 
-def test_dataloader_samples_budget_keeps_one_run_per_fill() -> None:
+def test_dataloader_events_budget_keeps_one_run_per_fill() -> None:
     """``batch_size`` fills, each one run when the run length equals the step budget."""
     store = _episode_store(n_episodes=8, steps=4)
     loader = _loader(
-        samples_budget=4,
+        events_budget=4,
         sample_field="episode_index",
         batch_size=3,
         num_workers=0,
@@ -890,11 +875,10 @@ def test_dataloader_samples_budget_keeps_one_run_per_fill() -> None:
 
 def _episode_store(*, n_episodes: int, steps: int) -> Datastore:
     """``n_episodes`` episodes of ``steps`` rows. Each episode is one ``episode_index`` run."""
-    store = Datastore()
+    store = measurement_store()
     for episode in range(n_episodes):
         for step in range(steps):
-            store.append(
-                data={
+            append_measurement(store, fields={
                     "action": episode * steps + step + 1,
                     "reward": 0.0,
                     "repeat_episode_done": 0,
@@ -903,8 +887,7 @@ def _episode_store(*, n_episodes: int, steps: int) -> Datastore:
                     "step_index": step,
                     "episode_index": episode,
                     "mark": 7,
-                }
-            )
+                })
     return store
 
 

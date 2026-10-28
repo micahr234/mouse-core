@@ -40,15 +40,20 @@ def test_selected_matches_dense_targets_loss_and_gradients(multiple_readouts, te
                      beta=0.4, normalize=True, eps=1e-8, bias=0.0,
                      policy_delayed=True, value_delayed=True)]))
     loss = objective(gates[gate_name], temperature=temperature)
-    kwargs = dict(objective_data=data, group_id=groups,
-                  backup_value_predictions=delayed, backup_action_predictions=delayed)
-    dense_losses, dense_metrics = loss(predictions=q, **kwargs)
-    losses, metrics = loss(predictions=selected, **kwargs)
+    dense_losses, dense_metrics = loss(
+        predictions=q, objective_data=data, group_id=groups,
+        backup_value_predictions=delayed, backup_action_predictions=delayed,
+    )
+    losses, metrics = loss(
+        predictions=selected, objective_data=data, group_id=groups,
+        backup_value_predictions=delayed, backup_action_predictions=delayed,
+    )
     torch.testing.assert_close(losses["action_value"], dense_losses["action_value"])
     for key in ("backup", "backup_weight", "in_run_backup"):
         torch.testing.assert_close(metrics[key], dense_metrics[key])
     losses["action_value"].backward()
     dense_losses["action_value"].backward()
+    assert q.grad is not None
     torch.testing.assert_close(selected.grad, q.grad.gather(-1, actions[:, None]).squeeze(-1))
     assert delayed.grad is None
 
@@ -63,9 +68,12 @@ def test_selected_uses_maximum_of_delayed_actions():
         cross_group_backups="fault")
     losses, metrics = loss(objective_data=data, group_id=torch.zeros(3, dtype=torch.long),
                           predictions=q, backup_value_predictions=delayed, backup_action_predictions=delayed)
-    torch.testing.assert_close(metrics["backup"][:2], torch.tensor([4.5, 4.]))
+    backup = metrics["backup"]
+    assert isinstance(backup, torch.Tensor)
+    torch.testing.assert_close(backup[:2], torch.tensor([4.5, 4.]))
     torch.testing.assert_close(losses["action_value"], torch.tensor((2.5**2 + 1) / 2))
     losses["action_value"].backward()
+    assert q.grad is not None
     assert delayed.grad is None and q.grad[-1] == 0
 
 

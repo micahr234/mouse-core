@@ -52,6 +52,25 @@ class Embedding(nn.Module):
                 token_rms = torch.linalg.vector_norm(table.weight) / table.weight.numel() ** 0.5
                 self.fourier.proj.weight.mul_(token_rms)
 
+    def resize_token_embeddings(self, vocab_size: int) -> None:
+        """Grow for registered special tokens before constructing an optimizer.
+
+        Existing rows are preserved. New rows start at the pretrained mean.
+        Call this before loading a checkpoint that contains the expanded table.
+        """
+        if type(vocab_size) is not int or vocab_size < self.vocab_size:
+            raise ValueError("vocab_size must be an integer at least as large as the existing table")
+        if vocab_size == self.vocab_size:
+            return
+        old = self.embed_tokens.weight
+        table = nn.Embedding(vocab_size, self.hidden_dim, device=old.device, dtype=old.dtype)
+        with torch.no_grad():
+            table.weight[:self.vocab_size].copy_(old)
+            table.weight[self.vocab_size:].copy_(old.mean(dim=0))
+        table.weight.requires_grad_(old.requires_grad)
+        self.embed_tokens = table
+        self.vocab_size = vocab_size
+
     def forward(
         self, token_ids: torch.Tensor, *, numeric_values: torch.Tensor | None = None,
         numeric_mask: torch.Tensor | None = None,

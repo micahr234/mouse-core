@@ -2,25 +2,11 @@
 
 from __future__ import annotations
 
+import copy
 import pytest
 import torch
 
 from mouse_core.optim import AdamW
-
-
-def _opt_dtypes(opt: AdamW) -> set[torch.dtype]:
-    return {p.dtype for group in opt.param_groups for p in group["params"]}
-
-
-def test_adamw_steps_fp32_params_in_place() -> None:
-    torch.manual_seed(0)
-    p = torch.nn.Parameter(torch.ones(4))
-    opt = AdamW(params=[p], lr=1e-2, fused=False)
-    p.grad = torch.ones_like(p)
-    opt.step()
-    assert p.dtype == torch.float32
-    assert _opt_dtypes(opt) == {torch.float32}
-    assert not torch.equal(p, torch.ones(4))
 
 
 def test_adamw_accumulates_sub_bf16_ulp_updates() -> None:
@@ -57,35 +43,39 @@ def test_adamw_accepts_frozen_non_fp32_params() -> None:
     assert not torch.equal(trainable, torch.ones(4))
 
 
-def test_adamw_state_dict_roundtrip() -> None:
+def test_adamw_state_dict_resumes_identical_updates() -> None:
     p = torch.nn.Parameter(torch.ones(4))
     opt = AdamW(params=[p], lr=1e-2, fused=False)
     p.grad = torch.ones_like(p)
     opt.step()
-    state = opt.state_dict()
-    q = torch.nn.Parameter(torch.ones(4))
-    opt2 = AdamW(params=[q], lr=1e-2, fused=False)
+    state = copy.deepcopy(opt.state_dict())
+    q = torch.nn.Parameter(p.detach().clone())
+    opt2 = AdamW(params=[q], lr=0.1, fused=False)
     opt2.load_state_dict(state)
     assert opt2.param_groups[0]["lr"] == 1e-2
-    assert len(opt2._inner.state) == 1
+    for scale in (0.3, -2.0, 0.0):
+        p.grad = torch.full_like(p, scale)
+        q.grad = p.grad.clone()
+        opt.step()
+        opt2.step()
+        torch.testing.assert_close(p, q, rtol=0, atol=0)
 
 
-def test_zero_grad_set_to_none() -> None:
-    p = torch.nn.Parameter(torch.ones(4))
-    opt = AdamW(params=[p], lr=1e-2, fused=False)
-    p.grad = torch.ones_like(p)
-    opt.zero_grad(set_to_none=True)
-    assert p.grad is None
-
-
-def test_zero_grad_zeros_in_place() -> None:
+@pytest.mark.parametrize("set_to_none", [None, True, False])
+def test_zero_grad_preserves_requested_storage_semantics(set_to_none) -> None:
     p = torch.nn.Parameter(torch.ones(4))
     opt = AdamW(params=[p], lr=1e-2, fused=False)
     p.grad = torch.ones_like(p)
     held = p.grad
-    opt.zero_grad(set_to_none=False)
-    assert p.grad is held
-    assert torch.equal(p.grad, torch.zeros_like(p))
+    if set_to_none is None:
+        opt.zero_grad()
+    else:
+        opt.zero_grad(set_to_none=set_to_none)
+    if set_to_none is False:
+        assert p.grad is held
+        assert torch.equal(p.grad, torch.zeros_like(p))
+    else:
+        assert p.grad is None
 
 
 def test_adamw_param_group_learning_rates_step_independently() -> None:
@@ -115,11 +105,3 @@ def test_adamw_param_group_rejects_a_mix_and_unknown_keys() -> None:
         AdamW(params=[{"lr": 1e-3}], lr=1e-3, fused=False)
     with pytest.raises(TypeError, match="unsupported keys"):
         AdamW(params=[{"params": [p], "momentum": 0.9}], lr=1e-3, fused=False)
-
-
-def test_zero_grad_default_drops_grad() -> None:
-    p = torch.nn.Parameter(torch.ones(4))
-    opt = AdamW(params=[p], lr=1e-2, fused=False)
-    p.grad = torch.ones_like(p)
-    opt.zero_grad()
-    assert p.grad is None

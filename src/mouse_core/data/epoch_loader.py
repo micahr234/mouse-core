@@ -3,20 +3,23 @@ from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 import numpy as np
 import torch
-from mouse_core.data.dataloader import _sample_runs, _segment_token_count, _take_window_steps
+from mouse_core.data.dataloader import _event_sample_ranges, _segment_token_count, _tokenize_event_window
 from mouse_core.data.token_batch import pack_token_batch
 
 
 class EpochDataLoader:
-    def __init__(self, *, stores, transform, token_budget, sample_field, epochs=1,
-                 num_workers=0, seed=0):
+    def __init__(self, *, stores, transform, token_budget, sample_field=None, sample_ranges=None, epochs=1,
+                 num_workers=0, seed=0, step_field=None, episode_field="episode_index"):
         if epochs < 1 or token_budget < 1 or num_workers < 0:
             raise ValueError("epochs and token_budget must be positive; num_workers must be nonnegative")
+        if (sample_field is None) == (sample_ranges is None):
+            raise ValueError("Pass exactly one of sample_field or sample_ranges")
         windows = []
         for store in stores:
             ds = store.to_dataset()
             windows.extend((ds, int(start), int(end))
-                           for start, end in _sample_runs(ds=ds, sample_field=sample_field))
+                           for start, end in _event_sample_ranges(ds=ds, sample_field=sample_field,
+                               sample_ranges=sample_ranges, step_field=step_field, episode_field=episode_field))
         if not windows:
             raise ValueError("EpochDataLoader requires at least one nonempty sample")
 
@@ -26,7 +29,7 @@ class EpochDataLoader:
             reseed = getattr(pipeline, "reseed", None)
             if callable(reseed):
                 reseed(generation=index)
-            return _take_window_steps(ds=ds, start=start, end=end, index_field=None, transform=pipeline)
+            return _tokenize_event_window(ds=ds, start=start, end=end, index_field=None, transform=pipeline)
 
         if num_workers:
             with ThreadPoolExecutor(max_workers=num_workers) as pool:

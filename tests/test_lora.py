@@ -107,8 +107,40 @@ def test_apply_lora_wraps_every_linear_and_freezes_base() -> None:
 
 
 def test_apply_lora_rejects_module_without_linear() -> None:
+    model = nn.Sequential(nn.LayerNorm(2))
     with pytest.raises(ValueError, match="no nn.Linear found"):
-        apply_lora(model=nn.Sequential(nn.ReLU()), config=LoRAConfig(rank=2))
+        apply_lora(model=model, config=LoRAConfig(rank=2))
+    assert all(p.requires_grad for p in model.parameters())
+
+
+def test_apply_lora_preserves_shared_linears_and_eval_mode() -> None:
+    shared = nn.Linear(3, 3)
+    model = nn.ModuleDict({"left": shared, "right": shared,
+                           "nested": nn.Sequential(shared)}).eval()
+    x = torch.ones(2, 3)
+    expected = shared(x)
+    assert apply_lora(model=model, config=LoRAConfig(rank=2, dropout=0.75)) == 1
+    adapter = cast(LoRALinear, model["left"])
+    nested = model["nested"]
+    assert isinstance(nested, nn.Sequential)
+    assert adapter is model["right"] is nested[0]
+    assert not adapter.training
+    torch.testing.assert_close(adapter(x), expected)
+    with torch.no_grad():
+        adapter.lora_A.weight.fill_(1.)
+        adapter.lora_B.weight.fill_(1.)
+    # Dropout must remain disabled even though the adapter was attached after eval().
+    torch.testing.assert_close(adapter(x), adapter(x))
+    assert not torch.equal(adapter(x), expected)
+
+
+def test_apply_lora_rejects_repeat_without_freezing_adapters() -> None:
+    model = nn.Sequential(nn.Linear(2, 2))
+    apply_lora(model=model, config=LoRAConfig(rank=1))
+    before = {name: p.requires_grad for name, p in model.named_parameters()}
+    with pytest.raises(ValueError, match="already contains LoRA"):
+        apply_lora(model=model, config=LoRAConfig(rank=1))
+    assert {name: p.requires_grad for name, p in model.named_parameters()} == before
 
 
 def test_backbone_without_lora_is_fully_trainable() -> None:
@@ -153,7 +185,7 @@ def test_cuda_fused_lora_matches_eager_and_trains() -> None:
     torch.manual_seed(0)
     device = torch.device("cuda")
     base = nn.Linear(8, 6).to(device=device, dtype=torch.bfloat16)
-    lora = LoRALinear(base, LoRAConfig(rank=2, alpha=4.0)).to(device)
+    lora = LoRALinear(base, LoRAConfig(rank=2, alpha=4.0))
     with torch.no_grad():
         lora.lora_B.weight.fill_(0.1)
     x = torch.randn(3, 8, device=device, dtype=torch.bfloat16, requires_grad=True)

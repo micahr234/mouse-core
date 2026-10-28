@@ -9,6 +9,7 @@ import torch.nn.functional as F
 
 from mouse_core.objectives._actions import canonical_actions, executed_actions
 
+from mouse_core.objectives.dqn import _expand_policy_readouts, _validate_request_actions, _validate_missing_bootstrap
 from mouse_core.objectives.base import Objective, _reject_predictions, _require_prediction
 from mouse_core.objectives.dqn import (
     CrossGroupBackups,
@@ -41,9 +42,14 @@ def sample_discrete_action(
     Args:
         logits: ``[..., A]`` unnormalized action scores (typically the last-step
             slice of ``predictions["action"]``).
-        num_actions: If set, only the first ``num_actions`` logits are used.
+        num_actions: If set, only the first ``num_actions`` logits are used;
+            must be an integer in ``1..A``.
     """
+    if logits.ndim < 1 or logits.shape[-1] == 0:
+        raise ValueError("logits must have shape [..., A] with at least one action.")
     if num_actions is not None:
+        if isinstance(num_actions, bool) or not isinstance(num_actions, int) or not 1 <= num_actions <= logits.shape[-1]:
+            raise ValueError(f"num_actions must be an integer in 1..{logits.shape[-1]}, got {num_actions}.")
         logits = logits[..., :num_actions]
     log_probs_all = F.log_softmax(logits, dim=-1)
     probs = log_probs_all.exp()
@@ -61,6 +67,7 @@ def _gae_advantages(
     valid: torch.Tensor,
     gae_lambda: float,
     cross_group_backups: CrossGroupBackups,
+    readout: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Generalized advantage estimation over valid consecutive pairs.
 
@@ -99,6 +106,9 @@ def _gae_advantages(
         T = rewards.shape[0]
         device = rewards.device
         dtype = rewards.dtype
+        trace = torch.full_like(rewards, gae_lambda)
+        if readout is not None:
+            trace = torch.where(readout[1:], trace, 1.0)
         next_values = values[1:]
         # Continuation after s_{t+1} is sampled only when pair t+1 stays in-run.
         sampled = torch.zeros(T, dtype=torch.bool, device=device)
@@ -110,9 +120,7 @@ def _gae_advantages(
             )
             # λ = 0 does not carry a later cutoff value. A non-zero λ does,
             # and that factor drops the step when the value is off-data.
-            carries = sampled if gae_lambda != 0.0 else torch.zeros(
-                T, dtype=torch.bool, device=device
-            )
+            carries = sampled & (trace != 0)
             participate = _zero_off_data_factor_scan(
                 discount=discounts,
                 in_sample=sampled,
@@ -124,7 +132,7 @@ def _gae_advantages(
         gae = torch.zeros((), device=device, dtype=dtype)
         for t in range(T - 1, -1, -1):
             delta = rewards[t] + discounts[t] * next_values[t] - values[t]
-            gae = delta + discounts[t] * gae_lambda * gae
+            gae = delta + discounts[t] * trace[t] * gae
             gae = torch.where(valid[t], gae, torch.zeros_like(gae))
             advantages[t] = gae
         returns = advantages + values[:-1]
@@ -199,6 +207,8 @@ class PpoObjective(Objective[...]):
 
     When ``old_log_prob`` is absent, the detached current log-probs are used
     (ratio = 1) — suitable for a single pass over a freshly collected batch.
+    Supplied behavior log-probabilities are also detached: they are fixed
+    reference probabilities, not outputs to optimize.
 
     Args:
         discount: Per-step γ from unpacked ``objective_data`` columns.
@@ -329,6 +339,9 @@ class PpoObjective(Objective[...]):
                 f"PPO expects policy logits shape [N, A], "
                 f"got {tuple(logits.shape)}."
             )
+        original_data = objective_data
+        logits, objective_data, readout = _expand_policy_readouts(objective_data, logits, who="PPO")
+        values_raw, _, _ = _expand_policy_readouts(original_data, values_raw, who="PPO")
         N, A = logits.shape
         device = cast(torch.device, logits.device)
         dtype = cast(torch.dtype, logits.dtype)
@@ -375,6 +388,7 @@ class PpoObjective(Objective[...]):
                 f"PPO objective expects action shape [{N}], got {tuple(action.shape)}."
             )
         executed = executed_actions(objective_data, action)
+        _validate_request_actions(readout, executed, group_id)
         action = canonical_actions(objective_data, action)
         _require_action_ids(action, A)
         objective_data = {**objective_data, self.action_key: action}
@@ -426,6 +440,9 @@ class PpoObjective(Objective[...]):
             device=device,
             identity=torch.ones(N, dtype=dtype, device=device),
         )
+        _validate_missing_bootstrap(readout, discount_all, group_id, self.cross_group_backups)
+        values = values.masked_fill(~readout, 0)
+        curr_values = values[:-1]
         discounts = discount_all[1:]
 
         advantages, returns, participate = _gae_advantages(
@@ -434,9 +451,10 @@ class PpoObjective(Objective[...]):
             discounts=discounts,
             valid=valid,
             gae_lambda=self.gae_lambda,
+            readout=readout,
             cross_group_backups=self.cross_group_backups,
         )
-        pair_weight = pair_weight * participate
+        pair_weight = pair_weight * participate * readout[:-1]
         valid = pair_weight > 0
 
         policy_weight = pair_weight * executed[1:].to(dtype=dtype)
@@ -456,7 +474,7 @@ class PpoObjective(Objective[...]):
                     f"PPO expects {self.old_log_prob_key!r} shape [{N}], "
                     f"got {tuple(old_log_prob_full.shape)}."
                 )
-            old_log_prob = old_log_prob_full[1:][policy_valid].to(dtype=dtype)
+            old_log_prob = old_log_prob_full[1:][policy_valid].detach().to(dtype=dtype)
         else:
             old_log_prob = new_log_prob.detach()
 
@@ -491,7 +509,7 @@ class PpoObjective(Objective[...]):
             if ret_v.numel() > 0:
                 ret_var = ret_v.var(correction=0)
                 if ret_var > 0:
-                    explained_var = 1.0 - ((ret_v - val_v) ** 2).mean() / ret_var
+                    explained_var = 1.0 - (ret_v - val_v).var(correction=0) / ret_var
                 else:
                     explained_var = torch.zeros((), device=device, dtype=dtype)
             else:

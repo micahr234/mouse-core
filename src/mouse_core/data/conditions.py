@@ -1,8 +1,8 @@
 """Callable emission condition types and save/load refs.
 
 Tokenizer ``when=`` takes a callable — not an equals / not_equals dict.
-DataLoader samples are not callables: ``sample_field`` names the column
-whose contiguous equal values are one sample.
+DataLoader accepts ``sample_field`` for contiguous equal-value groups or
+``sample_ranges`` for a domain-specific source-event grouping function.
 
 Tokenizer ``when``
 -----------------
@@ -26,17 +26,17 @@ Omit ``when`` (``None``) and the field always emits on the ordinary run.
 Named module-level functions round-trip through
 :func:`~mouse_core.data.tokenizer.save_tokenizer` /
 :func:`~mouse_core.data.tokenizer.load_tokenizer` via an import path.
-Lambdas work at runtime but cannot be saved. Define any named
-predicates inline in the notebook or caller module — this package
-does not ship convenience helpers.
+Notebook and script functions use ``__main__:name`` references. Define the same
+named conditions in the loading notebook or script before calling ``load_tokenizer``.
+Lambdas and nested functions work at runtime but cannot be saved.
 
 DataLoader ``sample_field``
 --------------------------
 A sample is every contiguous row that shares one value in
 ``sample_field``. Each sample is one group. Attention and loss stop
-where ``group_id`` changes. Pass exactly one of ``samples_budget`` (steps) or
+where ``group_id`` changes. Pass exactly one of ``events_budget`` (source events) or
 ``token_budget`` (packed tokens). A sample that does not fit is left
-out. Examples pass ``batch_size=1`` and ``sample_field="episode_index"``.
+out. Examples pass ``batch_size=1`` and ``sample_ranges=environment_episode_ranges``.
 """
 
 from __future__ import annotations
@@ -57,11 +57,18 @@ def when_ref(fn: WhenFn) -> str:
     qualname = getattr(fn, "__qualname__", None)
     if not module or not qualname or "<" in qualname:
         raise TypeError(
-            "tokenizer when= must be a named module-level function to "
+            "tokenizer when= must be a named top-level function to "
             "save/load; got "
-            f"{fn!r}. Prefer a def at module scope in the caller."
+            f"{fn!r}. Define the condition at notebook or module scope."
         )
-    return f"{module}:{qualname}"
+    ref = f"{module}:{qualname}"
+    try:
+        resolved = resolve_when_ref(ref)
+    except (ImportError, AttributeError, ValueError) as exc:
+        raise TypeError(f"tokenizer when= function is not importable as {ref!r}") from exc
+    if resolved != fn:
+        raise TypeError(f"tokenizer when= function does not match its import reference {ref!r}")
+    return ref
 
 
 def resolve_when_ref(ref: str) -> WhenFn:
@@ -74,7 +81,15 @@ def resolve_when_ref(ref: str) -> WhenFn:
     module = importlib.import_module(module_name)
     obj: Any = module
     for part in qualname.split("."):
-        obj = getattr(obj, part)
+        try:
+            obj = getattr(obj, part)
+        except AttributeError as exc:
+            if module_name == "__main__":
+                raise ValueError(
+                    f"Define tokenizer condition {qualname!r} in this notebook or script "
+                    "before loading the tokenizer"
+                ) from exc
+            raise
     if not callable(obj):
         raise TypeError(f"tokenizer when ref {ref!r} is not callable")
     return cast(WhenFn, obj)
