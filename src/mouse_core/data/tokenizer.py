@@ -5,7 +5,8 @@ I/O
 * ``tokenizer(event)`` emits token arrays from one provider/payload event.
 * ``tokenizer.encode(events)`` assembles complete steps by their markers.
 
-All fields emit into one token-ID stream. ``numeric`` fields also emit a
+All fields emit into one token-ID stream, with ``tokenizer_ids`` selecting
+the embedding table for each token. ``numeric`` fields also emit a
 scaled scalar in ``numeric_values`` and set ``numeric_mask=True``. Text,
 literal-token, and image fields set the mask to false. Pack ragged event sequences
 with :meth:`Tokenizer.pack_rows`; pack already-tokenized steps with
@@ -99,6 +100,14 @@ class Tokenizer:
     those arrays using ``step_field`` and returns completed ``StepTokens`` for
     a finalized sample. Pass ``transform=tokenizer.encode`` to a data loader.
 
+    The required ``tokenizers={name: pretrained_name_or_callable}`` dictionary
+    defines the backends, even when there is only one. It includes image
+    backends as callables returning discrete IDs. Set ``tokenizer=name``
+    on each input field. A lone backend or one named
+    ``default`` is used for fields without a selector. IDs stay local to each
+    backend; ``tokenizer_names[tokenizer_ids[i]]`` identifies token i's table.
+    Dictionary names are sorted so insertion order cannot change routing.
+
     A changed marker starts a step before that event. Missing markers continue
     the current step; the first event requires a marker. ``episode_field``
     separates repeated step indices in different episodes. Use ``stream()``
@@ -110,14 +119,15 @@ class Tokenizer:
     the complete step has no value. No labels or metadata are implicit inputs.
     """
 
-    def __init__(self, *, input_fields, step_field="step_index",
-                 episode_field="episode_index", tokenizer: Any = None, image_tokenizer=None,
-                 objective_fields=None, pretrained=None, hub_kwargs=None):
+    def __init__(self, *, tokenizers: Mapping[str, Any], input_fields, step_field="step_index",
+                 episode_field="episode_index", objective_fields=None, hub_kwargs=None):
+        if not isinstance(tokenizers, Mapping) or not tokenizers:
+            raise TypeError("tokenizers must be a nonempty dictionary of names to backends")
+        if any(not isinstance(name, str) or not name for name in tokenizers):
+            raise ValueError("tokenizer names must be nonempty strings")
         _StepBoundary(step_field, episode_field)
         self.step_field = step_field
         self.episode_field = episode_field
-        self.pretrained = None if pretrained is None else str(pretrained)
-        self.image_tokenizer = image_tokenizer
         self.objective_fields, self.objective_missing_values = _objective_config(objective_fields)
         self.input_fields = tuple(field if isinstance(field, TokenizerModalitySpec) else TokenizerModalitySpec(**field)
                                   for field in input_fields)
@@ -125,19 +135,36 @@ class Tokenizer:
         for provider in dict.fromkeys(spec.provider for spec in self.input_fields):
             fields = [spec for spec in self.input_fields if spec.provider == provider]
             _, meta = resolve_tokenizer_modalities(fields)
-            if any(m.kind == KIND_IMAGE for m in meta) and not callable(image_tokenizer):
-                raise TypeError("Image event fields require image_tokenizer= callable returning discrete token ids")
             self._provider_meta[provider] = tuple(meta)
         meta_by_spec = {id(meta.spec): meta for group in self._provider_meta.values() for meta in group}
         self._meta = tuple(meta_by_spec[id(spec)] for spec in self.input_fields)
-        needs_tokenizer = any(m.kind in (KIND_TEXT, KIND_TOKEN, KIND_NUMERIC) for m in self._meta)
-        if tokenizer is None and needs_tokenizer:
-            if pretrained is None:
-                raise TypeError("Tokenizer with text, numeric, or token fields requires tokenizer= or pretrained=")
-            from transformers import AutoTokenizer
-            tokenizer = AutoTokenizer.from_pretrained(pretrained, **dict(hub_kwargs or {}))
-        self.tokenizer: Any = tokenizer
-        self.special_token_ids = _register_special_tokens(tokenizer, self.input_fields)
+        sources = dict(tokenizers)
+        self.tokenizer_names = tuple(sorted(sources))
+        default = "default" if "default" in sources else self.tokenizer_names[0] if len(sources) == 1 else None
+        field_tokenizers = []
+        for spec in self.input_fields:
+            name = spec.tokenizer or default
+            if name not in sources:
+                raise ValueError(f"Input field {_field_label(spec)!r} must select a configured tokenizer; got {name!r}")
+            field_tokenizers.append(name)
+        self.tokenizer_sources = {name: str(value) if isinstance(value, (str, Path)) else None
+                                  for name, value in sources.items()}
+        self.tokenizers: dict[str, Any] = {}
+        for name, source in sources.items():
+            if isinstance(source, (str, Path)):
+                from transformers import AutoTokenizer
+                source = AutoTokenizer.from_pretrained(str(source), **dict(hub_kwargs or {}))
+            if not callable(source):
+                raise TypeError(f"Tokenizer {name!r} must be a callable backend or pretrained identifier")
+            self.tokenizers[name] = source
+        self._backends = tuple(self.tokenizers[name] for name in field_tokenizers)
+        self._routes = tuple(self.tokenizer_names.index(name) for name in field_tokenizers)
+        self.special_token_ids = {}
+        for name in self.tokenizer_names:
+            specs = [spec for spec, selected in zip(self.input_fields, field_tokenizers) if selected == name]
+            ids = _register_special_tokens(self.tokenizers[name], specs)
+            if ids:
+                self.special_token_ids[name] = ids
 
     def __call__(self, event: Mapping) -> dict[str, np.ndarray]:
         """Encode matching fields from one decoded event, without adding a step."""
@@ -149,8 +176,8 @@ class Tokenizer:
         payload = event["payload"]
         if meta and not isinstance(payload, Mapping):
             raise TypeError("Configured event input fields require an object payload")
-        values = _tokenize_fields(row=payload, meta=meta, tokenizer=self.tokenizer,
-                                  image_tokenizer=self.image_tokenizer, field_ids=field_ids)
+        values = _tokenize_fields(row=payload, meta=meta, tokenizers=self._backends,
+                                  tokenizer_routes=self._routes, field_ids=field_ids)
         return values
 
     def stream(self, *, include_objectives: bool = True) -> EventTokenStream:
@@ -182,6 +209,8 @@ class Tokenizer:
             sids.extend([index] * len(encoded))
         inputs, _, _ = pack_token_batch(steps=steps, sequence_ids=sids if steps else None,
                                         batch_size=len(rows), continuing=continuing)
+        if not steps:
+            inputs = replace(inputs, tokenizer_names=self.tokenizer_names, tokenizer_ids=np.zeros(0, dtype=np.int64))
         return inputs
 
 
@@ -238,7 +267,7 @@ class EventTokenStream:
     def _finish(self) -> StepTokens:
         pieces = self._pieces
         values = {name: np.concatenate([piece[name] for piece in pieces]) for name in
-                  ("token_ids", "numeric_values", "numeric_mask", "head_token_mask")}
+                  ("token_ids", "numeric_values", "numeric_mask", "head_token_mask", "tokenizer_ids")}
         prefixes = []
         seen_fields = set()
         for piece in pieces:
@@ -248,14 +277,14 @@ class EventTokenStream:
             keep = np.asarray([int(index) not in seen_fields for index in ids], dtype=bool)
             seen_fields.update(ids.tolist())
             prefixes.append({name: piece[name][keep] for name in
-                             ("group_start_token_ids", "group_start_numeric_values", "group_start_numeric_mask")})
+                             ("group_start_token_ids", "group_start_numeric_values", "group_start_numeric_mask", "group_start_tokenizer_ids")})
         if prefixes:
             values.update({name: np.concatenate([piece[name] for piece in prefixes]) for name in
-                           ("group_start_token_ids", "group_start_numeric_values", "group_start_numeric_mask")})
+                           ("group_start_token_ids", "group_start_numeric_values", "group_start_numeric_mask", "group_start_tokenizer_ids")})
         objective = copy_keep_fields(self._labels,
                                     self.tokenizer.objective_fields if self.include_objectives else (),
                                     missing_values=self.tokenizer.objective_missing_values)
-        return StepTokens(**values, objective_fields=objective)
+        return StepTokens(**values, objective_fields=objective, tokenizer_names=self.tokenizer.tokenizer_names)
 
     def flush(self) -> StepTokens | None:
         if not self._pieces:
@@ -444,12 +473,14 @@ def _image_token_ids(image_tokenizer: Any, value: Any, *, in_name: str) -> list[
     return img_ids
 
 
-def _tokenize_fields(*, row, meta, tokenizer, image_tokenizer, field_ids=None):
+def _tokenize_fields(*, row, meta, tokenizers, tokenizer_routes, field_ids):
     token_ids: list[int] = []
+    tokenizer_ids: list[int] = []
     numeric_values: list[float] = []
     numeric_mask: list[bool] = []
     head_token_mask: list[bool] = []
     prefix_token_ids: list[int] = []
+    prefix_tokenizer_ids: list[int] = []
     prefix_numeric_values: list[float] = []
     prefix_numeric_mask: list[bool] = []
     prefix_field_ids: list[int] = []
@@ -463,19 +494,21 @@ def _tokenize_fields(*, row, meta, tokenizer, image_tokenizer, field_ids=None):
         is_numeric = numeric_value is not None
         value = 0.0 if numeric_value is None else numeric_value
         if to_group_start:
-            if field_ids is not None:
-                prefix_field_ids.extend([field_ids[id(spec)]] * len(emitted_ids))
+            prefix_field_ids.extend([field_ids[id(spec)]] * len(emitted_ids))
             prefix_token_ids.extend(emitted_ids)
+            prefix_tokenizer_ids.extend([tokenizer_routes[field_ids[id(spec)]]] * len(emitted_ids))
             prefix_numeric_values.extend([value] * len(emitted_ids))
             prefix_numeric_mask.extend([is_numeric] * len(emitted_ids))
         else:
             token_ids.extend(emitted_ids)
+            tokenizer_ids.extend([tokenizer_routes[field_ids[id(spec)]]] * len(emitted_ids))
             numeric_values.extend([value] * len(emitted_ids))
             numeric_mask.extend([is_numeric] * len(emitted_ids))
             head_token_mask.extend([head_output] * len(emitted_ids))
 
     for m in meta:
         spec = m.spec
+        tokenizer = tokenizers[field_ids[id(spec)]]
         ordinary, to_group_start = _when_routes(spec, row)
         if not ordinary and not to_group_start:
             continue
@@ -533,7 +566,7 @@ def _tokenize_fields(*, row, meta, tokenizer, image_tokenizer, field_ids=None):
             continue
 
         if m.kind == KIND_IMAGE:
-            img_ids = _image_token_ids(image_tokenizer, value, in_name=in_name)
+            img_ids = _image_token_ids(tokenizer, value, in_name=in_name)
             _emit(
                 img_ids,
                 spec=spec,
@@ -547,6 +580,7 @@ def _tokenize_fields(*, row, meta, tokenizer, image_tokenizer, field_ids=None):
     if prefix_token_ids:
         group_start_kwargs = {
             "group_start_token_ids": np.asarray(prefix_token_ids, dtype=np.int64),
+            "group_start_tokenizer_ids": np.asarray(prefix_tokenizer_ids, dtype=np.int64),
             "group_start_numeric_values": np.asarray(prefix_numeric_values, dtype=np.float32),
             "group_start_numeric_mask": np.asarray(prefix_numeric_mask, dtype=bool),
         }
@@ -556,6 +590,7 @@ def _tokenize_fields(*, row, meta, tokenizer, image_tokenizer, field_ids=None):
 
     return dict(
         token_ids=np.asarray(token_ids, dtype=np.int64),
+        tokenizer_ids=np.asarray(tokenizer_ids, dtype=np.int64),
         numeric_values=np.asarray(numeric_values, dtype=np.float32),
         numeric_mask=np.asarray(numeric_mask, dtype=bool),
         head_token_mask=np.asarray(head_token_mask, dtype=bool),
@@ -642,7 +677,7 @@ def tokenizer_config(*, tokenizer: Tokenizer) -> dict[str, Any]:
         objective_fields.append(entry)
     result = {
         "format": TOKENIZER_FORMAT,
-        "pretrained": tokenizer.pretrained,
+        "tokenizers": {name: tokenizer.tokenizer_sources[name] for name in tokenizer.tokenizer_names},
         "objective_fields": objective_fields,
     }
 
@@ -667,8 +702,7 @@ def save_tokenizer(*, tokenizer: Tokenizer, path: str | Path) -> None:
 def load_tokenizer(
     *,
     repo_id_or_path: str,
-    tokenizer=None,
-    image_tokenizer=None,
+    tokenizers=None,
     force_download: bool = True,
     local_dir: str | Path | None = None,
     **kwargs: Any,
@@ -676,21 +710,25 @@ def load_tokenizer(
     """Load a tokenizer packing spec from a checkpoint directory or Hub repo.
 
     The JSON is the packing contract (fields, ``when`` import refs,
-    ``objective_fields``, ``pretrained`` name). A live HF tokenizer or
-    image tokenizer is an execution choice: pass ``tokenizer=`` /
-    ``image_tokenizer=`` when the spec needs them; otherwise
-    ``pretrained`` in the file reloads the HF tokenizer.
+    ``objective_fields``, and the named ``tokenizers`` dictionary).
+    Pretrained backends reload from saved identifiers. Supply custom text
+    or image backends by name in ``tokenizers=``.
 
     Args:
         repo_id_or_path: Local tokenizer directory or Hub repo id from
             :func:`save_tokenizer` / ``push_model_to_hub(..., repo_id=)``.
-        tokenizer: Optional already-built HF tokenizer. Overrides
-            ``pretrained`` in the file.
-        image_tokenizer: Required when the spec has ``image`` fields.
+        tokenizers: Optional dictionary overriding named backends. Custom
+            callables must be supplied again by name; other entries reload
+            from saved pretrained identifiers. Routing names cannot change.
         force_download: Bypass the Hub cache (ignored for local paths).
         local_dir: Where Hub files are saved (ignored for local paths).
         **kwargs: Hub download kwargs (``revision``, ``token``, …).
     """
+    obsolete = set(kwargs) & {"tokenizer", "pretrained", "image_tokenizer"}
+    if obsolete:
+        raise TypeError(f"Unsupported tokenizer arguments {sorted(obsolete)}; use tokenizers={{name: backend}}")
+    if tokenizers is not None and not isinstance(tokenizers, Mapping):
+        raise TypeError("tokenizers overrides must be a dictionary of names to backends")
     local = Path(repo_id_or_path)
     if local.exists():
         config_path = local / TOKENIZER_FILENAME
@@ -723,16 +761,23 @@ def load_tokenizer(
             "Unsupported tokenizer config format. Expected a MOUSE tokenizer "
             "saved with save_tokenizer or push_model_to_hub(..., repo_id=)."
         )
+    saved_backends = config.get("tokenizers")
+    if not isinstance(saved_backends, dict) or not saved_backends:
+        raise ValueError("Saved tokenizer specification requires a nonempty tokenizers dictionary")
+    if tokenizers is not None and set(tokenizers) - set(saved_backends):
+        raise ValueError("tokenizers overrides must use names from the saved specification")
+    tokenizers = {**saved_backends, **dict(tokenizers or {})}
     result = Tokenizer(
         input_fields=config["input_fields"],
         step_field=config["step_field"],
         episode_field=config["episode_field"],
         objective_fields=config.get("objective_fields") or (),
-        pretrained=config.get("pretrained"),
-        tokenizer=tokenizer,
-        image_tokenizer=image_tokenizer,
+        tokenizers=tokenizers,
         hub_kwargs=kwargs,
     )
     if result.special_token_ids != config.get("special_token_ids", {}):
         raise ValueError("Special token IDs differ from the saved tokenizer vocabulary")
+    # Preserve saved source identifiers when live callables override execution.
+    result.tokenizer_sources = {name: result.tokenizer_sources[name] or source
+                                for name, source in saved_backends.items()}
     return result

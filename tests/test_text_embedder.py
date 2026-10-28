@@ -122,16 +122,24 @@ def _text_pair(hidden_dim: int = 8, **kwargs):
                 "when": when_step_index_zero,
             },
         )
+    backends = {"default": hf_tok}
+    if image_tokenizer is not None:
+        backends["image"] = image_tokenizer
+        fields = [{**field, "tokenizer": "image"} if field["type"] == "image" else field for field in fields]
     tokenizer = Tokenizer(
         input_fields=fields,
-        tokenizer=hf_tok,
-        image_tokenizer=image_tokenizer,
+        tokenizers=backends,
         objective_fields=objective_fields,
     )
     backbone = Embedding(hidden_dim=hidden_dim, vocab_size=vocab)
     if emb is not None:
         with torch.no_grad():
             backbone.embed_tokens.weight.copy_(emb.weight)
+    if image_tokenizer is not None:
+        from mouse_core.models import MultiEmbedding
+        backbone = MultiEmbedding(embeddings={
+            "default": backbone, "image": Embedding(hidden_dim=hidden_dim, vocab_size=vocab),
+        })
     return tokenizer, backbone
 
 
@@ -195,7 +203,7 @@ def test_text_tokenizer_field_format_uses_str() -> None:
                 "when": when_step_index_zero,
             },
         ],
-        tokenizer=_FakeTokenizer(),
+        tokenizers={"default": _FakeTokenizer()},
     )
     step = encode_measurement(tokenizer, {"reward": 1.0, "grouping_id": 0})
     assert step.token_ids.tolist() == [ord(c) % 20 + 1 for c in "1.0"]
@@ -217,7 +225,7 @@ def test_text_tokenizer_field_format_spec() -> None:
                 "when": when_step_index_zero,
             },
         ],
-        tokenizer=_FakeTokenizer(),
+        tokenizers={"default": _FakeTokenizer()},
     )
     step = encode_measurement(tokenizer, {"reward": 1.0, "grouping_id": 0})
     assert step.token_ids.tolist() == [ord("1") % 20 + 1]
@@ -239,7 +247,7 @@ def test_text_tokenizer_omitted_input_field_is_const() -> None:
                 "when": when_step_index_zero,
             },
         ],
-        tokenizer=_FakeTokenizer(),
+        tokenizers={"default": _FakeTokenizer()},
     )
     spec = next(field for field in tokenizer.input_fields if field.format == ",value")
     assert spec.input_field is None
@@ -261,7 +269,7 @@ def test_text_tokenizer_const_format_keeps_the_word_field() -> None:
                 "head_output": True,
             },
         ],
-        tokenizer=_FakeTokenizer(),
+        tokenizers={"default": _FakeTokenizer()},
     )
     step = encode_measurement(tokenizer, {"action": 1})
     assert step.token_ids.tolist() == _enc("1") + _enc("field")
@@ -285,7 +293,7 @@ def test_text_tokenizer_const_format_rejects_placeholder() -> None:
                     "when": when_step_index_zero,
                 },
             ],
-            tokenizer=_FakeTokenizer(),
+            tokenizers={"default": _FakeTokenizer()},
         )
 
 
@@ -305,7 +313,7 @@ def test_text_tokenizer_max_tokens_allows_at_limit() -> None:
                 "when": when_step_index_zero,
             },
         ],
-        tokenizer=_FakeTokenizer(),
+        tokenizers={"default": _FakeTokenizer()},
     )
     step = encode_measurement(tokenizer, {"grouping_id": 0})
     assert len(step.token_ids) == 1
@@ -329,7 +337,7 @@ def test_text_tokenizer_max_tokens_raises_when_exceeded() -> None:
                 "when": when_step_index_zero,
             },
         ],
-        tokenizer=_FakeTokenizer(),
+        tokenizers={"default": _FakeTokenizer()},
     )
     with pytest.raises(ValueError, match="tokenized to 2 tokens"):
         encode_measurement(tokenizer, {"grouping_id": 0})
@@ -354,7 +362,7 @@ def test_text_tokenizer_max_tokens_must_be_positive() -> None:
                     "when": when_step_index_zero,
                 },
             ],
-            tokenizer=_FakeTokenizer(),
+            tokenizers={"default": _FakeTokenizer()},
         )
 
 
@@ -392,7 +400,7 @@ def test_text_tokenizer_when_gates_cover_skip_literal_pattern() -> None:
                 "when": when_step_index_zero,
             },
         ],
-        tokenizer=_CaptureTok(),
+        tokenizers={"default": _CaptureTok()},
     )
     encode_measurement(tokenizer, {"action": 1, "reward": 0.0, "grouping_id": 0})
     encode_measurement(tokenizer, {"action": 1, "reward": 2.0, "grouping_id": 0})
@@ -404,6 +412,7 @@ def test_text_tokenizer_when_rejects_non_callable() -> None:
 
     with pytest.raises(TypeError, match="when= must be a callable"):
         Tokenizer(
+            tokenizers={"default": _FakeTokenizer()},
             input_fields=[
                 {
                     "type": "text",
@@ -413,7 +422,6 @@ def test_text_tokenizer_when_rejects_non_callable() -> None:
                     "head_output": True,
                 },
             ],
-            tokenizer=_FakeTokenizer(),
         )
 
 
@@ -435,7 +443,7 @@ def test_text_tokenizer_when_or_in_callable() -> None:
             },
             {"type": "text", "input_field": "action", "format": "{field}", "head_output": True},
         ],
-        tokenizer=_FakeTokenizer(),
+        tokenizers={"default": _FakeTokenizer()},
     )
     zero = encode_measurement(tok, {"action": 1, "reward": 0.0, "grouping_id": 0})
     assert zero.token_ids.tolist() == (
@@ -461,7 +469,7 @@ def test_text_tokenizer_requires_field_format() -> None:
                     "when": when_step_index_zero,
                 },
             ],
-            tokenizer=_FakeTokenizer(),
+            tokenizers={"default": _FakeTokenizer()},
         )
 
 
@@ -475,7 +483,7 @@ def test_text_format_evaluates_expression_on_field() -> None:
                 "head_output": True,
             },
         ],
-        tokenizer=_FakeTokenizer(),
+        tokenizers={"default": _FakeTokenizer()},
     )
     step = encode_measurement(tokenizer, {"repeat_episode_index": 0})
     assert step.token_ids.tolist() == _enc(",episode 1")
@@ -500,7 +508,7 @@ def test_text_tokenizer_field_format_must_use_field_placeholder() -> None:
                     "when": when_step_index_zero,
                 },
             ],
-            tokenizer=_FakeTokenizer(),
+            tokenizers={"default": _FakeTokenizer()},
         )
 
 
@@ -511,12 +519,12 @@ def _enc(text: str) -> list[int]:
 def test_optional_literal_text_uses_field_presence_and_roundtrips(tmp_path) -> None:
     from mouse_core.data import load_tokenizer, save_tokenizer
 
-    tok = Tokenizer(tokenizer=_FakeTokenizer(), input_fields=[
+    tok = Tokenizer(tokenizers={"default": _FakeTokenizer()}, input_fields=[
         {"type": "text", "input_field": "inner_terminated", "format": ",terminated"},
         {"type": "token", "format": "\n", "head_output": True},
     ])
     save_tokenizer(tokenizer=tok, path=tmp_path)
-    loaded = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizer=_FakeTokenizer())
+    loaded = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizers={"default": _FakeTokenizer()})
     assert isinstance(loaded, Tokenizer)
     for encode in (tok, loaded):
         assert encode_measurement(encode, {}).token_ids.tolist() == _enc("\n")
@@ -543,7 +551,7 @@ def test_text_tokenizer_const_and_when_gated_unescape_braces() -> None:
                 "when": when_step_index_zero,
             },
         ],
-        tokenizer=_FakeTokenizer(),
+        tokenizers={"default": _FakeTokenizer()},
     )
     step = encode_measurement(tokenizer, {"a": 1, "r": 0, "grouping_id": 0})
     assert step.token_ids.tolist() == _enc("{1}") + _enc("{-}") + _enc("{c}")
@@ -572,7 +580,7 @@ def test_text_tokenizer_optional_missing_value_emits_nothing() -> None:
                 "when": when_step_index_zero,
             },
         ],
-        tokenizer=_FakeTokenizer(),
+        tokenizers={"default": _FakeTokenizer()},
     )
     assert encode_measurement(tokenizer, {"a": 1, "r": 0.0, "grouping_id": 0}).token_ids.tolist() == _enc("1,,\n")
     assert encode_measurement(tokenizer, {"a": 1, "r": None, "grouping_id": 0}).token_ids.tolist() == _enc("1,\n")
@@ -585,7 +593,7 @@ def test_missing_inputs_leave_constant_readout() -> None:
             {"type": "text", "input_field": "a", "format": "{field}"},
             {"type": "token", "format": "x", "head_output": True},
         ],
-        tokenizer=_FakeTokenizer(),
+        tokenizers={"default": _FakeTokenizer()},
     )
     assert encode_measurement(tokenizer, {}).token_ids.tolist() == _enc("x")
     assert encode_measurement(tokenizer, {"a": None}).token_ids.tolist() == _enc("x")
@@ -640,7 +648,7 @@ def test_text_tokenizer_rejects_duplicate_field_names_across_types() -> None:
                     "when": when_step_index_zero,
                 },
             ],
-            tokenizer=_FakeTokenizer(),
+            tokenizers={"default": _FakeTokenizer()},
         )
     with pytest.raises(ValueError, match="duplicate tokenizer field 'a'"):
         Tokenizer(
@@ -654,7 +662,7 @@ def test_text_tokenizer_rejects_duplicate_field_names_across_types() -> None:
                     "when": when_step_index_zero,
                 },
             ],
-            tokenizer=_FakeTokenizer(),
+            tokenizers={"default": _FakeTokenizer()},
         )
 
 
@@ -699,7 +707,7 @@ def test_text_input_index_emits_each_element_in_field_order() -> None:
                 "head_output": True,
             },
         ],
-        tokenizer=_capture_tokenizer(seen),
+        tokenizers={"default": _capture_tokenizer(seen)},
     )
     step = encode_measurement(tokenizer, {"observation": [1.25, -0.5]})
     assert seen == ["[", "1.25", ",-0.50", "]"]
@@ -716,7 +724,7 @@ def test_text_input_index_emits_each_element_in_field_order() -> None:
                 "head_output": True,
             }
         ],
-        tokenizer=_FakeTokenizer(),
+        tokenizers={"default": _FakeTokenizer()},
     )
     second = Tokenizer(
         input_fields=[
@@ -727,7 +735,7 @@ def test_text_input_index_emits_each_element_in_field_order() -> None:
                 "head_output": True,
             }
         ],
-        tokenizer=_FakeTokenizer(),
+        tokenizers={"default": _FakeTokenizer()},
     )
     assert encode_measurement(first, {"observation": 1.25}).token_ids.tolist() == _ids_for("1.25")
     assert encode_measurement(second, {"observation": -0.5}).token_ids.tolist() == _ids_for(",-0.50")
@@ -749,7 +757,7 @@ def test_text_input_index_emits_each_element_in_field_order() -> None:
                 "head_output": True,
             },
         ],
-        tokenizer=_capture_tokenizer(seen),
+        tokenizers={"default": _capture_tokenizer(seen)},
     )
     encode_measurement(swapped, {"observation": [1.25, -0.5]})
     assert seen == ["-0.50", ",1.25"]
@@ -774,7 +782,7 @@ def test_text_scalar_without_input_index_renders_once() -> None:
                 "head_output": True,
             }
         ],
-        tokenizer=_capture_tokenizer(seen),
+        tokenizers={"default": _capture_tokenizer(seen)},
     )
     encode_measurement(tokenizer, {"observation": 1.25})
     assert seen == ["1.25"]
@@ -795,7 +803,7 @@ def test_text_input_index_rejects_bad_shapes() -> None:
                 "head_output": True,
             }
         ],
-        tokenizer=_FakeTokenizer(),
+        tokenizers={"default": _FakeTokenizer()},
     )
     with pytest.raises(ValueError, match="1-D vector"):
         encode_measurement(vector, {"observation": [1.25, -0.5]})
@@ -812,7 +820,7 @@ def test_text_input_index_rejects_bad_shapes() -> None:
                 "head_output": True,
             }
         ],
-        tokenizer=_FakeTokenizer(),
+        tokenizers={"default": _FakeTokenizer()},
     )
     with pytest.raises(ValueError, match="requires a 1-D vector"):
         encode_measurement(indexed, {"observation": 1.25})
@@ -848,7 +856,7 @@ def test_text_input_index_uniqueness_and_rejected_types() -> None:
                 "head_output": True,
             },
         ],
-        tokenizer=_FakeTokenizer(),
+        tokenizers={"default": _FakeTokenizer()},
     )
     with pytest.raises(ValueError, match="input_index=0"):
         Tokenizer(
@@ -867,7 +875,7 @@ def test_text_input_index_uniqueness_and_rejected_types() -> None:
                     "head_output": True,
                 },
             ],
-            tokenizer=_FakeTokenizer(),
+            tokenizers={"default": _FakeTokenizer()},
         )
     with pytest.raises(TypeError, match="does not accept input_index="):
         TokenizerModalitySpec(type="token", format="\n", input_index=0)
@@ -897,10 +905,10 @@ def test_text_input_index_roundtrip(tmp_path) -> None:
                 "head_output": True,
             },
         ],
-        tokenizer=_FakeTokenizer(),
+        tokenizers={"default": _FakeTokenizer()},
     )
     save_tokenizer(tokenizer=tokenizer, path=tmp_path)
-    loaded = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizer=_FakeTokenizer())
+    loaded = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizers={"default": _FakeTokenizer()})
     assert isinstance(loaded, Tokenizer)
     assert [spec.input_index for spec in loaded.input_fields] == [None, 0, 1]
 
@@ -1051,7 +1059,7 @@ def _group_start_tokenizer(**kwargs):
     ]
     return Tokenizer(
         input_fields=fields,
-        tokenizer=kwargs.pop("tokenizer", _FakeTokenizer()),
+        tokenizers={"default": kwargs.pop("tokenizer", _FakeTokenizer())},
         objective_fields=_obj("action"),
         **kwargs,
     )
@@ -1183,7 +1191,7 @@ def test_text_tokenizer_group_start_const_without_other_text_is_nonnumeric() -> 
                 "when": when_step_index_zero,
             },
         ],
-        tokenizer=_FakeTokenizer(),
+        tokenizers={"default": _FakeTokenizer()},
         objective_fields=[],
     )
     st = encode_measurement(tok, {"action": 1, "episode_index": 3})
@@ -1206,7 +1214,7 @@ def test_token_pack_ignores_missing_group_start() -> None:
             },
         ],
         objective_fields=_obj("action"),
-        tokenizer=IntIdTokenizer(),
+        tokenizers={"default": IntIdTokenizer()},
     )
     steps = [
         encode_measurement(tok, {"action": 1, "episode_index": 0}),
@@ -1246,7 +1254,7 @@ def test_repeat_episode_index_emits_only_on_step_zero() -> None:
                 "head_output": True,
             },
         ],
-        tokenizer=_CaptureTok(),
+        tokenizers={"default": _CaptureTok()},
     )
 
     def rendered(*, repeat_episode_index: int, step_index: Any) -> list[str]:
@@ -1284,7 +1292,7 @@ def test_token_repeat_episode_index_emits_only_on_step_zero() -> None:
                 "when": when_step_index_zero,
             },
         ],
-        tokenizer=IntIdTokenizer(),
+        tokenizers={"default": IntIdTokenizer()},
     )
     zero = encode_measurement(tok, {"action": 1, "repeat_episode_index": 4, "step_index": 0, "episode_index": 0})
     assert zero.token_ids.tolist() == [1, 4]
@@ -1300,6 +1308,7 @@ def test_when_rejects_non_callable_scalar() -> None:
 
     with pytest.raises(TypeError, match="when= must be a callable"):
         Tokenizer(
+            tokenizers={"default": _FakeTokenizer()},
             input_fields=[
                 {
                     "type": "text",
@@ -1326,7 +1335,7 @@ def test_head_output_rejects_when() -> None:
                     "head_output": True,
                 }
             ],
-            tokenizer=_FakeTokenizer(),
+            tokenizers={"default": _FakeTokenizer()},
         )
 
 
@@ -1340,7 +1349,7 @@ def test_const_accepts_when() -> None:
             },
             {"type": "text", "input_field": "action", "format": "{field}", "head_output": True},
         ],
-        tokenizer=_FakeTokenizer(),
+        tokenizers={"default": _FakeTokenizer()},
     )
     zero = encode_measurement(tok, {"action": 1, "step_index": 0, "episode_index": 0})
     assert zero.token_ids.tolist() == _FakeTokenizer()("x")["input_ids"].view(-1).tolist() + _enc("1")
@@ -1360,7 +1369,7 @@ def test_when_equals_or_group_start_routes_value_to_ordinary() -> None:
             },
             {"type": "text", "input_field": "action", "format": "{field}", "head_output": True},
         ],
-        tokenizer=IntIdTokenizer(),
+        tokenizers={"default": IntIdTokenizer()},
     )
     # step_index==0 → ordinary emit (not group_start_*), even with group_start set.
     zero = encode_measurement(tok, {"action": 1, "repeat_episode_index": 4, "step_index": 0, "episode_index": 0})
@@ -1412,7 +1421,7 @@ def test_numeric_field_tokenizes_star_and_stores_scaled_value() -> None:
                 "fourier_max": 10.0,
             },
         ],
-        tokenizer=_FakeTokenizer(),
+        tokenizers={"default": _FakeTokenizer()},
     )
     step = encode_measurement(tokenizer, {"action": 0, "observation": [1.2, -5.0]})
     assert step.token_ids.tolist() == _encoded("0") + _encoded("*") + _encoded("*")
@@ -1440,7 +1449,7 @@ def test_zero_numeric_values_keep_their_mask_through_prefix_packing_and_embeddin
             {"type": "numeric", "input_field": "observation", "format": "*",
              "fourier_min": -1., "fourier_max": 1.},
         ],
-        tokenizer=_FakeTokenizer(),
+        tokenizers={"default": _FakeTokenizer()},
     )
     step = encode_measurement(tokenizer, {"prefix": 0., "observation": 0.})
     batch, _, _ = pack_token_batch(steps=[step, step], sequence_ids=[0, 0], continuing=None)
@@ -1514,7 +1523,7 @@ def test_numeric_format_is_literal_text() -> None:
                 "head_output": True,
             }
         ],
-        tokenizer=_FakeTokenizer(),
+        tokenizers={"default": _FakeTokenizer()},
     )
     with pytest.raises(ValueError, match="expected 1"):
         encode_measurement(tokenizer, {"x": 1.0})
@@ -1543,8 +1552,8 @@ def test_numeric_requires_distinct_finite_bounds() -> None:
             fourier_min=0.0,
             fourier_max=1.0,
         )
-    with pytest.raises(TypeError, match="numeric"):
-        Tokenizer(
+    with pytest.raises(TypeError, match="tokenizers"):
+        Tokenizer(  # type: ignore[call-arg]
             input_fields=[
                 {
                     "type": "numeric",
@@ -1573,7 +1582,7 @@ def test_numeric_group_start_keeps_the_scaled_value() -> None:
             },
             {"type": "text", "format": "\n", "head_output": True},
         ],
-        tokenizer=_FakeTokenizer(),
+        tokenizers={"default": _FakeTokenizer()},
     )
     step = encode_measurement(tokenizer, {"observation": 0.25})
     assert step.group_start_numeric_values is not None
@@ -1595,10 +1604,10 @@ def test_numeric_config_roundtrip(tmp_path) -> None:
                 "fourier_max": 4.8,
             },
         ],
-        tokenizer=_FakeTokenizer(),
+        tokenizers={"default": _FakeTokenizer()},
     )
     save_tokenizer(tokenizer=tokenizer, path=tmp_path)
-    loaded = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizer=_FakeTokenizer())
+    loaded = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizers={"default": _FakeTokenizer()})
     assert isinstance(loaded, Tokenizer)
     spec = loaded.input_fields[1]
     assert spec.type == "numeric"
@@ -1631,7 +1640,7 @@ def test_numeric_embed_adds_fourier_of_the_scaled_value() -> None:
                 "fourier_max": 1.0,
             },
         ],
-        tokenizer=_FakeTokenizer(),
+        tokenizers={"default": _FakeTokenizer()},
     )
     fresh = Embedding(hidden_dim=8, vocab_size=32, num_frequencies=4)
     assert fresh.fourier is not None
@@ -1684,14 +1693,14 @@ def test_token_field_emits_one_text_token() -> None:
             {"type": "text", "input_field": "action", "format": "{field}"},
             {"type": "token", "format": "\n", "head_output": True},
         ],
-        tokenizer=_FakeTokenizer(),
+        tokenizers={"default": _FakeTokenizer()},
     )
     step = encode_measurement(tokenizer, {"action": 0})
     assert step.token_ids.tolist() == _encoded("0") + _encoded("\n")
     assert step.head_token_mask.tolist() == [False, True]
     wide = Tokenizer(
         input_fields=[{"type": "token", "format": "ab", "head_output": True}],
-        tokenizer=_FakeTokenizer(),
+        tokenizers={"default": _FakeTokenizer()},
     )
     with pytest.raises(ValueError, match="expected 1"):
         encode_measurement(wide, {})

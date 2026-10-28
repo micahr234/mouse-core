@@ -15,7 +15,7 @@ class CharacterTokenizer:
 
 
 def make_tokenizer(**field_options):
-    return Tokenizer(tokenizer=CharacterTokenizer(), input_fields=[
+    return Tokenizer(tokenizers={"default": CharacterTokenizer()}, input_fields=[
         dict(type='text', input_field='action', lookup=['A', 'B', 'C', 'D'],
              format='[{field}]', **field_options),
         dict(type='token', input_field='action_requested', format='\n', head_output=True),
@@ -28,7 +28,7 @@ def test_lookup_roundtrip_preserves_events_and_numeric_labels(tmp_path):
               for i in range(4)]
     original = deepcopy(events)
     save_tokenizer(tokenizer=tok, path=tmp_path)
-    restored = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizer=CharacterTokenizer())
+    restored = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizers={"default": CharacterTokenizer()})
     for encoder in (tok, restored):
         steps = encoder.encode(events)
         assert [''.join(map(chr, step.token_ids)) for step in steps] == ['[A]\n', '[B]\n', '[C]\n', '[D]\n']

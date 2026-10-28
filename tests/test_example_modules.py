@@ -2,6 +2,7 @@ from tests._event_fixtures import measurement_events
 """Exercise the actual notebook encoders, separate heads, and training loops."""
 import ast
 from copy import deepcopy
+from dataclasses import replace
 import json
 from pathlib import Path
 from typing import Any
@@ -18,8 +19,8 @@ from mouse_core.data import (environment_episode_ranges, DataLoader, EventLog, T
 from mouse_core.data.token_batch import TokenBatch
 from mouse_gym import RepeatTaskTracker
 from mouse_core.models import (
-    Backbone, Embedding, DecodeCache, LatentReasoner, MLP, Model,
-    DiscretizedActionHead, prepare_decode, select_discrete_action,
+    Backbone, Embedding, MultiEmbedding, DecodeCache, LatentReasoner, MLP, Model,
+    DiscretizedActionHead, prepare_decode, select_discrete_action, action_readouts,
     load_model, save_model, sample_reasoning_splits,
 )
 from mouse_core.objectives import (
@@ -35,7 +36,8 @@ NOTEBOOKS = [path for path in sorted(EXAMPLES.glob("*.ipynb"))
 
 
 def _tokens(*actions):
-    return batch_to_token_batch(token_tokenizer("action"), [[{"action": action} for action in actions]])
+    return replace(batch_to_token_batch(token_tokenizer("action"), [[{"action": action} for action in actions]]),
+                   tokenizer_names=("text",))
 
 
 def _example(path, **overrides):
@@ -53,13 +55,14 @@ def _example(path, **overrides):
                 if isinstance(target, ast.Name):
                     namespace[target.id] = value
     namespace.update(
-        PRETRAINED="local-test", MAX_ACTIONS=3, HIDDEN_DIM=8, BACKBONE_LAYERS=1,
+        PRETRAINED="local-test", TOKENIZER_SOURCES={"text": "local-test"}, MAX_ACTIONS=3, HIDDEN_DIM=8, BACKBONE_LAYERS=1,
         BACKBONE_HEADS=2, NUM_FREQUENCIES=2, NUM_THOUGHTS=2,
         vocabulary={str(i): i for i in range(32)},
         text_tokenizer=list(range(32)),
         action_vectors=torch.tensor([[-2.], [0.], [2.]]),
     )
     namespace.update(overrides)
+    namespace["tokenizer"] = SimpleNamespace(tokenizer_sources=namespace["TOKENIZER_SOURCES"])
     construction = []
 
     def embedding_factory(**kwargs):
@@ -84,7 +87,8 @@ def _example(path, **overrides):
                 continue
             body.append(node)
     exec(compile(ast.Module(body=body, type_ignores=[]), str(path), "exec"), namespace)
-    assert [name for name, _ in construction] == ["embedding", "backbone"]
+    table_count = 1 if path.stem.startswith(("19_", "20_")) else len(namespace["TOKENIZER_SOURCES"])
+    assert [name for name, _ in construction] == ["embedding"] * table_count + ["backbone"]
     if "modules" not in namespace:  # cosine example saves separate tracker dicts
         namespace["modules"] = nn.ModuleDict({
             name: namespace[name] for name in ("encoder", "q_head", "transition")
@@ -98,6 +102,23 @@ def _heads(ns):
     return [ns[name] for name in ("q_head", "policy_head", "value_head") if name in ns]
 
 
+def test_example_encoder_builds_and_trains_each_named_tokenizer_table():
+    from tests._token_batch_helpers import IntIdTokenizer
+    _, ns = _example(EXAMPLES / '02_train_offline_dqn.ipynb',
+                     TOKENIZER_SOURCES={'text': 'text-model', 'actions': 'action-model'})
+    encoder = ns['encoder']
+    assert set(encoder.embedding.embeddings) == {'text', 'actions'}
+    tokenizer = Tokenizer(tokenizers={'text': IntIdTokenizer(), 'actions': IntIdTokenizer()}, input_fields=[
+        dict(type='text', tokenizer='actions', input_field='action', format='{field}'),
+        dict(type='text', tokenizer='text', input_field='observation', format='{field}', head_output=True),
+    ])
+    inputs = tokenizer.pack_rows(rows=[measurement_events([{'action': 2, 'observation': 3}])], continuing=None)
+    ns['q_head'](encoder(inputs)['z']).square().sum().backward()
+    for table in encoder.embedding.embeddings.values():
+        assert table.embed_tokens.weight.grad is not None
+        assert table.embed_tokens.weight.grad.abs().sum() > 0
+
+
 @pytest.mark.parametrize("path", NOTEBOOKS, ids=lambda p: p.stem)
 def test_encoders_and_heads_have_separate_gradients_and_cached_readouts(path):
     _, ns = _example(path)
@@ -108,9 +129,15 @@ def test_encoders_and_heads_have_separate_gradients_and_cached_readouts(path):
         else {"embedding", "backbone"}
     )
     assert not {id(p) for p in encoder.embedding.parameters()} & {id(p) for p in encoder.backbone.parameters()}
-    out = encoder(_tokens(0, 1))
-    assert "predictions" not in out
-    torch.testing.assert_close(out["z"], out["last_hidden_state"][out["head_token_ids"]])
+    tokens = _tokens(0, 1)
+    features = []
+    hook = encoder.backbone.register_forward_hook(lambda module, args, output: features.append(output))
+    try:
+        out = encoder(tokens)
+    finally:
+        hook.remove()
+    assert set(out) == {"z", "cache"}
+    torch.testing.assert_close(out["z"], features[-1][tokens.head_token_ids])
     heads = _heads(ns)
     torch.stack([head(out["z"]).square().mean() for head in heads]).sum().backward()
     for module in (encoder.embedding, encoder.backbone, *heads):
@@ -204,21 +231,22 @@ def test_notebook_training_uses_all_online_modules_and_updates_targets(path):
         target = ns["delayed_encoder"]
         assert all(p.grad is None for p in target.parameters())
         assert any(not torch.equal(old, new) for old, new in zip(delayed_before, target.parameters()))
-        # Check that both distinct backup heads track the online Q heads at their own rates.
+        # Only the value head has a delayed copy; actions use the online head.
+        assert "backup_action_head" not in ns and "backup_action_heads" not in ns
+        assert "POLYAK_TAU_ACTION" not in ns
         if "q_heads" in ns:
-            triples = [(ns["q_heads"][key], ns["backup_value_heads"][key], ns["backup_action_heads"][key])
+            pairs = [(ns["q_heads"][key], ns["backup_value_heads"][key])
                        for key in ns["head_keys"]]
             initial = before["q_heads"]
         else:
-            triples = [(ns["q_head"], ns["backup_value_head"], ns["backup_action_head"])]
+            pairs = [(ns["q_head"], ns["backup_value_head"])]
             initial = before["q_head"]
         offset = 0
-        for source, value, action in triples:
-            for online, v, a in zip(source.parameters(), value.parameters(), action.parameters()):
+        for source, value in pairs:
+            for online, v in zip(source.parameters(), value.parameters()):
                 old = initial[offset]
                 torch.testing.assert_close(v, old.lerp(online.detach(), ns["POLYAK_TAU_VALUE"]))
-                torch.testing.assert_close(a, old.lerp(online.detach(), ns["POLYAK_TAU_ACTION"]))
-                assert not v.requires_grad and not a.requires_grad
+                assert not v.requires_grad
                 offset += 1
 
 
@@ -243,9 +271,10 @@ def test_embedding_requires_prepared_inputs_on_the_model_device():
     model = namespace["encoder"]
     tokens = _tokens(0)
     tensors = tokens.to_tensors("cpu")
-    kwargs = {name: tensors[name] for name in ("numeric_mask", "numeric_values")}
+    kwargs: dict[str, Any] = {name: tensors[name] for name in ("numeric_mask", "numeric_values", "tokenizer_ids")}
+    kwargs["tokenizer_names"] = tokens.tokenizer_names
     with pytest.raises(TypeError, match="expects tensor"):
-        model.embedding(tokens, **kwargs)
+        model.embedding.embeddings["text"](tokens, numeric_values=tensors["numeric_values"], numeric_mask=tensors["numeric_mask"])
     model.to("meta")
     with pytest.raises(ValueError, match="same device"):
         model.embedding(tensors["token_ids"], **kwargs)
@@ -318,7 +347,7 @@ def test_ppo_collection_restarts_replay_and_preserves_behavior_prefixes():
         return env
 
     from tests._token_batch_helpers import IntIdTokenizer
-    tokenizer = Tokenizer(tokenizer=IntIdTokenizer(), input_fields=[
+    tokenizer = Tokenizer(tokenizers={"text": IntIdTokenizer()}, input_fields=[
             dict(type='text', provider='environment', input_field='observation', format='{field}'),
             dict(type='token', provider='environment', format='1', head_output=True)],
         objective_fields=[
@@ -394,7 +423,7 @@ def test_grpo_behavior_probability_uses_the_complete_training_prefix():
         # Make the logits depend on the first observation, so dropping an old
         # prefix would silently change the action distribution.
         first = float(tokens.token_ids[0])
-        return {'z': torch.tensor([[first, 0., -first]])}
+        return {'z': torch.tensor([[first, 0., -first]]).expand(tokens.P, -1)}
 
     ns.update(tokenizer=tokenizer, encoder=encoder, policy_head=lambda z: z,
               sample_discrete_action=sample_discrete_action)
@@ -410,8 +439,8 @@ def test_cartpole_encoder_uses_configured_fourier_features_for_observations():
     notebook, ns = _example(EXAMPLES / '18_train_offline_cartpole_dqn.ipynb',
                             NUM_FREQUENCIES=3)
     encoder = ns['encoder'].eval()
-    assert encoder.embedding.num_frequencies == 3
-    assert encoder.embedding.fourier is not None
+    assert encoder.embedding.embeddings["text"].num_frequencies == 3
+    assert encoder.embedding.embeddings["text"].fourier is not None
 
     # Keep the actual notebook's numeric observation fields and scaling bounds.
     definition = next(node.value for cell in notebook['cells'] if cell['cell_type'] == 'code'
@@ -437,7 +466,7 @@ def test_cartpole_encoder_uses_configured_fourier_features_for_observations():
         def __call__(self, text, **kwargs):
             return {'input_ids': torch.tensor([['xt\n'.index(text)]])}
 
-    tokenizer = Tokenizer(tokenizer=FieldTokenizer(), input_fields=input_fields,
+    tokenizer = Tokenizer(tokenizers={"text": FieldTokenizer()}, input_fields=input_fields,
                           objective_fields=[])
     first = tokenizer.pack_rows(rows=[measurement_events(payloads) for payloads in [[{'cart_position': 0., 'pole_angle': 0.}]]], continuing=None)
     second = tokenizer.pack_rows(rows=[measurement_events(payloads) for payloads in [[{'cart_position': 0.5, 'pole_angle': 0.1}]]], continuing=None)

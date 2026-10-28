@@ -84,8 +84,8 @@ def token_tokenizer(
         resolved = [{"input_field": name} for name in cast(list[str], objective_fields)]
     else:
         resolved = cast(list[dict[str, Any]], objective_fields)
-    if "tokenizer" not in kwargs:
-        kwargs["tokenizer"] = IntIdTokenizer()
+    if "tokenizers" not in kwargs:
+        kwargs["tokenizers"] = {"default": IntIdTokenizer()}
     return Tokenizer(
         input_fields=input_fields,
         objective_fields=resolved,
@@ -126,4 +126,5 @@ def embed_batch(embedding, batch):
     return embedding(
         tensors["token_ids"], numeric_values=tensors["numeric_values"],
         numeric_mask=tensors["numeric_mask"],
+        tokenizer_ids=tensors["tokenizer_ids"], tokenizer_names=batch.tokenizer_names,
     )

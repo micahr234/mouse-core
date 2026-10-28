@@ -16,7 +16,7 @@ from tests._token_batch_helpers import IntIdTokenizer
 
 
 def tokenizer():
-    return Tokenizer(tokenizer=IntIdTokenizer(), input_fields=[
+    return Tokenizer(tokenizers={"default": IntIdTokenizer()}, input_fields=[
         dict(type='numeric', provider='environment', input_field='position', format='1', fourier_min=-10., fourier_max=10.),
         dict(type='numeric', provider='environment', input_field='temperature', format='2', fourier_min=-40., fourier_max=40.),
         dict(type='token', provider='environment', format='4', head_output=True),
@@ -245,7 +245,7 @@ def test_incremental_tokens_and_saved_spec_match_replay(tmp_path):
     log = collect()
     tok = tokenizer()
     save_tokenizer(tokenizer=tok, path=tmp_path)
-    loaded = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizer=IntIdTokenizer())
+    loaded = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizers={"default": IntIdTokenizer()})
     rows = list(environment_decisions(log))[:4]
     full = tok.pack_rows(rows=[_events(rows)], continuing=None)
     first = tok.pack_rows(rows=[_events(rows[:1])], continuing=None)
@@ -280,7 +280,7 @@ def test_provider_fields_preserve_optional_environment_observations_in_order():
 
 
 def test_events_without_matching_fields_emit_no_tokens():
-    tok = Tokenizer(tokenizer=IntIdTokenizer(), input_fields=[])
+    tok = Tokenizer(tokenizers={"default": IntIdTokenizer()}, input_fields=[])
     step = _step(tok, list(environment_decisions(collect()))[1])
     assert step.token_ids.size == 0 and not step.head_token_mask.any()
 
@@ -292,9 +292,9 @@ def test_events_without_matching_fields_emit_no_tokens():
 ])
 def test_empty_provider_fields_explicitly_exclude_payloads(tmp_path, excluded, expected_ids):
     fields = [field for field in tokenizer().input_fields if field.provider not in excluded or field.input_field is None]
-    tok = Tokenizer(tokenizer=IntIdTokenizer(), input_fields=fields)
+    tok = Tokenizer(tokenizers={"default": IntIdTokenizer()}, input_fields=fields)
     save_tokenizer(tokenizer=tok, path=tmp_path)
-    loaded = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizer=IntIdTokenizer())
+    loaded = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizers={"default": IntIdTokenizer()})
     tokens = _step(loaded, list(environment_decisions(collect()))[1])
     np.testing.assert_array_equal(tokens.token_ids, expected_ids)
     assert tokens.head_token_mask.sum() == 1
@@ -398,7 +398,7 @@ def test_loader_index_overlay_follows_environment_readouts_without_altering_sour
         observed.append(events)
         return tok.encode(events)
 
-    tok = Tokenizer(tokenizer=IntIdTokenizer(), input_fields=tokenizer().input_fields,
+    tok = Tokenizer(tokenizers={"default": IntIdTokenizer()}, input_fields=tokenizer().input_fields,
         objective_fields=[dict(input_field='source_offset'),
                           dict(input_field='episode_index', output_field='source_episode_index')],
     )

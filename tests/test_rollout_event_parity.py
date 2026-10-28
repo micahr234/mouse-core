@@ -1,6 +1,7 @@
 """Dataset, online-policy, and inference loops share the same event contract."""
 
 from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 import pytest
@@ -26,7 +27,8 @@ OUTPUTS = [
 ]
 
 
-def assert_matching_events_and_tokens(reference, actual, *, behavior_labels=False):
+def assert_matching_events_and_tokens(reference, actual, *, behavior_labels=False,
+                                     tokenizer_filename='02_train_offline_dqn.ipynb'):
     # Policy probabilities are agent-owned training labels, not environment data.
     events = actual.events
     for event in events:
@@ -34,6 +36,7 @@ def assert_matching_events_and_tokens(reference, actual, *, behavior_labels=Fals
             assert event['payload'].pop('old_log_prob') == -.5
     assert events == reference.events
     tok = _notebook_transform('02_train_offline_dqn.ipynb', tokenizer_only=True)
+    runtime_tok = _notebook_transform(tokenizer_filename, tokenizer_only=True)
     expected = tok.encode(reference)
     for source in (actual, actual.to_dataset()):
         steps = tok.encode(source)
@@ -47,6 +50,11 @@ def assert_matching_events_and_tokens(reference, actual, *, behavior_labels=Fals
         reference_packed, _, _ = pack_token_batch(steps=expected, continuing=None)
         np.testing.assert_array_equal(packed.token_ids, reference_packed.token_ids)
         np.testing.assert_array_equal(packed.head_step_ids, reference_packed.head_step_ids)
+        # Use the actual online configuration too, not just one common test encoder.
+        runtime_steps = runtime_tok.encode(source, include_objectives=False)
+        runtime_packed, _, _ = pack_token_batch(steps=runtime_steps, continuing=None)
+        for key in ('token_ids', 'numeric_values', 'numeric_mask', 'head_token_ids', 'head_step_ids'):
+            np.testing.assert_array_equal(getattr(runtime_packed, key), getattr(reference_packed, key))
 
 
 @pytest.mark.parametrize('oracle_values', [False, True])
@@ -54,7 +62,8 @@ def assert_matching_events_and_tokens(reference, actual, *, behavior_labels=Fals
 def test_online_and_inference_events_match_dataset_collection(filename, oracle_values):
     reference, _ = _collect_outputs('01_collect_dataset.ipynb', OUTPUTS, oracle_values=oracle_values)
     actual, _ = _collect_outputs(filename, OUTPUTS, oracle_values=oracle_values, explore=False)
-    assert_matching_events_and_tokens(reference, actual, behavior_labels=filename.startswith('07_'))
+    assert_matching_events_and_tokens(reference, actual, behavior_labels=filename.startswith('07_'),
+                                     tokenizer_filename=filename if not filename.startswith('15_') else '02_train_offline_dqn.ipynb')
 
 
 def test_inference_continuation_matches_one_collection_run():
@@ -84,7 +93,7 @@ def test_grpo_reset_and_branch_events_match_dataset_collection(oracle_values):
         def close(self):
             pass
 
-    namespace = dict(EventLog=EventLog, RepeatTaskTracker=RepeatTaskTracker,
+    namespace: dict[str, Any] = dict(EventLog=EventLog, RepeatTaskTracker=RepeatTaskTracker,
                      Datastore=Datastore, torch=torch, group_relative_advantages=group_relative_advantages,
                      modules=SimpleNamespace(eval=lambda: None), make_episode_env=lambda **kwargs: Env(),
                      act_once=lambda **kwargs: (2, -.5), SEED_OFFSET=0, BRANCHES_PER_ENV=1,
@@ -99,4 +108,5 @@ def test_grpo_reset_and_branch_events_match_dataset_collection(oracle_values):
     _functions({'run_rollout', 'rollout_branch', 'stamp_advantages_with_prefix_len'}, namespace)
     assert namespace['run_rollout'](num_envs=1) == (1, 1)
     actual = EventLog.from_dataset(namespace['stores'][0].to_dataset())
-    assert_matching_events_and_tokens(reference, actual, behavior_labels=True)
+    assert_matching_events_and_tokens(reference, actual, behavior_labels=True,
+                                     tokenizer_filename='08_train_online_grpo.ipynb')

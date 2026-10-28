@@ -33,15 +33,15 @@ def test_inline_conditions_reload_in_a_fresh_notebook(tmp_path, monkeypatch):
             {'type': 'token', 'format': '2', 'when': training.on_start},
             {'type': 'token', 'format': '1', 'head_output': True},
         ],
-        tokenizer=IntIdTokenizer(),
+        tokenizers={"default": IntIdTokenizer()},
     )
     save_tokenizer(tokenizer=tokenizer, path=tmp_path)
     inference = ModuleType('__main__')
     monkeypatch.setitem(sys.modules, '__main__', inference)
     with pytest.raises(ValueError, match="Define tokenizer condition 'on_start'"):
-        load_tokenizer(repo_id_or_path=str(tmp_path), tokenizer=IntIdTokenizer())
+        load_tokenizer(repo_id_or_path=str(tmp_path), tokenizers={"default": IntIdTokenizer()})
     exec(source, inference.__dict__)
-    restored = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizer=IntIdTokenizer())
+    restored = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizers={"default": IntIdTokenizer()})
     assert isinstance(restored, Tokenizer)
     assert restored.input_fields[0].when is inference.on_start
     assert restored.input_fields[0].when is not training.on_start
@@ -53,7 +53,7 @@ def test_inline_conditions_reload_in_a_fresh_notebook(tmp_path, monkeypatch):
 def test_unsavable_predicate_does_not_overwrite_a_saved_tokenizer(tmp_path, module):
     good = Tokenizer(
         input_fields=[{'type': 'token', 'format': '1', 'head_output': True}],
-        tokenizer=IntIdTokenizer(),
+        tokenizers={"default": IntIdTokenizer()},
     )
     save_tokenizer(tokenizer=good, path=tmp_path)
     before = (tmp_path / 'tokenizer.json').read_bytes()
@@ -64,14 +64,14 @@ def test_unsavable_predicate_does_not_overwrite_a_saved_tokenizer(tmp_path, modu
             {'type': 'token', 'format': '2', 'when': namespace['on_start']},
             {'type': 'token', 'format': '1', 'head_output': True},
         ],
-        tokenizer=IntIdTokenizer(),
+        tokenizers={"default": IntIdTokenizer()},
     )
     # The condition is usable live, but its import path cannot survive a fresh process.
     assert bad.pack_rows(rows=[measurement_events(payloads) for payloads in [[{}]]], continuing=None).token_ids.tolist() == [2, 1]
     with pytest.raises(TypeError, match='importable'):
         save_tokenizer(tokenizer=bad, path=tmp_path)
     assert (tmp_path / 'tokenizer.json').read_bytes() == before
-    restored = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizer=IntIdTokenizer())
+    restored = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizers={"default": IntIdTokenizer()})
     assert isinstance(restored, Tokenizer)
     assert encode_measurement(restored, {}).token_ids.tolist() == [1]
 
@@ -346,13 +346,13 @@ def test_tokenizer_roundtrip(tmp_path) -> None:
             {"input_field": "repeat_episode_done"},
             {"input_field": "episode_done"},
         ],
-        tokenizer=IntIdTokenizer(),
+        tokenizers={"default": IntIdTokenizer()},
     )
     save_tokenizer(tokenizer=tokenizer, path=tmp_path)
     assert (tmp_path / "tokenizer.json").is_file()
-    loaded = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizer=IntIdTokenizer())
+    loaded = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizers={"default": IntIdTokenizer()})
     assert isinstance(loaded, Tokenizer)
-    assert loaded.pretrained is None
+    assert loaded.tokenizer_sources == {"default": None}
     assert loaded.objective_fields == (
         ("action", "action"),
         ("reward", "r"),
@@ -391,10 +391,10 @@ def test_tokenizer_roundtrip_group_start_and_not_equals(tmp_path) -> None:
             },
             {"type": "text", "input_field": "action", "format": "{field}", "head_output": True},
         ],
-        tokenizer=_Tok(),
+        tokenizers={"default": _Tok()},
     )
     save_tokenizer(tokenizer=tokenizer, path=tmp_path)
-    loaded = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizer=_Tok())
+    loaded = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizers={"default": _Tok()})
     assert isinstance(loaded, Tokenizer)
     assert loaded.input_fields[0].when is when_group_start
     assert loaded.input_fields[0].input_field is None
@@ -412,7 +412,7 @@ def test_load_tokenizer_missing_file_raises(tmp_path) -> None:
 
 def test_push_model_and_tokenizer_share_repository(monkeypatch) -> None:
     model = simple_model(backbone=IdentityBackbone(hidden_dim=8), heads=({'action_value': (head := MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0))}), reasoner=None)
-    tokenizer = Tokenizer(input_fields=[{'type': 'text', 'input_field': 'action', 'format': '{field}', 'head_output': True}, {'type': 'text', 'input_field': 'repeat_episode_index', 'format': '{field}', 'when': when_step_index_zero}], objective_fields=[], tokenizer=IntIdTokenizer())
+    tokenizer = Tokenizer(input_fields=[{'type': 'text', 'input_field': 'action', 'format': '{field}', 'head_output': True}, {'type': 'text', 'input_field': 'repeat_episode_index', 'format': '{field}', 'when': when_step_index_zero}], objective_fields=[], tokenizers={"default": IntIdTokenizer()})
     import mouse_core.models.io as io
     import huggingface_hub
     from pathlib import Path
@@ -426,7 +426,7 @@ def test_push_model_and_tokenizer_share_repository(monkeypatch) -> None:
             directory = Path(kwargs["folder_path"])
             assert {"config.json", "pytorch_model.bin", "tokenizer.json", "README.md"} <= {p.name for p in directory.iterdir()}
             load_model(model=model, repo_id_or_path=directory)
-            loaded = load_tokenizer(repo_id_or_path=str(directory), tokenizer=IntIdTokenizer())
+            loaded = load_tokenizer(repo_id_or_path=str(directory), tokenizers={"default": IntIdTokenizer()})
             assert isinstance(loaded, Tokenizer)
             assert loaded is not None
             uploads.append(kwargs)
@@ -439,7 +439,7 @@ def test_push_model_and_tokenizer_share_repository(monkeypatch) -> None:
 
 
 def test_explicit_missing_labels_roundtrip_without_inserting_input_tokens(tmp_path):
-    tokenizer = Tokenizer(tokenizer=IntIdTokenizer(), input_fields=[
+    tokenizer = Tokenizer(tokenizers={"default": IntIdTokenizer()}, input_fields=[
         {'type': 'numeric', 'input_field': 'reward',
          'format': '2', 'fourier_min': 0., 'fourier_max': 10.},
         {'type': 'token', 'format': '1', 'head_output': True},
@@ -448,7 +448,7 @@ def test_explicit_missing_labels_roundtrip_without_inserting_input_tokens(tmp_pa
         {'input_field': 'action', 'missing_value': None},
     ])
     save_tokenizer(tokenizer=tokenizer, path=tmp_path)
-    restored = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizer=IntIdTokenizer())
+    restored = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizers={"default": IntIdTokenizer()})
     assert isinstance(restored, Tokenizer)
     row = {}
     for encoder in (tokenizer, restored):
@@ -462,11 +462,11 @@ def test_explicit_missing_labels_roundtrip_without_inserting_input_tokens(tmp_pa
 
 
 def test_missing_vector_targets_roundtrip_and_do_not_train_unlabelled_rows(tmp_path):
-    tokenizer = Tokenizer(tokenizer=IntIdTokenizer(), input_fields=[
+    tokenizer = Tokenizer(tokenizers={"default": IntIdTokenizer()}, input_fields=[
         {'type': 'token', 'format': '1', 'head_output': True},
     ], objective_fields=[{'input_field': 'q_star', 'missing_value': []}])
     save_tokenizer(tokenizer=tokenizer, path=tmp_path)
-    restored = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizer=IntIdTokenizer())
+    restored = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizers={"default": IntIdTokenizer()})
     assert isinstance(restored, Tokenizer)
     rows = [{'q_star': [1., 2.]}, {}, {'q_star': [3., 4.]}]
     for encoder in (tokenizer, restored):

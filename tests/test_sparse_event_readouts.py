@@ -22,7 +22,7 @@ def on_group_start(ctx):
 
 
 def tokenizer():
-    return Tokenizer(tokenizer=backend(), input_fields=[
+    return Tokenizer(tokenizers={"default": backend()}, input_fields=[
         dict(type='token', provider='environment', format='prefix', when=on_group_start),
         dict(type='token', provider='agent', input_field='action', format='action'),
         dict(type='token', provider='environment', input_field='observation', format='obs'),
@@ -52,9 +52,9 @@ def episode():
 
 def test_special_tokens_sparse_steps_and_roundtrip(tmp_path):
     tok = tokenizer()
-    special = tok.special_token_ids['<|action_requested|>']
-    assert tok.tokenizer('<|action_requested|>', add_special_tokens=False)['input_ids'] == [special]
-    assert tok.tokenizer.decode([special], skip_special_tokens=True) == ''
+    special = tok.special_token_ids['default']['<|action_requested|>']
+    assert tok.tokenizers['default']('<|action_requested|>', add_special_tokens=False)['input_ids'] == [special]
+    assert tok.tokenizers['default'].decode([special], skip_special_tokens=True) == ''
     for source in (episode(), episode().to_dataset()):
         steps = tok.encode(source)
         assert [int(step.head_token_mask.sum()) for step in steps] == [1, 0, 0, 1, 0]
@@ -67,14 +67,14 @@ def test_special_tokens_sparse_steps_and_roundtrip(tmp_path):
         assert labels['reward'].tolist() == [0., 2., 3., 0., 7.]
         assert groups.tolist() == [0] * 5
     save_tokenizer(tokenizer=tok, path=tmp_path)
-    restored = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizer=backend())
+    restored = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizers={"default": backend()})
     assert isinstance(restored, Tokenizer)
     assert restored.special_token_ids == tok.special_token_ids
     assert [step.token_ids.tolist() for step in restored.encode(episode())] == [step.token_ids.tolist() for step in tok.encode(episode())]
     changed = backend()
     changed.add_tokens(['another-token'])
     with pytest.raises(ValueError, match='Special token IDs differ'):
-        load_tokenizer(repo_id_or_path=str(tmp_path), tokenizer=changed)
+        load_tokenizer(repo_id_or_path=str(tmp_path), tokenizers={"default": changed})
 
 
 def test_rewards_flow_through_steps_without_readouts():
@@ -132,7 +132,7 @@ def test_embedding_growth_preserves_old_rows_and_trains_special_row():
 
 
 def test_wildcard_fields_keep_order_and_group_prefix_once():
-    tok = Tokenizer(tokenizer=backend(), input_fields=[
+    tok = Tokenizer(tokenizers={"default": backend()}, input_fields=[
         dict(type='token', provider=None, format='prefix', when=on_group_start),
         dict(type='token', provider=None, input_field='value', format='obs'),
         dict(type='token', provider='agent', input_field='value', format='action', head_output=True),
@@ -205,7 +205,7 @@ def test_field_order_and_independent_events_with_mergeable_text():
     hf = PreTrainedTokenizerFast(tokenizer_object=Backend(BPE(
         vocab={'[UNK]': 0, 'a': 1, 'b': 2, 'ab': 3},
         merges=[('a', 'b')], unk_token='[UNK]')), unk_token='[UNK]')
-    tok = Tokenizer(tokenizer=hf, input_fields=[
+    tok = Tokenizer(tokenizers={"default": hf}, input_fields=[
         dict(type='text', provider=None, input_field='first', format='{field}'),
         dict(type='text', provider='environment', input_field='second', format='{field}'),
     ])
@@ -234,11 +234,11 @@ def test_missing_inputs_skip_all_modalities(payload):
     def unexpected_image(value):
         raise AssertionError('Missing images must not be tokenized')
 
-    tok = Tokenizer(tokenizer=backend(), image_tokenizer=unexpected_image, input_fields=[
+    tok = Tokenizer(tokenizers={'default': backend(), 'image': unexpected_image}, input_fields=[
         dict(type='text', input_field='text', format='{field}'),
         dict(type='token', input_field='marker', format='action', head_output=True),
         dict(type='numeric', input_field='number', format='reward', fourier_min=0., fourier_max=1.),
-        dict(type='image', input_field='image'),
+        dict(type='image', tokenizer='image', input_field='image'),
     ])
     assert tok({'provider': 'environment', 'payload': payload})['token_ids'].size == 0
     with pytest.raises(TypeError, match='real number'):
@@ -248,7 +248,7 @@ def test_missing_inputs_skip_all_modalities(payload):
 def test_existing_action_marker_does_not_extend_vocabulary():
     hf = backend()
     size = len(hf)
-    tok = Tokenizer(tokenizer=hf, input_fields=[
+    tok = Tokenizer(tokenizers={"default": hf}, input_fields=[
         dict(type='token', input_field='action_requested', format='action', head_output=True),
     ])
     assert len(hf) == size and tok.special_token_ids == {}

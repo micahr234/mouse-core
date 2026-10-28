@@ -58,6 +58,14 @@ All events for a step share those indices, including actions and their resulting
 observations. Step indices restart at zero in each episode. They are sampling
 metadata and do not become model-input tokens automatically.
 
+Dataset collection, online training, and inference use the same event order:
+the coordinator starts an episode, the agent records each requested action before
+execution, and the environment records its result. Reset frames have no agent
+event. Zero rewards and false flags are omitted. Oracle `q_star` values are
+recorded only when supplied and an action is requested; online and inference
+environments can leave oracle computation disabled. PPO and GRPO additionally
+record behavior log probabilities on agent events.
+
 `Tokenizer` encodes each event's configured payload fields in `input_fields` order.
 A change in `step_field` starts the next step before that event's tokens;
 an event without the marker continues the current step. The first event needs a
@@ -72,7 +80,7 @@ from functools import partial
 from mouse_core.data import DataLoader, Tokenizer, step_sample_ranges
 
 tokenizer = Tokenizer(
-    tokenizer=hf_tokenizer,
+    tokenizers={"text": hf_tokenizer},
     step_field="step_index",
     episode_field="episode_index",
     input_fields=[
@@ -111,6 +119,56 @@ embedding size unchanged, so the marker needs no new embedding row to train.
 For discrete actions, `lookup=["a", "b", "c", "d"]` renders IDs 0–3 as letters
 before applying `format`. Missing values are skipped; invalid IDs raise.
 Stored actions and objective labels remain numeric.
+
+For multiple vocabularies, supply a named dictionary and select a tokenizer on
+each input field. Values may be pretrained tokenizer names/paths or live callable
+backends. Each tokenizer has its own embedding table; local token ID 1 in one
+vocabulary is independent of ID 1 in another.
+
+```python
+from mouse_core.models import Embedding, MultiEmbedding
+
+sources = {"text": TEXT_CHECKPOINT, "actions": ACTION_CHECKPOINT}
+tokenizer = Tokenizer(
+    tokenizers=sources,
+    input_fields=[
+        {"type": "text", "tokenizer": "text", "format": group_prefix, "when": on_group_start},
+        {"type": "text", "tokenizer": "actions", "input_field": "action",
+         "lookup": ["a", "b", "c", "d"], "format": "{field}"},
+        {"type": "text", "tokenizer": "text", "input_field": "observation", "format": ",{field}"},
+        {"type": "token", "tokenizer": "text", "input_field": "action_requested",
+         "format": "\n", "head_output": True},
+    ],
+)
+embedding = MultiEmbedding(embeddings={
+    name: Embedding(pretrained=checkpoint) for name, checkpoint in sources.items()
+}).to(device)
+inputs = tokenizer.pack_rows(rows=[events], continuing=None)
+tensors = inputs.to_tensors(device)
+embedded = embedding(
+    tensors["token_ids"], tokenizer_ids=tensors["tokenizer_ids"],
+    tokenizer_names=inputs.tokenizer_names,
+    numeric_values=tensors["numeric_values"], numeric_mask=tensors["numeric_mask"],
+)
+```
+
+The embedding tables must have the same hidden dimension as the backbone.
+They can be frozen or trained independently, for example
+`embedding.embeddings["text"].requires_grad_(False)`. No tokens are added by
+selecting a backend. Tokenizer names are sorted for stable routing and preserved
+through event encoding, step packing, prefixes, and checkpoint specifications.
+Custom callable backends are supplied again by name when loading; pretrained
+sources reload from their saved identifiers. A lone backend or one named
+`default` may be selected implicitly. `tokenizers={...}` is required, including
+when there is only one backend. The old `tokenizer=`, `pretrained=`, and
+`image_tokenizer=` arguments are unsupported; saved specifications must also
+contain the named dictionary.
+
+For action selection, pass the packed `inputs` to `select_discrete_action`, or
+use `action_readouts(scores, inputs)` before sampling policy logits. Only the
+current step may supply a readout; a missing readout raises even if an earlier
+step has one. In mixed batches, `sequence_ids` selects the environments currently
+requesting actions. Example encoders return only `z` and `cache`.
 
 Augmentation uses the same optional `provider` filter (None matches all events).
 Missing or `None` fields are skipped automatically. Use

@@ -164,7 +164,7 @@ def _train_transform() -> Any:
             {"input_field": "terminated", "missing_value": False},
             {"input_field": "truncated", "missing_value": False},
         ],
-        pretrained="Qwen/Qwen3-0.6B",
+        tokenizers={"text": "Qwen/Qwen3-0.6B"},
     )
     return compose(stages=(augmenter.events, tokenizer.encode))
 

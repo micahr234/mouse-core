@@ -37,7 +37,8 @@ class TokenizerModalitySpec:
       * ``numeric`` — literal ``format`` → one token ID, with a scaled
         ``numeric_values`` entry and ``numeric_mask=True``
 
-    All token IDs address the same embedding table. Only numeric tokens
+    ``tokenizer`` selects a name from the Tokenizer's backend dictionary.
+    Each named backend addresses its own embedding table. Only numeric tokens
     receive the additional Fourier projection.
 
     A ``text`` field requires ``format=``. With ``input_field=``,
@@ -127,6 +128,7 @@ class TokenizerModalitySpec:
 
     type: str
     provider: str | None = None
+    tokenizer: str | None = None
     special: bool = False
     input_field: str | None = None
     input_index: int | None = None
@@ -147,6 +149,8 @@ class TokenizerModalitySpec:
     )
 
     def __post_init__(self) -> None:
+        if self.tokenizer is not None and (not isinstance(self.tokenizer, str) or not self.tokenizer):
+            raise ValueError("tokenizer must be a nonempty backend name")
         if type(self.special) is not bool or (self.special and (self.type or "").lower() != "token"):
             raise ValueError("special=True is supported only for token fields")
         if self.provider is not None and (not isinstance(self.provider, str) or not self.provider):

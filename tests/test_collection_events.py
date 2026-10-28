@@ -14,7 +14,7 @@ import torch
 from mouse_core.data import Augmenter, Datastore, EventLog, Tokenizer, compose, pack_token_batch
 from mouse_core.data.event_transform import environment_decisions, latest_environment_decision
 from mouse_gym import RepeatTaskTracker
-from mouse_core.models import select_discrete_action
+from mouse_core.models import action_readouts, select_discrete_action
 from mouse_core.models.kv_policy import cache_needs_rebuild, rebuild_starts, resolve_cache_bounds
 from mouse_core.objectives import DqnObjective, boundary_discount
 
@@ -85,7 +85,9 @@ def _collect_outputs(filename, outputs, *, oracle_values=True, inference_chunks=
     env = Env()
     cache = SimpleNamespace(close=lambda: None, reset_rows=lambda **kw: None)
     def encoder(batch, **kwargs):
-        return {'z': torch.tensor([[[0., 0., 1., 0.]]]), 'head_valid_mask': torch.ones((1, 1), dtype=torch.bool),
+        head_steps = np.unique(batch.head_step_ids)
+        counts = np.bincount(batch.step_sequence_ids[head_steps], minlength=batch.B)
+        return {'z': torch.tensor([0., 0., 1., 0.]).expand(batch.B, int(counts.max()), 4),
                 'cache': cache}
 
     namespace.update(EventLog=EventLog, RepeatTaskTracker=RepeatTaskTracker, gym=gym,
@@ -97,8 +99,8 @@ def _collect_outputs(filename, outputs, *, oracle_values=True, inference_chunks=
         REPEAT_COUNT=2, ORACLE_PROB=0.5 if oracle_values else 0., EPISODES_PER_ENV=1,
         epsilon_for_env_step=lambda **kw: float(explore), make_rollout_env=lambda **kw: env,
         encoder=encoder, q_head=lambda z: z, policy_head=lambda z: z, value_head=lambda z: z,
-        tokenizer=SimpleNamespace(pack_rows=lambda **kw: kw['rows']),
-        select_discrete_action=select_discrete_action,
+        tokenizer=_notebook_transform('02_train_offline_dqn.ipynb', tokenizer_only=True),
+        select_discrete_action=select_discrete_action, action_readouts=action_readouts,
         sample_discrete_action=lambda **kw: (torch.tensor([2]), torch.tensor([-.5])),
         cache_needs_rebuild=cache_needs_rebuild, rebuild_starts=rebuild_starts,
         resolve_cache_bounds=resolve_cache_bounds)
@@ -301,12 +303,12 @@ def _notebook_transform(filename, *, tokenizer_only=False):
                                                     and target.id in assignments for target in node.targets)]
 
     def tokenizer_factory(**kwargs):
-        kwargs.pop('pretrained')
-        return Tokenizer(tokenizer=_CharacterTokenizer(), **kwargs)
+        sources = kwargs.pop('tokenizers')
+        return Tokenizer(tokenizers={name: _CharacterTokenizer() for name in sources}, **kwargs)
 
     namespace: dict[str, Any] = dict(Augmenter=Augmenter, Tokenizer=tokenizer_factory, compose=compose,
                                     MAX_ACTIONS=4, MAX_OBS_DISCRETE=64, MAX_STEPS_PER_EPISODE=3,
-                                    REPEAT_COUNT=1, PRETRAINED='unused')
+                                    REPEAT_COUNT=1, PRETRAINED='unused', TOKENIZER_SOURCES={'text': 'unused'})
     exec(compile(ast.Module(body=body, type_ignores=[]), filename, 'exec'), namespace)
     if tokenizer_only:
         return namespace['tokenizer']

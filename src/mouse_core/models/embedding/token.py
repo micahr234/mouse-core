@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from collections.abc import Sequence
 from typing import Any
 
 import torch
@@ -74,10 +75,17 @@ class Embedding(nn.Module):
     def forward(
         self, token_ids: torch.Tensor, *, numeric_values: torch.Tensor | None = None,
         numeric_mask: torch.Tensor | None = None,
+        tokenizer_ids: torch.Tensor | None = None, tokenizer_names: Sequence[str] = ("default",),
     ) -> torch.Tensor:
         """Look up IDs and add Fourier features only at numeric-token positions."""
         if not isinstance(token_ids, torch.Tensor):
             raise TypeError("Embedding expects tensor token_ids.")
+        if len(tokenizer_names) != 1:
+            raise ValueError("Multiple tokenizers require MultiEmbedding with one table per tokenizer")
+        if tokenizer_ids is not None:
+            if (tokenizer_ids.shape != token_ids.shape or tokenizer_ids.dtype != torch.long
+                    or tokenizer_ids.device != token_ids.device or bool((tokenizer_ids != 0).any())):
+                raise ValueError("Single Embedding requires tokenizer_ids of zero matching token_ids")
         if token_ids.device != self.embed_tokens.weight.device:
             raise ValueError("input tensors and embedding weights must be on the same device")
         if (numeric_values is None) != (numeric_mask is None):

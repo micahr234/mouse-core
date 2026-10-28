@@ -106,7 +106,7 @@ def _head_output_tokenizer(
         obj.append({"input_field": tail})
     return Tokenizer(
         input_fields=fields,
-        tokenizer=_FakeTokenizer(),
+        tokenizers={"default": _FakeTokenizer()},
         objective_fields=obj,
     )
 
@@ -149,7 +149,7 @@ def _packed(model: Model):
 
 @pytest.mark.parametrize('head', [False, True])
 def test_tokenizer_supports_zero_or_multiple_head_fields(head) -> None:
-    tok = Tokenizer(tokenizer=_FakeTokenizer(), input_fields=[
+    tok = Tokenizer(tokenizers={"default": _FakeTokenizer()}, input_fields=[
         dict(type='text', input_field=name, format='{field}', head_output=head)
         for name in ('action', 'obs')
     ])
@@ -174,7 +174,7 @@ def test_step_without_head_output_token_is_retained() -> None:
                 "when": when_step_index_zero,
             },
         ],
-        tokenizer=_FakeTokenizer(),
+        tokenizers={"default": _FakeTokenizer()},
     )
     # Head-output field present → fine.
     st = encode_measurement(tok, {"action": 1, "reward": 0.5, "episode_index": 0})
@@ -196,7 +196,7 @@ def test_head_output_rejects_when() -> None:
                     "head_output": True,
                 },
             ],
-            tokenizer=_FakeTokenizer(),
+            tokenizers={"default": _FakeTokenizer()},
         )
 
 
@@ -211,7 +211,7 @@ def test_head_output_rejects_group_start() -> None:
                     "head_output": True,
                 },
             ],
-            tokenizer=_FakeTokenizer(),
+            tokenizers={"default": _FakeTokenizer()},
         )
 
 

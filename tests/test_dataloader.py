@@ -69,7 +69,7 @@ def _tokenizer(*, objective_fields: list[dict[str, str]] | None = None) -> Token
             },
         ],
         objective_fields=keep,
-        tokenizer=IntIdTokenizer(),
+        tokenizers={"default": IntIdTokenizer()},
     )
 
 
@@ -849,7 +849,7 @@ def _episode_transform(*, group_start: bool):
     tokenizer = Tokenizer(
         input_fields=fields,
         objective_fields=_obj("action", "store_index", "episode_done"),
-        tokenizer=IntIdTokenizer(),
+        tokenizers={"default": IntIdTokenizer()},
     )
     return compose(stages=(_stamp_grouping, partial(encode_measurement, tokenizer)))
 

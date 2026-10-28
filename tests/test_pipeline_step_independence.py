@@ -72,7 +72,7 @@ def test_missing_objective_fields_key_raises() -> None:
     tokenizer = Tokenizer(
         input_fields=_tok_in("action", head_output="action"),
         objective_fields=_io(("action", "action"), ("old_log_prob", "old_log_prob")),
-        tokenizer=IntIdTokenizer(),
+        tokenizers={"default": IntIdTokenizer()},
     )
     with pytest.raises(KeyError, match="old_log_prob"):
         encode_measurement(tokenizer, {"action": 1, "episode_index": 0})
@@ -82,7 +82,7 @@ def test_tokenizer_output_defaults_to_input() -> None:
     tokenizer = Tokenizer(
         input_fields=_tok_in("action", head_output="action"),
         objective_fields=_io(("reward", "reward")),
-        tokenizer=IntIdTokenizer(),
+        tokenizers={"default": IntIdTokenizer()},
     )
     tokens = encode_measurement(tokenizer, {"action": 2, "reward": 0.5, "episode_index": 0})
     assert not tokens.numeric_mask.any()
@@ -106,7 +106,7 @@ def test_tokenizer_renames_objective_fields() -> None:
             },
         ],
         objective_fields=_io(("q", "q_star")),
-        tokenizer=IntIdTokenizer(),
+        tokenizers={"default": IntIdTokenizer()},
     )
     tokens = encode_measurement(tokenizer, {"act": 3, "q": 1.5, "episode_index": 0})
     assert not tokens.numeric_mask.any()
@@ -126,7 +126,7 @@ def test_tokenizer_full_matches_per_step_concat() -> None:
             ("repeat_episode_done", "repeat_episode_done"),
             ("episode_done", "episode_done"),
         ),
-        tokenizer=IntIdTokenizer(),
+        tokenizers={"default": IntIdTokenizer()},
     )
     rows = _rows()
     full, full_obj, _sid = pack_token_batch(steps=[encode_measurement(tokenizer, step) for step in rows], continuing=None)

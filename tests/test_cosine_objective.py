@@ -89,13 +89,13 @@ def test_offline_dqn_cosine_example(monkeypatch):
     from mouse_core.objectives import DqnObjective, boundary_discount
     from copy import deepcopy
     from torch import nn
-    from mouse_core.models import Backbone, Embedding, MLP, Model, DecodeCache, prepare_decode
+    from mouse_core.models import Backbone, Embedding, MultiEmbedding, MLP, Model, DecodeCache, prepare_decode
     from tests.test_example_modules import _tokens
 
     path = Path(__file__).resolve().parents[1] / "examples/21_train_dqn_cosine.ipynb"
     notebook = json.loads(path.read_text())
     namespace: dict[str, Any] = dict(
-        torch=torch, nn=nn, Model=Model, MLP=MLP, DecodeCache=DecodeCache,
+        torch=torch, nn=nn, MultiEmbedding=MultiEmbedding, Model=Model, MLP=MLP, DecodeCache=DecodeCache,
         prepare_decode=prepare_decode, AdamW=AdamW, polyak_update=polyak_update,
         DataLoader=DataLoader, to_device=to_device, DqnObjective=DqnObjective,
         boundary_discount=boundary_discount, CosineObjective=CosineObjective, Path=Path,
@@ -121,7 +121,7 @@ def test_offline_dqn_cosine_example(monkeypatch):
     monkeypatch.setitem(namespace, "Embedding", make_embedding)
     monkeypatch.setitem(namespace, "Backbone", make_backbone)
     encoder = namespace["Encoder"](
-        pretrained="local-test", train_kernel="reference", decode_kernel="flex",
+        pretrained="local-test", tokenizer_sources={"text": "local-test"}, train_kernel="reference", decode_kernel="flex",
         dtype=torch.float32,
     )
     assert construction == [
@@ -143,11 +143,9 @@ def test_offline_dqn_cosine_example(monkeypatch):
     assert isinstance(transition.output_norm, nn.RMSNorm)
     delayed_encoder = deepcopy(encoder).requires_grad_(False).eval()
     backup_value_head = deepcopy(q_head).requires_grad_(False).eval()
-    backup_action_head = deepcopy(q_head).requires_grad_(False).eval()
     namespace.update(
         encoder=encoder, q_head=q_head, transition=transition,
         delayed_encoder=delayed_encoder, backup_value_head=backup_value_head,
-        backup_action_head=backup_action_head,
     )
     settings = ast.parse("".join(notebook["cells"][1]["source"]))
     assignments: list[ast.stmt] = [node for node in settings.body if isinstance(node, ast.Assign)]
@@ -167,7 +165,7 @@ def test_offline_dqn_cosine_example(monkeypatch):
     dqn_losses, _ = namespace["objective"](
         objective_data=data, group_id=group_id, predictions=q_head(out["z"]),
         backup_value_predictions=backup_value_head(target["z"]),
-        backup_action_predictions=backup_action_head(target["z"]),
+        backup_action_predictions=q_head(target["z"]).detach(),
     )
     losses, _ = namespace["cosine_objective"].latent_cosine_loss(
         transition=transition, predictions=out["z"], targets=target["z"],
@@ -183,7 +181,7 @@ def test_offline_dqn_cosine_example(monkeypatch):
             assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in module.parameters())
         for module in untrained:
             assert all(p.grad is None for p in module.parameters())
-    assert all(p.grad is None for module in (delayed_encoder, backup_value_head, backup_action_head)
+    assert all(p.grad is None for module in (delayed_encoder, backup_value_head)
                for p in module.parameters())
 
     # Capture pairs to verify incoming actions and reset/boundary exclusion.
@@ -210,8 +208,8 @@ def test_offline_dqn_cosine_example(monkeypatch):
     assert embedding_grad is not None
     assert embedding_grad[:2].abs().sum() > 0
     assert torch.count_nonzero(embedding_grad[2:]) == 0
-    assert encoder.embedding.embed_tokens.weight.grad is None
-    assert transition.action_embedding.weight is not encoder.embedding.embed_tokens.weight
+    assert encoder.embedding.embeddings["text"].embed_tokens.weight.grad is None
+    assert transition.action_embedding.weight is not encoder.embedding.embeddings["text"].embed_tokens.weight
     assert "action_embedding.weight" in transition.state_dict()
 
     # With zero residual updates, every block preserves the conditioned input before final RMSNorm.
@@ -247,7 +245,7 @@ def test_offline_dqn_cosine_example(monkeypatch):
 
     # The encoder returns the raw readout, with no Q head or projection.
     assert set(dict(encoder.named_children())) == {"embedding", "backbone"}
-    torch.testing.assert_close(out["z"], out["last_hidden_state"][out["head_token_ids"]])
+    assert set(out) == {"z", "cache"}
     encoder.eval()
     with torch.no_grad():
         full = encoder(_tokens(0, 1))["z"]

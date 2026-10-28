@@ -30,7 +30,7 @@ def _tok(**kwargs) -> Tokenizer:
             },
         ],
         objective_fields=[{"input_field": "reward"}, {"input_field": "action"}],
-        tokenizer=kwargs.pop("tokenizer", IntIdTokenizer()),
+        tokenizers={"default": kwargs.pop("tokenizer", IntIdTokenizer())},
         **kwargs,
     )
 
@@ -69,7 +69,7 @@ def test_sparse_inference_inputs_and_strict_training_labels():
     tok = Tokenizer(input_fields=[
         dict(type='text', provider='environment', input_field='observation', format='{field}'),
         dict(type='token', provider='environment', format='4', head_output=True),
-    ], objective_fields=[dict(input_field='advantage')], tokenizer=IntIdTokenizer())
+    ], objective_fields=[dict(input_field='advantage')], tokenizers={"default": IntIdTokenizer()})
     log = EventLog()
     log.event(provider='coordinator', episode_index=0, step_index=0, payload={
         'episode_start': True,
@@ -108,7 +108,7 @@ def test_sparse_inference_inputs_and_strict_training_labels():
 @pytest.mark.parametrize('provider', ['environment', 'agent'])
 def test_event_tokenizer_groups_repeated_providers_by_marker(provider):
     tok = Tokenizer(input_fields=[dict(type='text', provider=provider, input_field='value', format='{field}'),
-                                          dict(type='token', provider=provider, format='4', head_output=True)], tokenizer=IntIdTokenizer())
+                                          dict(type='token', provider=provider, format='4', head_output=True)], tokenizers={"default": IntIdTokenizer()})
     log = EventLog()
     for step, value in [(0, 1), (0, 2), (1, 3)]:
         log.event(provider=provider, episode_index=0, step_index=step, payload={'value': value})
@@ -197,7 +197,7 @@ def test_objective_vector_column_promotes_dtype() -> None:
             },
         ],
         objective_fields=[{"input_field": "q"}],
-        tokenizer=IntIdTokenizer(),
+        tokenizers={"default": IntIdTokenizer()},
     )
     steps = [
         encode_measurement(tok, {"action": 0, "q": np.array([1, 2]), "episode_index": 0}),
@@ -221,7 +221,7 @@ def test_objective_ragged_float_vectors_pad_with_neg_inf() -> None:
             },
         ],
         objective_fields=[{"input_field": "q"}],
-        tokenizer=IntIdTokenizer(),
+        tokenizers={"default": IntIdTokenizer()},
     )
     steps = [
         encode_measurement(tok, {"action": 0, "q": np.array([1.0, 2.0, 3.0]), "episode_index": 0}),
@@ -247,7 +247,7 @@ def test_objective_ragged_int_vectors_raise() -> None:
             },
         ],
         objective_fields=[{"input_field": "q"}],
-        tokenizer=IntIdTokenizer(),
+        tokenizers={"default": IntIdTokenizer()},
     )
     steps = [
         encode_measurement(tok, {"action": 0, "q": np.array([1, 2, 3]), "episode_index": 0}),
@@ -269,7 +269,7 @@ def test_objective_mixed_rank_raises() -> None:
             },
         ],
         objective_fields=[{"input_field": "q"}],
-        tokenizer=IntIdTokenizer(),
+        tokenizers={"default": IntIdTokenizer()},
     )
     steps = [
         encode_measurement(tok, {"action": 0, "q": np.array([1.0, 2.0]), "episode_index": 0}),

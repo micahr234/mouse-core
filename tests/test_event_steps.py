@@ -12,7 +12,7 @@ from tests._token_batch_helpers import IntIdTokenizer
 
 
 def make_tokenizer(**kwargs):
-    return Tokenizer(tokenizer=IntIdTokenizer(), input_fields=[
+    return Tokenizer(tokenizers={"default": IntIdTokenizer()}, input_fields=[
         dict(type='text', provider='sensor', input_field='value', format='{field}', head_output=True),
     ], **kwargs)
 
@@ -46,7 +46,7 @@ def test_stream_buffers_a_partial_step_and_tokenizes_each_event_once():
         def __call__(self, event):
             calls.append(event['payload'])
             return super().__call__(event)
-    tok = CountingTokenizer(tokenizer=IntIdTokenizer(), input_fields=make_tokenizer().input_fields)
+    tok = CountingTokenizer(tokenizers={"default": IntIdTokenizer()}, input_fields=make_tokenizer().input_fields)
     stream = tok.stream()
     events = recorded().events
     assert stream.push(events[0]) is None
@@ -111,7 +111,7 @@ def test_training_requires_labels_but_inference_does_not():
 def test_saved_marker_configuration_replays_identically(tmp_path):
     tok = make_tokenizer(step_field='payload.tick', episode_field=None)
     save_tokenizer(tokenizer=tok, path=tmp_path)
-    restored = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizer=IntIdTokenizer())
+    restored = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizers={"default": IntIdTokenizer()})
     assert isinstance(restored, Tokenizer)
     assert restored.step_field == 'payload.tick' and restored.episode_field is None
     events = [dict(provider='sensor', payload={'tick': i, 'value': i + 1}) for i in range(3)]
@@ -126,14 +126,14 @@ def test_tokenizer_requires_event_envelopes():
 
 def test_image_only_tokenizer_needs_no_text_backend():
     tok = Tokenizer(input_fields=[dict(type='image', input_field='image')],
-                    image_tokenizer=lambda value: value)
+                    tokenizers={"image": lambda value: value})
     assert tok({'provider': 'camera', 'payload': {'image': [1, 2]}})['token_ids'].tolist() == [1, 2]
 
 
 def test_row_checkpoint_format_is_rejected(tmp_path):
     (tmp_path / 'tokenizer.json').write_text('{"format": "mouse-core-tokenizer-v1"}')
     with pytest.raises(ValueError, match='Unsupported tokenizer config format'):
-        load_tokenizer(repo_id_or_path=str(tmp_path), tokenizer=IntIdTokenizer())
+        load_tokenizer(repo_id_or_path=str(tmp_path), tokenizers={"default": IntIdTokenizer()})
 
 
 def test_step_headers_survive_store_dataset_roundtrip():
@@ -262,7 +262,7 @@ def on_group_start(ctx):
 
 
 def test_event_prefix_and_readouts_match_full_and_cached_packing():
-    tok = Tokenizer(tokenizer=IntIdTokenizer(), input_fields=[
+    tok = Tokenizer(tokenizers={"default": IntIdTokenizer()}, input_fields=[
         dict(type='token', provider='sensor', format='8', when=on_group_start),
         dict(type='text', provider='sensor', input_field='value', format='{field}'),
         dict(type='token', provider='sensor', format='9', head_output=True),
