@@ -5,7 +5,8 @@ of ``events_budget`` or ``token_budget``, plus ``batch_size``:
 
 * ``events_budget`` — ``batch_size`` fills. That count does not depend
   on the budget. Each fill adds whole samples until the next one would
-  pass that many source events.
+  pass that many source events. Samples that do not fit are rejected
+  before materialization and tokenization.
 * ``token_budget`` — the same fills, counting packed tokens instead of
   events.
 
@@ -144,7 +145,9 @@ class _ColumnView(Mapping[str, Any]):
                     f"sample condition requires column {key!r}; "
                     f"store has {sorted(self._ds.column_names)}"
                 )
-            column = self._ds[self._offset : self._offset + self._n][key]
+            # Project before slicing so boundary scans do not materialize the
+            # payload (often by far the largest column) or other unused fields.
+            column = self._ds[key][self._offset : self._offset + self._n]
             self._cache[key] = _column_array(column=column, n=self._n, field=key)
         return self._cache[key]
 
@@ -403,6 +406,16 @@ def _fetch_budget_batch(
                     )
                 )
             attempt += 1
+            # Event counts are known without decoding or tokenizing. Keep the
+            # draw and reseed above so later fills keep the same random stream
+            # and transform generations, even when this sample is discarded.
+            if not count_tokens and used + (end - start) > budget:
+                if added == 0:
+                    raise ValueError(
+                        f"Sampled segment is {end - start} {unit} and does not fit "
+                        f"in {name}={budget}."
+                    )
+                break
             window = _tokenize_event_window(
                 ds=ds,
                 start=start,

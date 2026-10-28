@@ -331,9 +331,9 @@ def _as_field_array(value: Any) -> np.ndarray:
     arr = np.asarray(value)
     if arr.dtype == object:
         raise TypeError(f"objective_fields values must be numeric, got {type(value)}")
-    if np.issubdtype(arr.dtype, np.floating):
+    if arr.dtype.kind == "f":
         return arr.astype(np.float32, copy=False)
-    if np.issubdtype(arr.dtype, np.integer) or arr.dtype == np.bool_:
+    if arr.dtype.kind in "iub":
         return arr.astype(np.int64, copy=False)
     return arr
 
@@ -388,7 +388,7 @@ def _stack_objective_fields(steps: Sequence[StepTokens]) -> dict[str, np.ndarray
         # never truncate later float values.
         dtype = (
             np.float32
-            if any(np.issubdtype(a.dtype, np.floating) for a in present)
+            if any(a.dtype.kind == "f" for a in present)
             else np.int64
         )
         ndims = {a.ndim for a in present}
@@ -399,10 +399,7 @@ def _stack_objective_fields(steps: Sequence[StepTokens]) -> dict[str, np.ndarray
             )
         ndim = ndims.pop()
         if ndim == 0:
-            buf = np.zeros(n, dtype=dtype)
-            for i, a in enumerate(arrays):
-                buf[i] = a.reshape(())
-            out[key] = buf
+            out[key] = np.asarray(arrays, dtype=dtype)
         else:
             shapes = [a.shape for a in present]
             max_shape = tuple(max(s[d] for s in shapes) for d in range(ndim))
@@ -414,11 +411,13 @@ def _stack_objective_fields(steps: Sequence[StepTokens]) -> dict[str, np.ndarray
                     "columns can be padded (with -inf). Pad the values "
                     "explicitly or store the field as float."
                 )
+            if not ragged:
+                out[key] = np.stack(arrays, dtype=dtype, casting="unsafe")
+                continue
             # Pad ragged float vectors with -inf, the library-wide sentinel for
             # actions that do not exist (SP / SV exclude non-finite entries).
             # Finite zero padding would silently train toward fabricated values.
-            fill = -np.inf if ragged else 0
-            buf = np.full((n, *max_shape), fill, dtype=dtype)
+            buf = np.full((n, *max_shape), -np.inf, dtype=dtype)
             for i, a in enumerate(arrays):
                 slicer = tuple(slice(0, a.shape[d]) for d in range(a.ndim))
                 buf[i][slicer] = a
@@ -441,7 +440,7 @@ def _fields_to_tensors(fields: dict[str, np.ndarray]) -> dict[str, torch.Tensor]
     tensors: dict[str, torch.Tensor] = {}
     for k, v in fields.items():
         arr = np.asarray(v)
-        if np.issubdtype(arr.dtype, np.floating):
+        if arr.dtype.kind == "f":
             tensors[k] = torch.from_numpy(arr.astype(np.float32, copy=False))
         else:
             tensors[k] = torch.from_numpy(arr.astype(np.int64, copy=False))
@@ -506,10 +505,8 @@ def pack_token_batch(
     token_ids: list[np.ndarray] = []
     numeric_values: list[np.ndarray] = []
     tokenizer_ids: list[np.ndarray] = []
-    seq_ids: list[np.ndarray] = []
-    head_token_ids: list[int] = []
-    head_step_ids: list[int] = []
-    head_output_counts: list[int] = []
+    head_token_masks: list[np.ndarray] = []
+    step_lengths: list[int] = []
 
     inferred_B = (max(seq_per_step) + 1) if seq_per_step else 0
     if batch_size is None:
@@ -530,12 +527,12 @@ def pack_token_batch(
             )
         started = [bool(flag) for flag in continuing]
 
-    offset = 0
     tokenizer_names = steps[0].tokenizer_names
-    for step_idx, (st, sid) in enumerate(zip(steps, seq_per_step)):
+    for st, sid in zip(steps, seq_per_step):
         if st.tokenizer_names != tokenizer_names:
             raise ValueError("All steps must use the same tokenizer_names in the same order")
         emit_group_start = st.group_start_token_ids is not None and not started[sid]
+        pt = 0
         if emit_group_start:
             assert st.group_start_numeric_mask is not None
             assert st.group_start_token_ids is not None
@@ -546,32 +543,32 @@ def pack_token_batch(
             numeric_values.append(st.group_start_numeric_values)
             assert st.group_start_tokenizer_ids is not None
             tokenizer_ids.append(st.group_start_tokenizer_ids)
-            seq_ids.append(np.full(pt, sid, dtype=np.int64))
-            offset += pt
+            head_token_masks.append(np.zeros(pt, dtype=bool))
         t = st.T
         numeric_mask.append(st.numeric_mask)
         token_ids.append(st.token_ids)
         numeric_values.append(st.numeric_values)
         assert st.tokenizer_ids is not None
         tokenizer_ids.append(st.tokenizer_ids)
-        seq_ids.append(np.full(t, sid, dtype=np.int64))
-        ho = np.flatnonzero(st.head_token_mask)
-        head_token_ids.extend((offset + ho).tolist())
-        head_step_ids.extend([step_idx] * int(ho.size))
-        head_output_counts.append(int(ho.size))
-        offset += t
+        head_token_masks.append(st.head_token_mask)
+        step_lengths.append(pt + t)
         started[sid] = True
 
+    # Compute packed metadata in bulk, including zero-token/passive steps.
+    # Prefix tokens count toward their first step's length but never read out.
+    lengths = np.asarray(step_lengths, dtype=np.int64)
+    head_token_ids = np.flatnonzero(np.concatenate(head_token_masks))
+    head_step_ids = np.searchsorted(np.cumsum(lengths), head_token_ids, side="right")
     fields = _stack_objective_fields(steps)
-    fields["head_output_count"] = np.asarray(head_output_counts, dtype=np.int64)
+    fields["head_output_count"] = np.bincount(head_step_ids, minlength=len(steps))
     group_id = torch.tensor(seq_per_step, dtype=torch.int64)
     inputs = TokenBatch(
         numeric_mask=np.concatenate(numeric_mask),
         token_ids=np.concatenate(token_ids),
         numeric_values=np.concatenate(numeric_values),
-        sequence_ids=np.concatenate(seq_ids),
-        head_token_ids=np.asarray(head_token_ids, dtype=np.int64),
-        head_step_ids=np.asarray(head_step_ids, dtype=np.int64),
+        sequence_ids=np.repeat(seq_per_step, lengths),
+        head_token_ids=head_token_ids,
+        head_step_ids=head_step_ids,
         step_sequence_ids=np.asarray(seq_per_step, dtype=np.int64),
         tokenizer_ids=np.concatenate(tokenizer_ids),
         tokenizer_names=tokenizer_names,

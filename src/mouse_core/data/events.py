@@ -4,7 +4,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from copy import deepcopy
 import json
-from typing import Any
+from typing import Any, SupportsIndex, overload
 
 from datasets import Dataset, Features, Value
 
@@ -52,14 +52,12 @@ def _indices(values):
     return indices
 
 
-def _dataset(events, *, encoded):
+def _dataset(events):
     fields = {}
     fields.update({key: Value("int64") for key in INDEX_FIELDS
                    if any(key in event for event in events)})
     fields.update({key: Value("string") for key in EVENT_FIELDS})
     columns = {key: [event.get(key) for event in events] for key in fields}
-    if not encoded:
-        columns["payload"] = [_json(event["payload"]) for event in events]
     return Dataset.from_dict(columns, features=Features(fields))
 
 
@@ -75,32 +73,54 @@ class EventLog:
     """
     def __init__(self, *, name: str | None = None):
         self.name = name
-        self._events: list[dict] = []
+        self._records: list[tuple[dict, str]] = []
 
     def __len__(self):
-        return len(self._events)
+        return len(self._records)
+
+    @overload
+    def __getitem__(self, index: slice) -> list[dict]: ...
+
+    @overload
+    def __getitem__(self, index: SupportsIndex) -> dict: ...
 
     def __getitem__(self, index):
-        return deepcopy(self._events[index])
+        if isinstance(index, slice):
+            return deepcopy([event for event, _ in self._records[index]])
+        return deepcopy(self._records[index][0])
 
     @property
     def events(self):
-        return deepcopy(self._events)
+        return deepcopy([event for event, _ in self._records])
 
     @property
     def last_event(self):
         return self[-1]
 
-    def event(self, *, provider: str, payload, **indices):
-        """Append and return a snapshot. Both provider and payload are explicit."""
+    def _append(self, *, provider: str, payload, **indices):
         if not isinstance(provider, str) or not provider:
             raise ValueError("provider must be a nonempty string")
-        event = {**_indices(indices), "provider": provider, "payload": json.loads(_json(payload))}
-        self._events.append(event)
-        return deepcopy(event)
+        headers = _indices(indices)
+        encoded = _json(payload)
+        event = {**headers, "provider": provider, "payload": json.loads(encoded)}
+        # One append keeps the owned snapshot and its encoding together even
+        # when independent producers share a log.
+        self._records.append((event, encoded))
+        return event
+
+    def append(self, *, provider: str, payload, **indices) -> None:
+        """Append an owned snapshot without constructing a returned copy."""
+        self._append(provider=provider, payload=payload, **indices)
+
+    def event(self, *, provider: str, payload, **indices):
+        """Append and return a snapshot. Both provider and payload are explicit."""
+        return deepcopy(self._append(provider=provider, payload=payload, **indices))
 
     def to_dataset(self):
-        return _dataset(self._events, encoded=False)
+        return _dataset([
+            {**event, "payload": payload}
+            for event, payload in self._records
+        ])
 
     @classmethod
     def from_dataset(cls, dataset, *, name=None):
@@ -110,7 +130,7 @@ class EventLog:
         for record in dataset:
             if not set(EVENT_FIELDS) <= set(record) <= set(EVENT_FIELDS + INDEX_FIELDS) or not isinstance(record["payload"], str):
                 raise ValueError("Expected provider/payload event records with JSON-encoded payloads")
-            log.event(provider=record["provider"], payload=json.loads(record["payload"]),
+            log.append(provider=record["provider"], payload=json.loads(record["payload"]),
                       **{key: value for key, value in record.items() if key not in EVENT_FIELDS})
         return log
 
@@ -118,5 +138,5 @@ class EventLog:
         """Store source records without interpreting their payloads."""
         from mouse_core.data.datastore import Datastore
         store = Datastore(name=self.name)
-        store.from_dataset(ds=self.to_dataset())
+        store.extend_event_log(self)
         return store

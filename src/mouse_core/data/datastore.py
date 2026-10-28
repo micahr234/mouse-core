@@ -8,7 +8,7 @@ from typing import Any
 import numpy as np
 from datasets import Dataset, DatasetDict
 
-from mouse_core.data.events import EVENT_FIELDS, INDEX_FIELDS, _dataset, _indices, _json
+from mouse_core.data.events import EventLog, EVENT_FIELDS, INDEX_FIELDS, _dataset, _indices, _json
 
 _REQUIRED = EVENT_FIELDS
 
@@ -68,6 +68,40 @@ class Datastore:
         indices = _indices({key: value for key, value in event.items() if key not in _REQUIRED})
         self._events.append({**indices, 'provider': event['provider'], 'payload': _json(payload)})
 
+    def extend(self, events) -> None:
+        """Atomically append raw events, snapshotting and encoding each once."""
+        length = len(self)
+        try:
+            for event in events:
+                self._append_event(event, encoded=False)
+        except Exception:
+            del self._events[length:]
+            raise
+
+    def extend_event_log(self, log: EventLog, *, episode_index=None) -> None:
+        """Append owned log records, reusing their validated immutable JSON.
+
+        An explicit episode_index replaces that envelope field on every event.
+        This generic operation does not interpret providers or episode endings.
+        """
+        if not isinstance(log, EventLog):
+            raise TypeError('extend_event_log requires an EventLog')
+        replacement = {} if episode_index is None else _indices({'episode_index': episode_index})
+        length = len(self)
+        try:
+            for event, payload in log._records:
+                provider = event['provider']
+                # Match persisted string-column normalization for subclasses;
+                # native provider strings and encoded payloads are immutable.
+                if type(provider) is not str:
+                    provider = str(provider)
+                    if not provider:
+                        raise ValueError('provider must be a nonempty string')
+                self._events.append({**event, **replacement, 'provider': provider, 'payload': payload})
+        except Exception:
+            del self._events[length:]
+            raise
+
     def from_dataset(self, *, ds):
         """Append persisted records whose payloads are JSON-encoded strings."""
         if isinstance(ds, DatasetDict):
@@ -85,7 +119,7 @@ class Datastore:
 
     def to_dataset(self):
         """The sole persisted format: sparse event envelopes with JSON payloads."""
-        return _dataset(self._events, encoded=True)
+        return _dataset(self._events)
 
     def clear(self):
         self._events.clear()

@@ -108,6 +108,11 @@ class Tokenizer:
     backend; ``tokenizer_names[tokenizer_ids[i]]`` identifies token i's table.
     Dictionary names are sorted so insertion order cannot change routing.
 
+    Standard fast Hugging Face backends encode each field directly in Rust,
+    without computing unused offsets or Python output dictionaries. HF owns
+    any internal tokenization cache; this class retains no text-to-ID cache.
+    Custom backends and HF encoding overrides keep their callable behavior.
+
     A changed marker starts a step before that event. Missing markers continue
     the current step; the first event requires a marker. ``episode_field``
     separates repeated step indices in different episodes. Use ``stream()``
@@ -137,7 +142,13 @@ class Tokenizer:
             _, meta = resolve_tokenizer_modalities(fields)
             self._provider_meta[provider] = tuple(meta)
         meta_by_spec = {id(meta.spec): meta for group in self._provider_meta.values() for meta in group}
-        self._meta = tuple(meta_by_spec[id(spec)] for spec in self.input_fields)
+        self._meta = tuple(enumerate(meta_by_spec[id(spec)] for spec in self.input_fields))
+        self._default_meta = tuple((index, meta) for index, meta in self._meta if meta.spec.provider is None)
+        self._provider_meta = {
+            provider: tuple((index, meta) for index, meta in self._meta
+                            if meta.spec.provider is None or meta.spec.provider == provider)
+            for provider in self._provider_meta if provider is not None
+        }
         sources = dict(tokenizers)
         self.tokenizer_names = tuple(sorted(sources))
         default = "default" if "default" in sources else self.tokenizer_names[0] if len(sources) == 1 else None
@@ -165,19 +176,20 @@ class Tokenizer:
             ids = _register_special_tokens(self.tokenizers[name], specs)
             if ids:
                 self.special_token_ids[name] = ids
+        encoders = {name: _TextEncoder(backend) for name, backend in self.tokenizers.items()}
+        self._text_encoders = tuple(encoders[name] for name in field_tokenizers)
 
     def __call__(self, event: Mapping) -> dict[str, np.ndarray]:
         """Encode matching fields from one decoded event, without adding a step."""
         if not isinstance(event, Mapping) or not {"provider", "payload"} <= event.keys():
             raise TypeError("Tokenizer expects a provider/payload event")
         provider = event["provider"]
-        meta = tuple(m for m in self._meta if m.spec.provider is None or m.spec.provider == provider)
-        field_ids = {id(m.spec): index for index, m in enumerate(self._meta)}
+        meta = self._provider_meta.get(provider, self._default_meta)
         payload = event["payload"]
         if meta and not isinstance(payload, Mapping):
             raise TypeError("Configured event input fields require an object payload")
         values = _tokenize_fields(row=payload, meta=meta, tokenizers=self._backends,
-                                  tokenizer_routes=self._routes, field_ids=field_ids)
+                                  tokenizer_routes=self._routes, text_encoders=self._text_encoders)
         return values
 
     def stream(self, *, include_objectives: bool = True) -> EventTokenStream:
@@ -456,6 +468,38 @@ def _tokenize_ids(tokenizer: Any, text: str) -> list[int]:
     return out
 
 
+class _TextEncoder:
+    """Encode one field at a time; leave caching to the native HF backend."""
+
+    def __init__(self, backend: Any):
+        from transformers import PreTrainedTokenizerFast
+
+        self.backend = backend
+        self._native = (
+            isinstance(backend, PreTrainedTokenizerFast)
+            and not hasattr(backend, "_switch_to_input_mode")
+            and all(getattr(getattr(backend, name), "__func__", None)
+                    is getattr(PreTrainedTokenizerFast, name) for name in (
+                        "__call__", "_encode_plus", "_convert_encoding",
+                        "_get_padding_truncation_strategies", "set_truncation_and_padding",
+                    ))
+        )
+
+    def __call__(self, text: str) -> list[int]:
+        if not text:
+            return []
+        if self._native:
+            native = self.backend.backend_tokenizer
+            # The HF wrapper resets these settings before encoding. Use it
+            # when needed rather than changing a shared backend ourselves.
+            if (native.padding is None and native.truncation is None
+                    and native.encode_special_tokens == self.backend.split_special_tokens):
+                # Singleton input: fields never merge or execute out of order.
+                # Offsets are unused; only take the independent field's IDs.
+                return native.encode_batch_fast([text], add_special_tokens=False)[0].ids
+        return _tokenize_ids(self.backend, text)
+
+
 def _image_token_ids(image_tokenizer: Any, value: Any, *, in_name: str) -> list[int]:
     if image_tokenizer is None:
         raise RuntimeError("image_tokenizer is not configured")
@@ -473,7 +517,7 @@ def _image_token_ids(image_tokenizer: Any, value: Any, *, in_name: str) -> list[
     return img_ids
 
 
-def _tokenize_fields(*, row, meta, tokenizers, tokenizer_routes, field_ids):
+def _tokenize_fields(*, row, meta, tokenizers, tokenizer_routes, text_encoders):
     token_ids: list[int] = []
     tokenizer_ids: list[int] = []
     numeric_values: list[float] = []
@@ -486,7 +530,7 @@ def _tokenize_fields(*, row, meta, tokenizers, tokenizer_routes, field_ids):
     prefix_field_ids: list[int] = []
 
     def _emit(
-        emitted_ids: list[int], *, spec: TokenizerModalitySpec,
+        emitted_ids: list[int], *, spec: TokenizerModalitySpec, field_id: int,
         to_group_start: bool, numeric_value: float | None = None,
         head_output: bool = False,
     ) -> None:
@@ -494,21 +538,22 @@ def _tokenize_fields(*, row, meta, tokenizers, tokenizer_routes, field_ids):
         is_numeric = numeric_value is not None
         value = 0.0 if numeric_value is None else numeric_value
         if to_group_start:
-            prefix_field_ids.extend([field_ids[id(spec)]] * len(emitted_ids))
+            prefix_field_ids.extend([field_id] * len(emitted_ids))
             prefix_token_ids.extend(emitted_ids)
-            prefix_tokenizer_ids.extend([tokenizer_routes[field_ids[id(spec)]]] * len(emitted_ids))
+            prefix_tokenizer_ids.extend([tokenizer_routes[field_id]] * len(emitted_ids))
             prefix_numeric_values.extend([value] * len(emitted_ids))
             prefix_numeric_mask.extend([is_numeric] * len(emitted_ids))
         else:
             token_ids.extend(emitted_ids)
-            tokenizer_ids.extend([tokenizer_routes[field_ids[id(spec)]]] * len(emitted_ids))
+            tokenizer_ids.extend([tokenizer_routes[field_id]] * len(emitted_ids))
             numeric_values.extend([value] * len(emitted_ids))
             numeric_mask.extend([is_numeric] * len(emitted_ids))
             head_token_mask.extend([head_output] * len(emitted_ids))
 
-    for m in meta:
+    for field_id, m in meta:
         spec = m.spec
-        tokenizer = tokenizers[field_ids[id(spec)]]
+        tokenizer = tokenizers[field_id]
+        text_ids = text_encoders[field_id]
         ordinary, to_group_start = _when_routes(spec, row)
         if not ordinary and not to_group_start:
             continue
@@ -519,8 +564,8 @@ def _tokenize_fields(*, row, meta, tokenizers, tokenizer_routes, field_ids):
             if tokenizer is None:
                 raise RuntimeError("tokenizer required to tokenize text runs")
             _emit(
-                _tokenize_ids(tokenizer, rendered),
-                spec=spec,
+                text_ids(rendered),
+                spec=spec, field_id=field_id,
                 to_group_start=to_group_start,
                 head_output=spec.head_output,
             )
@@ -533,11 +578,11 @@ def _tokenize_fields(*, row, meta, tokenizers, tokenizer_routes, field_ids):
             if tokenizer is None:
                 raise RuntimeError("tokenizer required to tokenize numeric runs")
             rendered = render_text_format(spec, field=None)
-            emitted_ids = _tokenize_ids(tokenizer, rendered)
+            emitted_ids = text_ids(rendered)
             _require_one_token(spec, emitted_ids)
             _emit(
                 emitted_ids,
-                spec=spec,
+                spec=spec, field_id=field_id,
                 to_group_start=to_group_start,
                 numeric_value=scaled,
                 head_output=spec.head_output,
@@ -550,11 +595,11 @@ def _tokenize_fields(*, row, meta, tokenizers, tokenizer_routes, field_ids):
             if tokenizer is None:
                 raise RuntimeError("tokenizer required to tokenize token runs")
             rendered = render_text_format(spec, field=None)
-            emitted_ids = _tokenize_ids(tokenizer, rendered)
+            emitted_ids = text_ids(rendered)
             _require_one_token(spec, emitted_ids)
             _emit(
                 emitted_ids,
-                spec=spec,
+                spec=spec, field_id=field_id,
                 to_group_start=to_group_start,
                 head_output=spec.head_output,
             )
@@ -569,7 +614,7 @@ def _tokenize_fields(*, row, meta, tokenizers, tokenizer_routes, field_ids):
             img_ids = _image_token_ids(tokenizer, value, in_name=in_name)
             _emit(
                 img_ids,
-                spec=spec,
+                spec=spec, field_id=field_id,
                 to_group_start=to_group_start,
                 head_output=spec.head_output,
             )

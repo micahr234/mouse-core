@@ -1,4 +1,8 @@
-from mouse_core.data.event_transform import EventTransform, environment_decisions, environment_episode_ranges, latest_environment_decision
+from mouse_core.data.event_transform import (
+    EventTransform, environment_decisions, environment_episode_ranges,
+    latest_environment_decision, latest_environment_packet,
+    validate_environment_events, validate_latest_environment_step,
+)
 from mouse_core.data.events import EventLog
 from mouse_core.data.step_sampling import step_sample_ranges
 from mouse_core.data.dataloader import DataLoader
@@ -37,6 +41,9 @@ __all__ = [
     "environment_decisions",
     "environment_episode_ranges",
     "latest_environment_decision",
+    "latest_environment_packet",
+    "validate_environment_events",
+    "validate_latest_environment_step",
     "EventLog",
     "load_tokenizer",
     "save_tokenizer",

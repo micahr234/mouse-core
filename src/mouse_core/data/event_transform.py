@@ -27,7 +27,7 @@ def _record(event, *, encoded_payload, normalized=False):
     record = {key: value for key, value in event.items() if key not in INDEX_FIELDS or value is not None}
     if normalized and type(event["provider"]) is str:
         # EventLog owns already-normalized snapshots. Decoders only read them;
-        # _observation copies each returned view before it leaves this module.
+        # Public decoders copy each returned view before it leaves this module.
         return record
     return json.loads(_json({**record, "payload": payload}))
 
@@ -106,7 +106,7 @@ def _validate_agent(agent, coordinator, previous):
         raise ValueError("Agent and coordinator sampling indices must match")
 
 
-def _observation(previous, agent, environment, coordinator):
+def _observation_fields(previous, agent, environment, coordinator):
     row = _frame(environment, coordinator)
     new_episode = previous is None or row["episode_index"] != previous["episode_index"]
     if new_episode:
@@ -134,27 +134,35 @@ def _observation(previous, agent, environment, coordinator):
     if set(overlays) & (set(row) | _COORDINATION | _RESULTS | _DERIVED | {"action"}):
         raise ValueError("Event overlays cannot replace observation or derived fields")
     row.update(overlays)
-    packet = [event for event in (coordinator, agent, environment) if event is not None]
-    # _record has already normalized every source record. Serialize the packet
-    # directly instead of walking all nested payloads through _plain again.
-    row["events"] = json.dumps(
+    return row
+
+
+def _packet_json(packet, *, payload_json=None):
+    if payload_json is not None:
+        # Only owned EventLog payloads take this path. They were validated and
+        # encoded at ingestion; encode the small envelope without revisiting
+        # nested observations, maps, or other payload values.
+        return "[" + ",".join(
+            "{" + ",".join(
+                json.dumps(key) + ":" + (
+                    encoded if key == "payload" else
+                    json.dumps(event[key], separators=(",", ":"), allow_nan=False)
+                )
+                for key in EVENT_FIELDS + INDEX_FIELDS if key in event
+            ) + "}"
+            for event, encoded in zip(packet, payload_json, strict=True)
+        ) + "]"
+    return json.dumps(
         [{key: event[key] for key in EVENT_FIELDS + INDEX_FIELDS if key in event} for event in packet],
         separators=(",", ":"), allow_nan=False,
     )
-    return deepcopy(row)
 
 
-def environment_decisions(events):
-    """Yield sparse views of optional coordinator → optional agent → environment steps.
-
-    The environment requests the next action. Each source event has top-level
-    episode sampling indices. Payload fields are copied only when present;
-    no absent rewards, flags, actions, or repeat indices are reconstructed.
-    An unfinished tail stays recorded without inventing an observation.
-    """
+def _environment_steps(events, *, require_complete=False):
     previous = agent = coordinator = None
     normalized = isinstance(events, EventLog)
-    for source in events._events if normalized else events:
+    sources = (record[0] for record in events._records) if normalized else events
+    for source in sources:
         event = _record(source, encoded_payload=not normalized, normalized=normalized)
         provider = event["provider"]
         if provider == "coordinator":
@@ -170,12 +178,40 @@ def environment_decisions(events):
             agent = event
         elif provider == "environment":
             _validate_environment_payload(event["payload"])
-            row = _observation(previous, agent, event, coordinator)
+            row = _observation_fields(previous, agent, event, coordinator)
             previous = _frame(event, coordinator)
-            yield row
+            yield row, [item for item in (coordinator, agent, event) if item is not None]
             agent = coordinator = None
         else:
             raise ValueError("Environment protocol requires environment, coordinator or agent providers")
+    if require_complete and (
+        previous is None or agent is not None or coordinator is not None
+        or not (previous.get("terminated", False) or previous.get("truncated", False))
+    ):
+        raise ValueError("Replay ends with an incomplete episode")
+
+
+def validate_environment_events(events, *, require_complete=False) -> None:
+    """Validate the environment protocol without constructing decoded snapshots.
+
+    require_complete rejects empty logs and unfinished final episodes or steps.
+    Generic EventLog/Datastore recording remains independent of this protocol.
+    """
+    for _ in _environment_steps(events, require_complete=require_complete):
+        pass
+
+
+def environment_decisions(events):
+    """Yield sparse views of optional coordinator → optional agent → environment steps.
+
+    The environment requests the next action. Each source event has top-level
+    episode sampling indices. Payload fields are copied only when present;
+    no absent rewards, flags, actions, or repeat indices are reconstructed.
+    An unfinished tail stays recorded without inventing an observation.
+    """
+    for row, packet in _environment_steps(events):
+        row["events"] = _packet_json(packet)
+        yield deepcopy(row)
 
 
 def environment_episode_ranges(events):
@@ -190,7 +226,8 @@ def environment_episode_ranges(events):
     end = 0
     seen = set()
     normalized = isinstance(events, EventLog)
-    for index, event in enumerate(events._events if normalized else events):
+    sources = (record[0] for record in events._records) if normalized else events
+    for index, event in enumerate(sources):
         event = _record(event, encoded_payload=not normalized, normalized=normalized)
         end = index + 1
         marker = _headers(event)["episode_index"]
@@ -220,14 +257,18 @@ def environment_episode_ranges(events):
         yield start, end
 
 
-def latest_environment_decision(log):
-    """Read a completed observation from at most six source events."""
+def _latest_environment_step(log):
     if not len(log):
         raise ValueError("The log has no completed environment observation")
     normalized = isinstance(log, EventLog)
-    records = log._events if normalized else log
-    tail = [_record(records[-offset], encoded_payload=False, normalized=normalized)
-            for offset in range(min(len(log), 6), 0, -1)]
+    # Capture owned records and their encodings together. Later appends cannot
+    # change which payload belongs to this completed packet.
+    records = log._records[-6:] if normalized else None
+    if records is not None:
+        tail = [_record(event, encoded_payload=False, normalized=True) for event, _ in records]
+    else:
+        tail = [_record(log[-offset], encoded_payload=True)
+                for offset in range(min(len(log), 6), 0, -1)]
     if tail[-1]["provider"] != "environment":
         raise ValueError("The latest event is not an environment observation")
     boundaries = [index for index, event in enumerate(tail[:-1])
@@ -241,7 +282,28 @@ def latest_environment_decision(log):
         previous = _frame(previous_environment, previous_coordinator)
         start = previous_end + 1
     coordinator, agent, environment = _split_step(tail[start:])
-    return _observation(previous, agent, environment, coordinator)
+    row = _observation_fields(previous, agent, environment, coordinator)
+    packet = [event for event in (coordinator, agent, environment) if event is not None]
+    encoded = [payload for _, payload in records[start:]] if records is not None else None
+    return row, packet, encoded
+
+
+def validate_latest_environment_step(log) -> None:
+    """Validate the last completed step without copying or serializing a view."""
+    _latest_environment_step(log)
+
+
+def latest_environment_packet(log) -> str:
+    """Return only the validated latest step's source event packet as JSON."""
+    _, packet, encoded = _latest_environment_step(log)
+    return _packet_json(packet, payload_json=encoded)
+
+
+def latest_environment_decision(log):
+    """Read a completed observation from at most six source events."""
+    row, packet, encoded = _latest_environment_step(log)
+    row["events"] = _packet_json(packet, payload_json=encoded)
+    return deepcopy(row)
 
 
 class EventTransform:

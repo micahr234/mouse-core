@@ -66,6 +66,21 @@ recorded only when supplied and an action is requested; online and inference
 environments can leave oracle computation disabled. PPO and GRPO additionally
 record behavior log probabilities on agent events.
 
+Use `EventLog.append(provider=..., payload=..., **indices)` when recording does
+not need a return value. It owns a snapshot and caches the payload's JSON once.
+`EventLog.event(...)` additionally returns an independent, editable snapshot.
+`validate_latest_environment_step(log)` checks the latest completed step without
+building a decoded view; `latest_environment_packet(log)` returns its source JSON
+packet, while `latest_environment_decision(log)` returns the decoded observation.
+
+Before storing a completed episode, call
+`validate_environment_events(log, require_complete=True)`, then
+`store.extend_event_log(log, episode_index=destination_index)` to reuse the
+validated payload JSON. Omit `episode_index` to preserve existing indices.
+`Datastore.extend(events)` accepts an iterable of raw events and rolls back the
+whole batch if validation or iteration fails. Recording and storage remain
+independent of the environment protocol; callers explicitly select its validator.
+
 `Tokenizer` encodes each event's configured payload fields in `input_fields` order.
 A change in `step_field` starts the next step before that event's tokens;
 an event without the marker continues the current step. The first event needs a
@@ -163,6 +178,24 @@ sources reload from their saved identifiers. A lone backend or one named
 when there is only one backend. The old `tokenizer=`, `pretrained=`, and
 `image_tokenizer=` arguments are unsupported; saved specifications must also
 contain the named dictionary.
+
+Each field is tokenized separately, in configuration order. Standard fast Hugging
+Face backends use native Rust encoding without unused offsets or Python output
+dictionaries. Custom backends and HF encoding overrides keep their callable
+behavior. Tokenization caching belongs to HF; MOUSE keeps no additional text-to-ID
+cache, byte budget, or cache warning. Backend vocabulary and settings changes
+take effect on subsequent calls without cache invalidation.
+
+To measure the full loading path with a locally cached tokenizer:
+
+```bash
+PYTHON_GIL=0 .venv/bin/python bench/bench_dataloader.py \
+    --workloads short notebook --workers 0 --local-files-only --profile-stages
+```
+
+The benchmark reports loader setup, batch wait, throughput, and optional CPU
+stage timings. Use `--tokenizer /path/to/tokenizer` for a local backend and
+`--workers 0 1 4` to compare prefetch worker counts.
 
 For action selection, pass the packed `inputs` to `select_discrete_action`, or
 use `action_readouts(scores, inputs)` before sampling policy logits. Only the
