@@ -11,6 +11,8 @@ from datasets import Dataset, Features, Value
 
 def _plain(value) -> Any:
     """JSON-compatible copy, preserving vector shapes including length one."""
+    if type(value) in (str, int, float, bool, type(None)):
+        return value
     if isinstance(value, Mapping):
         if any(not isinstance(k, (str, int)) for k in value) or len({str(k) for k in value}) != len(value):
             raise TypeError("Event object keys must have distinct JSON string representations")
@@ -34,11 +36,20 @@ def _indices(values):
     """Validate optional sampling metadata without interpreting event payloads."""
     if not set(values) <= set(INDEX_FIELDS):
         raise ValueError("Sampling metadata supports only episode_index and step_index")
-    values = json.loads(_json({key: value for key, value in values.items() if value is not None}))
+    indices = {}
     for key, value in values.items():
+        if value is None:
+            continue
+        # Native integers already have the persisted JSON representation. Keep
+        # normalization for numpy scalars and other supported input wrappers.
+        # Very large integers still pass through JSON so its configured digit
+        # conversion limit is enforced just as it is for other event fields.
+        if type(value) is not int or value.bit_length() > 1024:
+            value = json.loads(_json(value))
         if type(value) is not int or value < 0:
             raise ValueError(f"{key} must be a nonnegative integer")
-    return values
+        indices[key] = value
+    return indices
 
 
 def _dataset(events, *, encoded):

@@ -1,6 +1,7 @@
 """Generic event recording, explicit environment decoding, and live/replay parity."""
 from copy import deepcopy
 import json
+import sys
 
 import numpy as np
 import pytest
@@ -97,6 +98,74 @@ def test_generic_log_snapshots_inputs_returns_and_reads():
     log.events[0]['payload']['data'][0] = 77.
     log[0]['payload']['data'][0] = 66.
     assert log.last_event == {'provider': 'sensor', 'payload': {'data': [2.], 'reward': None}}
+
+
+@pytest.mark.parametrize('index', [4, np.int64(4), np.array(4), torch.tensor(4)])
+def test_sampling_headers_normalize_scalar_integers_and_omit_nulls(index):
+    log = EventLog()
+    event = log.event(provider='sensor', payload={}, episode_index=index, step_index=None)
+    assert event == {'episode_index': 4, 'provider': 'sensor', 'payload': {}}
+    assert type(event['episode_index']) is int
+    assert EventLog.from_dataset(log.to_dataset()).events == log.events
+
+
+@pytest.mark.parametrize('index', [np.bool_(True), np.float64(4), np.array([4]),
+                                 np.int64(-1), float('nan'), float('inf')])
+def test_noninteger_or_nonfinite_sampling_headers_are_rejected_atomically(index):
+    log = EventLog()
+    with pytest.raises(ValueError):
+        log.event(provider='sensor', payload={}, episode_index=index)
+    assert len(log) == 0
+
+
+def test_sampling_headers_retain_json_integer_conversion_limit():
+    digits = sys.get_int_max_str_digits()
+    if not digits:
+        pytest.skip('Interpreter integer conversion limit is disabled')
+    log = EventLog()
+    with pytest.raises(ValueError):
+        log.event(provider='sensor', payload={}, episode_index=10 ** digits)
+    assert len(log) == 0
+
+
+def test_live_decoding_normalizes_provider_string_subclasses():
+    class Provider(str):
+        def __eq__(self, other):
+            return False
+
+        __hash__ = str.__hash__
+
+        def __str__(self):
+            return 'overridden string conversion'
+
+    log = EventLog()
+    log.event(provider=Provider('coordinator'), episode_index=0, step_index=0,
+              payload={'episode_start': True})
+    log.event(provider=Provider('environment'), episode_index=0, step_index=0,
+              payload={'observation': [1], 'terminated': True})
+    persisted = list(environment_decisions(json.loads(json.dumps(log.events))))
+    assert list(environment_decisions(log)) == persisted
+    assert latest_environment_decision(log) == persisted[-1]
+    assert list(environment_episode_ranges(log)) == [(0, 2)]
+
+
+@pytest.mark.parametrize('live', [False, True])
+def test_decoded_nested_payloads_are_isolated_from_source_and_later_reads(live):
+    log = EventLog()
+    log.event(provider='coordinator', episode_index=0, step_index=0,
+              payload={'episode_start': True})
+    log.event(provider='environment', episode_index=0, step_index=0,
+              payload={'observation': [1], 'info': {'q_star': [0., 1.]},
+                       'action_requested': True})
+    source = log.events
+    expected = latest_environment_decision(log)
+    row = latest_environment_decision(log) if live else next(environment_decisions(log))
+    row['observation'][0] = 99
+    row['info']['q_star'][1] = 99
+    assert log.events == source
+    assert latest_environment_decision(log) == expected
+    assert list(environment_decisions(log)) == [expected]
+    assert list(environment_decisions(log.to_dataset())) == [expected]
 
 
 def test_raw_json_string_payload_is_not_mistaken_for_an_environment_object():

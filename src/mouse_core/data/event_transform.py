@@ -14,7 +14,7 @@ _RESULTS = _ENDINGS | {"reward", "action_requested"}
 _DERIVED = {"events", "repeat_episode_start"}
 
 
-def _record(event, *, encoded_payload):
+def _record(event, *, encoded_payload, normalized=False):
     if not {"provider", "payload"} <= set(event):
         raise ValueError("Expected provider/payload event records")
     payload = event["payload"]
@@ -25,6 +25,10 @@ def _record(event, *, encoded_payload):
     # Arrow fills optional envelope columns with nulls. Restore their absence
     # so live and persisted views of sparse metadata remain identical.
     record = {key: value for key, value in event.items() if key not in INDEX_FIELDS or value is not None}
+    if normalized and type(event["provider"]) is str:
+        # EventLog owns already-normalized snapshots. Decoders only read them;
+        # _observation copies each returned view before it leaves this module.
+        return record
     return json.loads(_json({**record, "payload": payload}))
 
 
@@ -131,7 +135,12 @@ def _observation(previous, agent, environment, coordinator):
         raise ValueError("Event overlays cannot replace observation or derived fields")
     row.update(overlays)
     packet = [event for event in (coordinator, agent, environment) if event is not None]
-    row["events"] = _json([{key: event[key] for key in EVENT_FIELDS + INDEX_FIELDS if key in event} for event in packet])
+    # _record has already normalized every source record. Serialize the packet
+    # directly instead of walking all nested payloads through _plain again.
+    row["events"] = json.dumps(
+        [{key: event[key] for key in EVENT_FIELDS + INDEX_FIELDS if key in event} for event in packet],
+        separators=(",", ":"), allow_nan=False,
+    )
     return deepcopy(row)
 
 
@@ -144,8 +153,9 @@ def environment_decisions(events):
     An unfinished tail stays recorded without inventing an observation.
     """
     previous = agent = coordinator = None
-    for source in events:
-        event = _record(source, encoded_payload=not isinstance(events, EventLog))
+    normalized = isinstance(events, EventLog)
+    for source in events._events if normalized else events:
+        event = _record(source, encoded_payload=not normalized, normalized=normalized)
         provider = event["provider"]
         if provider == "coordinator":
             if coordinator is not None or agent is not None:
@@ -179,8 +189,9 @@ def environment_episode_ranges(events):
     start, episode, ended = 0, None, False
     end = 0
     seen = set()
-    for index, event in enumerate(events):
-        event = _record(event, encoded_payload=not isinstance(events, EventLog))
+    normalized = isinstance(events, EventLog)
+    for index, event in enumerate(events._events if normalized else events):
+        event = _record(event, encoded_payload=not normalized, normalized=normalized)
         end = index + 1
         marker = _headers(event)["episode_index"]
         payload = event["payload"]
@@ -213,7 +224,9 @@ def latest_environment_decision(log):
     """Read a completed observation from at most six source events."""
     if not len(log):
         raise ValueError("The log has no completed environment observation")
-    tail = [_record(log[-offset], encoded_payload=False)
+    normalized = isinstance(log, EventLog)
+    records = log._events if normalized else log
+    tail = [_record(records[-offset], encoded_payload=False, normalized=normalized)
             for offset in range(min(len(log), 6), 0, -1)]
     if tail[-1]["provider"] != "environment":
         raise ValueError("The latest event is not an environment observation")
