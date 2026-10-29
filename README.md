@@ -66,6 +66,16 @@ recorded only when supplied and an action is requested; online and inference
 environments can leave oracle computation disabled. PPO and GRPO additionally
 record behavior log probabilities on agent events.
 
+Repeated-task collectors record the zero-based `repeat_episode_index` only on
+the environment reset event starting each inner episode, using the live tracker.
+Subsequent action results and terminal events omit it. The saved index is used
+directly by the FrozenLake tokenizers to render a one-based `episode N` header
+before the reset observation. Inner termination and truncation append two
+newlines; those separators and headers do not create prediction readouts.
+Generic event views preserve this sparse field without reconstructing a counter.
+Recollect older datasets to include the reset indices before training with these
+example tokenizers.
+
 Use `EventLog.append(provider=..., payload=..., **indices)` when recording does
 not need a return value. It owns a snapshot and caches the payload's JSON once.
 `EventLog.event(...)` additionally returns an independent, editable snapshot.

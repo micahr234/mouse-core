@@ -72,6 +72,13 @@ Publication cells are skipped. This checks execution, not learning quality at fu
 Tokenizer conditions live in each notebook. Define the same named conditions in an
 inference notebook before loading its saved tokenizer.
 
+Repeated-task examples save `repeat_episode_index` only on each inner episode's
+reset environment event. Use `RepeatTaskTracker.repeat_episode_start` and its
+current index at collection time; do not derive the index while replaying data.
+Keep the one-based episode header and two-newline inner-ending separator
+consistent across the FrozenLake tokenizer schemas. Only the action-request
+newline is a prediction readout.
+
 ## Pull request workflow
 
 1. Fork the repository and create a branch from `main`.

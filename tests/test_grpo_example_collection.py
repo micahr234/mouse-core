@@ -31,6 +31,7 @@ def _reset_log():
     })
     log.event(provider='environment', episode_index=0, step_index=0, payload={
         'observation': 0,
+        'repeat_episode_index': 0,
         'reward': 0.0,
         'inner_terminated': False,
         'inner_truncated': False,
@@ -86,10 +87,13 @@ def test_example_branches_share_random_state_and_use_terminal_rewards():
     assert returns == [0.0, 1.0]
     assert all(len(events) == 122 and events[-1]['payload']['terminated'] for events in branches)
     event_branches = branches
+    source_branches = copy.deepcopy(event_branches)
     branches = [list(environment_decisions(events)) for events in branches]
     assert [r['observation'] for r in branches[0][1:]] == [r['observation'] for r in branches[1][1:]]
     for action, branch in enumerate(branches):
         assert 'action' not in branch[0]
+        assert branch[0]['repeat_episode_index'] == 0
+        assert all('repeat_episode_index' not in row for row in branch[1:])
         assert all(row['action'] == action and row['old_log_prob'] == -.69 for row in branch[1:])
         assert all(row.get('reward', 0.) == 0. for row in branch[:-1])
         replay = EventLog()
@@ -101,6 +105,10 @@ def test_example_branches_share_random_state_and_use_terminal_rewards():
     assert stamped[0][0]['advantage'] == stamped[1][0]['advantage'] == 0
     assert all(r['advantage'] < 0 for r in stamped[0][2:])
     assert all(r['advantage'] > 0 for r in stamped[1][2:])
+    assert event_branches == source_branches
+    for branch in stamped:
+        assert [event['payload'].get('repeat_episode_index') for event in branch
+                if event['provider'] == 'environment'] == [0] + [None] * 60
 
 
 def test_example_collection_starts_new_groups_without_prior_history():
@@ -115,6 +123,8 @@ def test_example_collection_starts_new_groups_without_prior_history():
         log = kwargs['log']
         prefix = list(environment_decisions(log.to_dataset()))
         assert len(log) == 2 and len(prefix) == 1 and prefix[0]['episode_start']
+        assert prefix[0]['repeat_episode_index'] == 0
+        assert 'repeat_episode_index' not in log[0]['payload']
         seen.append((prefix[0]['observation'], prefix[0]['episode_index']))
         return [log.events, log.events], [0, 0]
 
@@ -129,6 +139,10 @@ def test_example_collection_starts_new_groups_without_prior_history():
     assert namespace['run_rollout'](num_envs=2) == (2, 4)
     assert seen == [(10, 0), (11, 0), (12, 0), (13, 0)]
     assert len(namespace['stores']) == 4
+    for store in namespace['stores']:
+        persisted = EventLog.from_dataset(store.to_dataset())
+        assert all(event['payload']['repeat_episode_index'] == 0
+                   for event in persisted if event['provider'] == 'environment')
 
 
 def test_example_branch_logs_only_executed_actions_and_repeat_boundaries():
@@ -151,11 +165,17 @@ def test_example_branch_logs_only_executed_actions_and_repeat_boundaries():
                                     act_once=lambda **kw: (2, -.5))
     _functions({'rollout_branch'}, namespace)
     env = SimpleNamespace(step=step)
-    rows, ret = namespace['rollout_branch'](env=env, log=log, tracker=_reset_tracker())
-    rows = list(environment_decisions(rows))
+    events, ret = namespace['rollout_branch'](env=env, log=log, tracker=_reset_tracker())
+    rows = list(environment_decisions(events))
     assert actions == [2, None, 2]
     assert ret == 1.
-    assert all('repeat_episode_index' not in row for row in rows)
+    assert [row.get('repeat_episode_index') for row in rows] == [0, None, 1, None]
+    assert all('repeat_episode_index' not in event['payload']
+               for event in events if event['provider'] != 'environment')
+    replayed = EventLog()
+    for event in events:
+        replayed.event(**event)
+    assert list(environment_decisions(replayed.to_store().to_dataset())) == rows
     assert [row.get('action') for row in rows] == [None, 2, None, 2]
     assert ['old_log_prob' in row for row in rows] == [False, True, False, True]
     assert [row.get('reward', 0.) for row in rows] == [0., 0., 0., 1.]

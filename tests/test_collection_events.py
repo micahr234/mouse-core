@@ -156,6 +156,9 @@ def test_collector_logs_oracle_values_only_when_an_action_is_requested(ending):
         assert ('q_star' in row) == row.get('action_requested', False)
     payloads = [event['payload'] for event in log if event['provider'] == 'environment']
     assert ['q_star' in payload for payload in payloads] == [True, False, True]
+    assert [payload.get('repeat_episode_index') for payload in payloads] == [
+        0, None, 0 if ending[2] or ending[3] else 1,
+    ]
 
 
 @pytest.mark.parametrize(('probability', 'expected_actions'), [
@@ -224,7 +227,9 @@ def test_collector_uses_constant_oracle_probability_only_for_requested_actions(p
         None, expected_actions[0], expected_actions[1], None, expected_actions[2],
         None, expected_actions[3], None, expected_actions[4],
     ]
-    assert all('repeat_episode_index' not in row for row in decisions)
+    assert [row.get('repeat_episode_index') for row in decisions] == [
+        0, None, None, 1, None, 0, None, 1, None,
+    ]
 
 
 def _frozenlake_episode(filename):
@@ -236,7 +241,7 @@ def _frozenlake_episode(filename):
 
 
 @pytest.mark.parametrize('filename', FROZENLAKE_COLLECTORS)
-def test_collectors_log_only_outer_episode_markers_without_repeat_indices(filename):
+def test_collectors_save_repeat_indices_only_on_inner_resets(filename):
     log, live_rows = _collect_outputs(filename, [
         (0, 0., False, False, False, False),
         (1, 0., False, False, False, False),
@@ -253,9 +258,16 @@ def test_collectors_log_only_outer_episode_markers_without_repeat_indices(filena
     outputs = [event['payload'] for event in persisted.events if event['provider'] == 'coordinator']
     replayed = list(environment_decisions(dataset))
     assert outputs == [{'episode_start': True}, {'episode_start': True}]
-    assert all('repeat_episode_index' not in event['payload'] for event in persisted)
+    assert persisted.events == log.events
+    assert all('repeat_episode_index' not in event['payload']
+               for event in persisted if event['provider'] != 'environment')
+    assert [event['payload'].get('repeat_episode_index') for event in persisted
+            if event['provider'] == 'environment'] == [0, None, None, 1, None, 0, None, 1, None]
     for rows in (live_rows, replayed):
-        assert all('repeat_episode_index' not in row for row in rows)
+        assert [row.get('repeat_episode_index') for row in rows] == [
+            0, None, None, 1, None, 0, None, 1, None,
+        ]
+        assert all(('repeat_episode_index' in row) == ('action' not in row) for row in rows)
         assert all('repeat_episode_ended' not in row for row in rows)
         assert all('episode_reset' not in row for row in rows)
     assert all('repeat_episode_start' not in row for row in outputs)
@@ -319,14 +331,28 @@ def _notebook_transform(filename, *, tokenizer_only=False):
     *FROZENLAKE_REWARD_TRAINING, '05_train_offline_sv.ipynb',
     '08_train_online_grpo.ipynb', '09_train_offline_sp.ipynb',
 ])
-def test_tokenizers_omit_repeat_indices_and_preserve_action_masks(filename):
+@pytest.mark.parametrize('ending', ['terminated', 'truncated'])
+def test_tokenizers_render_saved_repeat_indices_and_preserve_action_masks(filename, ending):
+    terminated, truncated = ending == 'terminated', ending == 'truncated'
     log, _ = _collect_outputs('01_collect_dataset.ipynb', [
         (0, 0., False, False, False, False),
         (1, 0., False, False, False, False),
-        (2, 0., True, False, False, False),
+        (2, 0., terminated, truncated, False, False),
         (3, 0., False, False, False, False),
-        (4, 1., True, False, True, False),
+        (4, 1., terminated, truncated, terminated, truncated),
     ])
+    # A saved index determines the header even when it cannot be inferred by counting endings.
+    saved = EventLog()
+    reset_indices = iter((7, 12))
+    for event in log:
+        payload = event['payload']
+        if 'repeat_episode_index' in payload:
+            payload = {**payload, 'repeat_episode_index': next(reset_indices)}
+        saved.event(**{**event, 'payload': payload})
+    log = saved
+    before = json.dumps(log.events, sort_keys=True)
+    dataset = log.to_store().to_dataset()
+    persisted = EventLog.from_dataset(dataset)
     rows = list(environment_decisions(log.to_dataset()))
     transform = _notebook_transform(filename)
     for row in rows:
@@ -336,14 +362,30 @@ def test_tokenizers_omit_repeat_indices_and_preserve_action_masks(filename):
     assert [int(step.head_token_mask.sum()) for step in steps] == [1, 1, 0, 1, 0]
 
     def markers(tokens):
-        return re.findall(r',episode \d+', ''.join(chr(int(token)) for token in tokens))
+        return re.findall(r'episode \d+\n', ''.join(chr(int(token)) for token in tokens))
 
-    assert all(not markers(step.token_ids) for step in steps)
-    assert all('repeat_episode_index' not in row for row in rows)
+    assert [markers(step.token_ids) for step in steps] == [
+        ['episode 8\n'], [], [], ['episode 13\n'], [],
+    ]
+    rendered = [''.join(chr(int(token)) for token in step.token_ids) for step in steps]
+    assert re.search(r'episode 8\n,\d+\n$', rendered[0])
+    assert re.fullmatch(r'episode 13\n,\d+\n', rendered[3])
+    assert rendered[2].endswith(f',{ending}\n\n')
+    assert rendered[4].endswith(f',{ending}\n\n')
+    assert [row.get('repeat_episode_index') for row in rows] == [7, None, None, 12, None]
+    assert json.dumps(log.events, sort_keys=True) == before
+    assert json.dumps(persisted.events, sort_keys=True) == before
+    assert [row.get('repeat_episode_index') for row in environment_decisions(dataset)] == [
+        7, None, None, 12, None,
+    ]
+    replay_steps = _notebook_transform(filename)(persisted)
+    assert [markers(step.token_ids) for step in replay_steps] == [markers(step.token_ids) for step in steps]
+    assert [int(step.head_token_mask.sum()) for step in replay_steps] == [1, 1, 0, 1, 0]
+    assert json.dumps(persisted.events, sort_keys=True) == before
     for start in (0, 1):
         batch, labels, _ = pack_token_batch(steps=steps[start:], sequence_ids=[0] * (len(steps) - start),
                                             batch_size=1, continuing=None)
-        assert not markers(batch.token_ids)
+        assert markers(batch.token_ids) == (['episode 8\n', 'episode 13\n'] if start == 0 else ['episode 13\n'])
         if 'cosine' in filename:
             assert 'episode_reset' not in labels
             assert labels['action_executed'].tolist() == [False, True, True, False, True][start:]

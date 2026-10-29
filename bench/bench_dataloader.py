@@ -41,6 +41,10 @@ from mouse_core.data.token_batch import TokenBatch
 def on_group_start(ctx):
     return bool(ctx["group_start"])
 
+
+def on_inner_end(ctx):
+    return bool(ctx.get("inner_terminated", False) or ctx.get("inner_truncated", False))
+
 _BENCH_DIR = Path(__file__).resolve().parent
 if str(_BENCH_DIR) not in sys.path:
     sys.path.insert(0, str(_BENCH_DIR))
@@ -69,6 +73,7 @@ _group_prefix = (
     "explored; avoid holes you have already fallen in; once you have a "
     "path to the goal, repeat it.\n"
     "At each action-request newline, predict the value of all actions. Format:\n"
+    "Each episode starts with an episode N header; inner endings are followed by a blank line.\n"
     "action,observation[,r=reward][,terminated][,truncated].\n"
 )
 
@@ -103,6 +108,7 @@ def _stores(*, n_stores: int, steps: int) -> list[Datastore]:
                 **({'action_requested': True} if not repeat_ended else {}),
                 'observation': int(rng.integers(0, _MAX_OBS)),
                 'task_index': task,
+                **({'repeat_episode_index': repeat} if repeat_step == 0 else {}),
                 **({'inner_truncated': True} if repeat_ended else {}),
                 **({'q_star': rng.random(_MAX_ACTIONS, dtype=np.float32).tolist()} if not repeat_ended else {}),
                 **({'reward': reward} if reward != 0 else {}),
@@ -140,12 +146,13 @@ def _train_transform(*, tokenizer_source: str = "Qwen/Qwen3-0.6B", local_files_o
                 "format": _group_prefix,
                 "when": on_group_start,
             },
-            {"type": "text", "input_field": "action", "lookup": ["a", "b", "c", "d"], "format": "{field},"},
-            {"type": "text", "input_field": "observation", "format": "{field},"},
+            {"type": "text", "provider": "environment", "input_field": "repeat_episode_index", "format": "episode {field+1}\n"},
+            {"type": "text", "input_field": "action", "lookup": ["a", "b", "c", "d"], "format": "{field}"},
+            {"type": "text", "input_field": "observation", "format": ",{field}"},
             {
                 "type": "text",
                 "input_field": "reward",
-                "format": "r={field:g},",
+                "format": ",r={field:g}",
             },
             {
                 "type": "text",
@@ -162,6 +169,12 @@ def _train_transform(*, tokenizer_source: str = "Qwen/Qwen3-0.6B", local_files_o
                 "input_field": "action_requested",
                 "format": "\n",
                 "head_output": True,
+            },
+            {
+                "type": "text",
+                "provider": "environment",
+                "format": "\n\n",
+                "when": on_inner_end,
             },
         ],
         objective_fields=[
