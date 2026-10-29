@@ -82,6 +82,98 @@ def test_rejects_invalid_masks(mask, message):
         )
 
 
+@pytest.mark.parametrize("shared_targets", [False, True])
+@pytest.mark.parametrize("shared_mask", [False, True])
+def test_batched_direct_cosine_matches_independent_heads_and_gradients(
+    shared_targets: bool, shared_mask: bool,
+) -> None:
+    torch.manual_seed(23)
+    predictions = torch.randn(4, 2, 3, requires_grad=True)
+    targets = (
+        torch.randn(4, 3, requires_grad=True) if shared_targets
+        else torch.randn(4, 2, 3, requires_grad=True)
+    )
+    mask = (
+        torch.tensor([0, 1, 0, 0]) if shared_mask
+        else torch.tensor([[0, 1], [1, 0], [0, 0], [0, 1]])
+    )
+    losses, metrics = CosineObjective(mask_key="skip", batched_heads=True)(
+        objective_data={"skip": mask}, predictions=predictions, targets=targets,
+    )
+    assert losses["cosine"].shape == (2,)
+    assert all(
+        isinstance(value, torch.Tensor) and value.shape == (2,) and not value.requires_grad
+        for value in metrics.values()
+    )
+    expected = []
+    for head in range(2):
+        single, _ = CosineObjective(mask_key="skip")(
+            objective_data={"skip": mask if shared_mask else mask[:, head]},
+            predictions=predictions[:, head],
+            targets=targets if shared_targets else targets[:, head],
+        )
+        expected.append(single["cosine"])
+    expected_losses = torch.stack(expected)
+    torch.testing.assert_close(losses["cosine"], expected_losses)
+    expected_grad = torch.autograd.grad(expected_losses.sum(), predictions, retain_graph=True)[0]
+    losses["cosine"].sum().backward()
+    torch.testing.assert_close(predictions.grad, expected_grad)
+    assert targets.grad is None
+
+
+def test_batched_direct_cosine_empty_heads_are_differentiable_zero() -> None:
+    predictions = torch.tensor(
+        [[[1., 0.], [float("nan"), 0.]], [[0., 1.], [float("nan"), 1.]]],
+        requires_grad=True,
+    )
+    targets = torch.tensor(
+        [[[0., 1.], [float("nan"), 0.]], [[0., 1.], [float("nan"), 1.]]],
+        requires_grad=True,
+    )
+    losses, metrics = CosineObjective(mask_key="skip", batched_heads=True)(
+        objective_data={"skip": torch.tensor([[0, 1], [0, 1]])},
+        predictions=predictions, targets=targets,
+    )
+    torch.testing.assert_close(losses["cosine"], torch.tensor([0.5, 0.]))
+    torch.testing.assert_close(metrics["cosine_similarity"], torch.tensor([0.5, 0.]))
+    losses["cosine"].sum().backward()
+    assert predictions.grad is not None and torch.isfinite(predictions.grad).all()
+    torch.testing.assert_close(predictions.grad[:, 1], torch.zeros(2, 2))
+    assert targets.grad is None
+
+    predictions_all_masked = torch.randn(2, 2, 3, requires_grad=True)
+    empty, _ = CosineObjective(mask_key="skip", batched_heads=True)(
+        objective_data={"skip": torch.ones(2, dtype=torch.bool)},
+        predictions=predictions_all_masked,
+        targets=torch.randn(2, 3),
+    )
+    torch.testing.assert_close(empty["cosine"], torch.zeros(2))
+    empty["cosine"].sum().backward()
+    torch.testing.assert_close(predictions_all_masked.grad, torch.zeros(2, 2, 3))
+
+
+def test_batched_direct_cosine_requires_explicit_mode_and_aligned_shapes() -> None:
+    predictions = torch.randn(2, 3, 4)
+    targets = torch.randn(2, 3, 4)
+    scalar, _ = CosineObjective(mask_key=None)(
+        objective_data={}, predictions=predictions, targets=targets,
+    )
+    assert scalar["cosine"].ndim == 0
+    with pytest.raises(ValueError, match=r"\[P, K, D\]"):
+        CosineObjective(mask_key=None, batched_heads=True)(
+            objective_data={}, predictions=predictions[:, 0], targets=targets[:, 0],
+        )
+    with pytest.raises(ValueError, match="targets"):
+        CosineObjective(mask_key=None, batched_heads=True)(
+            objective_data={}, predictions=predictions, targets=torch.randn(2, 2, 4),
+        )
+    with pytest.raises(ValueError, match="skip mask"):
+        CosineObjective(mask_key="skip", batched_heads=True)(
+            objective_data={"skip": torch.zeros(2, 2)},
+            predictions=predictions, targets=targets,
+        )
+
+
 def test_offline_dqn_cosine_example(monkeypatch):
     import ast
     from mouse_core import AdamW, polyak_update
@@ -332,6 +424,127 @@ def test_sequential_cosine_skips_unexecuted_placeholder_actions():
     losses["cosine"].backward()
     assert z.grad is not None
     torch.testing.assert_close(z.grad[0], torch.zeros(2))
+
+
+@pytest.mark.parametrize("shared_targets", [False, True])
+@pytest.mark.parametrize("shared_mask", [False, True])
+def test_batched_latent_cosine_matches_independent_heads_and_gradients(
+    shared_targets: bool, shared_mask: bool,
+) -> None:
+    torch.manual_seed(29)
+    predictions = torch.randn(5, 2, 3, requires_grad=True)
+    targets = (
+        torch.randn(5, 3, requires_grad=True) if shared_targets
+        else torch.randn(5, 2, 3, requires_grad=True)
+    )
+    mask = (
+        torch.tensor([0, 1, 0, 0, 0]) if shared_mask
+        else torch.tensor([[0, 1], [1, 0], [0, 0], [0, 0], [0, 0]])
+    )
+    data = {
+        "action": torch.tensor([0, 1, 2, 3, 4]),
+        "terminated": torch.zeros(5, dtype=torch.bool),
+        "truncated": torch.zeros(5, dtype=torch.bool),
+        "skip": mask,
+    }
+    groups = torch.tensor([0, 0, 0, 1, 1])
+    captured = []
+
+    def transition(state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        captured.append((state, action))
+        return state + action[:, None].to(state.dtype) * 0.2
+
+    losses, metrics = CosineObjective(mask_key="skip", batched_heads=True).latent_cosine_loss(
+        objective_data=data, predictions=predictions, targets=targets,
+        group_id=groups, transition=transition, reset_key=None,
+    )
+    assert losses["cosine"].shape == (2,)
+    assert captured[0][0].ndim == 2 and captured[0][1].ndim == 1
+    assert captured[0][0].shape[0] == captured[0][1].shape[0]
+    assert all(
+        isinstance(value, torch.Tensor) and value.shape == (2,) and not value.requires_grad
+        for value in metrics.values()
+    )
+
+    expected = []
+    for head in range(2):
+        single, _ = CosineObjective(mask_key="skip").latent_cosine_loss(
+            objective_data={**data, "skip": mask if shared_mask else mask[:, head]},
+            predictions=predictions[:, head],
+            targets=targets if shared_targets else targets[:, head],
+            group_id=groups, transition=transition, reset_key=None,
+        )
+        expected.append(single["cosine"])
+    expected_losses = torch.stack(expected)
+    torch.testing.assert_close(losses["cosine"], expected_losses)
+    expected_grad = torch.autograd.grad(expected_losses.sum(), predictions, retain_graph=True)[0]
+    losses["cosine"].sum().backward()
+    torch.testing.assert_close(predictions.grad, expected_grad)
+    assert targets.grad is None
+
+
+def test_batched_latent_cosine_empty_head_and_no_pairs() -> None:
+    predictions = torch.randn(3, 2, 2, requires_grad=True)
+    targets = torch.randn(3, 2)
+    data = {
+        "action": torch.tensor([0, 1, 2]),
+        "terminated": torch.zeros(3, dtype=torch.bool),
+        "truncated": torch.zeros(3, dtype=torch.bool),
+        "skip": torch.tensor([[0, 1], [0, 1], [0, 1]]),
+    }
+
+    def transition(state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        return state + action[:, None] * 0.1
+
+    objective = CosineObjective(mask_key="skip", batched_heads=True)
+    losses, _ = objective.latent_cosine_loss(
+        objective_data=data, predictions=predictions, targets=targets,
+        group_id=torch.zeros(3, dtype=torch.int64), transition=transition,
+        reset_key=None,
+    )
+    assert losses["cosine"].shape == (2,)
+    assert losses["cosine"][1].item() == 0.0
+    losses["cosine"].sum().backward()
+    assert predictions.grad is not None
+    torch.testing.assert_close(predictions.grad[:, 1], torch.zeros(3, 2))
+
+    def forbidden_transition(state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        raise AssertionError("transition should not run without pairs")
+
+    isolated = torch.randn(3, 2, 2, requires_grad=True)
+    empty, _ = objective.latent_cosine_loss(
+        objective_data=data, predictions=isolated, targets=targets,
+        group_id=torch.arange(3), transition=forbidden_transition,
+        reset_key=None,
+    )
+    torch.testing.assert_close(empty["cosine"], torch.zeros(2))
+    empty["cosine"].sum().backward()
+    torch.testing.assert_close(isolated.grad, torch.zeros_like(isolated))
+
+
+def test_batched_latent_cosine_readout_expansion_and_action_alignment() -> None:
+    predictions = torch.randn(3, 2, 2, requires_grad=True)
+    targets = torch.randn(3, 2)
+    data = {
+        "head_output_count": torch.tensor([1, 1, 0, 1]),
+        "action": torch.tensor([0, 2, 3, 4]),
+        "terminated": torch.zeros(4, dtype=torch.bool),
+        "truncated": torch.zeros(4, dtype=torch.bool),
+    }
+    captured = []
+
+    def transition(state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        captured.append((state, action))
+        return state
+
+    losses, _ = CosineObjective(mask_key=None, batched_heads=True).latent_cosine_loss(
+        objective_data=data, predictions=predictions, targets=targets,
+        group_id=torch.zeros(4, dtype=torch.int64), transition=transition,
+        reset_key=None,
+    )
+    assert losses["cosine"].shape == (2,)
+    torch.testing.assert_close(captured[0][0], predictions[0])
+    torch.testing.assert_close(captured[0][1], torch.tensor([2, 2]))
 
 
 def test_example_zero_weight_omits_transition_and_auxiliary_loss():

@@ -86,11 +86,12 @@ class Objective[**P](ABC):
         target inputs depend on the objective.
 
         Returns:
-            ``(losses, metrics)``. ``losses`` maps a name to a 0-dim
-            tensor to minimize. Callers sum the terms they train.
-            ``metrics`` holds detached
-            0-dim tensors (or floats) for logging — prefer tensors so the
-            train step can defer host materialization until log time —
+            ``(losses, metrics)``. ``losses`` maps a name to a scalar
+            tensor, or to a ``[K]`` tensor when independent heads are
+            batched. Callers choose how to reduce head losses for training.
+            ``metrics`` holds detached scalar or per-head tensors (or floats)
+            for logging — prefer tensors so the train step can defer host
+            materialization until log time —
             and, when an objective exposes them, detached tensors built
             during the loss (for example DQN ``backup``).
         """

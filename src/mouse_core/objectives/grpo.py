@@ -116,7 +116,13 @@ class GrpoObjective(Objective[...]):
 
     Call with the policy logits as ``predictions=``:
 
-    * ``predictions`` — ``[N, A]`` discrete policy logits
+    * ``predictions`` — ``[P, A]`` discrete policy logits, or ``[P, K, A]``
+      for ``K`` independent policy heads
+
+    With ``K`` heads, each head computes its own action or episode ratio.
+    Losses and scalar diagnostics have shape ``[K]``; callers choose how to
+    combine them. Per-step columns are shared unless ``old_log_prob``,
+    ``advantage``, or sampling weights are supplied as ``[N, K]``.
 
     Advantages are **not** estimated from a learned baseline. The caller
     computes them with :func:`group_relative_advantages` over a group of
@@ -214,6 +220,7 @@ class GrpoObjective(Objective[...]):
         objective_data: dict[str, torch.Tensor],
         group_id: torch.Tensor,
         predictions: torch.Tensor,
+        _tensor_metrics: bool = False,
     ) -> tuple[dict[str, torch.Tensor], dict[str, float | torch.Tensor]]: ...
 
     @overload
@@ -227,6 +234,7 @@ class GrpoObjective(Objective[...]):
         backup_action_predictions: None = None,
         value_predictions: None = None,
         targets: None = None,
+        _tensor_metrics: bool = False,
     ) -> tuple[dict[str, torch.Tensor], dict[str, float | torch.Tensor]]: ...
 
     def __call__(
@@ -239,6 +247,7 @@ class GrpoObjective(Objective[...]):
         backup_action_predictions: torch.Tensor | None = None,
         value_predictions: torch.Tensor | None = None,
         targets: torch.Tensor | None = None,
+        _tensor_metrics: bool = False,
     ) -> tuple[dict[str, torch.Tensor], dict[str, float | torch.Tensor]]:
         _reject_predictions(
             "GrpoObjective",
@@ -249,9 +258,51 @@ class GrpoObjective(Objective[...]):
         )
         logits: torch.Tensor = predictions
 
+        if logits.ndim == 3:
+            _, K, A = logits.shape
+            if K < 1 or A < 1:
+                raise ValueError("GRPO needs at least one head and one action.")
+            n_steps = objective_data[self.action_key].shape[0]
+            head_columns = (self.old_log_prob_key, self.advantage_key)
+            if self.sampling_weight_key is not None:
+                head_columns += (self.sampling_weight_key,)
+            for key in head_columns:
+                column = objective_data.get(key)
+                if column is not None and column.ndim == 2 and column.shape != (n_steps, K):
+                    raise ValueError(
+                        f"GRPO expects {key!r} shape [{n_steps}] or [{n_steps}, {K}], "
+                        f"got {tuple(column.shape)}."
+                    )
+            per_head_losses: list[torch.Tensor] = []
+            per_head_metrics: list[dict[str, float | torch.Tensor]] = []
+            for head in range(K):
+                head_data = {
+                    **objective_data,
+                    **{
+                        key: objective_data[key][:, head]
+                        for key in head_columns
+                        if key in objective_data and objective_data[key].ndim == 2
+                    },
+                }
+                losses, metrics = self(
+                    objective_data=head_data,
+                    group_id=group_id,
+                    predictions=logits[:, head, :],
+                    _tensor_metrics=True,
+                )
+                per_head_losses.append(losses["grpo"])
+                per_head_metrics.append(metrics)
+            return {"grpo": torch.stack(per_head_losses)}, {
+                name: torch.stack([
+                    torch.as_tensor(metrics[name], device=logits.device)
+                    for metrics in per_head_metrics
+                ])
+                for name in per_head_metrics[0]
+            }
+
         if logits.ndim != 2:
             raise ValueError(
-                f"GRPO expects policy logits shape [N, A], "
+                f"GRPO expects policy logits shape [P, A] or [P, K, A], "
                 f"got {tuple(logits.shape)}."
             )
         original_data = objective_data
@@ -379,8 +430,10 @@ class GrpoObjective(Objective[...]):
             "entropy": entropy.detach(),
             "approx_kl": approx_kl,
             "clipfrac": clipfrac,
-            "advantage_mean": _weighted_mean(advantage, pair_weight),
+            "advantage_mean": _weighted_mean(advantage, pair_weight).detach(),
         }
+        if _tensor_metrics:
+            return {"grpo": loss}, cast(dict[str, float | torch.Tensor], named)
         metrics: dict[str, float | torch.Tensor] = dict(
             zip(named, torch.stack(list(named.values())).tolist())
         )

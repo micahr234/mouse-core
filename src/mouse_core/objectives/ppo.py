@@ -151,8 +151,16 @@ class PpoObjective(Objective[...]):
     Call with the policy logits as ``predictions=`` and the value
     tensor as ``value_predictions=``:
 
-    * ``predictions`` — ``[N, A]`` discrete policy logits
-    * ``value_predictions`` — ``[N, 1]`` or ``[N]`` scalar state values
+    * ``predictions`` — ``[P, A]`` discrete policy logits, or ``[P, K, A]``
+      for ``K`` independent policy heads
+    * ``value_predictions`` — ``[P, 1]`` or ``[P]`` scalar state values,
+      or ``[P, K, 1]`` or ``[P, K]`` for independent value heads
+
+    With ``K`` heads, each head has its own policy loss, value loss, GAE
+    estimate, and diagnostics. Losses and scalar diagnostics have shape
+    ``[K]``; callers choose how to combine them. Per-step objective columns
+    are shared. ``old_log_prob`` may also have shape ``[N, K]`` for distinct
+    behavior policies, where ``N`` is the number of environment steps.
 
     A run is one ``group_id`` (one dataloader sample). Neighbor reads must stay in-run: out-of-run
     pairs are multiplied by ``0`` (all-zero weights → loss ``0``). GAE
@@ -297,6 +305,7 @@ class PpoObjective(Objective[...]):
         group_id: torch.Tensor,
         predictions: torch.Tensor,
         value_predictions: torch.Tensor,
+        _tensor_metrics: bool = False,
     ) -> tuple[dict[str, torch.Tensor], dict[str, float | torch.Tensor]]: ...
 
     @overload
@@ -310,6 +319,7 @@ class PpoObjective(Objective[...]):
         backup_value_predictions: None = None,
         backup_action_predictions: None = None,
         targets: None = None,
+        _tensor_metrics: bool = False,
     ) -> tuple[dict[str, torch.Tensor], dict[str, float | torch.Tensor]]: ...
 
     def __call__(
@@ -322,6 +332,7 @@ class PpoObjective(Objective[...]):
         backup_action_predictions: torch.Tensor | None = None,
         value_predictions: torch.Tensor | None = None,
         targets: torch.Tensor | None = None,
+        _tensor_metrics: bool = False,
     ) -> tuple[dict[str, torch.Tensor], dict[str, float | torch.Tensor]]:
         _reject_predictions(
             "PpoObjective",
@@ -334,9 +345,48 @@ class PpoObjective(Objective[...]):
             value_predictions, owner="PpoObjective", name="value_predictions"
         )
 
+        if logits.ndim == 3:
+            P, K, A = logits.shape
+            if K < 1 or A < 1:
+                raise ValueError("PPO needs at least one head and one action.")
+            if values_raw.shape not in (torch.Size([P, K]), torch.Size([P, K, 1])):
+                raise ValueError(
+                    f"PPO expects batched value shape [{P}, {K}] or [{P}, {K}, 1], "
+                    f"got {tuple(values_raw.shape)}."
+                )
+            per_head_losses: list[torch.Tensor] = []
+            per_head_metrics: list[dict[str, float | torch.Tensor]] = []
+            n_steps = objective_data[self.action_key].shape[0]
+            old_log_prob = objective_data.get(self.old_log_prob_key)
+            if old_log_prob is not None and old_log_prob.ndim == 2 and old_log_prob.shape != (n_steps, K):
+                raise ValueError(
+                    f"PPO expects {self.old_log_prob_key!r} shape [{n_steps}] "
+                    f"or [{n_steps}, {K}], got {tuple(old_log_prob.shape)}."
+                )
+            for head in range(K):
+                head_data = objective_data
+                if old_log_prob is not None and old_log_prob.ndim == 2:
+                    head_data = {**objective_data, self.old_log_prob_key: old_log_prob[:, head]}
+                losses, metrics = self(
+                    objective_data=head_data,
+                    group_id=group_id,
+                    predictions=logits[:, head, :],
+                    value_predictions=values_raw[:, head],
+                    _tensor_metrics=True,
+                )
+                per_head_losses.append(losses["ppo"])
+                per_head_metrics.append(metrics)
+            return {"ppo": torch.stack(per_head_losses)}, {
+                name: torch.stack([
+                    torch.as_tensor(metrics[name], device=logits.device)
+                    for metrics in per_head_metrics
+                ])
+                for name in per_head_metrics[0]
+            }
+
         if logits.ndim != 2:
             raise ValueError(
-                f"PPO expects policy logits shape [N, A], "
+                f"PPO expects policy logits shape [P, A] or [P, K, A], "
                 f"got {tuple(logits.shape)}."
             )
         original_data = objective_data
@@ -523,9 +573,11 @@ class PpoObjective(Objective[...]):
             "approx_kl": approx_kl,
             "clipfrac": clipfrac,
             "explained_variance": explained_var,
-            "advantage_mean": _weighted_mean(advantages[policy_valid], policy_weight),
-            "value_mean": _weighted_mean(curr_values, pair_weight),
+            "advantage_mean": _weighted_mean(advantages[policy_valid], policy_weight).detach(),
+            "value_mean": _weighted_mean(curr_values, pair_weight).detach(),
         }
+        if _tensor_metrics:
+            return {"ppo": loss}, cast(dict[str, float | torch.Tensor], named)
         metrics: dict[str, float | torch.Tensor] = dict(
             zip(named, torch.stack(list(named.values())).tolist())
         )
