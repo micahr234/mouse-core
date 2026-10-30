@@ -237,7 +237,7 @@ def test_cuda_step_cudagraph_matches_eager_decode(S: int) -> None:
     B, D = 2, 64
     pre = torch.randn(B, 8, D, device=device, dtype=torch.bfloat16)
     preg = torch.zeros(B, 8, dtype=torch.long, device=device)
-    steps = [torch.randn(B, S, D, device=device, dtype=torch.bfloat16) for _ in range(4)]
+    steps = [torch.randn(B, S, D, device=device, dtype=torch.bfloat16) for _ in range(12)]
     stepg = torch.zeros(B, S, dtype=torch.long, device=device)
     step_lens = [S, S]
 
@@ -286,9 +286,9 @@ def test_cuda_step_graph_survives_chunk_shape_change() -> None:
     B, D = 2, 64
     pre = torch.randn(B, 8, D, device=device, dtype=torch.bfloat16)
     preg = torch.zeros(B, 8, dtype=torch.long, device=device)
-    # S=1 twice captures a graph, S=4 replaces the holder tensors, then the
-    # S=1 steps that follow must not replay against the old tables.
-    chunk_sizes = [1, 1, 4, 1, 1, 1, 1]
+    # Sustained S=1 captures a graph, S=4 replaces the holder tensors, then
+    # S=1 must recapture rather than replay against the old query tables.
+    chunk_sizes = [1] * 12 + [4] + [1] * 12
     chunks = [torch.randn(B, s, D, device=device, dtype=torch.bfloat16) for s in chunk_sizes]
 
     def run(*, graph: bool) -> list[torch.Tensor]:
@@ -331,7 +331,7 @@ def _cuda_graph_session(batch_size: int = 2) -> tuple[Any, torch.device, int]:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='decode CUDA graph is CUDA-only')
 def test_cuda_identical_incremental_steps_capture() -> None:
-    """Two identical incremental steps after prefill capture a CUDA graph."""
+    """Transient layouts stay compiled; sustained reuse eventually captures."""
     session, device, D = _cuda_graph_session()
     B, S = 2, 1
     pre = torch.randn(B, 8, D, device=device, dtype=torch.bfloat16)
@@ -340,10 +340,12 @@ def test_cuda_identical_incremental_steps_capture() -> None:
     stepg = torch.zeros(B, S, dtype=torch.long, device=device)
     with torch.no_grad():
         session.forward(embeds=pre, lengths=[8, 8])
-        session.forward(embeds=step, lengths=[S, S])
-        assert session._graph is None
-        assert not session._graph_disabled
-        session.forward(embeds=step, lengths=[S, S])
+        for _ in range(3):
+            session.forward(embeds=step, lengths=[S, S])
+            assert session._graph is None
+            assert not session._graph_disabled
+        for _ in range(12):
+            session.forward(embeds=step, lengths=[S, S])
     assert session._graph is not None
     assert not session._graph_disabled
 
@@ -354,15 +356,15 @@ def test_cuda_page_grow_skips_capture_then_recaptures() -> None:
     session, device, D = _cuda_graph_session()
     B, S = 2, 1
     page = session.page
-    pre_len = page - 2
+    pre_len = page - 16
     pre = torch.randn(B, pre_len, D, device=device, dtype=torch.bfloat16)
     preg = torch.zeros(B, pre_len, dtype=torch.long, device=device)
     step = torch.randn(B, S, D, device=device, dtype=torch.bfloat16)
     stepg = torch.zeros(B, S, dtype=torch.long, device=device)
     with torch.no_grad():
         session.forward(embeds=pre, lengths=[pre_len, pre_len])
-        session.forward(embeds=step, lengths=[S, S])
-        session.forward(embeds=step, lengths=[S, S])
+        for _ in range(16):
+            session.forward(embeds=step, lengths=[S, S])
         assert session._graph is not None
         assert not session._graph_disabled
         n_pages = session.n_pages
@@ -370,7 +372,8 @@ def test_cuda_page_grow_skips_capture_then_recaptures() -> None:
         assert session.n_pages > n_pages
         assert session._graph is None
         assert not session._graph_disabled
-        session.forward(embeds=step, lengths=[S, S])
+        for _ in range(12):
+            session.forward(embeds=step, lengths=[S, S])
         assert session._graph is not None
         assert not session._graph_disabled
         session.forward(embeds=step, lengths=[S, S])
@@ -933,3 +936,20 @@ def test_cuda_paged_pool_grows_in_place() -> None:
     assert session.k_cache.data_ptr() == ptr_k
     assert session.v_cache.data_ptr() == ptr_v
     torch.cuda.synchronize()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph capture")
+def test_cuda_ragged_scatter_sizes_do_not_trigger_repeated_capture() -> None:
+    session, device, width = _cuda_graph_session()
+    step = torch.randn(2, 4, width, device=device, dtype=torch.bfloat16)
+    try:
+        with torch.no_grad():
+            for index in range(12):
+                session.forward(embeds=step, lengths=[4, 1 + index % 2])
+                assert session._graph is None
+            for _ in range(12):
+                session.forward(embeds=step, lengths=[4, 2])
+            assert session._graph is not None
+            assert not session._graph_disabled
+    finally:
+        session.close()

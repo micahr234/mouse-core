@@ -49,6 +49,7 @@ How it works:
   shape, the eager full stack is CUDA-graphed so that steady incremental
   shape is one replay. ``S`` is whatever the caller keeps sending; one-off
   shapes (prefills, rebuilds) and VMM grow steps stay compiled-but-not-graphed.
+  Capture waits for sustained layout reuse to amortize its cost.
   A capture miss skips that step and retries once the shape is stable; graphs
   disable only after a repeated hard failure (logged). Eager FlexAttention
   is not capturable and is skipped, not treated as a disable.
@@ -113,6 +114,7 @@ def check_autocast_dtype(autocast_dtype: object, dtype: torch.dtype) -> torch.dt
 
 
 _BLOCK_SIZE = 128  # compiled CUDA FlexAttention requires >= 128
+_GRAPH_MIN_STABLE_STEPS = 8  # amortize capture on genuinely recurring layouts
 _compiled_create_block_mask: Any | None = None
 
 
@@ -505,15 +507,16 @@ class FlexDecodeSession:
         }
         _bind_decode_mask_holder(self._mask_holder)
 
-        # Incremental-step CUDA graph: captured the second time a shape
-        # repeats on a stable pool; rebuilt when the pool grows or BlockMask
+        # Incremental-step CUDA graph: captured after a layout repeatedly
+        # recurs on a stable pool; rebuilt when the pool grows or BlockMask
         # tables change. One miss skips; a second hard miss on the same key
         # disables graphs for the session.
         self._closed = False
+        self._graph_stable_key: tuple[Any, ...] | None = None
+        self._graph_stable_steps = 0
         self._graph: torch.cuda.CUDAGraph | None = None
         self._graph_disabled = False
         self._g_key: tuple[int, int, int] | None = None
-        self._pending_graph_key: tuple[int, int, int] | None = None
         self._graph_last_n_pages: int | None = None
         self._graph_last_addr_shape: tuple[int, ...] | None = None
         self._graph_miss_key: tuple[int, int, int] | None = None
@@ -642,6 +645,8 @@ class FlexDecodeSession:
         )
 
     def _invalidate_graph(self) -> None:
+        self._graph_stable_key = None
+        self._graph_stable_steps = 0
         self._graph = None
         self._g_key = None
         self._g_mask = None
@@ -657,7 +662,6 @@ class FlexDecodeSession:
         """Log a hard capture miss. Disable only after the same key misses twice."""
         warnings.warn(reason, stacklevel=3)
         self._invalidate_graph()
-        self._pending_graph_key = None
         if self._graph_miss_key == key:
             self._graph_miss_count += 1
         else:
@@ -800,6 +804,16 @@ class FlexDecodeSession:
             or addr.numel() == 0
         ):
             return None
+        # A capture runs the full decoder several times. Ragged rollouts
+        # often repeat a layout only briefly, so capturing the second hit
+        # costs more than the handful of replays can recover. Include the
+        # real-token scatter size and pool layout, not just padded [B, S].
+        stable_key = (self._step_graph_key(h), addr.numel(), self.n_pages, self.logical_cap)
+        if stable_key == self._graph_stable_key:
+            self._graph_stable_steps += 1
+        else:
+            self._graph_stable_key = stable_key
+            self._graph_stable_steps = 1
         pages_changed = (
             self._graph_last_n_pages is None or self._graph_last_n_pages != self.n_pages
         )
@@ -825,12 +839,9 @@ class FlexDecodeSession:
         # VMM grow / addr reshape this call: capture is illegal or would recapture
         # a transitioning shape. Compiled path this step; retry when stable.
         if pages_changed or addr_changed:
-            self._pending_graph_key = key
             return None
-        # One-off shapes (prefills) stay compiled. Capture the shape that
-        # just repeated — S is part of the key, not chosen here.
-        if self._pending_graph_key != key:
-            self._pending_graph_key = key
+        # One-off shapes (prefills) and brief repeats stay compiled.
+        if self._graph_stable_steps < _GRAPH_MIN_STABLE_STEPS:
             return None
         return self._capture_step_graph(h, cos, sin, addr, real_rows, real_cols, block_mask)
 
@@ -854,7 +865,6 @@ class FlexDecodeSession:
         self._g_mask = block_mask
         if not self._copy_graph_inputs(h, cos, sin, addr, real_rows, real_cols, block_mask):
             self._invalidate_graph()
-            self._pending_graph_key = None
             return self._run_layers(h, cos, sin, addr, real_rows, real_cols, block_mask)
 
         def _restore_static() -> None:
@@ -909,7 +919,6 @@ class FlexDecodeSession:
                     stacklevel=2,
                 )
                 self._invalidate_graph()
-                self._pending_graph_key = None
                 if out is None or hiddens is None:
                     out, hiddens = self._run_layers(
                         h, cos, sin, addr, real_rows, real_cols, block_mask,
@@ -985,7 +994,6 @@ class FlexDecodeSession:
             self._mask_holder["page_logical"][freed_t] = 0
             self._mask_holder["page_row"][freed_t] = -1
         self._invalidate_graph()
-        self._pending_graph_key = None
 
     # ------------------------------------------------------------------
 
