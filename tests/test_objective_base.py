@@ -40,7 +40,7 @@ def test_objective_can_preserve_a_specific_keyword_signature() -> None:
     result = objective(
         objective_data={},
         predictions=torch.tensor([[0.0, 1.0]], requires_grad=True),
-        targets=torch.tensor([1]),
+        targets=torch.tensor([[0.0, 1.0]]),
     )
     assert_type(result, _Result)
     losses, metrics = result
@@ -78,7 +78,7 @@ _CASES: list[tuple[Objective[...], dict[str, object], tuple[str, ...]]] = [
         {"group_id": torch.zeros(2, dtype=torch.int64)},
         ("group_id",),
     ),
-    (SpObjective(mask_key=None), {"targets": torch.zeros(2, dtype=torch.int64)}, ("targets",)),
+    (SpObjective(mask_key=None), {"targets": torch.zeros(2, 2)}, ("targets",)),
     (SvObjective(), {"targets": torch.zeros(2, 2)}, ("targets",)),
 ]
 

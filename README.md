@@ -41,6 +41,23 @@ To run the notebooks, follow the [development setup](CONTRIBUTING.md#development
 
 MOUSE is in early development; APIs may change.
 
+## Oracle-supervised policy loss
+
+`SpObjective` accepts floating-point oracle Q vectors and supports
+`loss_type="forward_kl"` (the default) or `"reverse_kl"`. Positive
+`oracle_temperature` values use `softmax(Q / temperature)` as the oracle policy.
+The default temperature is zero: forward KL targets the uniform distribution
+on finite Q maxima, without dividing by zero. A unique maximum gives exactly
+negative log likelihood; k tied maxima give their mean NLL minus log(k), with
+identical expected gradients to uniformly sampled best-action labels.
+Nonfinite Q entries are unavailable actions and are excluded from both policies.
+Reverse KL requires positive temperature because student probability on an
+action outside a hard target's support gives infinite divergence.
+
+Pass Q vectors directly; the CE mode, integer action-label targets, `sp_ce`, and
+`label_smoothing` option have been removed. See the
+[supervised policy example](examples/09_train_offline_sp.ipynb).
+
 ## Start with FrozenLake
 
 Follow these three notebooks:

@@ -11,19 +11,11 @@ import torch.nn.functional as F
 from mouse_core.objectives.base import Objective, _reject_predictions, _require_prediction
 
 
-def _integer_actions(actions: torch.Tensor) -> torch.Tensor:
-    """Convert integer storage types without silently truncating action labels."""
-    if actions.is_floating_point() or actions.is_complex() or actions.dtype == torch.bool:
-        raise TypeError("target actions must have an integer dtype.")
-    return actions.to(dtype=torch.int64)
-
-
 def best_action(q_targets: torch.Tensor) -> torch.Tensor:
     """Index of a uniformly random finite maximizer per row.
 
-    Callers that distill from a Q vector (e.g. ``q_star``) run this
-    outside ``SpObjective`` and pass the resulting action ids as
-    ``targets=``.
+    Use this for greedy action selection with random tie-breaking.
+    ``SpObjective`` accepts Q values directly.
 
     ``-inf`` padding is never selected. Rows with no finite entry fall through
     to ``argmax`` of an all-``-inf`` mask (index 0), matching ``torch.argmax``.
@@ -33,71 +25,6 @@ def best_action(q_targets: torch.Tensor) -> torch.Tensor:
     is_max = finite & (q == q.max(dim=-1, keepdim=True).values)
     scores = torch.rand(q.shape, device=q.device, dtype=torch.float32)
     return scores.masked_fill(~is_max, -torch.inf).argmax(dim=-1)
-
-
-def sp_ce(
-    target_actions: torch.Tensor,
-    logits: torch.Tensor,
-    *,
-    label_smoothing: float = 0.0,
-    invalid: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Hard CE onto integer action labels (aligned rows).
-
-    ``invalid`` is an optional ``[N, A]`` bool mask of action slots that do
-    not exist. Those slots are excluded from the student softmax and from
-    label smoothing.
-
-    Args:
-        target_actions: ``[N]`` integer action ids.
-        logits: ``[N, A]`` student action logits.
-        label_smoothing: Mixes uniform mass over the *valid* actions into the
-            hard label.
-        invalid: Optional ``[N, A]`` bool; ``True`` marks a padded action.
-    """
-    if not 0.0 <= label_smoothing <= 1.0:
-        raise ValueError("label_smoothing must be in [0, 1].")
-    target_actions = _integer_actions(target_actions)
-    if target_actions.ndim != 1:
-        raise ValueError(
-            f"sp_ce target_actions must be 1-D [N], got shape {tuple(target_actions.shape)}."
-        )
-    if logits.ndim != 2:
-        raise ValueError(
-            f"sp_ce logits must be 2-D [N, A], got shape {tuple(logits.shape)}."
-        )
-    if target_actions.shape[0] != logits.shape[0]:
-        raise ValueError(
-            f"sp_ce row count mismatch: target_actions {target_actions.shape[0]} "
-            f"vs logits {logits.shape[0]}."
-        )
-    if invalid is not None:
-        if invalid.shape != logits.shape:
-            raise ValueError(
-                f"sp_ce invalid shape {tuple(invalid.shape)} must match "
-                f"logits {tuple(logits.shape)}."
-            )
-        if invalid.dtype != torch.bool:
-            raise TypeError(
-                f"sp_ce invalid must be bool, got {invalid.dtype}."
-            )
-        if bool(invalid.gather(dim=-1, index=target_actions.unsqueeze(-1)).any()):
-            raise ValueError("sp_ce target labels must not select an invalid action.")
-    if invalid is None:
-        log_probs = F.log_softmax(logits, dim=-1)
-        nll = -log_probs.gather(dim=-1, index=target_actions.unsqueeze(-1)).squeeze(-1)
-        if label_smoothing > 0.0:
-            smooth = -log_probs.mean(dim=-1)
-            nll = (1.0 - label_smoothing) * nll + label_smoothing * smooth
-        return nll.mean()
-    log_probs = F.log_softmax(logits.masked_fill(invalid, -torch.inf), dim=-1)
-    nll = -log_probs.gather(dim=-1, index=target_actions.unsqueeze(-1)).squeeze(-1)
-    if label_smoothing > 0.0:
-        valid = (~invalid).to(dtype=log_probs.dtype)
-        num_valid = valid.sum(dim=-1).clamp(min=1.0)
-        smooth = -log_probs.masked_fill(invalid, 0).sum(dim=-1) / num_valid
-        nll = (1.0 - label_smoothing) * nll + label_smoothing * smooth
-    return nll.mean()
 
 
 def _sp_kl(
@@ -121,7 +48,13 @@ def _sp_kl(
     # A nonfinite Q value denotes an unavailable action, not probability mass.
     # Mask before scaling so +inf and NaN do not enter the softmax.
     max_q = q.masked_fill(~valid, -torch.inf).max(dim=-1, keepdim=True).values
-    oracle_logits = ((q - max_q) / oracle_temperature).masked_fill(~valid, -torch.inf)
+    if oracle_temperature == 0.0:
+        # The T -> 0 limit is uniform over finite maximizers. Construct it
+        # directly so neither 0/0 nor gradients through a division occur.
+        maxima = valid & (q == max_q)
+        oracle_logits = torch.zeros_like(q).masked_fill(~maxima, -torch.inf)
+    else:
+        oracle_logits = ((q - max_q) / oracle_temperature).masked_fill(~valid, -torch.inf)
     student_logits = logits.to(dtype=compute_dtype).masked_fill(~valid, -torch.inf)
     oracle_log_probs = F.log_softmax(oracle_logits, dim=-1)
     student_log_probs = F.log_softmax(student_logits, dim=-1)
@@ -168,19 +101,18 @@ class SpObjective(Objective[...]):
     By default, reads action logits ``[..., A]`` and returns a scalar.
     With ``batched_heads=True``, reads independent heads ``[P, K, A]``
     and returns one loss and metric per head, shaped ``[K]``;
-    callers choose how to reduce across heads. With ``loss_type="ce"``
-    (the default), targets are integer actions matching the leading
-    dimensions. In batched mode, ``[P]`` labels are shared by all heads
-    and ``[P, K]`` labels are per head. Filter Q* outside with
-    ``best_action`` (uniform among tied maxima) and pass those ids, or pass
-    dataset / behavior actions. With either KL loss, ``targets`` are oracle
-    Q values shaped like the logits. In batched mode, ``[P, A]`` values
-    are shared by all heads and ``[P, K, A]`` values are per head.
-    Finite Q entries are softmaxed at ``oracle_temperature`` inside the
-    loss; nonfinite entries (including
-    ``-inf`` padding) are excluded from both oracle and student policies.
-    All-zero Q rows produce uniform oracle policies. Callers pass the tensor
-    at call time; there is no ``targets_key`` batch lookup.
+    callers choose how to reduce across heads. Targets are floating-point
+    oracle Q values shaped like the logits. In batched mode, ``[P, A]``
+    values are shared by all heads and ``[P, K, A]`` values are per head.
+    Nonfinite Q entries are unavailable actions, excluded from both policies.
+
+    Positive oracle temperatures produce ``softmax(Q / temperature)``.
+    At zero, the oracle is uniform over finite Q maxima. Forward KL then
+    equals NLL for a unique best action. With k tied maxima, it equals
+    the mean NLL over those actions minus log(k), with the same gradients
+    as randomly tie-broken NLL in expectation. All-equal Q rows are uniform.
+    Reverse KL requires positive temperature because a hard oracle target
+    gives infinite divergence for student mass on nonoptimal actions.
 
     Rows where ``mask_key`` is True or any nonzero number are dropped. The
     mask follows the leading dimensions by default. In batched mode,
@@ -191,13 +123,10 @@ class SpObjective(Objective[...]):
     ``truncated`` when the wrapped env's episode is the rollout unit).
 
     Args:
-        loss_type: ``"ce"`` for hard-label cross entropy,
-            ``"forward_kl"`` for KL(oracle || student), or
+        loss_type: ``"forward_kl"`` for KL(oracle || student), or
             ``"reverse_kl"`` for KL(student || oracle).
-        label_smoothing: For CE only, mixes uniform mass over all action
-            slots into the hard label.
-        oracle_temperature: Positive temperature for softmaxing oracle Q
-            values in KL modes. Smaller values emphasize high-Q actions.
+        oracle_temperature: Finite, nonnegative oracle temperature; zero
+            is supported only for forward KL. Defaults to zero.
         batched_heads: Treat ``[P, K, A]`` as independent heads and return
             one loss per head. Defaults to the original scalar reduction.
         mask_key: Key in ``objective_data`` for a per-row skip mask (bool True
@@ -207,27 +136,23 @@ class SpObjective(Objective[...]):
     def __init__(
         self,
         *,
-        loss_type: Literal["ce", "forward_kl", "reverse_kl"] = "ce",
-        label_smoothing: float = 0.0,
-        oracle_temperature: float = 1.0,
+        loss_type: Literal["forward_kl", "reverse_kl"] = "forward_kl",
+        oracle_temperature: float = 0.0,
         batched_heads: bool = False,
         mask_key: str | None,
     ) -> None:
-        if loss_type not in {"ce", "forward_kl", "reverse_kl"}:
+        if loss_type not in {"forward_kl", "reverse_kl"}:
             raise ValueError(
                 f"Invalid SpObjective loss_type: {loss_type!r} "
-                "(expected 'ce', 'forward_kl', or 'reverse_kl')."
+                "(expected 'forward_kl' or 'reverse_kl')."
             )
-        if not 0.0 <= label_smoothing <= 1.0:
-            raise ValueError("label_smoothing must be in [0, 1].")
-        if not math.isfinite(oracle_temperature) or oracle_temperature <= 0.0:
-            raise ValueError("oracle_temperature must be finite and positive.")
-        if loss_type != "ce" and label_smoothing != 0.0:
-            raise ValueError("label_smoothing is supported only with loss_type='ce'.")
-        self.loss_type: Literal["ce", "forward_kl", "reverse_kl"] = cast(
-            Literal["ce", "forward_kl", "reverse_kl"], loss_type
+        if not math.isfinite(oracle_temperature) or oracle_temperature < 0.0:
+            raise ValueError("oracle_temperature must be finite and nonnegative.")
+        if loss_type == "reverse_kl" and oracle_temperature == 0.0:
+            raise ValueError("reverse_kl requires oracle_temperature > 0.")
+        self.loss_type: Literal["forward_kl", "reverse_kl"] = cast(
+            Literal["forward_kl", "reverse_kl"], loss_type
         )
-        self.label_smoothing = label_smoothing
         self.oracle_temperature = oracle_temperature
         self.batched_heads = batched_heads
         self.mask_key = mask_key
@@ -301,61 +226,27 @@ class SpObjective(Objective[...]):
             )
         active = valid_rows.reshape(-1)
         logits_active = logits_heads.reshape(-1, A)[active]
-        if self.loss_type == "ce":
-            if not batched:
-                leading = logits.shape[:-1]
-                if target_tensor.shape != leading and target_tensor.shape != (*leading, 1):
-                    raise ValueError(
-                        "SpObjective: CE targets must have shape "
-                        f"{tuple(leading)} or {(*leading, 1)}, got {tuple(target_tensor.shape)}."
-                    )
-                target_actions = target_tensor.reshape(P, 1)
-            elif target_tensor.shape == (P,):
-                target_actions = target_tensor[:, None].expand(P, K)
-            elif target_tensor.shape == (P, K):
-                target_actions = target_tensor
-            elif target_tensor.shape == (P, K, 1):
-                target_actions = target_tensor.squeeze(-1)
-            else:
-                raise ValueError(
-                    "SpObjective: CE targets must have shape [P] or [P, K] "
-                    f"(optionally with trailing singleton), got {tuple(target_tensor.shape)}."
-                )
-            target_actions = _integer_actions(target_actions).reshape(-1)[active]
-            if bool(((target_actions < 0) | (target_actions >= A)).any()):
-                raise ValueError(
-                    f"SpObjective: targets action ids must be in "
-                    f"[0, {A}), got min={int(target_actions.min())} "
-                    f"max={int(target_actions.max())}."
-                )
-            per_row = F.cross_entropy(
-                logits_active,
-                target_actions,
-                label_smoothing=self.label_smoothing,
-                reduction="none",
-            )
+        if not batched and target_tensor.shape == logits.shape:
+            q_targets = target_tensor.reshape(P, 1, A)
+        elif target_tensor.shape == (P, A) and batched:
+            q_targets = target_tensor[:, None, :].expand(P, K, A)
+        elif target_tensor.shape == logits.shape and batched:
+            q_targets = target_tensor
         else:
-            if not batched and target_tensor.shape == logits.shape:
-                q_targets = target_tensor.reshape(P, 1, A)
-            elif target_tensor.shape == (P, A) and batched:
-                q_targets = target_tensor[:, None, :].expand(P, K, A)
-            elif target_tensor.shape == logits.shape and batched:
-                q_targets = target_tensor
-            else:
-                raise ValueError(
-                    "SpObjective: KL targets must have the same shape as predictions "
-                    "or shared shape [P, A], "
-                    f"got {tuple(target_tensor.shape)}."
-                )
-            if not target_tensor.is_floating_point():
-                raise TypeError("SpObjective: KL targets must contain floating-point Q values.")
-            q_active = q_targets.reshape(-1, A)[active]
-            per_row = _sp_kl(
-                q_targets=q_active,
-                logits=logits_active,
-                loss_type=self.loss_type,
-                oracle_temperature=self.oracle_temperature,
+            raise ValueError(
+                "SpObjective: KL targets must have the same shape as predictions "
+                "or shared shape [P, A], "
+                f"got {tuple(target_tensor.shape)}."
             )
+        if not target_tensor.is_floating_point():
+            raise TypeError("SpObjective: KL targets must contain floating-point Q values.")
+        q_active = q_targets.reshape(-1, A)[active]
+        per_row = _sp_kl(
+            q_targets=q_active,
+            logits=logits_active,
+            loss_type=self.loss_type,
+            oracle_temperature=self.oracle_temperature,
+        )
         head_index = torch.arange(K, device=logits.device).expand(P, K).reshape(-1)[active]
         loss_by_head = per_row.new_zeros(K).scatter_add(0, head_index, per_row)
         loss_by_head = loss_by_head / valid_rows.sum(dim=0).to(per_row.dtype)
