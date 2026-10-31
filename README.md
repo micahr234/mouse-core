@@ -48,7 +48,7 @@ MOUSE is in early development; APIs may change.
 Losses and detached metrics use the key `"supervised"`.
 
 The KL modes accept floating-point oracle Q vectors through `targets=`. Positive
-`oracle_temperature` values use `softmax(Q / temperature)` as the oracle policy.
+`target_temperature` values use `softmax(Q / temperature)` as the oracle policy.
 The default temperature is zero: forward KL targets the uniform distribution
 on finite Q maxima, without dividing by zero. A unique maximum gives exactly
 negative log likelihood; k tied maxima give their mean NLL minus log(k), with
@@ -57,7 +57,7 @@ Nonfinite Q entries are unavailable actions and are excluded from both policies.
 Reverse KL requires positive temperature because student probability on an
 action outside a hard target's support gives infinite divergence.
 
-MSE, MAE, and CE require explicit `oracle_temperature=None`; numeric values are
+MSE, MAE, and CE require explicit `target_temperature=None`; numeric values are
 rejected because oracle temperature is unused.
 
 MSE and MAE regress raw predictions onto Q-vector `targets=`, ignoring nonfinite
@@ -71,7 +71,7 @@ probability targets and never selects labels by taking an argmax:
 ```python
 from mouse_core.objectives import SupervisedObjective
 
-objective = SupervisedObjective(loss_type="ce", oracle_temperature=None, mask_key="skip")
+objective = SupervisedObjective(loss_type="ce", target_temperature=None, mask_key="skip")
 losses, metrics = objective(
     objective_data={"skip": skip_rows},
     predictions=action_logits,

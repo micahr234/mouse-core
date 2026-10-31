@@ -78,8 +78,8 @@ _CASES: list[tuple[Objective[...], dict[str, object], tuple[str, ...]]] = [
         ("group_id",),
     ),
     (SupervisedObjective(mask_key=None), {"targets": torch.zeros(2, 2)}, ("targets",)),
-    (SupervisedObjective(loss_type="mse", oracle_temperature=None), {"targets": torch.zeros(2, 2)}, ("targets",)),
-    (SupervisedObjective(loss_type="ce", oracle_temperature=None), {"actions": torch.zeros(2, dtype=torch.int64)}, ("actions",)),
+    (SupervisedObjective(loss_type="mse", target_temperature=None), {"targets": torch.zeros(2, 2)}, ("targets",)),
+    (SupervisedObjective(loss_type="ce", target_temperature=None), {"actions": torch.zeros(2, dtype=torch.int64)}, ("actions",)),
 ]
 
 

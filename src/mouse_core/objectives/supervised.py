@@ -32,7 +32,7 @@ def _policy_kl(
     logits: torch.Tensor,
     *,
     loss_type: Literal["forward_kl", "reverse_kl"],
-    oracle_temperature: float,
+    target_temperature: float,
 ) -> torch.Tensor:
     """Per-row KL between softmaxed finite oracle Q values and student logits."""
     compute_dtype = torch.promote_types(
@@ -48,13 +48,13 @@ def _policy_kl(
     # A nonfinite Q value denotes an unavailable action, not probability mass.
     # Mask before scaling so +inf and NaN do not enter the softmax.
     max_q = q.masked_fill(~valid, -torch.inf).max(dim=-1, keepdim=True).values
-    if oracle_temperature == 0.0:
+    if target_temperature == 0.0:
         # The T -> 0 limit is uniform over finite maximizers. Construct it
         # directly so neither 0/0 nor gradients through a division occur.
         maxima = valid & (q == max_q)
         oracle_logits = torch.zeros_like(q).masked_fill(~maxima, -torch.inf)
     else:
-        oracle_logits = ((q - max_q) / oracle_temperature).masked_fill(~valid, -torch.inf)
+        oracle_logits = ((q - max_q) / target_temperature).masked_fill(~valid, -torch.inf)
     student_logits = logits.to(dtype=compute_dtype).masked_fill(~valid, -torch.inf)
     oracle_log_probs = F.log_softmax(oracle_logits, dim=-1)
     student_log_probs = F.log_softmax(student_logits, dim=-1)
@@ -100,7 +100,7 @@ class SupervisedObjective(Objective[...]):
 
     ``forward_kl`` and ``reverse_kl`` read floating-point oracle Q-vector
     ``targets``. Finite Q entries define the available actions. Positive
-    ``oracle_temperature`` softmaxes Q; zero gives a uniform distribution over
+    ``target_temperature`` softmaxes Q; zero gives a uniform distribution over
     finite maxima and is allowed only for forward KL.
 
     ``mse`` and ``mae`` regress raw predictions onto Q-vector ``targets``.
@@ -108,7 +108,7 @@ class SupervisedObjective(Objective[...]):
     loss averages all finite entries. With row weights, each row first averages
     its finite entries, then participates in the weighted row mean.
 
-    MSE, MAE, and CE require ``oracle_temperature=None`` because it is unused.
+    MSE, MAE, and CE require ``target_temperature=None`` because it is unused.
 
     ``ce`` requires integer ``actions`` identifying the actual target action at
     each prediction position. It never derives labels from Q values or accepts
@@ -133,7 +133,7 @@ class SupervisedObjective(Objective[...]):
         self,
         *,
         loss_type: Literal["forward_kl", "reverse_kl", "mse", "mae", "ce"] = "forward_kl",
-        oracle_temperature: float | None = 0.0,
+        target_temperature: float | None = 0.0,
         batched_heads: bool = False,
         mask_key: str | None = None,
         weight_key: str | None = None,
@@ -141,16 +141,16 @@ class SupervisedObjective(Objective[...]):
         if loss_type not in {"forward_kl", "reverse_kl", "mse", "mae", "ce"}:
             raise ValueError(f"Invalid SupervisedObjective loss_type: {loss_type!r}.")
         if loss_type in {"mse", "mae", "ce"}:
-            if oracle_temperature is not None:
-                raise ValueError(f"{loss_type} requires oracle_temperature=None (unused).")
-        elif (oracle_temperature is None or isinstance(oracle_temperature, bool)
-              or not isinstance(oracle_temperature, (int, float))
-              or not math.isfinite(oracle_temperature) or oracle_temperature < 0):
-            raise ValueError("oracle_temperature must be numeric, finite and nonnegative for KL.")
-        if loss_type == "reverse_kl" and oracle_temperature == 0:
-            raise ValueError("reverse_kl requires oracle_temperature > 0.")
+            if target_temperature is not None:
+                raise ValueError(f"{loss_type} requires target_temperature=None (unused).")
+        elif (target_temperature is None or isinstance(target_temperature, bool)
+              or not isinstance(target_temperature, (int, float))
+              or not math.isfinite(target_temperature) or target_temperature < 0):
+            raise ValueError("target_temperature must be numeric, finite and nonnegative for KL.")
+        if loss_type == "reverse_kl" and target_temperature == 0:
+            raise ValueError("reverse_kl requires target_temperature > 0.")
         self.loss_type = loss_type
-        self.oracle_temperature = oracle_temperature
+        self.target_temperature = target_temperature
         self.batched_heads = batched_heads
         self.mask_key = mask_key
         self.weight_key = weight_key
@@ -235,10 +235,10 @@ class SupervisedObjective(Objective[...]):
             assert q_targets is not None
             target_rows = q_targets.reshape(-1, A)[active]
             if self.loss_type in ("forward_kl", "reverse_kl"):
-                assert self.oracle_temperature is not None
+                assert self.target_temperature is not None
                 per_row = _policy_kl(
                     target_rows, predicted, loss_type=self.loss_type,
-                    oracle_temperature=self.oracle_temperature,
+                    target_temperature=self.target_temperature,
                 )
             else:
                 dtype = torch.promote_types(dtype, target_rows.dtype)

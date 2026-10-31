@@ -59,7 +59,7 @@ def test_supervised_policy_objective_kl_softmaxes_q_targets_at_temperature(
     logits = torch.tensor([[[1.0, -0.5]]], requires_grad=True)
     temperature = 0.5
     loss, metrics = SupervisedObjective(
-        loss_type=loss_type, oracle_temperature=temperature, mask_key=None
+        loss_type=loss_type, target_temperature=temperature, mask_key=None
     )(objective_data={}, predictions=logits, targets=q)
 
     oracle = torch.softmax(q[0, 0] / temperature, dim=-1)
@@ -78,10 +78,10 @@ def test_supervised_policy_objective_kl_softmaxes_q_targets_at_temperature(
 def test_supervised_policy_objective_kl_directions_are_distinct() -> None:
     q = torch.tensor([[0.0, 2.0]])
     logits = torch.tensor([[3.0, -1.0]])
-    forward, _ = SupervisedObjective(loss_type="forward_kl", oracle_temperature=1.0, mask_key=None)(
+    forward, _ = SupervisedObjective(loss_type="forward_kl", target_temperature=1.0, mask_key=None)(
         objective_data={}, predictions=logits, targets=q
     )
-    reverse, _ = SupervisedObjective(loss_type="reverse_kl", oracle_temperature=1.0, mask_key=None)(
+    reverse, _ = SupervisedObjective(loss_type="reverse_kl", target_temperature=1.0, mask_key=None)(
         objective_data={}, predictions=logits, targets=q
     )
     assert not torch.allclose(forward["supervised"], reverse["supervised"])
@@ -93,10 +93,10 @@ def test_supervised_policy_objective_kl_excludes_nonfinite_q_actions(
 ) -> None:
     q = torch.tensor([[0.0, 1.0, -torch.inf, torch.nan, torch.inf]])
     logits = torch.tensor([[0.2, -0.4, 100.0, 100.0, 100.0]], requires_grad=True)
-    loss, _ = SupervisedObjective(loss_type=loss_type, oracle_temperature=1.0, mask_key=None)(
+    loss, _ = SupervisedObjective(loss_type=loss_type, target_temperature=1.0, mask_key=None)(
         objective_data={}, predictions=logits, targets=q
     )
-    expected, _ = SupervisedObjective(loss_type=loss_type, oracle_temperature=1.0, mask_key=None)(
+    expected, _ = SupervisedObjective(loss_type=loss_type, target_temperature=1.0, mask_key=None)(
         objective_data={}, predictions=logits[:, :2], targets=q[:, :2]
     )
     torch.testing.assert_close(loss["supervised"], expected["supervised"])
@@ -111,7 +111,7 @@ def test_supervised_policy_objective_kl_all_zero_q_is_uniform(
 ) -> None:
     q = torch.zeros(1, 3)
     logits = torch.tensor([[0.0, 1.0, 2.0]], requires_grad=True)
-    loss, _ = SupervisedObjective(loss_type=loss_type, oracle_temperature=1.0, mask_key=None)(
+    loss, _ = SupervisedObjective(loss_type=loss_type, target_temperature=1.0, mask_key=None)(
         objective_data={}, predictions=logits, targets=q
     )
     student = torch.softmax(logits[0], dim=-1)
@@ -129,7 +129,7 @@ def test_supervised_policy_objective_kl_all_zero_q_is_uniform(
 def test_supervised_policy_objective_kl_skips_masked_rows_before_validating_q() -> None:
     q = torch.tensor([[[-torch.inf, torch.nan], [0.0, 1.0]]])
     logits = torch.tensor([[[100.0, -100.0], [0.0, 1.0]]])
-    loss, _ = SupervisedObjective(loss_type="forward_kl", oracle_temperature=1.0, mask_key="episode_ended")(
+    loss, _ = SupervisedObjective(loss_type="forward_kl", target_temperature=1.0, mask_key="episode_ended")(
         objective_data={"episode_ended": torch.tensor([[1, 0]])},
         predictions=logits,
         targets=q,
@@ -142,7 +142,7 @@ def test_supervised_policy_objective_kl_rejects_unmasked_row_without_finite_q(
     loss_type: Literal["forward_kl", "reverse_kl"],
 ) -> None:
     with pytest.raises(ValueError, match="finite Q value"):
-        SupervisedObjective(loss_type=loss_type, oracle_temperature=1.0, mask_key=None)(
+        SupervisedObjective(loss_type=loss_type, target_temperature=1.0, mask_key=None)(
             objective_data={},
             predictions=torch.tensor([[0.0, 1.0]]),
             targets=torch.tensor([[-torch.inf, torch.nan]]),
@@ -150,7 +150,7 @@ def test_supervised_policy_objective_kl_rejects_unmasked_row_without_finite_q(
 
 
 def test_supervised_policy_objective_kl_rejects_action_ids_and_wrong_shape() -> None:
-    objective = SupervisedObjective(loss_type="forward_kl", oracle_temperature=1.0, mask_key=None)
+    objective = SupervisedObjective(loss_type="forward_kl", target_temperature=1.0, mask_key=None)
     logits = torch.tensor([[0.0, 1.0]])
     with pytest.raises(ValueError, match="same shape"):
         objective(objective_data={}, predictions=logits, targets=torch.tensor([1]))
@@ -159,9 +159,9 @@ def test_supervised_policy_objective_kl_rejects_action_ids_and_wrong_shape() -> 
 
 
 @pytest.mark.parametrize("temperature", [-1.0, torch.nan, torch.inf])
-def test_supervised_policy_objective_rejects_invalid_oracle_temperature(temperature: float) -> None:
-    with pytest.raises(ValueError, match="oracle_temperature"):
-        SupervisedObjective(loss_type="forward_kl", oracle_temperature=temperature, mask_key=None)
+def test_supervised_policy_objective_rejects_invalid_target_temperature(temperature: float) -> None:
+    with pytest.raises(ValueError, match="target_temperature"):
+        SupervisedObjective(loss_type="forward_kl", target_temperature=temperature, mask_key=None)
 
 
 @pytest.mark.parametrize("loss_type", ["ce-soft", "not_a_loss"])
@@ -253,11 +253,11 @@ def test_supervised_policy_kl_batched_heads_match_independent_calls(
         q[:, 1, 1] -= 0.8
         q[1, 0] = torch.tensor([-torch.inf, torch.nan, -torch.inf, -torch.inf])
     batched_objective = SupervisedObjective(
-        loss_type=loss_type, oracle_temperature=0.65, mask_key="skip",
+        loss_type=loss_type, target_temperature=0.65, mask_key="skip",
         batched_heads=True,
     )
     single_objective = SupervisedObjective(
-        loss_type=loss_type, oracle_temperature=0.65, mask_key="skip",
+        loss_type=loss_type, target_temperature=0.65, mask_key="skip",
     )
     losses, metrics = batched_objective(
         objective_data={"skip": mask}, predictions=logits, targets=q,
@@ -321,7 +321,7 @@ def test_zero_temperature_matches_nll_loss_and_gradients(dtype) -> None:
     q = torch.tensor([[0.93, 0.94, 0.0], [-2.0, -3.0, -1.0]], requires_grad=True)
     logits = torch.tensor([[0.2, -0.4, 1.1], [100.0, 0.0, -100.0]],
                           dtype=dtype, requires_grad=True)
-    losses, _ = SupervisedObjective(oracle_temperature=0.0, mask_key=None)(
+    losses, _ = SupervisedObjective(target_temperature=0.0, mask_key=None)(
         objective_data={}, predictions=logits, targets=q,
     )
     expected = torch.nn.functional.cross_entropy(
@@ -373,7 +373,7 @@ def test_zero_temperature_masks_missing_rows_and_unavailable_actions() -> None:
 def test_forward_kl_small_temperature_converges_to_zero_temperature() -> None:
     q = torch.tensor([[1.0, 1.0, 0.99], [0.99, 1.0, 0.0]])
     logits = torch.tensor([[0.2, -0.4, 1.1], [0.3, 0.6, -0.2]], requires_grad=True)
-    losses = [SupervisedObjective(oracle_temperature=t, mask_key=None)(
+    losses = [SupervisedObjective(target_temperature=t, mask_key=None)(
         objective_data={}, predictions=logits, targets=q,
     )[0]["supervised"] for t in (0.0, 0.0001)]
     torch.testing.assert_close(losses[0], losses[1])
@@ -382,19 +382,19 @@ def test_forward_kl_small_temperature_converges_to_zero_temperature() -> None:
 
 
 def test_reverse_kl_rejects_zero_temperature_before_execution() -> None:
-    with pytest.raises(ValueError, match="reverse_kl requires oracle_temperature > 0"):
-        SupervisedObjective(loss_type="reverse_kl", oracle_temperature=0.0, mask_key=None)
+    with pytest.raises(ValueError, match="reverse_kl requires target_temperature > 0"):
+        SupervisedObjective(loss_type="reverse_kl", target_temperature=0.0, mask_key=None)
 
 
 @pytest.mark.parametrize("loss_type", ["mse", "mae", "ce"])
 @pytest.mark.parametrize("temperature", [0.0, 0.5, -1.0, float("nan"), float("inf"), True])
-def test_inactive_oracle_temperature_must_be_none(loss_type, temperature):
-    with pytest.raises(ValueError, match="requires oracle_temperature=None"):
-        SupervisedObjective(loss_type=loss_type, oracle_temperature=temperature)
+def test_inactive_target_temperature_must_be_none(loss_type, temperature):
+    with pytest.raises(ValueError, match="requires target_temperature=None"):
+        SupervisedObjective(loss_type=loss_type, target_temperature=temperature)
 
 
 @pytest.mark.parametrize("loss_type", ["forward_kl", "reverse_kl"])
 @pytest.mark.parametrize("temperature", [None, True, "none"])
-def test_kl_requires_numeric_oracle_temperature(loss_type, temperature):
-    with pytest.raises(ValueError, match="oracle_temperature"):
-        SupervisedObjective(loss_type=loss_type, oracle_temperature=temperature)
+def test_kl_requires_numeric_target_temperature(loss_type, temperature):
+    with pytest.raises(ValueError, match="target_temperature"):
+        SupervisedObjective(loss_type=loss_type, target_temperature=temperature)
