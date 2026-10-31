@@ -384,3 +384,17 @@ def test_forward_kl_small_temperature_converges_to_zero_temperature() -> None:
 def test_reverse_kl_rejects_zero_temperature_before_execution() -> None:
     with pytest.raises(ValueError, match="reverse_kl requires oracle_temperature > 0"):
         SupervisedObjective(loss_type="reverse_kl", oracle_temperature=0.0, mask_key=None)
+
+
+@pytest.mark.parametrize("loss_type", ["mse", "mae", "ce"])
+@pytest.mark.parametrize("temperature", [0.0, 0.5, -1.0, float("nan"), float("inf"), True])
+def test_inactive_oracle_temperature_must_be_none(loss_type, temperature):
+    with pytest.raises(ValueError, match="requires oracle_temperature=None"):
+        SupervisedObjective(loss_type=loss_type, oracle_temperature=temperature)
+
+
+@pytest.mark.parametrize("loss_type", ["forward_kl", "reverse_kl"])
+@pytest.mark.parametrize("temperature", [None, True, "none"])
+def test_kl_requires_numeric_oracle_temperature(loss_type, temperature):
+    with pytest.raises(ValueError, match="oracle_temperature"):
+        SupervisedObjective(loss_type=loss_type, oracle_temperature=temperature)

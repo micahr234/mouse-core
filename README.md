@@ -57,6 +57,9 @@ Nonfinite Q entries are unavailable actions and are excluded from both policies.
 Reverse KL requires positive temperature because student probability on an
 action outside a hard target's support gives infinite divergence.
 
+MSE, MAE, and CE require explicit `oracle_temperature=None`; numeric values are
+rejected because oracle temperature is unused.
+
 MSE and MAE regress raw predictions onto Q-vector `targets=`, ignoring nonfinite
 entries. Without row weights they average finite entries; with weights they
 average each row's finite entries before taking the weighted row mean.
@@ -68,7 +71,7 @@ probability targets and never selects labels by taking an argmax:
 ```python
 from mouse_core.objectives import SupervisedObjective
 
-objective = SupervisedObjective(loss_type="ce", mask_key="skip")
+objective = SupervisedObjective(loss_type="ce", oracle_temperature=None, mask_key="skip")
 losses, metrics = objective(
     objective_data={"skip": skip_rows},
     predictions=action_logits,

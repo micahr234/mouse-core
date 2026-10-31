@@ -108,6 +108,8 @@ class SupervisedObjective(Objective[...]):
     loss averages all finite entries. With row weights, each row first averages
     its finite entries, then participates in the weighted row mean.
 
+    MSE, MAE, and CE require ``oracle_temperature=None`` because it is unused.
+
     ``ce`` requires integer ``actions`` identifying the actual target action at
     each prediction position. It never derives labels from Q values or accepts
     probability targets. The caller aligns actions to predictions; there is no
@@ -131,15 +133,20 @@ class SupervisedObjective(Objective[...]):
         self,
         *,
         loss_type: Literal["forward_kl", "reverse_kl", "mse", "mae", "ce"] = "forward_kl",
-        oracle_temperature: float = 0.0,
+        oracle_temperature: float | None = 0.0,
         batched_heads: bool = False,
         mask_key: str | None = None,
         weight_key: str | None = None,
     ) -> None:
         if loss_type not in {"forward_kl", "reverse_kl", "mse", "mae", "ce"}:
             raise ValueError(f"Invalid SupervisedObjective loss_type: {loss_type!r}.")
-        if not math.isfinite(oracle_temperature) or oracle_temperature < 0:
-            raise ValueError("oracle_temperature must be finite and nonnegative.")
+        if loss_type in {"mse", "mae", "ce"}:
+            if oracle_temperature is not None:
+                raise ValueError(f"{loss_type} requires oracle_temperature=None (unused).")
+        elif (oracle_temperature is None or isinstance(oracle_temperature, bool)
+              or not isinstance(oracle_temperature, (int, float))
+              or not math.isfinite(oracle_temperature) or oracle_temperature < 0):
+            raise ValueError("oracle_temperature must be numeric, finite and nonnegative for KL.")
         if loss_type == "reverse_kl" and oracle_temperature == 0:
             raise ValueError("reverse_kl requires oracle_temperature > 0.")
         self.loss_type = loss_type
@@ -228,6 +235,7 @@ class SupervisedObjective(Objective[...]):
             assert q_targets is not None
             target_rows = q_targets.reshape(-1, A)[active]
             if self.loss_type in ("forward_kl", "reverse_kl"):
+                assert self.oracle_temperature is not None
                 per_row = _policy_kl(
                     target_rows, predicted, loss_type=self.loss_type,
                     oracle_temperature=self.oracle_temperature,

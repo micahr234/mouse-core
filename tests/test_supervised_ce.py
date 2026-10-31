@@ -13,7 +13,7 @@ from mouse_core.objectives import SupervisedObjective
 def test_ce_matches_action_nll_and_gradients(dtype):
     logits = torch.tensor([[3., -1., 0.], [-2., 4., 1.]], dtype=dtype, requires_grad=True)
     actions = torch.tensor([1, 0], dtype=torch.int32)
-    losses, metrics = SupervisedObjective(loss_type="ce")(
+    losses, metrics = SupervisedObjective(loss_type="ce", oracle_temperature=None)(
         objective_data={}, predictions=logits, actions=actions,
     )
     expected = F.cross_entropy(logits.to(torch.promote_types(dtype, torch.float32)), actions.long())
@@ -26,7 +26,7 @@ def test_ce_matches_action_nll_and_gradients(dtype):
 
 def test_ce_skips_invalid_action_placeholders_and_padded_logits():
     logits = torch.tensor([[1., 2., -torch.inf], [torch.nan] * 3], requires_grad=True)
-    losses, _ = SupervisedObjective(loss_type="ce", mask_key="skip")(
+    losses, _ = SupervisedObjective(loss_type="ce", oracle_temperature=None, mask_key="skip")(
         objective_data={"skip": torch.tensor([0, 2])},
         predictions=logits, actions=torch.tensor([0, -99]),
     )
@@ -47,13 +47,13 @@ def test_ce_skips_invalid_action_placeholders_and_padded_logits():
 ])
 def test_ce_rejects_non_action_targets(actions, error, match):
     with pytest.raises(error, match=match):
-        SupervisedObjective(loss_type="ce")(
+        SupervisedObjective(loss_type="ce", oracle_temperature=None)(
             objective_data={}, predictions=torch.zeros(2, 2), actions=actions,
         )
 
 
 def test_ce_requires_actions_and_rejects_q_targets():
-    objective = SupervisedObjective(loss_type="ce")
+    objective = SupervisedObjective(loss_type="ce", oracle_temperature=None)
     with pytest.raises(TypeError, match="actions"):
         objective(objective_data={}, predictions=torch.zeros(2, 2))
     with pytest.raises(TypeError, match="unexpected keyword argument 'targets'"):
@@ -72,7 +72,7 @@ def test_ce_batched_heads_match_independent_calls(shared_actions, shared_weights
                          [False, False, False], [True, False, False]])
     weights = torch.rand(4) if shared_weights else torch.rand(4, 3)
     weights.requires_grad_()
-    losses, _ = SupervisedObjective(loss_type="ce", batched_heads=True, mask_key="skip", weight_key="w")(
+    losses, _ = SupervisedObjective(loss_type="ce", oracle_temperature=None, batched_heads=True, mask_key="skip", weight_key="w")(
         objective_data={"skip": mask, "w": weights}, predictions=logits, actions=actions,
     )
     expected = []
@@ -99,7 +99,7 @@ def test_regression_weights_average_finite_entries_per_row(
     targets = torch.tensor([[0., 1.], [2., -torch.inf], [7., 8.]], requires_grad=True)
     predictions = logits[:, None, :].expand(3, 2, 2) if batched else logits
     weights = torch.tensor([1., 3., torch.nan], requires_grad=True)
-    losses, _ = SupervisedObjective(loss_type=loss_type, batched_heads=batched,
+    losses, _ = SupervisedObjective(loss_type=loss_type, oracle_temperature=None, batched_heads=batched,
                                     mask_key="skip", weight_key="w")(
         objective_data={"skip": torch.tensor([False, False, True]), "w": weights},
         predictions=predictions, targets=targets,

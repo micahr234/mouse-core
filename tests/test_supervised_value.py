@@ -11,7 +11,7 @@ from mouse_core.objectives import SupervisedObjective
 @pytest.mark.parametrize(("loss_type", "expected"), [("mse", 2.5), ("mae", 1.5)])
 def test_supervised_value_objective_uses_only_finite_targets(loss_type, expected) -> None:
     predictions = torch.tensor([[[1.0, 3.0, float("nan")]]], requires_grad=True)
-    loss, metrics = SupervisedObjective(loss_type=loss_type)(
+    loss, metrics = SupervisedObjective(loss_type=loss_type, oracle_temperature=None)(
         objective_data={},
         predictions=predictions,
         targets=torch.tensor([[[0.0, 1.0, -torch.inf]]]),
@@ -26,7 +26,7 @@ def test_supervised_value_objective_uses_only_finite_targets(loss_type, expected
 @pytest.mark.parametrize("shape", [(2, 3, 2), (6, 2), (3, 4)])
 def test_supervised_value_objective_rejects_misaligned_targets_with_same_element_count(shape) -> None:
     with pytest.raises(ValueError, match="same shape"):
-        SupervisedObjective(loss_type="mse")(
+        SupervisedObjective(loss_type="mse", oracle_temperature=None)(
             objective_data={},
             predictions=torch.zeros(3, 2, 2),
             targets=torch.zeros(shape),
@@ -36,7 +36,7 @@ def test_supervised_value_objective_rejects_misaligned_targets_with_same_element
 def test_supervised_value_default_three_dimensional_input_keeps_scalar_loss() -> None:
     predictions = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]], requires_grad=True)
     targets = torch.zeros_like(predictions)
-    loss, metrics = SupervisedObjective(loss_type="mse")(objective_data={}, predictions=predictions, targets=targets)
+    loss, metrics = SupervisedObjective(loss_type="mse", oracle_temperature=None)(objective_data={}, predictions=predictions, targets=targets)
     assert loss["supervised"].ndim == 0
     assert isinstance(metrics["supervised"], torch.Tensor)
     loss["supervised"].backward()
@@ -61,8 +61,8 @@ def test_supervised_value_batched_heads_match_independent_calls(
         q[:, 0, 0] += 0.4
         q[:, 1, 1] -= 0.8
         q[2, 2, 1] = torch.nan
-    batched_objective = SupervisedObjective(loss_type=loss_type, batched_heads=True)
-    single_objective = SupervisedObjective(loss_type=loss_type)
+    batched_objective = SupervisedObjective(loss_type=loss_type, oracle_temperature=None, batched_heads=True)
+    single_objective = SupervisedObjective(loss_type=loss_type, oracle_temperature=None)
     losses, metrics = batched_objective(
         objective_data={}, predictions=predictions, targets=q,
     )
@@ -88,7 +88,7 @@ def test_supervised_value_batched_heads_match_independent_calls(
 
 def test_supervised_value_batched_heads_reject_misaligned_targets() -> None:
     with pytest.raises(ValueError, match="same shape"):
-        SupervisedObjective(loss_type="mse", batched_heads=True)(
+        SupervisedObjective(loss_type="mse", oracle_temperature=None, batched_heads=True)(
             objective_data={}, predictions=torch.zeros(2, 3, 4),
             targets=torch.zeros(2, 4, 3),
         )
@@ -98,7 +98,7 @@ def test_supervised_value_batched_heads_reject_head_without_finite_targets() -> 
     targets = torch.zeros(2, 3, 4)
     targets[:, 1] = -torch.inf
     with pytest.raises(ValueError, match="one head"):
-        SupervisedObjective(loss_type="mse", batched_heads=True)(
+        SupervisedObjective(loss_type="mse", oracle_temperature=None, batched_heads=True)(
             objective_data={}, predictions=torch.zeros(2, 3, 4),
             targets=targets,
         )
