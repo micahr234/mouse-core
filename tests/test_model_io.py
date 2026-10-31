@@ -12,7 +12,7 @@ from mouse_core.models import Embedding, load_model, push_model_to_hub, save_mod
 from mouse_core.models.io import _write_model_card
 from mouse_core.models.backbone import IdentityBackbone, LoRAConfig, Backbone
 from mouse_core.data import Tokenizer, load_tokenizer, save_tokenizer, pack_token_batch
-from mouse_core.objectives import SvObjective
+from mouse_core.objectives import SupervisedObjective
 from mouse_core.models.mlp import MLP
 
 def when_repeat_episode_done_nonzero(ctx):
@@ -477,10 +477,10 @@ def test_missing_vector_targets_roundtrip_and_do_not_train_unlabelled_rows(tmp_p
         assert inputs.N == 3
         assert torch.isneginf(labels['q_star'][1]).all()
         predictions = torch.zeros((3, 2), requires_grad=True)
-        losses, _ = SvObjective(loss_type='mse')(
+        losses, _ = SupervisedObjective(loss_type='mse')(
             objective_data=labels, predictions=predictions, targets=labels['q_star'])
-        assert losses['value'].item() == pytest.approx(7.5)
-        losses['value'].backward()
+        assert losses['supervised'].item() == pytest.approx(7.5)
+        losses['supervised'].backward()
         assert predictions.grad is not None
         assert predictions.grad[1].count_nonzero() == 0
         assert predictions.grad[[0, 2]].count_nonzero() == 4

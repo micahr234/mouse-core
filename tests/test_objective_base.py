@@ -14,8 +14,7 @@ from mouse_core.objectives import (
     GrpoObjective,
     Objective,
     PpoObjective,
-    SpObjective,
-    SvObjective,
+    SupervisedObjective,
 )
 
 
@@ -36,7 +35,7 @@ def test_objective_base_is_abstract() -> None:
 
 
 def test_objective_can_preserve_a_specific_keyword_signature() -> None:
-    objective = _ForwardObjective(objective=SpObjective(mask_key=None))
+    objective = _ForwardObjective(objective=SupervisedObjective(mask_key=None))
     result = objective(
         objective_data={},
         predictions=torch.tensor([[0.0, 1.0]], requires_grad=True),
@@ -44,10 +43,10 @@ def test_objective_can_preserve_a_specific_keyword_signature() -> None:
     )
     assert_type(result, _Result)
     losses, metrics = result
-    loss = losses["action"]
+    loss = losses["supervised"]
     assert loss.ndim == 0
     assert loss.requires_grad
-    assert "action" in metrics
+    assert "supervised" in metrics
 
 
 _CASES: list[tuple[Objective[...], dict[str, object], tuple[str, ...]]] = [
@@ -78,8 +77,9 @@ _CASES: list[tuple[Objective[...], dict[str, object], tuple[str, ...]]] = [
         {"group_id": torch.zeros(2, dtype=torch.int64)},
         ("group_id",),
     ),
-    (SpObjective(mask_key=None), {"targets": torch.zeros(2, 2)}, ("targets",)),
-    (SvObjective(), {"targets": torch.zeros(2, 2)}, ("targets",)),
+    (SupervisedObjective(mask_key=None), {"targets": torch.zeros(2, 2)}, ("targets",)),
+    (SupervisedObjective(loss_type="mse"), {"targets": torch.zeros(2, 2)}, ("targets",)),
+    (SupervisedObjective(loss_type="ce"), {"actions": torch.zeros(2, dtype=torch.int64)}, ("actions",)),
 ]
 
 
@@ -114,7 +114,7 @@ def test_objectives_still_reject_unused_prediction_tensors(
         "predictions": torch.zeros(2, 2),
         **extra_inputs,
     }
-    for name in ("backup_value_predictions", "backup_action_predictions", "value_predictions", "targets"):
+    for name in ("backup_value_predictions", "backup_action_predictions", "value_predictions", "targets", "actions"):
         if name not in required:
             with pytest.raises(TypeError, match=f"unexpected keyword argument '{name}'"):
                 objective(**{**inputs, name: torch.zeros(2, 2)})

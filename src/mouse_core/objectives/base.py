@@ -58,8 +58,9 @@ class Objective[**P](ABC):
     Instantiate with hyperparameters; call with ``objective_data=`` and
     the prediction tensor for the head being trained. Objectives that read
     another head also take that tensor: DQN takes ``backup_value_predictions=``
-    and PPO takes ``value_predictions=``. Supervised objectives take
-    ``targets=`` (action ids for SP, Q vectors for SV). DQN, PPO, and GRPO
+    and PPO takes ``value_predictions=``. ``SupervisedObjective`` takes
+    ``actions=`` (integer action IDs for CE) or ``targets=`` (Q vectors for
+    KL, MSE, and MAE). DQN, PPO, and GRPO
     require ``group_id=`` (int64 ``[N]``) beside ``objective_data``.
     The returned loss is a dict of terms. ``DqnObjective`` trains Q
     through ``action_value``.

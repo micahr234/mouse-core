@@ -41,10 +41,13 @@ To run the notebooks, follow the [development setup](CONTRIBUTING.md#development
 
 MOUSE is in early development; APIs may change.
 
-## Oracle-supervised policy loss
+## Supervised policy and value losses
 
-`SpObjective` accepts floating-point oracle Q vectors and supports
-`loss_type="forward_kl"` (the default) or `"reverse_kl"`. Positive
+`SupervisedObjective` combines policy and value supervision. Set `loss_type` to
+`"forward_kl"` (the default), `"reverse_kl"`, `"mse"`, `"mae"`, or `"ce"`.
+Losses and detached metrics use the key `"supervised"`.
+
+The KL modes accept floating-point oracle Q vectors through `targets=`. Positive
 `oracle_temperature` values use `softmax(Q / temperature)` as the oracle policy.
 The default temperature is zero: forward KL targets the uniform distribution
 on finite Q maxima, without dividing by zero. A unique maximum gives exactly
@@ -54,9 +57,32 @@ Nonfinite Q entries are unavailable actions and are excluded from both policies.
 Reverse KL requires positive temperature because student probability on an
 action outside a hard target's support gives infinite divergence.
 
-Pass Q vectors directly; the CE mode, integer action-label targets, `sp_ce`, and
-`label_smoothing` option have been removed. See the
-[supervised policy example](examples/09_train_offline_sp.ipynb).
+MSE and MAE regress raw predictions onto Q-vector `targets=`, ignoring nonfinite
+entries. Without row weights they average finite entries; with weights they
+average each row's finite entries before taking the weighted row mean.
+
+CE takes **actual integer action IDs** through `actions=`, aligned by the caller
+to the corresponding prediction positions. It does not accept Q-vector or
+probability targets and never selects labels by taking an argmax:
+
+```python
+from mouse_core.objectives import SupervisedObjective
+
+objective = SupervisedObjective(loss_type="ce", mask_key="skip")
+losses, metrics = objective(
+    objective_data={"skip": skip_rows},
+    predictions=action_logits,
+    actions=executed_actions,
+)
+loss = losses["supervised"]
+```
+
+All losses support `mask_key` (nonzero skips a row), optional `weight_key`, and
+`batched_heads=True` for `[P, K, A]` predictions with independent `[K]` losses.
+Q targets may be shared `[P, A]` or per head `[P, K, A]`; CE actions may be
+shared `[P]` or per head `[P, K]`. The default `mask_key=None` keeps all rows
+with eligible targets. See the [policy example](examples/09_train_offline_sp.ipynb)
+and [value example](examples/05_train_offline_sv.ipynb).
 
 ## Start with FrozenLake
 

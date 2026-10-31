@@ -19,8 +19,7 @@ from mouse_core.objectives.transforms import (
 )
 from mouse_core.objectives.grpo import GrpoObjective, group_relative_advantages, sampling_mismatch_weights
 from mouse_core.objectives.ppo import PpoObjective, sample_discrete_action
-from mouse_core.objectives.sp import SpObjective, best_action
-from mouse_core.objectives.sv import SvObjective
+from mouse_core.objectives.supervised import SupervisedObjective, best_action
 
 __all__ = [
     "Objective",
@@ -46,7 +45,6 @@ __all__ = [
     "sampling_mismatch_weights",
     "PpoObjective",
     "sample_discrete_action",
-    "SpObjective",
+    "SupervisedObjective",
     "best_action",
-    "SvObjective",
 ]

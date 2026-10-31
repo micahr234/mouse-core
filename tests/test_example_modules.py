@@ -24,7 +24,7 @@ from mouse_core.models import (
     load_model, save_model, sample_reasoning_splits,
 )
 from mouse_core.objectives import (
-    DqnObjective, SvObjective, SpObjective, PpoObjective, GrpoObjective,
+    DqnObjective, SupervisedObjective, PpoObjective, GrpoObjective,
     CosineObjective, best_action, boundary_discount, nstep_gate,
     value_gap_gate, general_gate,
 )
@@ -219,7 +219,7 @@ def test_notebook_training_uses_all_online_modules_and_updates_targets(path):
             # Generic repeat flags are integer columns. They must form a boolean
             # mask, including the reset observation and excluding the terminal.
             assert kwargs['predictions'].shape[0] == 2
-            assert kwargs['targets'].tolist() == [0, 1]
+            torch.testing.assert_close(kwargs['targets'], data['q_star'][:2])
             return supervised_objective(**kwargs)
 
         ns["objective"] = check_active_observations
