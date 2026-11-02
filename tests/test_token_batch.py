@@ -21,8 +21,8 @@ def when_step_index_zero(ctx):
 def _tok(**kwargs) -> Tokenizer:
     return Tokenizer(
         input_fields=[
-            {"type": "text", "input_field": "action", "format": "{field}", "head_output": True},
-            {
+            {"provider": "sensor", "type": "text", "input_field": "action", "format": "{field}", "head_output": True},
+            {"provider": "sensor",
                 "type": "text",
                 "input_field": "repeat_episode_index",
                 "format": "{field}",
@@ -188,8 +188,8 @@ def test_objective_column_stays_int_when_all_steps_are_int() -> None:
 def test_objective_vector_column_promotes_dtype() -> None:
     tok = Tokenizer(
         input_fields=[
-            {"type": "text", "input_field": "action", "format": "{field}", "head_output": True},
-            {
+            {"provider": "sensor", "type": "text", "input_field": "action", "format": "{field}", "head_output": True},
+            {"provider": "sensor",
                 "type": "text",
                 "input_field": "repeat_episode_index",
                 "format": "{field}",
@@ -212,8 +212,8 @@ def test_objective_ragged_float_vectors_pad_with_neg_inf() -> None:
     """Shorter rows are padded with -inf (the nonexistent-action sentinel), not 0."""
     tok = Tokenizer(
         input_fields=[
-            {"type": "text", "input_field": "action", "format": "{field}", "head_output": True},
-            {
+            {"provider": "sensor", "type": "text", "input_field": "action", "format": "{field}", "head_output": True},
+            {"provider": "sensor",
                 "type": "text",
                 "input_field": "repeat_episode_index",
                 "format": "{field}",
@@ -238,8 +238,8 @@ def test_objective_ragged_int_vectors_raise() -> None:
     """Integer columns have no padding sentinel, so ragged shapes are an error."""
     tok = Tokenizer(
         input_fields=[
-            {"type": "text", "input_field": "action", "format": "{field}", "head_output": True},
-            {
+            {"provider": "sensor", "type": "text", "input_field": "action", "format": "{field}", "head_output": True},
+            {"provider": "sensor",
                 "type": "text",
                 "input_field": "repeat_episode_index",
                 "format": "{field}",
@@ -260,8 +260,8 @@ def test_objective_ragged_int_vectors_raise() -> None:
 def test_objective_mixed_rank_raises() -> None:
     tok = Tokenizer(
         input_fields=[
-            {"type": "text", "input_field": "action", "format": "{field}", "head_output": True},
-            {
+            {"provider": "sensor", "type": "text", "input_field": "action", "format": "{field}", "head_output": True},
+            {"provider": "sensor",
                 "type": "text",
                 "input_field": "repeat_episode_index",
                 "format": "{field}",

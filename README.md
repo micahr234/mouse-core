@@ -93,6 +93,7 @@ Follow these three notebooks:
 
 1. [Collect a dataset](examples/01_collect_dataset.ipynb) — record coordinator, agent, and environment events across repeated tasks.
 2. [Train offline DQN](examples/02_train_offline_dqn.ipynb) — tokenize the history, build an encoder and Q head, and train from replay.
+   See [offline DQN with time embeddings](examples/22_train_offline_dqn_time.ipynb) for optional per-field elapsed seconds, irregular event timing, and a local simulated replay.
 3. [Run inference](examples/15_inference.ipynb) — load that checkpoint and evaluate with cached history.
 
 The notebooks keep model construction, precision settings, batching, losses, and checkpoint handling beside the code that uses them.
@@ -143,7 +144,7 @@ an event without the marker continues the current step. The first event needs a
 marker. Readout positions are ordinary input fields marked `head_output=True`.
 The existing `\n` token marks an action request only when its sparse field is present.
 Passive and terminal steps retain their tokens and labels without producing a readout.
-`provider=None` matches any provider; a named provider limits a field to those events.
+Every tokenizer field requires a concrete `provider` name; missing, blank, and `None` providers are rejected.
 Using an existing Hugging Face tokenizer:
 
 ```python
@@ -155,9 +156,9 @@ tokenizer = Tokenizer(
     step_field="step_index",
     episode_field="episode_index",
     input_fields=[
-        {"type": "text", "provider": None, "input_field": "action", "lookup": ["a", "b", "c", "d"], "format": "{field}"},
-        {"type": "text", "provider": None, "input_field": "observation", "format": ",{field}"},
-        {"type": "token", "provider": None, "input_field": "action_requested",
+        {"type": "text", "provider": "agent", "input_field": "action", "lookup": ["a", "b", "c", "d"], "format": "{field}"},
+        {"type": "text", "provider": "environment", "input_field": "observation", "format": ",{field}"},
+        {"type": "token", "provider": "environment", "input_field": "action_requested",
          "format": "\n", "head_output": True},
     ],
 )
@@ -203,11 +204,11 @@ sources = {"text": TEXT_CHECKPOINT, "actions": ACTION_CHECKPOINT}
 tokenizer = Tokenizer(
     tokenizers=sources,
     input_fields=[
-        {"type": "text", "tokenizer": "text", "format": group_prefix, "when": on_group_start},
-        {"type": "text", "tokenizer": "actions", "input_field": "action",
+        {"type": "text", "provider": "environment", "tokenizer": "text", "format": group_prefix, "when": on_group_start},
+        {"type": "text", "provider": "agent", "tokenizer": "actions", "input_field": "action",
          "lookup": ["a", "b", "c", "d"], "format": "{field}"},
-        {"type": "text", "tokenizer": "text", "input_field": "observation", "format": ",{field}"},
-        {"type": "token", "tokenizer": "text", "input_field": "action_requested",
+        {"type": "text", "provider": "environment", "tokenizer": "text", "input_field": "observation", "format": ",{field}"},
+        {"type": "token", "provider": "environment", "tokenizer": "text", "input_field": "action_requested",
          "format": "\n", "head_output": True},
     ],
 )
@@ -259,7 +260,7 @@ current step may supply a readout; a missing readout raises even if an earlier
 step has one. In mixed batches, `sequence_ids` selects the environments currently
 requesting actions. Example encoders return only `z` and `cache`.
 
-Augmentation uses the same optional `provider` filter (None matches all events).
+Augmentation uses an optional `provider` filter (None matches all events).
 Missing or `None` fields are skipped automatically. Use
 `compose(stages=(augmenter.events, tokenizer.encode))` for training; the loader
 forwards reseeding to the augmenter. Events in an episode share permutation draws,
@@ -288,3 +289,52 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for setup and checks, and [CHANGELOG.md](
 ## License
 
 GNU General Public License v3.0 — see [LICENSE](LICENSE).
+
+### Optional numeric and position additions
+
+The token types are `text`, `token`, and `image`. `token` uses the same formatting,
+lookup, and indexing as `text`, but must produce exactly one token. `special=True`
+registers a literal token; dynamically formatted tokens use the existing vocabulary.
+
+Any of these types can add a numeric measurement and a position to every token
+it produces, without emitting extra tokens:
+
+```python
+{
+    "type": "text",
+    "provider": "charger",
+    "input_field": "description",
+    "format": "Charger: {field}",
+    "numeric_field": "battery_energy_kwh",
+    "fourier_min": 0.0,
+    "fourier_max": 100.0,
+    "position_field": "elapsed_seconds",
+    "position_fourier_min": 0.0,
+    "position_fourier_max": 86400.0,
+}
+```
+
+Both additions require explicit finite lower and upper bounds with min < max.
+Values map to [-1, 1] without clipping. Missing or `None` adds nothing; zero and
+negative values are valid. `numeric_index` selects a vector element independently
+of the content's `input_index`. Bounds are scaling ranges, not validity limits.
+
+Configure `Embedding` or `MultiEmbedding` with
+`numeric_field_names=tokenizer.numeric_field_names`, `num_frequencies=16`, and
+`position_num_frequencies=16`. For `MultiEmbedding`, these belong on the container,
+while its named `Embedding` tables contain only token lookups. Forward the
+`numeric_values`, `numeric_mask`, `numeric_field_ids`, `position_values`, and
+`position_mask` tensors, plus `tokens.numeric_field_names`. Packing, streaming,
+and group prefixes preserve this metadata. Position values are normalized float64.
+
+There is one learned numeric projection per `(provider, numeric_field)` and one
+shared position projection across all tokens and tables. Repeated values and
+vector elements reuse their field's matrix. Both are added once before the
+transformer. Numeric frequencies are pi * 2^k; position frequencies are 2^k
+radians per normalized unit, retaining distinct range endpoints. Projections can
+learn their directions in embedding space, though addition is not guaranteed to
+prevent interference. Freezing pretrained token tables or using LoRA need not
+freeze these new matrices; include them in the optimizer to train them.
+
+See [the elapsed-time DQN example](examples/22_train_offline_dqn_time.ipynb) for
+optional position embeddings, offline training, and local checkpoint save/load.

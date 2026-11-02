@@ -125,7 +125,7 @@ def test_tokenizer_requires_event_envelopes():
 
 
 def test_image_only_tokenizer_needs_no_text_backend():
-    tok = Tokenizer(input_fields=[dict(type='image', input_field='image')],
+    tok = Tokenizer(input_fields=[dict(provider="camera", type='image', input_field='image')],
                     tokenizers={"image": lambda value: value})
     assert tok({'provider': 'camera', 'payload': {'image': [1, 2]}})['token_ids'].tolist() == [1, 2]
 

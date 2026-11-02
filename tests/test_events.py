@@ -18,10 +18,10 @@ from tests._token_batch_helpers import IntIdTokenizer
 
 def tokenizer():
     return Tokenizer(tokenizers={"default": IntIdTokenizer()}, input_fields=[
-        dict(type='numeric', provider='environment', input_field='position', format='1', fourier_min=-10., fourier_max=10.),
-        dict(type='numeric', provider='environment', input_field='temperature', format='2', fourier_min=-40., fourier_max=40.),
+        dict(type="token", provider='environment', input_field='position', numeric_field='position', format='1', fourier_min=-10., fourier_max=10.),
+        dict(type="token", provider='environment', input_field='temperature', numeric_field='temperature', format='2', fourier_min=-40., fourier_max=40.),
         dict(type='token', provider='environment', format='4', head_output=True),
-        dict(type='numeric', provider='agent', input_field='action', format='3', fourier_min=0., fourier_max=2.),
+        dict(type="token", provider='agent', input_field='action', numeric_field='action', format='3', fourier_min=0., fourier_max=2.),
     ],
         objective_fields=[dict(input_field=name, missing_value=value) for name, value in
                           [('action', None), ('reward', 0.0), ('terminated', False), ('truncated', False)]]
@@ -380,7 +380,7 @@ def test_replay_loader_training_and_cached_inference(tmp_path):
     model = simple_model(backbone=Backbone(architecture='qwen3', hidden_dim=8, num_layers=1, num_heads=2,
                                           train_kernel='reference', decode_kernel='flex', dtype=torch.float32),
                          heads={'q': torch.nn.Linear(8, 2)}, reasoner=None,
-                         embedding=Embedding(hidden_dim=8, vocab_size=32, num_frequencies=2))
+                         embedding=Embedding(hidden_dim=8, vocab_size=32, num_frequencies=2, numeric_field_names=tok.numeric_field_names))
     inputs, data, group = loader.next_batch()
     assert inputs.head_step_ids.tolist() == list(range(8))
     assert data['action_executed'].tolist() == [False, True, False, True] * 2

@@ -9,6 +9,9 @@ from mouse_core.data.token_batch import StepTokens, pack_token_batch
 
 def _step(ids, heads=(), prefix=None, **fields):
     return StepTokens(
+        numeric_field_names=("sensor.value",),
+        numeric_field_ids=np.where(np.asarray(ids) % 2 == 0, 0, -1),
+        group_start_numeric_field_ids=None if prefix is None else np.where(np.asarray(prefix) % 2 == 0, 0, -1),
         token_ids=np.asarray(ids),
         numeric_values=np.asarray(ids, dtype=np.float32) / 10,
         numeric_mask=np.asarray(ids) % 2 == 0,

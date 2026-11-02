@@ -30,8 +30,8 @@ def test_inline_conditions_reload_in_a_fresh_notebook(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, '__main__', training)
     tokenizer = Tokenizer(
         input_fields=[
-            {'type': 'token', 'format': '2', 'when': training.on_start},
-            {'type': 'token', 'format': '1', 'head_output': True},
+            {"provider": "sensor", 'type': 'token', 'format': '2', 'when': training.on_start},
+            {"provider": "sensor", 'type': 'token', 'format': '1', 'head_output': True},
         ],
         tokenizers={"default": IntIdTokenizer()},
     )
@@ -52,7 +52,7 @@ def test_inline_conditions_reload_in_a_fresh_notebook(tmp_path, monkeypatch):
 @pytest.mark.parametrize('module', ['__main__', 'missing_notebook_predicate_module'])
 def test_unsavable_predicate_does_not_overwrite_a_saved_tokenizer(tmp_path, module):
     good = Tokenizer(
-        input_fields=[{'type': 'token', 'format': '1', 'head_output': True}],
+        input_fields=[{"provider": "sensor", 'type': 'token', 'format': '1', 'head_output': True}],
         tokenizers={"default": IntIdTokenizer()},
     )
     save_tokenizer(tokenizer=good, path=tmp_path)
@@ -61,8 +61,8 @@ def test_unsavable_predicate_does_not_overwrite_a_saved_tokenizer(tmp_path, modu
     exec('def on_start(ctx):\n    return bool(ctx["group_start"])\n', namespace)
     bad = Tokenizer(
         input_fields=[
-            {'type': 'token', 'format': '2', 'when': namespace['on_start']},
-            {'type': 'token', 'format': '1', 'head_output': True},
+            {"provider": "sensor", 'type': 'token', 'format': '2', 'when': namespace['on_start']},
+            {"provider": "sensor", 'type': 'token', 'format': '1', 'head_output': True},
         ],
         tokenizers={"default": IntIdTokenizer()},
     )
@@ -142,47 +142,47 @@ def test_loading_requires_a_model_and_preserves_its_runtime(tmp_path) -> None:
 
 
 def test_num_frequencies_roundtrip(tmp_path) -> None:
-    embedding = Embedding(hidden_dim=8, vocab_size=32, num_frequencies=3)
+    embedding = Embedding(hidden_dim=8, vocab_size=32, numeric_field_names=("sensor.value",), num_frequencies=3)
     hidden_dim = 8
     backbone = Backbone(architecture='qwen3', train_kernel='reference', decode_kernel='flex', dtype=torch.float32, hidden_dim=hidden_dim, num_layers=1, num_heads=2)
-    assert embedding.fourier is not None
+    assert embedding.features.numeric[0] is not None
     with torch.no_grad():
-        embedding.fourier.proj.weight.fill_(0.25)
+        embedding.features.numeric[0].proj.weight.fill_(0.25)
     heads = MLP(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, propagate_gradient=1.0)
     model = simple_model(embedding=embedding, backbone=backbone, heads={'action_value': heads}, reasoner=None)
     save_model(model=model, path=tmp_path)
     loaded_model = load_model(model=fresh_model(model), repo_id_or_path=tmp_path)
     loaded = loaded_model.embedding
-    assert loaded_model.embedding.num_frequencies == 3
-    assert loaded.fourier is not None
-    assert model.embedding.fourier is not None
-    assert torch.equal(loaded.fourier.proj.weight, model.embedding.fourier.proj.weight)
+    assert loaded_model.embedding.features.num_frequencies == 3
+    assert loaded.features.numeric[0] is not None
+    assert model.embedding.features.numeric[0] is not None
+    assert torch.equal(loaded.features.numeric[0].proj.weight, model.embedding.features.numeric[0].proj.weight)
     assert not any((key.endswith('bands') for key in model.state_dict()))
 
 
 def test_fourier_stays_trainable_when_lora_freezes_the_stack() -> None:
-    embedding = Embedding(hidden_dim=8, vocab_size=32, num_frequencies=2)
+    embedding = Embedding(hidden_dim=8, vocab_size=32, numeric_field_names=("sensor.value",), num_frequencies=2)
     backbone = Backbone(architecture='qwen3', train_kernel='reference', decode_kernel='flex', dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2, lora=LoRAConfig(rank=2))
-    assert embedding.fourier is not None
-    assert embedding.fourier.proj.weight.requires_grad
+    assert embedding.features.numeric[0] is not None
+    assert embedding.features.numeric[0].proj.weight.requires_grad
     assert any(not param.requires_grad for param in backbone.model.parameters())
 
 
 def test_identity_num_frequencies_roundtrip(tmp_path) -> None:
-    embedding = Embedding(hidden_dim=8, vocab_size=32, num_frequencies=4)
+    embedding = Embedding(hidden_dim=8, vocab_size=32, numeric_field_names=("sensor.value",), num_frequencies=4)
     backbone = IdentityBackbone(hidden_dim=8)
-    assert embedding.fourier is not None
+    assert embedding.features.numeric[0] is not None
     with torch.no_grad():
-        embedding.fourier.proj.weight.normal_()
+        embedding.features.numeric[0].proj.weight.normal_()
     heads = MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0)
     model = simple_model(embedding=embedding, backbone=backbone, heads={'action_value': heads}, reasoner=None)
     save_model(model=model, path=tmp_path)
     loaded_model = load_model(model=fresh_model(model), repo_id_or_path=tmp_path)
     loaded = loaded_model.embedding
-    assert loaded_model.embedding.num_frequencies == 4
-    assert loaded.fourier is not None
-    assert model.embedding.fourier is not None
-    assert torch.equal(loaded.fourier.proj.weight, model.embedding.fourier.proj.weight)
+    assert loaded_model.embedding.features.num_frequencies == 4
+    assert loaded.features.numeric[0] is not None
+    assert model.embedding.features.numeric[0] is not None
+    assert torch.equal(loaded.features.numeric[0].proj.weight, model.embedding.features.numeric[0].proj.weight)
 
 
 def test_explicit_model_checkpoints_roundtrip_without_backbone_output_norm(tmp_path) -> None:
@@ -330,10 +330,10 @@ def test_tokenizer_roundtrip(tmp_path) -> None:
     """save_tokenizer writes tokenizer.json; load_tokenizer is the recall path."""
     tokenizer = Tokenizer(
         input_fields=[
-            {"type": "text", "input_field": "action", "format": "{field}"},
-            {"type": "text", "input_field": "repeat_episode_done", "format": "{field}"},
-            {"type": "text", "input_field": "done_code", "format": "{field}", "head_output": True},
-            {
+            {"provider": "sensor", "type": "text", "input_field": "action", "format": "{field}"},
+            {"provider": "sensor", "type": "text", "input_field": "repeat_episode_done", "format": "{field}"},
+            {"provider": "sensor", "type": "text", "input_field": "done_code", "format": "{field}", "head_output": True},
+            {"provider": "sensor",
                 "type": "text",
                 "input_field": "repeat_episode_index",
                 "format": "{field}",
@@ -378,18 +378,18 @@ def test_tokenizer_roundtrip_group_start_and_not_equals(tmp_path) -> None:
 
     tokenizer = Tokenizer(
         input_fields=[
-            {
+            {"provider": "sensor",
                 "type": "text",
                 "format": "hello\n",
                 "when": when_group_start,
             },
-            {
+            {"provider": "sensor",
                 "type": "text",
                 "input_field": "reward",
                 "format": "{field}",
                 "when": when_reward_nonzero,
             },
-            {"type": "text", "input_field": "action", "format": "{field}", "head_output": True},
+            {"provider": "sensor", "type": "text", "input_field": "action", "format": "{field}", "head_output": True},
         ],
         tokenizers={"default": _Tok()},
     )
@@ -412,7 +412,7 @@ def test_load_tokenizer_missing_file_raises(tmp_path) -> None:
 
 def test_push_model_and_tokenizer_share_repository(monkeypatch) -> None:
     model = simple_model(backbone=IdentityBackbone(hidden_dim=8), heads=({'action_value': (head := MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0))}), reasoner=None)
-    tokenizer = Tokenizer(input_fields=[{'type': 'text', 'input_field': 'action', 'format': '{field}', 'head_output': True}, {'type': 'text', 'input_field': 'repeat_episode_index', 'format': '{field}', 'when': when_step_index_zero}], objective_fields=[], tokenizers={"default": IntIdTokenizer()})
+    tokenizer = Tokenizer(input_fields=[{"provider": "sensor", 'type': 'text', 'input_field': 'action', 'format': '{field}', 'head_output': True}, {"provider": "sensor", 'type': 'text', 'input_field': 'repeat_episode_index', 'format': '{field}', 'when': when_step_index_zero}], objective_fields=[], tokenizers={"default": IntIdTokenizer()})
     import mouse_core.models.io as io
     import huggingface_hub
     from pathlib import Path
@@ -440,9 +440,9 @@ def test_push_model_and_tokenizer_share_repository(monkeypatch) -> None:
 
 def test_explicit_missing_labels_roundtrip_without_inserting_input_tokens(tmp_path):
     tokenizer = Tokenizer(tokenizers={"default": IntIdTokenizer()}, input_fields=[
-        {'type': 'numeric', 'input_field': 'reward',
+        {"provider": "sensor", 'type': "token", 'input_field': 'reward', "numeric_field": 'reward',
          'format': '2', 'fourier_min': 0., 'fourier_max': 10.},
-        {'type': 'token', 'format': '1', 'head_output': True},
+        {"provider": "sensor", 'type': 'token', 'format': '1', 'head_output': True},
     ], objective_fields=[
         {'input_field': 'reward', 'output_field': 'return_reward', 'missing_value': 0.},
         {'input_field': 'action', 'missing_value': None},
@@ -463,7 +463,7 @@ def test_explicit_missing_labels_roundtrip_without_inserting_input_tokens(tmp_pa
 
 def test_missing_vector_targets_roundtrip_and_do_not_train_unlabelled_rows(tmp_path):
     tokenizer = Tokenizer(tokenizers={"default": IntIdTokenizer()}, input_fields=[
-        {'type': 'token', 'format': '1', 'head_output': True},
+        {"provider": "sensor", 'type': 'token', 'format': '1', 'head_output': True},
     ], objective_fields=[{'input_field': 'q_star', 'missing_value': []}])
     save_tokenizer(tokenizer=tokenizer, path=tmp_path)
     restored = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizers={"default": IntIdTokenizer()})

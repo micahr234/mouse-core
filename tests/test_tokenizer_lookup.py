@@ -16,9 +16,9 @@ class CharacterTokenizer:
 
 def make_tokenizer(**field_options):
     return Tokenizer(tokenizers={"default": CharacterTokenizer()}, input_fields=[
-        dict(type='text', input_field='action', lookup=['A', 'B', 'C', 'D'],
+        dict(provider="agent", type='text', input_field='action', lookup=['A', 'B', 'C', 'D'],
              format='[{field}]', **field_options),
-        dict(type='token', input_field='action_requested', format='\n', head_output=True),
+        dict(provider="agent", type='token', input_field='action_requested', format='\n', head_output=True),
     ], objective_fields=[dict(input_field='action', missing_value=None)])
 
 
@@ -61,10 +61,10 @@ def test_invalid_lookup_ids_raise(value, error):
 @pytest.mark.parametrize('lookup', [[], 'ABCD', ['A', 1], ['A', '']])
 def test_invalid_lookup_tables_raise(lookup):
     with pytest.raises(ValueError, match='lookup'):
-        TokenizerModalitySpec(type='text', input_field='action', format='{field}', lookup=lookup)
+        TokenizerModalitySpec(provider="sensor", type='text', input_field='action', format='{field}', lookup=lookup)
 
 
-@pytest.mark.parametrize('kind,field', [('token', 'action'), ('numeric', 'action'), ('image', 'action'), ('text', None)])
+@pytest.mark.parametrize('kind,field', [('image', 'action'), ('text', None), ('token', None)])
 def test_lookup_requires_input_text(kind, field):
-    with pytest.raises(TypeError, match='lookup requires a text field'):
-        TokenizerModalitySpec(type=kind, input_field=field, format='A', lookup=['A'])
+    with pytest.raises(TypeError, match='lookup requires a text or token field'):
+        TokenizerModalitySpec(provider="sensor", type=kind, input_field=field, format='A', lookup=['A'])

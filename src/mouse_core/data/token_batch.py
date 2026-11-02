@@ -40,6 +40,38 @@ def _sequence_id_array(value) -> np.ndarray:
     return array.astype(np.int64, copy=False)
 
 
+def _numeric_field_ids(value, mask, names):
+    if any(not isinstance(name, str) or not name for name in names) or len(set(names)) != len(names):
+        raise ValueError("numeric_field_names must contain unique nonempty field identities")
+    mask = np.asarray(mask, dtype=bool)
+    if value is None:
+        if mask.any():
+            raise ValueError("Numeric tokens require numeric_field_ids and numeric_field_names")
+        return np.full(mask.shape, -1, dtype=np.int64)
+    ids = _sequence_id_array(value)
+    if ids.shape != mask.shape or np.any(ids[~mask] != -1):
+        raise ValueError("numeric_field_ids must match tokens, with -1 on nonnumeric tokens")
+    if np.any(ids[mask] < 0) or np.any(ids[mask] >= len(names)):
+        raise ValueError("numeric_field_ids must identify a configured numeric input field")
+    return ids
+
+
+def _position_arrays(values, mask, shape):
+    """Optional position scalars stay float64 until sinusoidal features are formed."""
+    if (values is None) != (mask is None):
+        raise ValueError("position_values and position_mask must be supplied together")
+    if values is None:
+        return np.zeros(shape, dtype=np.float64), np.zeros(shape, dtype=bool)
+    values, mask = np.asarray(values, dtype=np.float64), np.asarray(mask)
+    if values.shape != shape or mask.shape != shape:
+        raise ValueError("position_values and position_mask must match token_ids shape")
+    if mask.dtype != np.bool_:
+        raise TypeError("position_mask must be boolean")
+    if not np.all(np.isfinite(values[mask])):
+        raise ValueError("position_values must contain finite numeric scalars")
+    return values, mask
+
+
 @contextmanager
 def reuse_token_tensors() -> Iterator[None]:
     """Reuse batch conversions within one online/delayed forward pair.
@@ -85,6 +117,8 @@ class StepTokens:
     ``tokenizer_ids`` selects a name in ``tokenizer_names`` for each token;
     IDs remain local to that tokenizer's vocabulary and embedding table.
     ``numeric_mask`` marks numeric tokens even when their scaled value is zero.
+    Optional ``position_values`` / ``position_mask`` carry numeric context per token.
+    Omitted arrays become zeros and a false mask; zero can be present.
     ``group_start_*`` arrays hold an optional prefix emitted once per sequence.
     A passive step can contain no head tokens, or even no input tokens, while
     retaining its objective labels.
@@ -100,12 +134,22 @@ class StepTokens:
     group_start_numeric_mask: np.ndarray | None = None
     tokenizer_ids: np.ndarray | None = None
     group_start_tokenizer_ids: np.ndarray | None = None
+    group_start_numeric_field_ids: np.ndarray | None = None
+    group_start_position_values: np.ndarray | None = None
+    group_start_position_mask: np.ndarray | None = None
+    numeric_field_ids: np.ndarray | None = None
+    numeric_field_names: tuple[str, ...] = ()
     tokenizer_names: tuple[str, ...] = ("default",)
+    position_values: np.ndarray | None = None
+    position_mask: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         token_ids = np.asarray(self.token_ids, dtype=np.int64)
         if token_ids.ndim != 1:
             raise ValueError("StepTokens requires a 1-D token_ids array")
+        self.position_values, self.position_mask = _position_arrays(self.position_values, self.position_mask, token_ids.shape)
+        self.numeric_field_names = tuple(self.numeric_field_names)
+        self.numeric_field_ids = _numeric_field_ids(self.numeric_field_ids, self.numeric_mask, self.numeric_field_names)
         self.tokenizer_names = tuple(self.tokenizer_names)
         self.tokenizer_ids = _tokenizer_ids(self.tokenizer_ids, token_ids.shape, self.tokenizer_names)
         for name, dtype in (("token_ids", np.int64), ("numeric_values", np.float32),
@@ -117,6 +161,10 @@ class StepTokens:
         prefix = (self.group_start_token_ids, self.group_start_numeric_values,
                   self.group_start_numeric_mask)
         if all(array is None for array in prefix):
+            if self.group_start_numeric_field_ids is not None:
+                raise ValueError("group_start numeric field IDs require prefix tokens")
+            if self.group_start_position_values is not None or self.group_start_position_mask is not None:
+                raise ValueError("group_start position requires group_start token arrays")
             if self.group_start_tokenizer_ids is not None:
                 raise ValueError("group_start_tokenizer_ids requires group_start token arrays")
             return
@@ -125,6 +173,10 @@ class StepTokens:
         prefix_ids = np.asarray(self.group_start_token_ids, dtype=np.int64)
         if prefix_ids.ndim != 1 or prefix_ids.size == 0:
             raise ValueError("group_start token arrays must be non-empty and 1-D")
+        self.group_start_numeric_field_ids = _numeric_field_ids(
+            self.group_start_numeric_field_ids, self.group_start_numeric_mask, self.numeric_field_names)
+        self.group_start_position_values, self.group_start_position_mask = _position_arrays(
+            self.group_start_position_values, self.group_start_position_mask, prefix_ids.shape)
         self.group_start_tokenizer_ids = _tokenizer_ids(
             self.group_start_tokenizer_ids, prefix_ids.shape, self.tokenizer_names)
         for name, dtype in (("group_start_token_ids", np.int64),
@@ -149,7 +201,8 @@ class TokenBatch:
     the embedding table by its index in ``tokenizer_names``. Token IDs are
     local to that table; numeric values
     are scaled by the tokenizer's Fourier bounds and used only where the mask
-    is true. Sequence IDs define attention boundaries.
+    is true. Optional ``position_values`` (float64 scalars) and ``position_mask``
+    also have shape ``[L]``; they add no tokens. Sequence IDs define attention boundaries.
 
     ``head_token_ids`` contains the ``[P]`` positions marked by the
     tokenizer. ``head_step_ids[p]`` identifies the corresponding step in
@@ -168,13 +221,20 @@ class TokenBatch:
     B: int = 0
     step_sequence_ids: np.ndarray | None = None
     tokenizer_ids: np.ndarray | None = None
+    numeric_field_ids: np.ndarray | None = None
+    numeric_field_names: tuple[str, ...] = ()
     tokenizer_names: tuple[str, ...] = ("default",)
+    position_values: np.ndarray | None = None
+    position_mask: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         token_ids = np.asarray(self.token_ids, dtype=np.int64)
         if token_ids.ndim != 1:
             raise ValueError("token_ids must be a 1-D array")
         L = int(token_ids.size)
+        self.position_values, self.position_mask = _position_arrays(self.position_values, self.position_mask, token_ids.shape)
+        self.numeric_field_names = tuple(self.numeric_field_names)
+        self.numeric_field_ids = _numeric_field_ids(self.numeric_field_ids, self.numeric_mask, self.numeric_field_names)
         self.tokenizer_names = tuple(self.tokenizer_names)
         self.tokenizer_ids = _tokenizer_ids(self.tokenizer_ids, token_ids.shape, self.tokenizer_names)
         for name, dtype in (("token_ids", np.int64), ("numeric_values", np.float32),
@@ -296,7 +356,10 @@ class TokenBatch:
         tensors = {
             "token_ids": _long(self.token_ids),
             "numeric_values": _float(self.numeric_values),
+            "numeric_field_ids": _long(self.numeric_field_ids),
             "numeric_mask": torch.from_numpy(self.numeric_mask).to(dev),
+            "position_values": torch.from_numpy(self.position_values).to(dev),
+            "position_mask": torch.from_numpy(self.position_mask).to(dev),
             "sequence_ids": _long(self.sequence_ids),
             "head_token_ids": _long(self.head_token_ids),
             "head_step_ids": _long(self.head_step_ids),
@@ -501,6 +564,9 @@ def pack_token_batch(
                 f"sequence_ids must be >= 0, got min={min(seq_per_step)}"
             )
 
+    position_values: list[np.ndarray] = []
+    position_mask: list[np.ndarray] = []
+    numeric_field_ids: list[np.ndarray] = []
     numeric_mask: list[np.ndarray] = []
     token_ids: list[np.ndarray] = []
     numeric_values: list[np.ndarray] = []
@@ -528,7 +594,10 @@ def pack_token_batch(
         started = [bool(flag) for flag in continuing]
 
     tokenizer_names = steps[0].tokenizer_names
+    numeric_field_names = steps[0].numeric_field_names
     for st, sid in zip(steps, seq_per_step):
+        if st.numeric_field_names != numeric_field_names:
+            raise ValueError("All steps must use the same numeric_field_names")
         if st.tokenizer_names != tokenizer_names:
             raise ValueError("All steps must use the same tokenizer_names in the same order")
         emit_group_start = st.group_start_token_ids is not None and not started[sid]
@@ -538,6 +607,9 @@ def pack_token_batch(
             assert st.group_start_token_ids is not None
             assert st.group_start_numeric_values is not None
             pt = int(st.group_start_token_ids.shape[0])
+            position_values.append(st.group_start_position_values)
+            position_mask.append(st.group_start_position_mask)
+            numeric_field_ids.append(st.group_start_numeric_field_ids)
             numeric_mask.append(st.group_start_numeric_mask)
             token_ids.append(st.group_start_token_ids)
             numeric_values.append(st.group_start_numeric_values)
@@ -545,6 +617,9 @@ def pack_token_batch(
             tokenizer_ids.append(st.group_start_tokenizer_ids)
             head_token_masks.append(np.zeros(pt, dtype=bool))
         t = st.T
+        position_values.append(st.position_values)
+        position_mask.append(st.position_mask)
+        numeric_field_ids.append(st.numeric_field_ids)
         numeric_mask.append(st.numeric_mask)
         token_ids.append(st.token_ids)
         numeric_values.append(st.numeric_values)
@@ -563,6 +638,10 @@ def pack_token_batch(
     fields["head_output_count"] = np.bincount(head_step_ids, minlength=len(steps))
     group_id = torch.tensor(seq_per_step, dtype=torch.int64)
     inputs = TokenBatch(
+        position_values=np.concatenate(position_values),
+        position_mask=np.concatenate(position_mask),
+        numeric_field_ids=np.concatenate(numeric_field_ids),
+        numeric_field_names=numeric_field_names,
         numeric_mask=np.concatenate(numeric_mask),
         token_ids=np.concatenate(token_ids),
         numeric_values=np.concatenate(numeric_values),

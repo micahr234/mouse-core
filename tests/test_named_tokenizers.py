@@ -26,10 +26,10 @@ class TextBackend:
 def _tokenizer():
     # Deliberately use the same token ID in both vocabularies.
     return Tokenizer(tokenizers={'text': TextBackend(1), 'actions': TextBackend(1)}, input_fields=[
-        dict(type='text', tokenizer='text', format='prefix', when=on_group_start),
-        dict(type='text', tokenizer='actions', input_field='action', lookup=['a', 'b'], format='{field}'),
-        dict(type='text', tokenizer='text', input_field='observation', format='{field}'),
-        dict(type='token', tokenizer='text', input_field='action_requested', format='\n', head_output=True),
+        dict(provider="environment", type='text', tokenizer='text', format='prefix', when=on_group_start),
+        dict(provider="agent", type='text', tokenizer='actions', input_field='action', lookup=['a', 'b'], format='{field}'),
+        dict(provider="environment", type='text', tokenizer='text', input_field='observation', format='{field}'),
+        dict(provider="environment", type='token', tokenizer='text', input_field='action_requested', format='\n', head_output=True),
     ], objective_fields=[dict(input_field='action', missing_value=None)])
 
 
@@ -52,22 +52,23 @@ def _embed(embedding, inputs):
     t = inputs.to_tensors()
     return embedding(t['token_ids'], tokenizer_ids=t['tokenizer_ids'],
                      tokenizer_names=inputs.tokenizer_names,
-                     numeric_values=t['numeric_values'], numeric_mask=t['numeric_mask'])
+                     numeric_values=t['numeric_values'], numeric_mask=t['numeric_mask'],
+                     numeric_field_ids=t['numeric_field_ids'], numeric_field_names=inputs.numeric_field_names)
 
 
 def test_fields_are_independent_ordered_and_keep_backend_identity_in_prefixes_and_batches():
     tok = _tokenizer()
-    event = dict(provider='any', step_index=0, payload={'observation': 9, 'action': 0, 'action_requested': True})
+    event = dict(provider='environment', step_index=0, payload={'observation': 9, 'action': 0, 'action_requested': True})
     piece = tok(event)
-    assert piece['token_ids'].tolist() == [1, 1, 1]
-    assert piece['tokenizer_ids'].tolist() == [0, 1, 1]
+    assert piece['token_ids'].tolist() == [1, 1]
+    assert piece['tokenizer_ids'].tolist() == [1, 1]
     assert piece['group_start_tokenizer_ids'].tolist() == [1]
-    assert tok.tokenizers['actions'].calls == ['a']
+    assert tok.tokenizers['actions'].calls == []
     assert tok.tokenizers['text'].calls == ['prefix', '9', '\n']
     # Another event does not inherit the first event's action or observation.
     second = tok(dict(provider='environment', payload={'action_requested': True}))
     assert second['tokenizer_ids'].tolist() == [1]
-    assert tok.tokenizers['actions'].calls == ['a']
+    assert tok.tokenizers['actions'].calls == []
     inputs = tok.pack_rows(rows=[_events(), []], continuing=None)
     assert inputs.tokenizer_names == ('actions', 'text')
     assert inputs.tokenizer_ids is not None
@@ -109,15 +110,16 @@ def test_colliding_token_ids_use_independent_tables_and_gradients():
 
 def test_numeric_and_image_backends_route_to_their_own_tables():
     tok = Tokenizer(tokenizers={'image': lambda image: image, 'numeric': TextBackend(2)}, input_fields=[
-        dict(type='numeric', tokenizer='numeric', input_field='value', format='n', fourier_min=0., fourier_max=2.),
-        dict(type='image', tokenizer='image', input_field='image'),
+        dict(provider="sensor", type="token", tokenizer='numeric', input_field='value', numeric_field='value', format='n', fourier_min=0., fourier_max=2.),
+        dict(provider="sensor", type='image', tokenizer='image', input_field='image'),
     ])
     inputs = tok.pack_rows(rows=[[dict(provider='sensor', step_index=0, payload={'value': 1.5, 'image': [1, 2]})]], continuing=None)
-    model = MultiEmbedding(embeddings={'numeric': Embedding(vocab_size=4, hidden_dim=8, num_frequencies=2),
-                                      'image': Embedding(vocab_size=3, hidden_dim=8)})
+    model = MultiEmbedding(embeddings={'numeric': Embedding(vocab_size=4, hidden_dim=8),
+                                      'image': Embedding(vocab_size=3, hidden_dim=8)},
+                           num_frequencies=2, numeric_field_names=tok.numeric_field_names)
     actual = _embed(model, inputs)
     expected = torch.cat([
-        model.embeddings['numeric'](torch.tensor([2]), numeric_values=torch.tensor([.5]), numeric_mask=torch.tensor([True])),
+        model.embeddings['numeric'](torch.tensor([2])) + model.features.numeric[0](torch.tensor([.5])),
         model.embeddings['image'](torch.tensor([1, 2])),
     ])
     torch.testing.assert_close(actual, expected)
@@ -134,8 +136,8 @@ def test_named_pretrained_sources_and_weights_roundtrip(tmp_path):
         _source('llama').save_pretrained(directory)
         sources[name] = str(directory)
     tok = Tokenizer(tokenizers=sources, input_fields=[
-        dict(type='token', tokenizer='text', format='obs'),
-        dict(type='token', tokenizer='actions', format='action'),
+        dict(provider="test", type='token', tokenizer='text', format='obs'),
+        dict(provider="test", type='token', tokenizer='actions', format='action'),
     ])
     model = MultiEmbedding(embeddings={name: Embedding(pretrained=source) for name, source in sources.items()})
     inputs = tok.pack_rows(rows=[[dict(provider='test', step_index=0, payload={})]], continuing=None)
@@ -176,7 +178,7 @@ def test_special_token_registration_is_scoped_to_named_backends(tmp_path):
     first, second = backend(), backend()
     second.add_tokens(['extra'])
     tok = Tokenizer(tokenizers={'first': first, 'second': second}, input_fields=[
-        dict(type='token', tokenizer=name, format='<new>', special=True) for name in ('first', 'second')])
+        dict(provider="sensor", type='token', tokenizer=name, format='<new>', special=True) for name in ('first', 'second')])
     assert tok.special_token_ids == {'first': {'<new>': 5}, 'second': {'<new>': 6}}
     save_tokenizer(tokenizer=tok, path=tmp_path)
     restored = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizers={'second': second, 'first': first})
@@ -195,7 +197,7 @@ def test_special_token_registration_is_scoped_to_named_backends(tmp_path):
 ])
 def test_invalid_or_ambiguous_backend_configuration_is_rejected(options):
     with pytest.raises((TypeError, ValueError)):
-        Tokenizer(input_fields=[dict(type='token', format='x')], **options)
+        Tokenizer(input_fields=[dict(provider="sensor", type='token', format='x')], **options)
 
 
 @pytest.mark.parametrize('override', [
@@ -225,10 +227,10 @@ def test_load_rejects_saved_specs_without_a_backend_dictionary(tmp_path, backend
 
 def test_one_named_backend_or_default_can_be_implicit():
     for backends in ({'text': TextBackend(3)}, {'default': TextBackend(3), 'actions': TextBackend(1)}):
-        tok = Tokenizer(tokenizers=backends, input_fields=[dict(type='token', format='x')])
+        tok = Tokenizer(tokenizers=backends, input_fields=[dict(provider="test", type='token', format='x')])
         assert tok(dict(provider='test', payload={}))['token_ids'].tolist() == [3]
     with pytest.raises(ValueError, match='configured tokenizer'):
-        Tokenizer(tokenizers={'text': TextBackend(1)}, input_fields=[dict(type='token', tokenizer='typo', format='x')])
+        Tokenizer(tokenizers={'text': TextBackend(1)}, input_fields=[dict(provider="test", type='token', tokenizer='typo', format='x')])
 
 
 def test_routing_mismatches_are_rejected():

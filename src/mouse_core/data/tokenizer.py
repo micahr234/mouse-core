@@ -6,9 +6,9 @@ I/O
 * ``tokenizer.encode(events)`` assembles complete steps by their markers.
 
 All fields emit into one token-ID stream, with ``tokenizer_ids`` selecting
-the embedding table for each token. ``numeric`` fields also emit a
-scaled scalar in ``numeric_values`` and set ``numeric_mask=True``. Text,
-literal-token, and image fields set the mask to false. Pack ragged event sequences
+the embedding table for each token. Fields with ``numeric_field`` also emit a
+scaled scalar in ``numeric_values`` and set ``numeric_mask=True``. Fields without
+a present numeric addition set the mask to false. Pack ragged event sequences
 with :meth:`Tokenizer.pack_rows`; pack already-tokenized steps with
 :func:`~mouse_core.data.token_batch.pack_token_batch`.
 :func:`save_tokenizer` writes the packing spec as ``tokenizer.json``;
@@ -34,7 +34,6 @@ from mouse_core.data.step_sampling import _StepBoundary
 from mouse_core.data.io_fields import coerce_io_fields
 from mouse_core.data.modality import (
     KIND_IMAGE,
-    KIND_NUMERIC,
     KIND_TEXT,
     KIND_TOKEN,
     _field_label,
@@ -90,8 +89,8 @@ class Tokenizer:
     """Encode each event using an ordered field list, then assemble marked steps.
 
     ``tokenizer(event)`` returns an event's token arrays, possibly empty. It does
-    not interpret provider roles. Each field's ``provider=None`` matches all
-    events; a named provider filters that field. ``head_output=True`` marks
+    not interpret provider roles. Each field requires a specific ``provider``
+    name and only matches events from that provider. ``head_output=True`` marks
     exactly the tokens that field emits, including optional special tokens.
     Matching fields emit in ``input_fields`` order, regardless of payload key
     order. Each field is tokenized separately; text never merges across fields
@@ -143,11 +142,10 @@ class Tokenizer:
             self._provider_meta[provider] = tuple(meta)
         meta_by_spec = {id(meta.spec): meta for group in self._provider_meta.values() for meta in group}
         self._meta = tuple(enumerate(meta_by_spec[id(spec)] for spec in self.input_fields))
-        self._default_meta = tuple((index, meta) for index, meta in self._meta if meta.spec.provider is None)
         self._provider_meta = {
             provider: tuple((index, meta) for index, meta in self._meta
-                            if meta.spec.provider is None or meta.spec.provider == provider)
-            for provider in self._provider_meta if provider is not None
+                            if meta.spec.provider == provider)
+            for provider in self._provider_meta
         }
         sources = dict(tokenizers)
         self.tokenizer_names = tuple(sorted(sources))
@@ -168,6 +166,12 @@ class Tokenizer:
             if not callable(source):
                 raise TypeError(f"Tokenizer {name!r} must be a callable backend or pretrained identifier")
             self.tokenizers[name] = source
+        # Identity belongs to the source input field, not its value or token ID.
+        field_keys = [json.dumps([spec.provider, spec.numeric_field], separators=(",", ":"))
+                      if spec.numeric_field is not None else None for spec in self.input_fields]
+        self.numeric_field_names = tuple(dict.fromkeys(key for key in field_keys if key is not None))
+        self._numeric_routes = tuple(-1 if key is None else self.numeric_field_names.index(key)
+                                     for key in field_keys)
         self._backends = tuple(self.tokenizers[name] for name in field_tokenizers)
         self._routes = tuple(self.tokenizer_names.index(name) for name in field_tokenizers)
         self.special_token_ids = {}
@@ -184,12 +188,14 @@ class Tokenizer:
         if not isinstance(event, Mapping) or not {"provider", "payload"} <= event.keys():
             raise TypeError("Tokenizer expects a provider/payload event")
         provider = event["provider"]
-        meta = self._provider_meta.get(provider, self._default_meta)
+        if not isinstance(provider, str) or not provider.strip():
+            raise ValueError("Event provider must be a specific nonempty string")
+        meta = self._provider_meta.get(provider, ())
         payload = event["payload"]
         if meta and not isinstance(payload, Mapping):
             raise TypeError("Configured event input fields require an object payload")
         values = _tokenize_fields(row=payload, meta=meta, tokenizers=self._backends,
-                                  tokenizer_routes=self._routes, text_encoders=self._text_encoders)
+                                  tokenizer_routes=self._routes, numeric_routes=self._numeric_routes, text_encoders=self._text_encoders)
         return values
 
     def stream(self, *, include_objectives: bool = True) -> EventTokenStream:
@@ -222,7 +228,8 @@ class Tokenizer:
         inputs, _, _ = pack_token_batch(steps=steps, sequence_ids=sids if steps else None,
                                         batch_size=len(rows), continuing=continuing)
         if not steps:
-            inputs = replace(inputs, tokenizer_names=self.tokenizer_names, tokenizer_ids=np.zeros(0, dtype=np.int64))
+            inputs = replace(inputs, tokenizer_names=self.tokenizer_names, tokenizer_ids=np.zeros(0, dtype=np.int64),
+                             numeric_field_names=self.numeric_field_names)
         return inputs
 
 
@@ -279,7 +286,7 @@ class EventTokenStream:
     def _finish(self) -> StepTokens:
         pieces = self._pieces
         values = {name: np.concatenate([piece[name] for piece in pieces]) for name in
-                  ("token_ids", "numeric_values", "numeric_mask", "head_token_mask", "tokenizer_ids")}
+                  ("token_ids", "numeric_values", "numeric_mask", "head_token_mask", "tokenizer_ids", "position_values", "position_mask", "numeric_field_ids")}
         prefixes = []
         seen_fields = set()
         for piece in pieces:
@@ -289,14 +296,15 @@ class EventTokenStream:
             keep = np.asarray([int(index) not in seen_fields for index in ids], dtype=bool)
             seen_fields.update(ids.tolist())
             prefixes.append({name: piece[name][keep] for name in
-                             ("group_start_token_ids", "group_start_numeric_values", "group_start_numeric_mask", "group_start_tokenizer_ids")})
+                             ("group_start_token_ids", "group_start_numeric_values", "group_start_numeric_mask", "group_start_tokenizer_ids", "group_start_position_values", "group_start_position_mask", "group_start_numeric_field_ids")})
         if prefixes:
             values.update({name: np.concatenate([piece[name] for piece in prefixes]) for name in
-                           ("group_start_token_ids", "group_start_numeric_values", "group_start_numeric_mask", "group_start_tokenizer_ids")})
+                           ("group_start_token_ids", "group_start_numeric_values", "group_start_numeric_mask", "group_start_tokenizer_ids", "group_start_position_values", "group_start_position_mask", "group_start_numeric_field_ids")})
         objective = copy_keep_fields(self._labels,
                                     self.tokenizer.objective_fields if self.include_objectives else (),
                                     missing_values=self.tokenizer.objective_missing_values)
-        return StepTokens(**values, objective_fields=objective, tokenizer_names=self.tokenizer.tokenizer_names)
+        return StepTokens(**values, objective_fields=objective, tokenizer_names=self.tokenizer.tokenizer_names,
+                          numeric_field_names=self.tokenizer.numeric_field_names)
 
     def flush(self) -> StepTokens | None:
         if not self._pieces:
@@ -326,14 +334,14 @@ def _field_text_value(spec: TokenizerModalitySpec, row: dict[str, Any]) -> str |
 
 def _numeric_scaled(spec: TokenizerModalitySpec, row: dict[str, Any]) -> float | None:
     """Map the field's number from ``[fourier_min, fourier_max]`` onto ``[-1, 1]``."""
-    in_name = spec.input_field
+    in_name = spec.numeric_field
     if not in_name:
-        raise RuntimeError("numeric field is missing input_field")
+        return None
     raw = row.get(in_name)
     if raw is None:
         return None
-    scalar = _text_scalar(spec, raw)
-    who = _field_label(spec)
+    scalar = _select_scalar(raw, who=in_name, index=spec.numeric_index, index_name="numeric_index")
+    who = in_name
     if isinstance(scalar, (bool, np.bool_)):
         raise TypeError(
             f"numeric field {who!r} value must be a real number, "
@@ -351,18 +359,23 @@ def _numeric_scaled(spec: TokenizerModalitySpec, row: dict[str, Any]) -> float |
     hi = spec.fourier_max
     if lo is None or hi is None:
         raise RuntimeError(f"numeric field {who!r} is missing fourier bounds")
-    return 2.0 * (value - lo) / (hi - lo) - 1.0
+    scaled = 2.0 * ((value - lo) / (hi - lo)) - 1.0
+    if not math.isfinite(scaled) or abs(scaled) > np.finfo(np.float32).max:
+        raise ValueError("Scaled numeric value must be finite in float32")
+    return scaled
 
 
 def _text_scalar(spec: TokenizerModalitySpec, raw: Any) -> Any:
     """Scalar to interpolate, or one element selected by ``input_index``."""
-    who = _field_label(spec)
+    return _select_scalar(raw, who=_field_label(spec), index=spec.input_index, index_name="input_index")
+
+
+def _select_scalar(raw: Any, *, who: str, index: int | None, index_name: str) -> Any:
     rank = _value_rank(raw)
-    index = spec.input_index
     if index is None:
         if rank == 1:
             raise ValueError(
-                f"field {who!r} value is a 1-D vector; set input_index= "
+                f"field {who!r} value is a 1-D vector; set {index_name}= "
                 "to select an element"
             )
         if rank is not None and rank != 0:
@@ -372,18 +385,18 @@ def _text_scalar(spec: TokenizerModalitySpec, raw: Any) -> Any:
         return unwrap_scalar(raw)
     if rank is None or rank == 0:
         raise ValueError(
-            f"field {who!r} input_index={index} requires a 1-D vector, "
+            f"field {who!r} {index_name}={index} requires a 1-D vector, "
             "got a scalar"
         )
     if rank != 1:
         raise ValueError(
-            f"field {who!r} input_index={index} requires a 1-D vector, "
+            f"field {who!r} {index_name}={index} requires a 1-D vector, "
             f"got rank {rank}"
         )
     n = _vector_length(raw)
     if index >= n:
         raise ValueError(
-            f"field {who!r} input_index={index} is out of range for a "
+            f"field {who!r} {index_name}={index} is out of range for a "
             f"vector of length {n}"
         )
     return unwrap_scalar(_vector_at(raw, index))
@@ -427,7 +440,7 @@ def _vector_at(value: Any, index: int) -> Any:
 
 
 def _require_one_token(spec: TokenizerModalitySpec, token_ids: list[int]) -> None:
-    """``numeric`` and ``token`` formats tokenize to one id."""
+    """``token`` formats tokenize to one id."""
     n = len(token_ids)
     if n == 1:
         return
@@ -517,7 +530,7 @@ def _image_token_ids(image_tokenizer: Any, value: Any, *, in_name: str) -> list[
     return img_ids
 
 
-def _tokenize_fields(*, row, meta, tokenizers, tokenizer_routes, text_encoders):
+def _tokenize_fields(*, row, meta, tokenizers, tokenizer_routes, numeric_routes, text_encoders):
     token_ids: list[int] = []
     tokenizer_ids: list[int] = []
     numeric_values: list[float] = []
@@ -528,13 +541,29 @@ def _tokenize_fields(*, row, meta, tokenizers, tokenizer_routes, text_encoders):
     prefix_numeric_values: list[float] = []
     prefix_numeric_mask: list[bool] = []
     prefix_field_ids: list[int] = []
+    numeric_field_ids: list[int] = []
+    prefix_numeric_field_ids: list[int] = []
+    position_values: list[float] = []
+    position_mask: list[bool] = []
+    prefix_position_values: list[float] = []
+    prefix_position_mask: list[bool] = []
 
     def _emit(
         emitted_ids: list[int], *, spec: TokenizerModalitySpec, field_id: int,
-        to_group_start: bool, numeric_value: float | None = None,
+        to_group_start: bool,
         head_output: bool = False,
     ) -> None:
         _require_max_tokens(spec, emitted_ids)
+        position = row.get(spec.position_field) if spec.position_field is not None else None
+        if position is not None:
+            position = unwrap_scalar(position)
+            if isinstance(position, bool) or not isinstance(position, (int, float)) or not math.isfinite(position):
+                raise ValueError("position_field must contain a finite numeric scalar")
+            position = 2.0 * ((float(position) - spec.position_fourier_min) /
+                             (spec.position_fourier_max - spec.position_fourier_min)) - 1.0
+            if not math.isfinite(position):
+                raise ValueError("Scaled position must be finite")
+        numeric_value = _numeric_scaled(spec, row)
         is_numeric = numeric_value is not None
         value = 0.0 if numeric_value is None else numeric_value
         if to_group_start:
@@ -543,11 +572,17 @@ def _tokenize_fields(*, row, meta, tokenizers, tokenizer_routes, text_encoders):
             prefix_tokenizer_ids.extend([tokenizer_routes[field_id]] * len(emitted_ids))
             prefix_numeric_values.extend([value] * len(emitted_ids))
             prefix_numeric_mask.extend([is_numeric] * len(emitted_ids))
+            prefix_numeric_field_ids.extend([numeric_routes[field_id] if is_numeric else -1] * len(emitted_ids))
+            prefix_position_values.extend([0.0 if position is None else position] * len(emitted_ids))
+            prefix_position_mask.extend([position is not None] * len(emitted_ids))
         else:
             token_ids.extend(emitted_ids)
             tokenizer_ids.extend([tokenizer_routes[field_id]] * len(emitted_ids))
             numeric_values.extend([value] * len(emitted_ids))
             numeric_mask.extend([is_numeric] * len(emitted_ids))
+            numeric_field_ids.extend([numeric_routes[field_id] if is_numeric else -1] * len(emitted_ids))
+            position_values.extend([0.0 if position is None else position] * len(emitted_ids))
+            position_mask.extend([position is not None] * len(emitted_ids))
             head_token_mask.extend([head_output] * len(emitted_ids))
 
     for field_id, m in meta:
@@ -557,46 +592,15 @@ def _tokenize_fields(*, row, meta, tokenizers, tokenizer_routes, text_encoders):
         ordinary, to_group_start = _when_routes(spec, row)
         if not ordinary and not to_group_start:
             continue
-        if m.kind == KIND_TEXT:
+        if m.kind in (KIND_TEXT, KIND_TOKEN):
             rendered = _field_text_value(spec, row)
             if rendered is None:
                 continue
             if tokenizer is None:
                 raise RuntimeError("tokenizer required to tokenize text runs")
-            _emit(
-                text_ids(rendered),
-                spec=spec, field_id=field_id,
-                to_group_start=to_group_start,
-                head_output=spec.head_output,
-            )
-            continue
-
-        if m.kind == KIND_NUMERIC:
-            scaled = _numeric_scaled(spec, row)
-            if scaled is None:
-                continue
-            if tokenizer is None:
-                raise RuntimeError("tokenizer required to tokenize numeric runs")
-            rendered = render_text_format(spec, field=None)
             emitted_ids = text_ids(rendered)
-            _require_one_token(spec, emitted_ids)
-            _emit(
-                emitted_ids,
-                spec=spec, field_id=field_id,
-                to_group_start=to_group_start,
-                numeric_value=scaled,
-                head_output=spec.head_output,
-            )
-            continue
-
-        if m.kind == KIND_TOKEN:
-            if spec.input_field is not None and row.get(spec.input_field) is None:
-                continue
-            if tokenizer is None:
-                raise RuntimeError("tokenizer required to tokenize token runs")
-            rendered = render_text_format(spec, field=None)
-            emitted_ids = text_ids(rendered)
-            _require_one_token(spec, emitted_ids)
+            if m.kind == KIND_TOKEN:
+                _require_one_token(spec, emitted_ids)
             _emit(
                 emitted_ids,
                 spec=spec, field_id=field_id,
@@ -628,6 +632,9 @@ def _tokenize_fields(*, row, meta, tokenizers, tokenizer_routes, text_encoders):
             "group_start_tokenizer_ids": np.asarray(prefix_tokenizer_ids, dtype=np.int64),
             "group_start_numeric_values": np.asarray(prefix_numeric_values, dtype=np.float32),
             "group_start_numeric_mask": np.asarray(prefix_numeric_mask, dtype=bool),
+            "group_start_numeric_field_ids": np.asarray(prefix_numeric_field_ids, dtype=np.int64),
+            "group_start_position_values": np.asarray(prefix_position_values, dtype=np.float64),
+            "group_start_position_mask": np.asarray(prefix_position_mask, dtype=bool),
         }
 
     if prefix_field_ids:
@@ -638,6 +645,9 @@ def _tokenize_fields(*, row, meta, tokenizers, tokenizer_routes, text_encoders):
         tokenizer_ids=np.asarray(tokenizer_ids, dtype=np.int64),
         numeric_values=np.asarray(numeric_values, dtype=np.float32),
         numeric_mask=np.asarray(numeric_mask, dtype=bool),
+        numeric_field_ids=np.asarray(numeric_field_ids, dtype=np.int64),
+        position_values=np.asarray(position_values, dtype=np.float64),
+        position_mask=np.asarray(position_mask, dtype=bool),
         head_token_mask=np.asarray(head_token_mask, dtype=bool),
         **group_start_kwargs,
     )
@@ -666,7 +676,7 @@ def _when_routes(
     return ordinary, to_group_start
 
 
-TOKENIZER_FORMAT = "mouse-core-tokenizer-v2"
+TOKENIZER_FORMAT = "mouse-core-tokenizer-v3"
 TOKENIZER_FILENAME = "tokenizer.json"
 
 

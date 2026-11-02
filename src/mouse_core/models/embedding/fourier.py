@@ -1,4 +1,4 @@
-"""Fourier add for ``numeric`` token embeddings."""
+"""Fourier features for optional numeric additions."""
 
 from __future__ import annotations
 

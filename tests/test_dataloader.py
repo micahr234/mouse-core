@@ -60,8 +60,8 @@ def _tokenizer(*, objective_fields: list[dict[str, str]] | None = None) -> Token
     )
     return Tokenizer(
         input_fields=[
-            {"type": "text", "input_field": "action", "format": "{field}", "head_output": True},
-            {
+            {"provider": "sensor", "type": "text", "input_field": "action", "format": "{field}", "head_output": True},
+            {"provider": "sensor",
                 "type": "text",
                 "input_field": "repeat_episode_index",
                 "format": "{field}",
@@ -840,11 +840,11 @@ def when_group_start(ctx):
 
 def _episode_transform(*, group_start: bool):
     fields: list[dict] = [
-        {"type": "text", "input_field": "action", "format": "{field}", "head_output": True},
+        {"provider": "sensor", "type": "text", "input_field": "action", "format": "{field}", "head_output": True},
     ]
     if group_start:
         fields.append(
-            {"type": "text", "input_field": "mark", "format": "{field}", "when": when_group_start}
+            {"provider": "sensor", "type": "text", "input_field": "mark", "format": "{field}", "when": when_group_start}
         )
     tokenizer = Tokenizer(
         input_fields=fields,

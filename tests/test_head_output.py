@@ -87,9 +87,9 @@ def _head_output_tokenizer(
     value: str = "ab",
     tail: str | None = None,
 ) -> Tokenizer:
-    fields: list[dict] = [{"type": "text", "input_field": name, "format": "{field}"} for name in token_fields]
+    fields: list[dict] = [{"provider": "sensor", "type": "text", "input_field": name, "format": "{field}"} for name in token_fields]
     fields.append(
-        {
+        {"provider": "sensor",
             "type": "text",
             "input_field": "repeat_episode_index",
             "format": "{field}",
@@ -97,10 +97,10 @@ def _head_output_tokenizer(
         }
     )
     fields.append(
-        {"type": "text", "format": value, "head_output": True}
+        {"provider": "sensor", "type": "text", "format": value, "head_output": True}
     )
     if tail is not None:
-        fields.append({"type": "text", "input_field": tail, "format": "{field}"})
+        fields.append({"provider": "sensor", "type": "text", "input_field": tail, "format": "{field}"})
     obj = [{"input_field": name} for name in token_fields]
     if tail is not None:
         obj.append({"input_field": tail})
@@ -150,7 +150,7 @@ def _packed(model: Model):
 @pytest.mark.parametrize('head', [False, True])
 def test_tokenizer_supports_zero_or_multiple_head_fields(head) -> None:
     tok = Tokenizer(tokenizers={"default": _FakeTokenizer()}, input_fields=[
-        dict(type='text', input_field=name, format='{field}', head_output=head)
+        dict(provider="sensor", type='text', input_field=name, format='{field}', head_output=head)
         for name in ('action', 'obs')
     ])
     step = encode_measurement(tok, {'action': 1, 'obs': 2})
@@ -160,14 +160,14 @@ def test_tokenizer_supports_zero_or_multiple_head_fields(head) -> None:
 def test_step_without_head_output_token_is_retained() -> None:
     tok = Tokenizer(
         input_fields=[
-            {"type": "text", "input_field": "action", "format": "{field}"},
-            {
+            {"provider": "sensor", "type": "text", "input_field": "action", "format": "{field}"},
+            {"provider": "sensor",
                 "type": "text",
                 "input_field": "reward",
                 "format": "{field}",
                 "head_output": True,
             },
-            {
+            {"provider": "sensor",
                 "type": "text",
                 "input_field": "repeat_episode_index",
                 "format": "{field}",
@@ -188,7 +188,7 @@ def test_head_output_rejects_when() -> None:
     with pytest.raises(ValueError, match="head_output and cannot set when="):
         Tokenizer(
             input_fields=[
-                {
+                {"provider": "sensor",
                     "type": "text",
                     "input_field": "reward",
                     "format": "{field}",
@@ -204,7 +204,7 @@ def test_head_output_rejects_group_start() -> None:
     with pytest.raises(ValueError, match="head_output and cannot set when="):
         Tokenizer(
             input_fields=[
-                {
+                {"provider": "sensor",
                     "type": "text",
                     "format": "\n",
                     "when": when_group_start,

@@ -131,10 +131,10 @@ def test_embedding_growth_preserves_old_rows_and_trains_special_row():
     assert embedding.embed_tokens.weight.grad[5].abs().sum() > 0
 
 
-def test_wildcard_fields_keep_order_and_group_prefix_once():
+def test_explicit_provider_fields_keep_order_and_group_prefix_once():
     tok = Tokenizer(tokenizers={"default": backend()}, input_fields=[
-        dict(type='token', provider=None, format='prefix', when=on_group_start),
-        dict(type='token', provider=None, input_field='value', format='obs'),
+        dict(type='token', provider='sensor', format='prefix', when=on_group_start),
+        dict(type='token', provider='sensor', input_field='value', format='obs'),
         dict(type='token', provider='agent', input_field='value', format='action', head_output=True),
     ])
     log = EventLog()
@@ -143,7 +143,7 @@ def test_wildcard_fields_keep_order_and_group_prefix_once():
     log.event(provider='sensor', episode_index=0, step_index=0, payload={'value': 2})
     log.event(provider='sensor', episode_index=0, step_index=1, payload={'value': 3})
     packed = tok.pack_rows(rows=[log], continuing=None)
-    assert packed.token_ids.tolist() == [4, 1, 2, 1, 1]
+    assert packed.token_ids.tolist() == [4, 2, 1, 1]
     assert packed.head_step_ids.tolist() == [0]
     first = tok.pack_rows(rows=[log[:3]], continuing=None)
     rest = tok.pack_rows(rows=[log[3:]], continuing=[True])
@@ -206,7 +206,7 @@ def test_field_order_and_independent_events_with_mergeable_text():
         vocab={'[UNK]': 0, 'a': 1, 'b': 2, 'ab': 3},
         merges=[('a', 'b')], unk_token='[UNK]')), unk_token='[UNK]')
     tok = Tokenizer(tokenizers={"default": hf}, input_fields=[
-        dict(type='text', provider=None, input_field='first', format='{field}'),
+        dict(type='text', provider='environment', input_field='first', format='{field}'),
         dict(type='text', provider='environment', input_field='second', format='{field}'),
     ])
     assert hf('ab', add_special_tokens=False)['input_ids'] == [3]
@@ -235,10 +235,10 @@ def test_missing_inputs_skip_all_modalities(payload):
         raise AssertionError('Missing images must not be tokenized')
 
     tok = Tokenizer(tokenizers={'default': backend(), 'image': unexpected_image}, input_fields=[
-        dict(type='text', input_field='text', format='{field}'),
-        dict(type='token', input_field='marker', format='action', head_output=True),
-        dict(type='numeric', input_field='number', format='reward', fourier_min=0., fourier_max=1.),
-        dict(type='image', tokenizer='image', input_field='image'),
+        dict(provider="environment", type='text', input_field='text', format='{field}'),
+        dict(provider="environment", type='token', input_field='marker', format='action', head_output=True),
+        dict(provider="environment", type="token", input_field='number', numeric_field='number', format='reward', fourier_min=0., fourier_max=1.),
+        dict(provider="environment", type='image', tokenizer='image', input_field='image'),
     ])
     assert tok({'provider': 'environment', 'payload': payload})['token_ids'].size == 0
     with pytest.raises(TypeError, match='real number'):
@@ -249,7 +249,7 @@ def test_existing_action_marker_does_not_extend_vocabulary():
     hf = backend()
     size = len(hf)
     tok = Tokenizer(tokenizers={"default": hf}, input_fields=[
-        dict(type='token', input_field='action_requested', format='action', head_output=True),
+        dict(provider="environment", type='token', input_field='action_requested', format='action', head_output=True),
     ])
     assert len(hf) == size and tok.special_token_ids == {}
     event = {'provider': 'environment', 'payload': {'action_requested': True}}

@@ -93,7 +93,7 @@ def test_per_event_weights_use_source_counts():
 
 
 @pytest.mark.parametrize('field', ['provider', 'payload'])
-def test_loader_index_overlay_cannot_overwrite_source_fields(field):
+def test_loader_index_position_cannot_overwrite_source_fields(field):
     with pytest.raises(ValueError, match='index_field cannot overwrite'):
         DataLoader(stores=source(), events_budget=6, batch_size=1,
                    sample_field='payload.episode_index', transform=EncodeSample(),

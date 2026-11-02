@@ -34,7 +34,7 @@ def _tok_in(
     *names: str, head_output: str | None = None
 ) -> list[dict[str, Any]]:
     fields: list[dict[str, Any]] = [
-        {
+        {"provider": "sensor",
             "type": "text",
             "input_field": name,
             "format": "{field}",
@@ -47,7 +47,7 @@ def _tok_in(
         for field in fields
     ):
         fields.append(
-            {
+            {"provider": "sensor",
                 "type": "text",
                 "input_field": "repeat_episode_index",
                 "format": "{field}",
@@ -92,13 +92,13 @@ def test_tokenizer_output_defaults_to_input() -> None:
 def test_tokenizer_renames_objective_fields() -> None:
     tokenizer = Tokenizer(
         input_fields=[
-            {
+            {"provider": "sensor",
                 "type": "text",
                 "input_field": "act",
                 "format": "{field}",
                 "head_output": True,
             },
-            {
+            {"provider": "sensor",
                 "type": "text",
                 "input_field": "repeat_episode_index",
                 "format": "{field}",

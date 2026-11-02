@@ -56,7 +56,7 @@ def test_embedding_loads_only_the_table_without_allocating_a_decoder(tmp_path, m
         return load_state_dict(path, *args, **kwargs)
 
     monkeypatch.setattr(modeling_utils, "load_state_dict", load_shard)
-    embedding = Embedding(pretrained=tmp_path, num_frequencies=2,
+    embedding = Embedding(pretrained=tmp_path, numeric_field_names=("sensor.value",), num_frequencies=2,
                           hub_kwargs={"local_files_only": True})
     assert inspected == [True]
     assert len(loaded_files) == 1
@@ -68,7 +68,7 @@ def test_embedding_loads_only_the_table_without_allocating_a_decoder(tmp_path, m
     torch.testing.assert_close(embedding.embed_tokens.weight, expected, atol=0, rtol=0)
     assert embedding.hidden_dim == 8 and embedding.vocab_size == 16
     assert all(p.dtype == torch.float32 and p.requires_grad for p in embedding.parameters())
-    assert set(embedding.state_dict()) == {"embed_tokens.weight", "fourier.proj.weight"}
+    assert set(embedding.state_dict()) == {"embed_tokens.weight", "features.numeric.0.proj.weight"}
     ids = torch.tensor([2, 5, 2])
     embedding.embed_tokens(ids).sum().backward()
     grad = embedding.embed_tokens.weight.grad
@@ -95,7 +95,7 @@ def test_fourier_initial_norm_matches_token_table(monkeypatch, hidden_dim, num_f
         torch.manual_seed(0)
         if pretrained_scale is None:
             embedding = Embedding(vocab_size=64, hidden_dim=hidden_dim,
-                                  num_frequencies=num_frequencies)
+                                  numeric_field_names=("sensor.value",), num_frequencies=num_frequencies)
         else:
             table = torch.nn.Embedding(64, hidden_dim)
             with torch.no_grad():
@@ -105,11 +105,11 @@ def test_fourier_initial_norm_matches_token_table(monkeypatch, hidden_dim, num_f
                 "mouse_core.models.embedding.token.load_token_table",
                 lambda pretrained, hub_kwargs: table,
             )
-            embedding = Embedding(pretrained="test-table", num_frequencies=num_frequencies)
-    assert embedding.fourier is not None
+            embedding = Embedding(pretrained="test-table", numeric_field_names=("sensor.value",), num_frequencies=num_frequencies)
+    assert embedding.features.numeric[0] is not None
     values = torch.linspace(-0.95, 0.95, 257)
     with torch.no_grad():
-        output = embedding.fourier(values)
+        output = embedding.features.numeric[0](values)
         token_norm = embedding.embed_tokens.weight.square().sum(-1).mean().sqrt()
         fourier_norm = output.square().sum(-1).mean().sqrt()
     assert fourier_norm.item() == pytest.approx(token_norm.item(), rel=0.15)
@@ -117,12 +117,12 @@ def test_fourier_initial_norm_matches_token_table(monkeypatch, hidden_dim, num_f
 
 
 def test_embedding_trainability_is_independent_of_backbone_lora():
-    embedding = Embedding(hidden_dim=8, vocab_size=16, num_frequencies=2)
+    embedding = Embedding(hidden_dim=8, vocab_size=16, numeric_field_names=("sensor.value",), num_frequencies=2)
     backbone = Backbone(architecture="qwen3", hidden_dim=8, num_layers=1,
                         num_heads=2, train_kernel="reference", decode_kernel="flex",
                         dtype=torch.bfloat16, lora=LoRAConfig(rank=2))
     assert any(not p.requires_grad for p in backbone.parameters())
     assert all(p.requires_grad for p in embedding.parameters())
     embedding.embed_tokens.requires_grad_(False)
-    assert embedding.fourier is not None and embedding.fourier.proj.weight.requires_grad
+    assert embedding.features.numeric[0] is not None and embedding.features.numeric[0].proj.weight.requires_grad
     assert any(p.requires_grad for p in backbone.parameters())

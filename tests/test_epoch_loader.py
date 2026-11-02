@@ -92,7 +92,7 @@ def test_remaining_batches_stops_at_each_pass():
     assert loader.remaining_in_epoch == 0
 
 
-def test_objective_overlays_follow_samples_through_shuffled_passes():
+def test_objective_positions_follow_samples_through_shuffled_passes():
     import torch
     loader = EpochDataLoader(stores=stores(), transform=EventTransform(encode=transform), token_budget=5,
                              sample_ranges=environment_episode_ranges, epochs=3, seed=9)

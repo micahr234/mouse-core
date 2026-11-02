@@ -20,7 +20,6 @@ _FSTRING_BUILTINS = {"str": str, "repr": repr, "ascii": ascii}
 KIND_TEXT = "text"
 KIND_TOKEN = "token"
 KIND_IMAGE = "image"
-KIND_NUMERIC = "numeric"
 
 # Per-step emission gate. See ``mouse_core.data.conditions``.
 WhenFn = Callable[[Mapping[str, Any]], bool]
@@ -28,110 +27,45 @@ WhenFn = Callable[[Mapping[str, Any]], bool]
 
 @dataclass
 class TokenizerModalitySpec:
-    """How the tokenizer packs one field from a step dict.
+    """Describe tokens from one concrete provider.
 
-    Types:
-      * ``text`` — format string → tokenizer → token IDs
-      * ``token`` — literal ``format`` → exactly one token ID
-      * ``image`` — image tokenizer → discrete visual token IDs
-      * ``numeric`` — literal ``format`` → one token ID, with a scaled
-        ``numeric_values`` entry and ``numeric_mask=True``
+    ``text`` formats an optional input scalar into a variable-length token run.
+    ``token`` uses the same formatting and lookup rules but must produce exactly
+    one token. ``special=True`` registers a literal token in the vocabulary.
+    ``image`` encodes an image into discrete visual tokens.
 
-    ``tokenizer`` selects a name from the Tokenizer's backend dictionary.
-    Each named backend addresses its own embedding table. Only numeric tokens
-    receive the additional Fourier projection.
+    ``input_index`` selects an element of a vector before formatting. A missing
+    or None input emits nothing. Without input_field, text/token are constants.
+    Optional ``when`` gates emission; ``head_output`` marks prediction tokens.
 
-    A ``text`` field requires ``format=``. With ``input_field=``,
-    ``format=`` is an f-string and the step value is the name ``field``:
-    ``{field}``, ``{field+1}``, ``{field:.0f}``. Expressions may use
-    ``field`` with operators and format specs. They may not call
-    functions or use any other name. A literal format with ``input_field=``
-    emits a fixed marker only when that field is
-    present and non-None; it does not test the value's truthiness.
-    Omit ``input_field=`` and the
-    field is a const: ``format=`` is the literal string to tokenize
-    (the word field is text; ``{field}`` is still a placeholder and is
-    rejected). Write ``{{`` / ``}}`` for a literal brace. ``image``
-    does not accept ``format=``.
+    Any type may set ``numeric_field`` and explicit finite ``fourier_min`` /
+    ``fourier_max`` bounds (min < max). ``numeric_index`` optionally selects a
+    vector element independently of input_index. The scalar is mapped to [-1,1]
+    without clipping, and a projection specific to (provider, numeric_field) is
+    added to every emitted token. Vector elements share their field's projection.
 
-    A text field may set ``lookup=["a", "b", "c", "d"]`` to map integer
-    IDs to strings before formatting. For example, ID 2 becomes ``"c"``
-    with ``format="{field}"``. Lookup runs after ``input_index`` selection;
-    missing inputs still emit nothing, while invalid IDs raise. Source
-    payloads and objective labels retain their original numeric values.
-    This renders ordinary text without registering vocabulary entries.
+    Independently, ``position_field`` selects a scalar with explicit finite
+    ``position_fourier_min`` / ``position_fourier_max`` bounds (min < max).
+    Its projection is shared across all fields and named token tables. Positions
+    also map to [-1,1] without clipping. Missing/None numeric or position values
+    add nothing; zero and signed values are valid. Neither addition emits tokens.
 
-    A ``token`` field emits its literal ``format`` as one token. With an
-    optional ``input_field``, it emits only when that
-    field is present and non-None, just like an optional literal text field.
-    ``special=True`` registers the literal as an atomic special token.
-    Grow the model embedding before training to include newly registered IDs. It rejects ``max_tokens``, ``input_index``,
-    and Fourier bounds.
-
-    A ``numeric`` field requires ``input_field=``, ``format=``,
-    ``fourier_min=``, and ``fourier_max=``. ``format=`` is the literal
-    text to tokenize. The word field is text. ``{field}`` is still a
-    placeholder and is rejected. The number is not written into that
-    text. It is mapped from ``[fourier_min, fourier_max]`` onto
-    ``[-1, 1]`` (no clipping) and stored on every token the format
-    produced. That format must tokenize to one id; zero or several
-    raise. ``fourier_min`` and ``fourier_max`` must be finite and
-    must differ. Other types reject those two arguments. The embedding
-    adds a Fourier projection of the stored value when it is built
-    with ``num_frequencies``. ``numeric`` rejects ``max_tokens``
-    because the limit is one token.
-
-
-    Omit ``input_index`` and the text or numeric field is that whole
-    scalar. Set ``input_index`` (an int ``>= 0``) and the field reads
-    that element of a 1-D vector (``list``, ``tuple``, ``ndarray``, or
-    ``Tensor``). Repeat ``input_field`` with a different
-    ``input_index`` for each element; fields still emit in
-    ``input_fields`` order. A 1-D vector without ``input_index``
-    raises, a scalar with ``input_index`` raises, and rank 2 or
-    higher raises. ``token``, ``image``, and const text reject
-    ``input_index``.
-
-    Optional ``when=`` is a callable ``ctx → bool``. The tokenizer builds
-    ``ctx`` from the step dict and injects boolean ``group_start``. It
-    calls the predicate twice: with ``group_start=False`` for ordinary
-    step tokens, and with ``group_start=True`` for pack-time
-    ``group_start_*`` tokens. Write OR in the callable
-    (``|`` / ``or``), e.g.
-    ``lambda ctx: (ctx.get("step_index") == 0) | ctx["group_start"]``.
-    Named callables round-trip via ``module:qualname``; define them
-    inline in the notebook or caller. Omit ``when``
-    (``None``) and the field always emits on the ordinary run.
-    ``head_output`` fields cannot set ``when``. Bind an ``input_field`` to
-    emit a readout only when that field is present and non-None.
-
-    A missing or ``None`` input value emits nothing. Present values are
-    validated normally. Const text fields have no ``input_field`` and may
-    still use ``when=``.
-
-    ``head_output=True`` marks prediction positions. Tokenizer permits
-    steps without readouts, including passive and terminal steps. Multiple
-    fields may emit prediction positions in the same event.
-    In Tokenizer, ``provider=None`` matches any provider; a string limits
-    the field to events from that provider. Fields emit in list order.
-
-    Optional ``max_tokens=`` raises if that field emits more ids than
-    the limit. Only ``text`` and ``image`` accept it. ``token`` and
-    ``numeric`` tokenize to one id and raise otherwise; they reject
-    ``max_tokens``.
-    Every ``input_field`` must be unique, except text or numeric
-    fields that share a column with a different ``input_index``. That pair
-    ``(input_field, input_index)`` is the unique key, so the same
-    pair twice raises. A const has no column, so several consts are
-    fine. Fields emit in ``input_fields`` order.
+    Each declaration requires a nonempty provider name; no wildcard is supported.
+    Declarations emit in list order. Content (input_field, input_index) pairs must
+    be unique within a provider, while constant declarations may repeat.
     """
 
     type: str
-    provider: str | None = None
+    provider: str
     tokenizer: str | None = None
     special: bool = False
     input_field: str | None = None
     input_index: int | None = None
+    numeric_field: str | None = None
+    numeric_index: int | None = None
+    position_field: str | None = None
+    position_fourier_min: float | None = None
+    position_fourier_max: float | None = None
     lookup: Sequence[str] | None = None
     format: str | None = None
     fourier_min: float | None = None
@@ -145,16 +79,46 @@ class TokenizerModalitySpec:
         "text",
         "token",
         "image",
-        "numeric",
     )
 
     def __post_init__(self) -> None:
+        if self.numeric_field is None:
+            if self.fourier_min is not None or self.fourier_max is not None or self.numeric_index is not None:
+                raise ValueError("Numeric bounds and numeric_index require numeric_field")
+        else:
+            if not isinstance(self.numeric_field, str) or not self.numeric_field.strip():
+                raise ValueError("numeric_field must be a nonempty payload field name")
+            if self.numeric_index is not None:
+                if isinstance(self.numeric_index, bool) or not isinstance(self.numeric_index, int):
+                    raise TypeError("numeric_index must be an int")
+                if self.numeric_index < 0:
+                    raise ValueError("numeric_index must be >= 0")
+            if self.fourier_min is None or self.fourier_max is None:
+                raise ValueError("numeric_field requires fourier_min and fourier_max")
+            lo = _as_finite_float(self.fourier_min, who=self.numeric_field, name="fourier_min")
+            hi = _as_finite_float(self.fourier_max, who=self.numeric_field, name="fourier_max")
+            if not lo < hi or not math.isfinite(hi - lo):
+                raise ValueError("Numeric bounds require a finite positive range (min < max)")
+            self.fourier_min, self.fourier_max = lo, hi
+        if self.position_field is not None and (not isinstance(self.position_field, str) or not self.position_field):
+            raise ValueError("position_field must be a nonempty payload field name")
+        if self.position_field is None:
+            if self.position_fourier_min is not None or self.position_fourier_max is not None:
+                raise ValueError("Position bounds require position_field")
+        else:
+            if self.position_fourier_min is None or self.position_fourier_max is None:
+                raise ValueError("position_field requires position_fourier_min and position_fourier_max")
+            lo = _as_finite_float(self.position_fourier_min, who=self.position_field, name="position_fourier_min")
+            hi = _as_finite_float(self.position_fourier_max, who=self.position_field, name="position_fourier_max")
+            if not lo < hi or not math.isfinite(hi - lo):
+                raise ValueError("Position bounds require a finite positive range (min < max)")
+            self.position_fourier_min, self.position_fourier_max = lo, hi
         if self.tokenizer is not None and (not isinstance(self.tokenizer, str) or not self.tokenizer):
             raise ValueError("tokenizer must be a nonempty backend name")
         if type(self.special) is not bool or (self.special and (self.type or "").lower() != "token"):
             raise ValueError("special=True is supported only for token fields")
-        if self.provider is not None and (not isinstance(self.provider, str) or not self.provider):
-            raise ValueError("provider must be a nonempty string")
+        if not isinstance(self.provider, str) or not self.provider.strip():
+            raise ValueError("provider must be a specific nonempty string")
         k = (self.type or "").lower()
         if k not in self._VALID_TYPES:
             raise ValueError(
@@ -163,66 +127,32 @@ class TokenizerModalitySpec:
             )
         object.__setattr__(self, "type", k)
         if self.lookup is not None:
-            if k != "text" or not self.input_field:
-                raise TypeError("lookup requires a text field with input_field=")
+            if k not in ("text", "token") or not self.input_field:
+                raise TypeError("lookup requires a text or token field with input_field=")
             if not isinstance(self.lookup, (list, tuple)) or not self.lookup:
                 raise ValueError("lookup must be a nonempty list or tuple of strings")
             if any(not isinstance(value, str) or not value for value in self.lookup):
                 raise ValueError("lookup entries must be nonempty strings")
             object.__setattr__(self, "lookup", tuple(self.lookup))
         if k == "text":
-            self._reject_fourier_bounds(k)
             self._init_text()
-            return
-        if k == "numeric":
-            self._init_numeric()
             return
         if k == "token":
             self._init_token()
             return
-        self._reject_fourier_bounds(k)
         self._reject_input_index(k)
         self._init_named_input()
         self._reject_text_format(k)
         _validate_max_tokens(self)
         _validate_when(self)
 
-    def _init_numeric(self) -> None:
-        if not self.input_field:
-            raise ValueError(
-                "tokenizer modality type='numeric' requires input_field="
-            )
-        _validate_input_index(self)
-        _validate_fourier_bounds(self)
-        if not self.format:
-            raise ValueError(
-                f"numeric field {_field_label(self)!r} requires format= "
-                "(a literal string, no placeholders)"
-            )
-        code = _compile_text_format(
-            self.format, who=self.input_field, allow_field=False, literal="numeric"
-        )
-        object.__setattr__(self, "_format_code", code)
-        self._reject_max_tokens("numeric")
-        _validate_when(self)
-
     def _init_token(self) -> None:
-        self._reject_fourier_bounds("token")
-        self._reject_input_index("token")
         self._reject_max_tokens("token")
-        if self.input_field is None:
-            self._reject_no_input_knobs("token")
-        elif not isinstance(self.input_field, str) or not self.input_field:
-            raise ValueError("token input_field must be a nonempty string")
-        if not self.format:
-            raise ValueError(
-                "token field requires format= (a literal string, no placeholders)"
+        self._init_text()
+        if self.special:
+            self._format_code = _compile_text_format(
+                self.format, who="special token", allow_field=False, literal="special token"
             )
-        code = _compile_text_format(
-            self.format, who="token", allow_field=False, literal="token"
-        )
-        object.__setattr__(self, "_format_code", code)
-        _validate_when(self)
 
     def _init_text(self) -> None:
         if self.input_field is None:
@@ -258,7 +188,7 @@ class TokenizerModalitySpec:
         if self.format is not None:
             raise TypeError(
                 f"tokenizer modality type={kind!r} does not accept format= "
-                "(text, token, and numeric only)"
+                "(text and token only)"
             )
 
     def _reject_max_tokens(self, kind: str) -> None:
@@ -272,14 +202,7 @@ class TokenizerModalitySpec:
         if self.input_index is not None:
             raise TypeError(
                 f"tokenizer modality type={kind!r} does not accept input_index= "
-                "(text and numeric fields with input_field= only)"
-            )
-
-    def _reject_fourier_bounds(self, kind: str) -> None:
-        if self.fourier_min is not None or self.fourier_max is not None:
-            raise TypeError(
-                f"tokenizer modality type={kind!r} does not accept "
-                "fourier_min= or fourier_max= (numeric only)"
+                "(text and token fields with input_field= only)"
             )
 
     def _reject_no_input_knobs(self, kind: str) -> None:
@@ -562,22 +485,6 @@ def _as_finite_float(value: Any, *, who: str, name: str) -> float:
     return number
 
 
-def _validate_fourier_bounds(spec: TokenizerModalitySpec) -> None:
-    who = _field_label(spec)
-    if spec.fourier_min is None or spec.fourier_max is None:
-        raise ValueError(
-            f"numeric field {who!r} requires fourier_min= and fourier_max="
-        )
-    lo = _as_finite_float(spec.fourier_min, who=who, name="fourier_min")
-    hi = _as_finite_float(spec.fourier_max, who=who, name="fourier_max")
-    if lo == hi:
-        raise ValueError(
-            f"numeric field {who!r} fourier_min and fourier_max must differ, "
-            f"got {lo}"
-        )
-    object.__setattr__(spec, "fourier_min", lo)
-    object.__setattr__(spec, "fourier_max", hi)
-
 
 def _field_label(spec: TokenizerModalitySpec) -> str:
     """Name used in errors. A const has no column."""
@@ -620,27 +527,27 @@ def resolve_tokenizer_modalities(
         specs.extend(expand_tokenizer_spec(spec))
 
     meta: list[TokenizerModalityMeta] = []
-    seen_names: set[str] = set()
-    seen_indexed: set[tuple[str, int]] = set()
-    indexed_names: set[str] = set()
+    seen_names: set[tuple[str, str]] = set()
+    seen_indexed: set[tuple[tuple[str, str], int]] = set()
+    indexed_names: set[tuple[str, str]] = set()
     for spec in specs:
         k = spec.type
         if spec.input_field is not None:
-            name = spec.input_field
+            name = (spec.provider, spec.input_field)
             if spec.input_index is None:
                 if name in seen_names or name in indexed_names:
-                    raise ValueError(f"duplicate tokenizer field {name!r}")
+                    raise ValueError(f"duplicate tokenizer field {spec.input_field!r} for provider {spec.provider!r}")
                 seen_names.add(name)
             else:
                 key = (name, spec.input_index)
                 if key in seen_indexed:
                     raise ValueError(
-                        f"duplicate tokenizer field {name!r} with "
+                        f"duplicate tokenizer field {spec.input_field!r} with "
                         f"input_index={spec.input_index}; each (input_field, "
                         "input_index) pair must be unique"
                     )
                 if name in seen_names:
-                    raise ValueError(f"duplicate tokenizer field {name!r}")
+                    raise ValueError(f"duplicate tokenizer field {spec.input_field!r} for provider {spec.provider!r}")
                 seen_indexed.add(key)
                 indexed_names.add(name)
         if k == "text":
@@ -655,12 +562,6 @@ def resolve_tokenizer_modalities(
             meta.append(
                 TokenizerModalityMeta(
                     spec=spec, kind=KIND_IMAGE
-                )
-            )
-        elif k == "numeric":
-            meta.append(
-                TokenizerModalityMeta(
-                    spec=spec, kind=KIND_NUMERIC
                 )
             )
         else:

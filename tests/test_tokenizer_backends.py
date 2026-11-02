@@ -32,15 +32,15 @@ def configured(*, wrapper=False):
 
     return Tokenizer(tokenizers={'text': source(), 'other': source(), 'image': lambda value: value},
                     input_fields=[
-        dict(type='text', tokenizer='text', format='prefix', when=on_group_start),
+        dict(provider="sensor", type='text', tokenizer='text', format='prefix', when=on_group_start),
         dict(type='text', tokenizer='other', provider='agent', input_field='action',
              lookup=['obs', 'action'], format='{field}'),
         dict(type='text', tokenizer='text', provider='sensor', input_field='text', format='{field}'),
-        dict(type='numeric', tokenizer='text', input_field='number', format='reward',
+        dict(provider="sensor", type="token", tokenizer='text', input_field='number', numeric_field='number', format='reward',
              fourier_min=0., fourier_max=2.),
-        dict(type='token', tokenizer='text', input_field='request', format='<readout>',
+        dict(provider="sensor", type='token', tokenizer='text', input_field='request', format='<readout>',
              special=True, head_output=True),
-        dict(type='image', tokenizer='image', input_field='image'),
+        dict(provider="sensor", type='image', tokenizer='image', input_field='image'),
     ], objective_fields=[dict(input_field='action', missing_value=None)])
 
 
@@ -99,8 +99,8 @@ def test_mergeable_fields_and_events_remain_separate_and_ordered():
     source = bpe_backend()
     assert source('ab', add_special_tokens=False)['input_ids'] == [3]
     tok = Tokenizer(tokenizers={'text': source}, input_fields=[
-        dict(type='text', input_field='first', format='{field}'),
-        dict(type='text', input_field='second', format='{field}'),
+        dict(provider="sensor", type='text', input_field='first', format='{field}'),
+        dict(provider="sensor", type='text', input_field='second', format='{field}'),
     ])
     steps = tok.encode([
         dict(provider='sensor', step_index=0, payload={'second': 'b', 'first': 'a'}),
@@ -119,8 +119,9 @@ def test_custom_stateful_callable_runs_in_field_and_event_order():
         return {'input_ids': [len(calls)]}
 
     tok = Tokenizer(tokenizers={'custom': source}, input_fields=[
-        dict(type='text', format='first'), dict(type='text', format='second')])
-    steps = tok.encode(events()[:2])
+        dict(provider="sensor", type='text', format='first'), dict(provider="sensor", type='text', format='second')])
+    steps = tok.encode([dict(provider='sensor', step_index=0, payload={}),
+                        dict(provider='sensor', step_index=0, payload={})])
     assert calls == ['first', 'second', 'first', 'second']
     assert steps[0].token_ids.tolist() == [1, 2, 3, 4]
 
@@ -140,7 +141,7 @@ def test_hf_overrides_and_input_mode_hooks_are_honored(method):
     custom_type = type('CustomBackend', (PreTrainedTokenizerFast,), {method: override})
     source = custom_type(tokenizer_object=backend().backend_tokenizer, unk_token='[UNK]')
     tok = Tokenizer(tokenizers={'text': source}, input_fields=[
-        dict(type='text', format='obs'), dict(type='text', format='action')])
+        dict(provider="sensor", type='text', format='obs'), dict(provider="sensor", type='text', format='action')])
     assert tok(dict(provider='sensor', payload={}))['token_ids'].tolist() == [1, 2]
     assert calls == [method, method]
 
@@ -154,8 +155,8 @@ def test_callback_backend_changes_take_effect_between_fields():
         return not ctx['group_start']
 
     tok = Tokenizer(tokenizers={'text': source}, input_fields=[
-        dict(type='text', format='new-word'),
-        dict(type='text', format='new-word', when=add_word),
+        dict(provider="sensor", type='text', format='new-word'),
+        dict(provider="sensor", type='text', format='new-word', when=add_word),
     ])
     assert tok(dict(provider='sensor', payload={}))['token_ids'].tolist() == [0, 5]
     assert tok(dict(provider='sensor', payload={}))['token_ids'].tolist() == [5, 5]
@@ -167,7 +168,7 @@ def test_native_setting_mismatches_use_hf_wrapper(monkeypatch, setting):
     source.backend_tokenizer.pre_tokenizer = Whitespace()
     source.add_tokens(['<special>'], special_tokens=True)
     tok = Tokenizer(tokenizers={'text': source}, input_fields=[
-        dict(type='text', format='obs action <special>')])
+        dict(provider="sensor", type='text', format='obs action <special>')])
     native = source.backend_tokenizer
     if setting == 'padding':
         native.enable_padding(length=8, pad_id=0, pad_token='[UNK]')
@@ -196,7 +197,7 @@ def test_native_setting_mismatches_use_hf_wrapper(monkeypatch, setting):
 
 def test_native_bpe_dropout_changes_are_immediate():
     source = bpe_backend()
-    tok = Tokenizer(tokenizers={'text': source}, input_fields=[dict(type='text', format='ab')])
+    tok = Tokenizer(tokenizers={'text': source}, input_fields=[dict(provider="sensor", type='text', format='ab')])
     event = dict(provider='sensor', payload={})
     assert tok(event)['token_ids'].tolist() == [3]
     source.backend_tokenizer.model.dropout = 1.0

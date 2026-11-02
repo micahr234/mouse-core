@@ -62,13 +62,14 @@ def _example(path, **overrides):
         action_vectors=torch.tensor([[-2.], [0.], [2.]]),
     )
     namespace.update(overrides)
-    namespace["tokenizer"] = SimpleNamespace(tokenizer_sources=namespace["TOKENIZER_SOURCES"])
+    namespace["tokenizer"] = SimpleNamespace(tokenizer_sources=namespace["TOKENIZER_SOURCES"], numeric_field_names=())
     construction = []
 
     def embedding_factory(**kwargs):
         construction.append(("embedding", kwargs))
         return Embedding(hidden_dim=8, vocab_size=32,
-                         num_frequencies=kwargs.get("num_frequencies"))
+                         num_frequencies=kwargs.get("num_frequencies"),
+                         position_num_frequencies=kwargs.get("position_num_frequencies"))
 
     def backbone_factory(**kwargs):
         construction.append(("backbone", kwargs))
@@ -109,8 +110,8 @@ def test_example_encoder_builds_and_trains_each_named_tokenizer_table():
     encoder = ns['encoder']
     assert set(encoder.embedding.embeddings) == {'text', 'actions'}
     tokenizer = Tokenizer(tokenizers={'text': IntIdTokenizer(), 'actions': IntIdTokenizer()}, input_fields=[
-        dict(type='text', tokenizer='actions', input_field='action', format='{field}'),
-        dict(type='text', tokenizer='text', input_field='observation', format='{field}', head_output=True),
+        dict(provider="sensor", type='text', tokenizer='actions', input_field='action', format='{field}'),
+        dict(provider="sensor", type='text', tokenizer='text', input_field='observation', format='{field}', head_output=True),
     ])
     inputs = tokenizer.pack_rows(rows=[measurement_events([{'action': 2, 'observation': 3}])], continuing=None)
     ns['q_head'](encoder(inputs)['z']).square().sum().backward()
@@ -281,13 +282,13 @@ def test_embedding_requires_prepared_inputs_on_the_model_device():
 
 
 def test_embedding_and_backbone_are_independently_constructed():
-    embedding = Embedding(hidden_dim=8, vocab_size=32, num_frequencies=2)
+    embedding = Embedding(hidden_dim=8, vocab_size=32, num_frequencies=2, numeric_field_names=("sensor.value",))
     backbone = Backbone(architecture="qwen3", hidden_dim=8, num_layers=1,
                         num_heads=2, train_kernel="reference",
                         decode_kernel="flex", dtype=torch.float32)
     assert not hasattr(backbone, "embedding")
     assert getattr(backbone.model, "embed_tokens") is None
-    assert embedding.fourier is not None
+    assert len(embedding.features.numeric) == 1
     assert not {id(p) for p in embedding.parameters()} & {id(p) for p in backbone.parameters()}
 
 
@@ -439,8 +440,8 @@ def test_cartpole_encoder_uses_configured_fourier_features_for_observations():
     notebook, ns = _example(EXAMPLES / '18_train_offline_cartpole_dqn.ipynb',
                             NUM_FREQUENCIES=3)
     encoder = ns['encoder'].eval()
-    assert encoder.embedding.embeddings["text"].num_frequencies == 3
-    assert encoder.embedding.embeddings["text"].fourier is not None
+    assert encoder.embedding.features.num_frequencies == 3
+    assert encoder.embedding.features.num_frequencies is not None
 
     # Keep the actual notebook's numeric observation fields and scaling bounds.
     definition = next(node.value for cell in notebook['cells'] if cell['cell_type'] == 'code'
@@ -457,10 +458,10 @@ def test_cartpole_encoder_uses_configured_fourier_features_for_observations():
         assert isinstance(field, ast.Dict)
         kind = next(value for key, value in zip(field.keys, field.values)
                     if isinstance(key, ast.Constant) and key.value == 'type')
-        if isinstance(kind, ast.Constant) and kind.value == 'numeric':
-            input_fields.append(ast.literal_eval(field))
+        if isinstance(kind, ast.Constant) and any(isinstance(key, ast.Constant) and key.value == 'numeric_field' for key in field.keys):
+            input_fields.append({**ast.literal_eval(field), "provider": "sensor"})
     assert [(field["input_field"], field["format"]) for field in input_fields] == [("cart_position", "x"), ("pole_angle", "t")]
-    input_fields.append({'type': 'token', 'format': '\n', 'head_output': True})
+    input_fields.append({"provider": "sensor", 'type': 'token', 'format': '\n', 'head_output': True})
 
     class FieldTokenizer:
         def __call__(self, text, **kwargs):
@@ -468,6 +469,8 @@ def test_cartpole_encoder_uses_configured_fourier_features_for_observations():
 
     tokenizer = Tokenizer(tokenizers={"text": FieldTokenizer()}, input_fields=input_fields,
                           objective_fields=[])
+    encoder.embedding = MultiEmbedding(embeddings={"text": Embedding(hidden_dim=8, vocab_size=32)},
+        numeric_field_names=tokenizer.numeric_field_names, num_frequencies=3)
     first = tokenizer.pack_rows(rows=[measurement_events(payloads) for payloads in [[{'cart_position': 0., 'pole_angle': 0.}]]], continuing=None)
     second = tokenizer.pack_rows(rows=[measurement_events(payloads) for payloads in [[{'cart_position': 0.5, 'pole_angle': 0.1}]]], continuing=None)
     np.testing.assert_array_equal(first.token_ids, second.token_ids)

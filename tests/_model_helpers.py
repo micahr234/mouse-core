@@ -59,6 +59,7 @@ class ExampleModel(Model):
         head_step_ids = tensors["head_step_ids"]
         embed = self.embedding(
             token_ids, numeric_values=numeric_values, numeric_mask=numeric_mask,
+            numeric_field_ids=tensors["numeric_field_ids"], numeric_field_names=batch.numeric_field_names,
         )
         head_valid_mask = None
         if reasoning is not None:

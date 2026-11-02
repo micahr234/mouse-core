@@ -58,7 +58,7 @@ def token_tokenizer(
     ``head_output=True``. Reward floats stay on ``objective_fields`` only.
     """
     input_fields: list[dict[str, Any]] = [
-        {"type": "text", "input_field": name, "format": "{field}"} for name in fields
+        {"provider": "sensor", "type": "text", "input_field": name, "format": "{field}"} for name in fields
     ]
     if input_fields:
         input_fields[-1]["head_output"] = True
@@ -71,7 +71,7 @@ def token_tokenizer(
         )
         input_fields.insert(
             head_at,
-            {
+            {"provider": "sensor",
                 "type": "text",
                 "input_field": "episode_index",
                 "format": "{field}",
@@ -126,5 +126,6 @@ def embed_batch(embedding, batch):
     return embedding(
         tensors["token_ids"], numeric_values=tensors["numeric_values"],
         numeric_mask=tensors["numeric_mask"],
+        numeric_field_ids=tensors["numeric_field_ids"], numeric_field_names=batch.numeric_field_names,
         tokenizer_ids=tensors["tokenizer_ids"], tokenizer_names=batch.tokenizer_names,
     )
