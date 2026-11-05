@@ -1,11 +1,42 @@
 # Changelog
 
+- Objectives now require the existing `objective_data["head_step_ids"]` mapping.
+  Removed the duplicate `head_output_count` objective column; counts are derived
+  internally. Updated examples, replay action selection and training metrics.
+
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+- Move step/prediction mappings to `objective_data`; use `head_token_mask` for model readouts and sample one action per prediction.
+
+- Replace `TokenBatch` with TensorDict inputs and return TensorDict objective
+  labels. Use dictionary access and `.to(device)`; shapes give derived counts,
+  and `num_sequences` retains empty decode rows. Remove batch construction
+  validation and the conversion cache. Shared-memory process workers retain
+  bounded reusable slots. Add `tensordict` as a runtime dependency.
+
+- FrozenLake collection prefixes non-input payload fields with `_`, including
+  supervision labels and outer episode controls. Matching tokenizers use explicit
+  objective aliases, and event readers accept explicit `EnvironmentProtocol`
+  field names. Underscores do not change tokenization behavior.
+
+- Augmentation uses `type="discrete_permute"` for categorical permutations; remove
+  the separate `permute` flag. Plain `discrete` retains masking/copying behavior.
+
+### DataLoader process workers and batch API
+- Positive `num_workers` now uses persistent spawned processes with reusable,
+  bounded shared-memory result slots on standard Python. Notebook-local callbacks
+  are serialized once per worker; augmenter synchronization is worker-local.
+- Remove `DataLoader.batch_size`: each event/token budget caps the whole batch.
+- `DataLoader`, `EpochDataLoader`, and `pack_token_batch` return
+  `(inputs, objective_data)`. Step boundaries live in `inputs["step_sequence_ids"]`
+  eliminating the duplicated third return value.
+- Install scripts and CI use standard Python 3.15 without `PYTHON_GIL=0`.
+  The `all` extra includes `kernels`.
 
 ### Added
 - Subclassable PyTorch `Model`: define architecture in `forward()` with ordinary
@@ -20,10 +51,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   non-trainable buffer saved with the model and restored by `load_model`.
   Example 19 uses this head for Pendulum DQN, with continuous torque in the
   transformer history and discrete IDs in the objective.
-- ``mouse_core.data.reuse_token_tensors()`` scopes read-only batch tensor
-  reuse across online/delayed forwards, keyed by batch, device, and
-  inference mode. Exiting the scope releases its cache. Model parameters
-  and activations remain separate.
 - Tokenizer ``type="token"`` tokenizes a literal ``format`` to one
   token ID. Zero or several tokens raise. It has no
   ``input_field`` and rejects ``max_tokens``. Example readouts use
@@ -915,7 +942,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   token of each decode row. Pass the ``ModelOutput`` from
   ``forward(..., use_cache=True)``: ``head_output_valid`` marks real
   last-head-output slots (not left-padded idle columns, not tokens
-  after the head-output field). A scores ``TensorDict`` still uses the
+  after the head-output field). A scores ``TokenBatch`` still uses the
   last step axis. Empty decode rows raise instead of acting on pad.
 - ``DiscreteActionHead`` always stores as ``action``. It no longer
   inherits ``SwiGLUHead``'s rename-from-``action_head`` behavior (that
@@ -1164,7 +1191,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tokens itself.
 - ``DataLoader.next_batch()`` and ``pack_token_batch(...)`` return
   ``(inputs, objective_data)``. ``inputs`` is the ``TokenBatch``;
-  ``objective_data`` is a CPU ``TensorDict`` of tokenizer
+  ``objective_data`` is a CPU ``TokenBatch`` of tokenizer
   ``objective_fields`` (plus ``sequence_id`` and the grouping column).
   ``Model.forward`` / embedders take ``TokenBatch`` only and return
   a ``ModelOutput``. Move ``objective_data`` onto the
@@ -1538,7 +1565,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``prediction_indices`` ``[N]``, ``objective_fields`` ``[N]`` (+ ``sequence_id``).
   No stored ``lengths`` / ``segment_ids`` fields.
 - ``Model.forward`` training path: predictions and ``objective_data`` are flat
-  ``TensorDict[N]`` (``N = len(prediction_indices)``). Flex / CPU document
+  ``TokenBatch[N]`` (``N = len(prediction_indices)``). Flex / CPU document
   attention masks by ``(sequence_ids, grouping_ids)`` (causal within the same
   grouping-id run). Cached decode applies the same isolation (per-slot grouping-id
   buffer + mask; RoPE resets per grouping-id run). Cached decode stays rectangular
@@ -1840,6 +1867,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `DataLoader` no longer accepts a `sampling` parameter; random windowed sampling is always used.
 
 ### Fixed
-- `Model.forward` no longer calls `TensorDict.to()` when encoder outputs are already on the target device, avoiding a spurious CUDA availability probe during CPU-only runs.
+- `Model.forward` no longer calls `TokenBatch.to()` when encoder outputs are already on the target device, avoiding a spurious CUDA availability probe during CPU-only runs.
 - `push_stores_to_hub` and `push_to_hub` were writing every config's parquet data to the same path (`data/train-*.parquet`) because `data_dir="data"` was passed explicitly to `DatasetDict.push_to_hub`, overriding the per-config subdirectory behaviour introduced in datasets v5. Each config now writes to its own `data/{config_name}/` directory, so multiple subsets are no longer silently overwritten by the last one pushed.
 - `push_stores_to_hub` and `push_to_hub` `clear` parameter now correctly defaults to `True` (the docstring-stated default), ensuring stale parquet shards are wiped before each fresh push.

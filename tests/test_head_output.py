@@ -1,6 +1,8 @@
 """Explicit head-output tokens: flagging, packing, objectives, multi-token readout."""
 
 from __future__ import annotations
+
+from tests._prediction_layout import fixture_head_steps
 from tests._event_fixtures import encode_measurement
 from tests._model_helpers import ExampleModel as Model
 from tests._model_helpers import copy_model, simple_model
@@ -115,7 +117,7 @@ _TOK = _head_output_tokenizer("action", "observation", "repeat_episode_done")
 
 
 def _tiny_model(*, with_reasoner: bool=False) -> Model:
-    backbone = Backbone(architecture='llama', train_kernel='reference', decode_kernel='flex', dtype=torch.float32, hidden_dim=_HIDDEN, num_layers=2, num_heads=2, max_position_embeddings=128)
+    backbone = Backbone(architecture='llama', train_kernel="flex", decode_kernel='flex', dtype=torch.float32, hidden_dim=_HIDDEN, num_layers=2, num_heads=2, max_position_embeddings=128)
     heads = MLP(in_features=_HIDDEN, out_features=_ACTIONS, hidden_dim=_HIDDEN, num_layers=1, propagate_gradient=1.0)
     reasoner = LatentReasoner(hidden_dim=_HIDDEN, num_thoughts=2) if with_reasoner else None
     return simple_model(backbone=backbone, heads={'action_value': heads}, reasoner=reasoner)
@@ -222,19 +224,20 @@ def test_head_output_rejects_group_start() -> None:
 
 def test_pack_multi_head_output_layout() -> None:
     model = _tiny_model()
-    batch, objective_data, _sid = _packed(model)
+    batch, objective_data = _packed(model)
     N = sum(len(seq) for seq in _BATCH)
-    assert batch.N == N
-    assert batch.P == _HEAD_OUTPUT_IDS * N
+    assert objective_data["step_sequence_ids"].shape[0] == N
+    assert batch["head_token_mask"].nonzero(as_tuple=True)[0].shape[0] == _HEAD_OUTPUT_IDS * N
     expected = []
     for i in range(N):
         base = i * _TOKENS_PER_STEP
         expected += [base + 3, base + 4]
-    assert batch.head_token_ids.tolist() == expected
-    assert batch.head_step_ids.tolist() == [i for i in range(N) for _ in range(_HEAD_OUTPUT_IDS)]
-    assert batch.step_counts().tolist() == [3, 2]
-    assert batch.numeric_mask[batch.head_token_ids].tolist() == [False] * (_HEAD_OUTPUT_IDS * N)
-    assert objective_data["head_output_count"].tolist() == [_HEAD_OUTPUT_IDS] * N
+    assert batch["head_token_mask"].nonzero(as_tuple=True)[0].tolist() == expected
+    assert objective_data["head_step_ids"].tolist() == [i for i in range(N) for _ in range(_HEAD_OUTPUT_IDS)]
+    assert torch.bincount(objective_data["step_sequence_ids"], minlength=batch["num_sequences"]).tolist() == [3, 2]
+    assert batch['numeric_mask'][batch["head_token_mask"].nonzero(as_tuple=True)[0]].tolist() == [False] * (_HEAD_OUTPUT_IDS * N)
+    assert "head_output_count" not in objective_data
+    assert np.bincount(objective_data["head_step_ids"], minlength=N).tolist() == [_HEAD_OUTPUT_IDS] * N
 
 
 # ---------------------------------------------------------------------------
@@ -245,33 +248,29 @@ def test_pack_multi_head_output_layout() -> None:
 def test_forward_yields_one_row_per_head_output_token() -> None:
     torch.manual_seed(0)
     model = _tiny_model().eval()
-    batch, _, _sid = _packed(model)
+    batch, objective_data = _packed(model)
     with torch.no_grad():
         out = model(batch)
-    assert out["predictions"]["action_value"].shape == (batch.P, _ACTIONS)
+    assert out["predictions"]["action_value"].shape == (batch["head_token_mask"].nonzero(as_tuple=True)[0].shape[0], _ACTIONS)
     assert out["head_token_ids"] is not None
-    assert out["head_token_ids"].shape == (batch.P,)
+    assert out["head_token_ids"].shape == (batch["head_token_mask"].nonzero(as_tuple=True)[0].shape[0],)
 
 
-def test_decode_pools_last_head_output_token_per_step() -> None:
+def test_decode_preserves_every_marked_head_token() -> None:
     torch.manual_seed(0)
     model = _tiny_model().eval()
-    batch, _, _sid = _packed(model)
+    batch, objective_data = _packed(model)
     with torch.no_grad():
         flat = model(batch)["predictions"]
         rect = model(batch, use_cache=True)["predictions"]
     q_flat = flat["action_value"]  # [P, A]
     q_rect = rect["action_value"]  # [B, S, A], steps left-padded
-    psteps = batch.head_step_ids
-    last = np.ones(batch.P, dtype=bool)
-    last[:-1] = psteps[1:] != psteps[:-1]
-    last_rows = np.flatnonzero(last)
-    counts = batch.step_counts().tolist()
+    counts = torch.bincount(batch["sequence_ids"][batch["head_token_mask"]], minlength=batch["num_sequences"]).tolist()
     S = q_rect.shape[1]
     row = 0
     for b, n in enumerate(counts):
         for s in range(n):
-            flat_q = q_flat[last_rows[row]]
+            flat_q = q_flat[row]
             rect_q = q_rect[b, S - n + s]
             assert torch.allclose(flat_q, rect_q, atol=1e-4), (b, s)
             row += 1
@@ -287,17 +286,17 @@ def test_get_action_uses_last_valid_head_output_not_last_token() -> None:
     """
     torch.manual_seed(0)
     hidden = _HIDDEN
-    backbone = Backbone(architecture='llama', train_kernel='reference', decode_kernel='flex', dtype=torch.float32, hidden_dim=hidden, num_layers=2, num_heads=2, max_position_embeddings=128)
+    backbone = Backbone(architecture='llama', train_kernel="flex", decode_kernel='flex', dtype=torch.float32, hidden_dim=hidden, num_layers=2, num_heads=2, max_position_embeddings=128)
     model = simple_model(backbone=backbone, heads=({'action_value': (head := MLP(in_features=hidden, out_features=_ACTIONS, hidden_dim=hidden, num_layers=1, propagate_gradient=1.0))}), reasoner=None).eval()
     tok = _head_output_tokenizer('action', 'observation', tail='tail')
     rows = [[{**step, 'tail': (i + 3) % 8} for i, step in enumerate(_rows(3))], [{**step, 'tail': (i + 5) % 8} for i, step in enumerate(_rows(1, offset=2))]]
-    batch, _, _sid = batch_to_packed(tok, rows)
+    batch, _ = batch_to_packed(tok, rows)
     with torch.no_grad():
         out = model(batch, use_cache=True)
         action = model.get_action(out=out, temperature=0.0)
     assert out["head_valid_mask"] is not None
-    assert out["head_valid_mask"].tolist() == [[True, True, True], [False, False, True]]
-    last_head = out["head_token_ids"][torch.arange(2), 2]
+    assert out["head_valid_mask"].tolist() == [[True] * 6, [False] * 4 + [True] * 2]
+    last_head = out["head_token_ids"][torch.arange(2), -1]
     assert (last_head != out["last_hidden_state"].shape[1] - 1).all()
     with torch.no_grad():
         h_head = out["last_hidden_state"][torch.arange(2), last_head]
@@ -368,8 +367,9 @@ def _objective_data(
         "truncated": torch.zeros(N, dtype=torch.int64),
         "group_id": torch.zeros(N, dtype=torch.int64),
     }
+    data["terminated"][-1] = 1
     if counts is not None:
-        data["head_output_count"] = torch.tensor(counts, dtype=torch.int64)
+        data["readout_counts"] = torch.tensor(counts, dtype=torch.int64)
     return data
 
 
@@ -378,18 +378,18 @@ def test_dqn_duplicated_rows_match_single_head_output() -> None:
     N, A = 5, _ACTIONS
     q = torch.randn(N, A)
     q_target = torch.randn(N, A)
-    objective = DqnObjective( reward=_rew(), value=_val(), discount=_disc(gamma_step=0.9), temperature=0.0, gate=None, cross_group_backups="bootstrap")
+    objective = DqnObjective( reward=_rew(), value=_val(), discount=_disc(gamma_step=0.9), temperature=0.0, gate=None)
 
     base_data = _objective_data(N)
     base_loss, base_metrics = objective(
-        objective_data=base_data, group_id=_group_id(base_data), predictions=q,  backup_value_predictions=q_target, backup_action_predictions=q_target
+        objective_data=base_data, group_id=_group_id(base_data), head_step_ids=fixture_head_steps(base_data),  predictions=q,  backup_value_predictions=q_target, backup_action_predictions=q_target
     )
     # Duplicate every step's head-output row: same targets, same loss.
     q2 = q.repeat_interleave(2, dim=0)
     q2_target = q_target.repeat_interleave(2, dim=0)
     dup_data = _objective_data(N, counts=[2] * N)
     dup_loss, dup_metrics = objective(
-        objective_data=dup_data, group_id=_group_id(dup_data), predictions=q2,  backup_value_predictions=q2_target, backup_action_predictions=q2_target
+        objective_data=dup_data, group_id=_group_id(dup_data), head_step_ids=fixture_head_steps(dup_data),  predictions=q2,  backup_value_predictions=q2_target, backup_action_predictions=q2_target
     )
     assert torch.allclose(base_loss["action_value"], dup_loss["action_value"], atol=1e-6)
     for key in ("q_values_mean", "q_values_min", "q_values_max"):
@@ -397,32 +397,32 @@ def test_dqn_duplicated_rows_match_single_head_output() -> None:
 
 
 def test_dqn_multi_head_output_shares_step_target() -> None:
-    # N=2 steps, step 0 has two head-output rows, step 1 has one. Both rows of
+    # Three steps: two readouts, one readout, then a terminal without a readout. Both rows of
     # step 0 train toward the same target, bootstrapped from step 1's last row.
     gamma = 0.9
     q = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
     q_target = torch.tensor([[10.0, 20.0], [30.0, 40.0], [50.0, 60.0]])
-    objective = DqnObjective( reward=_rew(), value=_val(), discount=_disc(gamma_step=gamma), temperature=0.0, gate=None, cross_group_backups="bootstrap")
-    data = _objective_data(2, counts=[2, 1], actions=[0, 1])
-    data["reward"] = torch.tensor([0.0, 0.5])
+    objective = DqnObjective( reward=_rew(), value=_val(), discount=_disc(gamma_step=gamma), temperature=0.0, gate=None)
+    data = _objective_data(3, counts=[2, 1, 0], actions=[0, 1, 0])
+    data["reward"] = torch.tensor([0.0, 0.5, 0.0])
     loss, _ = objective(
-        objective_data=data, group_id=_group_id(data), predictions=q,  backup_value_predictions=q_target, backup_action_predictions=q_target
+        objective_data=data, group_id=_group_id(data), head_step_ids=fixture_head_steps(data),  predictions=q,  backup_value_predictions=q_target, backup_action_predictions=q_target
     )
     target = 0.5 + gamma * 60.0  # r_1 + gamma * max_a Q_target(s_1) (row 2)
-    expected = ((2.0 - target) ** 2 + (4.0 - target) ** 2) / 2  # a_1 = 1
+    expected = ((2.0 - target) ** 2 + (4.0 - target) ** 2 + 5.0 ** 2) / 3  # a_1 = 1
     assert loss["action_value"].item() == pytest.approx(expected)
 
 
-def test_dqn_misaligned_head_output_count_raises() -> None:
+def test_dqn_misaligned_readout_counts_raises() -> None:
     N = 3
     q = torch.randn(2 * N, _ACTIONS)
-    objective = DqnObjective( reward=_rew(), value=_val(), discount=_disc(), temperature=0.0, gate=None, cross_group_backups="bootstrap")
+    objective = DqnObjective( reward=_rew(), value=_val(), discount=_disc(), temperature=0.0, gate=None)
     bad = _objective_data(N, counts=[2, 2, 1])
-    with pytest.raises(ValueError, match="misaligned"):
-        objective(objective_data=bad, group_id=_group_id(bad), predictions=q,  backup_value_predictions=q.clone(), backup_action_predictions=q.clone())
+    with pytest.raises(ValueError, match="head_step_ids must have shape"):
+        objective(objective_data=bad, group_id=_group_id(bad), head_step_ids=fixture_head_steps(bad),  predictions=q,  backup_value_predictions=q.clone(), backup_action_predictions=q.clone())
     plain = _objective_data(N)
-    with pytest.raises(ValueError, match="head_output_count column"):
-        objective(objective_data=plain, group_id=_group_id(plain), predictions=q,  backup_value_predictions=q.clone(), backup_action_predictions=q.clone())
+    with pytest.raises(ValueError, match="head_step_ids must have shape"):
+        objective(objective_data=plain, group_id=_group_id(plain), head_step_ids=fixture_head_steps(plain),  predictions=q,  backup_value_predictions=q.clone(), backup_action_predictions=q.clone())
 
 
 # ---------------------------------------------------------------------------
@@ -432,24 +432,24 @@ def test_dqn_misaligned_head_output_count_raises() -> None:
 
 def test_plan_anchors_on_first_head_output_token() -> None:
     model = _tiny_model(with_reasoner=True)
-    batch, _, _sid = _packed(model)
+    batch, objective_data = _packed(model)
     # Seq 0: 3 steps × 5 tokens; head-output pairs (3,4), (8,9), (13,14).
     # Burst at step 1 → anchor 8 (the *first* head-output token).
-    plan = _plan_insertions(batch, np.array([1, -1]), num_thoughts=2)
+    plan = _plan_insertions(batch, objective_data, np.array([1, -1]), num_thoughts=2)
     assert plan is not None
     assert plan.anchors.tolist() == [8]
     assert plan.latent_positions.tolist() == [8, 9]
-    shifted = [p if p < 8 else p + 2 for p in batch.head_token_ids.tolist()]
+    shifted = [p if p < 8 else p + 2 for p in batch["head_token_mask"].nonzero(as_tuple=True)[0].tolist()]
     assert plan.ext_head_token_ids.tolist() == shifted
 
 
 def test_reasoning_forward_and_delayed_parity_multi_head_output() -> None:
     torch.manual_seed(0)
     model = _tiny_model(with_reasoner=True).eval()
-    batch, _, _sid = _packed(model)
+    batch, objective_data = _packed(model)
     delayed = copy_model(model, heads=True, backbone=True, reasoner=False).eval()
     with torch.no_grad():
-        out = model(batch, reasoning=[1, 0])
-        delayed_out = delayed(batch, reasoning=[1, 0])
-    assert out["predictions"]['action_value'].shape == (batch.P, _ACTIONS)
+        out = model(batch, objective_data=objective_data, reasoning=[1, 0])
+        delayed_out = delayed(batch, objective_data=objective_data, reasoning=[1, 0])
+    assert out["predictions"]['action_value'].shape == (batch["head_token_mask"].nonzero(as_tuple=True)[0].shape[0], _ACTIONS)
     assert torch.allclose(out["predictions"]['action_value'], delayed_out["predictions"]['action_value'], atol=0.0001)

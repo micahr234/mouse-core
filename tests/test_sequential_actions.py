@@ -1,4 +1,6 @@
 """Sequential decisions keep action time separate from environment time."""
+
+from tests._prediction_layout import fixture_head_steps
 import pytest
 import torch
 
@@ -11,7 +13,7 @@ def _fixture():
     data = dict(
         action=torch.tensor([0, 1, 0, 1, 0]),
         reward=torch.tensor([0., 0., 3., 0., 7.]),
-        terminated=torch.zeros(5, dtype=torch.bool),
+        terminated=torch.tensor([False, False, False, False, True]),
         truncated=torch.zeros(5, dtype=torch.bool),
         environment_step=torch.tensor([False, False, True, False, True]),
     )
@@ -23,21 +25,21 @@ def _objective(gate):
     return DqnObjective(
         discount=boundary_discount(gamma_step=.5, gamma_terminated=0.,
                                    gamma_truncated=1., step_key="environment_step"),
-        reward=None, value=None, gate=gate, cross_group_backups="bootstrap", temperature=0.0,
+        reward=None, value=None, gate=gate,  temperature=0.0,
     )
 
 
 @pytest.mark.parametrize("gate, expected", [
-    (None, [20., 23., 60., 47., 0.]),
-    (nstep_gate(n=2), [23., 33., 47., 47., 0.]),
-    (nstep_gate(n=1, step_key="environment_step"), [23., 23., 47., 47., 0.]),
-    (nstep_gate(n=2, step_key="environment_step"), [26.5, 26.5, 47., 47., 0.]),
+    (None, [20., 23., 60., 7., 0.]),
+    (nstep_gate(n=2), [23., 33., 7., 7., 0.]),
+    (nstep_gate(n=1, step_key="environment_step"), [23., 23., 7., 7., 0.]),
+    (nstep_gate(n=2, step_key="environment_step"), [6.5, 6.5, 7., 7., 0.]),
 ])
 def test_component_and_environment_horizons(gate, expected):
     data, values = _fixture()
     online = torch.zeros_like(values, requires_grad=True)
     losses, metrics = _objective(gate)(objective_data=data,
-        group_id=torch.zeros(5, dtype=torch.int64), predictions=online,
+        group_id=torch.zeros(5, dtype=torch.int64), head_step_ids=fixture_head_steps(data),  predictions=online,
         backup_value_predictions=values, backup_action_predictions=values)
     assert isinstance(metrics["backup"], torch.Tensor)
     torch.testing.assert_close(metrics["backup"][:4], torch.tensor(expected[:4]))
@@ -56,13 +58,13 @@ def test_variable_component_counts_and_group_isolation():
     data["reward"] = torch.tensor([0., 0., 0., 3., 7.])
     objective = _objective(nstep_gate(n=1, step_key="environment_step"))
     def targets(data, values, groups):
-        result = objective(objective_data=data, group_id=groups,
+        result = objective(objective_data=data, group_id=groups, head_step_ids=fixture_head_steps(data),
             predictions=torch.zeros_like(values), backup_value_predictions=values,
             backup_action_predictions=values)[1]["backup"]
         assert isinstance(result, torch.Tensor)
         return result
     single = targets(data, values, torch.zeros(5, dtype=torch.int64))
-    torch.testing.assert_close(single[:4], torch.tensor([33., 33., 33., 47.]))
+    torch.testing.assert_close(single[:4], torch.tensor([33., 33., 33., 7.]))
     combined = targets({k: torch.cat([v, v]) for k, v in data.items()},
                        torch.cat([values, values + 1000]),
                        torch.tensor([0] * 5 + [1] * 5))
@@ -74,7 +76,7 @@ def test_boundary_flags_propagate_through_component_return(flag, expected):
     data, values = _fixture()
     data[flag][2] = True
     _, metrics = _objective(nstep_gate(n=1, step_key="environment_step"))(
-        objective_data=data, group_id=torch.zeros(5, dtype=torch.int64),
+        objective_data=data, group_id=torch.zeros(5, dtype=torch.int64), head_step_ids=fixture_head_steps(data),
         predictions=torch.zeros_like(values), backup_value_predictions=values,
         backup_action_predictions=values)
     assert isinstance(metrics["backup"], torch.Tensor)
@@ -113,17 +115,19 @@ def test_all_components_receive_reward_without_extra_discount(components):
                 terminated=torch.zeros(count, dtype=torch.bool),
                 truncated=torch.zeros(count, dtype=torch.bool),
                 environment_step=torch.tensor([False] * components + [True]))
+    data["terminated"][-1] = True
     values = torch.zeros(count, 2)
     values[-1, 1] = 10.
     _, metrics = _objective(nstep_gate(n=1, step_key="environment_step"))(
-        objective_data=data, group_id=torch.zeros(count, dtype=torch.int64),
+        objective_data=data, group_id=torch.zeros(count, dtype=torch.int64), head_step_ids=fixture_head_steps(data),
         predictions=values, backup_value_predictions=values, backup_action_predictions=values)
     backup = metrics["backup"]
     assert isinstance(backup, torch.Tensor)
-    torch.testing.assert_close(backup[:-1], torch.full((components,), 11.))
+    torch.testing.assert_close(backup[:-1], torch.full((components,), 6.))
 
 
 @pytest.mark.parametrize("mode", ["next_action", "n_actions", "next_step"])
+@pytest.mark.flex_training(default_device=False)
 def test_sequential_notebook_collects_and_trains(mode, monkeypatch):
     import json
     from pathlib import Path
@@ -205,15 +209,16 @@ def test_sequential_notebook_collects_and_trains(mode, monkeypatch):
             field = ("shoulder_torque", "elbow_torque")[index % 2]
             assert set(payload) == {"action", field}
         objective = namespace["objective"]
-        assert objective.cross_group_backups == "fault"
+
         assert history[-1]["truncated"] and "terminated" not in history[-1]
-        _, data, groups = pack_token_batch(
+        inputs, data = pack_token_batch(
             steps=namespace["tokenizer"].encode(raw_history),
             sequence_ids=[0] * len(history), batch_size=1, continuing=None,
         )
+        groups = data["step_sequence_ids"]
         assert objective.discount(**data)[-1] == 0
-        values = torch.full((int(data["head_output_count"].sum()), namespace["MAX_ACTIONS"]), 1000.)
-        _, metrics = objective(objective_data=data, group_id=groups,
+        values = torch.full((inputs["head_token_mask"].nonzero(as_tuple=True)[0].shape[0], namespace["MAX_ACTIONS"]), 1000.)
+        _, metrics = objective(objective_data=data, group_id=groups, head_step_ids=data["head_step_ids"],
             predictions=values, backup_value_predictions=values,
             backup_action_predictions=values)
         # The final executed action learns its actual reward, with no value
@@ -221,7 +226,7 @@ def test_sequential_notebook_collects_and_trains(mode, monkeypatch):
         assert metrics["backup"][-1].item() == pytest.approx(history[-1]["reward"])
         with pytest.raises(ValueError, match="cross-group backup"):
             objective(objective_data={key: value[:-1] for key, value in data.items()},
-                group_id=groups[:-1], predictions=values,
+                group_id=groups[:-1], head_step_ids=data["head_step_ids"],  predictions=values,
                 backup_value_predictions=values, backup_action_predictions=values)
         for index, applied in enumerate(applied_actions[-episode_steps:]):
             # One vector per physical step, assembled in the recorded component order.

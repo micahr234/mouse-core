@@ -1,0 +1,72 @@
+{
+  "python": "3.15.0 (main, Oct  9 2026, 15:24:40) [Clang 22.1.3 ]",
+  "torch": "2.15.0.dev20261005+cpu",
+  "results": [
+    {
+      "token_budget": 10000,
+      "workers": 0,
+      "repeat": 0,
+      "first_ms": 543.4377419878729,
+      "ms_per_batch": 387.1089480635419,
+      "tokens_per_second": 23435.42443382339,
+      "mean_tokens": 9072.0625,
+      "verified_batches": 4,
+      "median_wait_ms": 386.2340169871459
+    },
+    {
+      "token_budget": 10000,
+      "workers": 4,
+      "repeat": 0,
+      "first_ms": 4867.372606007848,
+      "ms_per_batch": 111.60568312334362,
+      "tokens_per_second": 81286.74316677761,
+      "mean_tokens": 9072.0625,
+      "verified_batches": 4,
+      "median_wait_ms": 4.041311491164379
+    },
+    {
+      "token_budget": 10000,
+      "workers": 0,
+      "repeat": 1,
+      "first_ms": 566.4213389973156,
+      "ms_per_batch": 390.3769329372153,
+      "tokens_per_second": 23239.2381172252,
+      "mean_tokens": 9072.0625,
+      "verified_batches": 4,
+      "median_wait_ms": 390.99490699300077
+    },
+    {
+      "token_budget": 10000,
+      "workers": 4,
+      "repeat": 1,
+      "first_ms": 4789.0282459848095,
+      "ms_per_batch": 110.20879325042188,
+      "tokens_per_second": 82317.0477820768,
+      "mean_tokens": 9072.0625,
+      "verified_batches": 4,
+      "median_wait_ms": 3.19788049091585
+    },
+    {
+      "token_budget": 10000,
+      "workers": 0,
+      "repeat": 2,
+      "first_ms": 549.4505790120456,
+      "ms_per_batch": 389.5941159371432,
+      "tokens_per_second": 23285.93304900857,
+      "mean_tokens": 9072.0625,
+      "verified_batches": 4,
+      "median_wait_ms": 389.2637204990024
+    },
+    {
+      "token_budget": 10000,
+      "workers": 4,
+      "repeat": 2,
+      "first_ms": 4835.042837017681,
+      "ms_per_batch": 110.53434712630406,
+      "tokens_per_second": 82074.6015682677,
+      "mean_tokens": 9072.0625,
+      "verified_batches": 4,
+      "median_wait_ms": 5.062823489424773
+    }
+  ]
+}

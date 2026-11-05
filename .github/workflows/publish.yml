@@ -23,10 +23,10 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Install free-threaded Python and build tools
+      - name: Install standard Python and build tools
         run: |
-          uv python install 3.15t
-          uv venv --python 3.15t
+          uv python install 3.15
+          uv venv --python 3.15
           uv pip install "build>=1.6.1" "twine>=7.0.0" --python .venv/bin/python
 
       - name: Verify tag matches package version

@@ -1,3 +1,5 @@
+
+from tests._prediction_layout import fixture_head_steps
 import numpy as np
 from typing import cast
 import pytest
@@ -82,7 +84,7 @@ def test_grpo_likelihood_ratio_matches_collected_episode_policy(temperature):
             'advantage': torch.tensor([0., 1., -1., 1.])}
     objective = GrpoObjective(clip_ratio_min=0.8, clip_ratio_max=1.2, ent_coef=0.01, num_actions=3)
     losses, metrics = objective(
-        objective_data=data, group_id=torch.zeros(4, dtype=torch.int64),
+        objective_data=data, group_id=torch.zeros(4, dtype=torch.int64), head_step_ids=fixture_head_steps(data),
         predictions=tempered_policy_logits(scores, torch.full((4,), temperature)),
     )
     assert metrics['approx_kl'] == pytest.approx(0., abs=1e-7)
@@ -131,7 +133,7 @@ def test_decode_selector_handles_tiny_temperature_and_large_finite_scores(temper
     actions = select_discrete_action(
         scores=torch.tensor([[[-limit, limit]], [[1., 2.]]]), temperature=temperature,
     )
-    assert actions.tolist() == [1, 1]
+    assert actions.tolist() == [[1], [1]]
     expected = torch.tensor([[0., 1.], [0., 1.]], dtype=torch.float64)
     expected[1] = (torch.tensor([1., 2.], dtype=torch.float64) / temperature).softmax(-1)
     torch.testing.assert_close(probabilities[0], expected)

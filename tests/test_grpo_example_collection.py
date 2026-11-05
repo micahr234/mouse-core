@@ -1,4 +1,5 @@
 import ast
+from functools import partial
 import copy
 import json
 from pathlib import Path
@@ -8,9 +9,14 @@ from typing import Any
 import numpy as np
 import torch
 
-from mouse_core.data import Datastore, EventLog, environment_decisions, latest_environment_decision
+from mouse_core.data import EnvironmentProtocol, Datastore, EventLog, environment_decisions, latest_environment_decision
 from mouse_gym import RepeatTaskTracker
 from mouse_core.objectives import group_relative_advantages
+
+
+environment_decisions = partial(environment_decisions, protocol=EnvironmentProtocol(
+    episode_start="_episode_start", terminated="_terminated", truncated="_truncated",
+))
 
 
 PATH = Path(__file__).resolve().parents[1] / 'examples/08_train_online_grpo.ipynb'
@@ -27,7 +33,7 @@ def _functions(names, namespace):
 def _reset_log():
     log = EventLog()
     log.event(provider='coordinator', episode_index=0, step_index=0, payload={
-        'episode_start': True,
+        '_episode_start': True,
     })
     log.event(provider='environment', episode_index=0, step_index=0, payload={
         'observation': 0,
@@ -35,8 +41,8 @@ def _reset_log():
         'reward': 0.0,
         'inner_terminated': False,
         'inner_truncated': False,
-        'terminated': False,
-        'truncated': False,
+        '_terminated': False,
+        '_truncated': False,
         'action_requested': True,
     })
     return log
@@ -85,7 +91,7 @@ def test_example_branches_share_random_state_and_use_terminal_rewards():
     assert len(log) == 2 and tracker.action_requested and tracker.step_index == 0
     assert tracker.tasks == tracker.episodes == ()
     assert returns == [0.0, 1.0]
-    assert all(len(events) == 122 and events[-1]['payload']['terminated'] for events in branches)
+    assert all(len(events) == 122 and events[-1]['payload']['_terminated'] for events in branches)
     event_branches = branches
     source_branches = copy.deepcopy(event_branches)
     branches = [list(environment_decisions(events)) for events in branches]
@@ -94,7 +100,7 @@ def test_example_branches_share_random_state_and_use_terminal_rewards():
         assert 'action' not in branch[0]
         assert branch[0]['repeat_episode_index'] == 0
         assert all('repeat_episode_index' not in row for row in branch[1:])
-        assert all(row['action'] == action and row['old_log_prob'] == -.69 for row in branch[1:])
+        assert all(row['action'] == action and row['_old_log_prob'] == -.69 for row in branch[1:])
         assert all(row.get('reward', 0.) == 0. for row in branch[:-1])
         replay = EventLog()
         for row in branch:
@@ -122,7 +128,7 @@ def test_example_collection_starts_new_groups_without_prior_history():
     def fork_group(**kwargs):
         log = kwargs['log']
         prefix = list(environment_decisions(log.to_dataset()))
-        assert len(log) == 2 and len(prefix) == 1 and prefix[0]['episode_start']
+        assert len(log) == 2 and len(prefix) == 1 and prefix[0]['_episode_start']
         assert prefix[0]['repeat_episode_index'] == 0
         assert 'repeat_episode_index' not in log[0]['payload']
         seen.append((prefix[0]['observation'], prefix[0]['episode_index']))
@@ -177,5 +183,5 @@ def test_example_branch_logs_only_executed_actions_and_repeat_boundaries():
         replayed.event(**event)
     assert list(environment_decisions(replayed.to_store().to_dataset())) == rows
     assert [row.get('action') for row in rows] == [None, 2, None, 2]
-    assert ['old_log_prob' in row for row in rows] == [False, True, False, True]
+    assert ['_old_log_prob' in row for row in rows] == [False, True, False, True]
     assert [row.get('reward', 0.) for row in rows] == [0., 0., 0., 1.]

@@ -21,7 +21,7 @@ permutation (inverse-permuted along the last axis).
 ``DataLoader`` calls ``train_transform.reseed`` with a generation unique to
 each sampled sequence, so every draw is a pure function
 of ``(seed, sequence generation, seed_field value)`` no matter which worker
-thread builds the batch. Two windows that share a ``seed_field`` value still
+process builds the batch. Two windows that share a ``seed_field`` value still
 get independent starting seeds; steps inside one window that share the value
 share draws. The generation and its draw cache are per thread. Eval / decode
 uses a second compose that omits the augmenter so raw values reach the model.
@@ -101,19 +101,20 @@ class SequenceAugmentFieldSpec:
     provider. Use ``Augmenter.events`` before ``Tokenizer.encode``.
     Optional fields do not create missing payload values.
 
-    For ``type='discrete'`` with ``permute=True``, ``input_field`` values are
+    For ``type='discrete_permute'``, ``input_field`` values are
     ids in ``[0, vocab_size)`` remapped by the sampled permutation.
     ``input_vector_field`` names optional id-indexed vectors (for example
     ``q_star``) that share that permutation: each vector is reordered so
     ``values[perm[i]]`` stays aligned with remapped ids. Omitted
     ``output_vector_field`` defaults to ``input_vector_field``. Different
     names write outputs and leave inputs.
+    ``type="discrete"`` supports masking/copying without permutation.
     Vector layout is never inferred from array shape.
     Missing or ``None`` fields are skipped without inserting outputs;
     associated value vectors are still transformed when present.
     """
 
-    type: Literal["discrete", "linear", "image"]
+    type: Literal["discrete", "discrete_permute", "linear", "image"]
     input_field: str | Sequence[str]
     provider: str | None = None
     output_field: str | Sequence[str] | None = None
@@ -133,17 +134,16 @@ class SequenceAugmentFieldSpec:
     shift_std: float = 0.0
     shift_low: float | None = None
     shift_high: float | None = None
-    permute: bool = False
     mask_value: Any = None
 
     def __post_init__(self) -> None:
         if self.provider is not None and (not isinstance(self.provider, str) or not self.provider):
             raise ValueError("provider must be a nonempty string or None")
         kind = self.type.lower()
-        if kind not in ("discrete", "linear", "image"):
+        if kind not in ("discrete", "discrete_permute", "linear", "image"):
             raise ValueError(
                 f"unknown augment type {self.type!r} for field {self.input_field!r}; "
-                "expected one of ('discrete', 'linear', 'image')."
+                "expected one of ('discrete', 'discrete_permute', 'linear', 'image')."
             )
         object.__setattr__(self, "type", kind)
         if self.output_field is None:
@@ -170,15 +170,13 @@ class SequenceAugmentFieldSpec:
             )
         if not 0.0 <= self.mask_prob <= 1.0:
             raise ValueError(f"mask_prob for field {self.input_field!r} must be in [0, 1], got {self.mask_prob}.")
-        if self.permute:
-            if kind != "discrete":
-                raise ValueError(f"field {self.input_field!r}: permute=True requires type='discrete'.")
+        if kind == "discrete_permute":
             if self.vocab_size is None or self.vocab_size <= 0:
-                raise ValueError(f"field {self.input_field!r}: vocab_size must be positive when permute=True.")
+                raise ValueError(f"field {self.input_field!r}: vocab_size must be positive for type='discrete_permute'.")
         if in_v:
-            if not self.permute:
+            if kind != "discrete_permute":
                 raise ValueError(
-                    f"field {self.input_field!r}: input_vector_field requires permute=True."
+                    f"field {self.input_field!r}: input_vector_field requires type='discrete_permute'."
                 )
             overlap = set(in_f) & set(in_v)
             if overlap:
@@ -198,10 +196,10 @@ class SequenceAugmentFieldSpec:
                     f"field {self.input_field!r}: linear augmentation uses scale_in_low, "
                     "scale_out_low, scale_in_high, and scale_out_high."
                 )
-            if self.type == "discrete":
+            if self.type in ("discrete", "discrete_permute"):
                 raise ValueError(
                     f"field {self.input_field!r}: scale/shift parameters only apply to "
-                    "type='image'; discrete fields support permute, mask_prob, "
+                    "type='image'; discrete fields support mask_prob "
                     "and mask_value."
                 )
 
@@ -278,7 +276,7 @@ class SequenceAugmentFieldSpec:
     def is_active(self) -> bool:
         linear_scale, linear_shift = self.linear_transform()
         return (
-            self.permute
+            self.type == "discrete_permute"
             or self.mask_prob > 0.0
             or self.input_fields != self.output_fields
             or linear_scale != 1.0
@@ -305,7 +303,7 @@ class Augmenter:
     every key. Mask decisions (``mask_prob``) are drawn independently per
     step (one draw per field spec per call), from a stream seeded by the
     base seed and generation.
-    Discrete ``permute=True`` specs remap ``input_field`` ids; set
+    ``type="discrete_permute"`` specs remap ``input_field`` ids; set
     ``input_vector_field`` / ``output_vector_field`` for id-indexed vectors
     that must stay aligned with those ids (they share the same sampled
     permutation).
@@ -326,6 +324,21 @@ class Augmenter:
         self._generation = 0
         self._lock = threading.Lock()
         self._tls = threading.local()
+
+    def __getstate__(self):
+        """Serialize configuration and draws, rebuilding synchronization per worker."""
+        state = {key: value for key, value in self.__dict__.items()
+                 if key not in {"_lock", "_tls"}}
+        state["_thread_state"] = self._tls.__dict__.copy()
+        return state
+
+    def __setstate__(self, state):
+        state = state.copy()
+        thread_state = state.pop("_thread_state")
+        self.__dict__.update(state)
+        self._lock = threading.Lock()
+        self._tls = threading.local()
+        self._tls.__dict__.update(thread_state)
 
     def __deepcopy__(self, memo):
         """Copy configuration and calling-thread draws without sharing locks."""
@@ -468,7 +481,7 @@ class Augmenter:
         spec: SequenceAugmentFieldSpec,
         rng: np.random.Generator,
     ) -> dict[str, Any]:
-        if spec.permute:
+        if spec.type == "discrete_permute":
             assert spec.vocab_size is not None
             perm = rng.permutation(spec.vocab_size)
         else:

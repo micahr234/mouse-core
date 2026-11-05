@@ -113,8 +113,7 @@ def preferred_dtype(*, device: torch.device | str | None = None) -> torch.dtype:
 
     Pass as the backbone ``dtype`` (``Backbone(dtype=preferred_dtype(device=device),
     ...)``) for a LoRA
-    backbone (frozen base) or for inference; the CUDA flash varlen kernel
-    needs bf16/fp16. Every trainable section is float32 regardless. To
+    backbone (frozen base) or for inference. Every trainable section is float32 regardless. To
     fine-tune the whole backbone, build it with ``dtype=torch.float32``.
     """
     if device is None:

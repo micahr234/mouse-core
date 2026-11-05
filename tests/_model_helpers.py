@@ -1,4 +1,5 @@
 """Standard model fixtures and explicit module groups for component tests."""
+from tensordict import TensorDict
 import copy
 
 import torch
@@ -7,7 +8,7 @@ from typing import Any
 
 from torch import nn
 
-from mouse_core.models import Model, TokenBatch, Embedding, DecodeCache, prepare_decode, select_discrete_action
+from mouse_core.models import Model, Embedding, DecodeCache, prepare_decode, select_discrete_action
 from mouse_core.models.backbone import BaseBackbone
 from mouse_core.models.reasoner import LatentReasoner
 
@@ -32,6 +33,7 @@ class ExampleModel(Model):
         self._backbone_has_parameters = next(backbone.parameters(), None) is not None
         self.projection = projection if projection is not None else nn.Identity()
         self.heads = nn.ModuleDict(heads)
+        self.to(torch.get_default_device())
 
     def get_action(self, *, out, temperature, num_actions=None):
         # This fixture explicitly acts from its first prediction. Real agents
@@ -39,27 +41,26 @@ class ExampleModel(Model):
         predictions = out["predictions"]
         valid = out.get("head_valid_mask")
         return select_discrete_action(
-            scores=next(iter(predictions.values())), valid=valid,
+            scores=_last_action_scores(next(iter(predictions.values())), name="action", valid=valid),
             temperature=temperature, num_actions=num_actions,
         )
 
     def forward(
-        self, batch, *, cache=None, use_cache=False, reasoning=None,
+        self, batch, *, cache=None, use_cache=False, reasoning=None, objective_data=None,
     ) -> dict[str, Any]:
-        if not isinstance(batch, TokenBatch):
+        if not isinstance(batch, TensorDict):
             raise TypeError("ExampleModel.forward expects a TokenBatch.")
         if cache is not None and not use_cache:
             raise ValueError("Passing cache= requires use_cache=True.")
-        tensors = batch.to_tensors(next(self.parameters()).device)
+        tensors = batch.to(next(self.parameters()).device)
         token_ids = tensors["token_ids"]
         numeric_values = tensors["numeric_values"]
         numeric_mask = tensors["numeric_mask"]
         sequence_ids = tensors["sequence_ids"]
-        head_token_ids = tensors["head_token_ids"]
-        head_step_ids = tensors["head_step_ids"]
+        head_token_ids = tensors["head_token_mask"].nonzero(as_tuple=True)[0]
         embed = self.embedding(
             token_ids, numeric_values=numeric_values, numeric_mask=numeric_mask,
-            numeric_field_ids=tensors["numeric_field_ids"], numeric_field_names=batch.numeric_field_names,
+            numeric_field_ids=tensors["numeric_field_ids"], numeric_field_names=batch['numeric_field_names'],
         )
         head_valid_mask = None
         if reasoning is not None:
@@ -68,17 +69,17 @@ class ExampleModel(Model):
             if self.reasoner is None:
                 raise ValueError("reasoning= requires a reasoner.")
             embed, sequence_ids, head_token_ids = self.reasoner.insert(
-                embeds=embed, tokens=batch, sequence_ids=sequence_ids,
+                embeds=embed, tokens=batch, objective_data=objective_data, sequence_ids=sequence_ids,
                 head_token_ids=head_token_ids,
                 splits=reasoning, backbone=self.backbone,
             )
         if use_cache:
             embed, lengths, head_token_ids, head_valid_mask = prepare_decode(
                 embeds=embed, tokens=batch, sequence_ids=sequence_ids,
-                head_token_ids=head_token_ids, head_step_ids=head_step_ids,
+                head_token_mask=tensors["head_token_mask"],
             )
             if cache is None:
-                cache = DecodeCache(sessions=(self.backbone.decode_session(batch_size=batch.B),))
+                cache = DecodeCache(sessions=(self.backbone.decode_session(batch_size=batch["num_sequences"]),))
             if len(cache.sessions) != 1:
                 raise ValueError("cache must contain one session per backbone stage.")
             features = self.backbone(embed, cache=cache.sessions[0], lengths=lengths)
@@ -135,3 +136,54 @@ def fresh_model[T: Model](model: T) -> T:
         for parameter in fresh.parameters():
             parameter.zero_()
     return fresh
+
+def _last_valid_step(valid: torch.Tensor) -> torch.Tensor:
+    """Last True index along dim=-1. Every row must have a valid head-output."""
+    if valid.ndim != 2 or valid.dtype != torch.bool:
+        raise ValueError(
+            f"head_valid_mask must be bool [B, S], got {valid.dtype} {tuple(valid.shape)}"
+        )
+    has = valid.any(dim=-1)
+    if not bool(has.all()):
+        empty = (~has).nonzero(as_tuple=True)[0]
+        raise ValueError(
+            "get_action needs a valid head-output token in every row; "
+            f"empty rows: {empty.tolist()}."
+        )
+    idx = valid.long() * torch.arange(valid.shape[1], device=valid.device)
+    return idx.max(dim=-1).values
+
+
+def _last_action_scores(
+    raw: torch.Tensor,
+    *,
+    name: str,
+    valid: torch.Tensor | None,
+) -> torch.Tensor:
+    """Action scores at the last valid head-output of each row.
+
+    Q / logit heads: ``[B, S, A]`` / ``[N, A]``. ``valid`` is the decode
+    ``[B, S]`` mask; omitted, the last step column is used (left-padded
+    decode).
+    """
+    expected_mask_shape = raw.shape[:2] if raw.ndim == 3 else (1, 1)
+    if valid is not None and valid.shape != expected_mask_shape:
+        raise ValueError(
+            f"{name} scores {tuple(raw.shape)} do not match "
+            f"head_valid_mask {tuple(valid.shape)}"
+        )
+    step = None if valid is None else _last_valid_step(valid)
+    batch = None if step is None else torch.arange(raw.shape[0], device=raw.device)
+    if raw.ndim == 3:
+        if step is None:
+            return raw[:, -1]
+        return raw[batch, step]
+    if raw.ndim == 2:
+        if raw.shape[0] != 1:
+            raise ValueError(
+                f"{name} has shape {tuple(raw.shape)}; get_action on flat "
+                "[N, A] training outputs needs N=1 (one step). Use "
+                "cached-decode [B, S, A] outputs for a batch."
+            )
+        return raw[-1].unsqueeze(0)
+    raise ValueError(f"{name} expects [B, S, A] or [N, A], got {tuple(raw.shape)}")

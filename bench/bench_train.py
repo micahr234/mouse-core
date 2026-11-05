@@ -1,42 +1,8 @@
-"""Benchmark the packed training forward (``packed_forward``) on CUDA.
+"""Benchmark FlexAttention packed training on CUDA.
 
-Measures, per workload: steady-state forward, forward+backward, a complete
-LoRA training step (AdamW), real tokens/second, and peak allocated memory
-above the parameter baseline, for every ``--train-kernel`` (``varlen``:
-flash varlen; ``flex``: FlexAttention block mask; ``padded``: dense causal
-SDPA on segments padded to ``max_seqlen``) in each ``--modes`` body
-(eager, compiled via ``install_compiled_decoder``, compiled with
-``gradient_checkpointing``). Warmup / compile time is reported separately.
-CUDA is synchronized around every measurement; medians and min/max over
-``--iters`` iterations. Each kernel's outputs are also checked against the
-other's on the same inputs (max abs diff printed per workload).
-``--profile`` adds a ``torch.profiler`` CPU/CUDA breakdown after warmup.
-
-    PYTHON_GIL=0 .venv/bin/python bench/bench_train.py --layers 8
-    PYTHON_GIL=0 .venv/bin/python bench/bench_train.py --layers 28 --workloads mid long
-    PYTHON_GIL=0 .venv/bin/python bench/bench_train.py --train-kernel flex --modes compiled
-    PYTHON_GIL=0 .venv/bin/python bench/bench_train.py --layers 8 --workloads short --modes compiled --train-kernel flex --profile
-
-Default shape is Qwen3-0.6B (hidden 1024, 16 q / 8 kv heads, head_dim 128,
-FFN 3072) with fp32 LoRA rank 16 on a frozen bf16 base; ``--layers`` trims the
-depth so long streams fit. Pass ``--no-lora`` for a fully trainable fp32
-backbone (fp32 reference attention / unfused Flex).
-
-Reference numbers (RTX 3090 Ti, torch 2.13.0+cu130, 8 layers, LoRA r16,
-fwd+bwd median, compiled body) for the two kernels on the same weights and
-streams; peak memory is equal within 10 MB:
-
-    workload                 flex       varlen
-    short   L=512  4 seqs     18.5 ms    21.8 ms
-    mid     L=4096 8 seqs     73.2 ms    69.0 ms
-    mid recurring groups      73.6 ms    67.5 ms
-    long    L=16384 4 seqs   401.1 ms   326.2 ms
-    long recurring groups    284.3 ms   252.1 ms
-    long 512 groups of 32    237.2 ms   237.2 ms
-
-Compile warmup for the first fwd+bwd: ~2.5 s with varlen, ~12 s with Flex
-(the block-mask kernel is autotuned). Gradient checkpointing (28 layers,
-L=4096): 7372 MB -> 779 MB at 1.44x the step time.
+Measure eager, compiled, and checkpointed decoder bodies: forward, backward,
+optimizer step, tokens/second, and peak allocation. Compile warmup is reported
+separately. Example: python bench/bench_train.py --layers 8 --modes compiled
 """
 
 from __future__ import annotations
@@ -127,7 +93,6 @@ def main() -> None:
         default=["short", "mid", "mid_recurring", "high_variance", "long", "long_recurring", "long_manysmall"],
     )
     parser.add_argument("--modes", nargs="+", default=["eager", "compiled", "compiled+checkpoint"])
-    parser.add_argument("--train-kernel", nargs="+", default=["varlen", "flex", "padded"], choices=["varlen", "flex", "padded"])
     add_profile_args(parser)
     args = parser.parse_args()
 
@@ -136,7 +101,7 @@ def main() -> None:
     device = torch.device("cuda")
     torch.manual_seed(0)
     lora = None if args.no_lora else LoRAConfig(rank=16, alpha=32.0)
-    kernels = cast(list[TrainKernel], args.train_kernel)
+    kernels: list[TrainKernel] = ["flex"]
     dtype = torch.float32 if lora is None else torch.bfloat16
     backbone = Backbone(
         train_kernel=kernels[0],
@@ -157,7 +122,7 @@ def main() -> None:
             if ".lora_B." in name:
                 torch.nn.init.normal_(p, std=0.02)  # nonzero B so A receives gradients
     trainable = [p for p in backbone.parameters() if p.requires_grad]
-    optimizer = AdamW(params=trainable, lr=1e-4)
+    optimizer = AdamW(params=[{'params': trainable, 'lr': 1e-4}])
     props = torch.cuda.get_device_properties(device)
     print(
         f"{props.name} | torch {torch.__version__} | layers={args.layers} base dtype={dtype} "
@@ -170,10 +135,6 @@ def main() -> None:
             install_compiled_decoder()
         backbone.gradient_checkpointing = "checkpoint" in mode
         for kernel in kernels:
-            other = cast(TrainKernel, next(
-                (k for k in ("varlen", "flex", "padded") if k != kernel and k in kernels),
-                "varlen" if kernel != "varlen" else "flex",
-            ))
             print(f"\n### mode: {mode} | train_kernel: {kernel}")
             for wname in args.workloads:
                 seq = _workload(wname, device)
@@ -211,13 +172,11 @@ def main() -> None:
                 first_f, med_f, _, _, peak_f = _timed(fwd, iters)
                 first_b, med_b, lo_b, hi_b, peak_b = _timed(fwd_bwd, iters)
                 _, med_s, _, _, peak_s = _timed(train_step, iters)
-                diff = (fwd().float() - fwd(other).float()).abs().max().item()
                 print(
                     f"  {wname:15s} L={L:6d} sequences={int(seq.unique().numel()):4d} | "
                     f"fwd {med_f:8.2f} ms (+{peak_f:6.0f} MB) | fwd+bwd {med_b:8.2f} ms [{lo_b:.1f},{hi_b:.1f}] "
                     f"(+{peak_b:6.0f} MB) | step {med_s:8.2f} ms (+{peak_s:6.0f} MB) | "
                     f"{L / med_b * 1e3:>9,.0f} tok/s | first fwd {first_f:.0f} ms, first fwd+bwd {first_b:.0f} ms | "
-                    f"vs {other} {diff:.2e}"
                 )
                 if wants_profile(args):
                     tag = f"{mode} {kernel} {wname}"

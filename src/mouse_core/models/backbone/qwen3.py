@@ -7,14 +7,13 @@ from typing import Any
 
 from transformers import Qwen3Config, Qwen3Model
 
-from mouse_core.models.backbone.base import _disable_cudnn_sdp
 
 
 @dataclass
 class _Qwen3BackboneConfig:
     """Configuration for a Qwen3 transformer stack.
 
-    Builds a HuggingFace ``Qwen3Model`` with SDPA attention. ``vocab_size=``
+    Builds a HuggingFace ``Qwen3Model`` as a parameter container for Mouse FlexAttention. ``vocab_size=``
     is a temporary stub of 1; Backbone removes the table before use.
     """
 
@@ -40,7 +39,6 @@ class _Qwen3BackboneConfig:
             self.num_key_value_heads = int(self.num_key_value_heads)
 
     def build(self, hidden_dim: int, *, vocab_size: int) -> Qwen3Model:
-        _disable_cudnn_sdp()
         if self.head_dim is None:
             if hidden_dim % self.num_heads != 0:
                 raise ValueError(
@@ -67,7 +65,6 @@ class _Qwen3BackboneConfig:
         if self.rope_parameters is not None:
             config_kwargs["rope_parameters"] = self.rope_parameters
         config = Qwen3Config(**config_kwargs)
-        config._attn_implementation = "sdpa"
         return Qwen3Model(config)
 
 

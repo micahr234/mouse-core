@@ -16,56 +16,69 @@ def _inputs(*rows):
                 numeric_mask=np.zeros(len(heads), dtype=bool), head_token_mask=np.array(heads, dtype=bool),
             ))
             sequences.append(sequence)
-    return pack_token_batch(steps=steps, sequence_ids=sequences, batch_size=len(rows), continuing=None)[0]
+    return pack_token_batch(steps=steps, sequence_ids=sequences, batch_size=len(rows), continuing=None)
 
 
 def _scores(inputs, cached):
     # Each token has distinct scores; prepare_decode collapses multiple heads
     # per step and left-pads ragged/empty rows exactly as notebook models do.
-    features = torch.arange(inputs.L * 3, dtype=torch.float32).reshape(-1, 3)
+    features = torch.arange(inputs["token_ids"].shape[0] * 3, dtype=torch.float32).reshape(-1, 3)
     if not cached:
-        return features[inputs.head_token_ids]
-    tensors = inputs.to_tensors('cpu')
+        return features[inputs["head_token_mask"].nonzero(as_tuple=True)[0]]
+    tensors = inputs.to('cpu')
     padded, _, heads, _ = prepare_decode(
         embeds=features, tokens=inputs, sequence_ids=tensors['sequence_ids'],
-        head_token_ids=tensors['head_token_ids'], head_step_ids=tensors['head_step_ids'],
+        head_token_mask=tensors["head_token_mask"],
     )
     return padded.gather(1, heads.unsqueeze(-1).expand(-1, -1, 3))
 
 
 @pytest.mark.parametrize('cached', [False, True])
 def test_current_step_readouts_handle_sparse_heads_padding_and_requested_order(cached):
-    inputs = _inputs([[True], [False], [True, True]], [], [[False]], [[True]])
+    inputs, objective_data = _inputs([[True], [False], [True, True]], [], [[False]], [[True]])
     scores = _scores(inputs, cached)
     actual = action_readouts(scores, inputs, sequence_ids=[3, 0])
     packed = _scores(inputs, False)
     torch.testing.assert_close(actual, packed[[3, 2]])
-    actions = select_discrete_action(scores=scores, inputs=inputs, sequence_ids=[3, 0], temperature=0.)
+    actions = select_discrete_action(scores=actual, temperature=0.)
     assert actions.tolist() == [2, 2]
     assert action_readouts(scores, inputs, sequence_ids=[]).shape == (0, 3)
 
 
-@pytest.mark.parametrize('cached', [False, True])
-@pytest.mark.parametrize('last_step', [[False], []])
-def test_older_readout_cannot_replace_missing_current_step(cached, last_step):
-    inputs = _inputs([[True], last_step])
-    with pytest.raises(ValueError, match='current step'):
-        select_discrete_action(scores=_scores(inputs, cached), inputs=inputs, temperature=0.)
+def test_action_sampler_returns_an_action_for_every_marked_token():
+    inputs, _ = _inputs([[True, True], [False], [True]], [[True]])
+    scores = _scores(inputs, False)
+    assert select_discrete_action(scores=scores, temperature=0.).tolist() == [2, 2, 2, 2]
 
 
 @pytest.mark.parametrize('cached', [False, True])
 def test_passive_and_empty_rows_are_rejected_if_requested(cached):
-    inputs = _inputs([[True]], [[False]], [])
+    inputs, objective_data = _inputs([[True]], [[False]], [])
     scores = _scores(inputs, cached)
-    with pytest.raises(ValueError, match='current step'):
+    with pytest.raises(ValueError, match='without a marked head token'):
         action_readouts(scores, inputs, sequence_ids=[1])
-    with pytest.raises(ValueError, match='without a current step'):
+    with pytest.raises(ValueError, match='without a marked head token'):
         action_readouts(scores, inputs, sequence_ids=[2])
 
 
 @pytest.mark.parametrize('cached', [False, True])
 def test_readout_layout_must_match_input_metadata(cached):
-    inputs = _inputs([[True], [True]], [[True]])
+    inputs, objective_data = _inputs([[True], [True]], [[True]])
     scores = _scores(inputs, cached)[:1]
     with pytest.raises(ValueError, match='scores must'):
         action_readouts(scores, inputs)
+
+
+@pytest.mark.parametrize("temperature", [0., 0.7])
+def test_cached_action_sampling_preserves_every_valid_prediction(temperature):
+    inputs, _ = _inputs([[True, True], [False], [True]], [], [[True]])
+    packed = _scores(inputs, False)
+    cached = _scores(inputs, True)
+    counts = torch.bincount(inputs["sequence_ids"][inputs["head_token_mask"]], minlength=3)
+    valid = torch.arange(cached.shape[1])[None, :] >= (cached.shape[1] - counts[:, None])
+    torch.manual_seed(5)
+    expected = select_discrete_action(scores=packed, temperature=temperature)
+    torch.manual_seed(5)
+    actual = select_discrete_action(scores=cached, valid=valid, temperature=temperature)
+    assert actual.shape == (4,)
+    torch.testing.assert_close(actual, expected)

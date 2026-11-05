@@ -309,14 +309,8 @@ class Gate(Protocol):
     (``group_id``). For any horizon, the last step of an episode is not
     updated when its target depends on the next step's value. It is
     updated when the target does not.
-    ``cross_group_backups="bootstrap"`` fills ``V`` on the step before
-    that group boundary, so the step is updated from ``V``.
-    ``cross_group_backups="ignore"`` leaves that off-data ``V`` out of
-    the target and leaves the step out of the loss and out of logged
-    metrics when the factor on it is non-zero.
-    ``cross_group_backups="fault"`` raises on that step instead. A
-    terminated or truncated γ of ``0``, or a horizon that puts no
-    weight on that value, does not depend on it, so the step stays. A
+    A target that needs a value beyond its sampled group always raises. A
+    zero ending discount or zero weight on that value ends the return. A
     gate ``0`` on a step still inside the run still bootstraps. Values
     must lie in
     ``[0, 1]``. One row cumprod.
@@ -460,7 +454,7 @@ def nstep_gate(*, n: int, step_key: str | None = None) -> Gate:
         N = _require_gate_batch(q=q, action=action)
         s = torch.arange(N, device=q.device).unsqueeze(0)
         if step_key is None:
-            clock = executed_actions(columns, action).to(torch.int64).cumsum(0)
+            clock = executed_actions(action).to(torch.int64).cumsum(0)
         else:
             advanced = _step_flags(columns, key=step_key, reference=action)
             clock = advanced.to(torch.int64).cumsum(0)
@@ -589,8 +583,8 @@ def value_gap_gate(
             raise ValueError("Selected Q predictions require a delayed-only value-gap gate.")
         policy = (q_delayed if policy_delayed else q)[:-1]
         values = (q_delayed if value_delayed else q)[:-1]
-        executed = executed_actions(columns, action)[1:]
-        taken = canonical_actions(columns, action)[1:]
+        executed = executed_actions(action)[1:]
+        taken = canonical_actions(action)[1:]
         mask = executed.reshape((-1,) + (1,) * (policy.ndim - 1))
         taken = taken.reshape((-1,) + (1,) * (policy.ndim - 1))
         taken = taken.expand(*policy.shape[:-1], 1)
@@ -707,7 +701,7 @@ def _align_objective_rows(
     """Index length-``N`` columns by ``step_of`` so they match ``[P]`` rows."""
     aligned: dict[str, torch.Tensor] = {}
     for key, values in objective_data.items():
-        if values.shape[:1] == torch.Size([N]):
+        if key != "head_step_ids" and values.shape[:1] == torch.Size([N]):
             aligned[key] = values[step_of]
         else:
             aligned[key] = values

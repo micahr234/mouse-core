@@ -49,11 +49,11 @@ def _embedding():
 
 
 def _embed(embedding, inputs):
-    t = inputs.to_tensors()
+    t = inputs
     return embedding(t['token_ids'], tokenizer_ids=t['tokenizer_ids'],
-                     tokenizer_names=inputs.tokenizer_names,
+                     tokenizer_names=inputs['tokenizer_names'],
                      numeric_values=t['numeric_values'], numeric_mask=t['numeric_mask'],
-                     numeric_field_ids=t['numeric_field_ids'], numeric_field_names=inputs.numeric_field_names)
+                     numeric_field_ids=t['numeric_field_ids'], numeric_field_names=inputs['numeric_field_names'])
 
 
 def test_fields_are_independent_ordered_and_keep_backend_identity_in_prefixes_and_batches():
@@ -69,27 +69,28 @@ def test_fields_are_independent_ordered_and_keep_backend_identity_in_prefixes_an
     second = tok(dict(provider='environment', payload={'action_requested': True}))
     assert second['tokenizer_ids'].tolist() == [1]
     assert tok.tokenizers['actions'].calls == []
-    inputs = tok.pack_rows(rows=[_events(), []], continuing=None)
-    assert inputs.tokenizer_names == ('actions', 'text')
-    assert inputs.tokenizer_ids is not None
-    assert inputs.tokenizer_ids.tolist() == [1, 1, 1, 0, 1, 1]
-    assert inputs.head_token_ids.tolist() == [2, 5]
-    continuing = tok.pack_rows(rows=[_events()], continuing=[True])
-    assert continuing.tokenizer_ids is not None
-    assert continuing.tokenizer_ids.tolist() == [1, 1, 0, 1, 1]
-    empty = tok.pack_rows(rows=[[]], continuing=None)
-    assert empty.tokenizer_names == inputs.tokenizer_names and empty.L == 0
-    with DataLoader(stores=_events().to_store(), events_budget=3, batch_size=1,
+    inputs, inputs_objective_data = tok.pack_rows(rows=[_events(), []], continuing=None)
+    assert inputs['tokenizer_names'] == ('actions', 'text')
+    assert inputs['tokenizer_ids'] is not None
+    assert inputs['tokenizer_ids'].tolist() == [1, 1, 1, 0, 1, 1]
+    assert inputs["head_token_mask"].nonzero(as_tuple=True)[0].tolist() == [2, 5]
+    continuing, continuing_objective_data = tok.pack_rows(rows=[_events()], continuing=[True])
+    assert continuing['tokenizer_ids'] is not None
+    assert continuing['tokenizer_ids'].tolist() == [1, 1, 0, 1, 1]
+    empty, empty_objective_data = tok.pack_rows(rows=[[]], continuing=None)
+    assert empty['tokenizer_names'] == inputs['tokenizer_names'] and empty["token_ids"].shape[0] == 0
+    with DataLoader(stores=_events().to_store(), events_budget=3,
                     transform=deepcopy(tok).encode, sample_field='episode_index', num_workers=0, seed=0) as loader:
-        loaded, labels, group_id = loader.next_batch()
-    np.testing.assert_array_equal(loaded.tokenizer_ids, inputs.tokenizer_ids)
-    assert loaded.tokenizer_names == inputs.tokenizer_names
-    assert labels['action_executed'].tolist() == [False, True]
+        loaded, labels = loader.next_batch()
+        group_id = labels["step_sequence_ids"]
+    np.testing.assert_array_equal(loaded['tokenizer_ids'], inputs['tokenizer_ids'])
+    assert loaded['tokenizer_names'] == inputs['tokenizer_names']
+    assert (~torch.isnan(labels["action"])).tolist() == [False, True]
     assert group_id.tolist() == [0, 0]
 
 
 def test_colliding_token_ids_use_independent_tables_and_gradients():
-    inputs = _tokenizer().pack_rows(rows=[_events()], continuing=None)
+    inputs, inputs_objective_data = _tokenizer().pack_rows(rows=[_events()], continuing=None)
     model = _embedding()
     with torch.no_grad():
         cast(Embedding, model.embeddings['actions']).embed_tokens.weight.fill_(2.)
@@ -113,7 +114,7 @@ def test_numeric_and_image_backends_route_to_their_own_tables():
         dict(provider="sensor", type="token", tokenizer='numeric', input_field='value', numeric_field='value', format='n', fourier_min=0., fourier_max=2.),
         dict(provider="sensor", type='image', tokenizer='image', input_field='image'),
     ])
-    inputs = tok.pack_rows(rows=[[dict(provider='sensor', step_index=0, payload={'value': 1.5, 'image': [1, 2]})]], continuing=None)
+    inputs, inputs_objective_data = tok.pack_rows(rows=[[dict(provider='sensor', step_index=0, payload={'value': 1.5, 'image': [1, 2]})]], continuing=None)
     model = MultiEmbedding(embeddings={'numeric': Embedding(vocab_size=4, hidden_dim=8),
                                       'image': Embedding(vocab_size=3, hidden_dim=8)},
                            num_frequencies=2, numeric_field_names=tok.numeric_field_names)
@@ -140,9 +141,9 @@ def test_named_pretrained_sources_and_weights_roundtrip(tmp_path):
         dict(provider="test", type='token', tokenizer='actions', format='action'),
     ])
     model = MultiEmbedding(embeddings={name: Embedding(pretrained=source) for name, source in sources.items()})
-    inputs = tok.pack_rows(rows=[[dict(provider='test', step_index=0, payload={})]], continuing=None)
+    inputs, inputs_objective_data = tok.pack_rows(rows=[[dict(provider='test', step_index=0, payload={})]], continuing=None)
     for index, name in enumerate(('text', 'actions')):
-        expected = cast(Embedding, model.embeddings[name]).embed_tokens.weight[inputs.token_ids[index]]
+        expected = cast(Embedding, model.embeddings[name]).embed_tokens.weight[inputs['token_ids'][index]]
         torch.testing.assert_close(_embed(model, inputs)[index], expected)
     checkpoint = tmp_path / 'saved'
     save_tokenizer(tokenizer=tok, path=checkpoint)
@@ -166,10 +167,10 @@ def test_live_backends_roundtrip_requires_named_overrides_and_preserves_ids(tmp_
     with pytest.raises(TypeError, match='callable'):
         load_tokenizer(repo_id_or_path=str(tmp_path))
     restored = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizers={'actions': TextBackend(1), 'text': TextBackend(1)})
-    expected = tok.pack_rows(rows=[_events()], continuing=None)
-    actual = restored.pack_rows(rows=[_events()], continuing=None)
-    np.testing.assert_array_equal(actual.token_ids, expected.token_ids)
-    np.testing.assert_array_equal(actual.tokenizer_ids, expected.tokenizer_ids)
+    expected, expected_objective_data = tok.pack_rows(rows=[_events()], continuing=None)
+    actual, actual_objective_data = restored.pack_rows(rows=[_events()], continuing=None)
+    np.testing.assert_array_equal(actual['token_ids'], expected['token_ids'])
+    np.testing.assert_array_equal(actual['tokenizer_ids'], expected['tokenizer_ids'])
     with pytest.raises(ValueError, match='saved specification'):
         load_tokenizer(repo_id_or_path=str(tmp_path), tokenizers={'wrong': TextBackend(1)})
 
@@ -234,8 +235,8 @@ def test_one_named_backend_or_default_can_be_implicit():
 
 
 def test_routing_mismatches_are_rejected():
-    inputs = _tokenizer().pack_rows(rows=[_events()], continuing=None)
-    inputs.tokenizer_names = tuple(reversed(inputs.tokenizer_names))
+    inputs, inputs_objective_data = _tokenizer().pack_rows(rows=[_events()], continuing=None)
+    inputs['tokenizer_names'] = tuple(reversed(inputs['tokenizer_names']))
     with pytest.raises(ValueError, match='tokenizer_names'):
         _embed(_embedding(), inputs)
     first = _tokenizer().encode(_events())[0]
@@ -252,19 +253,19 @@ def test_named_embeddings_match_cached_and_packed_backbone_readouts():
     tok = _tokenizer()
     embedding = _embedding().eval()
     backbone = Backbone(architecture='qwen3', hidden_dim=8, num_layers=1, num_heads=2,
-                        train_kernel='reference', decode_kernel='flex', dtype=torch.float32).eval()
-    inputs = tok.pack_rows(rows=[_events()], continuing=None)
+                        train_kernel="flex", decode_kernel='flex', dtype=torch.float32).eval()
+    inputs, inputs_objective_data = tok.pack_rows(rows=[_events()], continuing=None)
     with torch.no_grad():
-        features = backbone(_embed(embedding, inputs), sequence_ids=inputs.to_tensors()['sequence_ids'])
-        expected = features[inputs.head_token_ids]
+        features = backbone(_embed(embedding, inputs), sequence_ids=inputs['sequence_ids'])
+        expected = features[inputs["head_token_mask"].nonzero(as_tuple=True)[0]]
         cache = None
         actual = []
         try:
             for events in (_events().events[:1], _events().events[1:]):
-                tokens = tok.pack_rows(rows=[events], continuing=None if cache is None else [True])
-                t = tokens.to_tensors()
+                tokens, tokens_objective_data = tok.pack_rows(rows=[events], continuing=None if cache is None else [True])
+                t = tokens
                 embeds, lengths, heads, _ = prepare_decode(embeds=_embed(embedding, tokens), tokens=tokens,
-                    sequence_ids=t['sequence_ids'], head_token_ids=t['head_token_ids'], head_step_ids=t['head_step_ids'])
+                    sequence_ids=t['sequence_ids'], head_token_mask=t["head_token_mask"])
                 if cache is None:
                     cache = backbone.decode_session(batch_size=1)
                 decoded = backbone(embeds, cache=cache, lengths=lengths)

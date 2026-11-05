@@ -20,7 +20,7 @@ from tests._token_batch_helpers import batch_to_token_batch, token_tokenizer
 
 
 def _model(*, architecture: Literal['llama', 'qwen3'] | None=None, reasoning: bool=False) -> Model:
-    backbone = IdentityBackbone(hidden_dim=8) if architecture is None else Backbone(architecture=architecture, hidden_dim=8, num_layers=1, num_heads=2, train_kernel='reference', decode_kernel='flex', dtype=torch.float32)
+    backbone = IdentityBackbone(hidden_dim=8) if architecture is None else Backbone(architecture=architecture, hidden_dim=8, num_layers=1, num_heads=2, train_kernel="flex", decode_kernel='flex', dtype=torch.float32)
     return simple_model(backbone=backbone, projection=MLP(in_features=8, out_features=8, hidden_dim=12, num_layers=2), heads={'q': MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0), 'policy': MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0)}, reasoner=LatentReasoner(hidden_dim=8, num_thoughts=2) if reasoning else None)
 
 
@@ -31,6 +31,7 @@ def _batch(start: int = 0, stop: int = 3):
 
 
 @pytest.mark.parametrize('reasoning', [False, True])
+@pytest.mark.flex_training
 def test_projection_runs_once_for_all_heads_and_keeps_backbone_states(reasoning: bool) -> None:
     model = _model(architecture='qwen3', reasoning=reasoning)
     assert model.projection is not None
@@ -93,7 +94,7 @@ def test_delayed_projection_reuses_raw_online_states() -> None:
 def test_projection_learning_rate_steps_only_its_parameters() -> None:
     model = _model()
     assert model.projection is not None
-    optimizer = AdamW(params=[{'params': model.backbone.parameters(), 'lr': 0.0}, {'params': model.projection.parameters(), 'lr': 0.02}, {'params': model.heads.parameters(), 'lr': 0.0}], lr=0.0, fused=False)
+    optimizer = AdamW(params=[{'params': model.backbone.parameters(), 'lr': 0.0}, {'params': model.projection.parameters(), 'lr': 0.02}, {'params': model.heads.parameters(), 'lr': 0.0}],  fused=False)
     before = {name: p.detach().clone() for name, p in model.named_parameters()}
     for p in model.parameters():
         p.grad = torch.ones_like(p)

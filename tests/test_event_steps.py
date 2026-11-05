@@ -103,9 +103,9 @@ def test_training_requires_labels_but_inference_does_not():
     tok = make_tokenizer(objective_fields=[dict(input_field='label')])
     with pytest.raises(KeyError, match='label'):
         tok.encode(recorded())
-    packed = tok.pack_rows(rows=[recorded(), []], continuing=None)
-    assert packed.N == 6
-    assert packed.B == 2
+    packed, packed_objective_data = tok.pack_rows(rows=[recorded(), []], continuing=None)
+    assert packed_objective_data["step_sequence_ids"].shape[0] == 6
+    assert packed["num_sequences"] == 2
 
 
 def test_saved_marker_configuration_replays_identically(tmp_path):
@@ -160,11 +160,12 @@ def test_loader_samples_exact_whole_step_windows(kind):
     tok = make_tokenizer(objective_fields=[dict(input_field='episode_index'), dict(input_field='step_index')])
     kwargs: dict[str, Any] = dict(stores=[recorded().to_store()], transform=tok.encode,
                   sample_ranges=partial(step_sample_ranges, steps_per_sample=2), token_budget=15, seed=3)
-    loader = (DataLoader(**kwargs, batch_size=1, num_workers=0) if kind == 'random'
+    loader = (DataLoader(**kwargs,  num_workers=0) if kind == 'random'
               else EpochDataLoader(**kwargs))
     try:
         for _ in range(2):
-            _, labels, groups = loader.next_batch()
+            inputs, labels = loader.next_batch()
+            groups = labels["step_sequence_ids"]
             for group in groups.unique_consecutive():
                 mask = groups == group
                 indices = labels['step_index'][mask].tolist()
@@ -182,7 +183,7 @@ def test_both_loaders_reject_partial_step_or_cross_episode_ranges(window, match,
                   sample_ranges=lambda ds: [window], token_budget=30)
     with pytest.raises(ValueError, match=match):
         if kind == 'random':
-            DataLoader(**kwargs, batch_size=1, num_workers=0)
+            DataLoader(**kwargs,  num_workers=0)
         else:
             EpochDataLoader(**kwargs)
 
@@ -268,8 +269,8 @@ def test_event_prefix_and_readouts_match_full_and_cached_packing():
         dict(type='token', provider='sensor', format='9', head_output=True),
     ])
     events = [dict(provider='sensor', step_index=i, payload={'value': i + 1}) for i in range(3)]
-    full = tok.pack_rows(rows=[events], continuing=None)
-    first = tok.pack_rows(rows=[events[:1]], continuing=None)
-    rest = tok.pack_rows(rows=[events[1:]], continuing=[True])
-    assert full.token_ids.tolist() == first.token_ids.tolist() + rest.token_ids.tolist() == [8, 1, 9, 2, 9, 3, 9]
-    assert full.head_step_ids.tolist() == [0, 1, 2]
+    full, full_objective_data = tok.pack_rows(rows=[events], continuing=None)
+    first, first_objective_data = tok.pack_rows(rows=[events[:1]], continuing=None)
+    rest, rest_objective_data = tok.pack_rows(rows=[events[1:]], continuing=[True])
+    assert full['token_ids'].tolist() == first['token_ids'].tolist() + rest['token_ids'].tolist() == [8, 1, 9, 2, 9, 3, 9]
+    assert full_objective_data["head_step_ids"].tolist() == [0, 1, 2]

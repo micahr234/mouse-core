@@ -29,15 +29,18 @@ The FrozenLake examples use all four: generate a task, repeat it, collect experi
 
 ## Install
 
-Requires **Python 3.15+**. For CUDA 13.2:
+Requires **Python 3.15+**. From this checkout:
 
 ```bash
-pip install mouse-core --extra-index-url https://download.pytorch.org/whl/test/cu132
+source scripts/install.sh
+source .venv/bin/activate
 ```
 
-For CPU, replace the index URL with `https://download.pytorch.org/whl/test/cpu`.
+The installer pins PyTorch `2.15.0.dev20261005` and Triton `3.8.0+gitc01b6774`
+from the CUDA 13 nightly index (CPU when no GPU is detected), and applies the
+upstream Triton Python 3.15 fix. See the [dependency notes](CONTRIBUTING.md#pinned-pytorch-and-triton).
 
-To run the notebooks, follow the [development setup](CONTRIBUTING.md#development-setup), which installs the example dependencies and free-threaded Python 3.15t. Multi-worker loading requires the GIL to be disabled; the setup script configures this. See [example dependencies](CONTRIBUTING.md#example-dependencies) for system packages.
+To run the notebooks, follow the [development setup](CONTRIBUTING.md#development-setup), which installs the example dependencies and standard Python 3.15. Multi-worker loading uses persistent spawned processes with shared-memory batch transfer. See [example dependencies](CONTRIBUTING.md#example-dependencies) for system packages.
 
 MOUSE is in early development; APIs may change.
 
@@ -96,6 +99,12 @@ Follow these three notebooks:
    See [offline DQN with time embeddings](examples/22_train_offline_dqn_time.ipynb) for optional per-field elapsed seconds, irregular event timing, and a local simulated replay.
 3. [Run inference](examples/15_inference.ipynb) — load that checkpoint and evaluate with cached history.
 
+The [FrozenLake autoregressive reasoning notebook](examples/23_train_autoregressive_reasoning_dqn.ipynb) adds autoregressive vocabulary reasoning to the same Mouse model and uses negative DQN error as a REINFORCE reward.
+
+Mouse transformer backbones support **FlexAttention only**, for packed training, rectangular forwards, and paged cached generation. Training requires CUDA; CPU supports inference under `torch.no_grad()`. The optional `kernels` extra can accelerate supported decoder modules when enabled with `backbone.enable_kernels()`; attention remains FlexAttention.
+
+The `kernels` extra installs on standard Python 3.15 and is included in the `all` extra. Enable compatible kernels explicitly on the backbone; FlexAttention and continuous batching work independently.
+
 The notebooks keep model construction, precision settings, batching, losses, and checkpoint handling beside the code that uses them.
 
 Experience is now recorded as sequential event datasets; the [collection notebook](examples/01_collect_dataset.ipynb) explains the format.
@@ -108,10 +117,18 @@ metadata and do not become model-input tokens automatically.
 Dataset collection, online training, and inference use the same event order:
 the coordinator starts an episode, the agent records each requested action before
 execution, and the environment records its result. Reset frames have no agent
-event. Zero rewards and false flags are omitted. Oracle `q_star` values are
+event. Zero rewards and false flags are omitted. Oracle `_q_star` values are
 recorded only when supplied and an action is requested; online and inference
 environments can leave oracle computation disabled. PPO and GRPO additionally
-record behavior log probabilities on agent events.
+record `_old_log_prob` on agent events.
+
+The FrozenLake examples prefix payload fields intended only as labels or control
+metadata with `_`: `_q_star`, `_old_log_prob`, `_episode_start`, `_terminated`,
+and `_truncated`. This is only a naming convention: explicit tokenizer specs
+select inputs and map payload labels to objective names. Episode readers accept
+an explicit `EnvironmentProtocol` naming the start and ending fields; the
+FrozenLake notebooks configure those names when selecting complete episodes.
+There is no automatic filtering, prefix stripping, or old-name fallback.
 
 Repeated-task collectors record the zero-based `repeat_episode_index` only on
 the environment reset event starting each inner episode, using the live tracker.
@@ -120,8 +137,8 @@ directly by the FrozenLake tokenizers to render a one-based `episode N` header
 before the reset observation. Inner termination and truncation append two
 newlines; those separators and headers do not create prediction readouts.
 Generic event views preserve this sparse field without reconstructing a counter.
-Recollect older datasets to include the reset indices before training with these
-example tokenizers.
+Recollect datasets with the current payload field names and reset indices
+before training with these example tokenizers.
 
 Use `EventLog.append(provider=..., payload=..., **indices)` when recording does
 not need a return value. It owns a snapshot and caches the payload's JSON once.
@@ -167,10 +184,16 @@ loader = DataLoader(
     transform=tokenizer.encode,
     sample_ranges=partial(step_sample_ranges, steps_per_sample=8),
     token_budget=4096,
-    batch_size=1,
-    num_workers=0,
+    num_workers=4,
+    prefetch=4,
 )
+inputs, objective_data = loader.next_batch()
 ```
+
+The token budget applies to the entire returned batch. `inputs["sequence_ids"]` marks
+token boundaries; `objective_data["step_sequence_ids"]` marks the corresponding loss boundaries.
+There is no separate group-ID return value. Workers use shared memory and return
+owned tensors, so batches remain valid after subsequent reads or `loader.close()`.
 
 Each sample above contains exactly eight consecutive whole steps from one episode.
 For whole completed environment episodes, use
@@ -216,10 +239,10 @@ embedding = MultiEmbedding(embeddings={
     name: Embedding(pretrained=checkpoint) for name, checkpoint in sources.items()
 }).to(device)
 inputs = tokenizer.pack_rows(rows=[events], continuing=None)
-tensors = inputs.to_tensors(device)
+tensors = inputs.to(device)
 embedded = embedding(
     tensors["token_ids"], tokenizer_ids=tensors["tokenizer_ids"],
-    tokenizer_names=inputs.tokenizer_names,
+    tokenizer_names=inputs["tokenizer_names"],
     numeric_values=tensors["numeric_values"], numeric_mask=tensors["numeric_mask"],
 )
 ```
@@ -246,7 +269,7 @@ take effect on subsequent calls without cache invalidation.
 To measure the full loading path with a locally cached tokenizer:
 
 ```bash
-PYTHON_GIL=0 .venv/bin/python bench/bench_dataloader.py \
+.venv/bin/python bench/bench_dataloader.py \
     --workloads short notebook --workers 0 --local-files-only --profile-stages
 ```
 
@@ -254,13 +277,17 @@ The benchmark reports loader setup, batch wait, throughput, and optional CPU
 stage timings. Use `--tokenizer /path/to/tokenizer` for a local backend and
 `--workers 0 1 4` to compare prefetch worker counts.
 
-For action selection, pass the packed `inputs` to `select_discrete_action`, or
-use `action_readouts(scores, inputs)` before sampling policy logits. Only the
-current step may supply a readout; a missing readout raises even if an earlier
-step has one. In mixed batches, `sequence_ids` selects the environments currently
-requesting actions. Example encoders return only `z` and `cache`.
+`select_discrete_action(scores=..., temperature=...)` returns an action for every
+prediction. It does not read step mappings or select a final step. For environment
+rollouts, `action_readouts(scores, inputs, sequence_ids=...)` first selects the last
+marked token of each requested sequence using `head_token_mask` and `sequence_ids`.
+The caller decides which environments currently request actions. Example encoders
+return only `z` and `cache`.
 
-Augmentation uses an optional `provider` filter (None matches all events).
+Augmentation uses `type="discrete_permute"` to permute categorical IDs and any
+associated `input_vector_field` values together. It requires `vocab_size`; there
+is no separate `permute` option. Plain `type="discrete"` supports masking/copying
+without permutation. An optional `provider` filter selects events (None matches all).
 Missing or `None` fields are skipped automatically. Use
 `compose(stages=(augmenter.events, tokenizer.encode))` for training; the loader
 forwards reseeding to the augmenter. Events in an episode share permutation draws,
@@ -338,3 +365,29 @@ freeze these new matrices; include them in the optimizer to train them.
 
 See [the elapsed-time DQN example](examples/22_train_offline_dqn_time.ipynb) for
 optional position embeddings, offline training, and local checkpoint save/load.
+
+### Prediction alignment
+
+`loader.next_batch()` returns `(inputs, objective_data)`. `inputs` contains packed
+tokens and their structural mappings; `objective_data` contains per-step labels
+such as actions, rewards and episode endings. Missing actions are `NaN`.
+
+Pass `objective_data.to(device)["head_step_ids"]` as `head_step_ids=` to
+DQN, PPO, GRPO and the sequential cosine loss. Entry `p` identifies the step
+that owns prediction row `p`. For example, `[0, 0, 2]` means two predictions
+for step 0, none for step 1, and one for step 2. Objectives derive counts from
+this mapping; the loader does not duplicate them in `objective_data`. DQN trains
+every readout and bootstraps from the last readout of a step. Policy and sequential
+cosine losses accept zero or one readout per step.
+
+Packed loader outputs are TensorDicts with `batch_size=[]`. `inputs` contains
+token arrays, including the boolean `head_token_mask`, plus non-tensor metadata.
+`objective_data` contains step labels and `step_sequence_ids` of length `N`,
+and `head_step_ids` of length `P` (the number of marked tokens). Both support `.to(device)`. Access fields by key, such
+as `objective_data["head_step_ids"]`. Tokenizer names, numeric-field names, and
+`inputs["num_sequences"]` are non-tensor metadata; the sequence count includes
+empty decode rows. Derive token, step, and prediction counts from the corresponding
+tensor shapes. `make_token_batch` constructs CPU tensors without validating
+batch shapes, ordering, or indices; producers own those relationships. The old
+batch class and scoped tensor-conversion cache have been removed. Move inputs
+once before online and delayed forwards to reuse their device storage.

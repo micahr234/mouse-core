@@ -1,3 +1,5 @@
+
+from tests._prediction_layout import fixture_head_steps
 import math
 import pytest
 import torch
@@ -36,7 +38,7 @@ def test_mismatch_weight_is_detached_and_separate_from_policy_clipping():
             'old_log_prob': torch.tensor([0., math.log(.1)]), 'sampling_weight': weights}
     objective = GrpoObjective(ent_coef=0., old_log_prob_key='training_log_prob',
                               sampling_weight_key='sampling_weight')
-    loss, metrics = objective(objective_data=data, group_id=torch.zeros(2, dtype=torch.long), predictions=logits)
+    loss, metrics = objective(objective_data=data, group_id=torch.zeros(2, dtype=torch.long), head_step_ids=fixture_head_steps(data),  predictions=logits)
     assert loss['grpo'].item() == pytest.approx(-6.)
     assert metrics['clipfrac'] == 0.
     loss['grpo'].backward()
@@ -49,4 +51,4 @@ def test_corrected_objective_requires_frozen_probabilities():
     objective = GrpoObjective(old_log_prob_key='training_log_prob', sampling_weight_key='sampling_weight')
     data = {'action': torch.tensor([0, 0]), 'advantage': torch.ones(2), 'sampling_weight': torch.ones(2)}
     with pytest.raises(KeyError, match='frozen training'):
-        objective(objective_data=data, group_id=torch.zeros(2, dtype=torch.long), predictions=torch.zeros(2, 2))
+        objective(objective_data=data, group_id=torch.zeros(2, dtype=torch.long), head_step_ids=fixture_head_steps(data),  predictions=torch.zeros(2, 2))

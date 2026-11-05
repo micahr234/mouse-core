@@ -1,92 +1,35 @@
-"""DataLoader — sample ordered event sequences, tokenize complete samples, pack.
+"""Sample complete event sequences into one event or token budget per batch.
 
-A ``Datastore`` stores source events for sampling. Pass exactly one
-of ``events_budget`` or ``token_budget``, plus ``batch_size``:
+Each sampled segment is an independent sequence. Token-level ``sequence_ids`` live in inputs; step-level
+``step_sequence_ids`` and prediction-level ``head_step_ids`` live in objective_data.
+The loader returns
+``(inputs, objective_data)``. A budget limits the whole returned batch.
 
-* ``events_budget`` — ``batch_size`` fills. That count does not depend
-  on the budget. Each fill adds whole samples until the next one would
-  pass that many source events. Samples that do not fit are rejected
-  before materialization and tokenization.
-* ``token_budget`` — the same fills, counting packed tokens instead of
-  events.
+``num_workers=0`` prepares synchronously. Positive worker counts use persistent
+spawned processes and bounded, reusable shared-memory result slots. Transforms
+(including notebook-local functions) are serialized once per worker generation.
+Returned arrays are owned by the consumer and survive refresh/close.
 
-``sample_field`` names an envelope column or an explicit ``payload.<key>`` field. A sample is a maximal contiguous
-run of rows that share one value in that column: the run starts where
-the value changes (or at the first row) and ends at the next change.
-Each sample the loader keeps is one group. Every sample in a batch
-gets a distinct ``group_id``, and every step of that sample shares it.
-Attention and the TD / PPO / GRPO run stop where ``group_id`` changes,
-so they do not cross the field. A sample that does not fit is left
-out. The first sample of a fill is left out too when it alone is over
-the budget, and that raises. Examples pass ``batch_size=1`` (one fill)
-and ``sample_ranges=environment_episode_ranges``.
-
-Token ``sequence_ids`` and the step ``group_id`` tensor use those same
-ids, ``0 .. B - 1``, one contiguous block each. ``group_id`` is
-returned beside ``objective_data``, not inside it.
-
-The loader is stage-agnostic: compose augmenter / tokenizer
-(or any ``list[event] → list[StepTokens]`` callable) outside and pass the result as
-``transform=``. Before each sampled segment of batch ``k``, if
-``transform`` defines ``reseed()``, it is called with a generation
-unique to that segment. The generation is
-``k * batch_size * (budget + 1) + fill * (budget + 1) + attempt``,
-where ``budget`` is ``events_budget`` or ``token_budget``. Each
-segment costs at least one unit, so a fill draws at most ``budget + 1``
-generations (the segments that fit, plus one that does not) and the
-next batch does not collide. An
-:class:`~mouse_core.data.augmenter.Augmenter` in the compose pipeline
-draws a starting seed unique to that sequence.
-Steps that share a ``seed_field`` value inside one window still share
-permute/scale/shift draws; the same index on two windows does not.
-
-Determinism
------------
-Batches are numbered ``k = 0, 1, 2, ...`` in the order :meth:`DataLoader.next_batch`
-returns them. Batch ``k`` samples its windows from
-``SeedSequence(seed, spawn_key=(k,))`` and reseeds the transform once per
-sequence with a generation unique to ``(k, sequence)``, so it is a pure function
-of ``(seed, k, store snapshot)``:
-``num_workers`` changes only throughput, never the stream. Workers claim
-indices from a shared counter and the consumer hands batches out in index
-order (a small reorder buffer absorbs the interleaving). :meth:`DataLoader.refresh`
-discards prefetched batches and resumes numbering at the next batch the
-consumer has not seen, so the sequence after a refresh depends only on when
-(in batches) it was called. ``seed=None`` draws the entropy once at
-construction (a fresh stream per loader, still numbered and ordered).
-
-Usage
------
-::
-
-    train_transform = EventTransform(encode=compose(stages=(augmenter, tokenizer)))
-    loader = DataLoader(
-        stores=store,
-        token_budget=4096,
-        batch_size=1,
-        transform=train_transform,
-        sample_ranges=environment_episode_ranges,
-        num_workers=0,
-    )
-    inputs, objective_data, group_id = loader.next_batch()
+Batch k uses SeedSequence(seed, spawn_key=(k,)); each sampled segment is reseeded
+with k * (budget + 1) + attempt. Worker count changes throughput, not the stream.
+Refresh restarts workers against new store snapshots at the next unseen batch.
 """
 
 from __future__ import annotations
+from tensordict import TensorDict
 
 import json
-import queue
-import sys
-import sysconfig
-import threading
+from functools import partial
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from mouse_core.data.process_batches import ProcessBatches
 from mouse_core.data.datastore import _normalize_value
 from mouse_core.data.step_sampling import _step_spans, _validate_step_ranges
-from mouse_core.data.token_batch import StepTokens, TokenBatch, pack_token_batch
+from mouse_core.data.token_batch import StepTokens, pack_token_batch
 
 if TYPE_CHECKING:
     import torch
@@ -96,33 +39,14 @@ if TYPE_CHECKING:
 
 EventSequenceTransform = Callable[[list[dict]], list[StepTokens]]
 
-_FREE_THREADING_HINT = (
-    "DataLoader(num_workers>0) requires a free-threaded CPython build with the "
-    "GIL disabled (e.g. Python 3.15t). Install with `uv python install 3.15t` "
-    "and create the venv with that interpreter. If imports re-enable the GIL "
-    "(Triton still does this), run with `PYTHON_GIL=0` or "
-    "`python -Xgil=0`."
-)
-
-
-def _require_free_threading() -> None:
-    """Raise unless this process can run CPU-bound worker threads in parallel."""
-    if not sysconfig.get_config_var("Py_GIL_DISABLED"):
-        raise RuntimeError(_FREE_THREADING_HINT)
-    is_gil_enabled = getattr(sys, "_is_gil_enabled", None)
-    if callable(is_gil_enabled) and is_gil_enabled():
-        raise RuntimeError(_FREE_THREADING_HINT)
-
-
 @dataclass(frozen=True)
 class _SnapshotConfig:
-    """Immutable sampling snapshot shared with worker threads."""
+    """Immutable sampling snapshot sent once to each worker process."""
 
     datasets: tuple[Any, ...]
     ns: tuple[int, ...]
     probs: np.ndarray
     events_budget: int | None
-    batch_size: int | None
     token_budget: int | None
     index_field: str | None
     sample_field: str | None
@@ -298,7 +222,7 @@ def _batch_rng(entropy: int, k: int) -> np.random.Generator:
 def _sequence_generation(*, batch_index: int, sequence_index: int, stride: int) -> int:
     """Unique augmenter generation for one sampled segment of batch ``k``.
 
-    ``stride`` is ``batch_size * (budget + 1)``. The budget is
+    ``stride`` is ``budget + 1``. The budget is
     ``events_budget`` or ``token_budget``. Each segment costs at least
     one unit, so a fill draws at most ``budget + 1`` generations and the
     next batch does not collide.
@@ -370,16 +294,8 @@ def _fetch_budget_batch(
     entropy: int,
     k: int,
     transform: EventSequenceTransform,
-) -> tuple[TokenBatch, dict[str, torch.Tensor], torch.Tensor]:
-    """Fill batch ``k`` ``batch_size`` times up to the active budget.
-
-    Each fill samples whole segments. The next segment is measured, and
-    if it does not fit entirely it is left out and that fill stops. A
-    fill whose first segment does not fit raises. ``token_budget``
-    measures packed tokens. ``events_budget`` measures source events. Each
-    kept segment gets the next ``group_id``, unique in this batch.
-    """
-    assert cfg.batch_size is not None
+) -> tuple[TensorDict, TensorDict]:
+    """Fill one budget with whole, independently sampled sequences."""
     budget, name, unit = _budget_of(cfg)
     count_tokens = cfg.token_budget is not None
     rng = _batch_rng(entropy, k)
@@ -387,64 +303,57 @@ def _fetch_budget_batch(
     steps: list[StepTokens] = []
     sequence_ids: list[int] = []
     n_group = 0
-    # One rejected segment after the ones that fit in a fill. Each
-    # segment costs at least one unit, so a fill stays within this width.
-    per_fill = budget + 1
-    stride = cfg.batch_size * per_fill
-    for fill in range(cfg.batch_size):
-        used = 0
-        added = 0
-        attempt = 0
-        while True:
-            ds, start, end = _fetch_sequence(cfg, rng)
-            if callable(reseed):
-                reseed(
-                    generation=_sequence_generation(
-                        batch_index=k,
-                        sequence_index=fill * per_fill + attempt,
-                        stride=stride,
-                    )
+    used = 0
+    added = 0
+    attempt = 0
+    while True:
+        ds, start, end = _fetch_sequence(cfg, rng)
+        if callable(reseed):
+            reseed(
+                generation=_sequence_generation(
+                    batch_index=k,
+                    sequence_index=attempt,
+                    stride=budget + 1,
                 )
-            attempt += 1
-            # Event counts are known without decoding or tokenizing. Keep the
-            # draw and reseed above so later fills keep the same random stream
-            # and transform generations, even when this sample is discarded.
-            if not count_tokens and used + (end - start) > budget:
-                if added == 0:
-                    raise ValueError(
-                        f"Sampled segment is {end - start} {unit} and does not fit "
-                        f"in {name}={budget}."
-                    )
-                break
-            window = _tokenize_event_window(
-                ds=ds,
-                start=start,
-                end=end,
-                index_field=cfg.index_field,
-                transform=transform,
             )
-            cost = _segment_token_count(window) if count_tokens else end - start
-            if cost < 1:
+        attempt += 1
+        # Event counts are known before decoding or tokenizing.
+        if not count_tokens and used + (end - start) > budget:
+            if added == 0:
                 raise ValueError(
-                    f"Sampled segment produced no {unit} "
-                    f"(start={start}, exclusive_end={end})."
+                    f"Sampled segment is {end - start} {unit} and does not fit "
+                    f"in {name}={budget}."
                 )
-            if used + cost > budget:
-                if added == 0:
-                    raise ValueError(
-                        f"Sampled segment is {cost} {unit} and does not fit "
-                        f"in {name}={budget}."
-                    )
-                break
-            _append_window(
-                steps=steps,
-                sequence_ids=sequence_ids,
-                window=window,
-                group_id=n_group,
+            break
+        window = _tokenize_event_window(
+            ds=ds,
+            start=start,
+            end=end,
+            index_field=cfg.index_field,
+            transform=transform,
+        )
+        cost = _segment_token_count(window) if count_tokens else end - start
+        if cost < 1:
+            raise ValueError(
+                f"Sampled segment produced no {unit} "
+                f"(start={start}, exclusive_end={end})."
             )
-            used += cost
-            n_group += 1
-            added += 1
+        if used + cost > budget:
+            if added == 0:
+                raise ValueError(
+                    f"Sampled segment is {cost} {unit} and does not fit "
+                    f"in {name}={budget}."
+                )
+            break
+        _append_window(
+            steps=steps,
+            sequence_ids=sequence_ids,
+            window=window,
+            group_id=n_group,
+        )
+        used += cost
+        n_group += 1
+        added += 1
     return pack_token_batch(
         steps=steps,
         sequence_ids=sequence_ids,
@@ -458,71 +367,9 @@ def _fetch_one_batch(
     entropy: int,
     k: int,
     transform: EventSequenceTransform,
-) -> tuple[TokenBatch, dict[str, torch.Tensor], torch.Tensor]:
+) -> tuple[TensorDict, TensorDict]:
     """Build batch ``k``."""
     return _fetch_budget_batch(cfg, entropy, k, transform)
-
-
-class _WorkerFailure:
-    """First exception raised by any worker, delivered out-of-band.
-
-    Errors do not travel through the (bounded) result queue: when the queue is
-    full of good batches a queued error could be dropped or only surface after
-    the consumer drains everything already prefetched.
-    """
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self.exc: BaseException | None = None
-
-    def record(self, exc: BaseException) -> None:
-        with self._lock:
-            if self.exc is None:
-                self.exc = exc
-
-
-class _BatchCounter:
-    """Hands out batch indices ``k`` to whichever worker asks next.
-
-    One instance per worker generation: a worker that outlives
-    ``_stop_workers`` keeps claiming from its own (stale) counter and can
-    never punch a hole in the live numbering.
-    """
-
-    def __init__(self, start: int) -> None:
-        self._lock = threading.Lock()
-        self._next = int(start)
-
-    def claim(self) -> int:
-        with self._lock:
-            k = self._next
-            self._next += 1
-            return k
-
-
-def _worker_loop(
-    result_queue: queue.Queue,
-    stop_event: threading.Event,
-    failure: _WorkerFailure,
-    counter: _BatchCounter,
-    cfg: _SnapshotConfig,
-    entropy: int,
-    transform: EventSequenceTransform,
-) -> None:
-    """Prefetch loop run inside a worker thread: claim ``k``, build batch ``k``, enqueue ``(k, item)``."""
-    while not stop_event.is_set():
-        k = counter.claim()
-        try:
-            item = _fetch_one_batch(cfg, entropy, k, transform)
-        except Exception as exc:  # noqa: BLE001
-            failure.record(exc)
-            return
-        while not stop_event.is_set():
-            try:
-                result_queue.put((k, item), timeout=0.05)
-                break
-            except queue.Full:
-                pass
 
 
 class DataLoader:
@@ -534,11 +381,11 @@ class DataLoader:
         A single ``Datastore`` or a list of them. Each store is snapshotted
         at construction (and on :meth:`refresh`) via ``Datastore.to_dataset()``.
     events_budget :
-        Source events per fill. Whole samples are added until the next sample
+        Source events per batch. Whole samples are added until the next sample
         would pass the budget. A sample that does not fit is left out.
-        The first sample of a fill is left out too when it alone is over
+        The first sample of a batch is left out too when it alone is over
         the budget, and that raises. Pass this or ``token_budget``, not
-        both. Requires ``sample_field`` and ``batch_size``.
+        both. Requires a sample boundary policy.
     sample_field :
         Scalar column that defines a sample. A sample is every contiguous
         row that shares one value in this column. Each sample is one
@@ -555,16 +402,13 @@ class DataLoader:
         paths. The standard ``step_index`` column is detected automatically;
         set ``step_field`` explicitly for custom markers. ``episode_field``
         defaults to ``episode_index``. Use the same fields as Tokenizer.
-    batch_size :
-        How many times the budget is filled in the returned batch.
-        Independent of either budget. Examples pass ``1``.
     token_budget :
-        Packed tokens per fill (step tokens plus each sample's
+        Packed tokens per batch (step tokens plus each sample's
         group-start tokens). Whole samples are added until the next
         sample would pass the budget. A sample that does not fit is left
-        out. The first sample of a fill is left out too when it alone is
+        out. The first sample of a batch is left out too when it alone is
         over the budget, and that raises. Pass this or ``events_budget``,
-        not both. Requires ``sample_field`` and ``batch_size``.
+        not both. Requires a sample boundary policy.
     transform :
         Required ``list[event] → list[StepTokens]`` callable applied once per sample.
         Compose pipeline stages outside the loader; packing is loader-owned.
@@ -573,7 +417,7 @@ class DataLoader:
         store offset under this name before ``transform`` runs.
     weights / weight_mode / prefetch / num_workers :
         Sampling and worker controls. ``num_workers`` is required: ``0`` is
-        in-process; ``> 0`` needs free-threaded CPython with the GIL off.
+        in-process; ``> 0`` uses spawned processes with shared-memory batch transfer.
     seed :
         Entropy of the batch stream. Batch ``k`` is a pure function of
         ``(seed, k, snapshot)`` for any ``num_workers`` (see module
@@ -587,7 +431,6 @@ class DataLoader:
         transform: EventSequenceTransform,
         events_budget: int | None = None,
         token_budget: int | None = None,
-        batch_size: int | None = None,
         sample_field: str | None = None,
         sample_ranges: Callable | None = None,
         step_field: str | None = None,
@@ -601,17 +444,9 @@ class DataLoader:
     ) -> None:
         from mouse_core.data.datastore import Datastore as _DS
 
-        self._stop: threading.Event | None = None
-        self._result_queue: queue.Queue | None = None
-        self._workers: list[threading.Thread] = []
-        self._failure = _WorkerFailure()
-        # Batch numbering: the consumer returns _next_k next and parks
-        # out-of-order worker arrivals in _reorder. Workers claim indices from
-        # a counter created per _start_workers call, starting at _next_k.
+        self._pool: ProcessBatches | None = None
+        self._closed = False
         self._next_k = 0
-        self._reorder: dict[
-            int, tuple[TokenBatch, dict[str, torch.Tensor], torch.Tensor]
-        ] = {}
 
         if isinstance(stores, _DS):
             stores = [stores]
@@ -632,10 +467,6 @@ class DataLoader:
             raise ValueError(f"events_budget must be >= 1, got {events_budget}.")
         if token_budget is not None and token_budget < 1:
             raise ValueError(f"token_budget must be >= 1, got {token_budget}.")
-        if batch_size is None:
-            raise ValueError("batch_size is required.")
-        if batch_size < 1:
-            raise ValueError(f"batch_size must be >= 1, got {batch_size}.")
         if (sample_field is None) == (sample_ranges is None):
             raise ValueError("Pass exactly one of sample_field or sample_ranges")
         if sample_field is not None and (not isinstance(sample_field, str) or not sample_field):
@@ -655,12 +486,9 @@ class DataLoader:
                 raise ValueError("All weights must be positive.")
         if num_workers < 0:
             raise ValueError(f"num_workers must be >= 0, got {num_workers}.")
-        if num_workers > 0:
-            _require_free_threading()
 
         self.stores = stores
         self.events_budget = events_budget
-        self.batch_size = batch_size
         self.token_budget = token_budget
         self.sample_field = sample_field
         self.sample_ranges = sample_ranges
@@ -695,44 +523,29 @@ class DataLoader:
         so batches after the refresh are rebuilt against the new snapshot
         with their original indices.
         """
-        if self._num_workers > 0:
-            self._stop_workers()
-        self._reorder.clear()
+        if self._closed:
+            raise RuntimeError("DataLoader is closed")
+        self._stop_workers()
         self._resnapshot_stores()
         if self._num_workers > 0:
             self._start_workers()
 
     def next_batch(
         self,
-    ) -> tuple[TokenBatch, dict[str, torch.Tensor], torch.Tensor]:
-        """Return ``(inputs, objective_data, group_id)`` for the next batch.
-
-        ``inputs`` is the packed :class:`TokenBatch`. ``objective_data``
-        is a CPU ``dict[str, Tensor]`` of tokenizer ``objective_fields``.
-        ``group_id`` is int64 ``[N]``, one id per step. It is not a key
-        in ``objective_data``.
-        """
-        k = self._next_k
-        if self._num_workers == 0:
-            item = _fetch_one_batch(self._snapshot_config(), self._entropy, k, self.transform)
-            self._next_k = k + 1
-            return item
-        assert self._result_queue is not None
-        while k not in self._reorder:
-            if self._failure.exc is not None:
-                raise RuntimeError("A prefetch worker raised an exception.") from self._failure.exc
-            try:
-                got_k, got_item = self._result_queue.get(timeout=0.05)
-            except queue.Empty:
-                if self._failure.exc is None and not any(w.is_alive() for w in self._workers):
-                    raise RuntimeError("All prefetch workers stopped unexpectedly.")
-                continue
-            self._reorder[got_k] = got_item
-        self._next_k = k + 1
-        return self._reorder.pop(k)
+    ) -> tuple[TensorDict, TensorDict]:
+        """Return packed inputs and CPU objective tensors for the next batch."""
+        if self._closed:
+            raise RuntimeError("DataLoader is closed")
+        if self._pool is None:
+            item = _fetch_one_batch(self._snapshot_config(), self._entropy, self._next_k, self.transform)
+        else:
+            item = self._pool.next_batch()
+        self._next_k += 1
+        return item
 
     def close(self) -> None:
-        """Stop background workers and drain the queue."""
+        """Stop workers and release shared memory; already returned batches survive."""
+        self._closed = True
         self._stop_workers()
 
     def __enter__(self) -> DataLoader:
@@ -742,9 +555,8 @@ class DataLoader:
         self.close()
 
     def __del__(self) -> None:
-        if getattr(self, "_workers", None) is None:
-            return
-        self.close()
+        if hasattr(self, "_pool"):
+            self.close()
 
     def __repr__(self) -> str:
         store_info = ", ".join(
@@ -752,7 +564,7 @@ class DataLoader:
         )
         return (
             f"DataLoader(stores=[{store_info}], events_budget={self.events_budget}, "
-            f"token_budget={self.token_budget}, B={self.batch_size}, "
+            f"token_budget={self.token_budget}, "
             f"sample_field={self.sample_field!r}, seed={self.seed})"
         )
 
@@ -762,7 +574,6 @@ class DataLoader:
             ns=tuple(self._ns),
             probs=self._probs.copy(),
             events_budget=self.events_budget,
-            batch_size=self.batch_size,
             token_budget=self.token_budget,
             index_field=self.index_field,
             sample_field=self.sample_field,
@@ -770,54 +581,15 @@ class DataLoader:
         )
 
     def _start_workers(self) -> None:
-        assert self._num_workers > 0
-        self._failure = _WorkerFailure()
-        self._result_queue = queue.Queue(maxsize=self._prefetch)
-        self._stop = threading.Event()
-        cfg = self._snapshot_config()
-        counter = _BatchCounter(self._next_k)
-        self._workers = []
-        for i in range(self._num_workers):
-            thread = threading.Thread(
-                target=_worker_loop,
-                args=(
-                    self._result_queue,
-                    self._stop,
-                    self._failure,
-                    counter,
-                    cfg,
-                    self._entropy,
-                    self.transform,
-                ),
-                daemon=True,
-                name=f"DataLoader-{i}",
-            )
-            thread.start()
-            self._workers.append(thread)
+        build = partial(_fetch_one_batch, self._snapshot_config(), self._entropy,
+                        transform=self.transform)
+        self._pool = ProcessBatches(build, workers=self._num_workers,
+                                    prefetch=self._prefetch, start=self._next_k)
 
     def _stop_workers(self) -> None:
-        if self._stop is None:
-            self._workers = []
-            self._result_queue = None
-            return
-        self._stop.set()
-        # Drain under the queue mutex. ``except queue.Empty`` is unsafe here:
-        # ``__del__`` runs this during interpreter teardown, after ``queue``'s
-        # globals are cleared, so that handler becomes ``except None``.
-        q = self._result_queue
-        if q is not None:
-            with q.mutex:
-                q.queue.clear()
-                q.not_full.notify_all()
-        # ``Thread.join`` raises ``PythonFinalizationError`` once the
-        # interpreter is shutting down. Workers are daemons, so exit
-        # reaps them without a join.
-        if not sys.is_finalizing():
-            for w in self._workers:
-                w.join(timeout=2.0)
-        self._workers = []
-        self._stop = None
-        self._result_queue = None
+        if self._pool is not None:
+            self._pool.close()
+            self._pool = None
 
     def _resnapshot_stores(self) -> None:
         self._datasets = [s.to_dataset() for s in self.stores]

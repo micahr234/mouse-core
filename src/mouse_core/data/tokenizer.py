@@ -17,6 +17,7 @@ the model via :func:`~mouse_core.models.io.push_model_to_hub`.
 """
 
 from __future__ import annotations
+from tensordict import TensorDict
 
 import json
 import math
@@ -44,11 +45,7 @@ from mouse_core.data.modality import (
     unwrap_scalar,
     when_as_bool,
 )
-from mouse_core.data.token_batch import (
-    StepTokens,
-    TokenBatch,
-    pack_token_batch,
-)
+from mouse_core.data.token_batch import StepTokens, pack_token_batch
 
 
 def _objective_config(objective_fields):
@@ -218,19 +215,19 @@ class Tokenizer:
             steps.append(last)
         return steps
 
-    def pack_rows(self, *, rows, continuing) -> TokenBatch:
-        """Pack complete event steps per sequence for inference, without labels."""
+    def pack_rows(self, *, rows, continuing) -> tuple[TensorDict, TensorDict]:
+        """Return model inputs and objective step mappings for inference, without labels."""
         steps, sids = [], []
         for index, events in enumerate(rows):
             encoded = self.encode(events, include_objectives=False)
             steps.extend(encoded)
             sids.extend([index] * len(encoded))
-        inputs, _, _ = pack_token_batch(steps=steps, sequence_ids=sids if steps else None,
+        inputs, objective_data = pack_token_batch(steps=steps, sequence_ids=sids if steps else None,
                                         batch_size=len(rows), continuing=continuing)
         if not steps:
-            inputs = replace(inputs, tokenizer_names=self.tokenizer_names, tokenizer_ids=np.zeros(0, dtype=np.int64),
-                             numeric_field_names=self.numeric_field_names)
-        return inputs
+            inputs.set_non_tensor("tokenizer_names", self.tokenizer_names)
+            inputs.set_non_tensor("numeric_field_names", self.numeric_field_names)
+        return inputs, objective_data
 
 
 class EventTokenStream:

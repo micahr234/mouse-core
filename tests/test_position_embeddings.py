@@ -61,20 +61,20 @@ def test_stream_pack_prefix_slice_and_saved_field_association(tmp_path):
     save_tokenizer(tokenizer=tok, path=tmp_path)
     restored = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizers=tok.tokenizers)
     assert [s.position_field for s in restored.input_fields] == [s.position_field for s in tok.input_fields]
-    packed = tok.pack_rows(rows=[events()], continuing=None)
-    copied = restored.pack_rows(rows=[events()], continuing=None)
+    packed, packed_objective_data = tok.pack_rows(rows=[events()], continuing=None)
+    copied, copied_objective_data = restored.pack_rows(rows=[events()], continuing=None)
     names = ('token_ids', 'position_values', 'position_mask', 'numeric_field_ids')
-    assert packed.numeric_field_names == copied.numeric_field_names == tok.numeric_field_names
+    assert packed['numeric_field_names'] == copied['numeric_field_names'] == tok.numeric_field_names
     for name in names:
-        np.testing.assert_array_equal(getattr(packed, name), getattr(copied, name))
-    first = tok.pack_rows(rows=[events()[:2]], continuing=None)
-    continued = tok.pack_rows(rows=[events()[2:]], continuing=[True])
+        np.testing.assert_array_equal(packed[name], copied[name])
+    first, first_objective_data = tok.pack_rows(rows=[events()[:2]], continuing=None)
+    continued, continued_objective_data = tok.pack_rows(rows=[events()[2:]], continuing=[True])
     for name in names:
-        np.testing.assert_array_equal(getattr(packed, name), np.concatenate([getattr(first, name), getattr(continued, name)]))
-    assert packed.to_tensors()['position_values'].dtype == torch.float64
-    empty = tok.pack_rows(rows=[[]], continuing=None)
-    assert empty.numeric_field_names == tok.numeric_field_names
-    assert empty.to_tensors()['position_mask'].numel() == 0
+        np.testing.assert_array_equal(packed[name], np.concatenate([first[name], continued[name]]))
+    assert packed['position_values'].dtype == torch.float64
+    empty, empty_objective_data = tok.pack_rows(rows=[[]], continuing=None)
+    assert empty['numeric_field_names'] == tok.numeric_field_names
+    assert empty['position_mask'].numel() == 0
     stream = tok.stream(include_objectives=False)
     steps = []
     for event in events():
@@ -179,6 +179,7 @@ def test_one_position_projection_shared_across_named_token_tables():
     assert sum('position.proj.weight' in name for name, _ in model.named_parameters()) == 1
 
 
+@pytest.mark.flex_training(default_device=False)
 def test_offline_dqn_time_notebook_runs_local_training_and_saves(tmp_path):
     from transformers import Qwen3Config, Qwen3Model
     from mouse_core.models import load_model
@@ -205,7 +206,7 @@ def test_offline_dqn_time_notebook_runs_local_training_and_saves(tmp_path):
             exec(compile(''.join(cell['source']), f'{notebook}:cell{index}', 'exec'), ns)
             if index == 1:
                 ns.update(PRETRAINED=str(base), TOKEN_BUDGET=1024, TRAIN_STEPS=1, NUM_CYCLES=1,
-                          OUTPUT_DIR=tmp_path / 'checkpoint', device=torch.device('cpu'))
+                          OUTPUT_DIR=tmp_path / 'checkpoint', device=torch.device('cuda'))
         assert torch.isfinite(ns['loss'])
         time_projection = ns['encoder'].embedding.features.position.proj
         assert time_projection.weight.grad is not None
@@ -238,17 +239,17 @@ def test_numeric_and_position_additions_cover_every_emitted_token(kind, tmp_path
     content = [1, 2, 3] if kind == 'image' else 'a b a' if kind == 'text' else 'a'
     row = dict(provider='sensor', step_index=0,
                payload=dict(content=content, measurement=[0., 3.], context=1.))
-    packed = tok.pack_rows(rows=[[row]], continuing=None)
+    packed, packed_objective_data = tok.pack_rows(rows=[[row]], continuing=None)
     count = 1 if kind == 'token' else 3
-    assert packed.numeric_values.tolist() == [.5] * count
-    assert packed.position_values.tolist() == [.5] * count
-    assert packed.numeric_field_ids.tolist() == [0] * count
+    assert packed['numeric_values'].tolist() == [.5] * count
+    assert packed['position_values'].tolist() == [.5] * count
+    assert packed['numeric_field_ids'].tolist() == [0] * count
     model = Embedding(vocab_size=6, hidden_dim=8, num_frequencies=2,
                       numeric_field_names=tok.numeric_field_names, position_num_frequencies=3)
-    tensors = packed.to_tensors()
+    tensors = packed
     kwargs = {key: tensors[key] for key in ('numeric_values', 'numeric_mask', 'numeric_field_ids',
                                            'position_values', 'position_mask')}
-    actual = model(tensors['token_ids'], numeric_field_names=packed.numeric_field_names, **kwargs)
+    actual = model(tensors['token_ids'], numeric_field_names=packed['numeric_field_names'], **kwargs)
     expected = (model.embed_tokens(tensors['token_ids'])
                 + model.features.numeric[0](torch.full((count,), .5))
                 + model.features.position(torch.full((count,), .5, dtype=torch.float64)))

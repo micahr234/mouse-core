@@ -1,4 +1,6 @@
 """Action prompts are ordinary optional token fields; all step labels survive."""
+
+from tests._prediction_layout import fixture_head_steps
 import numpy as np
 import pytest
 import torch
@@ -58,12 +60,13 @@ def test_special_tokens_sparse_steps_and_roundtrip(tmp_path):
     for source in (episode(), episode().to_dataset()):
         steps = tok.encode(source)
         assert [int(step.head_token_mask.sum()) for step in steps] == [1, 0, 0, 1, 0]
-        packed, labels, groups = pack_token_batch(steps=steps, continuing=None)
-        assert packed.N == 5 and packed.P == 2
-        assert packed.head_step_ids.tolist() == [0, 3]
-        assert packed.step_counts().tolist() == [5]
-        assert packed.token_ids[packed.head_token_ids].tolist() == [special, special]
-        assert packed.token_ids.tolist().count(4) == 1  # group prefix
+        packed, labels = pack_token_batch(steps=steps, continuing=None)
+        groups = labels["step_sequence_ids"]
+        assert labels["step_sequence_ids"].shape[0] == 5 and packed["head_token_mask"].nonzero(as_tuple=True)[0].shape[0] == 2
+        assert labels["head_step_ids"].tolist() == [0, 3]
+        assert torch.bincount(labels["step_sequence_ids"], minlength=packed["num_sequences"]).tolist() == [5]
+        assert packed['token_ids'][packed["head_token_mask"].nonzero(as_tuple=True)[0]].tolist() == [special, special]
+        assert packed['token_ids'].tolist().count(4) == 1  # group prefix
         assert labels['reward'].tolist() == [0., 2., 3., 0., 7.]
         assert groups.tolist() == [0] * 5
     save_tokenizer(tokenizer=tok, path=tmp_path)
@@ -78,12 +81,12 @@ def test_special_tokens_sparse_steps_and_roundtrip(tmp_path):
 
 
 def test_rewards_flow_through_steps_without_readouts():
-    packed, labels, groups = pack_token_batch(steps=tokenizer().encode(episode()), continuing=None)
+    packed, labels = pack_token_batch(steps=tokenizer().encode(episode()), continuing=None)
+    groups = labels["step_sequence_ids"]
     q = torch.tensor([[1., 0.], [4., 0.]], requires_grad=True)
     discount = boundary_discount(gamma_step=.5, gamma_terminated=0., gamma_truncated=0.)
-    dqn = DqnObjective(discount=discount, reward=None, value=None, temperature=0., gate=None,
-                       cross_group_backups='fault')
-    loss, metrics = dqn(objective_data=labels, group_id=groups, predictions=q,
+    dqn = DqnObjective(discount=discount, reward=None, value=None, temperature=0., gate=None)
+    loss, metrics = dqn(objective_data=labels, group_id=groups, head_step_ids=labels["head_step_ids"],  predictions=q,
                         backup_value_predictions=q.detach(), backup_action_predictions=q.detach())
     # 2 + .5 * 3 + .5**3 * 4; final decision receives the terminal reward.
     torch.testing.assert_close(metrics['backup'], torch.tensor([4., 7.]))
@@ -91,34 +94,34 @@ def test_rewards_flow_through_steps_without_readouts():
     loss['action_value'].backward()
     assert q.grad is not None and (q.grad[:, 0] != 0).all()
     values = torch.tensor([1., 4.], requires_grad=True)
-    logits = torch.zeros(packed.P, 2, requires_grad=True)
+    logits = torch.zeros(packed["head_token_mask"].nonzero(as_tuple=True)[0].shape[0], 2, requires_grad=True)
     ppo = PpoObjective(discount=discount, reward=None, value=None, gae_lambda=0.,
-                       cross_group_backups='fault', normalize_advantage=False)
-    loss, metrics = ppo(objective_data=labels, group_id=groups, predictions=logits, value_predictions=values)
+                        normalize_advantage=False)
+    loss, metrics = ppo(objective_data=labels, group_id=groups, head_step_ids=labels["head_step_ids"],  predictions=logits, value_predictions=values)
     assert metrics['value_loss'] == pytest.approx(9.)
     loss['ppo'].backward()
     assert values.grad is not None and (values.grad != 0).all()
     grpo = GrpoObjective(clip_ratio_min=.8, clip_ratio_max=1.2)
-    losses, _ = grpo(objective_data=labels, group_id=groups, predictions=torch.zeros(2, 2, requires_grad=True))
+    losses, _ = grpo(objective_data=labels, group_id=groups, head_step_ids=labels["head_step_ids"],  predictions=torch.zeros(2, 2, requires_grad=True))
     assert all(torch.isfinite(value) for value in losses.values())
 
 
 def test_cached_layout_keeps_passive_tokens_without_inventing_readouts():
     steps = tokenizer().encode(episode())
-    tokens, _, _ = pack_token_batch(steps=[*steps, *steps[1:3]], sequence_ids=[0]*5+[1]*2, continuing=None)
-    tensors = tokens.to_tensors()
-    padded, lengths, ids, valid = prepare_decode(embeds=torch.ones(tokens.L, 3), tokens=tokens,
-        sequence_ids=tensors['sequence_ids'], head_token_ids=tensors['head_token_ids'], head_step_ids=tensors['head_step_ids'])
+    tokens, tokens_objective_data = pack_token_batch(steps=[*steps, *steps[1:3]], sequence_ids=[0]*5+[1]*2, continuing=None)
+    tensors = tokens
+    padded, lengths, ids, valid = prepare_decode(embeds=torch.ones(tokens["token_ids"].shape[0], 3), tokens=tokens,
+        sequence_ids=tensors['sequence_ids'], head_token_mask=tensors["head_token_mask"])
     assert padded.shape[0] == 2 and min(lengths) > 0
     assert ids.shape == (2, 2) and valid.tolist() == [[True, True], [False, False]]
     for seed in range(10):
-        splits = sample_reasoning_splits(batch=tokens, generator=np.random.default_rng(seed))
+        splits = sample_reasoning_splits(batch=tokens, objective_data=tokens_objective_data, generator=np.random.default_rng(seed))
         assert splits[0] in (0, 3) and splits[1] == -1
-    passive, _, _ = pack_token_batch(steps=steps[1:3], continuing=[True])
-    t = passive.to_tensors()
-    _, lengths, ids, valid = prepare_decode(embeds=torch.ones(passive.L, 3), tokens=passive,
-        sequence_ids=t['sequence_ids'], head_token_ids=t['head_token_ids'], head_step_ids=t['head_step_ids'])
-    assert lengths == [passive.L] and ids.shape == valid.shape == (1, 0)
+    passive, passive_objective_data = pack_token_batch(steps=steps[1:3], continuing=[True])
+    t = passive
+    _, lengths, ids, valid = prepare_decode(embeds=torch.ones(passive["token_ids"].shape[0], 3), tokens=passive,
+        sequence_ids=t['sequence_ids'], head_token_mask=t["head_token_mask"])
+    assert lengths == [passive["token_ids"].shape[0]] and ids.shape == valid.shape == (1, 0)
 
 
 def test_embedding_growth_preserves_old_rows_and_trains_special_row():
@@ -142,12 +145,12 @@ def test_explicit_provider_fields_keep_order_and_group_prefix_once():
     log.event(provider='agent', episode_index=0, step_index=0, payload={'value': 1})
     log.event(provider='sensor', episode_index=0, step_index=0, payload={'value': 2})
     log.event(provider='sensor', episode_index=0, step_index=1, payload={'value': 3})
-    packed = tok.pack_rows(rows=[log], continuing=None)
-    assert packed.token_ids.tolist() == [4, 2, 1, 1]
-    assert packed.head_step_ids.tolist() == [0]
-    first = tok.pack_rows(rows=[log[:3]], continuing=None)
-    rest = tok.pack_rows(rows=[log[3:]], continuing=[True])
-    assert packed.token_ids.tolist() == first.token_ids.tolist() + rest.token_ids.tolist()
+    packed, packed_objective_data = tok.pack_rows(rows=[log], continuing=None)
+    assert packed['token_ids'].tolist() == [4, 2, 1, 1]
+    assert packed_objective_data["head_step_ids"].tolist() == [0]
+    first, first_objective_data = tok.pack_rows(rows=[log[:3]], continuing=None)
+    rest, rest_objective_data = tok.pack_rows(rows=[log[3:]], continuing=[True])
+    assert packed['token_ids'].tolist() == first['token_ids'].tolist() + rest['token_ids'].tolist()
 
 
 def test_event_augmentation_provider_filters_and_shared_permutations():
@@ -158,8 +161,8 @@ def test_event_augmentation_provider_filters_and_shared_permutations():
     log.event(provider='agent', episode_index=7, step_index=1, payload={'action': 2, 'value': 2.})
     original = log.events
     augmenter = Augmenter(seed_field='episode_index', seed=12, fields=[
-        dict(type='discrete', provider=None, input_field='action', input_vector_field='q_star',
-             permute=True, vocab_size=4),
+        dict(type="discrete_permute", provider=None, input_field='action', input_vector_field='q_star',
+              vocab_size=4),
         dict(type='linear', provider='environment', input_field='value',
              scale_in_low=0., scale_in_high=1., scale_out_low=0., scale_out_high=2.),
     ])
@@ -187,11 +190,12 @@ def test_passive_only_step_window_has_no_prediction_loss():
     for step in range(2):
         log.event(provider='environment', episode_index=0, step_index=step, payload={'reward': 1.})
     steps = tokenizer().encode(log)
-    _, labels, groups = pack_token_batch(steps=steps, continuing=None)
+    inputs, labels = pack_token_batch(steps=steps, continuing=None)
+    groups = labels["step_sequence_ids"]
     q = torch.empty(0, 2, requires_grad=True)
     objective = DqnObjective(discount=boundary_discount(gamma_step=.5, gamma_terminated=0., gamma_truncated=0.),
-        reward=None, value=None, temperature=0., gate=None, cross_group_backups='ignore')
-    losses, metrics = objective(objective_data=labels, group_id=groups, predictions=q,
+        reward=None, value=None, temperature=0., gate=None)
+    losses, metrics = objective(objective_data=labels, group_id=groups, head_step_ids=labels["head_step_ids"],  predictions=q,
         backup_value_predictions=q.detach(), backup_action_predictions=q.detach())
     assert isinstance(metrics['backup'], torch.Tensor)
     assert losses['action_value'].item() == 0 and metrics['backup'].numel() == 0

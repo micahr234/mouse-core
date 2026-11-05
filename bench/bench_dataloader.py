@@ -5,27 +5,27 @@ Builds an in-memory ``Datastore`` (no Hub) with the same augmenter +
 times ``next_batch()`` for every ``--workloads`` × ``--workers`` pair. Reports
 average and max consumer wait (how long ``next_batch`` blocks), loader setup,
 first-call (queue fill) time, steps/second, and tokens/second. ``--profile`` adds a
-``torch.profiler`` CPU breakdown after warmup. ``num_workers>0`` needs
-free-threaded CPython with the GIL off. ``--profile-stages`` profiles the
+``torch.profiler`` CPU breakdown after warmup. ``num_workers>0`` uses
+spawned processes with shared-memory transfer. ``--profile-stages`` profiles the
 synchronous loading, augmentation, tokenization, and packing stages without
 ``torch.profiler``. Use ``--local-files-only`` for a cached tokenizer or
 ``--tokenizer /path/to/tokenizer`` for a local backend.
 
-    PYTHON_GIL=0 .venv/bin/python bench/bench_dataloader.py
-    PYTHON_GIL=0 .venv/bin/python bench/bench_dataloader.py --workers 0 1 4 8
-    PYTHON_GIL=0 .venv/bin/python bench/bench_dataloader.py --workloads notebook long
-    PYTHON_GIL=0 .venv/bin/python bench/bench_dataloader.py --workloads notebook --workers 0 --profile
-    PYTHON_GIL=0 .venv/bin/python bench/bench_dataloader.py --workloads notebook --workers 0 --local-files-only --profile-stages
+    .venv/bin/python bench/bench_dataloader.py
+    .venv/bin/python bench/bench_dataloader.py --workers 0 1 4 8
+    .venv/bin/python bench/bench_dataloader.py --workloads notebook long
+    .venv/bin/python bench/bench_dataloader.py --workloads notebook --workers 0 --profile
+    .venv/bin/python bench/bench_dataloader.py --workloads notebook --workers 0 --local-files-only --profile-stages
 """
 
 from __future__ import annotations
+from tensordict import TensorDict
 
 import argparse
 import cProfile
 import pstats
 import statistics
 import sys
-import sysconfig
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -35,7 +35,7 @@ import numpy as np
 
 
 from mouse_core.data import Augmenter, DataLoader, Datastore, EventLog, Tokenizer, compose
-from mouse_core.data.token_batch import TokenBatch
+
 
 
 def on_group_start(ctx):
@@ -78,13 +78,6 @@ _group_prefix = (
 )
 
 
-def _free_threading_ok() -> bool:
-    if not sysconfig.get_config_var("Py_GIL_DISABLED"):
-        return False
-    is_gil_enabled = getattr(sys, "_is_gil_enabled", None)
-    return not (callable(is_gil_enabled) and is_gil_enabled())
-
-
 def _stores(*, n_stores: int, steps: int) -> list[Datastore]:
     stores = []
     for stream in range(n_stores):
@@ -125,17 +118,15 @@ def _train_transform(*, tokenizer_source: str = "Qwen/Qwen3-0.6B", local_files_o
         seed=0,
         fields=[
             {
-                "type": "discrete",
+                "type": "discrete_permute",
                 "input_field": "action",
                 "input_vector_field": "q_star",
                 "vocab_size": _MAX_ACTIONS,
-                "permute": True,
             },
             {
-                "type": "discrete",
+                "type": "discrete_permute",
                 "input_field": "observation",
                 "vocab_size": _MAX_OBS,
-                "permute": True,
             },
         ],
     )
@@ -143,29 +134,34 @@ def _train_transform(*, tokenizer_source: str = "Qwen/Qwen3-0.6B", local_files_o
         input_fields=[
             {
                 "type": "text",
+                "provider": "environment",
                 "format": _group_prefix,
                 "when": on_group_start,
             },
             {"type": "text", "provider": "environment", "input_field": "repeat_episode_index", "format": "episode {field+1}\n"},
-            {"type": "text", "input_field": "action", "lookup": ["a", "b", "c", "d"], "format": "{field}"},
-            {"type": "text", "input_field": "observation", "format": ",{field}"},
+            {"type": "text", "provider": "agent", "input_field": "action", "lookup": ["a", "b", "c", "d"], "format": "{field}"},
+            {"type": "text", "provider": "environment", "input_field": "observation", "format": ",{field}"},
             {
                 "type": "text",
+                "provider": "environment",
                 "input_field": "reward",
                 "format": ",r={field:g}",
             },
             {
                 "type": "text",
+                "provider": "environment",
                 "format": ",terminated",
                 "input_field": "inner_terminated",
             },
             {
                 "type": "text",
+                "provider": "environment",
                 "format": ",truncated",
                 "input_field": "inner_truncated",
             },
             {
                 "type": "token",
+                "provider": "environment",
                 "input_field": "action_requested",
                 "format": "\n",
                 "head_output": True,
@@ -189,7 +185,7 @@ def _train_transform(*, tokenizer_source: str = "Qwen/Qwen3-0.6B", local_files_o
     return compose(stages=(augmenter.events, tokenizer.encode))
 
 
-def _timed(fn: Callable[[], TokenBatch], iters: int) -> tuple[float, float, float, float, float]:
+def _timed(fn: Callable[[], tuple[TensorDict, TensorDict]], iters: int) -> tuple[float, float, float, float, float]:
     """First/mean/max wait in ms, and mean steps/tokens per measured batch."""
     t0 = time.perf_counter()
     fn()
@@ -199,10 +195,10 @@ def _timed(fn: Callable[[], TokenBatch], iters: int) -> tuple[float, float, floa
     steps = tokens = 0
     for _ in range(iters):
         t0 = time.perf_counter()
-        sample = fn()
+        sample, sample_objective_data = fn()
         times.append((time.perf_counter() - t0) * 1e3)
-        steps += sample.N
-        tokens += sample.L
+        steps += sample_objective_data["step_sequence_ids"].shape[0]
+        tokens += sample["token_ids"].shape[0]
     return first, statistics.mean(times), max(times), steps / iters, tokens / iters
 
 
@@ -256,28 +252,21 @@ def main() -> None:
         raise SystemExit(f"unknown workload(s) {unknown}; choose from {sorted(_WORKLOADS)}")
     if any(w < 0 for w in args.workers):
         raise SystemExit("num_workers must be >= 0")
-    if any(w > 0 for w in args.workers) and not _free_threading_ok():
-        raise SystemExit(
-            "num_workers>0 needs free-threaded CPython with the GIL off "
-            "(PYTHON_GIL=0 .venv/bin/python bench/bench_dataloader.py)"
-        )
-
     stores = _stores(n_stores=args.stores, steps=args.store_steps)
     transform = _train_transform(tokenizer_source=args.tokenizer, local_files_only=args.local_files_only)
     print(
         f"stores={args.stores}×{args.store_steps} | augmenter+Tokenizer | "
-        f"prefetch={args.prefetch} seed={args.seed} | tokenizer={args.tokenizer} | gil_off={_free_threading_ok()}"
+        f"prefetch={args.prefetch} seed={args.seed} | tokenizer={args.tokenizer}"
     )
 
     for wname in args.workloads:
-        seq_len, batch_size = _WORKLOADS[wname]
-        print(f"\n### workload: {wname} | S={seq_len} B={batch_size}")
+        seq_len, scale = _WORKLOADS[wname]
+        print(f"\n### workload: {wname} | events_budget={3 * seq_len * scale}")
         for n_workers in args.workers:
             started = time.perf_counter()
             loader = DataLoader(
                 stores=stores,
-                events_budget=3 * seq_len,
-                batch_size=batch_size,
+                events_budget=3 * seq_len * scale,
                 sample_field="episode_index",
                 transform=transform,
                 prefetch=args.prefetch,
@@ -286,9 +275,8 @@ def main() -> None:
             )
             setup_ms = (time.perf_counter() - started) * 1e3
 
-            def next_batch() -> TokenBatch:
-                sample, _, _sid = loader.next_batch()
-                return sample
+            def next_batch() -> tuple[TensorDict, TensorDict]:
+                return loader.next_batch()
 
             first, avg_wait, max_wait, steps, tokens = _timed(next_batch, args.iters)
             print(
@@ -300,7 +288,7 @@ def main() -> None:
                 if n_workers == 0:
                     _profile_stages(next_batch, args.iters)
                 else:
-                    print("  cProfile stages skipped: worker threads are not captured; use --workers 0")
+                    print("  cProfile stages skipped: worker processes are not captured; use --workers 0")
             if wants_profile(args):
                 profile_call(
                     next_batch,

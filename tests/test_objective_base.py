@@ -53,29 +53,31 @@ _CASES: list[tuple[Objective[...], dict[str, object], tuple[str, ...]]] = [
     (
         DqnObjective(
             discount=None, reward=None, value=None, gate=None,
-            temperature=0.0, cross_group_backups="bootstrap",
+            temperature=0.0,
         ),
         {
             "group_id": torch.zeros(2, dtype=torch.int64),
+            "head_step_ids": torch.arange(2),
             "backup_value_predictions": torch.zeros(2, 2),
             "backup_action_predictions": torch.zeros(2, 2),
         },
-        ("group_id", "backup_value_predictions", "backup_action_predictions"),
+        ("group_id", "head_step_ids", "backup_value_predictions", "backup_action_predictions"),
     ),
     (
         PpoObjective(
-            discount=None, reward=None, value=None, cross_group_backups="bootstrap",
+            discount=None, reward=None, value=None,
         ),
         {
             "group_id": torch.zeros(2, dtype=torch.int64),
+            "head_step_ids": torch.arange(2),
             "value_predictions": torch.zeros(2),
         },
-        ("group_id", "value_predictions"),
+        ("group_id", "head_step_ids", "value_predictions"),
     ),
     (
         GrpoObjective(),
-        {"group_id": torch.zeros(2, dtype=torch.int64)},
-        ("group_id",),
+        {"group_id": torch.zeros(2, dtype=torch.int64), "head_step_ids": torch.arange(2)},
+        ("group_id", "head_step_ids"),
     ),
     (SupervisedObjective(mask_key=None), {"targets": torch.zeros(2, 2)}, ("targets",)),
     (SupervisedObjective(loss_type="mse", target_temperature=None), {"targets": torch.zeros(2, 2)}, ("targets",)),

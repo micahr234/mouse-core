@@ -46,25 +46,27 @@ def test_event_budget_shortcut_preserves_sampling_and_generations(budget):
     # its cost, so it supplies an independent reference for the shortcut.
     event_transform = _EncodeOneTokenPerEvent()
     token_transform = _EncodeOneTokenPerEvent()
-    options: dict[str, Any] = dict(stores=_store([1, 2, 3]), batch_size=3,
+    options: dict[str, Any] = dict(stores=_store([1, 2, 3]),
                                    sample_field="episode_index", index_field="source_offset",
                                    num_workers=0, seed=21)
     with DataLoader(**options, events_budget=budget, transform=event_transform) as events, \
             DataLoader(**options, token_budget=budget, transform=token_transform) as tokens:
         for _ in range(4):
-            event_batch, event_data, event_groups = events.next_batch()
-            token_batch, token_data, token_groups = tokens.next_batch()
-            for field in ("token_ids", "sequence_ids", "head_token_ids", "numeric_values", "numeric_mask"):
-                np.testing.assert_array_equal(getattr(event_batch, field), getattr(token_batch, field))
+            event_batch, event_data = events.next_batch()
+            event_groups = event_data["step_sequence_ids"]
+            token_batch, token_data = tokens.next_batch()
+            token_groups = token_data["step_sequence_ids"]
+            for field in ("token_ids", "sequence_ids", "head_token_mask", "numeric_values", "numeric_mask"):
+                np.testing.assert_array_equal(event_batch[field], token_batch[field])
             assert torch.equal(event_groups, token_groups)
             assert torch.equal(event_data["source_offset"], token_data["source_offset"])
         assert event_transform.generations == token_transform.generations
-        assert len(token_transform.encoded_generations) - len(event_transform.encoded_generations) == 12
+        assert len(token_transform.encoded_generations) - len(event_transform.encoded_generations) == 4
 
 
 def test_event_budget_rejects_oversized_first_window_before_transform():
     transform = _EncodeOneTokenPerEvent()
-    with DataLoader(stores=_store([3]), events_budget=2, batch_size=1,
+    with DataLoader(stores=_store([3]), events_budget=2,
                     sample_field="episode_index", index_field="source_offset",
                     transform=transform, num_workers=0, seed=0) as loader:
         with pytest.raises(ValueError, match="3 source events.*events_budget=2"):

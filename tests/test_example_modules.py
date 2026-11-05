@@ -1,3 +1,6 @@
+from tensordict import TensorDict
+
+from tests._prediction_layout import fixture_head_steps
 from tests._event_fixtures import measurement_events
 """Exercise the actual notebook encoders, separate heads, and training loops."""
 import ast
@@ -14,9 +17,8 @@ import torch
 from torch import nn
 
 from mouse_core import AdamW, polyak_update
-from mouse_core.data import (environment_episode_ranges, DataLoader, EventLog, Tokenizer, to_device,
-                             compose, environment_decisions, latest_environment_decision)
-from mouse_core.data.token_batch import TokenBatch
+from mouse_core.data import environment_episode_ranges, DataLoader, EventLog, Tokenizer, compose, environment_decisions, latest_environment_decision
+
 from mouse_gym import RepeatTaskTracker
 from mouse_core.models import (
     Backbone, Embedding, MultiEmbedding, DecodeCache, LatentReasoner, MLP, Model,
@@ -36,14 +38,13 @@ NOTEBOOKS = [path for path in sorted(EXAMPLES.glob("*.ipynb"))
 
 
 def _tokens(*actions):
-    return replace(batch_to_token_batch(token_tokenizer("action"), [[{"action": action} for action in actions]]),
-                   tokenizer_names=("text",))
+    return batch_to_token_batch(token_tokenizer("action"), [[{"action": action} for action in actions]]).set_non_tensor("tokenizer_names", ("text",))
 
 
 def _example(path, **overrides):
     """Use the notebook's construction code with small local backend factories."""
     notebook = json.loads(path.read_text())
-    namespace: dict[str, Any] = {**globals(), "device": torch.device("cpu")}
+    namespace: dict[str, Any] = {**globals(), "device": torch.get_default_device()}
     # Preserve symbolic settings; no network, environment, or publication calls.
     for node in ast.parse("".join(notebook["cells"][1]["source"])).body:
         if isinstance(node, ast.Assign):
@@ -74,7 +75,7 @@ def _example(path, **overrides):
     def backbone_factory(**kwargs):
         construction.append(("backbone", kwargs))
         return Backbone(architecture="qwen3", hidden_dim=8, num_layers=1, num_heads=2,
-                        train_kernel="reference", decode_kernel="flex", dtype=torch.float32)
+                        train_kernel="flex", decode_kernel="flex", dtype=torch.float32)
 
     namespace.update(Embedding=embedding_factory, Backbone=backbone_factory)
     source = next("".join(cell["source"]) for cell in notebook["cells"]
@@ -103,6 +104,7 @@ def _heads(ns):
     return [ns[name] for name in ("q_head", "policy_head", "value_head") if name in ns]
 
 
+@pytest.mark.flex_training
 def test_example_encoder_builds_and_trains_each_named_tokenizer_table():
     from tests._token_batch_helpers import IntIdTokenizer
     _, ns = _example(EXAMPLES / '02_train_offline_dqn.ipynb',
@@ -113,7 +115,7 @@ def test_example_encoder_builds_and_trains_each_named_tokenizer_table():
         dict(provider="sensor", type='text', tokenizer='actions', input_field='action', format='{field}'),
         dict(provider="sensor", type='text', tokenizer='text', input_field='observation', format='{field}', head_output=True),
     ])
-    inputs = tokenizer.pack_rows(rows=[measurement_events([{'action': 2, 'observation': 3}])], continuing=None)
+    inputs, inputs_objective_data = tokenizer.pack_rows(rows=[measurement_events([{'action': 2, 'observation': 3}])], continuing=None)
     ns['q_head'](encoder(inputs)['z']).square().sum().backward()
     for table in encoder.embedding.embeddings.values():
         assert table.embed_tokens.weight.grad is not None
@@ -121,6 +123,7 @@ def test_example_encoder_builds_and_trains_each_named_tokenizer_table():
 
 
 @pytest.mark.parametrize("path", NOTEBOOKS, ids=lambda p: p.stem)
+@pytest.mark.flex_training
 def test_encoders_and_heads_have_separate_gradients_and_cached_readouts(path):
     _, ns = _example(path)
     encoder = ns["encoder"]
@@ -138,7 +141,7 @@ def test_encoders_and_heads_have_separate_gradients_and_cached_readouts(path):
     finally:
         hook.remove()
     assert set(out) == {"z", "cache"}
-    torch.testing.assert_close(out["z"], features[-1][tokens.head_token_ids])
+    torch.testing.assert_close(out["z"], features[-1][tokens["head_token_mask"].nonzero(as_tuple=True)[0]])
     heads = _heads(ns)
     torch.stack([head(out["z"]).square().mean() for head in heads]).sum().backward()
     for module in (encoder.embedding, encoder.backbone, *heads):
@@ -161,6 +164,7 @@ def test_encoders_and_heads_have_separate_gradients_and_cached_readouts(path):
 
 
 @pytest.mark.parametrize("path", [p for p in NOTEBOOKS if "15_inference" not in p.stem], ids=lambda p: p.stem)
+@pytest.mark.flex_training
 def test_notebook_training_uses_all_online_modules_and_updates_targets(path):
     notebook, ns = _example(path)
     tokens = _tokens(0, 1, 2)
@@ -184,7 +188,7 @@ def test_notebook_training_uses_all_online_modules_and_updates_targets(path):
         def __init__(self, **kwargs):
             pass
         def next_batch(self):
-            return tokens, data, group_id
+            return tokens, TensorDict(dict(data, head_step_ids=torch.arange(len(group_id), device=group_id.device), step_sequence_ids=group_id), batch_size=[])
         def refresh(self):
             pass
         def close(self):
@@ -271,9 +275,9 @@ def test_embedding_requires_prepared_inputs_on_the_model_device():
     _, namespace = _example(NOTEBOOKS[0])
     model = namespace["encoder"]
     tokens = _tokens(0)
-    tensors = tokens.to_tensors("cpu")
+    tensors = tokens.to("cpu")
     kwargs: dict[str, Any] = {name: tensors[name] for name in ("numeric_mask", "numeric_values", "tokenizer_ids")}
-    kwargs["tokenizer_names"] = tokens.tokenizer_names
+    kwargs["tokenizer_names"] = tokens['tokenizer_names']
     with pytest.raises(TypeError, match="expects tensor"):
         model.embedding.embeddings["text"](tokens, numeric_values=tensors["numeric_values"], numeric_mask=tensors["numeric_mask"])
     model.to("meta")
@@ -284,7 +288,7 @@ def test_embedding_requires_prepared_inputs_on_the_model_device():
 def test_embedding_and_backbone_are_independently_constructed():
     embedding = Embedding(hidden_dim=8, vocab_size=32, num_frequencies=2, numeric_field_names=("sensor.value",))
     backbone = Backbone(architecture="qwen3", hidden_dim=8, num_layers=1,
-                        num_heads=2, train_kernel="reference",
+                        num_heads=2, train_kernel="flex",
                         decode_kernel="flex", dtype=torch.float32)
     assert not hasattr(backbone, "embedding")
     assert getattr(backbone.model, "embed_tokens") is None
@@ -292,8 +296,9 @@ def test_embedding_and_backbone_are_independently_constructed():
     assert not {id(p) for p in embedding.parameters()} & {id(p) for p in backbone.parameters()}
 
 
+@torch.no_grad()
 def test_backbone_requires_explicit_packed_metadata():
-    backbone = Backbone(architecture='qwen3', hidden_dim=8, num_layers=1, num_heads=2, train_kernel='reference', decode_kernel='flex', dtype=torch.float32)
+    backbone = Backbone(architecture='qwen3', hidden_dim=8, num_layers=1, num_heads=2, train_kernel="flex", decode_kernel='flex', dtype=torch.float32)
     embed = torch.randn(5, 8)
     with pytest.raises(ValueError, match="require sequence_ids"):
         backbone(embed)
@@ -313,9 +318,13 @@ def _notebook_functions(notebook, names, namespace):
     exec(compile(ast.Module(body=definitions, type_ignores=[]), '<notebook>', 'exec'), namespace)
 
 
+@torch.no_grad()
 def test_ppo_collection_restarts_replay_and_preserves_behavior_prefixes():
     from types import SimpleNamespace
-    from mouse_core.data import Datastore, environment_decisions
+    from functools import partial
+    from mouse_core.data import Datastore, EnvironmentProtocol, environment_decisions
+    protocol = EnvironmentProtocol(episode_start="_episode_start", terminated="_terminated", truncated="_truncated")
+    environment_decisions = partial(environment_decisions, protocol=protocol)
     from mouse_core.objectives import sample_discrete_action
 
     notebook, ns = _example(EXAMPLES / '07_train_online_ppo.ipynb', MAX_CONTEXT=6,
@@ -354,9 +363,9 @@ def test_ppo_collection_restarts_replay_and_preserves_behavior_prefixes():
         objective_fields=[
             {'input_field': 'action', 'missing_value': None},
             {'input_field': 'reward', 'missing_value': 0.},
-            {'input_field': 'terminated', 'missing_value': False},
-            {'input_field': 'truncated', 'missing_value': False},
-            {'input_field': 'old_log_prob', 'missing_value': 0.},
+            {'input_field': '_terminated', 'output_field': 'terminated', 'missing_value': False},
+            {'input_field': '_truncated', 'output_field': 'truncated', 'missing_value': False},
+            {'input_field': '_old_log_prob', 'output_field': 'old_log_prob', 'missing_value': 0.},
         ])
     ns.update(env=None, logs=[], trackers=[], contexts=[[]], stores=[Datastore(name='test')],
               make_rollout_env=make_env, tokenizer=tokenizer,
@@ -367,25 +376,26 @@ def test_ppo_collection_restarts_replay_and_preserves_behavior_prefixes():
         store = ns['stores'][0]
         rows = list(environment_decisions(store.to_dataset()))
         assert len(rows) == 5
-        assert rows[-1].get('terminated', False) or rows[-1].get('truncated', False)
+        assert rows[-1].get('_terminated', False) or rows[-1].get('_truncated', False)
         assert ['action' not in row for row in rows] == [True, False, False, True, False]
         assert rows[0]['observation'] == initial_step
         # No optimizer update occurred: replaying the collection prefix must reproduce
         # every stored action probability, including after an environment-only reset.
         ns['modules'].eval()
         with torch.no_grad():
-            tokens = tokenizer.pack_rows(rows=[ns['contexts'][0]], continuing=None)
+            tokens, tokens_objective_data = tokenizer.pack_rows(rows=[ns['contexts'][0]], continuing=None)
             logits = ns['policy_head'](ns['encoder'](tokens)['z'])
             for step, row in enumerate(rows[1:], 1):
                 if 'action' in row:
                     actual = logits[step - 1].log_softmax(-1)[row['action']]
-                    assert float(actual) == pytest.approx(row['old_log_prob'], abs=1e-5)
+                    assert float(actual) == pytest.approx(row['_old_log_prob'], abs=1e-5)
         # Preprocessing supplies an ignored agent probability on reset outputs. The complete task trains under fault mode.
-        loader = DataLoader(stores=[store], events_budget=len(store), batch_size=1,
-                            sample_ranges=environment_episode_ranges, num_workers=0,
+        loader = DataLoader(stores=[store], events_budget=len(store),
+                            sample_ranges=partial(environment_episode_ranges, protocol=protocol), num_workers=0,
                             transform=tokenizer.encode)
         try:
-            inputs, objective_data, group_id = loader.next_batch()
+            inputs, objective_data = loader.next_batch()
+            group_id = objective_data["step_sequence_ids"]
             out = ns['encoder'](inputs)
             definition = next(node for cell in notebook['cells'] if cell['cell_type'] == 'code'
                               for node in ast.parse(''.join(cell['source'])).body
@@ -394,8 +404,8 @@ def test_ppo_collection_restarts_replay_and_preserves_behavior_prefixes():
                                   for target in node.targets))
             exec(compile(ast.Module(body=[definition], type_ignores=[]), '<notebook>', 'exec'), ns)
             objective = ns['objective']
-            assert objective.cross_group_backups == 'fault'
-            losses, _ = objective(objective_data=objective_data, group_id=group_id,
+
+            losses, _ = objective(objective_data=objective_data, group_id=group_id, head_step_ids=objective_data["head_step_ids"],
                                   predictions=ns['policy_head'](out['z']),
                                   value_predictions=ns['value_head'](out['z']))
             assert torch.isfinite(losses['ppo'])
@@ -403,7 +413,7 @@ def test_ppo_collection_restarts_replay_and_preserves_behavior_prefixes():
             assert objective_data['old_log_prob'][3].item() == 0.0
             with pytest.raises(ValueError, match='cross-group backup'):
                 objective(objective_data={name: values[:2] for name, values in objective_data.items()},
-                          group_id=group_id[:2], predictions=ns['policy_head'](out['z'][:2]),
+                          group_id=group_id[:2], head_step_ids=fixture_head_steps({name: values[:2] for name, values in objective_data.items()}),  predictions=ns['policy_head'](out['z'][:2]),
                           value_predictions=ns['value_head'](out['z'][:2]))
         finally:
             loader.close()
@@ -420,11 +430,11 @@ def test_grpo_behavior_probability_uses_the_complete_training_prefix():
     seen = []
 
     def encoder(tokens, **kwargs):
-        seen.append(tokens.S)
+        seen.append(int(torch.bincount(tokens["sequence_ids"][tokens["head_token_mask"]], minlength=tokens["num_sequences"]).max()) if tokens["num_sequences"] else 0)
         # Make the logits depend on the first observation, so dropping an old
         # prefix would silently change the action distribution.
-        first = float(tokens.token_ids[0])
-        return {'z': torch.tensor([[first, 0., -first]]).expand(tokens.P, -1)}
+        first = float(tokens['token_ids'][0])
+        return {'z': torch.tensor([[first, 0., -first]]).expand(tokens["head_token_mask"].nonzero(as_tuple=True)[0].shape[0], -1)}
 
     ns.update(tokenizer=tokenizer, encoder=encoder, policy_head=lambda z: z,
               sample_discrete_action=sample_discrete_action)
@@ -471,15 +481,16 @@ def test_cartpole_encoder_uses_configured_fourier_features_for_observations():
                           objective_fields=[])
     encoder.embedding = MultiEmbedding(embeddings={"text": Embedding(hidden_dim=8, vocab_size=32)},
         numeric_field_names=tokenizer.numeric_field_names, num_frequencies=3)
-    first = tokenizer.pack_rows(rows=[measurement_events(payloads) for payloads in [[{'cart_position': 0., 'pole_angle': 0.}]]], continuing=None)
-    second = tokenizer.pack_rows(rows=[measurement_events(payloads) for payloads in [[{'cart_position': 0.5, 'pole_angle': 0.1}]]], continuing=None)
-    np.testing.assert_array_equal(first.token_ids, second.token_ids)
+    first, first_objective_data = tokenizer.pack_rows(rows=[measurement_events(payloads) for payloads in [[{'cart_position': 0., 'pole_angle': 0.}]]], continuing=None)
+    second, second_objective_data = tokenizer.pack_rows(rows=[measurement_events(payloads) for payloads in [[{'cart_position': 0.5, 'pole_angle': 0.1}]]], continuing=None)
+    np.testing.assert_array_equal(first['token_ids'], second['token_ids'])
     with torch.no_grad():
         first_readout = encoder(first)['z']
         second_readout = encoder(second)['z']
     assert not torch.allclose(first_readout, second_readout)
 
 
+@pytest.mark.flex_training(default_device=False)
 def test_pendulum_notebook_logs_only_position_and_keeps_independent_episodes(monkeypatch):
     gym = pytest.importorskip('gymnasium')
     pytest.importorskip('mouse_gym')

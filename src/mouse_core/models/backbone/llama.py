@@ -7,14 +7,13 @@ from typing import Any
 
 from transformers import LlamaConfig, LlamaModel
 
-from mouse_core.models.backbone.base import _disable_cudnn_sdp
 
 
 @dataclass
 class _LlamaBackboneConfig:
     """Configuration for a Llama transformer stack.
 
-    Builds a HuggingFace ``LlamaModel`` with SDPA attention. ``vocab_size=``
+    Builds a HuggingFace ``LlamaModel`` as a parameter container for Mouse FlexAttention. ``vocab_size=``
     is a temporary stub of 1; Backbone removes the table before use.
     """
 
@@ -38,7 +37,6 @@ class _LlamaBackboneConfig:
             self.num_key_value_heads = int(self.num_key_value_heads)
 
     def build(self, hidden_dim: int, *, vocab_size: int) -> LlamaModel:
-        _disable_cudnn_sdp()
         if hidden_dim % self.num_heads != 0:
             raise ValueError(
                 f"hidden_dim ({hidden_dim}) must be divisible by num_heads ({self.num_heads})."
@@ -59,7 +57,6 @@ class _LlamaBackboneConfig:
         if self.rope_parameters is not None:
             config_kwargs["rope_parameters"] = self.rope_parameters
         config = LlamaConfig(**config_kwargs)
-        config._attn_implementation = "sdpa"
         return LlamaModel(config)
 
 

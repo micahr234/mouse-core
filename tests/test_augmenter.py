@@ -99,13 +99,12 @@ def test_shared_action_permutation_also_permutates_action_value_targets() -> Non
         seed_field="episode_index",
         fields=[
             {
-                "type": "discrete",
+                "type": "discrete_permute",
                 "input_field": ("action", "prev_action"),
                 "output_field": ("action", "prev_action"),
                 "input_vector_field": "q_star",
                 "output_vector_field": "q_star",
                 "vocab_size": 3,
-                "permute": True,
             }
         ],
     )
@@ -122,13 +121,12 @@ def test_input_vector_field_is_skipped_when_absent() -> None:
         seed_field="episode_index",
         fields=[
             {
-                "type": "discrete",
+                "type": "discrete_permute",
                 "input_field": "action",
                 "output_field": "action",
                 "input_vector_field": "q_star",
                 "output_vector_field": "q_star",
                 "vocab_size": 3,
-                "permute": True,
             }
         ],
     )
@@ -146,13 +144,12 @@ def test_mask_does_not_zero_vector_field() -> None:
         seed_field="episode_index",
         fields=[
             {
-                "type": "discrete",
+                "type": "discrete_permute",
                 "input_field": "action",
                 "output_field": "action",
                 "input_vector_field": "q_star",
                 "output_vector_field": "q_star",
                 "vocab_size": 3,
-                "permute": True,
                 "mask_prob": 1.0,
             }
         ],
@@ -172,13 +169,12 @@ def test_vector_rename_writes_output_keeps_input() -> None:
         seed_field="episode_index",
         fields=[
             {
-                "type": "discrete",
+                "type": "discrete_permute",
                 "input_field": "action",
                 "output_field": "action",
                 "input_vector_field": "q_star",
                 "output_vector_field": "q_star_aug",
                 "vocab_size": 3,
-                "permute": True,
             }
         ],
     )
@@ -194,11 +190,10 @@ def test_vector_on_input_field_raises() -> None:
         seed_field="episode_index",
         fields=[
             {
-                "type": "discrete",
+                "type": "discrete_permute",
                 "input_field": "q_star",
                 "output_field": "q_star",
                 "vocab_size": 3,
-                "permute": True,
             }
         ],
     )
@@ -222,8 +217,8 @@ def test_reseed_replays_masks_and_permutations_for_the_same_generation() -> None
         seed=0,
         seed_field="episode_index",
         fields=[
-            {"type": "discrete", "input_field": "action", "vocab_size": 10,
-             "permute": True, "mask_prob": 0.5, "mask_value": -1}
+            {"type": "discrete_permute", "input_field": "action", "vocab_size": 10,
+              "mask_prob": 0.5, "mask_value": -1}
         ],
     )
     def sequence():
@@ -243,7 +238,7 @@ def test_reseed_generation_pins_thread_without_advancing_counter() -> None:
         seed=0,
         seed_field="episode_index",
         fields=[
-            {"type": "discrete", "input_field": "action", "output_field": "action", "vocab_size": 10, "permute": True}
+            {"type": "discrete_permute", "input_field": "action", "output_field": "action", "vocab_size": 10}
         ],
     )
     augment.reseed(generation=7)
@@ -288,7 +283,7 @@ def test_seed_field_shares_draws_across_steps() -> None:
         seed=0,
         seed_field="episode_index",
         fields=[
-            {"type": 'discrete', "input_field": 'action', "output_field": 'action', "vocab_size": 10, "permute": True}
+            {"type": "discrete_permute", "input_field": 'action', "output_field": 'action', "vocab_size": 10}
         ],
     )
     a = augment({"action": 0, "episode_index": 7})
@@ -305,7 +300,7 @@ def test_reseed_changes_draws_for_same_key() -> None:
         seed=0,
         seed_field="episode_index",
         fields=[
-            {"type": "discrete", "input_field": "action", "output_field": "action", "vocab_size": 10, "permute": True}
+            {"type": "discrete_permute", "input_field": "action", "output_field": "action", "vocab_size": 10}
         ],
     )
     before = augment({"action": 0, "episode_index": 7})
@@ -325,7 +320,7 @@ def test_compose_reseed_forwards_to_augmenter() -> None:
         seed=0,
         seed_field="episode_index",
         fields=[
-            {"type": "discrete", "input_field": "action", "output_field": "action", "vocab_size": 10, "permute": True}
+            {"type": "discrete_permute", "input_field": "action", "output_field": "action", "vocab_size": 10}
         ],
     )
     transform = compose(stages=(augment,))
@@ -343,7 +338,7 @@ def test_missing_seed_field_raises() -> None:
     augment = Augmenter(
         seed_field="episode_index",
         fields=[
-            {"type": 'discrete', "input_field": 'action', "output_field": 'action', "vocab_size": 10, "permute": True}
+            {"type": "discrete_permute", "input_field": 'action', "output_field": 'action', "vocab_size": 10}
         ],
     )
     with pytest.raises(KeyError, match="episode_index"):
@@ -354,18 +349,18 @@ def test_missing_input_field_is_skipped() -> None:
     augment = Augmenter(
         seed_field="episode_index",
         fields=[
-            {"type": 'discrete', "input_field": 'action', "output_field": 'action', "vocab_size": 10, "permute": True}
+            {"type": "discrete_permute", "input_field": 'action', "output_field": 'action', "vocab_size": 10}
         ],
     )
     assert augment({"episode_index": 0}) == {"episode_index": 0}
 
 
-@pytest.mark.parametrize('kind', ['discrete', 'linear', 'image'])
+@pytest.mark.parametrize('kind', ['discrete', 'discrete_permute', 'linear', 'image'])
 @pytest.mark.parametrize('payload', [{}, {'value': None, 'q': None}])
 def test_absent_or_none_inputs_do_not_create_augmented_outputs(kind, payload):
     field: dict[str, Any] = dict(type=kind, input_field='value', output_field='augmented')
-    if kind == 'discrete':
-        field.update(vocab_size=4, permute=True, input_vector_field='q', output_vector_field='augmented_q')
+    if kind == 'discrete_permute':
+        field.update(vocab_size=4, input_vector_field='q', output_vector_field='augmented_q')
     augment = Augmenter(seed_field='episode_index', fields=[field])
     row = {'episode_index': 0, **payload}
     assert augment(row) == row
@@ -380,8 +375,8 @@ def test_discrete_and_done_permutations_use_configured_vocab_sizes() -> None:
         seed=0,
         seed_field="episode_index",
         fields=[
-            {"type": 'discrete', "input_field": 'episode_done', "output_field": 'episode_done', "vocab_size": 3, "permute": True},
-            {"type": 'discrete', "input_field": 'observation', "output_field": 'observation', "vocab_size": 4, "permute": True},
+            {"type": "discrete_permute", "input_field": 'episode_done', "output_field": 'episode_done', "vocab_size": 3},
+            {"type": "discrete_permute", "input_field": 'observation', "output_field": 'observation', "vocab_size": 4},
         ],
     )
     out = augment(step)
@@ -425,7 +420,7 @@ def test_augmenter_rename_writes_output_keeps_input(scale) -> None:
 @pytest.mark.parametrize("action", [1.5, -0.5, "1", True])
 def test_permutation_rejects_noninteger_action_ids(action):
     augment = Augmenter(seed=0, seed_field="episode_index", fields=[
-        {"type": "discrete", "input_field": "action", "vocab_size": 3, "permute": True}
+        {"type": "discrete_permute", "input_field": "action", "vocab_size": 3}
     ])
     with pytest.raises(ValueError, match="integer id"):
         augment({"action": action, "episode_index": 0})
@@ -445,12 +440,13 @@ def test_linear_scale_endpoints_must_be_complete() -> None:
         )
 
 
-def test_discrete_scale_shift_raises() -> None:
+@pytest.mark.parametrize("kind", ["discrete", "discrete_permute"])
+def test_discrete_scale_shift_raises(kind) -> None:
     with pytest.raises(ValueError, match="only apply to type='image'"):
         SequenceAugmentFieldSpec(
             input_field="observation",
             output_field="observation",
-            type="discrete",
+            type=kind,
             vocab_size=10,
             scale_mean=2.0,
             shift_mean=5.0,
@@ -470,8 +466,8 @@ def test_linear_scale_input_endpoints_must_differ() -> None:
         )
 
 
-def test_input_vector_field_requires_permute() -> None:
-    with pytest.raises(ValueError, match="input_vector_field requires permute"):
+def test_input_vector_field_requires_discrete_permute() -> None:
+    with pytest.raises(ValueError, match="input_vector_field requires type='discrete_permute'"):
         SequenceAugmentFieldSpec(
             input_field="action",
             output_field="action",
@@ -487,9 +483,8 @@ def test_input_vector_field_must_not_overlap_input_field() -> None:
         SequenceAugmentFieldSpec(
             input_field=("action", "q_star"),
             output_field=("action", "q_star"),
-            type="discrete",
+            type="discrete_permute",
             vocab_size=3,
-            permute=True,
             input_vector_field="q_star",
             output_vector_field="q_star",
         )
@@ -498,9 +493,8 @@ def test_input_vector_field_must_not_overlap_input_field() -> None:
 def test_output_vector_field_defaults_to_input() -> None:
     spec = SequenceAugmentFieldSpec(
         input_field="action",
-        type="discrete",
+        type="discrete_permute",
         vocab_size=3,
-        permute=True,
         input_vector_field="q_star",
     )
     assert spec.output_field == "action"
@@ -511,9 +505,8 @@ def test_output_vector_field_requires_input() -> None:
     with pytest.raises(ValueError, match="output_vector_field requires"):
         SequenceAugmentFieldSpec(
             input_field="action",
-            type="discrete",
+            type="discrete_permute",
             vocab_size=3,
-            permute=True,
             output_vector_field="q_star",
         )
 
@@ -523,9 +516,8 @@ def test_vector_field_arity_mismatch() -> None:
         SequenceAugmentFieldSpec(
             input_field="action",
             output_field="action",
-            type="discrete",
+            type="discrete_permute",
             vocab_size=3,
-            permute=True,
             input_vector_field=("q_star", "q_star_2"),
             output_vector_field="q_star",
         )
@@ -533,8 +525,8 @@ def test_vector_field_arity_mismatch() -> None:
 
 def test_optional_action_stays_absent_while_value_labels_are_permuted():
     augment = Augmenter(seed=12, seed_field='episode_index', fields=[{
-        'type': 'discrete', 'input_field': 'action',
-        'input_vector_field': 'q', 'vocab_size': 4, 'permute': True,
+        'type': "discrete_permute", 'input_field': 'action',
+        'input_vector_field': 'q', 'vocab_size': 4,
     }])
     row = {'episode_index': 0, 'q': [1., 3., 5., 7.]}
     reset = augment(row)
@@ -542,3 +534,18 @@ def test_optional_action_stays_absent_while_value_labels_are_permuted():
     for action, value in enumerate(row['q']):
         active = augment({**row, 'action': action})
         assert reset['q'][active['action']] == value
+
+
+@pytest.mark.parametrize("vocab_size", [None, 0, -1])
+def test_discrete_permute_requires_positive_vocab_size(vocab_size):
+    with pytest.raises(ValueError, match="vocab_size must be positive"):
+        SequenceAugmentFieldSpec(type="discrete_permute", input_field="action", vocab_size=vocab_size)
+
+
+@pytest.mark.parametrize("permute", [True, False])
+def test_removed_permute_flag_is_rejected(permute):
+    with pytest.raises(TypeError, match="permute"):
+        Augmenter(seed_field="episode_index", fields=[{
+            "type": "discrete", "input_field": "action", "vocab_size": 4,
+            "permute": permute,
+        }])

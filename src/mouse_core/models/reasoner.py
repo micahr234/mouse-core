@@ -15,6 +15,7 @@ pass the result to ``Model.forward(batch, reasoning=...)``.
 """
 
 from __future__ import annotations
+from tensordict import TensorDict
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -23,7 +24,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from mouse_core.data.token_batch import TokenBatch
+
 
 
 class LatentReasoner(nn.Module):
@@ -59,7 +60,7 @@ class LatentReasoner(nn.Module):
         return embeddings
 
     def insert(
-        self, *, embeds: torch.Tensor, tokens: TokenBatch,
+        self, *, embeds: torch.Tensor, tokens: TensorDict, objective_data: TensorDict,
         sequence_ids: torch.Tensor, head_token_ids: torch.Tensor,
         splits: Sequence[int] | np.ndarray,
         backbone: Callable[..., torch.Tensor],
@@ -71,7 +72,7 @@ class LatentReasoner(nn.Module):
         """
         if embeds.shape[-1] != self.hidden_dim:
             raise ValueError("hidden_dim mismatch between reasoner and embeddings.")
-        plan = _plan_insertions(tokens, np.asarray(splits, dtype=np.int64).reshape(-1), self.num_thoughts)
+        plan = _plan_insertions(tokens, objective_data, np.asarray(splits, dtype=np.int64).reshape(-1), self.num_thoughts)
         if plan is None:
             return embeds, sequence_ids, head_token_ids
         embeds, sequence_ids, head_token_ids = self._generate_latents(
@@ -150,7 +151,8 @@ class LatentReasoner(nn.Module):
 
 def sample_reasoning_splits(
     *,
-    batch: TokenBatch,
+    batch: TensorDict,
+    objective_data: TensorDict,
     generator: np.random.Generator | None = None,
 ) -> np.ndarray:
     """Pick one burst step per sequence for ``Model.forward(reasoning=...)``.
@@ -161,27 +163,27 @@ def sample_reasoning_splits(
     receive gradient.
     """
     rng = generator if generator is not None else np.random.default_rng()
-    counts = batch.step_counts()
-    splits = np.full(batch.B, -1, dtype=np.int64)
+    counts = torch.bincount(objective_data["step_sequence_ids"], minlength=batch["num_sequences"]).cpu().numpy()
+    head_steps = objective_data['head_step_ids'].cpu().numpy()
+    splits = np.full(batch["num_sequences"], -1, dtype=np.int64)
     offset = 0
-    for b in range(batch.B):
+    for b in range(batch["num_sequences"]):
         n = int(counts[b])
-        eligible = np.unique(batch.head_step_ids[(batch.head_step_ids >= offset) &
-                                                 (batch.head_step_ids < offset + n - 1)]) - offset
+        eligible = np.unique(head_steps[(head_steps >= offset) & (head_steps < offset + n - 1)]) - offset
         if eligible.size:
             splits[b] = int(rng.choice(eligible))
         offset += n
     return splits
 
 
-def _first_head_output_rows(batch: TokenBatch) -> np.ndarray:
+def _first_head_output_rows(objective_data: TensorDict) -> np.ndarray:
     """Row index into ``head_token_ids`` of each step's first head-output token."""
-    head_step_ids = np.asarray(batch.head_step_ids, dtype=np.int64)
+    head_step_ids = objective_data['head_step_ids'].cpu().numpy()
     if head_step_ids.size == 0:
-        return np.full(batch.N, -1, dtype=np.int64)
+        return np.full(objective_data["step_sequence_ids"].shape[0], -1, dtype=np.int64)
     first = np.ones(head_step_ids.size, dtype=bool)
     first[1:] = head_step_ids[1:] != head_step_ids[:-1]
-    rows = np.full(batch.N, -1, dtype=np.int64)
+    rows = np.full(objective_data["step_sequence_ids"].shape[0], -1, dtype=np.int64)
     rows[head_step_ids[first]] = np.flatnonzero(first)
     return rows
 
@@ -223,7 +225,8 @@ def _validate_splits(splits: np.ndarray, counts: np.ndarray) -> None:
 
 
 def _plan_insertions(
-    batch: TokenBatch,
+    batch: TensorDict,
+    objective_data: TensorDict,
     splits: np.ndarray,
     num_thoughts: int,
 ) -> _InsertionPlan | None:
@@ -231,7 +234,7 @@ def _plan_insertions(
 
     Returns ``None`` when no sequence hosts a burst (all splits ``-1``).
     """
-    counts = batch.step_counts()
+    counts = torch.bincount(objective_data["step_sequence_ids"], minlength=batch["num_sequences"]).cpu().numpy()
     splits = np.asarray(splits, dtype=np.int64).reshape(-1)
     _validate_splits(splits, counts)
 
@@ -240,16 +243,16 @@ def _plan_insertions(
         return None
 
     R = int(num_thoughts)
-    L = batch.L
-    pred = np.asarray(batch.head_token_ids, dtype=np.int64)
-    seq = np.asarray(batch.sequence_ids, dtype=np.int64)
+    L = batch["token_ids"].shape[0]
+    pred = batch['head_token_mask'].nonzero(as_tuple=True)[0].cpu().numpy()
+    seq = batch['sequence_ids'].cpu().numpy()
     offsets = np.concatenate([np.zeros(1, dtype=np.int64), np.cumsum(counts)])
 
     # Anchor = the burst step's *first* head-output token (its action prompt),
     # so every head-output token of the step attends to the latents. Latents
     # are inserted immediately before it. Anchors are strictly increasing
     # because sequences occupy contiguous, ordered token blocks.
-    first_rows = _first_head_output_rows(batch)
+    first_rows = _first_head_output_rows(objective_data)
     selected_rows = first_rows[offsets[burst_rows] + splits[burst_rows]]
     if np.any(selected_rows < 0):
         raise ValueError("A reasoning split requires an action-request readout")

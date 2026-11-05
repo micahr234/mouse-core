@@ -39,7 +39,7 @@ def _tiny_model() -> Model:
 
 def _llama_model() -> Model:
     hidden_dim = 16
-    backbone = Backbone(architecture='llama', train_kernel='reference', decode_kernel='flex', dtype=torch.float32, hidden_dim=hidden_dim, num_layers=2, num_heads=2, max_position_embeddings=64)
+    backbone = Backbone(architecture='llama', train_kernel="flex", decode_kernel='flex', dtype=torch.float32, hidden_dim=hidden_dim, num_layers=2, num_heads=2, max_position_embeddings=64)
     head = _head(hidden_dim)
     return simple_model(backbone=backbone, heads={'action_value': head}, reasoner=None)
 
@@ -115,9 +115,10 @@ def _two_head_model(hidden_dim: int=8) -> Model:
     return simple_model(backbone=IdentityBackbone(hidden_dim=hidden_dim), heads={'action_value': q_head, 'behavior': MLP(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, propagate_gradient=1.0)}, reasoner=None)
 
 
-@pytest.mark.parametrize('device', ['cpu', 'cuda'])
-def test_tensor_reuse_preserves_separate_delayed_forward_and_online_gradients(monkeypatch, device) -> None:
-    from mouse_core.data import reuse_token_tensors
+@pytest.mark.parametrize('device', ['cuda'])
+@pytest.mark.flex_training
+def test_device_batch_reuse_preserves_separate_delayed_forward_and_online_gradients(device) -> None:
+
     if device == 'cuda' and (not torch.cuda.is_available()):
         pytest.skip('CUDA required')
     torch.manual_seed(0)
@@ -125,14 +126,6 @@ def test_tensor_reuse_preserves_separate_delayed_forward_and_online_gradients(mo
     delayed = copy_model(model, heads=True, backbone=True, reasoner=False).eval()
     _perturb(model.heads)
     batch = _token_batch(model)
-    conversions = []
-    from_numpy = torch.from_numpy
-
-    def record(array):
-        conversions.append(array)
-        return from_numpy(array)
-    monkeypatch.setattr(torch, 'from_numpy', record)
-
     def forward_pair():
         online_q = model(batch)["predictions"]['action_value']
         with torch.no_grad():
@@ -141,12 +134,10 @@ def test_tensor_reuse_preserves_separate_delayed_forward_and_online_gradients(mo
         return (online_q, delayed_q)
     expected = forward_pair()
     expected_grads = {name: p.grad.clone() for name, p in model.named_parameters() if p.grad is not None}
-    uncached_count = len(conversions)
     model.zero_grad(set_to_none=True)
-    conversions.clear()
-    with reuse_token_tensors():
-        actual = forward_pair()
-    assert len(conversions) < uncached_count
+    batch = batch.to(device)
+    assert batch.to(device) is batch
+    actual = forward_pair()
     for got, want in zip(actual, expected, strict=True):
         torch.testing.assert_close(got, want, rtol=0, atol=0)
     for name, param in model.named_parameters():
@@ -202,7 +193,8 @@ def test_delayed_model_matches_online_before_update_and_builds_no_graph() -> Non
     model = _llama_model().eval()
     delayed = copy_model(model, heads=True, backbone=True, reasoner=False).eval()
     batch = _token_batch(model)
-    out = model(batch)
+    with torch.no_grad():
+        out = model(batch)
     saved = {'n': 0}
 
     def pack(tensor: torch.Tensor) -> torch.Tensor:

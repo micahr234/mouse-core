@@ -1,19 +1,14 @@
-"""StepTokens (one step) and TokenBatch (packed multi-sequence batch)."""
+"""StepTokens (one step) and TensorDict (packed multi-sequence batch)."""
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping, Sequence
-from contextlib import contextmanager
-from contextvars import ContextVar
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
 import torch
-
-
-_TensorCache = dict[tuple[int, torch.device, bool], tuple[object, dict[str, torch.Tensor]]]
-_tensor_cache: ContextVar[_TensorCache | None] = ContextVar("token_batch_tensors", default=None)
+from tensordict import TensorDict, NonTensorData
 
 
 def _tokenizer_ids(value, shape, names) -> np.ndarray:
@@ -70,44 +65,6 @@ def _position_arrays(values, mask, shape):
     if not np.all(np.isfinite(values[mask])):
         raise ValueError("position_values must contain finite numeric scalars")
     return values, mask
-
-
-@contextmanager
-def reuse_token_tensors() -> Iterator[None]:
-    """Reuse batch conversions within one online/delayed forward pair.
-
-    Each TokenBatch/device/inference-mode combination is converted once.
-    Batches and returned tensors must be treated as read-only in this scope.
-    Exiting (including on error) drops the cache; later scopes see fresh data.
-    Model activations and parameters are never cached. Nested scopes have
-    independent caches. The cache is local to the execution context.
-    """
-    cache: _TensorCache = {}
-    token = _tensor_cache.set(cache)
-    try:
-        yield
-    finally:
-        _tensor_cache.reset(token)
-        cache.clear()
-
-
-def step_counts_from_group_id(
-    *,
-    group_id: np.ndarray | None,
-    B: int,
-) -> np.ndarray:
-    """Per-group step counts ``[B]`` from flat ``group_id`` ``[N]``.
-
-    Missing IDs (empty decode rows) become zeros when ``minlength=B``.
-    """
-    if B <= 0:
-        return np.zeros(0, dtype=np.int64)
-    if group_id is None:
-        return np.zeros(B, dtype=np.int64)
-    sid = np.asarray(group_id, dtype=np.int64).reshape(-1)
-    if sid.size == 0:
-        return np.zeros(B, dtype=np.int64)
-    return np.bincount(sid, minlength=B).astype(np.int64)[:B]
 
 
 @dataclass
@@ -192,196 +149,57 @@ class StepTokens:
         return int(self.token_ids.shape[0])
 
 
-@dataclass
-class TokenBatch:
-    """Packed token data for independent sequences, with no padding.
+def make_token_batch(
+    *, token_ids, numeric_values, numeric_mask, sequence_ids,
+    head_token_mask, num_sequences: int,
+    tokenizer_ids=None, tokenizer_names=("default",),
+    numeric_field_ids=None, numeric_field_names=(),
+    position_values=None, position_mask=None,
+) -> TensorDict:
+    """Build CPU tensor inputs without scanning or validating batch contents.
 
-    ``token_ids``, ``numeric_values``, ``numeric_mask``, and ``sequence_ids``
-    have shape ``[L]``. ``tokenizer_ids`` also has shape ``[L]`` and selects
-    the embedding table by its index in ``tokenizer_names``. Token IDs are
-    local to that table; numeric values
-    are scaled by the tokenizer's Fourier bounds and used only where the mask
-    is true. Optional ``position_values`` (float64 scalars) and ``position_mask``
-    also have shape ``[L]``; they add no tokens. Sequence IDs define attention boundaries.
+    Token, prediction and step arrays have independent lengths, so batch_size
+    is empty. The producer owns their alignment; this is an ordinary TensorDict.
 
-    ``head_token_ids`` contains the ``[P]`` positions marked by the
-    tokenizer. ``head_step_ids[p]`` identifies the corresponding step in
-    ``0..N-1``; a step may have multiple head tokens. ``B`` is the number of
-    sequences, including empty decode rows. ``step_sequence_ids`` records the
-    sequence of every step, including steps without readouts. Omitting it
-    retains the legacy dense-head layout.
+    Token arrays have shape [L]: token_ids, tokenizer_ids, numeric_values,
+    numeric_mask, numeric_field_ids, position_values, position_mask, sequence_ids.
+    sequence_ids defines attention boundaries. Token IDs are local to the table
+    selected by tokenizer_ids; numeric/position masks distinguish absent values
+    from zero. Numeric-field IDs select Fourier projections (-1 when absent).
+    position_values stays float64 until the position features are formed.
+
+    head_token_mask [L] selects tokens passed to prediction heads. Step mappings
+    belong to objective_data, not model inputs. Names and num_sequences are
+    non-tensor metadata; the count includes empty decode sequences.
     """
-
-    token_ids: np.ndarray
-    numeric_values: np.ndarray
-    numeric_mask: np.ndarray
-    sequence_ids: np.ndarray
-    head_token_ids: np.ndarray
-    head_step_ids: np.ndarray
-    B: int = 0
-    step_sequence_ids: np.ndarray | None = None
-    tokenizer_ids: np.ndarray | None = None
-    numeric_field_ids: np.ndarray | None = None
-    numeric_field_names: tuple[str, ...] = ()
-    tokenizer_names: tuple[str, ...] = ("default",)
-    position_values: np.ndarray | None = None
-    position_mask: np.ndarray | None = None
-
-    def __post_init__(self) -> None:
-        token_ids = np.asarray(self.token_ids, dtype=np.int64)
-        if token_ids.ndim != 1:
-            raise ValueError("token_ids must be a 1-D array")
-        L = int(token_ids.size)
-        self.position_values, self.position_mask = _position_arrays(self.position_values, self.position_mask, token_ids.shape)
-        self.numeric_field_names = tuple(self.numeric_field_names)
-        self.numeric_field_ids = _numeric_field_ids(self.numeric_field_ids, self.numeric_mask, self.numeric_field_names)
-        self.tokenizer_names = tuple(self.tokenizer_names)
-        self.tokenizer_ids = _tokenizer_ids(self.tokenizer_ids, token_ids.shape, self.tokenizer_names)
-        for name, dtype in (("token_ids", np.int64), ("numeric_values", np.float32),
-                            ("numeric_mask", np.bool_), ("sequence_ids", np.int64)):
-            array = (_sequence_id_array(self.sequence_ids) if name == "sequence_ids"
-                     else np.asarray(getattr(self, name), dtype=dtype))
-            if array.shape != (L,):
-                raise ValueError(f"{name} must have shape [{L}], got {array.shape}")
-            setattr(self, name, array)
-        if L > 0:
-            sequence_ids = self.sequence_ids
-            if int(sequence_ids.min()) < 0 or int(sequence_ids.max()) >= self.B:
-                raise ValueError(
-                    f"sequence_ids must be in [0, {self.B}), got "
-                    f"min={int(sequence_ids.min())} max={int(sequence_ids.max())}"
-                )
-            if bool(np.any(sequence_ids[1:] < sequence_ids[:-1])):
-                raise ValueError(
-                    "sequence_ids must be non-decreasing: every sequence's tokens "
-                    "must form one contiguous block, in sequence order (the model "
-                    "walks head_token_ids row by row and pads per block)."
-                )
-        head_token_ids = np.asarray(self.head_token_ids, dtype=np.int64).reshape(-1)
-        self.head_token_ids = head_token_ids
-        head_step_ids = np.asarray(self.head_step_ids, dtype=np.int64).reshape(-1)
-        self.head_step_ids = head_step_ids
-        p = int(head_token_ids.shape[0])
-        if head_step_ids.shape != (p,):
-            raise ValueError(
-                f"head_step_ids must have shape [{p}] (one step id per "
-                f"head-output token), got {head_step_ids.shape}"
-            )
-        if p > 0:
-            if L == 0:
-                raise ValueError("head_token_ids require L > 0 when P > 0")
-            if int(head_token_ids.min()) < 0 or int(head_token_ids.max()) >= L:
-                raise ValueError(
-                    f"head_token_ids must be in [0, {L}), got "
-                    f"min={int(head_token_ids.min())} max={int(head_token_ids.max())}"
-                )
-            if bool(np.any(head_token_ids[1:] <= head_token_ids[:-1])):
-                raise ValueError("head_token_ids must be strictly increasing")
-            diffs = np.diff(head_step_ids)
-            if int(head_step_ids[0]) < 0 or bool(np.any(diffs < 0)) or (
-                self.step_sequence_ids is None and (int(head_step_ids[0]) != 0 or bool(np.any(diffs > 1)))
-            ):
-                raise ValueError(
-                    "head_step_ids must be dense non-decreasing step ids "
-                    f"starting at 0, got {head_step_ids.tolist()}"
-                )
-            head_sequences = self.sequence_ids[head_token_ids]
-            if np.any((diffs == 0) & (head_sequences[1:] != head_sequences[:-1])):
-                raise ValueError("All head tokens of a step must belong to one sequence")
-        if self.step_sequence_ids is None:
-            first = np.ones(p, dtype=bool)
-            first[1:] = head_step_ids[1:] != head_step_ids[:-1]
-            self.step_sequence_ids = self.sequence_ids[head_token_ids[first]]
-        else:
-            ids = _sequence_id_array(self.step_sequence_ids)
-            if ids.ndim != 1 or (ids.size and (ids.min() < 0 or ids.max() >= self.B
-                                               or np.any(np.diff(ids) < 0))):
-                raise ValueError("step_sequence_ids must be ordered sequence IDs in [0, B)")
-            if p and (head_step_ids[-1] >= ids.size
-                      or np.any(ids[head_step_ids] != self.sequence_ids[head_token_ids])):
-                raise ValueError("head_step_ids must identify steps in the matching sequence")
-            self.step_sequence_ids = ids
-        counts = self.step_counts()
-        if int(counts.sum()) != self.N:
-            raise ValueError(
-                f"step count [{self.N}] must equal sum of per-sequence step "
-                f"counts from sequence_ids [{int(counts.sum())}] (B={self.B})"
-            )
-
-    @property
-    def L(self) -> int:
-        return int(self.token_ids.shape[0])
-
-    @property
-    def N(self) -> int:
-        """Number of steps."""
-        assert self.step_sequence_ids is not None
-        return int(self.step_sequence_ids.size)
-
-    @property
-    def P(self) -> int:
-        """Number of head-output tokens; passive steps contribute none."""
-        return int(self.head_token_ids.shape[0])
-
-    @property
-    def S(self) -> int:
-        """Max steps in the batch (convenience; rows may be shorter)."""
-        if self.B <= 0:
-            return 0
-        counts = self.step_counts()
-        return int(counts.max()) if counts.size else 0
-
-    def step_counts(self) -> np.ndarray:
-        """Steps per sequence, including steps without readouts."""
-        return step_counts_from_group_id(group_id=self.step_sequence_ids, B=self.B)
-
-    def to_tensors(self, device: torch.device | str | None = None) -> dict[str, torch.Tensor]:
-        """Move arrays to tensors; reuse them inside ``reuse_token_tensors``."""
-        dev = torch.device(device) if device is not None else torch.device("cpu")
-        if dev.type == "cuda" and dev.index is None:
-            dev = torch.device("cuda", torch.cuda.current_device())
-        elif dev.type == "cpu":
-            dev = torch.device("cpu")
-        cache = _tensor_cache.get()
-        key = (id(self), dev, torch.is_inference_mode_enabled())
-        if cache is not None and key in cache:
-            return cache[key][1]
-
-        def _long(a: np.ndarray) -> torch.Tensor:
-            return torch.from_numpy(np.asarray(a, dtype=np.int64)).to(dev)
-
-        def _float(a: np.ndarray) -> torch.Tensor:
-            return torch.from_numpy(np.asarray(a, dtype=np.float32)).to(dev)
-
-        tensors = {
-            "token_ids": _long(self.token_ids),
-            "numeric_values": _float(self.numeric_values),
-            "numeric_field_ids": _long(self.numeric_field_ids),
-            "numeric_mask": torch.from_numpy(self.numeric_mask).to(dev),
-            "position_values": torch.from_numpy(self.position_values).to(dev),
-            "position_mask": torch.from_numpy(self.position_mask).to(dev),
-            "sequence_ids": _long(self.sequence_ids),
-            "head_token_ids": _long(self.head_token_ids),
-            "head_step_ids": _long(self.head_step_ids),
-        }
-        assert self.tokenizer_ids is not None
-        tensors["tokenizer_ids"] = _long(self.tokenizer_ids)
-        if cache is not None:
-            # Retain the batch as well, so its id cannot be recycled in scope.
-            cache[key] = (self, tensors)
-        return tensors
+    ids = torch.as_tensor(token_ids, dtype=torch.int64, device="cpu")
+    shape = ids.shape
+    return TensorDict({
+        "token_ids": ids,
+        "numeric_values": torch.as_tensor(numeric_values, dtype=torch.float32, device="cpu"),
+        "numeric_mask": torch.as_tensor(numeric_mask, dtype=torch.bool, device="cpu"),
+        "sequence_ids": torch.as_tensor(sequence_ids, dtype=torch.int64, device="cpu"),
+        "head_token_mask": torch.as_tensor(head_token_mask, dtype=torch.bool, device="cpu"),
+        "tokenizer_ids": (torch.zeros(shape, dtype=torch.int64, device="cpu") if tokenizer_ids is None
+                          else torch.as_tensor(tokenizer_ids, dtype=torch.int64, device="cpu")),
+        "numeric_field_ids": (torch.full(shape, -1, dtype=torch.int64, device="cpu") if numeric_field_ids is None
+                              else torch.as_tensor(numeric_field_ids, dtype=torch.int64, device="cpu")),
+        "position_values": (torch.zeros(shape, dtype=torch.float64, device="cpu") if position_values is None
+                            else torch.as_tensor(position_values, dtype=torch.float64, device="cpu")),
+        "position_mask": (torch.zeros(shape, dtype=torch.bool, device="cpu") if position_mask is None
+                          else torch.as_tensor(position_mask, dtype=torch.bool, device="cpu")),
+        "tokenizer_names": NonTensorData(tuple(tokenizer_names)),
+        "numeric_field_names": NonTensorData(tuple(numeric_field_names)),
+        "num_sequences": NonTensorData(num_sequences),
+    }, batch_size=[], device="cpu")
 
 
-def empty_token_batch(*, B: int = 0) -> TokenBatch:
-    """Empty batch (L=0, N=0); all ``B`` sequences have zero steps."""
-    return TokenBatch(
-        token_ids=np.zeros(0, dtype=np.int64),
-        numeric_values=np.zeros(0, dtype=np.float32),
-        numeric_mask=np.zeros(0, dtype=bool),
-        sequence_ids=np.zeros(0, dtype=np.int64),
-        head_token_ids=np.zeros(0, dtype=np.int64),
-        head_step_ids=np.zeros(0, dtype=np.int64),
-        B=B,
+def empty_token_batch(*, num_sequences: int = 0) -> TensorDict:
+    """No tokens or steps, retaining empty decode sequences."""
+    return make_token_batch(
+        token_ids=[], numeric_values=[], numeric_mask=[], sequence_ids=[],
+        head_token_mask=[],
+        num_sequences=num_sequences,
     )
 
 
@@ -408,10 +226,9 @@ def _stack_objective_fields(steps: Sequence[StepTokens]) -> dict[str, np.ndarray
     for actions that do not exist, which objectives exclude. Ragged integer
     columns raise: there is no integer sentinel, so the caller must pad them
     explicitly or store the field as float. ``group_id`` is not a column:
-    packing returns that tensor beside this dict. A scalar ``action`` may be
-    ``None`` for an automatic transition. Only here is it replaced with zero
-    and paired with the derived ``action_executed`` mask; source steps retain
-    their nullable actions.
+    step_sequence_ids belongs to objective_data. A scalar ``action`` may be
+    ``None`` for an automatic transition. Packing represents it as NaN in
+    the float64 action tensor; source steps retain their nullable actions.
     """
     n = len(steps)
     keys: set[str] = set()
@@ -419,13 +236,13 @@ def _stack_objective_fields(steps: Sequence[StepTokens]) -> dict[str, np.ndarray
         keys.update(st.objective_fields)
     if "group_id" in keys:
         raise ValueError(
-            "group_id is not an objective column; pack_token_batch returns "
-            "it beside objective_data."
+            "group_id is not an objective column; use objective_data['step_sequence_ids']."
         )
-    keys.discard("head_output_count")
+    if "head_output_count" in keys:
+        raise ValueError("head_output_count is not an objective column; use objective_data['head_step_ids'].")
     if "action_executed" in keys:
         raise ValueError(
-            "action_executed is derived during packing; store action=None "
+            "action_executed is not supported; store action=None "
             "for an automatic transition instead."
         )
 
@@ -442,14 +259,19 @@ def _stack_objective_fields(steps: Sequence[StepTokens]) -> dict[str, np.ndarray
                 f"objective field {key!r} is missing on steps {missing}; "
                 "every step must provide every stacked key"
             )
-        arrays = [_as_field_array(v) for v in raw]
         if key == "action":
-            out["action_executed"] = np.asarray([v is not None for v in raw])
+            # Float64 preserves practical discrete IDs while carrying the missing
+            # value in the same tensor. Do not replace NaN with an action index.
+            arrays = [np.asarray(np.nan if v is None else
+                                 v.detach().cpu().numpy() if isinstance(v, torch.Tensor) else v,
+                                 dtype=np.float64) for v in raw]
+        else:
+            arrays = [_as_field_array(v) for v in raw]
         present = arrays
         # Column dtype is decided by *every* step, not the first one: a single
         # float anywhere makes the column float32, so int-typed steps can
         # never truncate later float values.
-        dtype = (
+        dtype = np.float64 if key == "action" else (
             np.float32
             if any(a.dtype.kind == "f" for a in present)
             else np.int64
@@ -489,22 +311,13 @@ def _stack_objective_fields(steps: Sequence[StepTokens]) -> dict[str, np.ndarray
     return out
 
 
-def to_device(
-    *,
-    data: Mapping[str, torch.Tensor],
-    device: torch.device | str,
-) -> dict[str, torch.Tensor]:
-    """Move every tensor in ``data`` to ``device``."""
-    return {key: value.to(device) for key, value in data.items()}
-
-
 def _fields_to_tensors(fields: dict[str, np.ndarray]) -> dict[str, torch.Tensor]:
     """CPU tensors from stacked numpy objective columns."""
     tensors: dict[str, torch.Tensor] = {}
     for k, v in fields.items():
         arr = np.asarray(v)
         if arr.dtype.kind == "f":
-            tensors[k] = torch.from_numpy(arr.astype(np.float32, copy=False))
+            tensors[k] = torch.from_numpy(arr.astype(np.float64 if k == "action" else np.float32, copy=False))
         else:
             tensors[k] = torch.from_numpy(arr.astype(np.int64, copy=False))
     return tensors
@@ -516,20 +329,18 @@ def pack_token_batch(
     sequence_ids: Sequence[int] | None = None,
     batch_size: int | None = None,
     continuing: Sequence[bool] | None,
-) -> tuple[TokenBatch, dict[str, torch.Tensor], torch.Tensor]:
+) -> tuple[TensorDict, TensorDict]:
     """Pack per-step :class:`StepTokens` into model and objective inputs.
 
-    Returns ``(inputs, objective_data, group_id)``. ``group_id`` is
-    int64 ``[N]``, one id per step. It is not a key in ``objective_data``.
-    Move ``objective_data`` with :func:`to_device` and ``group_id`` with
-    ``Tensor.to``.
+    Returns ``(inputs, objective_data)``. Step sequence boundaries live in
+    ``objective_data["step_sequence_ids"]``.
 
     Ragged float vector columns in ``objective_data`` are right-padded with
     ``-inf``, the sentinel objectives exclude as "action does not exist".
     Ragged integer columns raise — there is no integer sentinel.
 
     Nullable scalar ``action`` fields become numeric tensors with a derived
-    ``action_executed`` mask. This mask belongs only to the batch; it is not
+    missing-action NaN. This representation belongs only to the batch; it is not
     an input column or a stored field on :class:`StepTokens`.
 
     When a step carries ``group_start_*`` tokens (from input fields whose
@@ -540,12 +351,12 @@ def pack_token_batch(
     sample-start prefix again. Pass ``None`` when no sequence is a
     continuation (a fresh pack, including an empty batch).
     """
-    empty_objective: dict[str, torch.Tensor] = {}
-    empty_group_id = torch.zeros(0, dtype=torch.int64)
+    empty_objective = TensorDict({"step_sequence_ids": torch.empty(0, dtype=torch.int64, device="cpu"),
+                                  "head_step_ids": torch.empty(0, dtype=torch.int64, device="cpu")}, batch_size=[], device="cpu")
     if not steps:
         if batch_size is None:
-            return empty_token_batch(B=0), empty_objective, empty_group_id
-        return empty_token_batch(B=batch_size), empty_objective, empty_group_id
+            return empty_token_batch(num_sequences=0), empty_objective
+        return empty_token_batch(num_sequences=batch_size), empty_objective
 
     if sequence_ids is None:
         seq_per_step = [0] * len(steps)
@@ -607,6 +418,9 @@ def pack_token_batch(
             assert st.group_start_token_ids is not None
             assert st.group_start_numeric_values is not None
             pt = int(st.group_start_token_ids.shape[0])
+            assert st.group_start_position_values is not None
+            assert st.group_start_position_mask is not None
+            assert st.group_start_numeric_field_ids is not None
             position_values.append(st.group_start_position_values)
             position_mask.append(st.group_start_position_mask)
             numeric_field_ids.append(st.group_start_numeric_field_ids)
@@ -617,6 +431,9 @@ def pack_token_batch(
             tokenizer_ids.append(st.group_start_tokenizer_ids)
             head_token_masks.append(np.zeros(pt, dtype=bool))
         t = st.T
+        assert st.position_values is not None
+        assert st.position_mask is not None
+        assert st.numeric_field_ids is not None
         position_values.append(st.position_values)
         position_mask.append(st.position_mask)
         numeric_field_ids.append(st.numeric_field_ids)
@@ -632,12 +449,11 @@ def pack_token_batch(
     # Compute packed metadata in bulk, including zero-token/passive steps.
     # Prefix tokens count toward their first step's length but never read out.
     lengths = np.asarray(step_lengths, dtype=np.int64)
-    head_token_ids = np.flatnonzero(np.concatenate(head_token_masks))
+    head_token_mask = np.concatenate(head_token_masks)
+    head_token_ids = np.flatnonzero(head_token_mask)
     head_step_ids = np.searchsorted(np.cumsum(lengths), head_token_ids, side="right")
     fields = _stack_objective_fields(steps)
-    fields["head_output_count"] = np.bincount(head_step_ids, minlength=len(steps))
-    group_id = torch.tensor(seq_per_step, dtype=torch.int64)
-    inputs = TokenBatch(
+    inputs = make_token_batch(
         position_values=np.concatenate(position_values),
         position_mask=np.concatenate(position_mask),
         numeric_field_ids=np.concatenate(numeric_field_ids),
@@ -646,11 +462,12 @@ def pack_token_batch(
         token_ids=np.concatenate(token_ids),
         numeric_values=np.concatenate(numeric_values),
         sequence_ids=np.repeat(seq_per_step, lengths),
-        head_token_ids=head_token_ids,
-        head_step_ids=head_step_ids,
-        step_sequence_ids=np.asarray(seq_per_step, dtype=np.int64),
+        head_token_mask=head_token_mask,
         tokenizer_ids=np.concatenate(tokenizer_ids),
         tokenizer_names=tokenizer_names,
-        B=B,
+        num_sequences=B,
     )
-    return inputs, _fields_to_tensors(fields), group_id
+    objective_data = _fields_to_tensors(fields)
+    objective_data["head_step_ids"] = torch.from_numpy(head_step_ids)
+    objective_data["step_sequence_ids"] = torch.tensor(seq_per_step, dtype=torch.int64, device="cpu")
+    return inputs, TensorDict(objective_data, batch_size=[], device="cpu")

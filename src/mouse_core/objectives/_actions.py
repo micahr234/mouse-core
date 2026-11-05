@@ -1,25 +1,25 @@
-"""Validity of incoming actions, separate from observation and episode validity."""
+"""Action presence comes from the action value itself: NaN means no action."""
 
 import torch
 
 
-def executed_actions(columns: dict[str, torch.Tensor], action: torch.Tensor) -> torch.Tensor:
-    """Read the batch mask derived by packing nullable incoming actions.
-
-    Raw rows store ``action=None`` on resets. Their packed integer slot is
-    only a placeholder. Direct tensor callers may omit the mask when all
-    actions ran.
-    """
-    executed = columns.get("action_executed")
-    if executed is None:
+def executed_actions(action: torch.Tensor) -> torch.Tensor:
+    """Finite action values are present; NaN represents an automatic transition."""
+    if action.dtype == torch.int64:
         return torch.ones_like(action, dtype=torch.bool)
-    if executed.dtype not in (torch.bool, torch.int64) or executed.shape != action.shape:
-        raise ValueError("action_executed must be bool or binary int64 [N] matching action.")
-    if executed.dtype == torch.int64 and bool(((executed < 0) | (executed > 1)).any()):
-        raise ValueError("action_executed must be bool or binary int64 [N] matching action.")
-    return executed.to(device=action.device, dtype=torch.bool)
+    if not action.is_floating_point():
+        raise TypeError(f"action must be int64 or floating point with NaN for missing actions, got {action.dtype}.")
+    if bool(torch.isinf(action).any()):
+        raise ValueError("action cannot contain infinity; use NaN for a missing action.")
+    return ~torch.isnan(action)
 
 
-def canonical_actions(columns: dict[str, torch.Tensor], action: torch.Tensor) -> torch.Tensor:
-    """Never validate or gather an unexecuted action's arbitrary placeholder."""
-    return torch.where(executed_actions(columns, action), action, 0)
+def canonical_actions(action: torch.Tensor) -> torch.Tensor:
+    """Validate discrete IDs and supply safe integer indices for masked gathers."""
+    present = executed_actions(action)
+    if action.dtype == torch.int64:
+        return action
+    safe = torch.where(present, action, 0.)
+    if bool(((safe != safe.trunc()) | (safe < -(2**63)) | (safe >= 2**63)).any()):
+        raise ValueError("Present action IDs must be integers representable as int64.")
+    return safe.to(torch.int64)

@@ -34,7 +34,8 @@ def test_every_branch_once_per_epoch_and_final_batch_retained(workers):
                              sample_ranges=environment_episode_ranges, epochs=3, num_workers=workers, seed=9)
     seen = []
     while not loader.exhausted:
-        inputs, data, groups = loader.next_batch()
+        inputs, data = loader.next_batch()
+        groups = data["step_sequence_ids"]
         for group in groups.unique_consecutive():
             branch = data['branch'][groups == group]
             assert len(branch.unique()) == 1
@@ -61,8 +62,8 @@ def test_epoch_workers_support_augmentation_and_match_in_process_results():
     try:
         for workers in (0, 2):
             augment = Augmenter(seed=3, seed_field='episode_index', fields=[
-                {'type': 'discrete', 'input_field': 'branch', 'vocab_size': 5,
-                 'permute': True, 'mask_prob': .5, 'mask_value': -1}
+                {'type': "discrete_permute", 'input_field': 'branch', 'vocab_size': 5,
+                  'mask_prob': .5, 'mask_value': -1}
             ])
             pipeline = EventTransform(encode=compose(stages=(augment, transform)))
             loaders.append(EpochDataLoader(stores=stores(), transform=pipeline,
@@ -70,7 +71,7 @@ def test_epoch_workers_support_augmentation_and_match_in_process_results():
         while not loaders[0].exhausted:
             left, right = [loader.next_batch() for loader in loaders]
             assert left[1]['branch'].tolist() == right[1]['branch'].tolist()
-            assert left[2].tolist() == right[2].tolist()
+            assert left[1]["step_sequence_ids"].tolist() == right[1]["step_sequence_ids"].tolist()
     finally:
         for loader in loaders:
             loader.close()
@@ -99,5 +100,5 @@ def test_objective_positions_follow_samples_through_shuffled_passes():
     loader.set_sample_objective_fields('frozen', [torch.full((len(sample),), float(i))
                                                 for i, sample in enumerate(loader.samples)])
     while not loader.exhausted:
-        _, data, _ = loader.next_batch()
+        inputs, data = loader.next_batch()
         torch.testing.assert_close(data['frozen'], data['branch'].float())

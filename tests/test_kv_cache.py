@@ -33,7 +33,7 @@ def _as_rect(preds: torch.Tensor) -> torch.Tensor:
 
 _TOK = token_tokenizer("action", "repeat_episode_done")
 
-def _tiny_model(architecture: Literal['llama', 'qwen3']='qwen3', tokens: int=1, dtype: torch.dtype=torch.float32, train_kernel: TrainKernel='reference', **backbone_kwargs) -> Model:
+def _tiny_model(architecture: Literal['llama', 'qwen3']='qwen3', tokens: int=1, dtype: torch.dtype=torch.float32, train_kernel: TrainKernel="flex", **backbone_kwargs) -> Model:
     hidden_dim = 16
     backbone = Backbone(architecture=architecture, train_kernel=train_kernel, decode_kernel='flex', dtype=dtype, hidden_dim=hidden_dim, num_layers=2, num_heads=2, **backbone_kwargs)
     head = MLP(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, propagate_gradient=1.0)
@@ -91,9 +91,9 @@ def test_recurring_grouping_id_matches_between_full_and_cached(backbone_cls: Lit
     assert torch.allclose(incremental, _as_rect(full['action_value']), atol=1e-05)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason='flash varlen train / compiled Flex decode are CUDA bf16')
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='FlexAttention train / compiled Flex decode are CUDA bf16')
 def test_cuda_bf16_packed_train_matches_cached_decode_with_recurring_ids() -> None:
-    """Recommended config end to end: flash varlen packed forward == Flex cached decode."""
+    """Recommended config end to end: FlexAttention packed forward == Flex cached decode."""
     torch.manual_seed(4)
     model = _tiny_model("qwen3", dtype=torch.bfloat16).to(torch.device('cuda'))
     steps = _steps(8)
@@ -135,12 +135,12 @@ def test_cuda_fp32_decode_is_compiled_and_matches_full_forward() -> None:
     assert torch.allclose(incremental, full_q, atol=0.0001), (incremental - full_q).abs().max().item()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason='flash varlen train / compiled Flex decode are CUDA bf16')
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='FlexAttention train / compiled Flex decode are CUDA bf16')
 def test_cuda_bf16_lora_compiled_train_matches_cached_decode() -> None:
     """LoRA + compiled decoder body: packed forward == Flex cached decode."""
     torch.manual_seed(5)
     hidden_dim = 64
-    backbone = Backbone(architecture='qwen3', train_kernel='varlen', decode_kernel='flex', dtype=torch.bfloat16, hidden_dim=hidden_dim, num_layers=2, num_heads=4, lora=LoRAConfig(rank=4, alpha=8.0))
+    backbone = Backbone(architecture='qwen3', train_kernel="flex", decode_kernel='flex', dtype=torch.bfloat16, hidden_dim=hidden_dim, num_layers=2, num_heads=4, lora=LoRAConfig(rank=4, alpha=8.0))
     head = MLP(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, propagate_gradient=1.0)
     model = simple_model(backbone=backbone, heads={'action_value': head}, reasoner=None).eval().to(torch.device('cuda'))
     steps = _steps(8)
@@ -168,11 +168,11 @@ def test_cuda_bf16_lora_compiled_train_matches_cached_decode() -> None:
         packed_train_mod._compiled_layer = was
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason='varlen train / bf16 KV pool are CUDA-only')
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='FlexAttention train / bf16 KV pool are CUDA-only')
 def test_cuda_fp32_autocast_train_matches_cached_decode() -> None:
-    """bf16 declared on both paths: flash varlen packed train == Flex cached decode on a bf16 KV pool."""
+    """bf16 declared on both paths: FlexAttention packed train == Flex cached decode on a bf16 KV pool."""
     torch.manual_seed(6)
-    model = _tiny_model('qwen3', train_kernel='varlen', train_autocast_dtype=torch.bfloat16, decode_autocast_dtype=torch.bfloat16).to(torch.device('cuda'))
+    model = _tiny_model('qwen3', train_kernel="flex", train_autocast_dtype=torch.bfloat16, decode_autocast_dtype=torch.bfloat16).to(torch.device('cuda'))
     steps = _steps(8)
     for step, episode in zip(steps, (0, 0, 1, 1, 0, 0, 2, 0)):
         step['episode_index'] = episode
@@ -193,11 +193,11 @@ def test_cuda_fp32_autocast_train_matches_cached_decode() -> None:
     assert torch.allclose(incremental, full_q, atol=0.05), (incremental - full_q).abs().max().item()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason='varlen train is CUDA-only')
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='FlexAttention train is CUDA-only')
 def test_cuda_split_autocast_bf16_train_fp32_decode() -> None:
     """train_autocast_dtype=bf16 with decode_autocast_dtype=None: fp32 KV pool, decode matches bf16 train."""
     torch.manual_seed(7)
-    model = _tiny_model('qwen3', train_kernel='varlen', train_autocast_dtype=torch.bfloat16).to(torch.device('cuda'))
+    model = _tiny_model('qwen3', train_kernel="flex", train_autocast_dtype=torch.bfloat16).to(torch.device('cuda'))
     steps = _steps(6)
     with torch.no_grad():
         full, _ = _fwd(model, [steps])
@@ -228,7 +228,7 @@ def test_cuda_step_cudagraph_matches_eager_decode(S: int) -> None:
     torch.manual_seed(0)
     device = torch.device('cuda')
     backbone = Backbone(architecture="qwen3",
-        train_kernel="varlen", decode_kernel="flex", dtype=torch.bfloat16,
+        train_kernel="flex", decode_kernel="flex", dtype=torch.bfloat16,
         hidden_dim=64, num_layers=2, num_heads=4, lora=LoRAConfig(rank=4, alpha=8.0)).to(device).eval()
     for n, p in backbone.named_parameters():
         if ".lora_B." in n:
@@ -280,7 +280,7 @@ def test_cuda_step_graph_survives_chunk_shape_change() -> None:
     torch.manual_seed(0)
     device = torch.device('cuda')
     backbone = Backbone(architecture="qwen3",
-        train_kernel="varlen", decode_kernel="flex", dtype=torch.bfloat16,
+        train_kernel="flex", decode_kernel="flex", dtype=torch.bfloat16,
         hidden_dim=64, num_layers=2, num_heads=4).to(device).eval()
     inner = cast(nn.Module, cast(Any, backbone).model)
     B, D = 2, 64
@@ -323,7 +323,7 @@ def _cuda_graph_session(batch_size: int = 2) -> tuple[Any, torch.device, int]:
 
     device = torch.device("cuda")
     backbone = Backbone(architecture="qwen3",
-        train_kernel="varlen", decode_kernel="flex", dtype=torch.bfloat16,
+        train_kernel="flex", decode_kernel="flex", dtype=torch.bfloat16,
         hidden_dim=64, num_layers=2, num_heads=4, lora=LoRAConfig(rank=4, alpha=8.0)).to(device).eval()
     inner = cast(nn.Module, cast(Any, backbone).model)
     return FlexDecodeSession(inner, batch_size=batch_size), device, 64

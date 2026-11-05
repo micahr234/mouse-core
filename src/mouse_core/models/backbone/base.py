@@ -43,13 +43,6 @@ from mouse_core.models.backbone.packed_train import (
 from mouse_core.models.lora import LoRAConfig, apply_lora
 
 
-def _disable_cudnn_sdp() -> None:
-    """Disable the cuDNN SDPA backend to avoid driver-specific errors."""
-    enable_cudnn_sdp = getattr(torch.backends.cuda, "enable_cudnn_sdp", None)
-    if enable_cudnn_sdp is not None:
-        enable_cudnn_sdp(enabled=False)
-
-
 class BaseBackbone(nn.Module, ABC):
     """Abstract base for backbones.
 
@@ -77,18 +70,10 @@ class BaseBackbone(nn.Module, ABC):
     Attention kernels are required constructor arguments of every
     transformer backbone, so the choices are always explicit:
 
-    - ``train_kernel`` runs the uncached packed forward (training, and any
-      forward without a cache): ``"varlen"`` (flash varlen; requires CUDA
-      with bf16/fp16 q/k/v — a bf16/fp16 backbone or ``train_autocast_dtype`` —
-      and raises otherwise), ``"padded"`` (dense causal SDPA on segments
-      padded to ``max_seqlen``), ``"flex"`` (FlexAttention block mask,
-      compiled on CUDA in every dtype), or ``"reference"`` (masked SDPA,
-      O(L^2) memory, any device/dtype). All four give the same result; a
-      kernel that cannot run on the current device/dtype raises instead of
-      falling back to another one.
-    - ``decode_kernel`` runs cached decode (``use_cache=True``): ``"flex"``
-      (paged FlexAttention), currently the only kernel that reads K/V
-      through a page table.
+    - ``train_kernel="flex"`` uses block-sparse FlexAttention for uncached
+      forwards. Training requires CUDA; CPU supports inference only.
+    - ``decode_kernel="flex"`` uses paged FlexAttention for cached decode.
+      No alternate attention backend or automatic substitution is supported.
     - ``train_autocast_dtype`` / ``decode_autocast_dtype`` (default
       ``None``) declare mixed precision per path for a fp32 backbone: the
       packed training forward / cached decode run their matmuls in
@@ -208,22 +193,19 @@ class BaseBackbone(nn.Module, ABC):
             raise ValueError("packed input requires embeds [L, D] and sequence_ids [L].")
         if kwargs:
             raise ValueError("sequence_ids supplies packed attention; do not also pass attention kwargs.")
-        if self.uses_packed:
-            from mouse_core.models.backbone.packed_train import packed_forward
-            return packed_forward(
-                model=cast(nn.Module, self.model), embeds=embeds, sequence_ids=sequence_ids,
-                output_hidden_states=output_hidden_states, checkpoint=self.gradient_checkpointing,
-                train_kernel=self.train_kernel, autocast_dtype=self.train_autocast_dtype,
-            )
-        from mouse_core.models.encoding import _flat_sequence_causal_mask, _flat_sequence_position_ids
-        out = self._forward_dense(
-            embeds.unsqueeze(0), output_hidden_states=output_hidden_states,
-            attention_mask=_flat_sequence_causal_mask(dtype=embeds.dtype, sequence_ids=sequence_ids),
-            position_ids=_flat_sequence_position_ids(sequence_ids=sequence_ids),
+        return self._forward_packed(embeds, sequence_ids=sequence_ids, output_hidden_states=output_hidden_states)
+
+    def _forward_packed(
+        self, embeds: torch.Tensor, *, sequence_ids: torch.Tensor, output_hidden_states: bool,
+    ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+        if not self.uses_packed:
+            raise NotImplementedError("This backbone must implement _forward_packed for grouped inputs")
+        from mouse_core.models.backbone.packed_train import packed_forward
+        return packed_forward(
+            model=cast(nn.Module, self.model), embeds=embeds, sequence_ids=sequence_ids,
+            output_hidden_states=output_hidden_states, checkpoint=self.gradient_checkpointing,
+            train_kernel=self.train_kernel, autocast_dtype=self.train_autocast_dtype,
         )
-        if isinstance(out, tuple):
-            return out[0].squeeze(0), tuple(layer.squeeze(0) for layer in out[1])
-        return out.squeeze(0)
 
     @abstractmethod
     def _forward_dense(

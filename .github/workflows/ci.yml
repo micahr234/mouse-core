@@ -16,10 +16,6 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    env:
-      # TEMPORARY: keep GIL off while Triton re-enables it on import.
-      # Remove once Triton declares Py_MOD_GIL_NOT_USED — see CONTRIBUTING.md.
-      PYTHON_GIL: "0"
     steps:
       - uses: actions/checkout@v7
 
@@ -28,17 +24,15 @@ jobs:
           enable-cache: true
           cache-dependency-glob: "pyproject.toml"
 
-      - name: Install free-threaded Python and package
+      - name: Install standard Python and package
         run: |
-          uv python install 3.15t
-          uv venv --python 3.15t
-          # torch 2.15 cp315t wheels are on the PyTorch test index, not PyPI.
-          # The CPU index keeps CI from fetching a CUDA wheel. unsafe-best-match
-          # is required so PyPI still supplies packages the test index also hosts
-          # (numpy) at the versions this project requires.
+          uv python install 3.15
+          uv venv --python 3.15
+          # Resolve the pinned nightly pair with CPU wheels for CI.
           uv pip install -e ".[dev]" --python .venv/bin/python \
-            --extra-index-url https://download.pytorch.org/whl/test/cpu \
+            --extra-index-url https://download.pytorch.org/whl/nightly/cpu \
             --index-strategy unsafe-best-match
+          .venv/bin/python scripts/patch_triton.py
 
       - name: Type check
         run: .venv/bin/pyright src/ tests/
@@ -55,10 +49,10 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Install free-threaded Python and build tools
+      - name: Install standard Python and build tools
         run: |
-          uv python install 3.15t
-          uv venv --python 3.15t
+          uv python install 3.15
+          uv venv --python 3.15
           uv pip install "build>=1.6.1" "twine>=7.0.0" --python .venv/bin/python
 
       - name: Build wheel and sdist

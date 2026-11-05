@@ -1,4 +1,6 @@
 """Reset placeholders must not become decisions, even inside a live episode."""
+
+from tests._prediction_layout import fixture_head_steps
 import pytest
 import torch
 
@@ -10,8 +12,7 @@ from mouse_core.objectives import (
 
 def data():
     return {
-        'action': torch.tensor([-999, 0, 999, 1, 0]),
-        'action_executed': torch.tensor([False, True, False, True, True]),
+        'action': torch.where((torch.tensor([False, True, False, True, True])).bool(), (torch.tensor([-999, 0, 999, 1, 0])).to(torch.float64), float("nan")),
         'reward': torch.tensor([0., 2., 7., 3., 4.]),
         'terminated': torch.tensor([False, False, False, False, True]),
         'truncated': torch.zeros(5, dtype=torch.bool),
@@ -24,7 +25,7 @@ def objective(gate=None):
     return DqnObjective(
         reward=None, value=None,
         discount=boundary_discount(gamma_step=.9, gamma_terminated=0., gamma_truncated=0.),
-        temperature=0., gate=gate, cross_group_backups='fault',
+        temperature=0., gate=gate,
     )
 
 
@@ -37,14 +38,14 @@ def tensor_metric(metrics: dict[str, float | torch.Tensor], name: str) -> torch.
 def call_objective(algorithm: str, batch: dict[str, torch.Tensor], predictions: torch.Tensor):
     group_id = torch.zeros(predictions.shape[0], dtype=torch.int64)
     if algorithm == 'dqn':
-        return objective()(objective_data=batch, group_id=group_id, predictions=predictions,
+        return objective()(objective_data=batch, group_id=group_id, head_step_ids=fixture_head_steps(batch),  predictions=predictions,
                            backup_value_predictions=predictions, backup_action_predictions=predictions)
     if algorithm == 'grpo':
-        return GrpoObjective()(objective_data=batch, group_id=group_id, predictions=predictions)
+        return GrpoObjective()(objective_data=batch, group_id=group_id, head_step_ids=fixture_head_steps(batch),  predictions=predictions)
     return PpoObjective(
         discount=boundary_discount(gamma_step=.9, gamma_terminated=0., gamma_truncated=0.),
-        reward=None, value=None, cross_group_backups='fault',
-    )(objective_data=batch, group_id=group_id, predictions=predictions,
+        reward=None, value=None,
+    )(objective_data=batch, group_id=group_id, head_step_ids=fixture_head_steps(batch),  predictions=predictions,
       value_predictions=torch.arange(predictions.shape[0], dtype=torch.float32, requires_grad=True))
 
 
@@ -55,7 +56,7 @@ def test_dead_actions_and_dead_q_cannot_change_dqn(gate):
     batch = data()
     q = torch.tensor([[1., 2.], [float('nan')]*2, [3., 4.], [5., 6.], [9., 10.]], requires_grad=True)
     target = torch.tensor([[1., 2.], [float('nan')]*2, [4., 5.], [5., 6.], [9., 10.]])
-    losses, metrics = objective(gate)(objective_data=batch, group_id=torch.zeros(5,dtype=torch.long),
+    losses, metrics = objective(gate)(objective_data=batch, group_id=torch.zeros(5,dtype=torch.long), head_step_ids=fixture_head_steps(batch),
         predictions=q, backup_value_predictions=target, backup_action_predictions=target)
     assert torch.isfinite(losses['action_value'])
     assert tensor_metric(metrics, 'backup_weight').tolist() == [1., 0., 1., 1., 0.]
@@ -63,8 +64,8 @@ def test_dead_actions_and_dead_q_cannot_change_dqn(gate):
     assert q.grad is not None
     assert torch.isfinite(q.grad).all()
     assert q.grad[1].count_nonzero() == 0
-    changed = {**batch, 'action': torch.tensor([42, 0, -123, 1, 0])}
-    other, other_metrics = objective(gate)(objective_data=changed, group_id=torch.zeros(5,dtype=torch.long),
+    changed = {**batch, 'action': batch['action'].clone()}
+    other, other_metrics = objective(gate)(objective_data=changed, group_id=torch.zeros(5,dtype=torch.long), head_step_ids=fixture_head_steps(changed),
         predictions=q.detach().nan_to_num(12345.), backup_value_predictions=target.nan_to_num(-999.),
         backup_action_predictions=target.nan_to_num(999.))
     torch.testing.assert_close(losses['action_value'], other['action_value'])
@@ -96,7 +97,7 @@ def test_policy_loss_ignores_invalid_ids_nan_logits_and_stale_reset_logprobs(pol
 def test_mask_does_not_allow_invalid_executed_actions():
     batch = data(); batch['action'][1] = 999
     with pytest.raises(ValueError, match='action ids'):
-        objective()(objective_data=batch,group_id=torch.zeros(5,dtype=torch.long),
+        objective()(objective_data=batch,group_id=torch.zeros(5,dtype=torch.long), head_step_ids=fixture_head_steps(batch),
             predictions=torch.zeros(5,2),backup_value_predictions=torch.zeros(5,2),backup_action_predictions=torch.zeros(5,2))
 
 
@@ -105,12 +106,12 @@ def test_automatic_transitions_never_cross_episodes_and_multi_readouts_match():
     joined = {k:torch.cat([v,v]) for k,v in batch.items()}
     q = torch.arange(10,dtype=torch.float32).reshape(5,2)
     obj=objective(nstep_gate(n=20))
-    _,single=obj(objective_data=batch,group_id=torch.zeros(5,dtype=torch.long),
+    _,single=obj(objective_data=batch,group_id=torch.zeros(5,dtype=torch.long), head_step_ids=fixture_head_steps(batch),
         predictions=q,backup_value_predictions=q,backup_action_predictions=q)
     q2=torch.cat([q,q+1000])
-    joined['head_output_count']=torch.full((10,),2,dtype=torch.long)
+    joined['readout_counts']=torch.full((10,),2,dtype=torch.long)
     q2=q2.repeat_interleave(2,dim=0)
-    _,combined=obj(objective_data=joined,group_id=torch.tensor([0]*5+[1]*5),
+    _,combined=obj(objective_data=joined,group_id=torch.tensor([0]*5+[1]*5), head_step_ids=fixture_head_steps(joined),
         predictions=q2,backup_value_predictions=q2,backup_action_predictions=q2)
     torch.testing.assert_close(tensor_metric(combined, 'backup')[:10],
                                tensor_metric(single, 'backup').repeat_interleave(2))
@@ -120,7 +121,7 @@ def test_automatic_transitions_never_cross_episodes_and_multi_readouts_match():
 @pytest.mark.parametrize('policy', ['dqn','grpo'])
 def test_all_unexecuted_returns_differentiable_zero(policy):
     batch={k:v[:2].clone() for k,v in data().items()}
-    batch['action_executed'][:]=False
+    batch["action"].fill_(float("nan"))
     q=torch.full((2,2),float('nan'),requires_grad=True)
     losses, _ = call_objective(policy, batch, q)
     loss = torch.stack(tuple(losses.values())).sum()
@@ -128,18 +129,3 @@ def test_all_unexecuted_returns_differentiable_zero(policy):
     loss.backward()
     assert q.grad is not None
     assert q.grad.count_nonzero()==0
-
-
-@pytest.mark.parametrize('algorithm', ['dqn','grpo','ppo'])
-def test_binary_int64_action_flags_from_packed_data(algorithm):
-    batch=data();batch['action_executed']=batch['action_executed'].long()
-    q=torch.zeros(5,2,requires_grad=True)
-    losses, _ = call_objective(algorithm, batch, q)
-    loss = torch.stack(tuple(losses.values())).sum()
-    assert torch.isfinite(loss)
-    loss.backward()
-    assert q.grad is not None
-    assert q.grad[1].count_nonzero()==0
-    batch['action_executed'][1]=2
-    with pytest.raises(ValueError,match='binary'):
-        call_objective(algorithm, batch, q)

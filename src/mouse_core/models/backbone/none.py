@@ -22,6 +22,11 @@ class IdentityBackbone(BaseBackbone):
     def hidden_dim(self) -> int:
         return self._hidden_dim
 
+    def _forward_packed(
+        self, embeds: torch.Tensor, *, sequence_ids: torch.Tensor, output_hidden_states: bool,
+    ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+        return self._forward_dense(embeds, output_hidden_states=output_hidden_states)
+
     def _forward_dense(
         self,
         embeds: torch.Tensor,

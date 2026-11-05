@@ -17,11 +17,14 @@ classifiers = [
     "Programming Language :: Python :: 3.15",
 ]
 dependencies = [
-    "torch>=2.15.0",
+    "tensordict>=0.15.4,<0.16",
+    "torch==2.15.0.dev20261005",
+    "triton==3.8.0+gitc01b6774; sys_platform == 'linux'",
     "numpy>=2.5.4",
-    "transformers>=5.19.0",
+    "transformers>=5.22.0",
     "tokenizers>=0.23.3",
     "datasets>=5.1.0",
+    "cloudpickle>=3.1.2",
     "huggingface_hub>=2.2.0",
 ]
 
@@ -31,6 +34,7 @@ Repository = "https://github.com/micahr234/mouse-core"
 Issues = "https://github.com/micahr234/mouse-core/issues"
 
 [project.optional-dependencies]
+kernels = ["kernels>=0.17.2,<0.18"]
 examples = [
     "mouse-gym @ git+https://github.com/micahr234/mouse-gym.git@main",
     "repeat-task-gym @ git+https://github.com/micahr234/repeat-task-gym.git@main",
@@ -41,7 +45,7 @@ examples = [
     "matplotlib>=3.11.2",
 ]
 all = [
-    "mouse-core[examples]",
+    "mouse-core[examples,kernels]",
 ]
 dev = [
     "pyright>=1.1.414",

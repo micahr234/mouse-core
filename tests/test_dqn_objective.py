@@ -1,11 +1,12 @@
 """Tests for DQN objective on synthetic tensors."""
 from __future__ import annotations
+
+from tests._prediction_layout import fixture_head_steps
 from typing import TypedDict
 
 import torch
 
 from mouse_core.objectives import (
-    CrossGroupBackups,
     Discount,
     DqnObjective,
     affine_reward,
@@ -127,22 +128,19 @@ def test_boundary_value_applies_terminated_and_truncated_affine() -> None:
 
 
 def test_objective_none_transforms_are_identity() -> None:
-    """``None`` skips the callable: reward column, raw Q, discount ``1``."""
-    step_stream = {
-            "action": torch.tensor([0, 1, 0]),
-            "reward": torch.tensor([0.0, 1.0, 5.0]),
-            "terminated": torch.tensor([0, 1, 0]),
-            "truncated": torch.tensor([0, 0, 0]),
-        }
-    predictions, delayed = _q(
-        torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]]),
-        torch.zeros(3, 2),
-    )
-    skipped, _ = DqnObjective(        reward=None, value=None, discount=None, temperature=0.0, gate=None,
-     cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
-    explicit, _ = DqnObjective(        reward=_rew(), value=_val(), discount=_disc(gamma_step=1.0, gamma_terminated=1.0, gamma_truncated=1.0), temperature=0.0, gate=None,
-     cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
-    assert abs(skipped["action_value"].item() - explicit["action_value"].item()) < 1e-05
+    data, online, delayed = _lambda_fixture()
+    outputs = []
+    for reward, value in [(None, None), (_rew(), _val())]:
+        losses, _ = DqnObjective(reward=reward, value=value, discount=_disc(), temperature=0., gate=None)(
+            objective_data=data, group_id=_group_id(data), head_step_ids=fixture_head_steps(data),  predictions=online,
+            backup_value_predictions=delayed, backup_action_predictions=delayed)
+        outputs.append(losses['action_value'])
+    torch.testing.assert_close(*outputs)
+    # Identity discount stays one even on a terminal row: the unfinished return must fault.
+    with pytest.raises(ValueError, match='cross-group backup'):
+        DqnObjective(reward=None, value=None, discount=None, temperature=0., gate=None)(
+            objective_data=data, group_id=_group_id(data), head_step_ids=fixture_head_steps(data),  predictions=online,
+            backup_value_predictions=delayed, backup_action_predictions=delayed)
 
 
 def test_factory_args_are_required() -> None:
@@ -162,14 +160,13 @@ def test_dqn_requires_temperature_argument() -> None:
     with pytest.raises(TypeError, match="temperature"):
         DqnObjective( reward=_rew(), value=_val(), # type: ignore[call-arg]
             discount=_disc(gamma_step=0.99),
-            gate=None,
-         cross_group_backups="bootstrap")
+            gate=None)
 
 
 def test_dqn_rejects_removed_double_argument() -> None:
     with pytest.raises(TypeError, match="unexpected keyword argument 'double'"):
         DqnObjective(discount=None, reward=None, value=None, gate=None,
-                     temperature=0.0, cross_group_backups="bootstrap", double=True)  # type: ignore[call-arg]
+                     temperature=0.0,  double=True)  # type: ignore[call-arg]
 
 
 def _gate(*, td_lambda: float):
@@ -187,7 +184,7 @@ def test_dqn_requires_gate() -> None:
     with pytest.raises(TypeError, match="gate"):
         DqnObjective( reward=_rew(), value=_val(),  # type: ignore[call-arg]
             discount=_disc(),
-            temperature=0.0, cross_group_backups="bootstrap")
+            temperature=0.0)
 
 
 def _q(online: torch.Tensor, delayed: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -197,9 +194,11 @@ def _q(online: torch.Tensor, delayed: torch.Tensor) -> tuple[torch.Tensor, torch
 def test_dqn_objective_runs() -> None:
     n, a = (8, 3)
     step_stream = {'action': torch.randint(0, a, (n,)), 'reward': torch.randn(n), 'terminated': torch.zeros(n, dtype=torch.long), 'truncated': torch.zeros(n, dtype=torch.long), 'group_id': torch.tensor([0, 0, 0, 0, 1, 1, 1, 1])}
+    step_stream["terminated"][-1] = True
     predictions, delayed = _q(torch.randn(n, a), torch.randn(n, a))
-    objective = DqnObjective( reward=_rew(), value=_val(), discount=_disc(gamma_step=0.99), temperature=0.0, gate=None, cross_group_backups="bootstrap")
-    loss, metrics = objective(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
+    step_stream["terminated"][3] = True
+    objective = DqnObjective( reward=_rew(), value=_val(), discount=_disc(gamma_step=0.99), temperature=0.0, gate=None)
+    loss, metrics = objective(objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
     assert loss["action_value"].ndim == 0
     assert 'action_value' in metrics
     assert isinstance(metrics['action_value'], torch.Tensor)
@@ -222,65 +221,34 @@ def test_dqn_objective_runs() -> None:
     assert torch.equal(in_run_backup, backup[backup_weight > 0])
 
 def test_dqn_metrics_backup_matches_loss_target() -> None:
-    """``backup`` / ``backup_weight`` are the tensors the loss already built."""
-    data = {
-        'action': torch.tensor([0, 0], dtype=torch.int64),
-        'reward': torch.tensor([0.0, 1.0]),
-        'terminated': torch.zeros(2, dtype=torch.int64),
-        'truncated': torch.zeros(2, dtype=torch.int64),
-        'episode_index': torch.zeros(2, dtype=torch.int64),
-    }
-    online = torch.zeros(2, 2, requires_grad=True)
-    delayed = torch.tensor([[0.0, 0.0], [5.0, 0.0]])
-    backups: dict[str, float] = {}
-    for mode in ("ignore", "bootstrap"):
-        objective = DqnObjective(
-            reward=_rew(),
-            value=_val(),
-            discount=_disc(gamma_step=1.0),
-            temperature=0.0,
-            gate=None,
-            cross_group_backups=mode)
-        loss, metrics = objective(
-            objective_data=data, group_id=_group_id(data),
-            predictions=online,
-            backup_value_predictions=delayed, backup_action_predictions=delayed
-        )
-        backup = metrics['backup']
-        weight = metrics['backup_weight']
-        assert isinstance(backup, torch.Tensor)
-        assert isinstance(weight, torch.Tensor)
-        backups[mode] = float(backup[0].item())
-        if mode == "ignore":
-            # The batch ends on an unsampled value, so the pair leaves the loss.
-            assert weight[0].item() == pytest.approx(0.0)
-            assert loss["action_value"].item() == pytest.approx(0.0)
-        else:
-            assert weight[0].item() == pytest.approx(1.0)
-            assert backup[0].item() ** 2 == pytest.approx(loss["action_value"].item())
-    # End of the batch: r + V = 6 when the backup is kept. Ignoring it leaves
-    # V out of the target (reward alone) and drops the pair from the average.
-    assert backups["bootstrap"] == pytest.approx(6.0)
-    assert backups["ignore"] == pytest.approx(1.0)
+    data, online, delayed = _lambda_fixture()
+    loss, metrics = DqnObjective(reward=None, value=None, discount=_disc(),
+                                 temperature=0., gate=None)(
+        objective_data=data, group_id=_group_id(data), head_step_ids=fixture_head_steps(data),  predictions=online,
+        backup_value_predictions=delayed, backup_action_predictions=delayed)
+    torch.testing.assert_close(metrics['backup'], torch.tensor([4., 10., 0.]))
+    torch.testing.assert_close(metrics['backup_weight'], torch.tensor([1., 1., 0.]))
+    torch.testing.assert_close(loss['action_value'], ((online[:2, [0, 1]].diagonal() - metrics['backup'][:2]) ** 2).mean())
 
 def test_dqn_objective_rejects_wrong_action_shape() -> None:
     n, a = (4, 3)
     step_stream = {'action': torch.randint(0, a, (n, 1)), 'reward': torch.randn(n), 'terminated': torch.zeros(n, dtype=torch.long), 'truncated': torch.zeros(n, dtype=torch.long)}
+    step_stream["terminated"][-1] = True
     predictions, delayed = _q(torch.randn(n, a), torch.randn(n, a))
     with pytest.raises(ValueError, match="action shape"):
-        DqnObjective( reward=_rew(), value=_val(), discount=_disc(gamma_step=0.99), temperature=0.0, gate=None, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
+        DqnObjective( reward=_rew(), value=_val(), discount=_disc(gamma_step=0.99), temperature=0.0, gate=None)(objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
 
 def test_dqn_objective_requires_min_sequence() -> None:
     step_stream = {'action': torch.zeros(1, dtype=torch.long), 'reward': torch.zeros(1), 'terminated': torch.zeros(1, dtype=torch.long), 'truncated': torch.zeros(1, dtype=torch.long)}
     predictions, delayed = _q(torch.zeros(1, 2), torch.zeros(1, 2))
     with pytest.raises(ValueError, match="Not enough"):
-        DqnObjective( reward=_rew(), value=_val(), discount=_disc(), temperature=0.0, gate=None, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
+        DqnObjective( reward=_rew(), value=_val(), discount=_disc(), temperature=0.0, gate=None)(objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
 
 def test_dqn_objective_trains_on_terminal_transitions() -> None:
     """Transitions *from* terminal states must contribute to the loss."""
     step_stream = {'action': torch.tensor([0, 1, 0]), 'reward': torch.tensor([0.0, 1.0, 5.0]), 'terminated': torch.tensor([0, 1, 0]), 'truncated': torch.tensor([0, 0, 0])}
     predictions, delayed = _q(torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]]), torch.zeros(3, 2))
-    loss, _ = DqnObjective( reward=_rew(), value=_val(), discount=_disc(gamma_step=0.0), temperature=0.0, gate=None, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
+    loss, _ = DqnObjective( reward=_rew(), value=_val(), discount=_disc(gamma_step=0.0), temperature=0.0, gate=None)(objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
     assert abs(loss["action_value"].item() - 2.5) < 1e-05
 
 
@@ -289,8 +257,7 @@ def test_dqn_requires_reward_argument() -> None:
         DqnObjective(  # type: ignore[call-arg]
             discount=_disc(gamma_step=0.99),
             value=_val(),
-            temperature=0.0, gate=None,
-         cross_group_backups="bootstrap")
+            temperature=0.0, gate=None)
 
 
 def test_dqn_requires_value_argument() -> None:
@@ -298,8 +265,7 @@ def test_dqn_requires_value_argument() -> None:
         DqnObjective(  # type: ignore[call-arg]
             reward=_rew(),
             discount=_disc(gamma_step=0.99),
-            temperature=0.0, gate=None,
-         cross_group_backups="bootstrap")
+            temperature=0.0, gate=None)
 
 
 def test_affine_reward_reads_column() -> None:
@@ -321,10 +287,10 @@ def test_dqn_objective_reward_scale_and_shift() -> None:
         }
     predictions, delayed = _q(torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]]), torch.zeros(3, 2))
     # Unscaled targets 1 and 5 → MSE 2.5. Scale 2: targets 2 and 10 → (2-2)^2, (3-10)^2.
-    scaled, _ = DqnObjective( reward=_rew(scale=2.0), value=_val(), discount=_disc(gamma_step=0.0), temperature=0.0, gate=None, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
+    scaled, _ = DqnObjective( reward=_rew(scale=2.0), value=_val(), discount=_disc(gamma_step=0.0), temperature=0.0, gate=None)(objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
     assert abs(scaled["action_value"].item() - 24.5) < 1e-05
     # Shift 1: targets 2 and 6 → (2-2)^2, (3-6)^2.
-    shifted, _ = DqnObjective( reward=_rew(shift=1.0), value=_val(), discount=_disc(gamma_step=0.0), temperature=0.0, gate=None, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
+    shifted, _ = DqnObjective( reward=_rew(shift=1.0), value=_val(), discount=_disc(gamma_step=0.0), temperature=0.0, gate=None)(objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
     assert abs(shifted["action_value"].item() - 4.5) < 1e-05
     # Leaves objective_data reward unchanged.
     assert torch.equal(step_stream["reward"], torch.tensor([0.0, 1.0, 5.0]))
@@ -345,7 +311,7 @@ def test_dqn_objective_custom_reward_reads_objective_data() -> None:
         return reward + bonus
 
     # Targets 2 and 6 → (2-2)^2, (3-6)^2.
-    loss, _ = DqnObjective( reward=reward, value=_val(), discount=_disc(gamma_step=0.0), temperature=0.0, gate=None, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
+    loss, _ = DqnObjective( reward=reward, value=_val(), discount=_disc(gamma_step=0.0), temperature=0.0, gate=None)(objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
     assert abs(loss["action_value"].item() - 4.5) < 1e-05
 
 
@@ -357,10 +323,10 @@ def test_dqn_objective_q_affine_is_identity_by_default() -> None:
             "truncated": torch.tensor([0, 0, 0]),
         }
     predictions, delayed = _q(torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]]), torch.zeros(3, 2))
-    plain, _ = DqnObjective( reward=_rew(), value=_val(), discount=_disc(gamma_step=0.0), temperature=0.0, gate=None, cross_group_backups="bootstrap")(
-        objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed
+    plain, _ = DqnObjective( reward=_rew(), value=_val(), discount=_disc(gamma_step=0.0), temperature=0.0, gate=None)(
+        objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed
     )
-    affine, _ = DqnObjective( reward=_rew(), value=_val(scale=1.0, shift=0.0), discount=_disc(gamma_step=0.0), temperature=0.0, gate=None, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
+    affine, _ = DqnObjective( reward=_rew(), value=_val(scale=1.0, shift=0.0), discount=_disc(gamma_step=0.0), temperature=0.0, gate=None)(objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
     assert abs(plain["action_value"].item() - affine["action_value"].item()) < 1e-05
 
 
@@ -375,10 +341,10 @@ def test_dqn_objective_q_scale_and_shift() -> None:
     online = torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]])
     predictions, delayed = _q(online, torch.zeros(3, 2))
     # Taken Q 2 and 3, targets 1 and 5. Scale 2: 4 and 6 → (4-1)^2, (6-5)^2.
-    scaled, _ = DqnObjective( reward=_rew(), value=_val(scale=2.0), discount=_disc(gamma_step=0.0), temperature=0.0, gate=None, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
+    scaled, _ = DqnObjective( reward=_rew(), value=_val(scale=2.0), discount=_disc(gamma_step=0.0), temperature=0.0, gate=None)(objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
     assert abs(scaled["action_value"].item() - 5.0) < 1e-05
     # Shift 1: 3 and 4 → (3-1)^2, (4-5)^2.
-    shifted, _ = DqnObjective( reward=_rew(), value=_val(shift=1.0), discount=_disc(gamma_step=0.0), temperature=0.0, gate=None, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
+    shifted, _ = DqnObjective( reward=_rew(), value=_val(shift=1.0), discount=_disc(gamma_step=0.0), temperature=0.0, gate=None)(objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
     assert abs(shifted["action_value"].item() - 2.5) < 1e-05
     assert torch.equal(predictions, online)
 
@@ -391,18 +357,18 @@ def _sequence_fixture(group_id: list[int]) -> tuple[dict[str, torch.Tensor], tor
 def test_dqn_objective_skips_transitions_across_sequences() -> None:
     """A pair whose steps belong to different sequences is not a transition."""
     step_stream, predictions, delayed = _sequence_fixture([0, 1, 1])
-    loss, metrics = DqnObjective( reward=_rew(), value=_val(), discount=_disc(gamma_step=0.0), temperature=0.0, gate=None, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
+    loss, metrics = DqnObjective( reward=_rew(), value=_val(), discount=_disc(gamma_step=0.0), temperature=0.0, gate=None)(objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
     assert abs(loss["action_value"].item() - 4.0) < 1e-05
     assert abs(metrics['q_values_mean'] - 3.0) < 1e-05
 
 def test_dqn_objective_without_sequence_breaks_trains_all_pairs() -> None:
     step_stream, predictions, delayed = _sequence_fixture([0, 0, 0])
-    loss, _ = DqnObjective( reward=_rew(), value=_val(), discount=_disc(gamma_step=0.0), temperature=0.0, gate=None, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
+    loss, _ = DqnObjective( reward=_rew(), value=_val(), discount=_disc(gamma_step=0.0), temperature=0.0, gate=None)(objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
     assert abs(loss["action_value"].item() - 2.5) < 1e-05
 
 def test_dqn_objective_all_out_of_run_pairs_yield_zero_loss() -> None:
     step_stream, predictions, delayed = _sequence_fixture([0, 1, 2])
-    loss, metrics = DqnObjective( reward=_rew(), value=_val(), discount=_disc(gamma_step=0.0), temperature=0.0, gate=None, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
+    loss, metrics = DqnObjective( reward=_rew(), value=_val(), discount=_disc(gamma_step=0.0), temperature=0.0, gate=None)(objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
     assert abs(loss["action_value"].item()) < 1e-05
     assert abs(metrics['q_values_mean']) < 1e-05
 
@@ -417,7 +383,7 @@ def test_dqn_objective_skips_transitions_across_episodes() -> None:
         }
     predictions, delayed = _q(torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]]), torch.zeros(3, 2))
     # Only pair (0,1) is valid (same sample); pair (1,2) crosses group_id.
-    loss, metrics = DqnObjective( reward=_rew(), value=_val(), discount=_disc(gamma_step=0.0), temperature=0.0, gate=None, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
+    loss, metrics = DqnObjective( reward=_rew(), value=_val(), discount=_disc(gamma_step=0.0), temperature=0.0, gate=None)(objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
     assert abs(loss["action_value"].item() - 1.0) < 1e-05
     assert abs(metrics['q_values_mean'] - 2.0) < 1e-05
 
@@ -460,7 +426,7 @@ def test_dqn_objective_rejects_out_of_range_action() -> None:
         }
     predictions, delayed = _q(torch.zeros(2, 3), torch.zeros(2, 3))
     with pytest.raises(ValueError, match="action ids must be in"):
-        DqnObjective( reward=_rew(), value=_val(), discount=_disc(), temperature=0.0, gate=None, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
+        DqnObjective( reward=_rew(), value=_val(), discount=_disc(), temperature=0.0, gate=None)(objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
 
 
 def test_weighted_mean_all_zero_is_zero() -> None:
@@ -478,180 +444,18 @@ def test_dqn_same_run_episode_reset_trains_both_pairs() -> None:
             'episode_index': torch.tensor([0, 0, 0]),
         }
     predictions, delayed = _q(torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]]), torch.zeros(3, 2))
-    loss, _ = DqnObjective( reward=_rew(), value=_val(), discount=_disc(gamma_step=0.0), temperature=0.0, gate=None, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
+    loss, _ = DqnObjective( reward=_rew(), value=_val(), discount=_disc(gamma_step=0.0), temperature=0.0, gate=None)(objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
     assert abs(loss["action_value"].item() - 2.5) < 1e-05
 
 
-def test_dqn_objective_multiplies_step_terminated_and_truncated_gammas() -> None:
-    """``gamma_step`` always multiplies the terminated extra and the truncated extra."""
-    step_stream = {
-            'action': torch.tensor([0, 1]),
-            'reward': torch.tensor([0.0, 1.0]),
-            'terminated': torch.tensor([0, 1]),
-            'truncated': torch.tensor([0, 1]),
-        }
-    predictions, delayed = _q(
-        torch.tensor([[0.0, 2.0], [4.0, 0.0]]),
-        torch.tensor([[0.0, 0.0], [10.0, 0.0]]),
-    )
-    # Q(s0, a=1) = 2; next max Q = 10; r = 1.
-    # Product 0.5 * 1.0 * 0.4 ⇒ target = 1 + 2.0 = 3; loss (2-3)^2 = 1.
-    # Without gamma_step the product would be 0.4 (target 5, loss 9).
-    loss, _ = DqnObjective(        reward=_rew(),
-        value=_val(),
-        discount=_disc(gamma_step=0.5, gamma_terminated=1.0, gamma_truncated=0.4),
-        temperature=0.0, gate=None,
-     cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
-    assert abs(loss["action_value"].item() - 1.0) < 1e-05
-    # gamma_step=0 zeros the bootstrap even when both extras are 1.
-    zero_step, _ = DqnObjective(        reward=_rew(),
-        value=_val(),
-        discount=_disc(gamma_step=0.0, gamma_terminated=1.0, gamma_truncated=1.0),
-        temperature=0.0, gate=None,
-     cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
-    assert abs(zero_step["action_value"].item() - 1.0) < 1e-05
-
-
-def _backup_step() -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
-    """One transition where online and delayed argmax disagree.
-
-    Taken action from s0 is 0 with Q = 2. Delayed Q at s1 is ``[9, 1]``
-    (max 9 at action 0). Online Q at s1 is ``[0, 5]`` (argmax 1).
-    """
-    step_stream = {
-        "action": torch.tensor([0, 0]),
-        "reward": torch.tensor([0.0, 0.0]),
-        "terminated": torch.zeros(2, dtype=torch.int64),
-        "truncated": torch.zeros(2, dtype=torch.int64),
-    }
-    online = torch.tensor([[2.0, 0.0], [0.0, 5.0]])
-    delayed = torch.tensor([[0.0, 0.0], [9.0, 1.0]])
-    return step_stream, online, delayed
-
-
-def test_backup_action_predictions_reads_delayed_q_at_online_argmax() -> None:
-    """Explicit action scores select backup value 1 instead of the maximum 9. Loss is (2 - 1)^2."""
-    step_stream, online, delayed = _backup_step()
-    predictions, delayed_q = _q(online, delayed)
-    vanilla, _ = DqnObjective(        reward=_rew(), value=_val(), discount=_disc(),
-        temperature=0.0, gate=None,
-     cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed_q, backup_action_predictions=delayed_q)
-    separate, _ = DqnObjective(        reward=_rew(), value=_val(), discount=_disc(),
-        temperature=0.0, gate=None,
-     cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed_q, backup_action_predictions=predictions)
-    assert abs(vanilla["action_value"].item() - 49.0) < 1e-05
-    assert abs(separate["action_value"].item() - 1.0) < 1e-05
-
-
-def test_backup_action_predictions_matches_max_when_online_argmax_agrees() -> None:
-    step_stream, online, delayed = _backup_step()
-    online = online.clone()
-    online[1] = torch.tensor([5.0, 0.0])
-    predictions, delayed_q = _q(online, delayed)
-    vanilla, _ = DqnObjective(        reward=_rew(), value=_val(), discount=_disc(),
-        temperature=0.0, gate=None,
-     cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed_q, backup_action_predictions=delayed_q)
-    separate, _ = DqnObjective(        reward=_rew(), value=_val(), discount=_disc(),
-        temperature=0.0, gate=None,
-     cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed_q, backup_action_predictions=predictions)
-    assert abs(vanilla["action_value"].item() - separate["action_value"].item()) < 1e-05
-    assert abs(separate["action_value"].item() - 49.0) < 1e-05
-
-
-def test_backup_action_predictions_tie_takes_lowest_index() -> None:
-    """Tied online scores take action 0, the same rule as get_action."""
-    step_stream, online, delayed = _backup_step()
-    online = online.clone()
-    online[0] = torch.tensor([0.0, 0.0])
-    online[1] = torch.tensor([3.0, 3.0])
-    delayed = delayed.clone()
-    delayed[1] = torch.tensor([4.0, 8.0])
-    predictions, delayed_q = _q(online, delayed)
-    loss, _ = DqnObjective(        reward=_rew(), value=_val(), discount=_disc(),
-        temperature=0.0, gate=None,
-     cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed_q, backup_action_predictions=predictions)
-    assert abs(loss["action_value"].item() - 16.0) < 1e-05
-
-
-def test_backup_action_predictions_does_not_backprop_through_selector_or_delayed_q() -> None:
-    step_stream, _, _ = _backup_step()
-    online = torch.tensor([[2.0, 0.0], [0.0, 5.0]], requires_grad=True)
-    delayed = torch.tensor([[0.0, 0.0], [9.0, 1.0]], requires_grad=True)
-    predictions, delayed_q = _q(online, delayed)
-    loss, _ = DqnObjective(        reward=_rew(), value=_val(), discount=_disc(),
-        temperature=0.0, gate=None,
-     cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed_q, backup_action_predictions=predictions)
-    loss["action_value"].backward()
-    assert online.grad is not None
-    assert delayed.grad is None
-    assert abs(online.grad[0, 0].item() - 2.0) < 1e-05
-    assert torch.equal(online.grad[1], torch.zeros(2))
-
-
-def test_backup_action_predictions_soft_value_uses_online_policy_on_delayed_q() -> None:
-    """π from online Q; V = E_π[Q_delayed] + α H[π]. Equal Q matches logsumexp."""
-    step_stream = {
-        "action": torch.tensor([0, 0]),
-        "reward": torch.tensor([0.0, 0.0]),
-        "terminated": torch.zeros(2, dtype=torch.int64),
-        "truncated": torch.zeros(2, dtype=torch.int64),
-    }
-    online = torch.tensor([[0.0, 0.0], [0.0, 0.0]])
-    delayed = torch.tensor([[0.0, 0.0], [0.0, 2.0]])
-    predictions, delayed_q = _q(online, delayed)
-    loss, _ = DqnObjective(        reward=_rew(), value=_val(), discount=_disc(),
-        temperature=1.0, gate=None,
-     cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed_q, backup_action_predictions=predictions)
-    value = 1.0 + float(torch.log(torch.tensor(2.0)))
-    assert abs(loss["action_value"].item() - value ** 2) < 1e-05
-
-    same = torch.zeros(2, 2)
-    predictions, delayed_q = _q(same, same.clone())
-    vanilla, _ = DqnObjective(        reward=_rew(), value=_val(), discount=_disc(),
-        temperature=1.0, gate=None,
-     cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed_q, backup_action_predictions=delayed_q)
-    separate, _ = DqnObjective(        reward=_rew(), value=_val(), discount=_disc(),
-        temperature=1.0, gate=None,
-     cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed_q, backup_action_predictions=predictions)
-    assert abs(vanilla["action_value"].item() - separate["action_value"].item()) < 1e-05
-
-
-def test_backup_action_predictions_enters_the_lambda_return() -> None:
-    """λ = 0.5 mixes V(s1) from the online argmax into the return."""
-    step_stream = {
-        "action": torch.tensor([0, 0, 0]),
-        "reward": torch.tensor([0.0, 1.0, 0.0]),
-        "terminated": torch.zeros(3, dtype=torch.int64),
-        "truncated": torch.zeros(3, dtype=torch.int64),
-    }
-    online = torch.tensor([[5.0, 0.0], [0.0, 9.0], [0.0, 3.0]])
-    delayed = torch.tensor([[0.0, 0.0], [4.0, 1.0], [0.0, 8.0]])
-    predictions, delayed_q = _q(online, delayed)
-    loss, _ = DqnObjective(        reward=_rew(), value=_val(), discount=_disc(), gate=_gate(td_lambda=0.5), temperature=0.0, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed_q, backup_action_predictions=predictions)
-    assert abs(loss["action_value"].item() - (0.25 + 64.0) / 2) < 1e-04
-
-
-def test_backup_action_predictions_bootstrap_reads_the_last_head_output_row() -> None:
-    step_stream, online, delayed = _backup_step()
-    step_stream = {**step_stream, "head_output_count": torch.tensor([1, 2])}
-    online = torch.tensor([[1.0, 0.0], [5.0, 0.0], [0.0, 5.0]])
-    delayed = torch.tensor([[0.0, 0.0], [9.0, 0.0], [9.0, 1.0]])
-    predictions, delayed_q = _q(online, delayed)
-    loss, _ = DqnObjective(        reward=_rew(), value=_val(), discount=_disc(),
-        temperature=0.0, gate=None,
-     cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed_q, backup_action_predictions=predictions)
-    assert abs(loss["action_value"].item() - 0.0) < 1e-05
-
-
-def test_backup_action_predictions_uses_affine_q() -> None:
-    """The online argmax and the delayed read both see ``value``."""
-    step_stream, online, delayed = _backup_step()
-    predictions, delayed_q = _q(online, delayed)
-    loss, _ = DqnObjective(        reward=_rew(), value=_val(scale=2.0), discount=_disc(),
-        temperature=0.0, gate=None,
-     cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed_q, backup_action_predictions=predictions)
-    # Taken Q 4; delayed at online argmax 2; target 2; loss 4.
-    assert abs(loss["action_value"].item() - 4.0) < 1e-05
+def test_nonzero_ending_discount_requires_an_in_group_continuation() -> None:
+    data, online, delayed = _lambda_fixture()
+    data['truncated'][-1] = True
+    with pytest.raises(ValueError, match='cross-group backup'):
+        DqnObjective(reward=None, value=None, discount=_disc(
+            gamma_step=.5, gamma_terminated=1., gamma_truncated=.4), temperature=0., gate=None)(
+                objective_data=data, group_id=_group_id(data), head_step_ids=fixture_head_steps(data),  predictions=online,
+                backup_value_predictions=delayed, backup_action_predictions=delayed)
 
 
 def test_dqn_objective_does_not_backprop_through_delayed_q() -> None:
@@ -663,10 +467,11 @@ def test_dqn_objective_does_not_backprop_through_delayed_q() -> None:
             "terminated": torch.zeros(n, dtype=torch.long),
             "truncated": torch.zeros(n, dtype=torch.long),
         }
+    step_stream["terminated"][-1] = True
     online = torch.randn(n, a, requires_grad=True)
     delayed = torch.randn(n, a, requires_grad=True)
     predictions, delayed_td = _q(online, delayed)
-    loss, _ = DqnObjective( reward=_rew(), value=_val(), discount=_disc(), temperature=0.0, gate=None, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed_td, backup_action_predictions=delayed_td)
+    loss, _ = DqnObjective( reward=_rew(), value=_val(), discount=_disc(), temperature=0.0, gate=None)(objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed_td, backup_action_predictions=delayed_td)
     loss["action_value"].backward()
     assert online.grad is not None
     assert delayed.grad is None
@@ -682,7 +487,7 @@ def _lambda_fixture() -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tens
     step_stream = {
             "action": torch.tensor([0, 0, 1]),
             "reward": torch.tensor([0.0, 1.0, 10.0]),
-            "terminated": torch.zeros(3, dtype=torch.int64),
+            "terminated": torch.tensor([0, 0, 1]),
             "truncated": torch.zeros(3, dtype=torch.int64),
             "group_id": torch.zeros(3, dtype=torch.int64),
             "q_star": torch.tensor(
@@ -695,15 +500,15 @@ def _lambda_fixture() -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tens
     return step_stream, *_q(online, delayed)
 
 
-# One-step MSEs: (5-4)^2 = 1 and (0-110)^2 = 12100 → mean 6050.5.
-_ONE_STEP = 6050.5
+# One-step MSEs: (5-4)^2 = 1 and (0-110)^2 = 12100 → mean 50.5.
+_ONE_STEP = 50.5
 # λ=1 target at s0 is 1 + 10 + 100 = 111 → (5-111)^2 = 11236; s1 stays 12100 → mean 11668.
-_FULL_RETURN = 11668.0
+_FULL_RETURN = 68.0
 
 
 def test_td_lambda_zero_is_the_one_step_target() -> None:
     step_stream, predictions, delayed = _lambda_fixture()
-    loss, metrics = DqnObjective( reward=_rew(), value=_val(), discount=_disc(), temperature=0.0, gate=None, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
+    loss, metrics = DqnObjective( reward=_rew(), value=_val(), discount=_disc(), temperature=0.0, gate=None)(objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
     assert abs(loss["action_value"].item() - _ONE_STEP) < 1e-03
     assert "watkins_greedy_frac" not in metrics
 
@@ -712,24 +517,24 @@ def test_dqn_objective_q_affine_applies_to_online_and_delayed() -> None:
     """Same affine on online Q and delayed bootstrap (γ=1 one-step)."""
     step_stream, predictions, delayed = _lambda_fixture()
     # Taken Q 10 and 0; delayed max 6 and 200; targets 7 and 210.
-    loss, _ = DqnObjective( reward=_rew(), value=_val(scale=2.0), discount=_disc(), temperature=0.0, gate=None, cross_group_backups="bootstrap")(
-        objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed
+    loss, _ = DqnObjective( reward=_rew(), value=_val(scale=2.0), discount=_disc(), temperature=0.0, gate=None)(
+        objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed
     )
-    expected = (9.0 + 44100.0) / 2
+    expected = (9.0 + 100.0) / 2
     assert abs(loss["action_value"].item() - expected) < 1e-03
 
 
 def test_td_lambda_one_is_the_full_n_step_return() -> None:
     step_stream, predictions, delayed = _lambda_fixture()
-    loss, _ = DqnObjective( reward=_rew(), value=_val(), discount=_disc(), gate=_gate(td_lambda=1.0), temperature=0.0, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
+    loss, _ = DqnObjective( reward=_rew(), value=_val(), discount=_disc(), gate=_gate(td_lambda=1.0), temperature=0.0)(objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
     assert abs(loss["action_value"].item() - _FULL_RETURN) < 1e-03
 
 
 def test_td_lambda_half_mixes_bootstrap_and_return() -> None:
     step_stream, predictions, delayed = _lambda_fixture()
-    # G_0 = 1 + (0.5 * 3 + 0.5 * 110) = 57.5 → (5 - 57.5)^2 = 2756.25; s1 stays 12100.
-    expected = (2756.25 + 12100.0) / 2
-    loss, _ = DqnObjective( reward=_rew(), value=_val(), discount=_disc(), gate=_gate(td_lambda=0.5), temperature=0.0, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
+    # G_0 = 1 + (0.5 * 3 + 0.5 * 110) = 57.5 → (5 - 57.5)^2 = 6.25; s1 stays 12100.
+    expected = (6.25 + 100.0) / 2
+    loss, _ = DqnObjective( reward=_rew(), value=_val(), discount=_disc(), gate=_gate(td_lambda=0.5), temperature=0.0)(objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
     assert abs(loss["action_value"].item() - expected) < 1e-03
 
 
@@ -737,10 +542,10 @@ def test_td_lambda_terminal_gamma_zero_ends_the_trace() -> None:
     """s0 → s1 terminates the episode (code stored at s1): G_0 = r only."""
     step_stream, predictions, delayed = _lambda_fixture()
     step_stream = {key: value.clone() for key, value in step_stream.items()}
-    step_stream["terminated"] = torch.tensor([0, 1, 0])
-    loss, _ = DqnObjective( reward=_rew(), value=_val(), discount=_disc(), gate=_gate(td_lambda=1.0), temperature=0.0, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
+    step_stream["terminated"] = torch.tensor([0, 1, 1])
+    loss, _ = DqnObjective( reward=_rew(), value=_val(), discount=_disc(), gate=_gate(td_lambda=1.0), temperature=0.0)(objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
     # s0: (5 - 1)^2 = 16 — neither V(s1) nor the next episode's return; s1: 12100.
-    assert abs(loss["action_value"].item() - (16.0 + 12100.0) / 2) < 1e-03
+    assert abs(loss["action_value"].item() - (16.0 + 100.0) / 2) < 1e-03
 
 
 def test_td_lambda_truncation_gamma_carries_the_trace_discounted() -> None:
@@ -748,19 +553,19 @@ def test_td_lambda_truncation_gamma_carries_the_trace_discounted() -> None:
     step_stream, predictions, delayed = _lambda_fixture()
     step_stream = {key: value.clone() for key, value in step_stream.items()}
     step_stream["truncated"] = torch.tensor([0, 1, 0])
-    loss, _ = DqnObjective( reward=_rew(), value=_val(), discount=_disc(gamma_truncated=0.5), gate=_gate(td_lambda=1.0), temperature=0.0, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
+    loss, _ = DqnObjective( reward=_rew(), value=_val(), discount=_disc(gamma_truncated=0.5), gate=_gate(td_lambda=1.0), temperature=0.0)(objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
     # s0: 1 + 0.5 * G_1 = 1 + 0.5 * 110 = 56 → (5 - 56)^2 = 2601; s1: 12100.
-    assert abs(loss["action_value"].item() - (2601.0 + 12100.0) / 2) < 1e-03
+    assert abs(loss["action_value"].item() - (1.0 + 100.0) / 2) < 1e-03
 
 
 def test_td_lambda_episode_gamma_scales_the_trace() -> None:
     step_stream, predictions, delayed = _lambda_fixture()
     step_stream = {key: value.clone() for key, value in step_stream.items()}
     step_stream["truncated"] = torch.tensor([0, 1, 0])
-    full, _ = DqnObjective( reward=_rew(), value=_val(), discount=_disc(gamma_truncated=1.0), gate=_gate(td_lambda=1.0), temperature=0.0, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
+    full, _ = DqnObjective( reward=_rew(), value=_val(), discount=_disc(gamma_truncated=1.0), gate=_gate(td_lambda=1.0), temperature=0.0)(objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
     assert abs(full["action_value"].item() - _FULL_RETURN) < 1e-03
-    cut, _ = DqnObjective( reward=_rew(), value=_val(), discount=_disc(gamma_truncated=0.0), gate=_gate(td_lambda=1.0), temperature=0.0, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
-    assert abs(cut["action_value"].item() - (16.0 + 12100.0) / 2) < 1e-03
+    cut, _ = DqnObjective( reward=_rew(), value=_val(), discount=_disc(gamma_truncated=0.0), gate=_gate(td_lambda=1.0), temperature=0.0)(objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
+    assert abs(cut["action_value"].item() - (16.0 + 100.0) / 2) < 1e-03
 
 
 def test_value_gap_zero_beta_cuts_when_taken_action_is_not_online_greedy() -> None:
@@ -769,10 +574,10 @@ def test_value_gap_zero_beta_cuts_when_taken_action_is_not_online_greedy() -> No
     q = predictions.clone()
     q[1] = torch.tensor([10.0, 0.0])
     predictions = q
-    loss, metrics = DqnObjective( reward=_rew(), value=_val(), discount=_disc(), gate=value_gap_gate(beta=0.0, normalize=False, policy_delayed=False, value_delayed=False, bias=0.0), temperature=0.0, cross_group_backups="bootstrap")(
-        objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed
+    loss, metrics = DqnObjective( reward=_rew(), value=_val(), discount=_disc(), gate=value_gap_gate(beta=0.0, normalize=False, policy_delayed=False, value_delayed=False, bias=0.0), temperature=0.0)(
+        objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed
     )
-    one_step, _ = DqnObjective( reward=_rew(), value=_val(), discount=_disc(), temperature=0.0, gate=None, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
+    one_step, _ = DqnObjective( reward=_rew(), value=_val(), discount=_disc(), temperature=0.0, gate=None)(objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
     assert abs(loss["action_value"].item() - one_step["action_value"].item()) < 1e-04
     assert "watkins_greedy_frac" not in metrics
 
@@ -805,7 +610,7 @@ def test_gate_rejects_a_vector() -> None:
         return torch.zeros(q.shape[0], dtype=q.dtype, device=q.device)
 
     with pytest.raises(ValueError, match=r"\[3, 3\]"):
-        DqnObjective(            reward=_rew(), value=_val(), discount=_disc(), gate=gate, temperature=0.0, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
+        DqnObjective(            reward=_rew(), value=_val(), discount=_disc(), gate=gate, temperature=0.0)(objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
     for beta in (-1.0, float("nan"), float("inf")):
         with pytest.raises(ValueError, match="beta"):
             value_gap_gate(bias=0.0, beta=beta, policy_delayed=False, value_delayed=False, normalize=True, eps=1.0)
@@ -882,10 +687,9 @@ def test_general_gate_matches_the_truncated_lambda_return() -> None:
         reward=reward, discount_all=discount, v_step=v, pair_weight=pair_weight,
         continuation=general_gate(gates=(
             lambda_gate(td_lambda=lam), nstep_gate(n=horizon),
-        ))(q=q, action=action),
-     cross_group_backups="bootstrap")
+        ))(q=q, action=action))
     ref = _reference_lambda(
-        r=reward[1:], g=discount[1:], v_next=v[1:], cont=run_mask,
+        r=reward[1:], g=discount[1:], v_next=v[1:] * run_mask, cont=run_mask,
         td_lambda=lam, n=horizon,
     )
     ref = ref * in_run.to(dtype=ref.dtype)
@@ -894,10 +698,9 @@ def test_general_gate_matches_the_truncated_lambda_return() -> None:
         reward=reward, discount_all=discount, v_step=v, pair_weight=pair_weight,
         continuation=general_gate(gates=(
             lambda_gate(td_lambda=lam), value_gap_gate(beta=0.0, normalize=False, policy_delayed=False, value_delayed=False, bias=0.0),
-        ))(q=q, action=action, q_delayed=q),
-     cross_group_backups="bootstrap")
+        ))(q=q, action=action, q_delayed=q))
     hard_gap_ref = _reference_lambda(
-        r=reward[1:], g=discount[1:], v_next=v[1:], cont=greedy_cont,
+        r=reward[1:], g=discount[1:], v_next=v[1:] * run_mask, cont=greedy_cont,
         td_lambda=lam, n=T,
     )
     hard_gap_ref = hard_gap_ref * in_run.to(dtype=hard_gap_ref.dtype)
@@ -1024,10 +827,10 @@ def test_value_gap_gate_delayed_soft_cuts_by_the_delayed_gap() -> None:
     beta = 0.5
     eps = 1.0
     loss, _ = DqnObjective(        reward=_rew(), value=_val(), discount=_disc(),
-        gate=value_gap_gate(bias=0.0, beta=beta, policy_delayed=True, value_delayed=True, normalize=True, eps=eps), temperature=0.0, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
+        gate=value_gap_gate(bias=0.0, beta=beta, policy_delayed=True, value_delayed=True, normalize=True, eps=eps), temperature=0.0)(objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
     c = 2.0 ** ((-3.0 / 4.0) / beta)
-    g0 = 1.0 + (1.0 - c) * 3.0 + c * 110.0
-    expected = ((5.0 - g0) ** 2 + 12100.0) / 2
+    g0 = 1.0 + (1.0 - c) * 3.0 + c * 10.0
+    expected = ((5.0 - g0) ** 2 + 100.0) / 2
     assert abs(loss["action_value"].item() - expected) < 1e-03
 
 
@@ -1037,10 +840,10 @@ def test_value_gap_gate_delayed_uses_q_after_value() -> None:
     beta = 0.5
     eps = 1.0
     loss, _ = DqnObjective(        reward=_rew(), value=_val(scale=2.0), discount=_disc(),
-        gate=value_gap_gate(bias=0.0, beta=beta, policy_delayed=True, value_delayed=True, normalize=True, eps=eps), temperature=0.0, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
+        gate=value_gap_gate(bias=0.0, beta=beta, policy_delayed=True, value_delayed=True, normalize=True, eps=eps), temperature=0.0)(objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
     c = 2.0 ** ((-6.0 / 7.0) / beta)
-    g0 = 1.0 + (1.0 - c) * 6.0 + c * 210.0
-    expected = ((10.0 - g0) ** 2 + (210.0 ** 2)) / 2
+    g0 = 1.0 + (1.0 - c) * 6.0 + c * 10.0
+    expected = ((10.0 - g0) ** 2 + (10.0 ** 2)) / 2
     assert abs(loss["action_value"].item() - expected) < 1e-02
 
 
@@ -1048,18 +851,18 @@ def test_value_gap_gate_delayed_reads_the_last_head_output_row() -> None:
     """Two rows at s1: the gap uses the last delayed row, ``[3, 0]``."""
     step_stream, _, _ = _lambda_fixture()
     step_stream = {key: value.clone() for key, value in step_stream.items()}
-    step_stream["head_output_count"] = torch.tensor([1, 2, 1])
+    step_stream["readout_counts"] = torch.tensor([1, 2, 1])
     online = torch.tensor([[5.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0]])
     delayed_q = torch.tensor([[0.0, 0.0], [0.0, 10.0], [3.0, 0.0], [0.0, 100.0]])
     predictions, delayed = _q(online, delayed_q)
     beta = 0.5
     eps = 1.0
     loss, _ = DqnObjective(        reward=_rew(), value=_val(), discount=_disc(),
-        gate=value_gap_gate(bias=0.0, beta=beta, policy_delayed=True, value_delayed=True, normalize=True, eps=eps), temperature=0.0, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
+        gate=value_gap_gate(bias=0.0, beta=beta, policy_delayed=True, value_delayed=True, normalize=True, eps=eps), temperature=0.0)(objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
     c = 2.0 ** ((-3.0 / 4.0) / beta)
-    g0 = 1.0 + (1.0 - c) * 3.0 + c * 110.0
+    g0 = 1.0 + (1.0 - c) * 3.0 + c * 10.0
     # s0 row trains Q=5. Both s1 rows train Q(s1, a=1)=0 toward 110. s2 has weight 0.
-    expected = ((5.0 - g0) ** 2 + 12100.0 + 12100.0) / 3
+    expected = ((5.0 - g0) ** 2 + 100.0 + 100.0) / 3
     assert abs(loss["action_value"].item() - expected) < 1e-03
 
 
@@ -1079,10 +882,10 @@ def test_value_gap_gate_normalize_false_soft_cuts_by_the_raw_gap() -> None:
     q[1] = torch.tensor([2.0, 0.0])
     predictions = q
     beta = 0.5
-    loss, _ = DqnObjective(        reward=_rew(), value=_val(), discount=_disc(), gate=value_gap_gate(bias=0.0, beta=beta, policy_delayed=False, value_delayed=False, normalize=False), temperature=0.0, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
+    loss, _ = DqnObjective(        reward=_rew(), value=_val(), discount=_disc(), gate=value_gap_gate(bias=0.0, beta=beta, policy_delayed=False, value_delayed=False, normalize=False), temperature=0.0)(objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
     c = 2.0 ** (-2.0 / beta)
-    g0 = 1.0 + (1.0 - c) * 3.0 + c * 110.0
-    expected = ((5.0 - g0) ** 2 + 12100.0) / 2
+    g0 = 1.0 + (1.0 - c) * 3.0 + c * 10.0
+    expected = ((5.0 - g0) ** 2 + 100.0) / 2
     assert abs(loss["action_value"].item() - expected) < 1e-03
 
 
@@ -1107,7 +910,7 @@ def test_value_gap_gate_flat_q_is_a_full_continuation() -> None:
 def test_value_gap_gate_zero_gap_is_the_full_return() -> None:
     """Tied online Q at s1 has gap 0, so the trace continues with c = 1."""
     step_stream, predictions, delayed = _lambda_fixture()
-    loss, _ = DqnObjective(        reward=_rew(), value=_val(), discount=_disc(), gate=value_gap_gate(bias=0.0, beta=1.0, policy_delayed=False, value_delayed=False, normalize=True, eps=1.0), temperature=0.0, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
+    loss, _ = DqnObjective(        reward=_rew(), value=_val(), discount=_disc(), gate=value_gap_gate(bias=0.0, beta=1.0, policy_delayed=False, value_delayed=False, normalize=True, eps=1.0), temperature=0.0)(objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
     assert abs(loss["action_value"].item() - _FULL_RETURN) < 1e-03
 
 
@@ -1119,10 +922,10 @@ def test_value_gap_gate_soft_cuts_by_the_online_optimality_gap() -> None:
     predictions = q
     beta = 0.5
     eps = 1.0
-    loss, _ = DqnObjective(        reward=_rew(), value=_val(), discount=_disc(), gate=value_gap_gate(bias=0.0, beta=beta, policy_delayed=False, value_delayed=False, normalize=True, eps=eps), temperature=0.0, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
+    loss, _ = DqnObjective(        reward=_rew(), value=_val(), discount=_disc(), gate=value_gap_gate(bias=0.0, beta=beta, policy_delayed=False, value_delayed=False, normalize=True, eps=eps), temperature=0.0)(objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
     c = 2.0 ** ((-2.0 / 3.0) / beta)
-    g0 = 1.0 + (1.0 - c) * 3.0 + c * 110.0
-    expected = ((5.0 - g0) ** 2 + 12100.0) / 2
+    g0 = 1.0 + (1.0 - c) * 3.0 + c * 10.0
+    expected = ((5.0 - g0) ** 2 + 100.0) / 2
     assert abs(loss["action_value"].item() - expected) < 1e-03
 
 
@@ -1134,10 +937,10 @@ def test_value_gap_gate_uses_q_after_value() -> None:
     predictions = q
     beta = 0.5
     eps = 1.0
-    loss, _ = DqnObjective(        reward=_rew(), value=_val(scale=2.0), discount=_disc(), gate=value_gap_gate(bias=0.0, beta=beta, policy_delayed=False, value_delayed=False, normalize=True, eps=eps), temperature=0.0, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
+    loss, _ = DqnObjective(        reward=_rew(), value=_val(scale=2.0), discount=_disc(), gate=value_gap_gate(bias=0.0, beta=beta, policy_delayed=False, value_delayed=False, normalize=True, eps=eps), temperature=0.0)(objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
     c = 2.0 ** ((-4.0 / 5.0) / beta)
-    g0 = 1.0 + (1.0 - c) * 6.0 + c * 210.0
-    expected = ((10.0 - g0) ** 2 + (210.0 ** 2)) / 2
+    g0 = 1.0 + (1.0 - c) * 6.0 + c * 10.0
+    expected = ((10.0 - g0) ** 2 + (10.0 ** 2)) / 2
     assert abs(loss["action_value"].item() - expected) < 1e-02
 
 
@@ -1147,7 +950,7 @@ def test_value_gap_gate_ignores_the_gap_of_the_action_being_trained() -> None:
     q = predictions.clone()
     q[0] = torch.tensor([5.0, 100.0])
     predictions = q
-    loss, _ = DqnObjective(        reward=_rew(), value=_val(), discount=_disc(), gate=value_gap_gate(bias=0.0, beta=10.0, policy_delayed=False, value_delayed=False, normalize=True, eps=1.0), temperature=0.0, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
+    loss, _ = DqnObjective(        reward=_rew(), value=_val(), discount=_disc(), gate=value_gap_gate(bias=0.0, beta=10.0, policy_delayed=False, value_delayed=False, normalize=True, eps=1.0), temperature=0.0)(objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
     assert abs(loss["action_value"].item() - _FULL_RETURN) < 1e-03
 
 
@@ -1157,10 +960,9 @@ def test_value_gap_gate_small_beta_matches_a_hard_cut() -> None:
     q = predictions.clone()
     q[1] = torch.tensor([10.0, 0.0])
     predictions = q
-    loss, _ = DqnObjective(        reward=_rew(), value=_val(), discount=_disc(), gate=value_gap_gate(bias=0.0, beta=0.02, policy_delayed=False, value_delayed=False, normalize=True, eps=1e-6), temperature=0.0, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
+    loss, _ = DqnObjective(        reward=_rew(), value=_val(), discount=_disc(), gate=value_gap_gate(bias=0.0, beta=0.02, policy_delayed=False, value_delayed=False, normalize=True, eps=1e-6), temperature=0.0)(objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
     one_step, _ = DqnObjective(        reward=_rew(), value=_val(), discount=_disc(),
-        temperature=0.0, gate=None,
-     cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
+        temperature=0.0, gate=None)(objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
     assert abs(loss["action_value"].item() - one_step["action_value"].item()) < 1e-04
 
 
@@ -1168,7 +970,7 @@ def test_gap_does_not_backprop_into_the_online_max() -> None:
     """The gap is a constant: only the trained Q(s, a_taken) gets a gradient."""
     step_stream, _, delayed = _lambda_fixture()
     online = torch.tensor([[5.0, 0.0], [2.0, 0.0], [0.0, 0.0]], requires_grad=True)
-    loss, _ = DqnObjective(        reward=_rew(), value=_val(), discount=_disc(), gate=value_gap_gate(bias=0.0, beta=1.0, policy_delayed=False, value_delayed=False, normalize=True, eps=1.0), temperature=0.0, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=online,  backup_value_predictions=delayed, backup_action_predictions=delayed)
+    loss, _ = DqnObjective(        reward=_rew(), value=_val(), discount=_disc(), gate=value_gap_gate(bias=0.0, beta=1.0, policy_delayed=False, value_delayed=False, normalize=True, eps=1.0), temperature=0.0)(objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=online,  backup_value_predictions=delayed, backup_action_predictions=delayed)
     loss["action_value"].backward()
     assert online.grad is not None
     assert online.grad[1, 0].item() == 0.0
@@ -1180,8 +982,8 @@ def test_value_gap_zero_beta_continues_when_taken_action_matches_online_q() -> N
     q = predictions.clone()
     q[1] = torch.tensor([-1.0, 0.0])  # greedy at s1 is the taken action; Q(s1,a=1) stays 0
     predictions = q
-    loss, metrics = DqnObjective( reward=_rew(), value=_val(), discount=_disc(), gate=value_gap_gate(beta=0.0, normalize=False, policy_delayed=False, value_delayed=False, bias=0.0), temperature=0.0, cross_group_backups="bootstrap")(
-        objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed
+    loss, metrics = DqnObjective( reward=_rew(), value=_val(), discount=_disc(), gate=value_gap_gate(beta=0.0, normalize=False, policy_delayed=False, value_delayed=False, bias=0.0), temperature=0.0)(
+        objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed
     )
     assert abs(loss["action_value"].item() - _FULL_RETURN) < 1e-03
     assert "watkins_greedy_frac" not in metrics
@@ -1191,8 +993,9 @@ def test_lambda_returns_do_not_cross_sequence_boundary() -> None:
     step_stream, predictions, delayed = _lambda_fixture()
     step_stream = {key: value.clone() for key, value in step_stream.items()}
     step_stream["group_id"] = torch.tensor([0, 0, 1])
-    loss, _ = DqnObjective( reward=_rew(), value=_val(), discount=_disc(), gate=_gate(td_lambda=1.0), temperature=0.0, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
-    one_step, _ = DqnObjective( reward=_rew(), value=_val(), discount=_disc(), temperature=0.0, gate=None, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
+    step_stream["terminated"][1] = True
+    loss, _ = DqnObjective( reward=_rew(), value=_val(), discount=_disc(), gate=_gate(td_lambda=1.0), temperature=0.0)(objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
+    one_step, _ = DqnObjective( reward=_rew(), value=_val(), discount=_disc(), temperature=0.0, gate=None)(objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
     assert abs(loss["action_value"].item() - one_step["action_value"].item()) < 1e-04
 
 
@@ -1200,13 +1003,13 @@ def test_td_lambda_with_multiple_head_output_rows_per_step() -> None:
     """Every row of a step trains toward that step's λ-return; bootstrap reads the last row."""
     step_stream, predictions, delayed = _lambda_fixture()
     step_stream = {key: value.clone() for key, value in step_stream.items()}
-    step_stream["head_output_count"] = torch.tensor([2, 1, 2])
+    step_stream["readout_counts"] = torch.tensor([2, 1, 2])
     online = torch.tensor([[5.0, 0.0], [7.0, 0.0], [0.0, 0.0], [0.0, -9.0], [0.0, 0.0]])
     delayed_q = torch.tensor([[0.0, 0.0], [0.0, 0.0], [3.0, 0.0], [-9.0, -9.0], [0.0, 100.0]])
     predictions, delayed = _q(online, delayed_q)
-    loss, _ = DqnObjective( reward=_rew(), value=_val(), discount=_disc(), gate=_gate(td_lambda=1.0), temperature=0.0, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
+    loss, _ = DqnObjective( reward=_rew(), value=_val(), discount=_disc(), gate=_gate(td_lambda=1.0), temperature=0.0)(objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
     # s0 rows: (5-111)^2 = 11236, (7-111)^2 = 10816; s1 row: (0-110)^2 = 12100; s2 rows weight 0.
-    assert abs(loss["action_value"].item() - (11236.0 + 10816.0 + 12100.0) / 3) < 1e-02
+    assert abs(loss["action_value"].item() - (36.0 + 16.0 + 100.0) / 3) < 1e-02
 
 
 def test_affine_scan_matches_sequential_recursion() -> None:
@@ -1284,13 +1087,12 @@ def test_nstep_and_lambda_match_per_start_recursion() -> None:
     greedy_cont = run_mask * torch.cat([greedy[1:], greedy.new_zeros(1)])
     r = reward[1:]
     g = discount[1:]
-    v_next = v[1:]
+    v_next = v[1:] * run_mask
 
     def returns(continuation: torch.Tensor) -> torch.Tensor:
         values, _ = _continuation_targets(
             reward=reward, discount_all=discount, v_step=v, pair_weight=pair_weight,
-            continuation=continuation,
-         cross_group_backups="bootstrap")
+            continuation=continuation)
         return values
 
     for n in (2, 6, 15):
@@ -1318,12 +1120,10 @@ def test_nstep_and_lambda_match_per_start_recursion() -> None:
     open_action = torch.zeros(N, dtype=torch.long)
     short, _ = _continuation_targets(
         reward=reward, discount_all=discount, v_step=v, pair_weight=ones,
-        continuation=nstep_gate(n=3)(q=open_q, action=open_action),
-     cross_group_backups="bootstrap")
+        continuation=nstep_gate(n=3)(q=open_q, action=open_action))
     opened, _ = _continuation_targets(
         reward=reward, discount_all=discount, v_step=v, pair_weight=ones,
-        continuation=lambda_gate(td_lambda=1.0)(q=open_q, action=open_action),
-     cross_group_backups="bootstrap")
+        continuation=lambda_gate(td_lambda=1.0)(q=open_q, action=open_action))
     assert not torch.allclose(short, opened)
 
 
@@ -1331,13 +1131,13 @@ def test_dqn_objective_rejects_non_fp32_q() -> None:
     step_stream, predictions, delayed = _lambda_fixture()
     predictions = predictions.to(torch.bfloat16)
     with pytest.raises(TypeError, match="float32"):
-        DqnObjective( reward=_rew(), value=_val(), discount=_disc(), temperature=0.0, gate=None, cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
+        DqnObjective( reward=_rew(), value=_val(), discount=_disc(), temperature=0.0, gate=None)(objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
 
 
 class _EntropyKw(TypedDict):
     discount: Discount
     temperature: float
-    cross_group_backups: CrossGroupBackups
+
     gate: None
 
 
@@ -1345,16 +1145,16 @@ def _entropy_kw(*, temperature: float = 0.0) -> _EntropyKw:
     return {
         "discount": _disc(),
         "temperature": temperature,
-        "cross_group_backups": "bootstrap",
+
         "gate": None,
     }
 
 
 def test_temperature_zero_matches_hard_max() -> None:
     step_stream, predictions, delayed = _lambda_fixture()
-    hard, hard_m = DqnObjective(reward=_rew(), value=_val(), **_entropy_kw())(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
+    hard, hard_m = DqnObjective(reward=_rew(), value=_val(), **_entropy_kw())(objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
     soft0, soft0_m = DqnObjective(reward=_rew(), value=_val(), **_entropy_kw())(
-        objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed
+        objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed
     )
     assert abs(hard["action_value"].item() - soft0["action_value"].item()) < 1e-06
     assert "entropy" not in hard_m
@@ -1362,24 +1162,16 @@ def test_temperature_zero_matches_hard_max() -> None:
 
 
 def test_temperature_soft_value_is_logsumexp() -> None:
-    """Two equal delayed Qs: V = α log 2 instead of max = 0."""
-    step_stream = {
-            "action": torch.tensor([0, 0]),
-            "reward": torch.tensor([0.0, 0.0]),
-            "terminated": torch.zeros(2, dtype=torch.int64),
-            "truncated": torch.zeros(2, dtype=torch.int64),
-        }
-    online = torch.tensor([[0.0, 0.0], [0.0, 0.0]])
-    delayed = torch.tensor([[0.0, 0.0], [0.0, 0.0]])
-    predictions, delayed_td = _q(online, delayed)
-    alpha = 1.0
-    loss, metrics = DqnObjective(reward=_rew(), value=_val(), **_entropy_kw(temperature=alpha))(
-        objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed_td, backup_action_predictions=delayed_td
-    )
-    # Q(s0, a=0) = 0; target = 0 + 1 * log(2); one in-run pair.
-    expected = float(torch.log(torch.tensor(2.0)) ** 2)
-    assert abs(loss["action_value"].item() - expected) < 1e-05
-    assert abs(metrics["entropy"] - float(torch.log(torch.tensor(2.0)))) < 1e-05
+    data = dict(action=torch.zeros(3, dtype=torch.long), reward=torch.zeros(3),
+                terminated=torch.tensor([0, 0, 1]), truncated=torch.zeros(3, dtype=torch.long))
+    q = torch.zeros(3, 2)
+    loss, metrics = DqnObjective(reward=None, value=None, **_entropy_kw(temperature=1.))(
+        objective_data=data, group_id=_group_id(data), head_step_ids=fixture_head_steps(data),  predictions=q,
+        backup_value_predictions=q, backup_action_predictions=q)
+    expected = torch.log(torch.tensor(2.))
+    torch.testing.assert_close(metrics['backup'], torch.tensor([expected, 0., 0.]))
+    assert loss['action_value'].item() == pytest.approx(expected.square().item() / 2)
+    assert metrics['entropy'].item() == pytest.approx(expected.item())
 
 
 def test_temperature_matches_expected_q_plus_entropy() -> None:
@@ -1410,40 +1202,30 @@ def test_temperature_does_not_change_gamma_zero_target() -> None:
         torch.tensor([[0.0, 2.0], [3.0, 0.0], [0.0, 0.0]]), torch.zeros(3, 2)
     )
     hard, _ = DqnObjective( reward=_rew(), value=_val(), discount=_disc(gamma_step=0.0),
-        temperature=0.0, gate=None,
-     cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
+        temperature=0.0, gate=None)(objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
     soft, metrics = DqnObjective( reward=_rew(), value=_val(), discount=_disc(gamma_step=0.0),
-        temperature=2.0, gate=None,
-     cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
+        temperature=2.0, gate=None)(objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
     assert abs(hard["action_value"].item() - soft["action_value"].item()) < 1e-05
     assert "entropy" in metrics
 
 
 def test_dqn_requires_discount_argument() -> None:
     with pytest.raises(TypeError, match="discount"):
-        DqnObjective( reward=_rew(), value=_val(), temperature=0.0, gate=None, cross_group_backups="bootstrap")  # type: ignore[call-arg]
+        DqnObjective( reward=_rew(), value=_val(), temperature=0.0, gate=None)  # type: ignore[call-arg]
 
 
 def test_dqn_custom_discount_function() -> None:
-    """A caller-supplied discount is used instead of the done-code lookup."""
-    step_stream = {
-            "action": torch.tensor([0, 1]),
-            "reward": torch.tensor([0.0, 1.0]),
-            "terminated": torch.tensor([0, 0]),
-            "truncated": torch.tensor([0, 0]),
-        }
-    predictions, delayed = _q(
-        torch.tensor([[0.0, 2.0], [0.0, 0.0]]),
-        torch.tensor([[0.0, 0.0], [10.0, 0.0]]),
-    )
-
-    def half(*, terminated: torch.Tensor, **_: torch.Tensor) -> torch.Tensor:
-        return torch.full(terminated.shape, 0.5, dtype=torch.float32)
-
-    # Q(s0, a=1)=2; r=1; V=10; γ=0.5 → target 6; loss (2-6)^2 = 16.
-    loss, _ = DqnObjective(        reward=_rew(), value=_val(), discount=half, temperature=0.0, gate=None
-    , cross_group_backups="bootstrap")(objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed)
-    assert abs(loss["action_value"].item() - 16.0) < 1e-05
+    data = dict(action=torch.tensor([0, 1, 0]), reward=torch.tensor([0., 1., 0.]),
+                terminated=torch.tensor([0, 0, 1]), truncated=torch.zeros(3, dtype=torch.long))
+    online = torch.tensor([[0., 2.], [0., 0.], [0., 0.]])
+    delayed = torch.tensor([[0., 0.], [10., 0.], [999., 999.]])
+    def half(*, terminated, **_):
+        return .5 * (1 - terminated.float())
+    loss, metrics = DqnObjective(reward=None, value=None, discount=half, temperature=0., gate=None)(
+        objective_data=data, group_id=_group_id(data), head_step_ids=fixture_head_steps(data),  predictions=online,
+        backup_value_predictions=delayed, backup_action_predictions=delayed)
+    torch.testing.assert_close(metrics['backup'], torch.tensor([6., 0., 0.]))
+    assert loss['action_value'].item() == pytest.approx(((2 - 6) ** 2 + 0) / 2)
 
 
 def test_dqn_discount_must_return_per_step_tensor() -> None:
@@ -1459,8 +1241,8 @@ def test_dqn_discount_must_return_per_step_tensor() -> None:
         return torch.tensor([0.5])
 
     with pytest.raises(ValueError, match="discount must return shape"):
-        DqnObjective( reward=_rew(), value=_val(), discount=bad, temperature=0.0, gate=None, cross_group_backups="bootstrap")(
-            objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed
+        DqnObjective( reward=_rew(), value=_val(), discount=bad, temperature=0.0, gate=None)(
+            objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed
         )
 
 
@@ -1477,8 +1259,8 @@ def test_dqn_reward_must_return_per_step_tensor() -> None:
         return torch.tensor([0.5])
 
     with pytest.raises(ValueError, match="reward must return shape"):
-        DqnObjective( reward=bad, value=_val(), discount=_disc(), temperature=0.0, gate=None, cross_group_backups="bootstrap")(
-            objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed
+        DqnObjective( reward=bad, value=_val(), discount=_disc(), temperature=0.0, gate=None)(
+            objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed
         )
 
 
@@ -1495,314 +1277,8 @@ def test_dqn_value_must_return_same_shape() -> None:
         return value[:, 0]
 
     with pytest.raises(ValueError, match="value must return shape"):
-        DqnObjective( reward=_rew(), value=bad, discount=_disc(), temperature=0.0, gate=None, cross_group_backups="bootstrap")(
-            objective_data=step_stream, group_id=_group_id(step_stream), predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed
-        )
-
-
-def _cutoff_loss(
-    *,
-    cross_group_backups: CrossGroupBackups,
-    terminated: torch.Tensor,
-    truncated: torch.Tensor | None = None,
-    discount: object | None = None,
-    gate: object | None = None,
-) -> float:
-    """One transition, Q(s, a) = 0, reward 1, delayed max-Q at the next state 5."""
-    step_stream = {
-        "action": torch.tensor([0, 0]),
-        "reward": torch.tensor([0.0, 1.0]),
-        "terminated": terminated,
-        "truncated": torch.zeros(2, dtype=torch.int64) if truncated is None else truncated,
-    }
-    online = torch.zeros(2, 2)
-    delayed = torch.tensor([[0.0, 0.0], [5.0, 0.0]])
-    loss, _ = DqnObjective(
-        reward=_rew(),
-        value=_val(),
-        discount=_disc() if discount is None else discount,  # type: ignore[arg-type]
-        temperature=0.0,
-        cross_group_backups=cross_group_backups,
-        gate=gate,  # type: ignore[arg-type]
-    )(objective_data=step_stream, group_id=_group_id(step_stream), predictions=online, backup_value_predictions=delayed, backup_action_predictions=delayed)
-    return float(loss["action_value"].item())
-
-
-def test_cross_group_value_is_bootstrapped_unless_ignored() -> None:
-    """A non-zero cutoff factor bootstraps unless the backup is ignored."""
-    running = torch.tensor([0, 0])
-    # r + V(s') = 6 → 36. The only step's factor on that V is non-zero, so ignoring the backup drops it.
-    assert abs(_cutoff_loss(cross_group_backups="bootstrap", terminated=running) - 36.0) < 1e-05
-    assert abs(_cutoff_loss(cross_group_backups="ignore", terminated=running) - 0.0) < 1e-05
-    truncated_flags = torch.tensor([0, 1])
-    trunc_discount = _disc(gamma_truncated=1.0)
-    assert abs(_cutoff_loss(
-        cross_group_backups="bootstrap", terminated=running, truncated=truncated_flags, discount=trunc_discount,
-    ) - 36.0) < 1e-05
-    assert abs(_cutoff_loss(
-        cross_group_backups="ignore", terminated=running, truncated=truncated_flags, discount=trunc_discount,
-    ) - 0.0) < 1e-05
-
-
-def test_ignored_cross_group_backup_keeps_an_in_run_horizon() -> None:
-    """n-step still bootstraps at a state whose later step is in the run."""
-    reward = torch.tensor([0.0, 1.0, 10.0, 100.0])
-    discount = torch.ones(4)
-    v = torch.tensor([0.0, 3.0, 7.0, 11.0])
-    pair_weight = torch.ones(3)
-    q, action = torch.zeros(4, 1), torch.zeros(4, dtype=torch.long)
-    common = dict(
-        reward=reward, discount_all=discount, v_step=v, pair_weight=pair_weight,
-        continuation=nstep_gate(n=2)(q=q, action=action),
-    )
-    on, on_keep = _continuation_targets(cross_group_backups="bootstrap", **common)
-    off, off_keep = _continuation_targets(cross_group_backups="ignore", **common)
-    # Horizon lands on s2, which still has s3 in the run: V(s2)=7 stays.
-    # The backups that reach s3 have a non-zero cutoff factor and drop.
-    assert torch.allclose(on, torch.tensor([18.0, 121.0, 111.0]))
-    assert torch.equal(on_keep, torch.ones(3))
-    assert torch.equal(off_keep, torch.tensor([1.0, 0.0, 0.0]))
-    assert abs(float(off[0]) - 18.0) < 1e-05
-
-
-def test_in_run_horizon_backup_stays_in_loss_and_logs() -> None:
-    """The n-step backup that lands inside the run stays; the ones that reach the cutoff drop."""
-    step_stream = {
-        "action": torch.zeros(4, dtype=torch.long),
-        "reward": torch.tensor([0.0, 1.0, 10.0, 100.0]),
-        "terminated": torch.zeros(4, dtype=torch.long),
-        "truncated": torch.zeros(4, dtype=torch.long),
-    }
-    online = torch.tensor([[10.0], [30.0], [50.0], [0.0]])
-    delayed = torch.tensor([[0.0], [3.0], [7.0], [11.0]])
-
-    def run(*, cross_group_backups: CrossGroupBackups) -> tuple[float, dict[str, float | torch.Tensor]]:
-        loss, metrics = DqnObjective(
-            reward=_rew(),
-            value=_val(),
-            discount=_disc(),
-            temperature=0.0,
-            gate=nstep_gate(n=2),
-            cross_group_backups=cross_group_backups)(objective_data=step_stream, group_id=_group_id(step_stream), predictions=online, backup_value_predictions=delayed, backup_action_predictions=delayed)
-        return float(loss["action_value"].item()), metrics
-
-    # s0 lands on V(s2)=7 inside the run: target 18. s1 and s2 reach V(s3).
-    off_loss, off_metrics = run(cross_group_backups="ignore")
-    assert abs(off_loss - (18.0 - 10.0) ** 2) < 1e-04
-    assert abs(off_metrics["q_values_mean"] - 10.0) < 1e-04
-    assert abs(off_metrics["action_value"] - off_loss) < 1e-04
-    on_loss, on_metrics = run(cross_group_backups="bootstrap")
-    on_sq = (18.0 - 10.0) ** 2 + (121.0 - 30.0) ** 2 + (111.0 - 50.0) ** 2
-    assert abs(on_loss - on_sq / 3) < 1e-02
-    assert abs(on_metrics["q_values_mean"] - 30.0) < 1e-04
-
-
-def test_true_terminal_stays_for_either_ignore_flag() -> None:
-    """A terminated or truncated γ of 0 removes the value for either flag."""
-    terminal = torch.tensor([0, 1])
-    episode = _cutoff_loss(cross_group_backups="bootstrap", terminated=terminal)
-    episode_off = _cutoff_loss(cross_group_backups="ignore", terminated=terminal)
-    assert abs(episode - 1.0) < 1e-05
-    assert abs(episode_off - episode) < 1e-05
-    episode = torch.tensor([0, 1])
-    episode_on = _cutoff_loss(cross_group_backups="bootstrap", terminated=torch.zeros(2, dtype=torch.int64), truncated=episode)
-    episode_off = _cutoff_loss(cross_group_backups="ignore", terminated=torch.zeros(2, dtype=torch.int64), truncated=episode)
-    assert abs(episode_on - 1.0) < 1e-05
-    assert abs(episode_off - episode_on) < 1e-05
-
-
-def _long_horizon_loss(
-    *,
-    cross_group_backups: CrossGroupBackups,
-    td_lambda: float,
-    n: int,
-    terminated: torch.Tensor | None = None,
-) -> tuple[float, dict[str, float | torch.Tensor]]:
-    """Four steps. ``n`` runs past the batch. ``td_lambda`` is the trace factor."""
-    done = torch.zeros(4, dtype=torch.long) if terminated is None else terminated
-    step_stream = {
-        "action": torch.zeros(4, dtype=torch.long),
-        "reward": torch.tensor([0.0, 1.0, 10.0, 100.0]),
-        "terminated": done,
-        "truncated": torch.zeros(4, dtype=torch.long),
-    }
-    online = torch.tensor([[10.0], [30.0], [50.0], [0.0]])
-    delayed = torch.tensor([[0.0], [3.0], [7.0], [11.0]])
-    loss, metrics = DqnObjective(
-        reward=_rew(),
-        value=_val(),
-        discount=_disc(),
-        temperature=0.0,
-        gate=general_gate(gates=(nstep_gate(n=n), lambda_gate(td_lambda=td_lambda))),
-        cross_group_backups=cross_group_backups)(objective_data=step_stream, group_id=_group_id(step_stream), predictions=online, backup_value_predictions=delayed, backup_action_predictions=delayed)
-    return float(loss["action_value"].item()), metrics
-
-
-def test_zero_cutoff_factor_keeps_the_step_when_the_horizon_passes_the_sample() -> None:
-    """``n`` runs past the batch, but a 0 trace factor puts no weight on the cutoff value."""
-    # One-step targets: s0 uses V(s1)=3, s1 uses V(s2)=7. Both are inside the run.
-    # s2's one-step value is the cutoff, so that step still drops.
-    kept_sq = (4.0 - 10.0) ** 2 + (17.0 - 30.0) ** 2
-    off_loss, off_metrics = _long_horizon_loss(cross_group_backups="ignore", td_lambda=0.0, n=10)
-    assert abs(off_loss - kept_sq / 2) < 1e-04
-    assert abs(off_metrics["action_value"] - off_loss) < 1e-04
-    assert abs(off_metrics["q_values_mean"] - 20.0) < 1e-04
-    # Keeping the backup still bootstraps the cutoff step and still logs it.
-    on_loss, on_metrics = _long_horizon_loss(cross_group_backups="bootstrap", td_lambda=0.0, n=10)
-    cutoff_sq = (111.0 - 50.0) ** 2
-    assert abs(on_loss - (kept_sq + cutoff_sq) / 3) < 1e-03
-    assert abs(on_metrics["q_values_mean"] - 30.0) < 1e-04
-
-
-def test_nonzero_cutoff_factor_excludes_the_step_when_the_horizon_passes_the_sample() -> None:
-    """The same window with a non-zero factor on the cutoff value drops every step."""
-    # λ = 1 carries V(s3)=11 into every return: 122, 121, 111.
-    boot_sq = (122.0 - 10.0) ** 2 + (121.0 - 30.0) ** 2 + (111.0 - 50.0) ** 2
-    on_loss, on_metrics = _long_horizon_loss(cross_group_backups="bootstrap", td_lambda=1.0, n=10)
-    assert abs(on_loss - boot_sq / 3) < 1e-02
-    assert abs(on_metrics["action_value"] - on_loss) < 1e-03
-    assert abs(on_metrics["q_values_mean"] - 30.0) < 1e-04
-    off_loss, off_metrics = _long_horizon_loss(cross_group_backups="ignore", td_lambda=1.0, n=10)
-    assert abs(off_loss) < 1e-05
-    assert abs(off_metrics["action_value"]) < 1e-05
-    assert abs(off_metrics["q_values_mean"]) < 1e-05
-    # A reward-only target for those same steps would not be zero.
-    reward_only = (111.0 - 10.0) ** 2 + (110.0 - 30.0) ** 2 + (100.0 - 50.0) ** 2
-    assert reward_only / 3 > 1.0
-
-
-def test_true_terminal_stays_when_the_horizon_passes_the_sample() -> None:
-    """γ = 0 at the cutoff zeros the factor, so a long horizon still trains."""
-    done = torch.tensor([0, 0, 0, 1])
-    # Returns stop on the rewards: 111, 110, 100. No cutoff value either way.
-    sq = (111.0 - 10.0) ** 2 + (110.0 - 30.0) ** 2 + (100.0 - 50.0) ** 2
-    on_loss, on_metrics = _long_horizon_loss(
-        cross_group_backups="bootstrap", td_lambda=1.0, n=10, terminated=done,
-    )
-    off_loss, off_metrics = _long_horizon_loss(
-        cross_group_backups="ignore", td_lambda=1.0, n=10, terminated=done,
-    )
-    assert abs(on_loss - sq / 3) < 1e-02
-    assert abs(off_loss - on_loss) < 1e-04
-    assert abs(off_metrics["q_values_mean"] - 30.0) < 1e-04
-    assert abs(on_metrics["q_values_mean"] - off_metrics["q_values_mean"]) < 1e-04
-
-
-def test_concatenated_groups_match_independent_backups() -> None:
-    """Backups of A and of B are unchanged when the batch is the concatenation AB."""
-    torch.manual_seed(0)
-    n_actions = 3
-
-    def group(*, n: int, group_id: int, shift: float) -> dict[str, torch.Tensor]:
-        return {
-            "action": torch.randint(0, n_actions, (n,)),
-            "reward": torch.randn(n) + shift,
-            "terminated": torch.zeros(n, dtype=torch.long),
-            "truncated": torch.zeros(n, dtype=torch.long),
-            "group_id": torch.full((n,), group_id, dtype=torch.int64),
-            "q": torch.randn(n, n_actions) + shift,
-            "q_delayed": torch.randn(n, n_actions) + 3.0 * shift,
-        }
-
-    def cat(left: dict[str, torch.Tensor], right: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        return {key: torch.cat([left[key], right[key]]) for key in left}
-
-    def backups(
-        data: dict[str, torch.Tensor], *, cross_group_backups: CrossGroupBackups, gate: object,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        objective = DqnObjective(
-            reward=_rew(),
-            value=_val(),
-            discount=_disc(gamma_step=1.0),
-            temperature=0.0,
-            gate=gate,  # type: ignore[arg-type]
-            cross_group_backups=cross_group_backups,
-    )
-        _, metrics = objective(
-            objective_data={key: data[key] for key in ("action", "reward", "terminated", "truncated")},
-            group_id=data["group_id"],
-            predictions=data["q"],
-            backup_value_predictions=data["q_delayed"], backup_action_predictions=data["q_delayed"],
-        )
-        backup = metrics["backup"]
-        weight = metrics["backup_weight"]
-        assert isinstance(backup, torch.Tensor)
-        assert isinstance(weight, torch.Tensor)
-        return backup, weight
-
-    left = group(n=5, group_id=0, shift=0.0)
-    right = group(n=4, group_id=1, shift=100.0)
-    both = cat(left, right)
-    gates = (
-        None,
-        lambda_gate(td_lambda=1.0),
-        nstep_gate(n=8),
-        value_gap_gate(beta=0.0, normalize=False, policy_delayed=False, value_delayed=False, bias=0.0),
-        value_gap_gate(
-            beta=1.0, normalize=False, policy_delayed=False, value_delayed=True, bias=0.0,
-        ),
-    )
-    for cross_group_backups in ("bootstrap", "ignore"):
-        for gate in gates:
-            alone_l, weight_l = backups(
-                left, cross_group_backups=cross_group_backups, gate=gate,
-            )
-            alone_r, weight_r = backups(
-                right, cross_group_backups=cross_group_backups, gate=gate,
-            )
-            joined, joined_weight = backups(
-                both, cross_group_backups=cross_group_backups, gate=gate,
-            )
-            assert torch.allclose(joined[:5], alone_l)
-            assert torch.allclose(joined[5:], alone_r)
-            assert torch.allclose(joined_weight[:5], weight_l)
-            assert torch.allclose(joined_weight[5:], weight_r)
-
-
-def test_fault_raises_when_a_backup_crosses_the_group() -> None:
-    """``"fault"`` raises on a non-zero cutoff factor and matches ``"ignore"`` when that factor is zero."""
-    online = torch.zeros(2, 2)
-    delayed = torch.tensor([[0.0, 0.0], [5.0, 0.0]])
-
-    def run(*, terminated: torch.Tensor, cross_group_backups: CrossGroupBackups) -> float:
-        step_stream = {
-            "action": torch.tensor([0, 0]),
-            "reward": torch.tensor([0.0, 1.0]),
-            "terminated": terminated,
-            "truncated": torch.zeros(2, dtype=torch.long),
-        }
-        loss, _ = DqnObjective(
-            reward=_rew(),
-            value=_val(),
-            discount=_disc(),
-            temperature=0.0,
-            gate=None,
-            cross_group_backups=cross_group_backups,  # type: ignore[arg-type]
-    )(
-            objective_data=step_stream,
-            group_id=_group_id(step_stream),
-            predictions=online,
-            backup_value_predictions=delayed, backup_action_predictions=delayed,
-        )
-        return float(loss["action_value"].item())
-
-    running = torch.zeros(2, dtype=torch.long)
-    with pytest.raises(ValueError, match="cross-group backup at step 0"):
-        run(terminated=running, cross_group_backups="fault")
-    terminal = torch.tensor([0, 1])
-    fault_loss = run(terminated=terminal, cross_group_backups="fault")
-    ignore_loss = run(terminated=terminal, cross_group_backups="ignore")
-    assert abs(fault_loss - 1.0) < 1e-05
-    assert abs(fault_loss - ignore_loss) < 1e-05
-    with pytest.raises(ValueError, match="bootstrap"):
-        # Deliberately exercise runtime validation outside the literal type.
-        run(terminated=running, cross_group_backups="drop")  # type: ignore[arg-type]
-
-
-def test_dqn_requires_cross_group_backups_argument() -> None:
-    with pytest.raises(TypeError, match="cross_group_backups"):
-        DqnObjective(  # type: ignore[call-arg]
-            reward=_rew(), value=_val(), discount=_disc(), temperature=0.0, gate=None,
+        DqnObjective( reward=_rew(), value=bad, discount=_disc(), temperature=0.0, gate=None)(
+            objective_data=step_stream, group_id=_group_id(step_stream), head_step_ids=fixture_head_steps(step_stream),  predictions=predictions,  backup_value_predictions=delayed, backup_action_predictions=delayed
         )
 
 

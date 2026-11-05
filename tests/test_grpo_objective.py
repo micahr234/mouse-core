@@ -1,5 +1,7 @@
 """Tests for GRPO objective and group-relative advantages."""
 from __future__ import annotations
+
+from tests._prediction_layout import fixture_head_steps
 import pytest
 import torch
 from mouse_core.objectives import GrpoObjective, group_relative_advantages
@@ -33,7 +35,7 @@ def test_grpo_objective_runs() -> None:
     n, a = (8, 3)
     objective_data = {'action': torch.randint(0, a, (n,)), 'old_log_prob': torch.randn(n), 'advantage': torch.randn(n), 'group_id': torch.tensor([0, 0, 0, 0, 1, 1, 1, 1])}
     predictions = torch.randn(n, a)
-    loss, metrics = GrpoObjective()(objective_data=objective_data, group_id=_group_id(objective_data), predictions=predictions)
+    loss, metrics = GrpoObjective()(objective_data=objective_data, group_id=_group_id(objective_data), head_step_ids=fixture_head_steps(objective_data),  predictions=predictions)
     assert loss["grpo"].ndim == 0
     assert 'grpo' in metrics
     assert 'policy_loss' in metrics
@@ -43,7 +45,7 @@ def test_grpo_objective_requires_advantage() -> None:
     objective_data = {'action': torch.zeros(2, dtype=torch.long), 'old_log_prob': torch.zeros(2)}
     predictions = torch.zeros(2, 2)
     try:
-        GrpoObjective()(objective_data=objective_data, group_id=_group_id(objective_data), predictions=predictions)
+        GrpoObjective()(objective_data=objective_data, group_id=_group_id(objective_data), head_step_ids=fixture_head_steps(objective_data),  predictions=predictions)
     except KeyError as e:
         assert 'advantage' in str(e)
     else:
@@ -53,21 +55,21 @@ def test_grpo_objective_closed_form() -> None:
     """ratio≈1, advantage=3 → policy_loss = -3; ent_coef=0 → loss = -3."""
     objective_data = {'action': torch.tensor([0, 0]), 'old_log_prob': torch.tensor([0.0, 0.0]), 'advantage': torch.tensor([0.0, 3.0])}
     predictions = torch.tensor([[20.0, -20.0], [20.0, -20.0]])
-    loss, metrics = GrpoObjective(ent_coef=0.0)(objective_data=objective_data, group_id=_group_id(objective_data), predictions=predictions)
+    loss, metrics = GrpoObjective(ent_coef=0.0)(objective_data=objective_data, group_id=_group_id(objective_data), head_step_ids=fixture_head_steps(objective_data),  predictions=predictions)
     assert abs(loss["grpo"].item() - -3.0) < 0.001
     assert abs(metrics['policy_loss'] - -3.0) < 0.001
 
 def test_grpo_objective_skips_sequence_boundaries() -> None:
     objective_data = {'action': torch.tensor([0, 0, 0]), 'old_log_prob': torch.zeros(3), 'advantage': torch.tensor([9.0, 9.0, 2.0]), 'group_id': torch.tensor([0, 1, 1])}
     predictions = torch.tensor([[20.0, -20.0], [20.0, -20.0], [20.0, -20.0]])
-    loss, _ = GrpoObjective(ent_coef=0.0)(objective_data=objective_data, group_id=_group_id(objective_data), predictions=predictions)
+    loss, _ = GrpoObjective(ent_coef=0.0)(objective_data=objective_data, group_id=_group_id(objective_data), head_step_ids=fixture_head_steps(objective_data),  predictions=predictions)
     assert abs(loss["grpo"].item() - -2.0) < 0.001
 
 
 def test_grpo_objective_all_out_of_run_pairs_yield_zero_loss() -> None:
     objective_data = {'action': torch.tensor([0, 1, 0]), 'old_log_prob': torch.zeros(3), 'advantage': torch.tensor([9.0, 9.0, 2.0]), 'group_id': torch.tensor([0, 1, 2])}
     predictions = torch.zeros(3, 2)
-    loss, metrics = GrpoObjective(ent_coef=0.0)(objective_data=objective_data, group_id=_group_id(objective_data), predictions=predictions)
+    loss, metrics = GrpoObjective(ent_coef=0.0)(objective_data=objective_data, group_id=_group_id(objective_data), head_step_ids=fixture_head_steps(objective_data),  predictions=predictions)
     assert abs(loss["grpo"].item()) < 1e-05
     assert abs(metrics['advantage_mean']) < 1e-05
 
@@ -76,10 +78,10 @@ def test_grpo_rejects_compensating_missing_and_extra_head_rows() -> None:
     data = {
         "action": torch.zeros(3, dtype=torch.int64),
         "advantage": torch.ones(3),
-        "head_output_count": torch.tensor([0, 2, 1]),
+        "readout_counts": torch.tensor([0, 2, 1]),
     }
     with pytest.raises(ValueError, match="one prediction row per step"):
-        GrpoObjective()(objective_data=data, group_id=torch.zeros(3, dtype=torch.int64),
+        GrpoObjective()(objective_data=data, group_id=torch.zeros(3, dtype=torch.int64), head_step_ids=fixture_head_steps(data),
                         predictions=torch.zeros(3, 2))
 
 
@@ -90,7 +92,7 @@ def test_grpo_behavior_log_probabilities_and_advantages_are_fixed_targets() -> N
     losses, _ = GrpoObjective(ent_coef=0.0)(
         objective_data={'action': torch.zeros(3, dtype=torch.int64),
                         'old_log_prob': old_log_prob, 'advantage': advantage},
-        group_id=torch.zeros(3, dtype=torch.int64), predictions=logits,
+        group_id=torch.zeros(3, dtype=torch.int64), head_step_ids=fixture_head_steps({'action': torch.zeros(3, dtype=torch.int64), 'old_log_prob': old_log_prob, 'advantage': advantage}),  predictions=logits,
     )
     losses['grpo'].backward()
     assert old_log_prob.grad is None
@@ -100,14 +102,13 @@ def test_grpo_behavior_log_probabilities_and_advantages_are_fixed_targets() -> N
 
 def test_ignored_reset_action_has_no_policy_gradient_or_metrics():
     data = {
-        'action': torch.tensor([0, 1, 0, 1]),
-        'action_executed': torch.tensor([False, True, False, True]),
+        'action': torch.where((torch.tensor([False, True, False, True])).bool(), (torch.tensor([0, 1, 0, 1])).to(torch.float64), float("nan")),
         'old_log_prob': torch.tensor([0., -.5, -3., -.8]),
         'advantage': torch.tensor([0., 2., 999., -1.]),
     }
     predictions = torch.tensor([[.2, .4], [1., -2.], [.5, .1], [8., 9.]], requires_grad=True)
     objective = GrpoObjective(ent_coef=.1)
-    loss, metrics = objective(objective_data=data, group_id=torch.zeros(4, dtype=torch.int64), predictions=predictions)
+    loss, metrics = objective(objective_data=data, group_id=torch.zeros(4, dtype=torch.int64), head_step_ids=fixture_head_steps(data),  predictions=predictions)
     loss['grpo'].backward()
     assert predictions.grad is not None
     torch.testing.assert_close(predictions.grad[1], torch.zeros(2))
@@ -116,28 +117,20 @@ def test_ignored_reset_action_has_no_policy_gradient_or_metrics():
     # Removing the unexecuted transition gives the same result, including the
     # denominator and all statistics. The reset observation still predicts the
     # next real action.
-    real_data = {key: value[[0, 1, 2, 3]] for key, value in data.items() if key != 'action_executed'}
+    real_data = {key: value[[0, 1, 2, 3]] for key, value in data.items() }
     expected, expected_metrics = objective(
-        objective_data=real_data, group_id=torch.tensor([0, 0, 1, 1]), predictions=predictions.detach(),
+        objective_data=real_data, group_id=torch.tensor([0, 0, 1, 1]), head_step_ids=fixture_head_steps(real_data),  predictions=predictions.detach(),
     )
     torch.testing.assert_close(loss['grpo'], expected['grpo'])
     assert metrics == pytest.approx(expected_metrics)
-    changed = {**data, 'action': torch.tensor([1, 1, 1, 1]),
+    changed = {**data, 'action': data['action'].clone(),
                'old_log_prob': torch.tensor([999., -.5, -6., -.8]),
                'advantage': torch.tensor([999., 2., -999., -1.])}
     changed_loss, changed_metrics = objective(
-        objective_data=changed, group_id=torch.zeros(4, dtype=torch.int64), predictions=predictions.detach(),
+        objective_data=changed, group_id=torch.zeros(4, dtype=torch.int64), head_step_ids=fixture_head_steps(changed),  predictions=predictions.detach(),
     )
     torch.testing.assert_close(changed_loss['grpo'], loss['grpo'])
     assert changed_metrics == pytest.approx(metrics)
-
-
-@pytest.mark.parametrize('executed', [torch.ones(3), torch.ones(2, dtype=torch.bool)])
-def test_action_executed_requires_aligned_boolean_column(executed):
-    data = {'action': torch.zeros(3, dtype=torch.int64), 'advantage': torch.ones(3),
-            'action_executed': executed}
-    with pytest.raises(ValueError, match='action_executed must be bool'):
-        GrpoObjective()(objective_data=data, group_id=torch.zeros(3, dtype=torch.int64), predictions=torch.zeros(3, 2))
 
 
 @pytest.mark.parametrize('ratio,advantage,expected_loss,clipped', [
@@ -157,7 +150,7 @@ def test_asymmetric_policy_ratio_clipping(ratio, advantage, expected_loss, clipp
     }
     logits = torch.zeros(2, 2, requires_grad=True)
     objective = GrpoObjective(clip_ratio_min=0.9, clip_ratio_max=1.4, ent_coef=0.0)
-    losses, metrics = objective(objective_data=data, group_id=_group_id(data), predictions=logits)
+    losses, metrics = objective(objective_data=data, group_id=_group_id(data), head_step_ids=fixture_head_steps(data),  predictions=logits)
     assert losses['grpo'].item() == pytest.approx(expected_loss)
     assert metrics['clipfrac'] == float(clipped)
     losses['grpo'].backward()
@@ -209,14 +202,13 @@ def test_maxrl_rejects_invalid_rewards(rewards):
 def test_policy_importance_sampling_level_separates_branches_and_skips_resets(level, expected):
     import math
     # Two executed actions in branch zero, then one in branch one; reset log-probs are invalid.
-    data = {'action': torch.zeros(6, dtype=torch.long),
-            'action_executed': torch.tensor([False, True, False, True, False, True]),
+    data = {'action': torch.where((torch.tensor([False, True, False, True, False, True])).bool(), (torch.zeros(6, dtype=torch.long)).to(torch.float64), float("nan")),
             'advantage': torch.ones(6),
             'old_log_prob': torch.tensor([float('nan'), math.log(1.), float('nan'),
                                           math.log(.25), float('nan'), math.log(.125)])}
     logits = torch.zeros(6, 2, requires_grad=True)
     objective = GrpoObjective(ent_coef=0., importance_sampling_level=level)
-    losses, metrics = objective(objective_data=data, group_id=torch.tensor([0,0,0,0,1,1]), predictions=logits)
+    losses, metrics = objective(objective_data=data, group_id=torch.tensor([0,0,0,0,1,1]), head_step_ids=fixture_head_steps(data),  predictions=logits)
     assert losses['grpo'].item() == pytest.approx(expected)
     assert metrics['clipfrac'] == pytest.approx(2./3. if level == 'action' else 1./3.)
     losses['grpo'].backward()
@@ -243,5 +235,5 @@ def test_small_rewards_use_stabilizer(scaling):
 def test_zero_advantage_does_not_count_as_clipped():
     data = {"action": torch.zeros(2, dtype=torch.long), "old_log_prob": torch.zeros(2),
             "advantage": torch.zeros(2)}
-    _, metrics = GrpoObjective()(objective_data=data, group_id=_group_id(data), predictions=torch.zeros(2, 2))
+    _, metrics = GrpoObjective()(objective_data=data, group_id=_group_id(data), head_step_ids=fixture_head_steps(data),  predictions=torch.zeros(2, 2))
     assert metrics["clipfrac"] == 0.

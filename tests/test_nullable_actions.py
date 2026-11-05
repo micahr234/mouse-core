@@ -1,4 +1,6 @@
-"""A nullable stored action becomes a validity mask only at the tensor boundary."""
+"""A nullable stored action becomes a NaN only at the tensor boundary."""
+
+from tests._prediction_layout import fixture_head_steps
 
 from functools import partial
 from tests._event_fixtures import encode_measurement
@@ -30,7 +32,6 @@ from mouse_core.objectives import (
     boundary_discount,
 )
 from tests._token_batch_helpers import IntIdTokenizer
-from mouse_core.data.dataloader import _require_free_threading
 
 
 def tokenizer(*fields):
@@ -42,13 +43,14 @@ def tokenizer(*fields):
 
 
 @pytest.mark.parametrize("actions", [[None, 0, None, 2], [None, None], [0, 2]])
-def test_only_packing_introduces_action_mask(actions):
+def test_only_packing_converts_missing_actions_to_nan(actions):
     rows = [{"action": action, "reward": 0.0} for action in actions]
     steps = [encode_measurement(tokenizer("action", "reward"), row) for row in rows]
-    _, data, _ = pack_token_batch(steps=steps, continuing=None)
-    assert data["action"].dtype == torch.int64
-    assert data["action"].tolist() == [0 if a is None else a for a in actions]
-    assert data["action_executed"].tolist() == [a is not None for a in actions]
+    inputs, data = pack_token_batch(steps=steps, continuing=None)
+    assert data["action"].dtype == torch.float64
+    torch.testing.assert_close(data["action"], torch.tensor([float("nan") if a is None else a for a in actions], dtype=torch.float64), equal_nan=True)
+    assert "action_executed" not in data
+    assert (~torch.isnan(data["action"])).tolist() == [a is not None for a in actions]
     assert [row["action"] for row in rows] == actions
     assert [step.objective_fields["action"] for step in steps] == actions
     assert all("action_executed" not in step.objective_fields for step in steps)
@@ -72,7 +74,7 @@ def test_stored_mask_is_rejected_in_favor_of_nullable_action():
     step = encode_measurement(tokenizer("action", "action_executed"),
         {"action": 0, "action_executed": False}
     )
-    with pytest.raises(ValueError, match="derived during packing"):
+    with pytest.raises(ValueError, match="not supported"):
         pack_token_batch(steps=[step], continuing=None)
 
 
@@ -82,11 +84,10 @@ def test_augmentation_preserves_none_and_permutates_reset_value_targets():
         seed_field="episode_index",
         fields=[
             {
-                "type": "discrete",
+                "type": "discrete_permute",
                 "input_field": "action",
                 "input_vector_field": "q",
                 "vocab_size": 4,
-                "permute": True,
             }
         ],
     )
@@ -153,23 +154,18 @@ def test_resets_persist_without_null_agent_events(tmp_path):
 
 @pytest.mark.parametrize("workers", [0, 2])
 def test_dataloader_derives_masks_without_mutating_replay(workers):
-    if workers:
-        try:
-            _require_free_threading()
-        except RuntimeError as error:
-            pytest.skip(str(error))
     store = reset_stream()
     before = store[:]
     loader = DataLoader(
         stores=store, sample_ranges=environment_episode_ranges, events_budget=10,
-        batch_size=1, transform=EventTransform(encode=partial(encode_measurement, Tokenizer(
+         transform=EventTransform(encode=partial(encode_measurement, Tokenizer(
             tokenizers={"default": IntIdTokenizer()}, input_fields=[{"provider": "sensor", "type": "text", "format": "1", "head_output": True}],
             objective_fields=[{"input_field": "action", "missing_value": None}]))), num_workers=workers, seed=4,
     )
     try:
-        _, data, _ = loader.next_batch()
-        assert data["action"].tolist() == [0, 0, 0, 1]
-        assert data["action_executed"].tolist() == [False, True, False, True]
+        inputs, data = loader.next_batch()
+        torch.testing.assert_close(data["action"], torch.tensor([float("nan"), 0., float("nan"), 1.], dtype=torch.float64), equal_nan=True)
+        assert (~torch.isnan(data["action"])).tolist() == [False, True, False, True]
         assert store[:] == before
     finally:
         loader.close()
@@ -191,9 +187,10 @@ def test_nullable_rows_through_objective_ignore_automatic_decisions(algorithm):
         )
     ]
     tok = tokenizer(*rows[0])
-    _, data, groups = pack_token_batch(
+    inputs, data = pack_token_batch(
         steps=[encode_measurement(tok, row) for row in rows], continuing=None
     )
+    groups = data["step_sequence_ids"]
     predictions = torch.tensor(
         [[1.0, 2.0], [float("nan")] * 2, [3.0, 4.0], [5.0, 6.0], [9.0, 10.0]],
         requires_grad=True,
@@ -202,7 +199,7 @@ def test_nullable_rows_through_objective_ignore_automatic_decisions(algorithm):
         gamma_step=0.9, gamma_terminated=0.0, gamma_truncated=0.0
     )
     kwargs: dict[str, Any] = dict(
-        objective_data=data, group_id=groups, predictions=predictions
+        objective_data=data, group_id=groups, head_step_ids=fixture_head_steps(data),  predictions=predictions
     )
     if algorithm == "dqn":
         obj = DqnObjective(
@@ -211,7 +208,6 @@ def test_nullable_rows_through_objective_ignore_automatic_decisions(algorithm):
             discount=discount,
             temperature=0.0,
             gate=None,
-            cross_group_backups="fault",
         )
         target = predictions.detach().clone()
         target[2] = torch.tensor([4.0, 5.0])
@@ -220,7 +216,7 @@ def test_nullable_rows_through_objective_ignore_automatic_decisions(algorithm):
         obj = GrpoObjective()
     else:
         obj = PpoObjective(
-            discount=discount, reward=None, value=None, cross_group_backups="fault"
+            discount=discount, reward=None, value=None
         )
         kwargs["value_predictions"] = torch.arange(
             5, dtype=torch.float32, requires_grad=True

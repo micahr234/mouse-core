@@ -1,4 +1,6 @@
 """Generic event recording, explicit environment decoding, and live/replay parity."""
+
+from tests._prediction_layout import fixture_head_steps
 from copy import deepcopy
 import json
 import sys
@@ -316,12 +318,12 @@ def test_incremental_tokens_and_saved_spec_match_replay(tmp_path):
     save_tokenizer(tokenizer=tok, path=tmp_path)
     loaded = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizers={"default": IntIdTokenizer()})
     rows = list(environment_decisions(log))[:4]
-    full = tok.pack_rows(rows=[_events(rows)], continuing=None)
-    first = tok.pack_rows(rows=[_events(rows[:1])], continuing=None)
-    rest = loaded.pack_rows(rows=[_events(rows[1:])], continuing=[True])
+    full, full_objective_data = tok.pack_rows(rows=[_events(rows)], continuing=None)
+    first, first_objective_data = tok.pack_rows(rows=[_events(rows[:1])], continuing=None)
+    rest, rest_objective_data = loaded.pack_rows(rows=[_events(rows[1:])], continuing=[True])
     for field in ('token_ids', 'numeric_values', 'numeric_mask'):
-        np.testing.assert_array_equal(getattr(full, field), np.concatenate([getattr(first, field), getattr(rest, field)]))
-    np.testing.assert_array_equal(full.head_step_ids, [0, 1, 2, 3])
+        np.testing.assert_array_equal(full[field], np.concatenate([first[field], rest[field]]))
+    np.testing.assert_array_equal(full_objective_data["head_step_ids"], [0, 1, 2, 3])
     for row in rows:
         tokens = _step(tok, row)
         assert tokens.head_token_mask.sum() == 1
@@ -369,6 +371,7 @@ def test_empty_provider_fields_explicitly_exclude_payloads(tmp_path, excluded, e
     assert tokens.head_token_mask.sum() == 1
 
 
+@pytest.mark.flex_training
 def test_replay_loader_training_and_cached_inference(tmp_path):
     from mouse_core.objectives import DqnObjective, boundary_discount
     torch.manual_seed(4)
@@ -378,18 +381,21 @@ def test_replay_loader_training_and_cached_inference(tmp_path):
     loader = EpochDataLoader(stores=[replay.to_store()], transform=tok.encode,
                              token_budget=1000, sample_ranges=environment_episode_ranges, seed=1)
     model = simple_model(backbone=Backbone(architecture='qwen3', hidden_dim=8, num_layers=1, num_heads=2,
-                                          train_kernel='reference', decode_kernel='flex', dtype=torch.float32),
+                                          train_kernel="flex", decode_kernel='flex', dtype=torch.float32),
                          heads={'q': torch.nn.Linear(8, 2)}, reasoner=None,
                          embedding=Embedding(hidden_dim=8, vocab_size=32, num_frequencies=2, numeric_field_names=tok.numeric_field_names))
-    inputs, data, group = loader.next_batch()
-    assert inputs.head_step_ids.tolist() == list(range(8))
-    assert data['action_executed'].tolist() == [False, True, False, True] * 2
+    inputs, data = loader.next_batch()
+    group = data["step_sequence_ids"]
+    data = {key: value.to(torch.get_default_device()) for key, value in data.items()}
+    group = group.to(torch.get_default_device())
+    assert data["head_step_ids"].tolist() == list(range(8))
+    assert (~torch.isnan(data["action"])).tolist() == [False, True, False, True] * 2
     objective = DqnObjective(discount=boundary_discount(gamma_step=.9, gamma_terminated=0., gamma_truncated=1.),
-                             reward=None, value=None, temperature=0., cross_group_backups='ignore', gate=None)
+                             reward=None, value=None, temperature=0.,  gate=None)
     prediction = model(inputs)['predictions']['q']
     losses, _ = objective(predictions=prediction, backup_action_predictions=prediction.detach(),
                           backup_value_predictions=prediction.detach(), objective_data=data,
-                          group_id=group)
+                          group_id=group, head_step_ids=fixture_head_steps(data))
     optimizer = torch.optim.Adam(model.parameters(), lr=.01)
     before = [p.detach().clone() for p in model.parameters()]
     loss = torch.stack(list(losses.values())).sum()
@@ -400,12 +406,12 @@ def test_replay_loader_training_and_cached_inference(tmp_path):
     model.eval()
     rows = list(environment_decisions(log))[:4]
     with torch.no_grad():
-        full = model(tok.pack_rows(rows=[_events(rows)], continuing=None))['predictions']['q']
+        full = model(tok.pack_rows(rows=[_events(rows)], continuing=None)[0])['predictions']['q']
         cache = None
         values = []
         try:
             for i, row in enumerate(rows):
-                result = model(tok.pack_rows(rows=[_events([row])], continuing=[True] if i else None), cache=cache, use_cache=True)
+                result = model(tok.pack_rows(rows=[_events([row])], continuing=[True] if i else None)[0], cache=cache, use_cache=True)
                 cache = result['cache']
                 values.append(result['predictions']['q'].reshape(-1, 2))
             torch.testing.assert_close(torch.cat(values), full, atol=2e-5, rtol=2e-5)
@@ -446,13 +452,14 @@ def test_loader_counts_source_events_and_tokenizer_maps_readouts():
     store = collect().to_store()
     before = store.to_dataset().to_list()
     assert len(store) == 20
-    with DataLoader(stores=store, events_budget=10, batch_size=1,
+    with DataLoader(stores=store, events_budget=10,
                     sample_ranges=environment_episode_ranges, transform=tokenizer().encode, num_workers=0, seed=3) as loader:
-        inputs, data, groups = loader.next_batch()
-        assert inputs.N == 4
+        inputs, data = loader.next_batch()
+        groups = data["step_sequence_ids"]
+        assert data["step_sequence_ids"].shape[0] == 4
         assert groups.tolist() == [0, 0, 0, 0]
-        assert inputs.head_step_ids.tolist() == list(range(4))
-        assert data['action_executed'].tolist() == [False, True, False, True]
+        assert data["head_step_ids"].tolist() == list(range(4))
+        assert (~torch.isnan(data["action"])).tolist() == [False, True, False, True]
         assert data['reward'].tolist() == [0., .25, .75, 2.]
     assert store.to_dataset().to_list() == before
 
@@ -471,10 +478,10 @@ def test_loader_index_overlay_follows_environment_readouts_without_altering_sour
         objective_fields=[dict(input_field='source_offset'),
                           dict(input_field='episode_index', output_field='source_episode_index')],
     )
-    with DataLoader(stores=store, events_budget=10, batch_size=1,
+    with DataLoader(stores=store, events_budget=10,
                     sample_ranges=lambda dataset: [(10, 20)], index_field='source_offset',
                     transform=decode, num_workers=0, seed=3) as loader:
-        _, data, _ = loader.next_batch()
+        inputs, data = loader.next_batch()
     assert data['source_offset'].tolist() == [11, 14, 16, 19]
     assert 'source_step_index' not in data
     assert data['source_episode_index'].tolist() == [1] * 4
@@ -490,7 +497,7 @@ def test_loader_index_overlay_cannot_overwrite_decoded_fields(name):
     from mouse_core.data import DataLoader
     store = collect().to_store()
     before = store[:]
-    with DataLoader(stores=store, events_budget=10, batch_size=1,
+    with DataLoader(stores=store, events_budget=10,
                     sample_ranges=environment_episode_ranges, index_field=name,
                     transform=EventTransform(encode=lambda row: _step(tokenizer(), row)), num_workers=0, seed=3) as loader:
         with pytest.raises(ValueError, match='overlays cannot replace'):
@@ -594,12 +601,13 @@ def test_episode_header_groups_events_with_logged_steps():
     from mouse_core.data import DataLoader
     store = collect().to_store()
     with DataLoader(stores=store, sample_field='episode_index', events_budget=10,
-                    batch_size=1, transform=tokenizer().encode,
+                     transform=tokenizer().encode,
                     num_workers=0, seed=3) as loader:
-        inputs, labels, groups = loader.next_batch()
-    assert inputs.N == 4
+        inputs, labels = loader.next_batch()
+        groups = labels["step_sequence_ids"]
+    assert labels["step_sequence_ids"].shape[0] == 4
     assert groups.tolist() == [0] * 4
-    assert inputs.head_step_ids.tolist() == list(range(4))
+    assert labels["head_step_ids"].tolist() == list(range(4))
     assert len(set(labels['source_episode_index'].tolist())) == 1
     assert all('step_index' in event and 'step_index' not in json.loads(event['payload'])
                for event in store[:])
@@ -651,10 +659,10 @@ def test_omitting_empty_coordinators_preserves_views_tokens_and_sampling():
         np.testing.assert_array_equal(old.numeric_values, new.numeric_values)
         assert old.objective_fields == new.objective_fields
     with DataLoader(stores=sparse.to_store(), sample_field='episode_index', events_budget=7,
-                    batch_size=1, transform=encode.encode, num_workers=0, seed=3) as loader:
-        inputs, labels, _ = loader.next_batch()
-    assert inputs.N == 4
-    assert labels['action_executed'].tolist() == [False, True, False, True]
+                     transform=encode.encode, num_workers=0, seed=3) as loader:
+        inputs, labels = loader.next_batch()
+    assert labels["step_sequence_ids"].shape[0] == 4
+    assert (~torch.isnan(labels["action"])).tolist() == [False, True, False, True]
 
 
 @pytest.mark.parametrize('invalid', ['wrong_agent_episode', 'coordinator_after_agent', 'missing_start'])

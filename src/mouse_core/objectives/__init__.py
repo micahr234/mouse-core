@@ -1,7 +1,8 @@
+from mouse_core.objectives.reinforce import reinforce_loss
 from mouse_core.objectives.replicate import ReplicateObjective
 from mouse_core.objectives.base import Objective
 from mouse_core.objectives.cosine import CosineObjective
-from mouse_core.objectives.dqn import CrossGroupBackups, DqnObjective
+from mouse_core.objectives.dqn import DqnObjective
 from mouse_core.objectives.transforms import (
     Discount,
     Gate,
@@ -23,13 +24,13 @@ from mouse_core.objectives.supervised import SupervisedObjective, best_action
 
 __all__ = [
     "Objective",
+    "reinforce_loss",
     "ReplicateObjective",
     "CosineObjective",
     "Discount",
     "Gate",
     "Reward",
     "Value",
-    "CrossGroupBackups",
     "DqnObjective",
     "affine_reward",
     "affine_value",

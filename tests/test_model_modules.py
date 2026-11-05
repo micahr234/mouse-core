@@ -17,7 +17,7 @@ from tests._token_batch_helpers import batch_to_token_batch, token_tokenizer
 
 
 def _backbone() -> Backbone:
-    return Backbone(architecture='qwen3', hidden_dim=8, num_layers=1, num_heads=2, train_kernel='reference', decode_kernel='flex', dtype=torch.float32)
+    return Backbone(architecture='qwen3', hidden_dim=8, num_layers=1, num_heads=2, train_kernel="flex", decode_kernel='flex', dtype=torch.float32)
 
 
 def _batch(start=0, stop=3):
@@ -40,6 +40,7 @@ class BranchedModel(Model):
                                     num_layers=2, propagate_gradient=1.)
         self.policy = MLP(in_features=width, out_features=4, hidden_dim=8,
                                          num_layers=1, propagate_gradient=1.)
+        self.to(torch.get_default_device())
 
     def get_action(self, *, out):
         # This implementation chooses continuous actions from its scalar output.
@@ -48,13 +49,12 @@ class BranchedModel(Model):
     def forward(self, batch, *, cache=None, use_cache=False, residual=True) -> dict[str, Any]:
         if cache is not None and not use_cache:
             raise ValueError("cache requires use_cache=True")
-        tensors = batch.to_tensors(next(self.parameters()).device)
+        tensors = batch.to(next(self.parameters()).device)
         token_ids = tensors["token_ids"]
         numeric_values = tensors["numeric_values"]
         numeric_mask = tensors["numeric_mask"]
         sequence_ids = tensors["sequence_ids"]
-        head_token_ids = tensors["head_token_ids"]
-        head_step_ids = tensors["head_step_ids"]
+        head_token_ids = tensors["head_token_mask"].nonzero(as_tuple=True)[0]
         embed = self.embedding(
             token_ids, numeric_values=numeric_values, numeric_mask=numeric_mask,
         )
@@ -62,13 +62,13 @@ class BranchedModel(Model):
         if use_cache:
             embed, lengths, head_token_ids, head_valid_mask = prepare_decode(
                 embeds=embed, tokens=batch, sequence_ids=sequence_ids,
-                head_token_ids=head_token_ids, head_step_ids=head_step_ids,
+                head_token_mask=tensors["head_token_mask"],
             )
             if cache is None:
                 sessions = []
                 try:
                     for backbone in self.backbones:
-                        sessions.append(cast(BaseBackbone, backbone).decode_session(batch_size=batch.B))
+                        sessions.append(cast(BaseBackbone, backbone).decode_session(batch_size=batch["num_sequences"]))
                 except Exception:
                     for session in sessions:
                         session.close()
@@ -97,13 +97,14 @@ class BranchedModel(Model):
 
 @pytest.mark.parametrize("projection", [False, True])
 @pytest.mark.parametrize("stacked", [False, True])
+@pytest.mark.flex_training
 def test_custom_forward_gradients_head_tokens_and_cache(projection, stacked):
     model = BranchedModel(projection, stacked)
     seen = []
     handle = model.projection.register_forward_pre_hook(lambda _, args: seen.append(args[0].shape))
     full = model(_batch())
     handle.remove()
-    assert seen == [torch.Size([3, 8])] and _batch().L > 3
+    assert seen == [torch.Size([3, 8])] and _batch()["token_ids"].shape[0] > 3
     torch.stack([value.square().mean() for value in full["predictions"].values()]).sum().backward()
     for module in (model.embedding, model.backbones, model.skip, model.value, model.policy):
         assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in module.parameters())
@@ -127,11 +128,12 @@ def test_custom_forward_gradients_head_tokens_and_cache(projection, stacked):
             first["cache"].close()
 
 
+@torch.no_grad()
 def test_custom_copy_preserves_forward_and_module_rates():
     model = BranchedModel()
     rates = {"embedding": 0., "backbones": 0., "projection.0": 0., "projection.1": 0.2,
              "skip": 0., "value": 0., "policy": 0.}
-    optimizer = AdamW(params=model.parameter_groups(lr=rates), lr=0., weight_decay=0., betas=(0., 0.), eps=0.)
+    optimizer = AdamW(params=model.parameter_groups(lr=rates),  weight_decay=0., betas=(0., 0.), eps=0.)
     before = {name: p.detach().clone() for name, p in model.named_parameters()}
     for p in model.parameters():
         p.grad = torch.ones_like(p)
@@ -165,6 +167,7 @@ def test_groups_reject_overlap_missing_and_unknown_modules():
 
 
 @pytest.mark.parametrize('projection', [False, True])
+@torch.no_grad()
 def test_explicit_composition_checkpoint_roundtrip(tmp_path: Path, projection):
     model = BranchedModel(projection=projection, stacked=True).eval()
     save_model(model=model, path=tmp_path)
@@ -173,9 +176,10 @@ def test_explicit_composition_checkpoint_roundtrip(tmp_path: Path, projection):
     assert set(loaded.state_dict()) == set(model.state_dict())
 
 
+@pytest.mark.flex_training
 def test_custom_checkpoint_saves_only_online_state(tmp_path: Path):
     model = BranchedModel()
-    optimizer = AdamW(params=model.parameters(), lr=0.01)
+    optimizer = AdamW(params=[{'params': model.parameters(), 'lr': 0.01}])
     delayed = model.copy()
     model(_batch())["predictions"]['baseline'].square().mean().backward()
     optimizer.step()

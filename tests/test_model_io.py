@@ -45,8 +45,8 @@ def test_inline_conditions_reload_in_a_fresh_notebook(tmp_path, monkeypatch):
     assert isinstance(restored, Tokenizer)
     assert restored.input_fields[0].when is inference.on_start
     assert restored.input_fields[0].when is not training.on_start
-    assert restored.pack_rows(rows=[measurement_events(payloads) for payloads in [[{}]]], continuing=None).token_ids.tolist() == [2, 1]
-    assert restored.pack_rows(rows=[measurement_events(payloads) for payloads in [[{}]]], continuing=[True]).token_ids.tolist() == [1]
+    assert restored.pack_rows(rows=[measurement_events(payloads) for payloads in [[{}]]], continuing=None)[0]['token_ids'].tolist() == [2, 1]
+    assert restored.pack_rows(rows=[measurement_events(payloads) for payloads in [[{}]]], continuing=[True])[0]['token_ids'].tolist() == [1]
 
 
 @pytest.mark.parametrize('module', ['__main__', 'missing_notebook_predicate_module'])
@@ -67,7 +67,7 @@ def test_unsavable_predicate_does_not_overwrite_a_saved_tokenizer(tmp_path, modu
         tokenizers={"default": IntIdTokenizer()},
     )
     # The condition is usable live, but its import path cannot survive a fresh process.
-    assert bad.pack_rows(rows=[measurement_events(payloads) for payloads in [[{}]]], continuing=None).token_ids.tolist() == [2, 1]
+    assert bad.pack_rows(rows=[measurement_events(payloads) for payloads in [[{}]]], continuing=None)[0]['token_ids'].tolist() == [2, 1]
     with pytest.raises(TypeError, match='importable'):
         save_tokenizer(tokenizer=bad, path=tmp_path)
     assert (tmp_path / 'tokenizer.json').read_bytes() == before
@@ -122,7 +122,7 @@ def test_composed_model_roundtrip(tmp_path) -> None:
 
 def test_loading_requires_a_model_and_preserves_its_runtime(tmp_path) -> None:
     source = simple_model(
-        backbone=Backbone(architecture='qwen3', train_kernel='reference', decode_kernel='flex', dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2),
+        backbone=Backbone(architecture='qwen3', train_kernel="flex", decode_kernel='flex', dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2),
         heads={'action_value': MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.)},
          reasoner=None,
     )
@@ -144,7 +144,7 @@ def test_loading_requires_a_model_and_preserves_its_runtime(tmp_path) -> None:
 def test_num_frequencies_roundtrip(tmp_path) -> None:
     embedding = Embedding(hidden_dim=8, vocab_size=32, numeric_field_names=("sensor.value",), num_frequencies=3)
     hidden_dim = 8
-    backbone = Backbone(architecture='qwen3', train_kernel='reference', decode_kernel='flex', dtype=torch.float32, hidden_dim=hidden_dim, num_layers=1, num_heads=2)
+    backbone = Backbone(architecture='qwen3', train_kernel="flex", decode_kernel='flex', dtype=torch.float32, hidden_dim=hidden_dim, num_layers=1, num_heads=2)
     assert embedding.features.numeric[0] is not None
     with torch.no_grad():
         embedding.features.numeric[0].proj.weight.fill_(0.25)
@@ -162,7 +162,7 @@ def test_num_frequencies_roundtrip(tmp_path) -> None:
 
 def test_fourier_stays_trainable_when_lora_freezes_the_stack() -> None:
     embedding = Embedding(hidden_dim=8, vocab_size=32, numeric_field_names=("sensor.value",), num_frequencies=2)
-    backbone = Backbone(architecture='qwen3', train_kernel='reference', decode_kernel='flex', dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2, lora=LoRAConfig(rank=2))
+    backbone = Backbone(architecture='qwen3', train_kernel="flex", decode_kernel='flex', dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2, lora=LoRAConfig(rank=2))
     assert embedding.features.numeric[0] is not None
     assert embedding.features.numeric[0].proj.weight.requires_grad
     assert any(not param.requires_grad for param in backbone.model.parameters())
@@ -186,7 +186,7 @@ def test_identity_num_frequencies_roundtrip(tmp_path) -> None:
 
 
 def test_explicit_model_checkpoints_roundtrip_without_backbone_output_norm(tmp_path) -> None:
-    backbone = Backbone(architecture='qwen3', train_kernel='reference', decode_kernel='flex', dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2)
+    backbone = Backbone(architecture='qwen3', train_kernel="flex", decode_kernel='flex', dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2)
     head = MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0)
     model = simple_model(backbone=backbone, heads={'action_value': head}, reasoner=None)
     with torch.no_grad():
@@ -229,9 +229,9 @@ def test_transformer_backbone_requires_kernels_and_dtype() -> None:
     with pytest.raises(ValueError, match="train_kernel"):
         Backbone(architecture="qwen3", train_kernel=cast(Any, "sdpa"), decode_kernel="flex", dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2)
     with pytest.raises(ValueError, match="decode_kernel"):
-        Backbone(architecture="qwen3", train_kernel="reference", decode_kernel=cast(Any, "sdpa"), dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2)
+        Backbone(architecture="qwen3", train_kernel="flex", decode_kernel=cast(Any, "sdpa"), dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2)
     with pytest.raises(TypeError, match="dtype"):
-        Backbone(architecture="qwen3", train_kernel="reference", decode_kernel="flex", dtype=torch.int8, hidden_dim=8, num_layers=1, num_heads=2)
+        Backbone(architecture="qwen3", train_kernel="flex", decode_kernel="flex", dtype=torch.int8, hidden_dim=8, num_layers=1, num_heads=2)
 
 
 def test_identity_embed_tokens_roundtrip(tmp_path) -> None:
@@ -267,7 +267,7 @@ def test_model_card_requires_the_application_implementation(tmp_path) -> None:
 
 def _lora_model(dtype: torch.dtype) -> Model:
     hidden_dim = 8
-    backbone = Backbone(architecture='qwen3', train_kernel='reference', decode_kernel='flex', dtype=dtype, hidden_dim=hidden_dim, num_layers=1, num_heads=2, lora=LoRAConfig(rank=2))
+    backbone = Backbone(architecture='qwen3', train_kernel="flex", decode_kernel='flex', dtype=dtype, hidden_dim=hidden_dim, num_layers=1, num_heads=2, lora=LoRAConfig(rank=2))
     heads = MLP(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, propagate_gradient=1.0)
     return simple_model(backbone=backbone, heads={'action_value': heads}, reasoner=None).eval()
 
@@ -472,9 +472,9 @@ def test_missing_vector_targets_roundtrip_and_do_not_train_unlabelled_rows(tmp_p
     for encoder in (tokenizer, restored):
         steps = [encode_measurement(encoder, row) for row in rows]
         assert steps[1].objective_fields['q_star'].size == 0
-        inputs, labels, _ = pack_token_batch(
+        inputs, labels = pack_token_batch(
             steps=steps, sequence_ids=[0, 0, 0], batch_size=1, continuing=None)
-        assert inputs.N == 3
+        assert labels["step_sequence_ids"].shape[0] == 3
         assert torch.isneginf(labels['q_star'][1]).all()
         predictions = torch.zeros((3, 2), requires_grad=True)
         losses, _ = SupervisedObjective(loss_type='mse', target_temperature=None)(

@@ -151,11 +151,11 @@ def test_text_tokenizer_when_not_equals_omits_value() -> None:
             {"observation": 2, "action": 1, "reward": 1.0, "repeat_episode_done": 1, "episode_done": 0},
         ]
     ]
-    tb, obj, _sid = batch_to_packed(tokenizer, batch)
+    tb, obj = batch_to_packed(tokenizer, batch)
     embeds = embed_batch(backbone, tb)
-    indices = tb.to_tensors(embeds.device)["head_token_ids"]
+    indices = tb.to(embeds.device)["head_token_mask"].nonzero(as_tuple=True)[0]
     assert obj["reward"].dtype == torch.float32
-    assert obj["action"].dtype == torch.int64
+    assert obj["action"].dtype == torch.float64
     assert obj["reward"].tolist() == [0.0, 1.0]
     assert embeds.ndim == 2 and embeds.shape[1] == 8
     # when not_equals shortens step 0 relative to step 1; head-output indices point at
@@ -935,7 +935,7 @@ def test_token_modality_is_single_embed_row() -> None:
     )
     tb = batch_to_token_batch(tokenizer, [[{"action": 16}]])
     embeds = embed_batch(backbone, tb)
-    indices = tb.to_tensors(embeds.device)["head_token_ids"]
+    indices = tb.to(embeds.device)["head_token_mask"].nonzero(as_tuple=True)[0]
     assert embeds.shape[0] == 1
     assert int(indices[0].item()) == 0
     assert torch.equal(embeds[0], emb.weight[16])
@@ -998,9 +998,9 @@ def test_identity_embed_image_token_ids() -> None:
         head_output="pixels",
     )
     batch = [[{"observation": 3, "pixels": [1, 2, 3]}]]
-    tb, obj, _sid = batch_to_packed(tokenizer, batch)
+    tb, obj = batch_to_packed(tokenizer, batch)
     embeds = embed_batch(backbone, tb)
-    indices = tb.to_tensors(embeds.device)["head_token_ids"]
+    indices = tb.to(embeds.device)["head_token_mask"].nonzero(as_tuple=True)[0]
     assert "pixels" in obj.keys()
     assert embeds.ndim == 2 and embeds.shape[1] == D
     # "3" (1 char → 1 token), then the two image tokens (the head-output tokens).
@@ -1085,20 +1085,20 @@ def test_pack_emits_group_start_once_per_sequence() -> None:
         encode_measurement(tok, {"action": 2, "episode_index": 0}),
         encode_measurement(tok, {"action": 3, "episode_index": 1}),
     ]
-    inputs, obj, _sid = pack_token_batch(steps=steps, sequence_ids=[0, 0, 0], batch_size=1, continuing=None)
+    inputs, obj = pack_token_batch(steps=steps, sequence_ids=[0, 0, 0], batch_size=1, continuing=None)
     prefix = steps[0].group_start_token_ids
     assert prefix is not None
     p = int(prefix.shape[0])
-    assert inputs.L == p + steps[0].T + steps[1].T + steps[2].T
+    assert inputs["token_ids"].shape[0] == p + steps[0].T + steps[1].T + steps[2].T
     assert obj["action"].tolist() == [1, 2, 3]
-    assert inputs.head_token_ids.tolist() == [
+    assert inputs["head_token_mask"].nonzero(as_tuple=True)[0].tolist() == [
         p + int(steps[0].head_token_mask.nonzero()[0][0]),
         p + steps[0].T + int(steps[1].head_token_mask.nonzero()[0][0]),
         p + steps[0].T + steps[1].T + int(steps[2].head_token_mask.nonzero()[0][0]),
     ]
     # Group-start text tokens are nonnumeric and never head-output.
     assert not any(
-        int(i) in set(inputs.head_token_ids.tolist())
+        int(i) in set(inputs["head_token_mask"].nonzero(as_tuple=True)[0].tolist())
         for i in range(p)
     )
 
@@ -1111,12 +1111,12 @@ def test_pack_group_start_is_per_sequence() -> None:
         encode_measurement(tok, {"action": 1, "episode_index": 0}),
         encode_measurement(tok, {"action": 2, "episode_index": 0}),
     ]
-    inputs, _, _sid = pack_token_batch(steps=steps, sequence_ids=[0, 1], batch_size=2, continuing=None)
+    inputs, inputs_objective_data = pack_token_batch(steps=steps, sequence_ids=[0, 1], batch_size=2, continuing=None)
     prefix = steps[0].group_start_token_ids
     assert prefix is not None
     p = int(prefix.shape[0])
-    assert inputs.L == (p + steps[0].T) + (p + steps[1].T)
-    assert inputs.sequence_ids.tolist() == (
+    assert inputs["token_ids"].shape[0] == (p + steps[0].T) + (p + steps[1].T)
+    assert inputs['sequence_ids'].tolist() == (
         [0] * (p + steps[0].T) + [1] * (p + steps[1].T)
     )
 
@@ -1130,29 +1130,29 @@ def test_pack_continuing_suppresses_group_start() -> None:
     assert prefix is not None
     p = int(prefix.shape[0])
 
-    cached, _, _sid = pack_token_batch(
+    cached, cached_objective_data = pack_token_batch(
         steps=[step],
         sequence_ids=[0],
         batch_size=1,
         continuing=[True],
     )
-    assert cached.L == step.T
+    assert cached["token_ids"].shape[0] == step.T
 
-    fresh, _, _sid = pack_token_batch(
+    fresh, fresh_objective_data = pack_token_batch(
         steps=[step],
         sequence_ids=[0],
         batch_size=1,
         continuing=None,
     )
-    assert fresh.L == p + step.T
+    assert fresh["token_ids"].shape[0] == p + step.T
 
-    restarted, _, _sid = pack_token_batch(
+    restarted, restarted_objective_data = pack_token_batch(
         steps=[step],
         sequence_ids=[0],
         batch_size=1,
         continuing=[False],
     )
-    assert restarted.L == p + step.T
+    assert restarted["token_ids"].shape[0] == p + step.T
 
 
 def test_tokenizer_pack_rows_forwards_continuing() -> None:
@@ -1162,11 +1162,11 @@ def test_tokenizer_pack_rows_forwards_continuing() -> None:
     assert st.group_start_token_ids is not None
     p = int(st.group_start_token_ids.shape[0])
 
-    fresh = tok.pack_rows(rows=[measurement_events(payloads) for payloads in [[row]]], continuing=None)
-    assert fresh.L == p + st.T
+    fresh, fresh_objective_data = tok.pack_rows(rows=[measurement_events(payloads) for payloads in [[row]]], continuing=None)
+    assert fresh["token_ids"].shape[0] == p + st.T
 
-    cached = tok.pack_rows(rows=[measurement_events(payloads) for payloads in [[row]]], continuing=[True])
-    assert cached.L == st.T
+    cached, cached_objective_data = tok.pack_rows(rows=[measurement_events(payloads) for payloads in [[row]]], continuing=[True])
+    assert cached["token_ids"].shape[0] == st.T
 
 
 def test_text_tokenizer_group_start_missing_placeholder_is_skipped() -> None:
@@ -1220,8 +1220,8 @@ def test_token_pack_ignores_missing_group_start() -> None:
         encode_measurement(tok, {"action": 1, "episode_index": 0}),
         encode_measurement(tok, {"action": 2, "episode_index": 0}),
     ]
-    inputs, _, _sid = pack_token_batch(steps=steps, sequence_ids=[0, 0], batch_size=1, continuing=None)
-    assert inputs.L == steps[0].T + steps[1].T
+    inputs, inputs_objective_data = pack_token_batch(steps=steps, sequence_ids=[0, 0], batch_size=1, continuing=None)
+    assert inputs["token_ids"].shape[0] == steps[0].T + steps[1].T
     assert steps[0].group_start_token_ids is None
 
 
@@ -1452,15 +1452,15 @@ def test_zero_numeric_values_keep_their_mask_through_prefix_packing_and_embeddin
         tokenizers={"default": _FakeTokenizer()},
     )
     step = encode_measurement(tokenizer, {"prefix": 0., "observation": 0.})
-    batch, _, _ = pack_token_batch(steps=[step, step], sequence_ids=[0, 0], continuing=None)
-    tensors = batch.to_tensors("cpu")
+    batch, batch_objective_data = pack_token_batch(steps=[step, step], sequence_ids=[0, 0], continuing=None)
+    tensors = batch.to("cpu")
     # Every token has the same ID and value; only the mask distinguishes them.
     assert tensors["token_ids"].unique().numel() == 1
     assert not tensors["numeric_values"].any()
     assert tensors["numeric_mask"].dtype == torch.bool
     assert tensors["numeric_mask"].tolist() == [True, False, True, False, True]
-    assert tensors["head_token_ids"].tolist() == [1, 3]
-    assert tensors["head_step_ids"].tolist() == [0, 1]
+    assert tensors["head_token_mask"].nonzero(as_tuple=True)[0].tolist() == [1, 3]
+    assert batch_objective_data["head_step_ids"].tolist() == [0, 1]
 
     embedding = Embedding(hidden_dim=8, vocab_size=32, numeric_field_names=tokenizer.numeric_field_names, num_frequencies=2)
     assert embedding.features.numeric[0] is not None
@@ -1478,9 +1478,9 @@ def test_zero_numeric_values_keep_their_mask_through_prefix_packing_and_embeddin
     assert embedding.embed_tokens.weight.grad is not None
     assert embedding.embed_tokens.weight.grad.abs().sum() > 0
 
-    continued, _, _ = pack_token_batch(steps=[step], sequence_ids=[0], continuing=[True])
-    assert continued.numeric_mask.tolist() == [False, True]
-    assert continued.head_token_ids.tolist() == [0]
+    continued, continued_objective_data = pack_token_batch(steps=[step], sequence_ids=[0], continuing=[True])
+    assert continued['numeric_mask'].tolist() == [False, True]
+    assert continued["head_token_mask"].nonzero(as_tuple=True)[0].tolist() == [0]
 
 
 def test_text_only_embedding_accepts_just_token_ids() -> None:
@@ -1643,7 +1643,7 @@ def test_numeric_embed_adds_fourier_of_the_scaled_value() -> None:
     assert fresh.features.numeric[0] is not None
     assert torch.count_nonzero(fresh.features.numeric[0].proj.weight) > 0
     low = encode_measurement(tokenizer, {"action": 0, "observation": -0.5})
-    batch, _, _ = pack_token_batch(
+    batch, batch_objective_data = pack_token_batch(
         steps=[low], sequence_ids=[0], batch_size=1, continuing=None
     )
     embeds = embed_batch(fresh, batch)
@@ -1652,10 +1652,10 @@ def test_numeric_embed_adds_fourier_of_the_scaled_value() -> None:
     looked = fresh.embed_tokens.weight[torch.tensor(star.tolist())]
     assert not torch.allclose(embeds[mask], looked)
     high = encode_measurement(tokenizer, {"action": 0, "observation": 0.5})
-    low_batch, _, _ = pack_token_batch(
+    low_batch, low_batch_objective_data = pack_token_batch(
         steps=[low], sequence_ids=[0], batch_size=1, continuing=None
     )
-    high_batch, _, _ = pack_token_batch(
+    high_batch, high_batch_objective_data = pack_token_batch(
         steps=[high], sequence_ids=[0], batch_size=1, continuing=None
     )
     low_embeds = embed_batch(fresh, low_batch)

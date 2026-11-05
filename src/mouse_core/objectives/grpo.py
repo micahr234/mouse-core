@@ -10,12 +10,11 @@ import torch.nn.functional as F
 
 from mouse_core.objectives._actions import canonical_actions, executed_actions
 
-from mouse_core.objectives.dqn import _expand_policy_readouts, _validate_request_actions, _validate_missing_bootstrap
+from mouse_core.objectives.dqn import _expand_policy_readouts, _validate_request_actions
 from mouse_core.objectives.base import Objective, _reject_predictions
 from mouse_core.objectives.dqn import (
     _pair_weight,
     _require_action_ids,
-    _require_step_aligned_predictions,
     _weighted_mean,
 )
 
@@ -145,12 +144,13 @@ class GrpoObjective(Objective[...]):
                 {"input_field": "advantage"},
             ],
         )
-        from mouse_core.data import to_device
-        inputs, objective_data, group_id = loader.next_batch()
+        inputs, objective_data = loader.next_batch()
+        group_id = objective_data.to(device)["step_sequence_ids"]
         out = model(inputs)
         losses, metrics = objective(
-            objective_data=to_device(data=objective_data, device=device),
+            objective_data=objective_data.to(device),
             group_id=group_id.to(device),
+            head_step_ids=objective_data.to(device)["head_step_ids"],
             predictions=out["predictions"]["action"],
         )
         loss = torch.stack(tuple(losses.values())).sum()
@@ -166,12 +166,8 @@ class GrpoObjective(Objective[...]):
     reads must stay in-run: out-of-run pairs are multiplied by ``0``
     (all-zero weights → loss ``0``).
 
-    Packing nullable ``action`` fields derives the ``[N]`` batch mask
-    ``objective_data["action_executed"]``; raw rows do not need that field.
-    A false entry marks an action-independent reset transition. Its numeric
-    action is only a placeholder; the transition contributes no policy loss,
-    entropy, or KL statistics. Direct tensor callers may omit the mask when
-    every action is executed.
+    Missing actions are NaN in the packed action tensor. They mark automatic
+    transitions and contribute no policy loss, entropy, or KL statistics.
 
     Args:
         clip_ratio_min: Lower probability-ratio clip bound, in (0, 1].
@@ -219,6 +215,7 @@ class GrpoObjective(Objective[...]):
         *,
         objective_data: dict[str, torch.Tensor],
         group_id: torch.Tensor,
+        head_step_ids: torch.Tensor,
         predictions: torch.Tensor,
         _tensor_metrics: bool = False,
     ) -> tuple[dict[str, torch.Tensor], dict[str, float | torch.Tensor]]: ...
@@ -229,6 +226,7 @@ class GrpoObjective(Objective[...]):
         *,
         objective_data: dict[str, torch.Tensor],
         group_id: torch.Tensor,
+        head_step_ids: torch.Tensor,
         predictions: torch.Tensor,
         backup_value_predictions: None = None,
         backup_action_predictions: None = None,
@@ -242,6 +240,7 @@ class GrpoObjective(Objective[...]):
         *,
         objective_data: dict[str, torch.Tensor],
         group_id: torch.Tensor,
+        head_step_ids: torch.Tensor,
         predictions: torch.Tensor,
         backup_value_predictions: torch.Tensor | None = None,
         backup_action_predictions: torch.Tensor | None = None,
@@ -287,6 +286,8 @@ class GrpoObjective(Objective[...]):
                 losses, metrics = self(
                     objective_data=head_data,
                     group_id=group_id,
+                    head_step_ids=head_step_ids,
+
                     predictions=logits[:, head, :],
                     _tensor_metrics=True,
                 )
@@ -306,7 +307,7 @@ class GrpoObjective(Objective[...]):
                 f"got {tuple(logits.shape)}."
             )
         original_data = objective_data
-        logits, objective_data, readout = _expand_policy_readouts(objective_data, logits, who="GRPO")
+        logits, objective_data, readout = _expand_policy_readouts(objective_data, logits, head_step_ids=head_step_ids, n_steps=group_id.numel(), who="GRPO")
         N, A = logits.shape
         device = cast(torch.device, logits.device)
         dtype = cast(torch.dtype, logits.dtype)
@@ -323,26 +324,20 @@ class GrpoObjective(Objective[...]):
             raise ValueError("Not enough valid steps in data for GRPO (need N >= 2).")
 
         action = objective_data[self.action_key]
-        if action.dtype != torch.int64:
-            raise TypeError(f"action must be int64, got {action.dtype}.")
         if action.ndim != 1:
             raise ValueError(
                 f"GRPO objective expects action shape [N], "
                 f"got {tuple(action.shape)}."
             )
-        _require_step_aligned_predictions(
-            objective_data, n_pred=N, n_steps=int(action.shape[0]), who="GRPO"
-        )
         if action.shape != torch.Size([N]):
             raise ValueError(
                 f"GRPO objective expects action shape [{N}], "
                 f"got {tuple(action.shape)}."
             )
-        executed = executed_actions(objective_data, action)
+        executed = executed_actions(action)
         _validate_request_actions(readout, executed, group_id)
-        action = canonical_actions(objective_data, action)
+        action = canonical_actions(action)
         _require_action_ids(action, A)
-        objective_data = {**objective_data, self.action_key: action}
 
         if self.advantage_key not in objective_data.keys():
             raise KeyError(

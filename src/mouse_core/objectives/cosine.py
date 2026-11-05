@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 from mouse_core.objectives.base import Objective
 from mouse_core.objectives.dqn import _expand_policy_readouts
-from mouse_core.objectives._actions import executed_actions
+from mouse_core.objectives._actions import canonical_actions, executed_actions
 
 
 class CosineObjective(Objective[...]):
@@ -148,20 +148,22 @@ class CosineObjective(Objective[...]):
         predictions: torch.Tensor,
         targets: torch.Tensor,
         group_id: torch.Tensor,
+        head_step_ids: torch.Tensor,
         transition: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
         reset_key: str | None,
     ) -> tuple[dict[str, torch.Tensor], dict[str, float | torch.Tensor]]:
         """Predict the next encoding from each current encoding and incoming action.
 
-        Encodings are aligned ``[N, D]`` readouts, one per step. With
-        ``batched_heads=True``, predictions are ``[N, K, D]`` and targets
-        may be shared ``[N, D]`` or per-head ``[N, K, D]``. The transition
+        Encodings are ``[P, D]`` readouts aligned by ``head_step_ids`` to
+        ``N`` steps, with zero or one readout per step. With
+        ``batched_heads=True``, predictions are ``[P, K, D]`` and targets
+        may be shared ``[P, D]`` or per-head ``[P, K, D]``. The transition
         receives only eligible flattened ``[M, D]`` sources and ``[M]``
         incoming actions. The action at row i+1 belongs to the transition
         from i to i+1. Exclude group breaks,
         transitions out of terminated/truncated rows, and transitions into
         reset rows identified by ``reset_key`` (None disables that check).
-        When ``action_executed`` is present, action-independent transitions
+        When actions are NaN, action-independent transitions
         are also excluded; their action slots are only placeholders.
         Only pairs with readouts at both ends are eligible; a terminal
         observation without a readout has no latent target. ``mask_key``, if
@@ -189,8 +191,8 @@ class CosineObjective(Objective[...]):
             raise TypeError("predictions and targets must be floating-point encodings.")
         if predictions.device != targets.device:
             raise ValueError("predictions and targets must share a device.")
-        predictions, _, readout = _expand_policy_readouts(objective_data, predictions, who="Cosine")
-        targets, _, _ = _expand_policy_readouts(objective_data, targets, who="Cosine")
+        predictions, _, readout = _expand_policy_readouts(objective_data, predictions, head_step_ids=head_step_ids, n_steps=group_id.numel(), who="Cosine")
+        targets, _, _ = _expand_policy_readouts(objective_data, targets, head_step_ids=head_step_ids, n_steps=group_id.numel(), who="Cosine")
         n = predictions.shape[0]
 
         def column(name: str, value: torch.Tensor) -> torch.Tensor:
@@ -200,12 +202,13 @@ class CosineObjective(Objective[...]):
 
         groups = column("group_id", group_id)
         actions = column("action", objective_data["action"])
-        if groups.dtype != torch.int64 or actions.dtype != torch.int64:
-            raise TypeError("group_id and action must be int64.")
+        if groups.dtype != torch.int64:
+            raise TypeError("group_id must be int64.")
         terminated = column("terminated", objective_data["terminated"]).bool()
         truncated = column("truncated", objective_data["truncated"]).bool()
         valid = (groups[:-1] == groups[1:]) & ~terminated[:-1] & ~truncated[:-1]
-        valid &= executed_actions(objective_data, actions)[1:] & readout[:-1] & readout[1:]
+        valid &= executed_actions(actions)[1:] & readout[:-1] & readout[1:]
+        actions = canonical_actions(actions)
         if reset_key is not None:
             valid &= ~column(reset_key, objective_data[reset_key])[1:].bool()
         if self.mask_key is not None and not self.batched_heads:

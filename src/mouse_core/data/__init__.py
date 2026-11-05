@@ -1,5 +1,5 @@
 from mouse_core.data.event_transform import (
-    EventTransform, environment_decisions, environment_episode_ranges,
+    EnvironmentProtocol, EventTransform, environment_decisions, environment_episode_ranges,
     latest_environment_decision, latest_environment_packet,
     validate_environment_events, validate_latest_environment_step,
 )
@@ -16,15 +16,7 @@ from mouse_core.data.augmenter import (
 from mouse_core.data.compose import compose
 from mouse_core.data.modality import TokenizerModalitySpec
 from mouse_core.data.tokenizer import Tokenizer, EventTokenStream, load_tokenizer, save_tokenizer
-from mouse_core.data.token_batch import (
-    StepTokens,
-    TokenBatch,
-    empty_token_batch,
-    pack_token_batch,
-    reuse_token_tensors,
-    step_counts_from_group_id,
-    to_device,
-)
+from mouse_core.data.token_batch import make_token_batch, StepTokens, empty_token_batch, pack_token_batch
 
 __all__ = [
     "Augmenter",
@@ -37,6 +29,7 @@ __all__ = [
     "Tokenizer",
     "EventTokenStream",
     "step_sample_ranges",
+    "EnvironmentProtocol",
     "EventTransform",
     "environment_decisions",
     "environment_episode_ranges",
@@ -48,12 +41,9 @@ __all__ = [
     "load_tokenizer",
     "save_tokenizer",
     "StepTokens",
-    "TokenBatch",
+    "make_token_batch",
     "pack_token_batch",
-    "reuse_token_tensors",
     "empty_token_batch",
-    "step_counts_from_group_id",
-    "to_device",
     "load_stores_from_hub",
     "push_stores_to_hub",
     "push_to_hub",

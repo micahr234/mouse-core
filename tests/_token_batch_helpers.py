@@ -1,6 +1,7 @@
 """Encode synthetic measurement payloads as events, then pack model test batches."""
 
 from __future__ import annotations
+from tensordict import TensorDict
 
 from collections.abc import Callable
 from typing import Any, cast
@@ -9,7 +10,7 @@ import torch
 
 from mouse_core.data import Tokenizer, pack_token_batch
 from tests._event_fixtures import encode_measurement
-from mouse_core.data.token_batch import StepTokens, TokenBatch
+from mouse_core.data.token_batch import StepTokens
 
 def when_episode_done_nonzero(ctx):
     return "episode_done" in ctx and ctx["episode_done"] != 0
@@ -96,8 +97,8 @@ def token_tokenizer(
 def batch_to_packed(
     tokenizer: Tokenizer | Callable[[dict], StepTokens],
     batch: list[list[dict]],
-) -> tuple[TokenBatch, dict[str, torch.Tensor], torch.Tensor]:
-    """Tokenize a ragged ``list[list[dict]]`` into ``(inputs, objective_data, group_id)``."""
+) -> tuple[TensorDict, dict[str, torch.Tensor]]:
+    """Tokenize a ragged ``list[list[dict]]`` into ``(inputs, objective_data)``."""
     steps: list[StepTokens] = []
     sids: list[int] = []
     for b, seq in enumerate(batch):
@@ -115,17 +116,17 @@ def batch_to_packed(
 def batch_to_token_batch(
     tokenizer: Tokenizer | Callable[[dict], StepTokens],
     batch: list[list[dict]],
-) -> TokenBatch:
+) -> TensorDict:
     """Tokenize a ragged ``list[list[dict]]`` to model inputs only."""
-    inputs, _, _ = batch_to_packed(tokenizer, batch)
+    inputs, _ = batch_to_packed(tokenizer, batch)
     return inputs
 
 
 def embed_batch(embedding, batch):
-    tensors = batch.to_tensors(next(embedding.parameters()).device)
+    tensors = batch.to(next(embedding.parameters()).device)
     return embedding(
         tensors["token_ids"], numeric_values=tensors["numeric_values"],
         numeric_mask=tensors["numeric_mask"],
-        numeric_field_ids=tensors["numeric_field_ids"], numeric_field_names=batch.numeric_field_names,
-        tokenizer_ids=tensors["tokenizer_ids"], tokenizer_names=batch.tokenizer_names,
+        numeric_field_ids=tensors["numeric_field_ids"], numeric_field_names=batch['numeric_field_names'],
+        tokenizer_ids=tensors["tokenizer_ids"], tokenizer_names=batch['tokenizer_names'],
     )

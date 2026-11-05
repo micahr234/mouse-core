@@ -13,13 +13,13 @@ MOUSE is actively developed and contributions are very welcome — whether that'
 ## Development setup
 
 ```bash
-# Clone and create a free-threaded Python 3.15t virtual environment (via uv)
+# Clone and create a standard Python 3.15 virtual environment (via uv)
 git clone https://github.com/micahr234/mouse-core.git
 cd mouse-core
 source scripts/install.sh
 ```
 
-This installs the package in editable mode with the `dev` and `all` extras (`all` bundles every feature extra — currently `examples`). Activate with `source .venv/bin/activate`. The install uses free-threaded CPython (`3.15t`). `torch` 2.15 wheels for that interpreter come from the PyTorch test index (`cu132` when `nvidia-smi` is present, CPU otherwise). See [Example dependencies](#example-dependencies) for notebook system packages.
+This installs the package in editable mode with the `dev` and `all` extras (`all` bundles every feature extra — `examples` and `kernels`). Activate with `source .venv/bin/activate`. The install uses standard CPython (`3.15`). The pinned PyTorch/Triton pair comes from the nightly index (`cu130` when `nvidia-smi` is present, CPU otherwise), with the Python 3.15 source fix described below. See [Example dependencies](#example-dependencies) for notebook system packages.
 
 ### Example dependencies
 
@@ -31,7 +31,7 @@ uv pip install -e ".[examples]" --python .venv/bin/python
 ```
 
 Gymnasium's toy-text environments depend on `pygame-ce`. If no wheel is available for
-free-threaded Python, building it requires SDL2 and PortMidi development libraries.
+your platform, building it requires SDL2 and PortMidi development libraries.
 On Debian/Ubuntu:
 
 ```bash
@@ -42,13 +42,20 @@ Missing headers cause errors such as `library 'SDL2' not found` or `library 'por
 The extra also includes `gymnasium[mujoco]` for [example 20](examples/20_train_sequential_actions_dqn.ipynb),
 which runs Reacher on CPU without rendering or a display.
 
-### Temporary `PYTHON_GIL=0` (remove when possible)
+### Data preparation workers
 
-`scripts/install.sh` and CI set `PYTHON_GIL=0` so the free-threaded interpreter **keeps the GIL off** after imports. `tokenizers>=0.23.3` declares `Py_MOD_GIL_NOT_USED`. Triton still does not, so importing `triton._C.libtriton` (pulled in by torch) would otherwise re-enable the GIL.
+Use `DataLoader(..., num_workers=4, prefetch=4)` for four persistent processes
+with bounded shared-memory transfer. Standard Python works; no GIL override is
+needed. One event/token budget applies to the whole batch, and `next_batch()`
+returns `(inputs, objective_data)`. Loss boundaries are available as
+`objective_data.to(device)["step_sequence_ids"]`.
 
-**Follow-up:** when Triton declares `Py_MOD_GIL_NOT_USED`, drop `PYTHON_GIL=0` from [`scripts/install.sh`](scripts/install.sh) and [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
-
-**Risk:** forcing the GIL off skips CPython’s “this extension did not opt in” safety brake. That is fine for our usual path (read-only HF Dataset slices + numeric / text prepare). Triton’s autotune cache is still racy under `GIL=0` if Python threads launch kernels concurrently.
+Spawned processes support notebook-local preprocessing through `cloudpickle`.
+In Python scripts, construct loaders under `if __name__ == "__main__":`.
+Transforms run on CPU and must serialize; keep models and external resources out
+of their closures. Worker-local augmenter locks are rebuilt on deserialization.
+`refresh()` replaces worker snapshots at the next unconsumed batch. `close()`
+reclaims processes and shared memory; previously returned batches stay valid.
 
 The package lives at `src/mouse_core/` (standard src layout) and is imported as `mouse_core`.
 
@@ -59,7 +66,7 @@ Notebooks under [`examples/`](examples/) are committed **without** cell outputs.
 Use an existing local Qwen3 tokenizer directory to run the notebooks without downloads or publishing:
 
 ```bash
-PYTHON_GIL=0 .venv/bin/python scripts/run_examples.py \
+.venv/bin/python scripts/run_examples.py \
     --output-dir /tmp/mouse-examples \
     --tokenizer-source /path/to/local/Qwen3-tokenizer \
     --threads 2 --seed 7 --examples all
@@ -87,7 +94,7 @@ newline is a prediction readout.
    ```bash
    pyright src/ tests/
    python scripts/check_example_types.py
-   PYTHON_GIL=0 pytest
+   pytest
    ```
    The notebook check extracts code cells and reports type errors by notebook and cell. CI runs source/test type checks, tests, and a wheel/sdist build on every pull request and on pushes to `main`.
 4. Open a pull request against `main` with a clear description of what changed and why.
@@ -98,7 +105,7 @@ When working through a coding agent, complete and review changes locally before 
 
 ## Code style
 
-- Python 3.15+ (free-threaded `3.15t` for multi-worker DataLoader), type-annotated throughout.
+- Python 3.15+, type-annotated throughout.
 - Follow the existing patterns: base classes in `base.py`, public API in `__init__.py`, usage in `examples/`.
 - Keep example notebook imports together at the top of the first code cell.
 - Avoid silent fallbacks — if a precondition isn't met, raise a clear error.
@@ -120,3 +127,20 @@ You can also run the workflow manually from the Actions tab (**Publish** → **R
 ## Questions
 
 Open a GitHub Discussion or issue.
+
+## Pinned PyTorch and Triton
+
+The development environment pins PyTorch `2.15.0.dev20261005` and Triton
+`3.8.0+gitc01b6774` from the official PyTorch nightly index, using standard
+Python 3.15. This pair avoids the nanobind shutdown warning reproduced with
+Triton 3.9. The installer and CI apply `scripts/patch_triton.py`, which backports
+[Triton PR #10986](https://github.com/triton-lang/triton/pull/10986): the
+`AnnAssign.simple` argument required by Python 3.15. Reapply this script after
+manually reinstalling Triton. It checks the version and expected source before
+editing the installed package.
+
+The official `cp315` wheel still declares Python `<3.15`, so `uv pip check`
+reports that upstream metadata mismatch. The metadata is left intact. This
+setup depends on the explicit source fix; it was verified in V2B with compiled
+CUDA FlexAttention forward/backward and the test suites. Use the nightly CPU
+index `https://download.pytorch.org/whl/nightly/cpu` for CPU installations.

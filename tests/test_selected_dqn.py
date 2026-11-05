@@ -1,4 +1,6 @@
 """Selected-action online Q must preserve dense DQN targets and gradients."""
+
+from tests._prediction_layout import fixture_head_steps
 import pytest
 import torch
 from mouse_core.objectives import (
@@ -14,7 +16,7 @@ def objective(gate=None, temperature=0.0, cql_weight=0.0):
                              value_terminated_shift=0.1, value_truncated_scale=1.0,
                              value_truncated_shift=0.0),
         discount=boundary_discount(gamma_step=0.9, gamma_terminated=0.0, gamma_truncated=0.0),
-        gate=gate, temperature=temperature, cross_group_backups="bootstrap", cql_weight=cql_weight,
+        gate=gate, temperature=temperature,  cql_weight=cql_weight,
     )
 
 
@@ -24,11 +26,10 @@ def objective(gate=None, temperature=0.0, cql_weight=0.0):
 def test_selected_matches_dense_targets_loss_and_gradients(multiple_readouts, temperature, gate_name):
     torch.manual_seed(12)
     counts = torch.tensor([2, 1, 3, 1, 2]) if multiple_readouts else torch.ones(5, dtype=torch.long)
-    data = dict(action=torch.tensor([0, 1, -999, 0, 2]), reward=torch.randn(5),
-                terminated=torch.tensor([False, False, False, False, True]),
+    data = dict(action=torch.where((torch.tensor([False, True, False, True, True])).bool(), (torch.tensor([0, 1, -999, 0, 2])).to(torch.float64), float("nan")), reward=torch.randn(5),
+                terminated=torch.tensor([False, False, True, False, True]),
                 truncated=torch.zeros(5, dtype=torch.bool),
-                action_executed=torch.tensor([False, True, False, True, True]),
-                head_output_count=counts)
+                readout_counts=counts)
     groups = torch.tensor([0, 0, 0, 1, 1])
     step_of = torch.repeat_interleave(torch.arange(5), counts)
     actions = torch.tensor([1, 0, 0, 2, 2])[step_of]
@@ -41,11 +42,11 @@ def test_selected_matches_dense_targets_loss_and_gradients(multiple_readouts, te
                      policy_delayed=True, value_delayed=True)]))
     loss = objective(gates[gate_name], temperature=temperature)
     dense_losses, dense_metrics = loss(
-        predictions=q, objective_data=data, group_id=groups,
+        predictions=q, objective_data=data, group_id=groups, head_step_ids=fixture_head_steps(data),
         backup_value_predictions=delayed, backup_action_predictions=delayed,
     )
     losses, metrics = loss(
-        predictions=selected, objective_data=data, group_id=groups,
+        predictions=selected, objective_data=data, group_id=groups, head_step_ids=fixture_head_steps(data),
         backup_value_predictions=delayed, backup_action_predictions=delayed,
     )
     torch.testing.assert_close(losses["action_value"], dense_losses["action_value"])
@@ -64,9 +65,8 @@ def test_selected_uses_maximum_of_delayed_actions():
     data = dict(action=torch.tensor([0, 1, 0]), reward=torch.tensor([0., 1., 4.]),
                 terminated=torch.tensor([False, False, True]), truncated=torch.zeros(3, dtype=torch.bool))
     loss = DqnObjective(reward=None, value=None, gate=None, temperature=0.0,
-        discount=boundary_discount(gamma_step=0.5, gamma_terminated=0.0, gamma_truncated=0.0),
-        cross_group_backups="fault")
-    losses, metrics = loss(objective_data=data, group_id=torch.zeros(3, dtype=torch.long),
+        discount=boundary_discount(gamma_step=0.5, gamma_terminated=0.0, gamma_truncated=0.0))
+    losses, metrics = loss(objective_data=data, group_id=torch.zeros(3, dtype=torch.long), head_step_ids=fixture_head_steps(data),
                           predictions=q, backup_value_predictions=delayed, backup_action_predictions=delayed)
     backup = metrics["backup"]
     assert isinstance(backup, torch.Tensor)
@@ -87,6 +87,6 @@ def test_selected_rejects_gate_that_needs_online_action_comparison(policy_delaye
 
 def test_selected_rejects_cql():
     with pytest.raises(ValueError, match="CQL requires all-action"):
-        objective(cql_weight=0.5)(objective_data={}, group_id=torch.zeros(3, dtype=torch.long),
+        objective(cql_weight=0.5)(objective_data={}, group_id=torch.zeros(3, dtype=torch.long), head_step_ids=torch.arange(3),
             predictions=torch.ones(3), backup_value_predictions=torch.ones(3, 2),
             backup_action_predictions=torch.ones(3, 2))

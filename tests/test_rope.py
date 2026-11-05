@@ -19,7 +19,7 @@ def limited_threads():
 
 
 def backbone(architecture: Literal["llama", "qwen3"], *, rope_enabled: bool,
-             train_kernel: TrainKernel = "reference", lora: bool = False) -> Backbone:
+             train_kernel: TrainKernel = "flex", lora: bool = False) -> Backbone:
     return Backbone(
         architecture=architecture, hidden_dim=16, num_layers=2, num_heads=2,
         num_key_value_heads=1, intermediate_size=32,
@@ -30,8 +30,9 @@ def backbone(architecture: Literal["llama", "qwen3"], *, rope_enabled: bool,
 
 
 @pytest.mark.parametrize("architecture", ["llama", "qwen3"])
-@pytest.mark.parametrize("train_kernel", ["reference", "padded"])
+@pytest.mark.parametrize("train_kernel", ["flex"])
 @pytest.mark.parametrize("checkpoint", [False, True])
+@pytest.mark.flex_training
 def test_disabled_rope_matches_zero_position_reference_and_gradients(
     architecture, train_kernel, checkpoint,
 ):
@@ -123,4 +124,4 @@ def test_disabling_rope_rejects_non_rotary_decoder():
     config = GPT2Config(n_embd=8, n_layer=1, n_head=2, n_inner=16, vocab_size=16)
     with pytest.raises(ValueError, match="packed-compatible rotary decoder"):
         Backbone(architecture="hf", hf_config=config.to_dict(), rope_enabled=False,
-                 train_kernel="reference", decode_kernel="flex", dtype=torch.float32)
+                 train_kernel="flex", decode_kernel="flex", dtype=torch.float32)

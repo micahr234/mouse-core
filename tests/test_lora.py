@@ -41,7 +41,7 @@ def _backbone(
     architecture: Literal["llama", "qwen3"] = "qwen3",
     dtype: torch.dtype = torch.float32,
 ):
-    return Backbone(architecture=architecture, train_kernel='reference', decode_kernel='flex', dtype=dtype, hidden_dim=_HIDDEN, num_layers=2, num_heads=2, max_position_embeddings=64, lora=lora)
+    return Backbone(architecture=architecture, train_kernel="flex", decode_kernel='flex', dtype=dtype, hidden_dim=_HIDDEN, num_layers=2, num_heads=2, max_position_embeddings=64, lora=lora)
 
 
 def _model(lora: LoRAConfig | None=LoRAConfig(rank=4, alpha=8.0), *, reasoner: bool=False, dtype: torch.dtype=torch.float32) -> Model:
@@ -216,6 +216,7 @@ def test_lora_linear_runs_fp32_adapters_over_bf16_base() -> None:
     assert lora.lora_B.weight.grad is not None and lora.lora_B.weight.grad.dtype == torch.float32
 
 
+@pytest.mark.flex_training
 def test_only_lora_params_receive_gradients() -> None:
     torch.manual_seed(0)
     model = _model().train()
@@ -282,7 +283,8 @@ def test_model_to_bf16_keeps_every_trainable_section_fp32() -> None:
     assert {p.dtype for p in model.heads.parameters()} == {torch.float32}
 
 
-def test_bf16_backbone_forward_backward_on_cpu() -> None:
+@pytest.mark.flex_training
+def test_bf16_backbone_forward_backward_on_cuda() -> None:
     """LoRA adapters stay fp32 over a bf16 backbone, through masked SDPA on CPU."""
     torch.manual_seed(0)
     model = _model(dtype=torch.bfloat16).train()
@@ -301,7 +303,8 @@ def test_bf16_backbone_forward_backward_on_cpu() -> None:
     assert decoded.dtype == torch.float32
 
 
-def test_bf16_reasoner_forward_on_cpu() -> None:
+@pytest.mark.flex_training
+def test_bf16_reasoner_forward_on_cuda() -> None:
     torch.manual_seed(0)
     model = _model(reasoner=True, dtype=torch.bfloat16).train()
     batch = _batch(model)
@@ -311,10 +314,11 @@ def test_bf16_reasoner_forward_on_cpu() -> None:
     assert model.reasoner.proj.weight.grad is not None
 
 
+@pytest.mark.flex_training
 def test_adamw_trains_bf16_backbone_model_through_lora() -> None:
     torch.manual_seed(0)
     model = _model(dtype=torch.bfloat16).train()
-    optimizer = AdamW(params=model.parameters(), lr=0.001, fused=False)
+    optimizer = AdamW(params=[{'params': model.parameters(), 'lr': 0.001}],  fused=False)
     n_trainable = sum((1 for p in model.parameters() if p.requires_grad))
     assert sum((len(g['params']) for g in optimizer.param_groups)) == n_trainable
     assert model.backbone is not None
@@ -330,10 +334,11 @@ def test_adamw_trains_bf16_backbone_model_through_lora() -> None:
 # ---- full fp32 fine-tuning (no LoRA) -----------------------------------------
 
 
+@pytest.mark.flex_training
 def test_full_fp32_path_trains_backbone_directly_with_adamw() -> None:
     """No LoRA: keep the model fp32 and step base weights in place."""
     torch.manual_seed(0)
-    model = _model(None).train().to(device=torch.device('cpu'))
+    model = _model(None).train().to(device=torch.device('cuda'))
     assert all((p.requires_grad and p.dtype == torch.float32 for p in model.parameters()))
     assert model.backbone is not None and model.backbone.dtype == torch.float32
     delayed = copy_model(model, heads=True, backbone=True, reasoner=False)
@@ -341,7 +346,7 @@ def test_full_fp32_path_trains_backbone_directly_with_adamw() -> None:
     online = dict(model.backbone.named_parameters())
     for name, p in delayed.backbone.named_parameters():
         assert p is not online[name]
-    optimizer = AdamW(params=model.parameters(), lr=0.001, fused=False)
+    optimizer = AdamW(params=[{'params': model.parameters(), 'lr': 0.001}],  fused=False)
     assert sum((len(g['params']) for g in optimizer.param_groups)) == sum((1 for _ in model.parameters()))
     q_proj = cast(Any, model.backbone).model.layers[0].self_attn.q_proj
     assert isinstance(q_proj, nn.Linear)
@@ -356,7 +361,7 @@ def test_full_fp32_model_cast_to_bf16_is_rejected_by_adamw() -> None:
     torch.manual_seed(0)
     model = _model(None, dtype=torch.bfloat16)
     with pytest.raises(TypeError, match='dtype=torch.float32'):
-        AdamW(params=model.parameters(), lr=0.001, fused=False)
+        AdamW(params=[{'params': model.parameters(), 'lr': 0.001}],  fused=False)
 
 
 # ---- save / load -------------------------------------------------------------

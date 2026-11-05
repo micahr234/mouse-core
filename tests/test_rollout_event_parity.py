@@ -33,7 +33,7 @@ def assert_matching_events_and_tokens(reference, actual, *, behavior_labels=Fals
     events = actual.events
     for event in events:
         if event['provider'] == 'agent' and behavior_labels:
-            assert event['payload'].pop('old_log_prob') == -.5
+            assert event['payload'].pop('_old_log_prob') == -.5
     assert events == reference.events
     tok = _notebook_transform('02_train_offline_dqn.ipynb', tokenizer_only=True)
     runtime_tok = _notebook_transform(tokenizer_filename, tokenizer_only=True)
@@ -46,15 +46,15 @@ def assert_matching_events_and_tokens(reference, actual, *, behavior_labels=Fals
                         'group_start_token_ids'):
                 np.testing.assert_array_equal(getattr(left, key), getattr(right, key))
             assert left.objective_fields == right.objective_fields
-        packed, _, _ = pack_token_batch(steps=steps, continuing=None)
-        reference_packed, _, _ = pack_token_batch(steps=expected, continuing=None)
-        np.testing.assert_array_equal(packed.token_ids, reference_packed.token_ids)
-        np.testing.assert_array_equal(packed.head_step_ids, reference_packed.head_step_ids)
+        packed, packed_objective_data = pack_token_batch(steps=steps, continuing=None)
+        reference_packed, reference_packed_objective_data = pack_token_batch(steps=expected, continuing=None)
+        np.testing.assert_array_equal(packed['token_ids'], reference_packed['token_ids'])
+        np.testing.assert_array_equal(packed_objective_data["head_step_ids"], reference_packed_objective_data["head_step_ids"])
         # Use the actual online configuration too, not just one common test encoder.
         runtime_steps = runtime_tok.encode(source, include_objectives=False)
-        runtime_packed, _, _ = pack_token_batch(steps=runtime_steps, continuing=None)
-        for key in ('token_ids', 'numeric_values', 'numeric_mask', 'head_token_ids', 'head_step_ids'):
-            np.testing.assert_array_equal(getattr(runtime_packed, key), getattr(reference_packed, key))
+        runtime_packed, runtime_packed_objective_data = pack_token_batch(steps=runtime_steps, continuing=None)
+        for key in ('token_ids', 'numeric_values', 'numeric_mask', 'head_token_mask'):
+            np.testing.assert_array_equal(runtime_packed[key], reference_packed[key])
 
 
 @pytest.mark.parametrize('oracle_values', [False, True])

@@ -1,5 +1,8 @@
 """The existing collectors write the sole source format, without Hub access."""
+
+from tests._prediction_layout import fixture_head_steps
 import ast
+from functools import partial
 import json
 import re
 from pathlib import Path
@@ -11,12 +14,18 @@ import numpy as np
 import pytest
 import torch
 
-from mouse_core.data import Augmenter, Datastore, EventLog, Tokenizer, compose, pack_token_batch
+from mouse_core.data import EnvironmentProtocol, Augmenter, Datastore, EventLog, Tokenizer, compose, pack_token_batch
 from mouse_core.data.event_transform import environment_decisions, latest_environment_decision
 from mouse_gym import RepeatTaskTracker
 from mouse_core.models import action_readouts, select_discrete_action
 from mouse_core.models.kv_policy import cache_needs_rebuild, rebuild_starts, resolve_cache_bounds
 from mouse_core.objectives import DqnObjective, boundary_discount
+
+
+FROZENLAKE_PROTOCOL = EnvironmentProtocol(
+    episode_start="_episode_start", terminated="_terminated", truncated="_truncated",
+)
+read_frozenlake = partial(environment_decisions, protocol=FROZENLAKE_PROTOCOL)
 
 
 EXAMPLES = Path(__file__).parents[1] / 'examples'
@@ -85,9 +94,8 @@ def _collect_outputs(filename, outputs, *, oracle_values=True, inference_chunks=
     env = Env()
     cache = SimpleNamespace(close=lambda: None, reset_rows=lambda **kw: None)
     def encoder(batch, **kwargs):
-        head_steps = np.unique(batch.head_step_ids)
-        counts = np.bincount(batch.step_sequence_ids[head_steps], minlength=batch.B)
-        return {'z': torch.tensor([0., 0., 1., 0.]).expand(batch.B, int(counts.max()), 4),
+        counts = np.bincount(batch["sequence_ids"][batch["head_token_mask"]], minlength=batch["num_sequences"])
+        return {'z': torch.tensor([0., 0., 1., 0.]).expand(batch["num_sequences"], int(counts.max()), 4),
                 'cache': cache}
 
     namespace.update(EventLog=EventLog, RepeatTaskTracker=RepeatTaskTracker, gym=gym,
@@ -139,7 +147,7 @@ def _collect_outputs(filename, outputs, *, oracle_values=True, inference_chunks=
     if filename.startswith('15_'):
         history = [event for step in namespace['eval_contexts'][0] for event in step]
         assert history == log.events[-len(history):]
-    return log, list(environment_decisions(log.to_dataset()))
+    return log, list(read_frozenlake(log.to_dataset()))
 
 
 @pytest.mark.parametrize('ending', [
@@ -153,9 +161,9 @@ def test_collector_logs_oracle_values_only_when_an_action_is_requested(ending):
         (2, 0., False, False, False, False),
     ])
     for row in rows:
-        assert ('q_star' in row) == row.get('action_requested', False)
+        assert ('_q_star' in row) == row.get('action_requested', False)
     payloads = [event['payload'] for event in log if event['provider'] == 'environment']
-    assert ['q_star' in payload for payload in payloads] == [True, False, True]
+    assert ['_q_star' in payload for payload in payloads] == [True, False, True]
     assert [payload.get('repeat_episode_index') for payload in payloads] == [
         0, None, 0 if ending[2] or ending[3] else 1,
     ]
@@ -222,7 +230,7 @@ def test_collector_uses_constant_oracle_probability_only_for_requested_actions(p
         exec(compile(source, '<collector>', 'exec'), namespace)
     assert len(draws) == 5
     assert random_samples == [i for i, action in enumerate(expected_actions) if action == 0]
-    decisions = list(environment_decisions(log.to_dataset()))
+    decisions = list(read_frozenlake(log.to_dataset()))
     assert [row.get('action') for row in decisions] == [
         None, expected_actions[0], expected_actions[1], None, expected_actions[2],
         None, expected_actions[3], None, expected_actions[4],
@@ -256,8 +264,8 @@ def test_collectors_save_repeat_indices_only_on_inner_resets(filename):
     dataset = log.to_store().to_dataset()
     persisted = EventLog.from_dataset(dataset)
     outputs = [event['payload'] for event in persisted.events if event['provider'] == 'coordinator']
-    replayed = list(environment_decisions(dataset))
-    assert outputs == [{'episode_start': True}, {'episode_start': True}]
+    replayed = list(read_frozenlake(dataset))
+    assert outputs == [{'_episode_start': True}, {'_episode_start': True}]
     assert persisted.events == log.events
     assert all('repeat_episode_index' not in event['payload']
                for event in persisted if event['provider'] != 'environment')
@@ -289,12 +297,12 @@ def test_frozenlake_collectors_omit_zero_rewards_and_false_flags(filename):
     assert ['reward' in output for output in outputs] == [False, False, True]
     assert outputs[-1]['reward'] == 1.
     for event in persisted:
-        for field in ('episode_start', 'terminated', 'truncated',
+        for field in ('_episode_start', '_terminated', '_truncated',
                       'inner_terminated', 'inner_truncated'):
             if field in event['payload']:
                 assert event['payload'][field] is True
     assert [row.get('reward', 0.) for row in live_rows] == [0., 0., 1.]
-    assert [row.get('action') for row in environment_decisions(persisted.to_dataset())] == [None, 2, 2]
+    assert [row.get('action') for row in read_frozenlake(persisted.to_dataset())] == [None, 2, 2]
 
 
 class _CharacterTokenizer:
@@ -353,11 +361,11 @@ def test_tokenizers_render_saved_repeat_indices_and_preserve_action_masks(filena
     before = json.dumps(log.events, sort_keys=True)
     dataset = log.to_store().to_dataset()
     persisted = EventLog.from_dataset(dataset)
-    rows = list(environment_decisions(log.to_dataset()))
+    rows = list(read_frozenlake(log.to_dataset()))
     transform = _notebook_transform(filename)
     for row in rows:
         if 'grpo' in filename:
-            row.update(advantage=1., old_log_prob=row.get('old_log_prob', 0.))
+            row.update(advantage=1., _old_log_prob=row.get('_old_log_prob', 0.))
     steps = transform(log)
     assert [int(step.head_token_mask.sum()) for step in steps] == [1, 1, 0, 1, 0]
 
@@ -375,7 +383,7 @@ def test_tokenizers_render_saved_repeat_indices_and_preserve_action_masks(filena
     assert [row.get('repeat_episode_index') for row in rows] == [7, None, None, 12, None]
     assert json.dumps(log.events, sort_keys=True) == before
     assert json.dumps(persisted.events, sort_keys=True) == before
-    assert [row.get('repeat_episode_index') for row in environment_decisions(dataset)] == [
+    assert [row.get('repeat_episode_index') for row in read_frozenlake(dataset)] == [
         7, None, None, 12, None,
     ]
     replay_steps = _notebook_transform(filename)(persisted)
@@ -383,12 +391,12 @@ def test_tokenizers_render_saved_repeat_indices_and_preserve_action_masks(filena
     assert [int(step.head_token_mask.sum()) for step in replay_steps] == [1, 1, 0, 1, 0]
     assert json.dumps(persisted.events, sort_keys=True) == before
     for start in (0, 1):
-        batch, labels, _ = pack_token_batch(steps=steps[start:], sequence_ids=[0] * (len(steps) - start),
+        batch, labels = pack_token_batch(steps=steps[start:], sequence_ids=[0] * (len(steps) - start),
                                             batch_size=1, continuing=None)
-        assert markers(batch.token_ids) == (['episode 8\n', 'episode 13\n'] if start == 0 else ['episode 13\n'])
+        assert markers(batch['token_ids']) == (['episode 8\n', 'episode 13\n'] if start == 0 else ['episode 13\n'])
         if 'cosine' in filename:
             assert 'episode_reset' not in labels
-            assert labels['action_executed'].tolist() == [False, True, True, False, True][start:]
+            assert (~torch.isnan(labels["action"])).tolist() == [False, True, True, False, True][start:]
         if 'sp' in filename:
             # Supervised labels describe the resulting observation, not its incoming request.
             active = ~(labels['terminated'] | labels['truncated']
@@ -408,22 +416,23 @@ def test_rewards_preserve_replay_tokens_labels_and_dqn_updates(filename):
             transform.reseed(generation=7)
         return pack_token_batch(steps=transform(source), sequence_ids=[0, 0, 0], batch_size=1, continuing=None)
 
-    inputs, labels, groups = batch(log)
-    replay_inputs, replay_labels, replay_groups = batch(replayed.to_dataset())
-    np.testing.assert_array_equal(inputs.token_ids, replay_inputs.token_ids)
+    inputs, labels = batch(log)
+    groups = labels["step_sequence_ids"]
+    replay_inputs, replay_labels = batch(replayed.to_dataset())
+    replay_groups = replay_labels["step_sequence_ids"]
+    np.testing.assert_array_equal(inputs['token_ids'], replay_inputs['token_ids'])
     assert labels['reward'].tolist() == [0., 0., 1.]
-    for key in labels:
-        torch.testing.assert_close(labels[key], replay_labels[key])
+    for key in labels.keys():
+        torch.testing.assert_close(labels[key], replay_labels[key], equal_nan=True)
     torch.testing.assert_close(groups, replay_groups)
     assert 'reward' not in rows[0]
     assert encode(log)[0].objective_fields['reward'] == 0.
 
     objective = DqnObjective(reward=None, value=None, gate=None, temperature=0.,
-        discount=boundary_discount(gamma_step=.9, gamma_terminated=0., gamma_truncated=0.),
-        cross_group_backups='fault')
-    predictions = torch.arange(inputs.P * 4, dtype=torch.float32).reshape(inputs.P, 4).requires_grad_()
+        discount=boundary_discount(gamma_step=.9, gamma_terminated=0., gamma_truncated=0.))
+    predictions = torch.arange(inputs["head_token_mask"].nonzero(as_tuple=True)[0].shape[0] * 4, dtype=torch.float32).reshape(inputs["head_token_mask"].nonzero(as_tuple=True)[0].shape[0], 4).requires_grad_()
     backup = predictions.detach() / 3
-    losses, _ = objective(objective_data=labels, group_id=groups, predictions=predictions,
+    losses, _ = objective(objective_data=labels, group_id=groups, head_step_ids=labels["head_step_ids"],  predictions=predictions,
         backup_value_predictions=backup, backup_action_predictions=backup)
     assert torch.isfinite(losses['action_value'])
     losses['action_value'].backward()
@@ -436,9 +445,9 @@ def test_rewards_preserve_replay_tokens_labels_and_dqn_updates(filename):
 def test_other_frozenlake_tokenizers_encode_events(filename):
     log, _ = _frozenlake_episode('01_collect_dataset.ipynb')
     transform = _notebook_transform(filename)
-    inputs, labels, _ = pack_token_batch(steps=transform(log.to_dataset()),
+    inputs, labels = pack_token_batch(steps=transform(log.to_dataset()),
         sequence_ids=[0, 0, 0], batch_size=1, continuing=None)
-    assert inputs.N == 3
+    assert labels["step_sequence_ids"].shape[0] == 3
     expected = {'action', 'advantage', 'old_log_prob'} if 'grpo' in filename else {'q_star'}
     assert expected <= labels.keys()
     if 'grpo' not in filename:
@@ -469,7 +478,7 @@ def test_existing_collector_records_events(filename):
             dataset = store.to_dataset()
             assert set(dataset.column_names) == {'provider', 'payload', 'episode_index', 'step_index'}
             log = EventLog.from_dataset(dataset)
-            decisions = list(environment_decisions(dataset))
+            decisions = list((read_frozenlake if filename.startswith("01_") else environment_decisions)(dataset))
             assert len(decisions) == 12
             assert len(log) > len(decisions)
             assert 'action' not in decisions[0]
@@ -482,14 +491,14 @@ def test_existing_collector_records_events(filename):
                 assert all('observation' not in row for row in decisions)
                 assert all(not any(key.startswith('repeat_episode') for key in row) for row in decisions)
                 transform = _notebook_transform('18_train_offline_cartpole_dqn.ipynb')
-                inputs, labels, _ = pack_token_batch(
+                inputs, labels = pack_token_batch(
                     steps=transform(dataset),
                     sequence_ids=[row['episode_index'] for row in decisions],
                     batch_size=len({row['episode_index'] for row in decisions}), continuing=None,
                 )
-                assert int(inputs.numeric_mask.sum()) == 2 * len(decisions)
+                assert int(inputs['numeric_mask'].sum()) == 2 * len(decisions)
                 # Physical action ids are preserved by the training pipeline.
-                assert labels['action'].tolist() == [row.get('action') or 0 for row in decisions]
+                torch.testing.assert_close(labels['action'], torch.tensor([float('nan') if row.get('action') is None else row['action'] for row in decisions], dtype=torch.float64), equal_nan=True)
 
     finally:
         if 'env' in namespace: namespace['env'].close()

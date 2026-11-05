@@ -34,7 +34,7 @@ def compose(*, stages: Sequence[Callable[[Any], Any]]) -> _Compose:
     forwards to any stage that defines ``reseed`` (e.g.
     :class:`~mouse_core.data.augmenter.Augmenter`). ``DataLoader`` calls it
     once per sampled segment with a generation unique to that segment:
-    ``batch_index * batch_size * (budget + 1) + fill * (budget + 1) + attempt``,
+    ``batch_index * (budget + 1) + attempt``,
     where ``budget`` is ``events_budget`` or ``token_budget``.
 
     Train includes the augmenter; eval leaves it out so the model sees raw

@@ -9,10 +9,10 @@ breakdown after warmup. Decode is ``decode_kernel="flex"`` only.
 ``torch.set_float32_matmul_precision("high")`` is set so fp32 matches the
 README TF32 path.
 
-    PYTHON_GIL=0 .venv/bin/python bench/bench_inference.py --layers 8 --step 1
-    PYTHON_GIL=0 .venv/bin/python bench/bench_inference.py --layers 28 --workloads mid long --step 1
-    PYTHON_GIL=0 .venv/bin/python bench/bench_inference.py --no-lora --step 1
-    PYTHON_GIL=0 .venv/bin/python bench/bench_inference.py --layers 8 --step 1 --profile --workloads short
+    .venv/bin/python bench/bench_inference.py --layers 8 --step 1
+    .venv/bin/python bench/bench_inference.py --layers 28 --workloads mid long --step 1
+    .venv/bin/python bench/bench_inference.py --no-lora --step 1
+    .venv/bin/python bench/bench_inference.py --layers 8 --step 1 --profile --workloads short
 
 Default shape is Qwen3-0.6B (hidden 1024, 16 q / 8 kv heads, head_dim 128,
 FFN 3072) with fp32 LoRA rank 16 on a frozen bf16 base; ``--layers`` trims the
@@ -136,7 +136,7 @@ def main() -> None:
     lora = None if args.no_lora else LoRAConfig(rank=16, alpha=32.0)
     dtype = torch.float32 if lora is None else torch.bfloat16
     backbone = Backbone(
-        train_kernel="varlen",
+        train_kernel="flex",
         decode_kernel="flex",
         dtype=dtype,
         hidden_dim=args.hidden,

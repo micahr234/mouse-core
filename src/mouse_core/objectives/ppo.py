@@ -9,16 +9,13 @@ import torch.nn.functional as F
 
 from mouse_core.objectives._actions import canonical_actions, executed_actions
 
-from mouse_core.objectives.dqn import _expand_policy_readouts, _validate_request_actions, _validate_missing_bootstrap
+from mouse_core.objectives.dqn import _expand_policy_readouts, _validate_request_actions
 from mouse_core.objectives.base import Objective, _reject_predictions, _require_prediction
 from mouse_core.objectives.dqn import (
-    CrossGroupBackups,
     _pair_weight,
     _raise_if_cross_group_backup,
     _require_action_ids,
-    _require_cross_group_backups,
     _require_done_flags,
-    _require_step_aligned_predictions,
     _weighted_mean,
     _zero_off_data_factor_scan,
 )
@@ -66,10 +63,11 @@ def _gae_advantages(
     discounts: torch.Tensor,
     valid: torch.Tensor,
     gae_lambda: float,
-    cross_group_backups: CrossGroupBackups,
     readout: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Generalized advantage estimation over valid consecutive pairs.
+
+    An advantage requiring a value beyond its sampled group always raises.
 
     Args:
         rewards: ``[N-1]`` rewards for transitions out of states ``0..N-2``.
@@ -78,19 +76,6 @@ def _gae_advantages(
         valid: ``[N-1]`` mask — False at run boundaries (different
             ``group_id``).
         gae_lambda: GAE λ.
-        cross_group_backups: ``"bootstrap"``, ``"ignore"``, or ``"fault"``.
-            For any horizon, the last step of an episode is not updated when
-            its advantage depends on the next step's value. It is updated
-            when the advantage does not. ``"bootstrap"`` fills ``V`` on
-            the step before a group boundary (a state whose next step is
-            not an in-run pair: end of the batch, or a run break) and
-            keeps the step. ``"ignore"`` leaves that off-data ``V`` out
-            of the advantage and drops the step when the factor on it is
-            non-zero. ``"fault"`` raises on that step instead. A zero
-            factor leaves the value out of the advantage, so the step
-            stays and ``"fault"`` does not raise. ``V`` at a state that
-            still has a later in-run step is unchanged. A ``0`` discount
-            (true terminal) removes the value either way.
 
     Returns:
         ``(advantages, returns, participate)`` each ``[N-1]``. Advantages
@@ -100,7 +85,6 @@ def _gae_advantages(
         zero. ``participate`` is ``1`` for a step that stays in the loss
         and in logged metrics.
     """
-    cross_group_backups = _require_cross_group_backups(cross_group_backups)
     with torch.no_grad():
         values = values.detach()
         T = rewards.shape[0]
@@ -114,20 +98,17 @@ def _gae_advantages(
         sampled = torch.zeros(T, dtype=torch.bool, device=device)
         if T > 1:
             sampled[:-1] = valid[1:]
-        if cross_group_backups != "bootstrap":
-            next_values = torch.where(
-                sampled, next_values, torch.zeros_like(next_values)
-            )
-            # λ = 0 does not carry a later cutoff value. A non-zero λ does,
-            # and that factor drops the step when the value is off-data.
-            carries = sampled & (trace != 0)
-            participate = _zero_off_data_factor_scan(
-                discount=discounts,
-                in_sample=sampled,
-                carries=carries,
-            )
-        else:
-            participate = torch.ones(T, dtype=dtype, device=device)
+        next_values = torch.where(
+            sampled, next_values, torch.zeros_like(next_values)
+        )
+        # λ = 0 does not carry a later cutoff value. A non-zero λ does,
+        # and that factor drops the step when the value is off-data.
+        carries = sampled & (trace != 0)
+        participate = _zero_off_data_factor_scan(
+            discount=discounts,
+            in_sample=sampled,
+            carries=carries,
+        )
         advantages = torch.zeros(T, device=device, dtype=dtype)
         gae = torch.zeros((), device=device, dtype=dtype)
         for t in range(T - 1, -1, -1):
@@ -136,8 +117,7 @@ def _gae_advantages(
             gae = torch.where(valid[t], gae, torch.zeros_like(gae))
             advantages[t] = gae
         returns = advantages + values[:-1]
-    if cross_group_backups == "fault":
-        _raise_if_cross_group_backup(in_run=valid, participate=participate)
+    _raise_if_cross_group_backup(in_run=valid, participate=participate)
     return advantages, returns, participate
 
 
@@ -181,10 +161,9 @@ class PpoObjective(Objective[...]):
     Discounts match ``DqnObjective``:
     ``discount(**objective_data)``.
 
-    Packing nullable ``action`` fields derives the batch mask ``action_executed``
-    marking incoming actions that actually ran; raw rows do not need that field.
-    False entries have no policy loss, entropy, or probability statistics; their
-    integer placeholders and behavior log-probabilities are ignored. Value/GAE
+    Missing actions are NaN in the packed action tensor. These transitions
+    have no policy loss, entropy, or probability statistics; their behavior
+    log-probabilities are ignored. Value/GAE
     learning still follows these action-independent transitions and their rewards.
 
     ``truncated`` and ``old_log_prob`` are objective columns only — not
@@ -202,12 +181,13 @@ class PpoObjective(Objective[...]):
                 {"input_field": "old_log_prob"},
             ],
         )
-        from mouse_core.data import to_device
-        inputs, objective_data, group_id = loader.next_batch()
+        inputs, objective_data = loader.next_batch()
+        group_id = objective_data.to(device)["step_sequence_ids"]
         out = model(inputs)
         losses, metrics = objective(
-            objective_data=to_device(data=objective_data, device=device),
+            objective_data=objective_data.to(device),
             group_id=group_id.to(device),
+            head_step_ids=objective_data.to(device)["head_step_ids"],
             predictions=out["predictions"]["action"],
             value_predictions=out["predictions"]["value"],
         )
@@ -236,21 +216,6 @@ class PpoObjective(Objective[...]):
             any ``value(value=..., **objective_data)`` returning the same
             shape is accepted.
         gae_lambda: GAE λ (``1.0`` = Monte Carlo returns within the discount).
-        cross_group_backups: Required. ``"bootstrap"``, ``"ignore"``, or
-            ``"fault"``. For any horizon, the last step of an episode is not
-            updated when its advantage depends on the next step's value.
-            It is updated when the advantage does not. ``"bootstrap"``
-            fills ``V`` on the step before a group boundary (the end of
-            the batch, or a ``group_id`` break: a chunk boundary, time
-            limit, or truncation whose rest was not sampled), so that
-            step is updated from ``V`` and stays. ``"ignore"`` leaves
-            that off-data ``V`` out of the advantage and leaves the step
-            out of the loss and out of logged metrics when the factor on
-            it is non-zero. ``"fault"`` raises on that step instead. A
-            terminated or truncated γ of ``0``, or a horizon that puts no weight on
-            that value, does not depend on it, so the step stays and
-            ``"fault"`` does not raise. ``V`` at a state that still has
-            a later in-run step is unchanged.
         clip_eps: PPO ratio clip ε.
         vf_coef: Weight on the value-function MSE term.
         ent_coef: Weight on the policy entropy bonus (subtracted from the loss).
@@ -269,7 +234,6 @@ class PpoObjective(Objective[...]):
         reward: Reward | None,
         value: Value | None,
         gae_lambda: float = 0.95,
-        cross_group_backups: CrossGroupBackups,
         clip_eps: float = 0.2,
         vf_coef: float = 0.5,
         ent_coef: float = 0.01,
@@ -284,9 +248,6 @@ class PpoObjective(Objective[...]):
         self.reward = _require_transform(reward, name="reward")
         self.value = _require_transform(value, name="value")
         self.gae_lambda = gae_lambda
-        self.cross_group_backups: CrossGroupBackups = _require_cross_group_backups(
-            cross_group_backups
-        )
         self.clip_eps = clip_eps
         self.vf_coef = vf_coef
         self.ent_coef = ent_coef
@@ -303,6 +264,7 @@ class PpoObjective(Objective[...]):
         *,
         objective_data: dict[str, torch.Tensor],
         group_id: torch.Tensor,
+        head_step_ids: torch.Tensor,
         predictions: torch.Tensor,
         value_predictions: torch.Tensor,
         _tensor_metrics: bool = False,
@@ -314,6 +276,7 @@ class PpoObjective(Objective[...]):
         *,
         objective_data: dict[str, torch.Tensor],
         group_id: torch.Tensor,
+        head_step_ids: torch.Tensor,
         predictions: torch.Tensor,
         value_predictions: torch.Tensor,
         backup_value_predictions: None = None,
@@ -327,6 +290,7 @@ class PpoObjective(Objective[...]):
         *,
         objective_data: dict[str, torch.Tensor],
         group_id: torch.Tensor,
+        head_step_ids: torch.Tensor,
         predictions: torch.Tensor,
         backup_value_predictions: torch.Tensor | None = None,
         backup_action_predictions: torch.Tensor | None = None,
@@ -370,6 +334,8 @@ class PpoObjective(Objective[...]):
                 losses, metrics = self(
                     objective_data=head_data,
                     group_id=group_id,
+                    head_step_ids=head_step_ids,
+
                     predictions=logits[:, head, :],
                     value_predictions=values_raw[:, head],
                     _tensor_metrics=True,
@@ -390,8 +356,8 @@ class PpoObjective(Objective[...]):
                 f"got {tuple(logits.shape)}."
             )
         original_data = objective_data
-        logits, objective_data, readout = _expand_policy_readouts(objective_data, logits, who="PPO")
-        values_raw, _, _ = _expand_policy_readouts(original_data, values_raw, who="PPO")
+        logits, objective_data, readout = _expand_policy_readouts(objective_data, logits, head_step_ids=head_step_ids, n_steps=group_id.numel(), who="PPO")
+        values_raw, _, _ = _expand_policy_readouts(original_data, values_raw, head_step_ids=head_step_ids, n_steps=group_id.numel(), who="PPO")
         N, A = logits.shape
         device = cast(torch.device, logits.device)
         dtype = cast(torch.dtype, logits.dtype)
@@ -424,24 +390,18 @@ class PpoObjective(Objective[...]):
             raise ValueError("Not enough valid steps in data for PPO (need N >= 2).")
 
         action = objective_data[self.action_key]
-        if action.dtype != torch.int64:
-            raise TypeError(f"action must be int64, got {action.dtype}.")
         if action.ndim != 1:
             raise ValueError(
                 f"PPO objective expects action shape [N], got {tuple(action.shape)}."
             )
-        _require_step_aligned_predictions(
-            objective_data, n_pred=N, n_steps=int(action.shape[0]), who="PPO"
-        )
         if action.shape != torch.Size([N]):
             raise ValueError(
                 f"PPO objective expects action shape [{N}], got {tuple(action.shape)}."
             )
-        executed = executed_actions(objective_data, action)
+        executed = executed_actions(action)
         _validate_request_actions(readout, executed, group_id)
-        action = canonical_actions(objective_data, action)
+        action = canonical_actions(action)
         _require_action_ids(action, A)
-        objective_data = {**objective_data, self.action_key: action}
 
         reward = _apply_transform(
             transform=self.reward,
@@ -490,7 +450,6 @@ class PpoObjective(Objective[...]):
             device=device,
             identity=torch.ones(N, dtype=dtype, device=device),
         )
-        _validate_missing_bootstrap(readout, discount_all, group_id, self.cross_group_backups)
         values = values.masked_fill(~readout, 0)
         curr_values = values[:-1]
         discounts = discount_all[1:]
@@ -502,7 +461,7 @@ class PpoObjective(Objective[...]):
             valid=valid,
             gae_lambda=self.gae_lambda,
             readout=readout,
-            cross_group_backups=self.cross_group_backups,
+
         )
         pair_weight = pair_weight * participate * readout[:-1]
         valid = pair_weight > 0

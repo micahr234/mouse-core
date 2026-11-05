@@ -119,7 +119,7 @@ def test_fourier_initial_norm_matches_token_table(monkeypatch, hidden_dim, num_f
 def test_embedding_trainability_is_independent_of_backbone_lora():
     embedding = Embedding(hidden_dim=8, vocab_size=16, numeric_field_names=("sensor.value",), num_frequencies=2)
     backbone = Backbone(architecture="qwen3", hidden_dim=8, num_layers=1,
-                        num_heads=2, train_kernel="reference", decode_kernel="flex",
+                        num_heads=2, train_kernel="flex", decode_kernel="flex",
                         dtype=torch.bfloat16, lora=LoRAConfig(rank=2))
     assert any(not p.requires_grad for p in backbone.parameters())
     assert all(p.requires_grad for p in embedding.parameters())

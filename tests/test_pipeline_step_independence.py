@@ -129,14 +129,14 @@ def test_tokenizer_full_matches_per_step_concat() -> None:
         tokenizers={"default": IntIdTokenizer()},
     )
     rows = _rows()
-    full, full_obj, _sid = pack_token_batch(steps=[encode_measurement(tokenizer, step) for step in rows], continuing=None)
+    full, full_obj = pack_token_batch(steps=[encode_measurement(tokenizer, step) for step in rows], continuing=None)
     head = [encode_measurement(tokenizer, s) for s in rows[:3]]
     tail = [encode_measurement(tokenizer, s) for s in rows[3:]]
-    cat, cat_obj, _sid = pack_token_batch(steps=head + tail, continuing=None)
-    assert np.array_equal(full.numeric_mask, cat.numeric_mask)
-    assert np.array_equal(full.token_ids, cat.token_ids)
-    assert np.allclose(full.numeric_values, cat.numeric_values)
-    assert np.array_equal(full.sequence_ids, cat.sequence_ids)
-    assert np.array_equal(full.head_token_ids, cat.head_token_ids)
+    cat, cat_obj = pack_token_batch(steps=head + tail, continuing=None)
+    assert np.array_equal(full['numeric_mask'], cat['numeric_mask'])
+    assert np.array_equal(full['token_ids'], cat['token_ids'])
+    assert np.allclose(full['numeric_values'], cat['numeric_values'])
+    assert np.array_equal(full['sequence_ids'], cat['sequence_ids'])
+    assert np.array_equal(full["head_token_mask"].nonzero(as_tuple=True)[0], cat["head_token_mask"].nonzero(as_tuple=True)[0])
     for key in ("action", "observation", "reward", "repeat_episode_done", "episode_done"):
         assert torch.equal(full_obj[key], cat_obj[key])

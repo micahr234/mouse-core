@@ -1,4 +1,7 @@
 """Direct latent matching and combined DQN example gradient contracts."""
+from tensordict import TensorDict
+
+from tests._prediction_layout import fixture_head_steps
 
 import json
 from pathlib import Path
@@ -174,10 +177,12 @@ def test_batched_direct_cosine_requires_explicit_mode_and_aligned_shapes() -> No
         )
 
 
+@pytest.mark.flex_training
 def test_offline_dqn_cosine_example(monkeypatch):
     import ast
     from mouse_core import AdamW, polyak_update
-    from mouse_core.data import DataLoader, to_device
+    from mouse_core.data import DataLoader, EnvironmentProtocol, environment_episode_ranges
+    from functools import partial
     from mouse_core.objectives import DqnObjective, boundary_discount
     from copy import deepcopy
     from torch import nn
@@ -189,7 +194,8 @@ def test_offline_dqn_cosine_example(monkeypatch):
     namespace: dict[str, Any] = dict(
         torch=torch, nn=nn, MultiEmbedding=MultiEmbedding, Model=Model, MLP=MLP, DecodeCache=DecodeCache,
         prepare_decode=prepare_decode, AdamW=AdamW, polyak_update=polyak_update,
-        DataLoader=DataLoader, to_device=to_device, DqnObjective=DqnObjective,
+        DataLoader=DataLoader, DqnObjective=DqnObjective,
+        partial=partial, EnvironmentProtocol=EnvironmentProtocol, environment_episode_ranges=environment_episode_ranges,
         boundary_discount=boundary_discount, CosineObjective=CosineObjective, Path=Path,
     )
     definitions: list[ast.stmt] = [node for node in ast.parse(
@@ -213,12 +219,12 @@ def test_offline_dqn_cosine_example(monkeypatch):
     monkeypatch.setitem(namespace, "Embedding", make_embedding)
     monkeypatch.setitem(namespace, "Backbone", make_backbone)
     encoder = namespace["Encoder"](
-        pretrained="local-test", tokenizer_sources={"text": "local-test"}, train_kernel="reference", decode_kernel="flex",
+        pretrained="local-test", tokenizer_sources={"text": "local-test"}, train_kernel="flex", decode_kernel="flex",
         dtype=torch.float32,
     )
     assert construction == [
         ("embedding", "local-test"),
-        ("backbone", "local-test", "reference", "flex", torch.float32),
+        ("backbone", "local-test", "flex", "flex", torch.float32),
     ]
     q_head = namespace["QHead"](hidden_dim=8, num_actions=3, num_layers=1, scale=0.1)
     assert q_head.mlp.in_features == q_head.mlp.hidden_dim == 8
@@ -233,6 +239,9 @@ def test_offline_dqn_cosine_example(monkeypatch):
         assert block.in_features == 8
         assert block.num_layers == 2 and block.hidden_dim == 32 and block.scale is None
     assert isinstance(transition.output_norm, nn.RMSNorm)
+    encoder.to(torch.get_default_device())
+    q_head.to(torch.get_default_device())
+    transition.to(torch.get_default_device())
     delayed_encoder = deepcopy(encoder).requires_grad_(False).eval()
     backup_value_head = deepcopy(q_head).requires_grad_(False).eval()
     namespace.update(
@@ -242,8 +251,10 @@ def test_offline_dqn_cosine_example(monkeypatch):
     settings = ast.parse("".join(notebook["cells"][1]["source"]))
     assignments: list[ast.stmt] = [node for node in settings.body if isinstance(node, ast.Assign)]
     exec(compile(ast.Module(body=assignments, type_ignores=[]), str(path), "exec"), namespace)
-    namespace["device"] = torch.device("cpu")
-    exec(compile("".join(notebook["cells"][9]["source"]), str(path), "exec"), namespace)
+    namespace["device"] = torch.get_default_device()
+    training_source = next("".join(cell["source"]) for cell in notebook["cells"]
+                           if cell["cell_type"] == "code" and "def run_train(" in "".join(cell["source"]))
+    exec(compile(training_source, str(path), "exec"), namespace)
     tokens = _tokens(0, 1, 2, 0, 1)
     data = {
         "action": torch.tensor([0, 1, 2, 0, 1]),
@@ -255,13 +266,13 @@ def test_offline_dqn_cosine_example(monkeypatch):
     group_id = torch.tensor([0, 0, 0, 1, 1])
     out, target = encoder(tokens), delayed_encoder(tokens)
     dqn_losses, _ = namespace["objective"](
-        objective_data=data, group_id=group_id, predictions=q_head(out["z"]),
+        objective_data=data, group_id=group_id, head_step_ids=fixture_head_steps(data),  predictions=q_head(out["z"]),
         backup_value_predictions=backup_value_head(target["z"]),
         backup_action_predictions=q_head(target["z"]).detach(),
     )
     losses, _ = namespace["cosine_objective"].latent_cosine_loss(
         transition=transition, predictions=out["z"], targets=target["z"],
-        reset_key="episode_reset", objective_data=data, group_id=group_id,
+        reset_key="episode_reset", objective_data=data, group_id=group_id, head_step_ids=fixture_head_steps(data),
     )
     for loss, trained, untrained in (
         (torch.stack(tuple(dqn_losses.values())).sum(), (encoder.embedding, encoder.backbone, q_head), (transition,)),
@@ -282,7 +293,7 @@ def test_offline_dqn_cosine_example(monkeypatch):
     namespace["cosine_objective"].latent_cosine_loss(
         transition=transition, predictions=out["z"], targets=target["z"],
         reset_key="episode_reset", objective_data=data,
-        group_id=torch.zeros_like(group_id),
+        group_id=torch.zeros_like(group_id), head_step_ids=fixture_head_steps(data),
     )
     handle.remove()
     torch.testing.assert_close(captured[0][0], out["z"][[0, 1, 3]])
@@ -319,7 +330,7 @@ def test_offline_dqn_cosine_example(monkeypatch):
 
     class Loader:
         def next_batch(self):
-            return tokens, data, group_id
+            return tokens, TensorDict(dict(data, head_step_ids=torch.arange(len(group_id), device=group_id.device), step_sequence_ids=group_id), batch_size=[])
 
     before = [p.detach().clone() for p in transition.parameters()]
     namespace["loader"] = Loader()
@@ -330,7 +341,7 @@ def test_offline_dqn_cosine_example(monkeypatch):
     empty, _ = namespace["cosine_objective"].latent_cosine_loss(
         transition=transition, predictions=encoder(tokens)["z"], targets=delayed_encoder(tokens)["z"],
         reset_key="episode_reset",
-        objective_data=data, group_id=torch.arange(5),
+        objective_data=data, group_id=torch.arange(5), head_step_ids=fixture_head_steps(data),
     )
     assert empty["cosine"].item() == 0
     empty["cosine"].backward()
@@ -371,7 +382,7 @@ def test_sequential_cosine_pairs_boundaries_masks_and_detaches_targets():
 
     losses, _ = CosineObjective(mask_key="skip").latent_cosine_loss(
         objective_data=data, predictions=z, targets=target,
-        group_id=torch.tensor([0, 0, 0, 0, 0, 0, 1, 1]),
+        group_id=torch.tensor([0, 0, 0, 0, 0, 0, 1, 1]), head_step_ids=fixture_head_steps(data),
         transition=transition, reset_key="reset",
     )
     torch.testing.assert_close(captured[0][0], z[[0, 6]])
@@ -394,7 +405,7 @@ def test_sequential_cosine_without_pairs_does_not_call_transition(n):
             "terminated": torch.zeros(n, dtype=torch.bool),
             "truncated": torch.zeros(n, dtype=torch.bool),
         },
-        predictions=z, targets=z.detach(), group_id=torch.zeros(n, dtype=torch.long),
+        predictions=z, targets=z.detach(), group_id=torch.zeros(n, dtype=torch.long), head_step_ids=fixture_head_steps({'action': torch.zeros(n, dtype=torch.long), 'terminated': torch.zeros(n, dtype=torch.bool), 'truncated': torch.zeros(n, dtype=torch.bool)}),
         transition=transition, reset_key=None,
     )
     assert losses["cosine"].item() == 0
@@ -412,12 +423,11 @@ def test_sequential_cosine_skips_unexecuted_placeholder_actions():
 
     losses, _ = CosineObjective(mask_key=None).latent_cosine_loss(
         objective_data={
-            "action": torch.tensor([999, 999, 1]),
-            "action_executed": torch.tensor([False, False, True]),
+            "action": torch.where((torch.tensor([False, False, True])).bool(), (torch.tensor([999, 999, 1])).to(torch.float64), float("nan")),
             "terminated": torch.zeros(3, dtype=torch.bool),
             "truncated": torch.zeros(3, dtype=torch.bool),
         },
-        predictions=z, targets=z.detach(), group_id=torch.zeros(3, dtype=torch.int64),
+        predictions=z, targets=z.detach(), group_id=torch.zeros(3, dtype=torch.int64), head_step_ids=fixture_head_steps({'action': torch.where(torch.tensor([False, False, True]).bool(), torch.tensor([999, 999, 1]).to(torch.float64), float('nan')), 'terminated': torch.zeros(3, dtype=torch.bool), 'truncated': torch.zeros(3, dtype=torch.bool)}),
         transition=transition, reset_key=None,
     )
     torch.testing.assert_close(captured[0], torch.tensor([1]))
@@ -456,7 +466,7 @@ def test_batched_latent_cosine_matches_independent_heads_and_gradients(
 
     losses, metrics = CosineObjective(mask_key="skip", batched_heads=True).latent_cosine_loss(
         objective_data=data, predictions=predictions, targets=targets,
-        group_id=groups, transition=transition, reset_key=None,
+        group_id=groups, head_step_ids=fixture_head_steps(data),  transition=transition, reset_key=None,
     )
     assert losses["cosine"].shape == (2,)
     assert captured[0][0].ndim == 2 and captured[0][1].ndim == 1
@@ -472,7 +482,7 @@ def test_batched_latent_cosine_matches_independent_heads_and_gradients(
             objective_data={**data, "skip": mask if shared_mask else mask[:, head]},
             predictions=predictions[:, head],
             targets=targets if shared_targets else targets[:, head],
-            group_id=groups, transition=transition, reset_key=None,
+            group_id=groups, head_step_ids=fixture_head_steps({**data, 'skip': mask if shared_mask else mask[:, head]}),  transition=transition, reset_key=None,
         )
         expected.append(single["cosine"])
     expected_losses = torch.stack(expected)
@@ -499,7 +509,7 @@ def test_batched_latent_cosine_empty_head_and_no_pairs() -> None:
     objective = CosineObjective(mask_key="skip", batched_heads=True)
     losses, _ = objective.latent_cosine_loss(
         objective_data=data, predictions=predictions, targets=targets,
-        group_id=torch.zeros(3, dtype=torch.int64), transition=transition,
+        group_id=torch.zeros(3, dtype=torch.int64), head_step_ids=fixture_head_steps(data),  transition=transition,
         reset_key=None,
     )
     assert losses["cosine"].shape == (2,)
@@ -514,7 +524,7 @@ def test_batched_latent_cosine_empty_head_and_no_pairs() -> None:
     isolated = torch.randn(3, 2, 2, requires_grad=True)
     empty, _ = objective.latent_cosine_loss(
         objective_data=data, predictions=isolated, targets=targets,
-        group_id=torch.arange(3), transition=forbidden_transition,
+        group_id=torch.arange(3), head_step_ids=fixture_head_steps(data),  transition=forbidden_transition,
         reset_key=None,
     )
     torch.testing.assert_close(empty["cosine"], torch.zeros(2))
@@ -526,7 +536,7 @@ def test_batched_latent_cosine_readout_expansion_and_action_alignment() -> None:
     predictions = torch.randn(3, 2, 2, requires_grad=True)
     targets = torch.randn(3, 2)
     data = {
-        "head_output_count": torch.tensor([1, 1, 0, 1]),
+        "readout_counts": torch.tensor([1, 1, 0, 1]),
         "action": torch.tensor([0, 2, 3, 4]),
         "terminated": torch.zeros(4, dtype=torch.bool),
         "truncated": torch.zeros(4, dtype=torch.bool),
@@ -539,7 +549,7 @@ def test_batched_latent_cosine_readout_expansion_and_action_alignment() -> None:
 
     losses, _ = CosineObjective(mask_key=None, batched_heads=True).latent_cosine_loss(
         objective_data=data, predictions=predictions, targets=targets,
-        group_id=torch.zeros(4, dtype=torch.int64), transition=transition,
+        group_id=torch.zeros(4, dtype=torch.int64), head_step_ids=fixture_head_steps(data),  transition=transition,
         reset_key=None,
     )
     assert losses["cosine"].shape == (2,)
@@ -547,6 +557,7 @@ def test_batched_latent_cosine_readout_expansion_and_action_alignment() -> None:
     torch.testing.assert_close(captured[0][1], torch.tensor([2, 2]))
 
 
+@pytest.mark.flex_training
 def test_example_zero_weight_omits_transition_and_auxiliary_loss():
     from tests.test_example_modules import _example, EXAMPLES, _tokens
     notebook, ns = _example(EXAMPLES / "21_train_dqn_cosine.ipynb", COSINE_LOSS_WEIGHT=0.0)
@@ -558,7 +569,7 @@ def test_example_zero_weight_omits_transition_and_auxiliary_loss():
     data = dict(action=torch.tensor([0, 1]), reward=torch.tensor([0., 1.]),
                 terminated=torch.tensor([False, True]), truncated=torch.tensor([False, False]))
     from types import SimpleNamespace
-    ns["loader"] = SimpleNamespace(next_batch=lambda: (_tokens(0, 1), data, torch.zeros(2, dtype=torch.long)))
+    ns["loader"] = SimpleNamespace(next_batch=lambda: (_tokens(0, 1), TensorDict(dict(data, head_step_ids=torch.arange(2), step_sequence_ids=torch.zeros(2, dtype=torch.long)), batch_size=[])))
     loss, metrics = ns["run_train"](num_steps=1)
     assert torch.isfinite(loss) and "cosine" not in metrics
     optimized = {id(p) for g in ns["optimizer"].param_groups for p in g["params"]}

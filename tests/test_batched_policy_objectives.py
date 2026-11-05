@@ -1,5 +1,7 @@
 """Independent policy heads match separate scalar objective calls."""
 
+from tests._prediction_layout import fixture_head_steps
+
 import pytest
 import torch
 
@@ -14,12 +16,11 @@ from mouse_core.objectives import (
 
 def _columns() -> tuple[dict[str, torch.Tensor], torch.Tensor]:
     columns = {
-        "action": torch.tensor([-99, 1, 0, 2, -99, 1, 0]),
-        "action_executed": torch.tensor([False, True, True, True, False, True, True]),
+        "action": torch.where((torch.tensor([False, True, True, True, False, True, True])).bool(), (torch.tensor([-99, 1, 0, 2, -99, 1, 0])).to(torch.float64), float("nan")),
         "reward": torch.tensor([0.0, 1.0, 0.5, 0.2, 0.0, 1.5, 0.1]),
         "terminated": torch.tensor([False, False, False, True, False, False, True]),
         "truncated": torch.zeros(7, dtype=torch.bool),
-        "head_output_count": torch.ones(7, dtype=torch.int64),
+        "readout_counts": torch.ones(7, dtype=torch.int64),
     }
     return columns, torch.tensor([0, 0, 0, 0, 1, 1, 1])
 
@@ -42,7 +43,6 @@ def test_batched_ppo_matches_independent_heads_and_gradients(
         ),
         reward=affine_reward(scale=1.0, shift=0.0),
         value=affine_value(scale=1.3, shift=-0.2),
-        cross_group_backups="bootstrap",
         gae_lambda=0.8,
         ent_coef=0.05,
         normalize_advantage=normalize_advantage,
@@ -54,7 +54,7 @@ def test_batched_ppo_matches_independent_heads_and_gradients(
         head_columns = {**columns, "old_log_prob": columns["old_log_prob"][:, head]}
         losses, metrics = objective(
             objective_data=head_columns,
-            group_id=groups,
+            group_id=groups, head_step_ids=fixture_head_steps(head_columns),
             predictions=logits[:, head],
             value_predictions=values[:, head],
         )
@@ -67,7 +67,7 @@ def test_batched_ppo_matches_independent_heads_and_gradients(
 
     losses, metrics = objective(
         objective_data=columns,
-        group_id=groups,
+        group_id=groups, head_step_ids=fixture_head_steps(columns),
         predictions=logits,
         value_predictions=value_predictions,
     )
@@ -124,7 +124,7 @@ def test_batched_grpo_matches_independent_heads_and_gradients(
         }
         losses, metrics = objective(
             objective_data=head_columns,
-            group_id=groups,
+            group_id=groups, head_step_ids=fixture_head_steps(head_columns),
             predictions=logits[:, head],
         )
         scalar_losses.append(losses["grpo"])
@@ -133,7 +133,7 @@ def test_batched_grpo_matches_independent_heads_and_gradients(
     expected_grad = torch.autograd.grad(expected_loss.mean(), logits, retain_graph=True)[0]
 
     losses, metrics = objective(
-        objective_data=columns, group_id=groups, predictions=logits,
+        objective_data=columns, group_id=groups, head_step_ids=fixture_head_steps(columns),  predictions=logits,
     )
     torch.testing.assert_close(losses["grpo"], expected_loss)
     assert losses["grpo"].shape == (3,)
@@ -159,17 +159,16 @@ def test_batched_policy_objectives_reject_empty_or_misaligned_heads(kind: str) -
     if kind == "ppo":
         objective = PpoObjective(
             discount=None, reward=None, value=None,
-            cross_group_backups="bootstrap",
         )
         with pytest.raises(ValueError, match="batched value shape"):
             objective(
-                objective_data=columns, group_id=groups,
+                objective_data=columns, group_id=groups, head_step_ids=fixture_head_steps(columns),
                 predictions=torch.zeros(7, 2, 3),
                 value_predictions=torch.zeros(7, 3),
             )
         with pytest.raises(ValueError, match="at least one head"):
             objective(
-                objective_data=columns, group_id=groups,
+                objective_data=columns, group_id=groups, head_step_ids=fixture_head_steps(columns),
                 predictions=torch.zeros(7, 0, 3),
                 value_predictions=torch.zeros(7, 0),
             )
@@ -177,6 +176,6 @@ def test_batched_policy_objectives_reject_empty_or_misaligned_heads(kind: str) -
         objective = GrpoObjective()
         with pytest.raises(ValueError, match="at least one head"):
             objective(
-                objective_data=columns, group_id=groups,
+                objective_data=columns, group_id=groups, head_step_ids=fixture_head_steps(columns),
                 predictions=torch.zeros(7, 0, 3),
             )

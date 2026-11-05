@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal, cast, overload
+from typing import overload
 
 import torch
 import torch.nn.functional as F
@@ -44,80 +44,53 @@ def _require_done_flags(
 
 
 def _head_output_layout(
-    objective_data: dict[str, torch.Tensor],
+    head_step_ids: torch.Tensor,
     *,
     N: int,
     P: int,
     device: torch.device | str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Map head-output rows to steps: ``(step_of [P], last_rows [N])``.
+    """Map prediction rows to steps using the TensorDict's existing mapping.
 
-    ``step_of[p]`` is the step of head-output row ``p``; ``last_rows[i]`` is
-    the row of step ``i``'s last head-output token (the bootstrap read).
-    A missing readout uses sentinel ``P``; ``_step_predictions`` supplies its
-    zero placeholder, and return construction continues through that step. Reads
-    the ``head_output_count`` column stamped by ``pack_token_batch``; when the
-    column is absent every step must have exactly one head-output token (``P == N``).
+    The explicit mapping handles missing and repeated readouts, even when
+    the number of predictions happens to equal the number of steps.
+    Return each prediction's step and each step's last prediction row. A step
+    without a prediction uses sentinel P, selecting the padding row below.
     """
-    if "head_output_count" in objective_data.keys():
-        counts = objective_data["head_output_count"]
-        if counts.dtype != torch.int64:
-            raise TypeError(f"head_output_count must be int64, got {counts.dtype}.")
-        if counts.shape != torch.Size([N]):
-            raise ValueError(
-                f"head_output_count must have shape [{N}], got {tuple(counts.shape)}."
-            )
-        if bool((counts < 0).any()):
-            raise ValueError("head_output_count entries must be >= 0.")
-        if int(counts.sum()) != P:
-            raise ValueError(
-                f"head_output_count sums to {int(counts.sum())} but predictions "
-                f"have {P} rows; predictions and objective_data are misaligned."
-            )
-        counts = counts.to(device=device)
-    else:
-        if P != N:
-            raise ValueError(
-                f"predictions have {P} rows for {N} steps but objective_data "
-                "has no head_output_count column; pack with pack_token_batch "
-                "or provide head_output_count."
-            )
-        counts = torch.ones(N, dtype=torch.int64, device=device)
-    step_of = torch.repeat_interleave(
-        torch.arange(N, dtype=torch.int64, device=device), counts, output_size=P
-    )
-    last_rows = torch.where(counts > 0, counts.cumsum(dim=0) - 1, P)
+    if head_step_ids.dtype != torch.int64:
+        raise TypeError("head_step_ids must be int64.")
+    if head_step_ids.shape != (P,):
+        raise ValueError(f"head_step_ids must have shape [{P}] matching prediction rows.")
+    step_of = head_step_ids.to(device=device)
+    if bool(((step_of < 0) | (step_of >= N)).any()):
+        raise ValueError("head_step_ids must identify steps in [0, N).")
+    if bool((step_of[1:] < step_of[:-1]).any()):
+        raise ValueError("head_step_ids must be in step order.")
+    counts = torch.bincount(step_of, minlength=N)
+    last_rows = torch.where(counts > 0, counts.cumsum(0) - 1, P)
     return step_of, last_rows
 
 
 def _step_predictions(predictions: torch.Tensor, last_rows: torch.Tensor) -> torch.Tensor:
-    """Scatter real readouts onto the step clock; absent values are placeholders."""
-    return torch.cat([predictions, predictions.new_zeros((1,) + predictions.shape[1:])])[last_rows]
+    """Align readouts to steps, padding steps without a readout with zeros."""
+    padding = predictions.new_zeros((1,) + predictions.shape[1:])
+    return torch.cat([predictions, padding], dim=0)[last_rows]
 
 
-def _expand_policy_readouts(objective_data, predictions, *, who):
-    counts = objective_data.get("head_output_count")
-    if counts is None:
-        return predictions, objective_data, torch.ones(predictions.shape[0], dtype=torch.bool, device=predictions.device)
-    if counts.ndim != 1 or counts.dtype != torch.int64 or bool(((counts < 0) | (counts > 1)).any()):
-        raise ValueError(f"{who} expects one prediction row per step with a readout (zero or one per step)")
-    step_of, last_rows = _head_output_layout(objective_data, N=counts.numel(), P=predictions.shape[0], device=predictions.device)
-    return (_step_predictions(predictions, last_rows),
-            {**objective_data, "head_output_count": torch.ones_like(counts)}, counts.to(predictions.device) > 0)
+def _expand_policy_readouts(objective_data, predictions, *, head_step_ids, n_steps, who):
+    step_of, last_rows = _head_output_layout(
+        head_step_ids, N=n_steps, P=predictions.shape[0], device=predictions.device,
+    )
+    if bool((step_of[1:] == step_of[:-1]).any()):
+        raise ValueError(f"{who} expects at most one prediction row per step")
+    return (_step_predictions(predictions, last_rows), objective_data,
+            last_rows < predictions.shape[0])
 
 
 def _validate_request_actions(readout, executed, group_id):
     if bool(((group_id[:-1] == group_id[1:]) & executed[1:] & ~readout[:-1]).any()):
         raise ValueError("An executed action requires a readout on its preceding step")
 
-
-def _validate_missing_bootstrap(readout, discount, group_id, mode):
-    if mode != "bootstrap":
-        return
-    last = torch.ones_like(readout)
-    last[:-1] = group_id[:-1] != group_id[1:]
-    if bool((last & ~readout & (discount != 0)).any()):
-        raise ValueError("Cannot bootstrap from a final step without an action-request readout; use zero ending discount, ignore, or fault")
 
 
 def _pair_weight(
@@ -152,35 +125,6 @@ def _require_action_ids(action: torch.Tensor, A: int) -> None:
         raise ValueError(
             f"action ids must be in [0, {A}), got min={int(action.min())} "
             f"max={int(action.max())}."
-        )
-
-
-def _require_step_aligned_predictions(
-    objective_data: dict[str, torch.Tensor],
-    *,
-    n_pred: int,
-    n_steps: int,
-    who: str,
-) -> None:
-    """PPO / GRPO read one prediction row per step.
-
-    DQN-family objectives expand multi-token steps via ``head_output_count``.
-    Policy objectives do not: more than one head-output token per step is an
-    alignment error, not a silent gather of the wrong rows.
-    """
-    if "head_output_count" not in objective_data.keys():
-        return
-    counts = objective_data["head_output_count"]
-    if counts.dtype != torch.int64:
-        raise TypeError(f"head_output_count must be int64, got {counts.dtype}.")
-    total = int(counts.sum())
-    if (counts.shape != torch.Size([n_steps]) or total != n_pred
-            or n_pred != n_steps or bool((counts != 1).any())):
-        raise ValueError(
-            f"{who} expects one prediction row per step "
-            f"(got {n_pred} prediction rows, {n_steps} steps, "
-            f"head_output_count sum {total}). Use a single head-output token "
-            "per step, or a DQN-family objective."
         )
 
 
@@ -278,19 +222,6 @@ def _affine_scan_backward(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 # Rows of the gate matrix unrolled together. The workspace is this many
 # rows by the remaining horizon, not a second ``[N, N]`` copy.
 _CONTINUATION_ROWS = 256
-
-CrossGroupBackups = Literal["bootstrap", "ignore", "fault"]
-
-
-def _require_cross_group_backups(value: str) -> CrossGroupBackups:
-    """``"bootstrap"``, ``"ignore"``, or ``"fault"``."""
-    if value not in ("bootstrap", "ignore", "fault"):
-        raise ValueError(
-            "cross_group_backups must be 'bootstrap', 'ignore', or 'fault', "
-            f"got {value!r}."
-        )
-    return cast(CrossGroupBackups, value)
-
 
 def _raise_if_cross_group_backup(
     *,
@@ -393,7 +324,6 @@ def _block_returns(
     v_next: torch.Tensor,
     t0: int,
     rows: int,
-    cross_group_backups: CrossGroupBackups,
     decision_count: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Returns for starts ``t0 .. t0+rows``, and which starts stay.
@@ -403,15 +333,12 @@ def _block_returns(
     the cumprod is unchanged, and their reward term is ``0``.
 
     ``col_mask`` is ``0`` at a group boundary, where the continuation is
-    outside the sampled run. ``"ignore"`` and ``"fault"`` leave that
-    off-data ``V`` out of the target and mark a start when the factor on
-    it is non-zero. A zero factor leaves the value out of the target, so
-    the start stays. ``"bootstrap"`` fills ``V`` on the step before the
-    boundary, and every start stays. A gate ``0`` on a step the mask
-    still keeps bootstraps either way.
+    outside the sampled run. Leave off-data values out of the provisional
+    target and mark a start invalid when it depends on one. The caller raises
+    for invalid starts that correspond to executed actions. A gate cut inside
+    the sampled run still bootstraps from the sampled value.
 
-    The second tensor is ``1`` for a start that stays and ``0`` for a
-    start that drops.
+    The second tensor is 1 for a complete start and 0 for a missing backup.
     """
     device = reward.device
     dtype = reward.dtype
@@ -433,8 +360,7 @@ def _block_returns(
         g = g.unsqueeze(-1) if g.ndim == 1 else g
         alive = alive.unsqueeze(-1)
     # ``alive == 0`` is a group boundary whose continuation was not sampled.
-    leave_out = cross_group_backups != "bootstrap"
-    boot = (1 - step) * alive if leave_out else (1 - step * alive)
+    boot = (1 - step) * alive
     step.mul_(alive)
     term = reward[t0:] + g * boot * v_next[t0:]
     lengths = None
@@ -457,10 +383,7 @@ def _block_returns(
         if lengths is not None:
             left_lengths = torch.where(before, 0, lengths[:, :rows])
             lengths = torch.cat([left_lengths, lengths[:, rows:]], dim=1) if width > rows else left_lengths
-    if leave_out:
-        participate = _block_cutoff_factor_is_zero(step=step, alive=alive, discount=g)
-    else:
-        participate = step.new_ones((rows,) + step.shape[2:])
+    participate = _block_cutoff_factor_is_zero(step=step, alive=alive, discount=g)
     if width > 1:
         torch.cumprod(step, dim=1, out=step)
         term = torch.cat([term[:, :1], term[:, 1:] * step[:, :-1]], dim=1)
@@ -476,7 +399,6 @@ def _continuation_targets(
     v_step: torch.Tensor,
     pair_weight: torch.Tensor,
     continuation: torch.Tensor | _PreparedGate,
-    cross_group_backups: CrossGroupBackups,
     backup_lengths: torch.Tensor | None = None,
     decision_count: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -488,20 +410,13 @@ def _continuation_targets(
     started at ``t``. Rows are cumprod'd in blocks of
     ``_CONTINUATION_ROWS`` and never read another start's return. The
     in-run mask zeros a continuation that would leave the run.
-    ``"ignore"`` leaves that off-data ``V`` out of the target and drops
-    the pair when the factor on it is non-zero, from the loss and from
-    logged metrics. ``"fault"`` raises on that pair instead.
-    ``"bootstrap"`` fills ``V`` on the step before that group boundary
-    and keeps the pair. A zero factor leaves the value out of the
-    target, so the pair stays and ``"fault"`` does not raise. A gate
-    ``0`` on a step still inside the run still bootstraps. Out-of-run
-    pairs return ``0``.
+    Off-data values are excluded and marked in ``participate``; the objective
+    rejects any executed transition whose return needs one. Automatic steps
+    remain in the return but are not independent action-value training targets.
+    Out-of-run pairs return zero.
 
-    Returns ``(returns [N-1], participate [N-1])``. ``participate`` is
-    ``1`` for a pair that stays. ``"fault"`` raises when an in-run pair
-    would be dropped.
+    Returns ``(returns [N-1], participate [N-1])``.
     """
-    cross_group_backups = _require_cross_group_backups(cross_group_backups)
     r = reward[1:].to(dtype=v_step.dtype)  # [N-1]  r_t (stored at t+1)
     g = discount_all[1:]  # [N-1]  γ_t
     v_next = v_step[1:]  # [N-1]  V(s_{t+1})
@@ -528,7 +443,7 @@ def _continuation_targets(
             v_next=v_next,
             t0=t0,
             rows=rows,
-            cross_group_backups=cross_group_backups,
+
             decision_count=decision_count,
         )
         returns[t0:t0 + rows] = block_return
@@ -542,8 +457,6 @@ def _continuation_targets(
         in_run_f = in_run_f.unsqueeze(-1)
     if backup_lengths is not None:
         backup_lengths.mul_(in_run_f)
-    if cross_group_backups == "fault":
-        _raise_if_cross_group_backup(in_run=in_run, participate=participate)
     return returns * in_run_f, participate
 
 
@@ -582,7 +495,6 @@ def _read_gate(
 def _column_targets(
     *, reward: torch.Tensor, discount: torch.Tensor, v_step: torch.Tensor,
     pair_weight: torch.Tensor, columns: torch.Tensor,
-    cross_group_backups: CrossGroupBackups,
     decision_count: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Linear-workspace targets for continuation independent of the start row."""
@@ -595,15 +507,12 @@ def _column_targets(
         g = g[:, None] if g.ndim == 1 else g
         c = c[:, None] if c.ndim == 1 else c
     link = g * c * alive
-    boot = (1 - c) * alive if cross_group_backups != "bootstrap" else 1 - c * alive
+    boot = (1 - c) * alive
     direct = reward[1:] + g * boot * v_step[1:]
     returns = _affine_scan_backward(direct, link)
-    if cross_group_backups == "bootstrap":
-        participate = torch.ones_like(returns)
-    else:
-        participate = _zero_off_data_factor_scan(
-            discount=g, in_sample=alive > 0, carries=(c * alive) != 0,
-        ).expand_as(returns)
+    participate = _zero_off_data_factor_scan(
+        discount=g, in_sample=alive > 0, carries=(c * alive) != 0,
+    ).expand_as(returns)
     lengths = None
     if decision_count is not None:
         count = decision_count[:, None] if v_step.ndim == 2 else decision_count
@@ -654,8 +563,8 @@ class DqnObjective(Objective[...]):
     Q rows are **per head-output token** (``[P, A]``), not per step: a step may
     own several head-output tokens (tokenizer input field flagged
     ``head_output=True`` emitting more than one token). The
-    ``head_output_count`` column stamped by ``pack_token_batch`` maps rows to
-    steps, so predictions and step fields can never misalign. Every
+    ``head_step_ids`` mapping already carried by ``TensorDict`` maps rows to
+    steps, so the loss can align predictions with per-step labels. Every
     head-output row of step ``i`` trains toward the *same* TD target; the
     bootstrap reads the *last* head-output row of step ``i+1`` (the most
     informed one).
@@ -716,21 +625,10 @@ class DqnObjective(Objective[...]):
     the delayed state value. The gate returns ``[N, N]``. Row ``t``,
     column ``s`` is the continuation at absolute step ``s`` for the
     return that started at ``t``, and that row is unrolled on its own.
-    The objective then zeros a
-    continuation that would leave the run. For any horizon, the last
-    step of an episode is not updated when its target depends on the next
-    step's value. It is updated when the target does not.
-    ``cross_group_backups="bootstrap"`` fills ``V`` on the step before
-    that group boundary (the rest of the episode is not in the sample),
-    so that step is updated from ``V`` and stays.
-    ``cross_group_backups="ignore"`` leaves that off-data ``V`` out of
-    the target and leaves the step out of the loss and out of logged
-    metrics when the factor on it is non-zero.
-    ``cross_group_backups="fault"`` raises instead. A terminated or
-    truncated γ of
-    ``0``, or a horizon that puts no
-    weight on that value, does not depend on it, so the step stays. A
-    gate cut on a later in-run step still bootstraps. At zero temperature,
+    A target that depends on a value beyond its sampled group always raises.
+    A zero ending discount or a horizon with zero weight on that value ends
+    the return safely. A gate cut inside the group still bootstraps from its
+    sampled value. At zero temperature,
     ``V = Q_backup(s, argmax_a Q_actions(s, a))``; ties choose the lowest
     action index. At positive temperature ``alpha``, the action scores define
     ``pi = softmax(Q_actions / alpha)`` and
@@ -741,10 +639,9 @@ class DqnObjective(Objective[...]):
     ``delta = G - Q(s, a)``. Both backup inputs remain outside the gradient path.
     The returned loss is a dict. ``action_value`` is the TD loss and
     trains Q.
-    Packing nullable ``action`` fields derives the batch mask
-    ``objective_data["action_executed"]`` to mark real incoming actions. False
-    marks an automatic transition (such as an inner reset): its arbitrary
-    integer placeholder is never validated, fitted, or used to cut a
+    Missing actions are NaN in the packed action tensor. A missing action
+    marks an automatic transition (such as an inner reset) and is never
+    validated as a discrete ID, fitted, or used to cut a
     value-gap trace. No action is selected from the preceding state's Q scores.
     Backups pass through that automatic transition using its reward and supplied
     discount, within the same group only. Its outgoing Q row has zero loss weight.
@@ -845,21 +742,6 @@ class DqnObjective(Objective[...]):
             Zero selects the greedy action from ``backup_action_predictions``. Positive
             values use that head's Boltzmann policy and entropy bonus, evaluated
             with ``backup_value_predictions``. Same units as rollout temperature.
-        cross_group_backups: Required. ``"bootstrap"``, ``"ignore"``, or
-            ``"fault"``. For any horizon, the last step of an episode is not
-            updated when its target depends on the next step's value. It
-            is updated when the target does not. ``"bootstrap"`` fills
-            ``V`` on the step before a group boundary (the end of the
-            batch, or a ``group_id`` break: a chunk boundary, time
-            limit, or truncation whose rest was not sampled), so that
-            step is updated from ``V`` and stays. ``"ignore"`` leaves
-            that off-data ``V`` out of the target and leaves the step
-            out of the loss and out of logged metrics when the factor
-            on it is non-zero. ``"fault"`` raises on that step instead.
-            A terminated or truncated γ of ``0``, or a horizon that puts no weight on
-            that value, does not depend on it, so the step stays and
-            ``"fault"`` does not raise. An earlier step whose backup
-            stays inside the episode stays either way.
     """
 
     def __init__(
@@ -869,7 +751,6 @@ class DqnObjective(Objective[...]):
         reward: Reward | None,
         value: Value | None,
         temperature: float,
-        cross_group_backups: CrossGroupBackups,
         action_key: str = "action",
         terminated_key: str = "terminated",
         truncated_key: str = "truncated",
@@ -878,9 +759,6 @@ class DqnObjective(Objective[...]):
         cql_scale_q_eps: float = 1.0,
     ) -> None:
         self.temperature = _require_temperature(temperature)
-        self.cross_group_backups: CrossGroupBackups = _require_cross_group_backups(
-            cross_group_backups
-        )
         self.discount = _require_transform(discount, name="discount")
         self.reward = _require_transform(reward, name="reward")
         self.value = _require_transform(value, name="value")
@@ -897,6 +775,7 @@ class DqnObjective(Objective[...]):
         *,
         objective_data: dict[str, torch.Tensor],
         group_id: torch.Tensor,
+        head_step_ids: torch.Tensor,
         predictions: torch.Tensor,
         backup_value_predictions: torch.Tensor,
         backup_action_predictions: torch.Tensor,
@@ -908,6 +787,7 @@ class DqnObjective(Objective[...]):
         *,
         objective_data: dict[str, torch.Tensor],
         group_id: torch.Tensor,
+        head_step_ids: torch.Tensor,
         predictions: torch.Tensor,
         backup_value_predictions: torch.Tensor,
         backup_action_predictions: torch.Tensor,
@@ -922,6 +802,7 @@ class DqnObjective(Objective[...]):
         *,
         objective_data: dict[str, torch.Tensor],
         group_id: torch.Tensor,
+        head_step_ids: torch.Tensor,
         predictions: torch.Tensor,
         backup_value_predictions: torch.Tensor | None = None,
         backup_action_predictions: torch.Tensor | None = None,
@@ -969,17 +850,14 @@ class DqnObjective(Objective[...]):
         value_dtype = q.dtype
 
         action = objective_data[self.action_key]
-        if action.dtype != torch.int64:
-            raise TypeError(f"action must be int64, got {action.dtype}.")
         if action.ndim != 1:
             raise ValueError(
                 f"DQN objective expects action shape [N], got {tuple(action.shape)}."
             )
         N = int(action.shape[0])
-        executed = executed_actions(objective_data, action)
-        action = canonical_actions(objective_data, action)
+        executed = executed_actions(action)
+        action = canonical_actions(action)
         _require_action_ids(action, A)
-        objective_data = {**objective_data, self.action_key: action}
 
         if N < 2:
             raise ValueError("Not enough valid q values in data.")
@@ -1006,7 +884,7 @@ class DqnObjective(Objective[...]):
         # toward the same target, and the bootstrap reads step i+1's *last*
         # head-output row.
         step_of, last_rows = _head_output_layout(
-            objective_data, N=N, P=P, device=device
+            head_step_ids, N=N, P=P, device=device
         )
         q = _apply_value(
             transform=self.value,
@@ -1060,7 +938,6 @@ class DqnObjective(Objective[...]):
         # its Q row. A backup passes through the automatic transition instead.
         readout = last_rows < P
         _validate_request_actions(readout, executed, group_id)
-        _validate_missing_bootstrap(readout, discount_all, group_id, self.cross_group_backups)
         automatic = torch.cat([~executed[1:] & (pair_weight > 0), executed.new_zeros(1)]) | ~readout
         online_mask = automatic[step_of].reshape((P,) + (1,) * (q.ndim - 1))
         backup_mask = automatic[step_of].reshape((P,) + (1,) * (q_target.ndim - 1))
@@ -1098,7 +975,7 @@ class DqnObjective(Objective[...]):
             pair_target, participate, backup_lengths = _column_targets(
                 reward=reward, discount=discount_all, v_step=v_step,
                 pair_weight=pair_weight, columns=prepared.columns,
-                cross_group_backups=self.cross_group_backups,
+
                 decision_count=decision_count,
             )
         else:
@@ -1107,14 +984,13 @@ class DqnObjective(Objective[...]):
             pair_target, participate = _continuation_targets(
                 reward=reward, discount_all=discount_all, v_step=v_step,
                 pair_weight=pair_weight, continuation=prepared,
-                cross_group_backups="ignore" if self.cross_group_backups == "fault" else self.cross_group_backups,
+
                 backup_lengths=backup_lengths, decision_count=decision_count,
             )
         pair_weight = pair_weight * executed[1:].to(dtype=pair_weight.dtype)
         if heads is not None:
             pair_weight = pair_weight[:, None]
-        if self.cross_group_backups == "fault":
-            _raise_if_cross_group_backup(in_run=pair_weight > 0, participate=participate)
+        _raise_if_cross_group_backup(in_run=pair_weight > 0, participate=participate)
         pair_weight = pair_weight * participate
         row_weight = _pair_values_to_rows(pair_weight, step_of)
         td_target = _pair_values_to_rows(pair_target, step_of)

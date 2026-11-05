@@ -1,14 +1,7 @@
-"""Single public transformer backbone.
+"""Transformer backbone using FlexAttention for every forward.
 
-``Backbone`` is the one way to attach a decoder stack. Construction
-is either ``pretrained=`` (Hub / local checkpoint: inspect, then packed kernels
-or HuggingFace ``forward``) or ``architecture=`` plus width (a llama / qwen3
-stack from scratch, or ``architecture="hf"`` with a saved ``hf_config``).
-
-Packed Flex / varlen / padded kernels run when every layer is a Llama/Qwen3-
-shaped softmax block. Other softmax decoders use HuggingFace ``forward`` with
-the grouping mask. Hybrid / linear / sliding-window stacks raise — grouping
-would be silently wrong.
+Llama/Qwen-shaped rotary decoder stacks are supported, including compatible
+HuggingFace checkpoints. Other layouts are rejected at construction.
 """
 
 from __future__ import annotations
@@ -27,8 +20,7 @@ from mouse_core.models.backbone.base import (
     _load_transformer_weights,
     _rope_parameters_from_config,
 )
-from mouse_core.models.backbone.packed_train import _DecoderStack
-from mouse_core.models.backbone.flex_decode import FlexDecodeSession
+from mouse_core.models.backbone.packed_train import _DecoderStack, packed_forward
 from mouse_core.models.backbone.llama import _LlamaBackboneConfig, llama_config_kwargs
 from mouse_core.models.backbone.qwen3 import _Qwen3BackboneConfig, qwen3_config_kwargs
 from mouse_core.models.lora import LoRAConfig
@@ -188,9 +180,9 @@ class _IdentityRotaryEmbedding(nn.Module):
 
 
 class Backbone(BaseBackbone):
-    """Decoder stack with packed kernels when the layout allows, else HF forward.
+    """Decoder stack using FlexAttention for packed, rectangular, and cached inputs.
 
-    ``train_kernel`` (``"varlen"`` / ``"padded"`` / ``"flex"`` / ``"reference"``),
+    ``train_kernel`` (``"flex"``),
     ``decode_kernel`` (``"flex"``), and ``dtype`` are required:
     the uncached-forward kernel, the cached-decode kernel, and the dtype of
     the base weights (``torch.float32`` to fine-tune them,
@@ -202,16 +194,13 @@ class Backbone(BaseBackbone):
     Pass **either** ``pretrained=`` **or** ``architecture=``:
 
     - ``pretrained="Qwen/Qwen3-0.6B"`` inspects the Hub config. A Llama/Qwen3-
-      shaped softmax stack uses packed kernels (the speedup). Any other
-      maskable softmax decoder uses HuggingFace ``forward`` with the grouping
-      mask and requires ``train_kernel="reference"``. Hybrid / linear /
-      sliding-window stacks raise.
+      shaped softmax stack uses FlexAttention. Other decoder layouts and
+      hybrid / linear / sliding-window stacks raise at construction.
     - ``architecture="qwen3"`` or ``"llama"`` builds that stack from
       ``hidden_dim``, ``num_layers``, ``num_heads``, … (tests, ablations).
     - ``architecture="hf"`` rebuilds a saved generic stack from ``hf_config``.
 
-    Cached decode (``decode_session``) is the packed/flex path. Generic HF
-    stacks raise there; grouping still applies on the full-sequence forward.
+    CPU forwards require ``torch.no_grad()``; FlexAttention training requires CUDA.
 
     Token tables and numeric Fourier features belong to an independent
     ``Embedding`` module. This backbone owns only the decoder.
@@ -325,6 +314,17 @@ class Backbone(BaseBackbone):
                 int(self.model.config.head_dim)
             )
         self._config_kwargs["rope_enabled"] = rope_enabled
+
+    def enable_kernels(self) -> None:
+        """Opt into HF kernels on this existing decoder, without replacing it.
+
+        Call after moving the model to its execution device and before creating
+        decode sessions. Packed/cached attention remains Mouse's configured
+        implementation; kernels can replace supported norm/MLP operations.
+        Requires the kernels project extra. HF selects the
+        available device/training implementations; speedups need benchmarking.
+        """
+        cast(Any, self.model).set_use_kernels(True)
 
     @property
     def rope_enabled(self) -> bool:
@@ -486,12 +486,7 @@ class Backbone(BaseBackbone):
                 f"this stack: {grouping_unsupported_reason(model.config)}."
             )
         else:
-            if self.train_kernel != "reference":
-                raise ValueError(
-                    "this architecture has no packed train kernels; use "
-                    "train_kernel='reference' (HuggingFace forward + grouping mask), "
-                    f"got {self.train_kernel!r}."
-                )
+            raise ValueError("FlexAttention requires a packed-compatible rotary decoder (Llama/Qwen layout).")
         self.model = cast(_DecoderStack, model)
         self.architecture = "hf"
         self.uses_packed = packed
@@ -504,15 +499,6 @@ class Backbone(BaseBackbone):
     def hidden_dim(self) -> int:
         return _hidden_size(self.model.config)
 
-    def decode_session(self, batch_size: int) -> FlexDecodeSession:
-        if not self.uses_packed:
-            raise NotImplementedError(
-                "cached decode is the packed/flex path; this backbone uses the "
-                "generic HuggingFace forward (uncached). Grouping still applies "
-                "on the full-sequence path."
-            )
-        return super().decode_session(batch_size)
-
     def _forward_dense(
         self,
         embeds: torch.Tensor,
@@ -520,22 +506,35 @@ class Backbone(BaseBackbone):
         output_hidden_states: bool,
         **kwargs: Any,
     ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
-        out = self.model(
-            inputs_embeds=embeds,
+        mask = kwargs.pop("attention_mask", None)
+        positions = kwargs.pop("position_ids", None)
+        if kwargs:
+            raise ValueError(f"Unsupported FlexAttention forward arguments: {sorted(kwargs)}")
+        batch, length, width = embeds.shape
+        valid = torch.ones((batch, length), dtype=torch.bool, device=embeds.device)
+        if mask is not None:
+            if mask.shape != (batch, length) or not bool(((mask == 0) | (mask == 1)).all()):
+                raise ValueError("attention_mask must be a binary [B, T] padding mask")
+            valid = mask.to(device=embeds.device, dtype=torch.bool)
+        if positions is None:
+            positions = torch.arange(length, device=embeds.device).expand(batch, -1)
+        elif positions.shape not in ((batch, length), (1, length)):
+            raise ValueError("position_ids must have shape [B, T] or [1, T]")
+        positions = positions.to(embeds.device).expand(batch, -1)
+        groups = torch.arange(batch, device=embeds.device)[:, None].expand(-1, length)
+        out = packed_forward(
+            model=self.model, embeds=embeds[valid], sequence_ids=groups[valid],
+            position_ids=positions[valid], train_kernel=self.train_kernel,
+            autocast_dtype=self.train_autocast_dtype, checkpoint=self.gradient_checkpointing,
             output_hidden_states=output_hidden_states,
-            **kwargs,
         )
-        hidden = getattr(out, "last_hidden_state", None)
-        if hidden is None:
-            hidden = out[0] if isinstance(out, tuple) else out
-        if output_hidden_states:
-            states = getattr(out, "hidden_states", None)
-            if states is None:
-                raise RuntimeError("Backbone expected hidden_states but the model returned None.")
-            # HF includes the embedding output at index 0; drop it so the tuple is post-layer states.
-            layer_states = states[1:] if len(states) > 1 else states
-            return hidden, tuple(layer_states)
-        return hidden
+        def restore(flat: torch.Tensor) -> torch.Tensor:
+            result = flat.new_zeros(batch, length, width)
+            result[valid] = flat
+            return result
+        if isinstance(out, tuple):
+            return restore(out[0]), tuple(restore(layer) for layer in out[1])
+        return restore(out)
 
 
 def _qwen3_kwargs_from_pretrained(

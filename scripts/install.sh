@@ -54,35 +54,27 @@ setup_venv() {
         rm -rf .venv
     fi
 
-    # Free-threaded 3.15t so DataLoader(num_workers>0) can use real thread parallelism.
-    log "Ensuring free-threaded Python 3.15t is available..."
-    if ! uv python install 3.15t; then
-        error "Failed to install Python 3.15t"
+    # Standard Python; DataLoader uses spawned process workers.
+    log "Ensuring standard Python 3.15 is available..."
+    if ! uv python install 3.15; then
+        error "Failed to install Python 3.15"
         return 1
     fi
 
-    if ! uv venv --python 3.15t; then
+    if ! uv venv --python 3.15; then
         error "Failed to create virtual environment"
         return 1
     fi
 
     success "Virtual environment created"
 
-    # TEMPORARY: Triton still re-enables the GIL on import (no Py_mod_gil slot).
-    # tokenizers>=0.23.3 is free-thread-safe. Drop PYTHON_GIL=0 when Triton
-    # declares Py_MOD_GIL_NOT_USED — see CONTRIBUTING.md.
-    if ! grep -qxF 'export PYTHON_GIL=0' .venv/bin/activate 2>/dev/null; then
-        echo 'export PYTHON_GIL=0' >> .venv/bin/activate
-    fi
-
     # Install project dependencies (core + all optional extras).
     log "Installing project dependencies..."
-    # torch 2.15 cp315t wheels are not on PyPI yet. The PyTorch test index
-    # publishes them (cu132 when a GPU is present, CPU otherwise).
+    # Install the pinned Python 3.15 PyTorch/Triton nightly pair.
     if command -v nvidia-smi >/dev/null 2>&1; then
-        TORCH_INDEX="https://download.pytorch.org/whl/test/cu132"
+        TORCH_INDEX="https://download.pytorch.org/whl/nightly/cu130"
     else
-        TORCH_INDEX="https://download.pytorch.org/whl/test/cpu"
+        TORCH_INDEX="https://download.pytorch.org/whl/nightly/cpu"
     fi
     # --refresh bypasses uv's cache so branch-pinned git extras (mouse-gym@main,
     # procedural-frozenlake@main) re-resolve to the current head.
@@ -90,6 +82,8 @@ setup_venv() {
         error "Failed to install project dependencies"
         return 1
     fi
+
+    .venv/bin/python scripts/patch_triton.py || return 1
 
     success "Project dependencies installed"
 }
