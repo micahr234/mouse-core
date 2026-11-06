@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Reject model class, state-key, and tensor-shape mismatches before loading weights.
+
 - Move step/prediction mappings to `objective_data`; use `head_token_mask` for model readouts and sample one action per prediction.
 
 - Replace `TokenBatch` with TensorDict inputs and return TensorDict objective

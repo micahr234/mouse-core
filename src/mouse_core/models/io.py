@@ -61,7 +61,18 @@ def load_model[T: nn.Module](
     config = json.loads(config_path.read_text())
     if config.get("format") != "mouse-core-model-v3":
         raise ValueError("Unsupported model config format; expected mouse-core-model-v3.")
-    model.load_state_dict(torch.load(weights_path, map_location=map_location, weights_only=True))
+    expected_class = f"{type(model).__module__}.{type(model).__qualname__}"
+    if config.get("class") != expected_class:
+        raise ValueError(f"Model class mismatch: saved {config.get('class')!r}, supplied {expected_class!r}")
+    state = torch.load(weights_path, map_location=map_location, weights_only=True)
+    current = model.state_dict()
+    if set(state) != set(current):
+        raise RuntimeError("Model state keys do not match saved weights")
+    for name, value in state.items():
+        if isinstance(value, torch.Tensor) and isinstance(current[name], torch.Tensor):
+            if value.shape != current[name].shape:
+                raise RuntimeError(f"Model size mismatch for {name}: saved {tuple(value.shape)}, supplied {tuple(current[name].shape)}")
+    model.load_state_dict(state, strict=True)
     return model
 
 

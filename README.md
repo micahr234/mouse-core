@@ -480,3 +480,8 @@ tensor shapes. `make_token_batch` constructs CPU tensors without validating
 batch shapes, ordering, or indices; producers own those relationships. The old
 batch class and scoped tensor-conversion cache have been removed. Move inputs
 once before online and delayed forwards to reuse their device storage.
+
+Model weight exports record the fully qualified model class. `load_model` requires
+a caller-constructed instance of that class and matching state keys and tensor
+shapes; mismatches fail before applying weights. It does not deserialize Python
+classes or compare forward code sharing the same class name.

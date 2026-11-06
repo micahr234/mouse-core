@@ -432,3 +432,27 @@ def test_missing_vector_targets_roundtrip_and_do_not_train_unlabelled_rows(tmp_p
 
 def format_episode_index(ctx):
     return str(ctx["field"]) if ctx.get("step_index") == 0 else ""
+
+
+def test_load_rejects_different_class_with_identical_parameter_shapes(tmp_path):
+    class DifferentLinear(torch.nn.Linear):
+        pass
+    source = torch.nn.Linear(2, 3)
+    destination = DifferentLinear(2, 3)
+    before = {name: value.clone() for name, value in destination.state_dict().items()}
+    save_model(model=source, path=tmp_path)
+    with pytest.raises(ValueError, match="Model class mismatch"):
+        load_model(model=destination, repo_id_or_path=tmp_path)
+    for name, value in destination.state_dict().items():
+        torch.testing.assert_close(value, before[name])
+
+
+def test_shape_mismatch_does_not_partially_modify_model(tmp_path):
+    source = torch.nn.Sequential(torch.nn.Linear(2, 3), torch.nn.Linear(3, 4))
+    target = torch.nn.Sequential(torch.nn.Linear(2, 3), torch.nn.Linear(3, 5))
+    before = {name: value.clone() for name, value in target.state_dict().items()}
+    save_model(model=source, path=tmp_path)
+    with pytest.raises(RuntimeError, match="size mismatch"):
+        load_model(model=target, repo_id_or_path=tmp_path)
+    for name, value in target.state_dict().items():
+        torch.testing.assert_close(value, before[name])
