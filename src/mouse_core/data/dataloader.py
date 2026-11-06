@@ -230,18 +230,6 @@ def _sequence_generation(*, batch_index: int, sequence_index: int, stride: int) 
     return batch_index * stride + sequence_index
 
 
-def _step_token_count(step: StepTokens, *, started: bool) -> int:
-    """Packed tokens this step adds inside its own sample.
-
-    Includes group-start tokens on the first step of a fresh sequence,
-    matching :func:`~mouse_core.data.token_batch.pack_token_batch`.
-    """
-    extra = 0
-    if step.group_start_token_ids is not None and not started:
-        extra = int(step.group_start_token_ids.shape[0])
-    return extra + int(step.T)
-
-
 def _tokenize_event_window(
     *,
     ds: Any,
@@ -259,13 +247,8 @@ def _tokenize_event_window(
 
 
 def _segment_token_count(steps: list[StepTokens]) -> int:
-    """Packed tokens of one sample, including its group-start tokens."""
-    tokens = 0
-    started = False
-    for step in steps:
-        tokens += _step_token_count(step, started=started)
-        started = True
-    return tokens
+    """All tokens emitted by one complete sample."""
+    return sum(step.T for step in steps)
 
 
 def _append_window(
@@ -273,12 +256,12 @@ def _append_window(
     steps: list[StepTokens],
     sequence_ids: list[int],
     window: list[StepTokens],
-    group_id: int,
+    sequence_id: int,
 ) -> None:
     if not window:
         return
     steps.extend(window)
-    sequence_ids.extend([group_id] * len(window))
+    sequence_ids.extend([sequence_id] * len(window))
 
 
 def _budget_of(cfg: _SnapshotConfig) -> tuple[int, str, str]:
@@ -302,7 +285,7 @@ def _fetch_budget_batch(
     reseed = getattr(transform, "reseed", None)
     steps: list[StepTokens] = []
     sequence_ids: list[int] = []
-    n_group = 0
+    n_sequences = 0
     used = 0
     added = 0
     attempt = 0
@@ -349,16 +332,15 @@ def _fetch_budget_batch(
             steps=steps,
             sequence_ids=sequence_ids,
             window=window,
-            group_id=n_group,
+            sequence_id=n_sequences,
         )
         used += cost
-        n_group += 1
+        n_sequences += 1
         added += 1
     return pack_token_batch(
         steps=steps,
         sequence_ids=sequence_ids,
-        batch_size=n_group,
-        continuing=None,
+        batch_size=n_sequences,
     )
 
 
@@ -403,8 +385,8 @@ class DataLoader:
         set ``step_field`` explicitly for custom markers. ``episode_field``
         defaults to ``episode_index``. Use the same fields as Tokenizer.
     token_budget :
-        Packed tokens per batch (step tokens plus each sample's
-        group-start tokens). Whole samples are added until the next
+        Packed tokens per batch, including episode prompts emitted by the
+        tokenizer. Whole samples are added until the next
         sample would pass the budget. A sample that does not fit is left
         out. The first sample of a batch is left out too when it alone is
         over the budget, and that raises. Pass this or ``events_budget``,

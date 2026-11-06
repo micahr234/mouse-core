@@ -20,45 +20,6 @@ from mouse_core.models import Embedding
 from mouse_core.models.backbone import IdentityBackbone
 from mouse_core.models.mlp import MLP
 
-def when_repeat_episode_done_nonzero(ctx):
-    return "repeat_episode_done" in ctx and ctx["repeat_episode_done"] != 0
-
-
-def when_group_start(ctx):
-    return bool(ctx["group_start"])
-
-
-def when_reward_nonzero(ctx):
-    return "reward" in ctx and ctx["reward"] != 0.0
-
-
-def when_step_index_zero(ctx):
-    return "step_index" in ctx and ctx["step_index"] == 0
-
-
-def when_step_index_zero_or_group_start(ctx):
-    return (ctx.get("step_index") == 0) | bool(ctx["group_start"])
-
-
-def _when_reward_zero(ctx):
-    return "reward" in ctx and ctx["reward"] == 0.0
-
-
-def _when_always(ctx):
-    return True
-
-
-def _when_r_equals_zero(ctx):
-    return "r" in ctx and ctx["r"] == 0
-
-
-def _when_r_nonzero(ctx):
-    return "r" in ctx and ctx["r"] != 0.0
-
-
-def _when_r_zero(ctx):
-    return "r" in ctx and ctx["r"] == 0.0
-
 
 class _FakeTokenizer:
 
@@ -70,8 +31,8 @@ class _FakeTokenizer:
 _DEFAULT_FIELDS: list[dict[str, Any]] = [
     {"provider": "sensor", "type": "text", "input_field": "action", "format": "{field}"},
     {"provider": "sensor", "type": "text", "input_field": "observation", "format": "{field}"},
-    {"provider": "sensor", "type": "text", "input_field": "reward", "format": "{field}", "when": when_reward_nonzero},
-    {"provider": "sensor", "type": "text", "input_field": "repeat_episode_done", "format": "{field}", "when": when_repeat_episode_done_nonzero},
+    {"provider": "sensor", "type": "text", "input_field": "reward", "format": lambda ctx: f"{ctx['field']}" if ('reward' in ctx and ctx['reward'] != 0.0) else ""},
+    {"provider": "sensor", "type": "text", "input_field": "repeat_episode_done", "format": lambda ctx: f"{ctx['field']}" if ('repeat_episode_done' in ctx and ctx['repeat_episode_done'] != 0) else ""},
 ]
 
 
@@ -118,8 +79,7 @@ def _text_pair(hidden_dim: int = 8, **kwargs):
             {"provider": "sensor",
                 "type": "text",
                 "input_field": "repeat_episode_index",
-                "format": "{field}",
-                "when": when_step_index_zero,
+                "format": lambda ctx: f"{ctx['field']}" if ('step_index' in ctx and ctx['step_index'] == 0) else "",
             },
         )
     backends = {"default": hf_tok}
@@ -199,8 +159,7 @@ def test_text_tokenizer_field_format_uses_str() -> None:
             {"provider": "sensor",
                 "type": "text",
                 "input_field": "repeat_episode_index",
-                "format": "{field}",
-                "when": when_step_index_zero,
+                "format": lambda ctx: f"{ctx['field']}" if ('step_index' in ctx and ctx['step_index'] == 0) else "",
             },
         ],
         tokenizers={"default": _FakeTokenizer()},
@@ -221,8 +180,7 @@ def test_text_tokenizer_field_format_spec() -> None:
             {"provider": "sensor",
                 "type": "text",
                 "input_field": "repeat_episode_index",
-                "format": "{field}",
-                "when": when_step_index_zero,
+                "format": lambda ctx: f"{ctx['field']}" if ('step_index' in ctx and ctx['step_index'] == 0) else "",
             },
         ],
         tokenizers={"default": _FakeTokenizer()},
@@ -243,8 +201,7 @@ def test_text_tokenizer_omitted_input_field_is_const() -> None:
             {"provider": "sensor",
                 "type": "text",
                 "input_field": "repeat_episode_index",
-                "format": "{field}",
-                "when": when_step_index_zero,
+                "format": lambda ctx: f"{ctx['field']}" if ('step_index' in ctx and ctx['step_index'] == 0) else "",
             },
         ],
         tokenizers={"default": _FakeTokenizer()},
@@ -289,8 +246,7 @@ def test_text_tokenizer_const_format_rejects_placeholder() -> None:
                 {"provider": "sensor",
                     "type": "text",
                     "input_field": "repeat_episode_index",
-                    "format": "{field}",
-                    "when": when_step_index_zero,
+                    "format": lambda ctx: f"{ctx['field']}" if ('step_index' in ctx and ctx['step_index'] == 0) else "",
                 },
             ],
             tokenizers={"default": _FakeTokenizer()},
@@ -309,8 +265,7 @@ def test_text_tokenizer_max_tokens_allows_at_limit() -> None:
             {"provider": "sensor",
                 "type": "text",
                 "input_field": "repeat_episode_index",
-                "format": "{field}",
-                "when": when_step_index_zero,
+                "format": lambda ctx: f"{ctx['field']}" if ('step_index' in ctx and ctx['step_index'] == 0) else "",
             },
         ],
         tokenizers={"default": _FakeTokenizer()},
@@ -333,8 +288,7 @@ def test_text_tokenizer_max_tokens_raises_when_exceeded() -> None:
             {"provider": "sensor",
                 "type": "text",
                 "input_field": "repeat_episode_index",
-                "format": "{field}",
-                "when": when_step_index_zero,
+                "format": lambda ctx: f"{ctx['field']}" if ('step_index' in ctx and ctx['step_index'] == 0) else "",
             },
         ],
         tokenizers={"default": _FakeTokenizer()},
@@ -358,8 +312,7 @@ def test_text_tokenizer_max_tokens_must_be_positive() -> None:
                 {"provider": "sensor",
                     "type": "text",
                     "input_field": "repeat_episode_index",
-                    "format": "{field}",
-                    "when": when_step_index_zero,
+                    "format": lambda ctx: f"{ctx['field']}" if ('step_index' in ctx and ctx['step_index'] == 0) else "",
                 },
             ],
             tokenizers={"default": _FakeTokenizer()},
@@ -385,19 +338,16 @@ def test_text_tokenizer_when_gates_cover_skip_literal_pattern() -> None:
             {"provider": "sensor",
                 "type": "text",
                 "input_field": "reward",
-                "format": "{field:.0f},",
-                "when": when_reward_nonzero,
+                "format": lambda ctx: f"{ctx['field']:.0f}," if ('reward' in ctx and ctx['reward'] != 0.0) else "",
             },
             {"provider": "sensor",
                 "type": "text",
-                "format": ",",
-                "when": _when_reward_zero,
+                "format": lambda ctx: f',' if ('reward' in ctx and ctx['reward'] == 0.0) else "",
             },
             {"provider": "sensor",
                 "type": "text",
                 "input_field": "repeat_episode_index",
-                "format": "{field}",
-                "when": when_step_index_zero,
+                "format": lambda ctx: f"{ctx['field']}" if ('step_index' in ctx and ctx['step_index'] == 0) else "",
             },
         ],
         tokenizers={"default": _CaptureTok()},
@@ -405,24 +355,6 @@ def test_text_tokenizer_when_gates_cover_skip_literal_pattern() -> None:
     encode_measurement(tokenizer, {"action": 1, "reward": 0.0, "grouping_id": 0})
     encode_measurement(tokenizer, {"action": 1, "reward": 2.0, "grouping_id": 0})
     assert seen == ["1", ",", "1", "2,"]
-
-
-def test_text_tokenizer_when_rejects_non_callable() -> None:
-    import pytest
-
-    with pytest.raises(TypeError, match="when= must be a callable"):
-        Tokenizer(
-            tokenizers={"default": _FakeTokenizer()},
-            input_fields=[
-                {"provider": "sensor",
-                    "type": "text",
-                    "input_field": "reward",
-                    "format": "{field}",
-                    "when": {"skip": True},
-                    "head_output": True,
-                },
-            ],
-        )
 
 
 def test_text_tokenizer_when_or_in_callable() -> None:
@@ -438,8 +370,7 @@ def test_text_tokenizer_when_or_in_callable() -> None:
             {"provider": "sensor",
                 "type": "text",
                 "input_field": "reward",
-                "format": "{field}",
-                "when": when_any_reward,
+                "format": lambda ctx: f"{ctx['field']}" if when_any_reward(ctx) else "",
             },
             {"provider": "sensor", "type": "text", "input_field": "action", "format": "{field}", "head_output": True},
         ],
@@ -465,8 +396,7 @@ def test_text_tokenizer_requires_field_format() -> None:
                 {"provider": "sensor",
                     "type": "text",
                     "input_field": "repeat_episode_index",
-                    "format": "{field}",
-                    "when": when_step_index_zero,
+                    "format": lambda ctx: f"{ctx['field']}" if ('step_index' in ctx and ctx['step_index'] == 0) else "",
                 },
             ],
             tokenizers={"default": _FakeTokenizer()},
@@ -504,8 +434,7 @@ def test_text_tokenizer_field_format_must_use_field_placeholder() -> None:
                 {"provider": "sensor",
                     "type": "text",
                     "input_field": "repeat_episode_index",
-                    "format": "{field}",
-                    "when": when_step_index_zero,
+                    "format": lambda ctx: f"{ctx['field']}" if ('step_index' in ctx and ctx['step_index'] == 0) else "",
                 },
             ],
             tokenizers={"default": _FakeTokenizer()},
@@ -540,15 +469,13 @@ def test_text_tokenizer_const_and_when_gated_unescape_braces() -> None:
             {"provider": "sensor", "type": "text", "input_field": "a", "format": "{{{field}}}"},
             {"provider": "sensor",
                 "type": "text",
-                "format": "{{-}}",
-                "when": _when_r_equals_zero,
+                "format": lambda ctx: f'{{-}}' if ('r' in ctx and ctx['r'] == 0) else "",
             },
             {"provider": "sensor", "type": "text", "format": "{{c}}", "head_output": True},
             {"provider": "sensor",
                 "type": "text",
                 "input_field": "repeat_episode_index",
-                "format": "{field}",
-                "when": when_step_index_zero,
+                "format": lambda ctx: f"{ctx['field']}" if ('step_index' in ctx and ctx['step_index'] == 0) else "",
             },
         ],
         tokenizers={"default": _FakeTokenizer()},
@@ -564,20 +491,17 @@ def test_text_tokenizer_optional_missing_value_emits_nothing() -> None:
             {"provider": "sensor",
                 "type": "text",
                 "input_field": "r",
-                "format": "{field},",
-                "when": _when_r_nonzero,
+                "format": lambda ctx: f"{ctx['field']}," if ('r' in ctx and ctx['r'] != 0.0) else "",
             },
             {"provider": "sensor",
                 "type": "text",
-                "format": ",",
-                "when": _when_r_zero,
+                "format": lambda ctx: f',' if ('r' in ctx and ctx['r'] == 0.0) else "",
             },
             {"provider": "sensor", "type": "text", "format": "\n", "head_output": True},
             {"provider": "sensor",
                 "type": "text",
                 "input_field": "repeat_episode_index",
-                "format": "{field}",
-                "when": when_step_index_zero,
+                "format": lambda ctx: f"{ctx['field']}" if ('step_index' in ctx and ctx['step_index'] == 0) else "",
             },
         ],
         tokenizers={"default": _FakeTokenizer()},
@@ -644,8 +568,7 @@ def test_text_tokenizer_rejects_duplicate_field_names_across_types() -> None:
                 {"provider": "sensor",
                     "type": "text",
                     "input_field": "repeat_episode_index",
-                    "format": "{field}",
-                    "when": when_step_index_zero,
+                    "format": lambda ctx: f"{ctx['field']}" if ('step_index' in ctx and ctx['step_index'] == 0) else "",
                 },
             ],
             tokenizers={"default": _FakeTokenizer()},
@@ -658,8 +581,7 @@ def test_text_tokenizer_rejects_duplicate_field_names_across_types() -> None:
                 {"provider": "sensor",
                     "type": "text",
                     "input_field": "repeat_episode_index",
-                    "format": "{field}",
-                    "when": when_step_index_zero,
+                    "format": lambda ctx: f"{ctx['field']}" if ('step_index' in ctx and ctx['step_index'] == 0) else "",
                 },
             ],
             tokenizers={"default": _FakeTokenizer()},
@@ -927,8 +849,7 @@ def test_token_modality_is_single_embed_row() -> None:
             {"provider": "sensor",
                 "type": "text",
                 "input_field": "repeat_episode_index",
-                "format": "{field}",
-                "when": when_step_index_zero,
+                "format": lambda ctx: f"{ctx['field']}" if ('step_index' in ctx and ctx['step_index'] == 0) else "",
             },
         ],
         objective_fields=_obj("action"),
@@ -963,8 +884,7 @@ def test_text_tokenizer_tokenizes_each_field_separately() -> None:
             {"provider": "sensor",
                 "type": "text",
                 "input_field": "repeat_episode_index",
-                "format": "{field}",
-                "when": when_step_index_zero,
+                "format": lambda ctx: f"{ctx['field']}" if ('step_index' in ctx and ctx['step_index'] == 0) else "",
             },
         ],
         objective_fields=_obj("action"),
@@ -990,8 +910,7 @@ def test_identity_embed_image_token_ids() -> None:
             {"provider": "sensor",
                 "type": "text",
                 "input_field": "repeat_episode_index",
-                "format": "{field}",
-                "when": when_step_index_zero,
+                "format": lambda ctx: f"{ctx['field']}" if ('step_index' in ctx and ctx['step_index'] == 0) else "",
             },
         ],
         objective_fields=_obj("observation", "pixels"),
@@ -1039,192 +958,6 @@ def test_text_model_card_describes_tokenizer(tmp_path) -> None:
     assert 'user/mouse-text' in text and 'stored in this repository' in text
 
 
-def _group_start_tokenizer(**kwargs):
-    prefix_format = kwargs.pop("prefix_format", "episode={field}\n")
-    prefix_field = kwargs.pop("prefix_field", "episode_index")
-    fields = [
-        {"provider": "sensor",
-            "type": "text",
-            "input_field": prefix_field,
-            "format": prefix_format,
-            "when": when_group_start,
-        },
-        {"provider": "sensor", "type": "text", "input_field": "action", "format": "{field}", "head_output": True},
-        {"provider": "sensor",
-            "type": "text",
-            "input_field": "repeat_episode_index",
-            "format": "{field}",
-            "when": when_step_index_zero,
-        },
-    ]
-    return Tokenizer(
-        input_fields=fields,
-        tokenizers={"default": kwargs.pop("tokenizer", _FakeTokenizer())},
-        objective_fields=_obj("action"),
-        **kwargs,
-    )
-
-
-def test_text_tokenizer_group_start_carried_on_step() -> None:
-    tok = _group_start_tokenizer()
-    st = encode_measurement(tok, {"action": 1, "episode_index": 7})
-    assert st.group_start_token_ids is not None
-    assert st.group_start_numeric_mask is not None
-    expected = _FakeTokenizer()("episode=7\n")["input_ids"].view(-1).tolist()
-    assert st.group_start_token_ids.tolist() == expected
-    assert st.group_start_numeric_mask.tolist() == [False] * len(expected)
-    assert st.head_token_mask.tolist() == [True]
-
-
-def test_pack_emits_group_start_once_per_sequence() -> None:
-    from mouse_core.data import pack_token_batch
-
-    tok = _group_start_tokenizer()
-    steps = [
-        encode_measurement(tok, {"action": 1, "episode_index": 0}),
-        encode_measurement(tok, {"action": 2, "episode_index": 0}),
-        encode_measurement(tok, {"action": 3, "episode_index": 1}),
-    ]
-    inputs, obj = pack_token_batch(steps=steps, sequence_ids=[0, 0, 0], batch_size=1, continuing=None)
-    prefix = steps[0].group_start_token_ids
-    assert prefix is not None
-    p = int(prefix.shape[0])
-    assert inputs["token_ids"].shape[0] == p + steps[0].T + steps[1].T + steps[2].T
-    assert obj["action"].tolist() == [1, 2, 3]
-    assert inputs["head_token_mask"].nonzero(as_tuple=True)[0].tolist() == [
-        p + int(steps[0].head_token_mask.nonzero()[0][0]),
-        p + steps[0].T + int(steps[1].head_token_mask.nonzero()[0][0]),
-        p + steps[0].T + steps[1].T + int(steps[2].head_token_mask.nonzero()[0][0]),
-    ]
-    # Group-start text tokens are nonnumeric and never head-output.
-    assert not any(
-        int(i) in set(inputs["head_token_mask"].nonzero(as_tuple=True)[0].tolist())
-        for i in range(p)
-    )
-
-
-def test_pack_group_start_is_per_sequence() -> None:
-    from mouse_core.data import pack_token_batch
-
-    tok = _group_start_tokenizer()
-    steps = [
-        encode_measurement(tok, {"action": 1, "episode_index": 0}),
-        encode_measurement(tok, {"action": 2, "episode_index": 0}),
-    ]
-    inputs, inputs_objective_data = pack_token_batch(steps=steps, sequence_ids=[0, 1], batch_size=2, continuing=None)
-    prefix = steps[0].group_start_token_ids
-    assert prefix is not None
-    p = int(prefix.shape[0])
-    assert inputs["token_ids"].shape[0] == (p + steps[0].T) + (p + steps[1].T)
-    assert inputs['sequence_ids'].tolist() == (
-        [0] * (p + steps[0].T) + [1] * (p + steps[1].T)
-    )
-
-
-def test_pack_continuing_suppresses_group_start() -> None:
-    from mouse_core.data import pack_token_batch
-
-    tok = _group_start_tokenizer()
-    step = encode_measurement(tok, {"action": 1, "episode_index": 5})
-    prefix = step.group_start_token_ids
-    assert prefix is not None
-    p = int(prefix.shape[0])
-
-    cached, cached_objective_data = pack_token_batch(
-        steps=[step],
-        sequence_ids=[0],
-        batch_size=1,
-        continuing=[True],
-    )
-    assert cached["token_ids"].shape[0] == step.T
-
-    fresh, fresh_objective_data = pack_token_batch(
-        steps=[step],
-        sequence_ids=[0],
-        batch_size=1,
-        continuing=None,
-    )
-    assert fresh["token_ids"].shape[0] == p + step.T
-
-    restarted, restarted_objective_data = pack_token_batch(
-        steps=[step],
-        sequence_ids=[0],
-        batch_size=1,
-        continuing=[False],
-    )
-    assert restarted["token_ids"].shape[0] == p + step.T
-
-
-def test_tokenizer_pack_rows_forwards_continuing() -> None:
-    tok = _group_start_tokenizer()
-    row = {"action": 1, "episode_index": 5}
-    st = encode_measurement(tok, row)
-    assert st.group_start_token_ids is not None
-    p = int(st.group_start_token_ids.shape[0])
-
-    fresh, fresh_objective_data = tok.pack_rows(rows=[measurement_events(payloads) for payloads in [[row]]], continuing=None)
-    assert fresh["token_ids"].shape[0] == p + st.T
-
-    cached, cached_objective_data = tok.pack_rows(rows=[measurement_events(payloads) for payloads in [[row]]], continuing=[True])
-    assert cached["token_ids"].shape[0] == st.T
-
-
-def test_text_tokenizer_group_start_missing_placeholder_is_skipped() -> None:
-    tok = _group_start_tokenizer(prefix_format="label={field}\n", prefix_field="label")
-    step = encode_measurement(tok, {"action": 1, "episode_index": 0})
-    assert step.group_start_token_ids is None
-
-
-def test_text_tokenizer_group_start_const_without_other_text_is_nonnumeric() -> None:
-    tok = Tokenizer(
-        input_fields=[
-            {"provider": "sensor",
-                "type": "text",
-                "format": "hello\n",
-                "when": when_group_start,
-            },
-            {"provider": "sensor", "type": "text", "input_field": "action", "format": "{field}", "head_output": True},
-            {"provider": "sensor",
-                "type": "text",
-                "input_field": "repeat_episode_index",
-                "format": "{field}",
-                "when": when_step_index_zero,
-            },
-        ],
-        tokenizers={"default": _FakeTokenizer()},
-        objective_fields=[],
-    )
-    st = encode_measurement(tok, {"action": 1, "episode_index": 3})
-    assert st.group_start_token_ids is not None
-    assert st.group_start_numeric_mask is not None
-    assert st.T == 1
-    assert not st.group_start_numeric_mask.any()
-
-
-def test_token_pack_ignores_missing_group_start() -> None:
-    from mouse_core.data import Tokenizer, pack_token_batch
-
-    tok = Tokenizer(
-        input_fields=[{"provider": "sensor", "type": "text", "input_field": "action", "format": "{field}", "head_output": True},
-            {"provider": "sensor",
-                "type": "text",
-                "input_field": "repeat_episode_index",
-                "format": "{field}",
-                "when": when_step_index_zero,
-            },
-        ],
-        objective_fields=_obj("action"),
-        tokenizers={"default": IntIdTokenizer()},
-    )
-    steps = [
-        encode_measurement(tok, {"action": 1, "episode_index": 0}),
-        encode_measurement(tok, {"action": 2, "episode_index": 0}),
-    ]
-    inputs, inputs_objective_data = pack_token_batch(steps=steps, sequence_ids=[0, 0], batch_size=1, continuing=None)
-    assert inputs["token_ids"].shape[0] == steps[0].T + steps[1].T
-    assert steps[0].group_start_token_ids is None
-
-
 def test_repeat_episode_index_emits_only_on_step_zero() -> None:
     """``repeat_episode_index`` is text only when ``step_index`` is 0, including a later episode."""
     seen: list[str] = []
@@ -1244,8 +977,7 @@ def test_repeat_episode_index_emits_only_on_step_zero() -> None:
             {"provider": "sensor",
                 "type": "text",
                 "input_field": "repeat_episode_index",
-                "format": ",e={field}",
-                "when": when_step_index_zero,
+                "format": lambda ctx: f",e={ctx['field']}" if ('step_index' in ctx and ctx['step_index'] == 0) else "",
             },
             {"provider": "sensor",
                 "type": "text",
@@ -1288,8 +1020,7 @@ def test_token_repeat_episode_index_emits_only_on_step_zero() -> None:
             {"provider": "sensor",
                 "type": "text",
                 "input_field": "repeat_episode_index",
-                "format": "{field}",
-                "when": when_step_index_zero,
+                "format": lambda ctx: f"{ctx['field']}" if ('step_index' in ctx and ctx['step_index'] == 0) else "",
             },
         ],
         tokenizers={"default": IntIdTokenizer()},
@@ -1303,10 +1034,10 @@ def test_token_repeat_episode_index_emits_only_on_step_zero() -> None:
     assert again.token_ids.tolist() == [1, 9]
 
 
-def test_when_rejects_non_callable_scalar() -> None:
+def test_removed_when_keyword_is_rejected() -> None:
     import pytest
 
-    with pytest.raises(TypeError, match="when= must be a callable"):
+    with pytest.raises(TypeError, match="unexpected keyword argument.*when"):
         Tokenizer(
             tokenizers={"default": _FakeTokenizer()},
             input_fields=[
@@ -1321,31 +1052,12 @@ def test_when_rejects_non_callable_scalar() -> None:
         )
 
 
-def test_head_output_rejects_when() -> None:
-    import pytest
-
-    with pytest.raises(ValueError, match="head_output"):
-        Tokenizer(
-            input_fields=[
-                {"provider": "sensor",
-                    "type": "text",
-                    "input_field": "repeat_episode_index",
-                    "format": "{field}",
-                    "when": when_step_index_zero,
-                    "head_output": True,
-                }
-            ],
-            tokenizers={"default": _FakeTokenizer()},
-        )
-
-
-def test_const_accepts_when() -> None:
+def test_constant_format_callback_controls_emission() -> None:
     tok = Tokenizer(
         input_fields=[
             {"provider": "sensor",
                 "type": "text",
-                "format": "x",
-                "when": when_step_index_zero,
+                "format": lambda ctx: f'x' if ('step_index' in ctx and ctx['step_index'] == 0) else "",
             },
             {"provider": "sensor", "type": "text", "input_field": "action", "format": "{field}", "head_output": True},
         ],
@@ -1355,31 +1067,6 @@ def test_const_accepts_when() -> None:
     assert zero.token_ids.tolist() == _FakeTokenizer()("x")["input_ids"].view(-1).tolist() + _enc("1")
     later = encode_measurement(tok, {"action": 1, "step_index": 2, "episode_index": 0})
     assert later.token_ids.tolist() == _enc("1")
-
-
-def test_when_equals_or_group_start_routes_value_to_ordinary() -> None:
-    """equals match prefers ordinary tokens; group_start alone uses group_start_*."""
-    tok = Tokenizer(
-        input_fields=[
-            {"provider": "sensor",
-                "type": "text",
-                "input_field": "repeat_episode_index",
-                "format": "{field}",
-                "when": when_step_index_zero_or_group_start,
-            },
-            {"provider": "sensor", "type": "text", "input_field": "action", "format": "{field}", "head_output": True},
-        ],
-        tokenizers={"default": IntIdTokenizer()},
-    )
-    # step_index==0 → ordinary emit (not group_start_*), even with group_start set.
-    zero = encode_measurement(tok, {"action": 1, "repeat_episode_index": 4, "step_index": 0, "episode_index": 0})
-    assert zero.token_ids.tolist() == [4, 1]
-    assert zero.group_start_token_ids is None
-    # Mid-episode non-zero step → only group_start branch; tokens on group_start_*.
-    later = encode_measurement(tok, {"action": 1, "repeat_episode_index": 4, "step_index": 2, "episode_index": 0})
-    assert later.token_ids.tolist() == [1]
-    assert later.group_start_token_ids is not None
-    assert later.group_start_token_ids.tolist() == [4]
 
 
 def _scaled(value: float, lo: float, hi: float) -> float:
@@ -1444,7 +1131,7 @@ def test_zero_numeric_values_keep_their_mask_through_prefix_packing_and_embeddin
     tokenizer = Tokenizer(
         input_fields=[
             {"provider": "sensor", "type": "token", "input_field": "prefix", "numeric_field": "prefix", "format": "*",
-             "fourier_min": -1., "fourier_max": 1., "when": when_group_start},
+             "fourier_min": -1., "fourier_max": 1.},
             {"provider": "sensor", "type": "token", "format": "*", "head_output": True},
             {"provider": "sensor", "type": "token", "input_field": "observation", "numeric_field": "observation", "format": "*",
              "fourier_min": -1., "fourier_max": 1.},
@@ -1452,14 +1139,14 @@ def test_zero_numeric_values_keep_their_mask_through_prefix_packing_and_embeddin
         tokenizers={"default": _FakeTokenizer()},
     )
     step = encode_measurement(tokenizer, {"prefix": 0., "observation": 0.})
-    batch, batch_objective_data = pack_token_batch(steps=[step, step], sequence_ids=[0, 0], continuing=None)
+    batch, batch_objective_data = pack_token_batch(steps=[step, step], sequence_ids=[0, 0])
     tensors = batch.to("cpu")
     # Every token has the same ID and value; only the mask distinguishes them.
     assert tensors["token_ids"].unique().numel() == 1
     assert not tensors["numeric_values"].any()
     assert tensors["numeric_mask"].dtype == torch.bool
-    assert tensors["numeric_mask"].tolist() == [True, False, True, False, True]
-    assert tensors["head_token_mask"].nonzero(as_tuple=True)[0].tolist() == [1, 3]
+    assert tensors["numeric_mask"].tolist() == [True, False, True, True, False, True]
+    assert tensors["head_token_mask"].nonzero(as_tuple=True)[0].tolist() == [1, 4]
     assert batch_objective_data["head_step_ids"].tolist() == [0, 1]
 
     embedding = Embedding(hidden_dim=8, vocab_size=32, numeric_field_names=tokenizer.numeric_field_names, num_frequencies=2)
@@ -1478,9 +1165,9 @@ def test_zero_numeric_values_keep_their_mask_through_prefix_packing_and_embeddin
     assert embedding.embed_tokens.weight.grad is not None
     assert embedding.embed_tokens.weight.grad.abs().sum() > 0
 
-    continued, continued_objective_data = pack_token_batch(steps=[step], sequence_ids=[0], continuing=[True])
-    assert continued['numeric_mask'].tolist() == [False, True]
-    assert continued["head_token_mask"].nonzero(as_tuple=True)[0].tolist() == [0]
+    continued, continued_objective_data = pack_token_batch(steps=[step], sequence_ids=[0])
+    assert continued['numeric_mask'].tolist() == [True, False, True]
+    assert continued["head_token_mask"].nonzero(as_tuple=True)[0].tolist() == [1]
 
 
 def test_text_only_embedding_accepts_just_token_ids() -> None:
@@ -1563,28 +1250,6 @@ def test_numeric_requires_distinct_finite_bounds() -> None:
         )
 
 
-def test_numeric_group_start_keeps_the_scaled_value() -> None:
-    import pytest
-
-    tokenizer = Tokenizer(
-        input_fields=[
-            {"provider": "sensor",
-                "type": "token",
-                "input_field": "observation", "numeric_field": "observation",
-                "format": "*",
-                "fourier_min": 0.0,
-                "fourier_max": 1.0,
-                "when": when_group_start,
-            },
-            {"provider": "sensor", "type": "text", "format": "\n", "head_output": True},
-        ],
-        tokenizers={"default": _FakeTokenizer()},
-    )
-    step = encode_measurement(tokenizer, {"observation": 0.25})
-    assert step.group_start_numeric_values is not None
-    assert step.group_start_numeric_values.tolist() == pytest.approx([_scaled(0.25, 0.0, 1.0)])
-
-
 def test_numeric_config_roundtrip(tmp_path) -> None:
     from mouse_core.data import load_tokenizer, save_tokenizer
 
@@ -1644,7 +1309,7 @@ def test_numeric_embed_adds_fourier_of_the_scaled_value() -> None:
     assert torch.count_nonzero(fresh.features.numeric[0].proj.weight) > 0
     low = encode_measurement(tokenizer, {"action": 0, "observation": -0.5})
     batch, batch_objective_data = pack_token_batch(
-        steps=[low], sequence_ids=[0], batch_size=1, continuing=None
+        steps=[low], sequence_ids=[0], batch_size=1
     )
     embeds = embed_batch(fresh, batch)
     mask = torch.tensor(low.numeric_mask)
@@ -1653,10 +1318,10 @@ def test_numeric_embed_adds_fourier_of_the_scaled_value() -> None:
     assert not torch.allclose(embeds[mask], looked)
     high = encode_measurement(tokenizer, {"action": 0, "observation": 0.5})
     low_batch, low_batch_objective_data = pack_token_batch(
-        steps=[low], sequence_ids=[0], batch_size=1, continuing=None
+        steps=[low], sequence_ids=[0], batch_size=1
     )
     high_batch, high_batch_objective_data = pack_token_batch(
-        steps=[high], sequence_ids=[0], batch_size=1, continuing=None
+        steps=[high], sequence_ids=[0], batch_size=1
     )
     low_embeds = embed_batch(fresh, low_batch)
     high_embeds = embed_batch(fresh, high_batch)

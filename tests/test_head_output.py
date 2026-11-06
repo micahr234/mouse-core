@@ -18,24 +18,6 @@ from mouse_core.models.mlp import MLP
 from mouse_core.models.reasoner import _plan_insertions
 from mouse_core.objectives import DqnObjective, affine_reward, affine_value, boundary_discount
 
-def when_repeat_episode_done_nonzero(ctx):
-    return "repeat_episode_done" in ctx and ctx["repeat_episode_done"] != 0
-
-
-def when_group_start(ctx):
-    return bool(ctx["group_start"])
-
-
-def when_reward_nonzero(ctx):
-    return "reward" in ctx and ctx["reward"] != 0.0
-
-
-def when_step_index_zero(ctx):
-    return "step_index" in ctx and ctx["step_index"] == 0
-
-
-def when_step_index_zero_or_group_start(ctx):
-    return (ctx.get("step_index") == 0) | bool(ctx["group_start"])
 
 from tests._token_batch_helpers import batch_to_packed
 
@@ -44,8 +26,6 @@ def _group_id(data: dict[str, torch.Tensor]) -> torch.Tensor:
         return data["group_id"]
     n = int(next(iter(data.values())).shape[0])
     return torch.zeros(n, dtype=torch.int64)
-
-
 
 
 def _disc(**overrides: float):
@@ -94,8 +74,7 @@ def _head_output_tokenizer(
         {"provider": "sensor",
             "type": "text",
             "input_field": "repeat_episode_index",
-            "format": "{field}",
-            "when": when_step_index_zero,
+            "format": lambda ctx: f"{ctx['field']}" if ('step_index' in ctx and ctx['step_index'] == 0) else "",
         }
     )
     fields.append(
@@ -172,8 +151,7 @@ def test_step_without_head_output_token_is_retained() -> None:
             {"provider": "sensor",
                 "type": "text",
                 "input_field": "repeat_episode_index",
-                "format": "{field}",
-                "when": when_step_index_zero,
+                "format": lambda ctx: f"{ctx['field']}" if ('step_index' in ctx and ctx['step_index'] == 0) else "",
             },
         ],
         tokenizers={"default": _FakeTokenizer()},
@@ -184,37 +162,6 @@ def test_step_without_head_output_token_is_retained() -> None:
     # Head-output field missing → the step has no head-output token.
     passive = encode_measurement(tok, {"action": 1, "reward": None, "episode_index": 0})
     assert passive.token_ids.size == 1 and not passive.head_token_mask.any()
-
-
-def test_head_output_rejects_when() -> None:
-    with pytest.raises(ValueError, match="head_output and cannot set when="):
-        Tokenizer(
-            input_fields=[
-                {"provider": "sensor",
-                    "type": "text",
-                    "input_field": "reward",
-                    "format": "{field}",
-                    "when": when_reward_nonzero,
-                    "head_output": True,
-                },
-            ],
-            tokenizers={"default": _FakeTokenizer()},
-        )
-
-
-def test_head_output_rejects_group_start() -> None:
-    with pytest.raises(ValueError, match="head_output and cannot set when="):
-        Tokenizer(
-            input_fields=[
-                {"provider": "sensor",
-                    "type": "text",
-                    "format": "\n",
-                    "when": when_group_start,
-                    "head_output": True,
-                },
-            ],
-            tokenizers={"default": _FakeTokenizer()},
-        )
 
 
 # ---------------------------------------------------------------------------

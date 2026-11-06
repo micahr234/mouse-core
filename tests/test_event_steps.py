@@ -17,7 +17,6 @@ def make_tokenizer(**kwargs):
     ], **kwargs)
 
 
-
 def recorded():
     log = EventLog()
     for episode in range(2):
@@ -103,7 +102,7 @@ def test_training_requires_labels_but_inference_does_not():
     tok = make_tokenizer(objective_fields=[dict(input_field='label')])
     with pytest.raises(KeyError, match='label'):
         tok.encode(recorded())
-    packed, packed_objective_data = tok.pack_rows(rows=[recorded(), []], continuing=None)
+    packed, packed_objective_data = tok.pack_rows(rows=[recorded(), []])
     assert packed_objective_data["step_sequence_ids"].shape[0] == 6
     assert packed["num_sequences"] == 2
 
@@ -258,19 +257,15 @@ def test_sparse_step_headers_keep_metadata_labels_identical_after_persistence():
         assert step.objective_fields == {'episode_index': 3, 'step_index': 7}
 
 
-def on_group_start(ctx):
-    return ctx['group_start']
-
-
 def test_event_prefix_and_readouts_match_full_and_cached_packing():
     tok = Tokenizer(tokenizers={"default": IntIdTokenizer()}, input_fields=[
-        dict(type='token', provider='sensor', format='8', when=on_group_start),
+        dict(type='token', provider='sensor', input_field='_episode_start', format='8'),
         dict(type='text', provider='sensor', input_field='value', format='{field}'),
         dict(type='token', provider='sensor', format='9', head_output=True),
     ])
-    events = [dict(provider='sensor', step_index=i, payload={'value': i + 1}) for i in range(3)]
-    full, full_objective_data = tok.pack_rows(rows=[events], continuing=None)
-    first, first_objective_data = tok.pack_rows(rows=[events[:1]], continuing=None)
-    rest, rest_objective_data = tok.pack_rows(rows=[events[1:]], continuing=[True])
+    events = [dict(provider='sensor', step_index=i, payload={'value': i + 1, **({'_episode_start': True} if i == 0 else {})}) for i in range(3)]
+    full, full_objective_data = tok.pack_rows(rows=[events])
+    first, first_objective_data = tok.pack_rows(rows=[events[:1]])
+    rest, rest_objective_data = tok.pack_rows(rows=[events[1:]])
     assert full['token_ids'].tolist() == first['token_ids'].tolist() + rest['token_ids'].tolist() == [8, 1, 9, 2, 9, 3, 9]
     assert full_objective_data["head_step_ids"].tolist() == [0, 1, 2]

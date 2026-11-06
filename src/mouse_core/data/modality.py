@@ -21,22 +21,23 @@ KIND_TEXT = "text"
 KIND_TOKEN = "token"
 KIND_IMAGE = "image"
 
-# Per-step emission gate. See ``mouse_core.data.conditions``.
-WhenFn = Callable[[Mapping[str, Any]], bool]
-
 
 @dataclass
 class TokenizerModalitySpec:
     """Describe tokens from one concrete provider.
 
     ``text`` formats an optional input scalar into a variable-length token run.
+    A callable ``format(ctx)`` may instead return any text, including an empty
+    string. It receives the payload and, with input_field, the selected/lookup
+    value under ``ctx["field"]``.
     ``token`` uses the same formatting and lookup rules but must produce exactly
-    one token. ``special=True`` registers a literal token in the vocabulary.
+    one token for nonempty output. ``special=True`` registers a literal token
+    in the vocabulary.
     ``image`` encodes an image into discrete visual tokens.
 
     ``input_index`` selects an element of a vector before formatting. A missing
     or None input emits nothing. Without input_field, text/token are constants.
-    Optional ``when`` gates emission; ``head_output`` marks prediction tokens.
+    ``head_output`` marks prediction tokens.
 
     Any type may set ``numeric_field`` and explicit finite ``fourier_min`` /
     ``fourier_max`` bounds (min < max). ``numeric_index`` optionally selects a
@@ -67,12 +68,11 @@ class TokenizerModalitySpec:
     position_fourier_min: float | None = None
     position_fourier_max: float | None = None
     lookup: Sequence[str] | None = None
-    format: str | None = None
+    format: str | Callable[[Mapping[str, Any]], str] | None = None
     fourier_min: float | None = None
     fourier_max: float | None = None
     _format_code: CodeType | None = field(default=None, init=False, repr=False, compare=False)
     max_tokens: int | None = None
-    when: WhenFn | None = None
     head_output: bool = False
 
     _VALID_TYPES: ClassVar[tuple[str, ...]] = (
@@ -144,39 +144,46 @@ class TokenizerModalitySpec:
         self._init_named_input()
         self._reject_text_format(k)
         _validate_max_tokens(self)
-        _validate_when(self)
 
     def _init_token(self) -> None:
         self._reject_max_tokens("token")
         self._init_text()
         if self.special:
             self._format_code = _compile_text_format(
-                self.format, who="special token", allow_field=False, literal="special token"
+                cast(str, self.format), who="special token", allow_field=False, literal="special token"
             )
 
     def _init_text(self) -> None:
+        if callable(self.format):
+            if self.special:
+                raise TypeError("Special tokens require a literal format string")
+            if self.input_field is None:
+                self._reject_input_index("text callback")
+                self._reject_no_input_knobs("text callback")
+            else:
+                _validate_input_index(self)
+            _validate_max_tokens(self)
+            return
         if self.input_field is None:
             self._reject_input_index("text const")
             self._reject_no_input_knobs("text const")
-            if not self.format:
+            if self.format is None:
                 raise ValueError(
                     "text const field requires format= "
                     "(a literal string, no placeholders)"
                 )
             code = _compile_text_format(
-                self.format, who="const", allow_field=False
+                cast(str, self.format), who="const", allow_field=False
             )
             object.__setattr__(self, "_format_code", code)
             _validate_max_tokens(self)
-            _validate_when(self)
             return
         _validate_input_index(self)
         code = _compile_text_format(
-            self.format, who=self.input_field, allow_field=True
+            cast(str, self.format), who=self.input_field, allow_field=True
         )
         object.__setattr__(self, "_format_code", code)
         _validate_max_tokens(self)
-        _validate_when(self)
 
     def _init_named_input(self) -> None:
         if not self.input_field:
@@ -220,7 +227,7 @@ def _compile_text_format(
 ) -> CodeType:
     """Compile ``format=`` as an f-string whose only name is ``field``."""
     label = who or "text field"
-    if not format_str:
+    if format_str is None or (literal is not None and format_str == ""):
         if literal is not None:
             raise ValueError(
                 f"{literal} field {label!r} requires format= "
@@ -319,60 +326,6 @@ def _validate_max_tokens(spec: TokenizerModalitySpec) -> None:
             f"tokenizer modality {_field_label(spec)!r} max_tokens must be >= 1"
         )
     object.__setattr__(spec, "max_tokens", n)
-
-
-def _normalize_when(when: Any, *, name: str) -> WhenFn | None:
-    """Normalize ``when=`` to a callable, or ``None``.
-
-    Accepts a callable, an import-path string (``module:qualname`` from
-    JSON), or ``None``. Dict-style equals / not_equals / group_start
-    gates are rejected.
-    """
-    if when is None:
-        return None
-    if isinstance(when, str):
-        from mouse_core.data.conditions import resolve_when_ref
-
-        when = resolve_when_ref(when)
-    if not callable(when):
-        raise TypeError(
-            f"tokenizer modality {name!r} when= must be a callable "
-            f"(ctx → bool), an import path string, or None; got "
-            f"{type(when).__name__}"
-        )
-    return cast(WhenFn, when)
-
-
-def _validate_when(spec: TokenizerModalitySpec) -> None:
-    name = _field_label(spec)
-    normalized = _normalize_when(spec.when, name=name)
-    object.__setattr__(spec, "when", normalized)
-    if normalized is None:
-        return
-    if spec.head_output:
-        raise ValueError(
-            f"tokenizer modality {name!r} is head_output and cannot set "
-            "when= (that field must emit on every step)"
-        )
-
-
-def when_as_bool(value: Any) -> bool:
-    """Coerce a ``when`` return value to a Python ``bool``."""
-    if isinstance(value, np.ndarray):
-        if value.shape != ():
-            raise TypeError(
-                "tokenizer when= must return a scalar bool, got array "
-                f"with shape {value.shape}"
-            )
-        return bool(value.item())
-    if isinstance(value, torch.Tensor):
-        if value.ndim != 0:
-            raise TypeError(
-                "tokenizer when= must return a scalar bool, got tensor "
-                f"with shape {tuple(value.shape)}"
-            )
-        return bool(value.item())
-    return bool(value)
 
 
 def unwrap_scalar(value: Any) -> Any:
@@ -483,7 +436,6 @@ def _as_finite_float(value: Any, *, who: str, name: str) -> float:
     if not math.isfinite(number):
         raise ValueError(f"numeric field {who!r} {name} must be finite, got {value!r}")
     return number
-
 
 
 def _field_label(spec: TokenizerModalitySpec) -> str:

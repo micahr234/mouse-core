@@ -318,9 +318,9 @@ def test_incremental_tokens_and_saved_spec_match_replay(tmp_path):
     save_tokenizer(tokenizer=tok, path=tmp_path)
     loaded = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizers={"default": IntIdTokenizer()})
     rows = list(environment_decisions(log))[:4]
-    full, full_objective_data = tok.pack_rows(rows=[_events(rows)], continuing=None)
-    first, first_objective_data = tok.pack_rows(rows=[_events(rows[:1])], continuing=None)
-    rest, rest_objective_data = loaded.pack_rows(rows=[_events(rows[1:])], continuing=[True])
+    full, full_objective_data = tok.pack_rows(rows=[_events(rows)])
+    first, first_objective_data = tok.pack_rows(rows=[_events(rows[:1])])
+    rest, rest_objective_data = loaded.pack_rows(rows=[_events(rows[1:])])
     for field in ('token_ids', 'numeric_values', 'numeric_mask'):
         np.testing.assert_array_equal(full[field], np.concatenate([first[field], rest[field]]))
     np.testing.assert_array_equal(full_objective_data["head_step_ids"], [0, 1, 2, 3])
@@ -406,19 +406,18 @@ def test_replay_loader_training_and_cached_inference(tmp_path):
     model.eval()
     rows = list(environment_decisions(log))[:4]
     with torch.no_grad():
-        full = model(tok.pack_rows(rows=[_events(rows)], continuing=None)[0])['predictions']['q']
+        full = model(tok.pack_rows(rows=[_events(rows)])[0])['predictions']['q']
         cache = None
         values = []
         try:
             for i, row in enumerate(rows):
-                result = model(tok.pack_rows(rows=[_events([row])], continuing=[True] if i else None)[0], cache=cache, use_cache=True)
+                result = model(tok.pack_rows(rows=[_events([row])])[0], cache=cache, use_cache=True)
                 cache = result['cache']
                 values.append(result['predictions']['q'].reshape(-1, 2))
             torch.testing.assert_close(torch.cat(values), full, atol=2e-5, rtol=2e-5)
         finally:
             if cache is not None: cache.close()
     loader.close()
-
 
 
 def test_consecutive_passive_outputs_keep_separate_rewards_and_action_ownership():

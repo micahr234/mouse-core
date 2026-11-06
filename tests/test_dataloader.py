@@ -29,10 +29,6 @@ from tests._token_batch_helpers import IntIdTokenizer
 from tests._token_batch_helpers import token_tokenizer
 
 
-def when_step_index_zero(ctx):
-    return "step_index" in ctx and ctx["step_index"] == 0
-
-
 def _store_with_actions() -> Datastore:
     store = measurement_store()
     for action in range(8):
@@ -61,8 +57,7 @@ def _tokenizer(*, objective_fields: list[dict[str, str]] | None = None) -> Token
             {"provider": "sensor",
                 "type": "text",
                 "input_field": "repeat_episode_index",
-                "format": "{field}",
-                "when": when_step_index_zero,
+                "format": lambda ctx: f"{ctx['field']}" if ('step_index' in ctx and ctx['step_index'] == 0) else "",
             },
         ],
         objective_fields=keep,
@@ -711,17 +706,13 @@ def test_dataloader_first_sample_over_budget_raises() -> None:
         loader.next_batch()
 
 
-def when_group_start(ctx):
-    return bool(ctx["group_start"])
-
-
-def _episode_transform(*, group_start: bool):
+def _episode_transform(*, episode_prompt: bool):
     fields: list[dict] = [
         {"provider": "sensor", "type": "text", "input_field": "action", "format": "{field}", "head_output": True},
     ]
-    if group_start:
+    if episode_prompt:
         fields.append(
-            {"provider": "sensor", "type": "text", "input_field": "mark", "format": "{field}", "when": when_group_start}
+            {"provider": "sensor", "type": "text", "input_field": "mark", "format": lambda ctx: f"{ctx['field']}" if ctx.get("step_index") == 0 else ""}
         )
     tokenizer = Tokenizer(
         input_fields=fields,
@@ -741,7 +732,7 @@ def test_dataloader_events_budget_keeps_whole_runs() -> None:
         seed=0,
         stores=store,
         index_field="store_index",
-        transform=_episode_transform(group_start=False),
+        transform=_episode_transform(episode_prompt=False),
     )
     tb, obj = loader.next_batch()
     assert tb["num_sequences"] == 3
@@ -807,7 +798,7 @@ def test_dataloader_token_budget_fills_the_batch_with_segments() -> None:
         sample_field="episode_index",
         stores=store,
         index_field="store_index",
-        transform=_episode_transform(group_start=False),
+        transform=_episode_transform(episode_prompt=False),
     )
     tb, obj = loader.next_batch()
     assert tb["num_sequences"] == 2
@@ -821,7 +812,7 @@ def test_dataloader_token_budget_fills_the_batch_with_segments() -> None:
         sample_field="episode_index",
         stores=store,
         index_field="store_index",
-        transform=_episode_transform(group_start=False),
+        transform=_episode_transform(episode_prompt=False),
     )
     tb, obj = short.next_batch()
     # Each episode is 2 tokens. Two fit in 5; the third does not, so it is left out.
@@ -836,7 +827,7 @@ def test_dataloader_token_budget_fills_the_batch_with_segments() -> None:
         sample_field="episode_index",
         stores=store,
         index_field="store_index",
-        transform=_episode_transform(group_start=False),
+        transform=_episode_transform(episode_prompt=False),
     )
     tb, obj = two.next_batch()
     assert tb["num_sequences"] == 4
@@ -845,9 +836,9 @@ def test_dataloader_token_budget_fills_the_batch_with_segments() -> None:
 
 
 def test_dataloader_token_budget_does_not_split_a_segment() -> None:
-    """A segment that does not fit is left out, group-start tokens included.
+    """A segment that does not fit is left out, episode-prompt tokens included.
 
-    Each episode is two steps. The first step emits one group-start token plus
+    Each episode is two steps. The first step emits one episode-prompt token plus
     one action token; the second emits one action token. A segment costs 3.
     Budget 5 keeps one whole segment and drops the next.
     """
@@ -859,7 +850,7 @@ def test_dataloader_token_budget_does_not_split_a_segment() -> None:
         sample_field="episode_index",
         stores=store,
         index_field="store_index",
-        transform=_episode_transform(group_start=True),
+        transform=_episode_transform(episode_prompt=True),
     )
     tb, obj = loader.next_batch()
     assert tb["num_sequences"] == 1
@@ -882,7 +873,7 @@ def test_dataloader_token_budget_rejects_an_oversized_segment() -> None:
         sample_field="episode_index",
         stores=store,
         index_field="store_index",
-        transform=_episode_transform(group_start=False),
+        transform=_episode_transform(episode_prompt=False),
     )
     with pytest.raises(ValueError, match="does not fit"):
         loader.next_batch()

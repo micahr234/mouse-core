@@ -213,7 +213,7 @@ def test_sequential_notebook_collects_and_trains(mode, monkeypatch):
         assert history[-1]["truncated"] and "terminated" not in history[-1]
         inputs, data = pack_token_batch(
             steps=namespace["tokenizer"].encode(raw_history),
-            sequence_ids=[0] * len(history), batch_size=1, continuing=None,
+            sequence_ids=[0] * len(history), batch_size=1,
         )
         groups = data["step_sequence_ids"]
         assert objective.discount(**data)[-1] == 0

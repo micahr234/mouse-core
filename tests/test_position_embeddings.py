@@ -15,16 +15,12 @@ from mouse_core.data import Tokenizer, TokenizerModalitySpec, load_tokenizer, sa
 from mouse_core.models import Embedding, MultiEmbedding
 
 
-def group_start(ctx):
-    return ctx['group_start']
-
-
 def tokenizer():
     backend = Backend(WordLevel({'[UNK]': 0, 'a': 1, 'b': 2, 'n': 3, 'head': 4}, unk_token='[UNK]'))
     backend.pre_tokenizer = Whitespace()
     position = dict(position_field='context', position_fourier_min=-1., position_fourier_max=1.)
     return Tokenizer(tokenizers={'text': PreTrainedTokenizerFast(tokenizer_object=backend, unk_token='[UNK]')}, input_fields=[
-        dict(type='text', provider='sensor', input_field='prefix', format='{field}', when=group_start, **position),
+        dict(type='text', provider='sensor', input_field='prefix', format='{field}', **position),
         dict(type='text', provider='sensor', input_field='reading', format='a {field} b', **position),
         dict(type="token", provider='sensor', input_field='position', numeric_field='position', format='n', fourier_min=0., fourier_max=2., **position),
         dict(type="token", provider='sensor', input_field='angle', numeric_field='angle', format='n', fourier_min=0., fourier_max=2., **position),
@@ -36,7 +32,7 @@ def events():
     return [dict(provider='sensor', episode_index=0, step_index=step, payload=payload) for step, payload in [
         (0, dict(prefix='a b', reading='a b', context=-.5, position=1.5, angle=1.5, request=True)),
         (0, dict(reading='b', context=0.)),
-        (1, dict(prefix='b', reading='a', context=None, request=True)),
+        (1, dict(reading='a', context=None, request=True)),
         (2, dict(reading='a', context=.9, request=True)),
     ]]
 
@@ -44,11 +40,9 @@ def events():
 def test_field_scope_multitoken_and_optional_position():
     tok = tokenizer()
     piece = tok(events()[0])
-    assert piece['position_values'].tolist() == [-.5] * 6 + [0]
-    assert piece['position_mask'].tolist() == [True] * 6 + [False]
-    assert piece['numeric_field_ids'].tolist() == [-1] * 4 + [0, 1, -1]
-    assert piece['group_start_position_values'].tolist() == [-.5, -.5]
-    assert piece['group_start_position_mask'].all()
+    assert piece['position_values'].tolist() == [-.5] * 8 + [0]
+    assert piece['position_mask'].tolist() == [True] * 8 + [False]
+    assert piece['numeric_field_ids'].tolist() == [-1] * 6 + [0, 1, -1]
     assert not tok(events()[2])['position_mask'].any()
     zero = tok(events()[1])
     assert zero['position_mask'].all() and (zero['position_values'] == 0).all()
@@ -61,18 +55,18 @@ def test_stream_pack_prefix_slice_and_saved_field_association(tmp_path):
     save_tokenizer(tokenizer=tok, path=tmp_path)
     restored = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizers=tok.tokenizers)
     assert [s.position_field for s in restored.input_fields] == [s.position_field for s in tok.input_fields]
-    packed, packed_objective_data = tok.pack_rows(rows=[events()], continuing=None)
-    copied, copied_objective_data = restored.pack_rows(rows=[events()], continuing=None)
+    packed, packed_objective_data = tok.pack_rows(rows=[events()])
+    copied, copied_objective_data = restored.pack_rows(rows=[events()])
     names = ('token_ids', 'position_values', 'position_mask', 'numeric_field_ids')
     assert packed['numeric_field_names'] == copied['numeric_field_names'] == tok.numeric_field_names
     for name in names:
         np.testing.assert_array_equal(packed[name], copied[name])
-    first, first_objective_data = tok.pack_rows(rows=[events()[:2]], continuing=None)
-    continued, continued_objective_data = tok.pack_rows(rows=[events()[2:]], continuing=[True])
+    first, first_objective_data = tok.pack_rows(rows=[events()[:2]])
+    continued, continued_objective_data = tok.pack_rows(rows=[events()[2:]])
     for name in names:
         np.testing.assert_array_equal(packed[name], np.concatenate([first[name], continued[name]]))
     assert packed['position_values'].dtype == torch.float64
-    empty, empty_objective_data = tok.pack_rows(rows=[[]], continuing=None)
+    empty, empty_objective_data = tok.pack_rows(rows=[[]])
     assert empty['numeric_field_names'] == tok.numeric_field_names
     assert empty['position_mask'].numel() == 0
     stream = tok.stream(include_objectives=False)
@@ -239,7 +233,7 @@ def test_numeric_and_position_additions_cover_every_emitted_token(kind, tmp_path
     content = [1, 2, 3] if kind == 'image' else 'a b a' if kind == 'text' else 'a'
     row = dict(provider='sensor', step_index=0,
                payload=dict(content=content, measurement=[0., 3.], context=1.))
-    packed, packed_objective_data = tok.pack_rows(rows=[[row]], continuing=None)
+    packed, packed_objective_data = tok.pack_rows(rows=[[row]])
     count = 1 if kind == 'token' else 3
     assert packed['numeric_values'].tolist() == [.5] * count
     assert packed['position_values'].tolist() == [.5] * count

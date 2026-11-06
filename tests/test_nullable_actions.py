@@ -46,7 +46,7 @@ def tokenizer(*fields):
 def test_only_packing_converts_missing_actions_to_nan(actions):
     rows = [{"action": action, "reward": 0.0} for action in actions]
     steps = [encode_measurement(tokenizer("action", "reward"), row) for row in rows]
-    inputs, data = pack_token_batch(steps=steps, continuing=None)
+    inputs, data = pack_token_batch(steps=steps)
     assert data["action"].dtype == torch.float64
     torch.testing.assert_close(data["action"], torch.tensor([float("nan") if a is None else a for a in actions], dtype=torch.float64), equal_nan=True)
     assert "action_executed" not in data
@@ -67,7 +67,7 @@ def test_missing_packed_action_is_not_treated_as_explicit_none():
     steps = [encode_measurement(tok, {"action": None}), encode_measurement(tok, {"action": 0})]
     del steps[1].objective_fields["action"]
     with pytest.raises(KeyError, match="action"):
-        pack_token_batch(steps=steps, continuing=None)
+        pack_token_batch(steps=steps)
 
 
 def test_stored_mask_is_rejected_in_favor_of_nullable_action():
@@ -75,7 +75,7 @@ def test_stored_mask_is_rejected_in_favor_of_nullable_action():
         {"action": 0, "action_executed": False}
     )
     with pytest.raises(ValueError, match="not supported"):
-        pack_token_batch(steps=[step], continuing=None)
+        pack_token_batch(steps=[step])
 
 
 def test_augmentation_preserves_none_and_permutates_reset_value_targets():
@@ -188,7 +188,7 @@ def test_nullable_rows_through_objective_ignore_automatic_decisions(algorithm):
     ]
     tok = tokenizer(*rows[0])
     inputs, data = pack_token_batch(
-        steps=[encode_measurement(tok, row) for row in rows], continuing=None
+        steps=[encode_measurement(tok, row) for row in rows]
     )
     groups = data["step_sequence_ids"]
     predictions = torch.tensor(

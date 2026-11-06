@@ -19,13 +19,9 @@ def backend():
         unk_token='[UNK]')
 
 
-def on_group_start(ctx):
-    return ctx['group_start']
-
-
 def tokenizer():
     return Tokenizer(tokenizers={"default": backend()}, input_fields=[
-        dict(type='token', provider='environment', format='prefix', when=on_group_start),
+        dict(type='token', provider='coordinator', input_field='_episode_start', format='prefix'),
         dict(type='token', provider='agent', input_field='action', format='action'),
         dict(type='token', provider='environment', input_field='observation', format='obs'),
         dict(type='token', provider='environment', input_field='reward', format='reward'),
@@ -38,7 +34,7 @@ def tokenizer():
 
 def episode():
     log = EventLog()
-    log.event(provider='coordinator', episode_index=0, step_index=0, payload={'episode_start': True})
+    log.event(provider='coordinator', episode_index=0, step_index=0, payload={'_episode_start': True})
     for step, payload in enumerate([
         {'observation': 0, 'action_requested': True},
         {'observation': 1, 'reward': 2.},
@@ -60,13 +56,13 @@ def test_special_tokens_sparse_steps_and_roundtrip(tmp_path):
     for source in (episode(), episode().to_dataset()):
         steps = tok.encode(source)
         assert [int(step.head_token_mask.sum()) for step in steps] == [1, 0, 0, 1, 0]
-        packed, labels = pack_token_batch(steps=steps, continuing=None)
+        packed, labels = pack_token_batch(steps=steps)
         groups = labels["step_sequence_ids"]
         assert labels["step_sequence_ids"].shape[0] == 5 and packed["head_token_mask"].nonzero(as_tuple=True)[0].shape[0] == 2
         assert labels["head_step_ids"].tolist() == [0, 3]
         assert torch.bincount(labels["step_sequence_ids"], minlength=packed["num_sequences"]).tolist() == [5]
         assert packed['token_ids'][packed["head_token_mask"].nonzero(as_tuple=True)[0]].tolist() == [special, special]
-        assert packed['token_ids'].tolist().count(4) == 1  # group prefix
+        assert packed['token_ids'].tolist().count(4) == 1  # episode prompt
         assert labels['reward'].tolist() == [0., 2., 3., 0., 7.]
         assert groups.tolist() == [0] * 5
     save_tokenizer(tokenizer=tok, path=tmp_path)
@@ -81,7 +77,7 @@ def test_special_tokens_sparse_steps_and_roundtrip(tmp_path):
 
 
 def test_rewards_flow_through_steps_without_readouts():
-    packed, labels = pack_token_batch(steps=tokenizer().encode(episode()), continuing=None)
+    packed, labels = pack_token_batch(steps=tokenizer().encode(episode()))
     groups = labels["step_sequence_ids"]
     q = torch.tensor([[1., 0.], [4., 0.]], requires_grad=True)
     discount = boundary_discount(gamma_step=.5, gamma_terminated=0., gamma_truncated=0.)
@@ -108,7 +104,7 @@ def test_rewards_flow_through_steps_without_readouts():
 
 def test_cached_layout_keeps_passive_tokens_without_inventing_readouts():
     steps = tokenizer().encode(episode())
-    tokens, tokens_objective_data = pack_token_batch(steps=[*steps, *steps[1:3]], sequence_ids=[0]*5+[1]*2, continuing=None)
+    tokens, tokens_objective_data = pack_token_batch(steps=[*steps, *steps[1:3]], sequence_ids=[0]*5+[1]*2)
     tensors = tokens
     padded, lengths, ids, valid = prepare_decode(embeds=torch.ones(tokens["token_ids"].shape[0], 3), tokens=tokens,
         sequence_ids=tensors['sequence_ids'], head_token_mask=tensors["head_token_mask"])
@@ -117,7 +113,7 @@ def test_cached_layout_keeps_passive_tokens_without_inventing_readouts():
     for seed in range(10):
         splits = sample_reasoning_splits(batch=tokens, objective_data=tokens_objective_data, generator=np.random.default_rng(seed))
         assert splits[0] in (0, 3) and splits[1] == -1
-    passive, passive_objective_data = pack_token_batch(steps=steps[1:3], continuing=[True])
+    passive, passive_objective_data = pack_token_batch(steps=steps[1:3])
     t = passive
     _, lengths, ids, valid = prepare_decode(embeds=torch.ones(passive["token_ids"].shape[0], 3), tokens=passive,
         sequence_ids=t['sequence_ids'], head_token_mask=t["head_token_mask"])
@@ -134,22 +130,22 @@ def test_embedding_growth_preserves_old_rows_and_trains_special_row():
     assert embedding.embed_tokens.weight.grad[5].abs().sum() > 0
 
 
-def test_explicit_provider_fields_keep_order_and_group_prefix_once():
+def test_explicit_provider_fields_keep_order_and_episode_prompt_once():
     tok = Tokenizer(tokenizers={"default": backend()}, input_fields=[
-        dict(type='token', provider='sensor', format='prefix', when=on_group_start),
+        dict(type='token', provider='coordinator', input_field='_episode_start', format='prefix'),
         dict(type='token', provider='sensor', input_field='value', format='obs'),
         dict(type='token', provider='agent', input_field='value', format='action', head_output=True),
     ])
     log = EventLog()
-    log.event(provider='coordinator', episode_index=0, step_index=0, payload={})
+    log.event(provider='coordinator', episode_index=0, step_index=0, payload={'_episode_start': True})
     log.event(provider='agent', episode_index=0, step_index=0, payload={'value': 1})
     log.event(provider='sensor', episode_index=0, step_index=0, payload={'value': 2})
     log.event(provider='sensor', episode_index=0, step_index=1, payload={'value': 3})
-    packed, packed_objective_data = tok.pack_rows(rows=[log], continuing=None)
+    packed, packed_objective_data = tok.pack_rows(rows=[log])
     assert packed['token_ids'].tolist() == [4, 2, 1, 1]
     assert packed_objective_data["head_step_ids"].tolist() == [0]
-    first, first_objective_data = tok.pack_rows(rows=[log[:3]], continuing=None)
-    rest, rest_objective_data = tok.pack_rows(rows=[log[3:]], continuing=[True])
+    first, first_objective_data = tok.pack_rows(rows=[log[:3]])
+    rest, rest_objective_data = tok.pack_rows(rows=[log[3:]])
     assert packed['token_ids'].tolist() == first['token_ids'].tolist() + rest['token_ids'].tolist()
 
 
@@ -190,7 +186,7 @@ def test_passive_only_step_window_has_no_prediction_loss():
     for step in range(2):
         log.event(provider='environment', episode_index=0, step_index=step, payload={'reward': 1.})
     steps = tokenizer().encode(log)
-    inputs, labels = pack_token_batch(steps=steps, continuing=None)
+    inputs, labels = pack_token_batch(steps=steps)
     groups = labels["step_sequence_ids"]
     q = torch.empty(0, 2, requires_grad=True)
     objective = DqnObjective(discount=boundary_discount(gamma_step=.5, gamma_terminated=0., gamma_truncated=0.),

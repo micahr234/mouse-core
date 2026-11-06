@@ -16,7 +16,7 @@ def _inputs(*rows):
                 numeric_mask=np.zeros(len(heads), dtype=bool), head_token_mask=np.array(heads, dtype=bool),
             ))
             sequences.append(sequence)
-    return pack_token_batch(steps=steps, sequence_ids=sequences, batch_size=len(rows), continuing=None)
+    return pack_token_batch(steps=steps, sequence_ids=sequences, batch_size=len(rows))
 
 
 def _scores(inputs, cached):

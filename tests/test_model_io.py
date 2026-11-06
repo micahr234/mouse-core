@@ -15,22 +15,15 @@ from mouse_core.data import Tokenizer, load_tokenizer, save_tokenizer, pack_toke
 from mouse_core.objectives import SupervisedObjective
 from mouse_core.models.mlp import MLP
 
-def when_repeat_episode_done_nonzero(ctx):
-    return "repeat_episode_done" in ctx and ctx["repeat_episode_done"] != 0
 
-
-def when_group_start(ctx):
-    return bool(ctx["group_start"])
-
-
-def test_inline_conditions_reload_in_a_fresh_notebook(tmp_path, monkeypatch):
-    source = 'def on_start(ctx):\n    return bool(ctx["group_start"])\n'
+def test_inline_formats_reload_in_a_fresh_notebook(tmp_path, monkeypatch):
+    source = 'def episode_prompt(ctx):\n    return "2" if ctx.get("_episode_start") else ""\n'
     training = ModuleType('__main__')
     exec(source, training.__dict__)
     monkeypatch.setitem(sys.modules, '__main__', training)
     tokenizer = Tokenizer(
         input_fields=[
-            {"provider": "sensor", 'type': 'token', 'format': '2', 'when': training.on_start},
+            {"provider": "sensor", 'type': 'text', 'format': training.episode_prompt},
             {"provider": "sensor", 'type': 'token', 'format': '1', 'head_output': True},
         ],
         tokenizers={"default": IntIdTokenizer()},
@@ -38,19 +31,19 @@ def test_inline_conditions_reload_in_a_fresh_notebook(tmp_path, monkeypatch):
     save_tokenizer(tokenizer=tokenizer, path=tmp_path)
     inference = ModuleType('__main__')
     monkeypatch.setitem(sys.modules, '__main__', inference)
-    with pytest.raises(ValueError, match="Define tokenizer condition 'on_start'"):
+    with pytest.raises(ValueError, match="Define tokenizer callback 'episode_prompt'"):
         load_tokenizer(repo_id_or_path=str(tmp_path), tokenizers={"default": IntIdTokenizer()})
     exec(source, inference.__dict__)
     restored = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizers={"default": IntIdTokenizer()})
     assert isinstance(restored, Tokenizer)
-    assert restored.input_fields[0].when is inference.on_start
-    assert restored.input_fields[0].when is not training.on_start
-    assert restored.pack_rows(rows=[measurement_events(payloads) for payloads in [[{}]]], continuing=None)[0]['token_ids'].tolist() == [2, 1]
-    assert restored.pack_rows(rows=[measurement_events(payloads) for payloads in [[{}]]], continuing=[True])[0]['token_ids'].tolist() == [1]
+    assert restored.input_fields[0].format is inference.episode_prompt
+    assert restored.input_fields[0].format is not training.episode_prompt
+    assert restored.pack_rows(rows=[measurement_events(payloads) for payloads in [[{"_episode_start": True}]]])[0]['token_ids'].tolist() == [2, 1]
+    assert restored.pack_rows(rows=[measurement_events(payloads) for payloads in [[{}]]])[0]['token_ids'].tolist() == [1]
 
 
 @pytest.mark.parametrize('module', ['__main__', 'missing_notebook_predicate_module'])
-def test_unsavable_predicate_does_not_overwrite_a_saved_tokenizer(tmp_path, module):
+def test_unsavable_callback_does_not_overwrite_a_saved_tokenizer(tmp_path, module):
     good = Tokenizer(
         input_fields=[{"provider": "sensor", 'type': 'token', 'format': '1', 'head_output': True}],
         tokenizers={"default": IntIdTokenizer()},
@@ -58,16 +51,16 @@ def test_unsavable_predicate_does_not_overwrite_a_saved_tokenizer(tmp_path, modu
     save_tokenizer(tokenizer=good, path=tmp_path)
     before = (tmp_path / 'tokenizer.json').read_bytes()
     namespace: dict[str, Any] = {'__name__': module}
-    exec('def on_start(ctx):\n    return bool(ctx["group_start"])\n', namespace)
+    exec('def episode_prompt(ctx):\n    return "2" if ctx.get("_episode_start") else ""\n', namespace)
     bad = Tokenizer(
         input_fields=[
-            {"provider": "sensor", 'type': 'token', 'format': '2', 'when': namespace['on_start']},
+            {"provider": "sensor", 'type': 'text', 'format': namespace['episode_prompt']},
             {"provider": "sensor", 'type': 'token', 'format': '1', 'head_output': True},
         ],
         tokenizers={"default": IntIdTokenizer()},
     )
-    # The condition is usable live, but its import path cannot survive a fresh process.
-    assert bad.pack_rows(rows=[measurement_events(payloads) for payloads in [[{}]]], continuing=None)[0]['token_ids'].tolist() == [2, 1]
+    # The callback is usable live, but its import path cannot survive a fresh process.
+    assert bad.pack_rows(rows=[measurement_events(payloads) for payloads in [[{"_episode_start": True}]]])[0]['token_ids'].tolist() == [2, 1]
     with pytest.raises(TypeError, match='importable'):
         save_tokenizer(tokenizer=bad, path=tmp_path)
     assert (tmp_path / 'tokenizer.json').read_bytes() == before
@@ -75,17 +68,6 @@ def test_unsavable_predicate_does_not_overwrite_a_saved_tokenizer(tmp_path, modu
     assert isinstance(restored, Tokenizer)
     assert encode_measurement(restored, {}).token_ids.tolist() == [1]
 
-
-def when_reward_nonzero(ctx):
-    return "reward" in ctx and ctx["reward"] != 0.0
-
-
-def when_step_index_zero(ctx):
-    return "step_index" in ctx and ctx["step_index"] == 0
-
-
-def when_step_index_zero_or_group_start(ctx):
-    return (ctx.get("step_index") == 0) | bool(ctx["group_start"])
 
 from tests._token_batch_helpers import (
     IntIdTokenizer,
@@ -138,7 +120,6 @@ def test_loading_requires_a_model_and_preserves_its_runtime(tmp_path) -> None:
     assert next(loaded.parameters()).requires_grad
     with pytest.raises(TypeError, match="model"):
         load_model(repo_id_or_path=tmp_path)  # type: ignore[call-arg]
-
 
 
 def test_num_frequencies_roundtrip(tmp_path) -> None:
@@ -201,7 +182,6 @@ def test_explicit_model_checkpoints_roundtrip_without_backbone_output_norm(tmp_p
     torch.testing.assert_close(loaded.head(h=h)['action_value'], model.head(h=h)['action_value'])
 
 
-
 @pytest.mark.parametrize("version", ["mouse-core-model-v1", "mouse-core-model-v2"])
 def test_legacy_checkpoint_formats_are_rejected(tmp_path, version: str) -> None:
     model = _lora_model(torch.float32)
@@ -212,7 +192,6 @@ def test_legacy_checkpoint_formats_are_rejected(tmp_path, version: str) -> None:
     path.write_text(json.dumps(config))
     with pytest.raises(ValueError, match="Unsupported model config format"):
         load_model(model=fresh_model(model), repo_id_or_path=tmp_path)
-
 
 
 def test_mlp_defaults_to_full_input_gradients() -> None:
@@ -262,7 +241,6 @@ def test_model_card_requires_the_application_implementation(tmp_path) -> None:
     assert "No default architecture" in text
     assert "user/model" in text and "stored in this repository" in text
     assert "Optimizer state and delayed models" in text
-
 
 
 def _lora_model(dtype: torch.dtype) -> Model:
@@ -336,8 +314,7 @@ def test_tokenizer_roundtrip(tmp_path) -> None:
             {"provider": "sensor",
                 "type": "text",
                 "input_field": "repeat_episode_index",
-                "format": "{field}",
-                "when": when_step_index_zero,
+                "format": format_episode_index,
             },
         ],
         objective_fields=[
@@ -367,42 +344,8 @@ def test_tokenizer_roundtrip(tmp_path) -> None:
     ]
     assert "required" not in (tmp_path / "tokenizer.json").read_text()
     assert loaded.input_fields[2].head_output is True
-    assert loaded.input_fields[3].when is when_step_index_zero
+    assert loaded.input_fields[3].format is format_episode_index
     assert sum(1 for s in loaded.input_fields if s.head_output) == 1
-
-
-def test_tokenizer_roundtrip_group_start_and_not_equals(tmp_path) -> None:
-    class _Tok:
-        def __call__(self, text: str, add_special_tokens: bool = False):
-            return {"input_ids": [1, 2]}
-
-    tokenizer = Tokenizer(
-        input_fields=[
-            {"provider": "sensor",
-                "type": "text",
-                "format": "hello\n",
-                "when": when_group_start,
-            },
-            {"provider": "sensor",
-                "type": "text",
-                "input_field": "reward",
-                "format": "{field}",
-                "when": when_reward_nonzero,
-            },
-            {"provider": "sensor", "type": "text", "input_field": "action", "format": "{field}", "head_output": True},
-        ],
-        tokenizers={"default": _Tok()},
-    )
-    save_tokenizer(tokenizer=tokenizer, path=tmp_path)
-    loaded = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizers={"default": _Tok()})
-    assert isinstance(loaded, Tokenizer)
-    assert loaded.input_fields[0].when is when_group_start
-    assert loaded.input_fields[0].input_field is None
-    assert loaded.input_fields[0].format == "hello\n"
-    assert loaded.input_fields[1].when is when_reward_nonzero
-    st = encode_measurement(loaded, {"action": 1, "reward": 1.0, "episode_index": 0})
-    assert st.group_start_token_ids is not None
-    assert st.group_start_token_ids.tolist() == [1, 2]
 
 
 def test_load_tokenizer_missing_file_raises(tmp_path) -> None:
@@ -412,7 +355,7 @@ def test_load_tokenizer_missing_file_raises(tmp_path) -> None:
 
 def test_push_model_and_tokenizer_share_repository(monkeypatch) -> None:
     model = simple_model(backbone=IdentityBackbone(hidden_dim=8), heads=({'action_value': (head := MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0))}), reasoner=None)
-    tokenizer = Tokenizer(input_fields=[{"provider": "sensor", 'type': 'text', 'input_field': 'action', 'format': '{field}', 'head_output': True}, {"provider": "sensor", 'type': 'text', 'input_field': 'repeat_episode_index', 'format': '{field}', 'when': when_step_index_zero}], objective_fields=[], tokenizers={"default": IntIdTokenizer()})
+    tokenizer = Tokenizer(input_fields=[{"provider": "sensor", 'type': 'text', 'input_field': 'action', 'format': '{field}', 'head_output': True}, {"provider": "sensor", 'type': 'text', 'input_field': 'repeat_episode_index', 'format': format_episode_index}], objective_fields=[], tokenizers={"default": IntIdTokenizer()})
     import mouse_core.models.io as io
     import huggingface_hub
     from pathlib import Path
@@ -473,7 +416,7 @@ def test_missing_vector_targets_roundtrip_and_do_not_train_unlabelled_rows(tmp_p
         steps = [encode_measurement(encoder, row) for row in rows]
         assert steps[1].objective_fields['q_star'].size == 0
         inputs, labels = pack_token_batch(
-            steps=steps, sequence_ids=[0, 0, 0], batch_size=1, continuing=None)
+            steps=steps, sequence_ids=[0, 0, 0], batch_size=1)
         assert labels["step_sequence_ids"].shape[0] == 3
         assert torch.isneginf(labels['q_star'][1]).all()
         predictions = torch.zeros((3, 2), requires_grad=True)
@@ -485,3 +428,7 @@ def test_missing_vector_targets_roundtrip_and_do_not_train_unlabelled_rows(tmp_p
         assert predictions.grad[1].count_nonzero() == 0
         assert predictions.grad[[0, 2]].count_nonzero() == 4
     assert rows[1] == {}
+
+
+def format_episode_index(ctx):
+    return str(ctx["field"]) if ctx.get("step_index") == 0 else ""

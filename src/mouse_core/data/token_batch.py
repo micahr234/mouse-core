@@ -76,7 +76,6 @@ class StepTokens:
     ``numeric_mask`` marks numeric tokens even when their scaled value is zero.
     Optional ``position_values`` / ``position_mask`` carry numeric context per token.
     Omitted arrays become zeros and a false mask; zero can be present.
-    ``group_start_*`` arrays hold an optional prefix emitted once per sequence.
     A passive step can contain no head tokens, or even no input tokens, while
     retaining its objective labels.
     """
@@ -86,14 +85,7 @@ class StepTokens:
     numeric_mask: np.ndarray  # [T] bool
     head_token_mask: np.ndarray  # [T] bool
     objective_fields: dict[str, Any] = field(default_factory=dict)
-    group_start_token_ids: np.ndarray | None = None
-    group_start_numeric_values: np.ndarray | None = None
-    group_start_numeric_mask: np.ndarray | None = None
     tokenizer_ids: np.ndarray | None = None
-    group_start_tokenizer_ids: np.ndarray | None = None
-    group_start_numeric_field_ids: np.ndarray | None = None
-    group_start_position_values: np.ndarray | None = None
-    group_start_position_mask: np.ndarray | None = None
     numeric_field_ids: np.ndarray | None = None
     numeric_field_names: tuple[str, ...] = ()
     tokenizer_names: tuple[str, ...] = ("default",)
@@ -114,34 +106,6 @@ class StepTokens:
             array = np.asarray(getattr(self, name), dtype=dtype)
             if array.shape != token_ids.shape:
                 raise ValueError(f"{name} must have shape [{token_ids.size}], got {array.shape}")
-            setattr(self, name, array)
-        prefix = (self.group_start_token_ids, self.group_start_numeric_values,
-                  self.group_start_numeric_mask)
-        if all(array is None for array in prefix):
-            if self.group_start_numeric_field_ids is not None:
-                raise ValueError("group_start numeric field IDs require prefix tokens")
-            if self.group_start_position_values is not None or self.group_start_position_mask is not None:
-                raise ValueError("group_start position requires group_start token arrays")
-            if self.group_start_tokenizer_ids is not None:
-                raise ValueError("group_start_tokenizer_ids requires group_start token arrays")
-            return
-        if any(array is None for array in prefix):
-            raise ValueError("group_start_token_ids / group_start_numeric_values / group_start_numeric_mask must all be set or all None")
-        prefix_ids = np.asarray(self.group_start_token_ids, dtype=np.int64)
-        if prefix_ids.ndim != 1 or prefix_ids.size == 0:
-            raise ValueError("group_start token arrays must be non-empty and 1-D")
-        self.group_start_numeric_field_ids = _numeric_field_ids(
-            self.group_start_numeric_field_ids, self.group_start_numeric_mask, self.numeric_field_names)
-        self.group_start_position_values, self.group_start_position_mask = _position_arrays(
-            self.group_start_position_values, self.group_start_position_mask, prefix_ids.shape)
-        self.group_start_tokenizer_ids = _tokenizer_ids(
-            self.group_start_tokenizer_ids, prefix_ids.shape, self.tokenizer_names)
-        for name, dtype in (("group_start_token_ids", np.int64),
-                            ("group_start_numeric_values", np.float32),
-                            ("group_start_numeric_mask", np.bool_)):
-            array = np.asarray(getattr(self, name), dtype=dtype)
-            if array.shape != prefix_ids.shape:
-                raise ValueError(f"{name} must have shape [{prefix_ids.size}], got {array.shape}")
             setattr(self, name, array)
 
     @property
@@ -328,7 +292,6 @@ def pack_token_batch(
     steps: Sequence[StepTokens],
     sequence_ids: Sequence[int] | None = None,
     batch_size: int | None = None,
-    continuing: Sequence[bool] | None,
 ) -> tuple[TensorDict, TensorDict]:
     """Pack per-step :class:`StepTokens` into model and objective inputs.
 
@@ -343,13 +306,6 @@ def pack_token_batch(
     missing-action NaN. This representation belongs only to the batch; it is not
     an input column or a stored field on :class:`StepTokens`.
 
-    When a step carries ``group_start_*`` tokens (from input fields whose
-    ``when`` callable is true with ``group_start=True`` and false with
-    ``group_start=False``), they are inserted once, on the first step of
-    each sequence. ``continuing`` is length ``B``: ``True`` means that
-    sequence already has cached tokens, so this pack does not emit the
-    sample-start prefix again. Pass ``None`` when no sequence is a
-    continuation (a fresh pack, including an empty batch).
     """
     empty_objective = TensorDict({"step_sequence_ids": torch.empty(0, dtype=torch.int64, device="cpu"),
                                   "head_step_ids": torch.empty(0, dtype=torch.int64, device="cpu")}, batch_size=[], device="cpu")
@@ -395,41 +351,13 @@ def pack_token_batch(
             )
         B = int(batch_size)
 
-    if continuing is None:
-        started = [False] * B
-    else:
-        if len(continuing) != B:
-            raise ValueError(
-                f"continuing length ({len(continuing)}) must match batch_size ({B})"
-            )
-        started = [bool(flag) for flag in continuing]
-
     tokenizer_names = steps[0].tokenizer_names
     numeric_field_names = steps[0].numeric_field_names
-    for st, sid in zip(steps, seq_per_step):
+    for st in steps:
         if st.numeric_field_names != numeric_field_names:
             raise ValueError("All steps must use the same numeric_field_names")
         if st.tokenizer_names != tokenizer_names:
             raise ValueError("All steps must use the same tokenizer_names in the same order")
-        emit_group_start = st.group_start_token_ids is not None and not started[sid]
-        pt = 0
-        if emit_group_start:
-            assert st.group_start_numeric_mask is not None
-            assert st.group_start_token_ids is not None
-            assert st.group_start_numeric_values is not None
-            pt = int(st.group_start_token_ids.shape[0])
-            assert st.group_start_position_values is not None
-            assert st.group_start_position_mask is not None
-            assert st.group_start_numeric_field_ids is not None
-            position_values.append(st.group_start_position_values)
-            position_mask.append(st.group_start_position_mask)
-            numeric_field_ids.append(st.group_start_numeric_field_ids)
-            numeric_mask.append(st.group_start_numeric_mask)
-            token_ids.append(st.group_start_token_ids)
-            numeric_values.append(st.group_start_numeric_values)
-            assert st.group_start_tokenizer_ids is not None
-            tokenizer_ids.append(st.group_start_tokenizer_ids)
-            head_token_masks.append(np.zeros(pt, dtype=bool))
         t = st.T
         assert st.position_values is not None
         assert st.position_mask is not None
@@ -443,11 +371,9 @@ def pack_token_batch(
         assert st.tokenizer_ids is not None
         tokenizer_ids.append(st.tokenizer_ids)
         head_token_masks.append(st.head_token_mask)
-        step_lengths.append(pt + t)
-        started[sid] = True
+        step_lengths.append(t)
 
     # Compute packed metadata in bulk, including zero-token/passive steps.
-    # Prefix tokens count toward their first step's length but never read out.
     lengths = np.asarray(step_lengths, dtype=np.int64)
     head_token_mask = np.concatenate(head_token_masks)
     head_token_ids = np.flatnonzero(head_token_mask)

@@ -215,6 +215,44 @@ For discrete actions, `lookup=["a", "b", "c", "d"]` renders IDs 0–3 as letters
 before applying `format`. Missing values are skipped; invalid IDs raise.
 Stored actions and objective labels remain numeric.
 
+A `text` or `token` field can use a function for `format`. The function receives
+the event payload and returns text; return `""` to skip that field:
+
+```python
+import random
+
+
+def compute_text(ctx):
+    if not ctx.get("action_requested", False):
+        return ""
+    return " ." * random.randint(1, 10)
+
+
+# Insert immediately before the field marked head_output=True.
+compute_field = {
+    "type": "text", "provider": "environment",
+    "format": compute_text,
+}
+```
+
+Each matching event calls the function once. Returned text goes through ordinary
+tokenization; characters or repetitions do not necessarily equal token count.
+Returning `""` emits no tokens. With `input_field`, missing values skip the
+callback and the selected/lookup value is available as `ctx["field"]`.
+`max_tokens` still limits the actual tokenized length. Callback randomness and
+inference choices belong to your function, not the tokenizer. For cached
+inference, keep generated text in the history stable when rebuilding it.
+Named callbacks save/load by import reference; redefine notebook callbacks
+before loading their saved tokenizer. [Notebook 02](examples/02_train_offline_dqn.ipynb)
+demonstrates random compute text and ordinary FrozenLake DQN training.
+
+Episode prompts are ordinary fields on the coordinator's `_episode_start` event.
+Emit that event before the first observation of every outer episode. The prompt then
+belongs to that episode's attention sequence and is visible to all its inner episodes.
+`environment_episode_ranges` samples complete outer episodes; data producers and
+samplers own these boundaries. Packing never invents or reinserts a prompt, including
+when a caller supplies a partial history. Cached decoding simply packs new events.
+
 For multiple vocabularies, supply a named dictionary and select a tokenizer on
 each input field. Values may be pretrained tokenizer names/paths or live callable
 backends. Each tokenizer has its own embedding table; local token ID 1 in one
@@ -227,7 +265,8 @@ sources = {"text": TEXT_CHECKPOINT, "actions": ACTION_CHECKPOINT}
 tokenizer = Tokenizer(
     tokenizers=sources,
     input_fields=[
-        {"type": "text", "provider": "environment", "tokenizer": "text", "format": group_prefix, "when": on_group_start},
+        {"type": "text", "provider": "coordinator", "tokenizer": "text",
+         "input_field": "_episode_start", "format": episode_prompt},
         {"type": "text", "provider": "agent", "tokenizer": "actions", "input_field": "action",
          "lookup": ["a", "b", "c", "d"], "format": "{field}"},
         {"type": "text", "provider": "environment", "tokenizer": "text", "input_field": "observation", "format": ",{field}"},
@@ -238,7 +277,7 @@ tokenizer = Tokenizer(
 embedding = MultiEmbedding(embeddings={
     name: Embedding(pretrained=checkpoint) for name, checkpoint in sources.items()
 }).to(device)
-inputs = tokenizer.pack_rows(rows=[events], continuing=None)
+inputs, objective_data = tokenizer.pack_rows(rows=[events])
 tensors = inputs.to(device)
 embedded = embedding(
     tensors["token_ids"], tokenizer_ids=tensors["tokenizer_ids"],

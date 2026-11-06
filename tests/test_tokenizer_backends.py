@@ -13,7 +13,7 @@ from tokenizers.pre_tokenizers import Whitespace
 from transformers import PreTrainedTokenizerFast
 
 from mouse_core.data import Tokenizer, load_tokenizer, save_tokenizer
-from tests.test_sparse_event_readouts import backend, on_group_start
+from tests.test_sparse_event_readouts import backend
 
 
 class WrapperBackend(PreTrainedTokenizerFast):
@@ -32,7 +32,7 @@ def configured(*, wrapper=False):
 
     return Tokenizer(tokenizers={'text': source(), 'other': source(), 'image': lambda value: value},
                     input_fields=[
-        dict(provider="sensor", type='text', tokenizer='text', format='prefix', when=on_group_start),
+        dict(provider="sensor", type='text', tokenizer='text', input_field='_episode_start', format='prefix'),
         dict(type='text', tokenizer='other', provider='agent', input_field='action',
              lookup=['obs', 'action'], format='{field}'),
         dict(type='text', tokenizer='text', provider='sensor', input_field='text', format='{field}'),
@@ -48,7 +48,7 @@ def events():
     return [event for step in range(3) for event in (
         dict(provider='agent', step_index=step, payload={'action': step % 2}),
         dict(provider='sensor', step_index=step,
-             payload={'text': 'obs', 'number': step / 2, 'request': True, 'image': [7, 8]}),
+             payload={**({'_episode_start': True} if step == 0 else {}), 'text': 'obs', 'number': step / 2, 'request': True, 'image': [7, 8]}),
     )]
 
 
@@ -84,8 +84,6 @@ def test_native_fields_and_steps_match_hf_wrapper_without_output_aliasing(monkey
     assert wrapper_calls and all(isinstance(source, WrapperBackend) for source in wrapper_calls)
     first = tok.encode(events())
     first[0].token_ids[:] = 999
-    assert first[0].group_start_token_ids is not None
-    first[0].group_start_token_ids[:] = 999
     assert_steps_equal(tok.encode(events()), expected_steps)
 
 
@@ -150,13 +148,12 @@ def test_callback_backend_changes_take_effect_between_fields():
     source = backend()
 
     def add_word(ctx):
-        if not ctx['group_start']:
-            source.add_tokens(['new-word'])
-        return not ctx['group_start']
+        source.add_tokens(['new-word'])
+        return 'new-word'
 
     tok = Tokenizer(tokenizers={'text': source}, input_fields=[
         dict(provider="sensor", type='text', format='new-word'),
-        dict(provider="sensor", type='text', format='new-word', when=add_word),
+        dict(provider="sensor", type='text', format=add_word),
     ])
     assert tok(dict(provider='sensor', payload={}))['token_ids'].tolist() == [0, 5]
     assert tok(dict(provider='sensor', payload={}))['token_ids'].tolist() == [5, 5]

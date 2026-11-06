@@ -5,6 +5,7 @@ import ast
 from functools import partial
 import json
 import re
+import random
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -310,15 +311,15 @@ class _CharacterTokenizer:
         return {'input_ids': torch.tensor([[ord(char) for char in text]])}
 
 
-def _notebook_transform(filename, *, tokenizer_only=False):
-    """Build each actual example's field pipeline without model downloads or I/O."""
+def _notebook_transform(filename, *, tokenizer_only=False, compute_range=(0, 0)):
+    """Build each example with test-owned settings; parity tests disable compute text."""
     notebook = json.loads((EXAMPLES / filename).read_text())
     source = next(''.join(cell['source']) for cell in notebook['cells']
-                  if cell['cell_type'] == 'code' and 'group_prefix = ' in ''.join(cell['source']))
-    assignments = {'group_prefix', 'augmenter', 'tokenizer', 'train_transform', 'transform'}
+                  if cell['cell_type'] == 'code' and 'episode_prompt = ' in ''.join(cell['source']))
+    assignments = {'episode_prompt', 'augmenter', 'tokenizer', 'train_transform', 'transform'}
     body: list[ast.stmt] = [node for node in ast.parse(source).body if
             isinstance(node, ast.FunctionDef) and
-            (node.name.startswith('on_') or node.name in {'frozenlake_fields', 'behavior_fields'})
+            (node.name.startswith('on_') or node.name in {'frozenlake_fields', 'behavior_fields', 'compute_text', 'episode_separator'})
             or isinstance(node, ast.Assign) and any(isinstance(target, ast.Name)
                                                     and target.id in assignments for target in node.targets)]
 
@@ -327,6 +328,8 @@ def _notebook_transform(filename, *, tokenizer_only=False):
         return Tokenizer(tokenizers={name: _CharacterTokenizer() for name in sources}, **kwargs)
 
     namespace: dict[str, Any] = dict(Augmenter=Augmenter, Tokenizer=tokenizer_factory, compose=compose,
+                                    random=random.Random(7), COMPUTE_MIN_REPEATS=compute_range[0],
+                                    COMPUTE_MAX_REPEATS=compute_range[1],
                                     MAX_ACTIONS=4, MAX_OBS_DISCRETE=64, MAX_STEPS_PER_EPISODE=3,
                                     REPEAT_COUNT=1, PRETRAINED='unused', TOKENIZER_SOURCES={'text': 'unused'})
     exec(compile(ast.Module(body=body, type_ignores=[]), filename, 'exec'), namespace)
@@ -392,7 +395,7 @@ def test_tokenizers_render_saved_repeat_indices_and_preserve_action_masks(filena
     assert json.dumps(persisted.events, sort_keys=True) == before
     for start in (0, 1):
         batch, labels = pack_token_batch(steps=steps[start:], sequence_ids=[0] * (len(steps) - start),
-                                            batch_size=1, continuing=None)
+                                            batch_size=1)
         assert markers(batch['token_ids']) == (['episode 8\n', 'episode 13\n'] if start == 0 else ['episode 13\n'])
         if 'cosine' in filename:
             assert 'episode_reset' not in labels
@@ -414,7 +417,7 @@ def test_rewards_preserve_replay_tokens_labels_and_dqn_updates(filename):
     def batch(source):
         if hasattr(transform, "reseed"):
             transform.reseed(generation=7)
-        return pack_token_batch(steps=transform(source), sequence_ids=[0, 0, 0], batch_size=1, continuing=None)
+        return pack_token_batch(steps=transform(source), sequence_ids=[0, 0, 0], batch_size=1)
 
     inputs, labels = batch(log)
     groups = labels["step_sequence_ids"]
@@ -446,7 +449,7 @@ def test_other_frozenlake_tokenizers_encode_events(filename):
     log, _ = _frozenlake_episode('01_collect_dataset.ipynb')
     transform = _notebook_transform(filename)
     inputs, labels = pack_token_batch(steps=transform(log.to_dataset()),
-        sequence_ids=[0, 0, 0], batch_size=1, continuing=None)
+        sequence_ids=[0, 0, 0], batch_size=1)
     assert labels["step_sequence_ids"].shape[0] == 3
     expected = {'action', 'advantage', 'old_log_prob'} if 'grpo' in filename else {'q_star'}
     assert expected <= labels.keys()
@@ -494,7 +497,7 @@ def test_existing_collector_records_events(filename):
                 inputs, labels = pack_token_batch(
                     steps=transform(dataset),
                     sequence_ids=[row['episode_index'] for row in decisions],
-                    batch_size=len({row['episode_index'] for row in decisions}), continuing=None,
+                    batch_size=len({row['episode_index'] for row in decisions}),
                 )
                 assert int(inputs['numeric_mask'].sum()) == 2 * len(decisions)
                 # Physical action ids are preserved by the training pipeline.

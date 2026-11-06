@@ -37,13 +37,9 @@ import numpy as np
 from mouse_core.data import Augmenter, DataLoader, Datastore, EventLog, Tokenizer, compose
 
 
-
-def on_group_start(ctx):
-    return bool(ctx["group_start"])
-
-
-def on_inner_end(ctx):
-    return bool(ctx.get("inner_terminated", False) or ctx.get("inner_truncated", False))
+def episode_separator(ctx):
+    ended = ctx.get("inner_terminated", False) or ctx.get("inner_truncated", False)
+    return "\n\n" if ended else ""
 
 _BENCH_DIR = Path(__file__).resolve().parent
 if str(_BENCH_DIR) not in sys.path:
@@ -62,7 +58,7 @@ _MAX_ACTIONS = 4
 _MAX_OBS = 64
 _STEPS_PER_EPISODE = 8
 _EPISODES_PER_TASK = 10  # 80 observations per task; fits the shortest event budget
-_group_prefix = (
+episode_prompt = (
     "Your job is to predict the future sum of rewards in FrozenLake. "
     "Navigate a grid; reach the goal for reward; a hole ends the "
     f"episode with none. Each episode lasts at most {_STEPS_PER_EPISODE - 1} steps. "
@@ -134,9 +130,9 @@ def _train_transform(*, tokenizer_source: str = "Qwen/Qwen3-0.6B", local_files_o
         input_fields=[
             {
                 "type": "text",
-                "provider": "environment",
-                "format": _group_prefix,
-                "when": on_group_start,
+                "provider": "coordinator",
+                "input_field": "episode_start",
+                "format": episode_prompt,
             },
             {"type": "text", "provider": "environment", "input_field": "repeat_episode_index", "format": "episode {field+1}\n"},
             {"type": "text", "provider": "agent", "input_field": "action", "lookup": ["a", "b", "c", "d"], "format": "{field}"},
@@ -169,8 +165,7 @@ def _train_transform(*, tokenizer_source: str = "Qwen/Qwen3-0.6B", local_files_o
             {
                 "type": "text",
                 "provider": "environment",
-                "format": "\n\n",
-                "when": on_inner_end,
+                "format": episode_separator,
             },
         ],
         objective_fields=[

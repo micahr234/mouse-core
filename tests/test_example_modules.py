@@ -115,7 +115,7 @@ def test_example_encoder_builds_and_trains_each_named_tokenizer_table():
         dict(provider="sensor", type='text', tokenizer='actions', input_field='action', format='{field}'),
         dict(provider="sensor", type='text', tokenizer='text', input_field='observation', format='{field}', head_output=True),
     ])
-    inputs, inputs_objective_data = tokenizer.pack_rows(rows=[measurement_events([{'action': 2, 'observation': 3}])], continuing=None)
+    inputs, inputs_objective_data = tokenizer.pack_rows(rows=[measurement_events([{'action': 2, 'observation': 3}])])
     ns['q_head'](encoder(inputs)['z']).square().sum().backward()
     for table in encoder.embedding.embeddings.values():
         assert table.embed_tokens.weight.grad is not None
@@ -383,7 +383,7 @@ def test_ppo_collection_restarts_replay_and_preserves_behavior_prefixes():
         # every stored action probability, including after an environment-only reset.
         ns['modules'].eval()
         with torch.no_grad():
-            tokens, tokens_objective_data = tokenizer.pack_rows(rows=[ns['contexts'][0]], continuing=None)
+            tokens, tokens_objective_data = tokenizer.pack_rows(rows=[ns['contexts'][0]])
             logits = ns['policy_head'](ns['encoder'](tokens)['z'])
             for step, row in enumerate(rows[1:], 1):
                 if 'action' in row:
@@ -481,8 +481,8 @@ def test_cartpole_encoder_uses_configured_fourier_features_for_observations():
                           objective_fields=[])
     encoder.embedding = MultiEmbedding(embeddings={"text": Embedding(hidden_dim=8, vocab_size=32)},
         numeric_field_names=tokenizer.numeric_field_names, num_frequencies=3)
-    first, first_objective_data = tokenizer.pack_rows(rows=[measurement_events(payloads) for payloads in [[{'cart_position': 0., 'pole_angle': 0.}]]], continuing=None)
-    second, second_objective_data = tokenizer.pack_rows(rows=[measurement_events(payloads) for payloads in [[{'cart_position': 0.5, 'pole_angle': 0.1}]]], continuing=None)
+    first, first_objective_data = tokenizer.pack_rows(rows=[measurement_events(payloads) for payloads in [[{'cart_position': 0., 'pole_angle': 0.}]]])
+    second, second_objective_data = tokenizer.pack_rows(rows=[measurement_events(payloads) for payloads in [[{'cart_position': 0.5, 'pole_angle': 0.1}]]])
     np.testing.assert_array_equal(first['token_ids'], second['token_ids'])
     with torch.no_grad():
         first_readout = encoder(first)['z']

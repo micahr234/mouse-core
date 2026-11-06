@@ -42,17 +42,16 @@ def assert_matching_events_and_tokens(reference, actual, *, behavior_labels=Fals
         steps = tok.encode(source)
         assert len(steps) == len(expected)
         for left, right in zip(expected, steps, strict=True):
-            for key in ('token_ids', 'numeric_values', 'numeric_mask', 'head_token_mask',
-                        'group_start_token_ids'):
+            for key in ('token_ids', 'numeric_values', 'numeric_mask', 'head_token_mask'):
                 np.testing.assert_array_equal(getattr(left, key), getattr(right, key))
             assert left.objective_fields == right.objective_fields
-        packed, packed_objective_data = pack_token_batch(steps=steps, continuing=None)
-        reference_packed, reference_packed_objective_data = pack_token_batch(steps=expected, continuing=None)
+        packed, packed_objective_data = pack_token_batch(steps=steps)
+        reference_packed, reference_packed_objective_data = pack_token_batch(steps=expected)
         np.testing.assert_array_equal(packed['token_ids'], reference_packed['token_ids'])
         np.testing.assert_array_equal(packed_objective_data["head_step_ids"], reference_packed_objective_data["head_step_ids"])
         # Use the actual online configuration too, not just one common test encoder.
         runtime_steps = runtime_tok.encode(source, include_objectives=False)
-        runtime_packed, runtime_packed_objective_data = pack_token_batch(steps=runtime_steps, continuing=None)
+        runtime_packed, runtime_packed_objective_data = pack_token_batch(steps=runtime_steps)
         for key in ('token_ids', 'numeric_values', 'numeric_mask', 'head_token_mask'):
             np.testing.assert_array_equal(runtime_packed[key], reference_packed[key])
 

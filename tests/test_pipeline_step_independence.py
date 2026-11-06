@@ -15,10 +15,6 @@ from mouse_core.data import (
 )
 from tests._token_batch_helpers import IntIdTokenizer
 
-def when_step_index_zero(ctx):
-    return "step_index" in ctx and ctx["step_index"] == 0
-
-
 
 def _io(*pairs: tuple[str, str]) -> list[dict[str, str]]:
     fields: list[dict[str, str]] = []
@@ -50,8 +46,7 @@ def _tok_in(
             {"provider": "sensor",
                 "type": "text",
                 "input_field": "repeat_episode_index",
-                "format": "{field}",
-                "when": when_step_index_zero,
+                "format": lambda ctx: f"{ctx['field']}" if ('step_index' in ctx and ctx['step_index'] == 0) else "",
             }
         )
     return fields
@@ -101,8 +96,7 @@ def test_tokenizer_renames_objective_fields() -> None:
             {"provider": "sensor",
                 "type": "text",
                 "input_field": "repeat_episode_index",
-                "format": "{field}",
-                "when": when_step_index_zero,
+                "format": lambda ctx: f"{ctx['field']}" if ('step_index' in ctx and ctx['step_index'] == 0) else "",
             },
         ],
         objective_fields=_io(("q", "q_star")),
@@ -129,10 +123,10 @@ def test_tokenizer_full_matches_per_step_concat() -> None:
         tokenizers={"default": IntIdTokenizer()},
     )
     rows = _rows()
-    full, full_obj = pack_token_batch(steps=[encode_measurement(tokenizer, step) for step in rows], continuing=None)
+    full, full_obj = pack_token_batch(steps=[encode_measurement(tokenizer, step) for step in rows])
     head = [encode_measurement(tokenizer, s) for s in rows[:3]]
     tail = [encode_measurement(tokenizer, s) for s in rows[3:]]
-    cat, cat_obj = pack_token_batch(steps=head + tail, continuing=None)
+    cat, cat_obj = pack_token_batch(steps=head + tail)
     assert np.array_equal(full['numeric_mask'], cat['numeric_mask'])
     assert np.array_equal(full['token_ids'], cat['token_ids'])
     assert np.allclose(full['numeric_values'], cat['numeric_values'])

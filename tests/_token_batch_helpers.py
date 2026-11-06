@@ -12,25 +12,6 @@ from mouse_core.data import Tokenizer, pack_token_batch
 from tests._event_fixtures import encode_measurement
 from mouse_core.data.token_batch import StepTokens
 
-def when_episode_done_nonzero(ctx):
-    return "episode_done" in ctx and ctx["episode_done"] != 0
-
-
-def when_group_start(ctx):
-    return bool(ctx["group_start"])
-
-
-def when_reward_nonzero(ctx):
-    return "reward" in ctx and ctx["reward"] != 0.0
-
-
-def when_step_index_zero(ctx):
-    return "step_index" in ctx and ctx["step_index"] == 0
-
-
-def when_step_index_zero_or_group_start(ctx):
-    return (ctx.get("step_index") == 0) | bool(ctx["group_start"])
-
 
 DEFAULT_TOKEN_VOCAB = 32
 
@@ -75,8 +56,7 @@ def token_tokenizer(
             {"provider": "sensor",
                 "type": "text",
                 "input_field": "episode_index",
-                "format": "{field}",
-                "when": when_step_index_zero,
+                "format": lambda ctx: f"{ctx['field']}" if ('step_index' in ctx and ctx['step_index'] == 0) else "",
             },
         )
     if objective_fields is None:
@@ -109,7 +89,6 @@ def batch_to_packed(
         steps=steps,
         sequence_ids=sids if steps else None,
         batch_size=len(batch),
-        continuing=None,
     )
 
 

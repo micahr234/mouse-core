@@ -78,7 +78,7 @@ class EpochDataLoader:
             steps.extend(sample)
             sequence_ids.extend([group] * len(sample))
         batch = pack_token_batch(steps=steps, sequence_ids=sequence_ids,
-                                 batch_size=len(indices), continuing=None)
+                                 batch_size=len(indices))
         inputs, data = batch
         for name, values in self.sample_objective_fields.items():
             data[name] = torch.cat([values[index] for index in indices])
