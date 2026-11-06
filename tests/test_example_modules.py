@@ -85,7 +85,7 @@ def _example(path, **overrides):
         if isinstance(node, ast.ClassDef):
             body.append(node)
         elif isinstance(node, ast.Assign):
-            if any(isinstance(t, ast.Name) and t.id == "tokenizer" for t in node.targets):
+            if any(isinstance(t, ast.Name) and t.id in {"tokenizer", "compute_token_ids"} for t in node.targets):
                 continue
             body.append(node)
     exec(compile(ast.Module(body=body, type_ignores=[]), str(path), "exec"), namespace)

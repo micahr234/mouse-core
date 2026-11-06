@@ -16,18 +16,21 @@ Refresh restarts workers against new store snapshots at the next unseen batch.
 """
 
 from __future__ import annotations
-from tensordict import TensorDict
 
 import json
-from functools import partial
 from collections.abc import Callable, Mapping
+from copy import deepcopy
 from dataclasses import dataclass
+from functools import partial
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+from tensordict import TensorDict
 
-from mouse_core.data.process_batches import ProcessBatches
+from mouse_core.data.callbacks import accepts_context
 from mouse_core.data.datastore import _normalize_value
+from mouse_core.data.process_batches import ProcessBatches
 from mouse_core.data.step_sampling import _step_spans, _validate_step_ranges
 from mouse_core.data.token_batch import StepTokens, pack_token_batch
 
@@ -37,7 +40,7 @@ if TYPE_CHECKING:
     from mouse_core.data.datastore import Datastore
 
 
-EventSequenceTransform = Callable[[list[dict]], list[StepTokens]]
+EventSequenceTransform = Callable[..., list[StepTokens]]
 
 @dataclass(frozen=True)
 class _SnapshotConfig:
@@ -237,10 +240,11 @@ def _tokenize_event_window(
     end: int,
     index_field: str | None,
     transform: EventSequenceTransform,
+    context=None,
 ) -> list[StepTokens]:
     """Tokenize one complete ordered event sample, without trimming it."""
     events = _rows_from_slice(ds=ds, start=start, end=end, index_field=index_field)
-    encoded = transform(events)
+    encoded = transform(events) if context is None else transform(events, context=context)
     if not isinstance(encoded, list) or not encoded or not all(isinstance(item, StepTokens) for item in encoded):
         raise TypeError("Event transform must return a nonempty list of StepTokens readouts")
     return encoded
@@ -277,6 +281,7 @@ def _fetch_budget_batch(
     entropy: int,
     k: int,
     transform: EventSequenceTransform,
+    *, context=None,
 ) -> tuple[TensorDict, TensorDict]:
     """Fill one budget with whole, independently sampled sequences."""
     budget, name, unit = _budget_of(cfg)
@@ -314,6 +319,7 @@ def _fetch_budget_batch(
             end=end,
             index_field=cfg.index_field,
             transform=transform,
+            context=context,
         )
         cost = _segment_token_count(window) if count_tokens else end - start
         if cost < 1:
@@ -349,9 +355,10 @@ def _fetch_one_batch(
     entropy: int,
     k: int,
     transform: EventSequenceTransform,
+    *, context=None,
 ) -> tuple[TensorDict, TensorDict]:
     """Build batch ``k``."""
-    return _fetch_budget_batch(cfg, entropy, k, transform)
+    return _fetch_budget_batch(cfg, entropy, k, transform, context=context)
 
 
 class DataLoader:
@@ -400,9 +407,18 @@ class DataLoader:
     weights / weight_mode / prefetch / num_workers :
         Sampling and worker controls. ``num_workers`` is required: ``0`` is
         in-process; ``> 0`` uses spawned processes with shared-memory batch transfer.
+    context_for_batch :
+        Optional ``fn(batch_index) -> mapping``, evaluated once in the parent
+        process as each zero-based batch is scheduled. A snapshot travels with
+        that job and is passed as ``context=`` to the transform. Use ``compose``
+        to forward it only to stages declaring ``*, context``. Treat context as
+        read-only: the top-level mapping is immutable, nested values are owned
+        by that batch. Keep it small; result tensors still use shared memory.
+        Prefetched jobs keep their scheduled context. ``refresh()`` drops them
+        and reevaluates the schedule from the next unconsumed batch index.
     seed :
         Entropy of the batch stream. Batch ``k`` is a pure function of
-        ``(seed, k, snapshot)`` for any ``num_workers`` (see module
+        ``(seed, k, snapshot, context)`` for any ``num_workers`` (see module
         docstring). ``None`` draws fresh entropy for this loader.
     """
 
@@ -423,6 +439,7 @@ class DataLoader:
         prefetch: int = 4,
         num_workers: int,
         seed: int | None = None,
+        context_for_batch: Callable[[int], Mapping[str, Any]] | None = None,
     ) -> None:
         from mouse_core.data.datastore import Datastore as _DS
 
@@ -478,6 +495,12 @@ class DataLoader:
         self.episode_field = episode_field
         self.weight_mode = weight_mode
         self.seed = seed
+        if context_for_batch is not None:
+            if not callable(context_for_batch):
+                raise TypeError("context_for_batch must be callable")
+            if not accepts_context(transform):
+                raise TypeError("A scheduled transform must accept *, context; compose forwards it to participating stages")
+        self.context_for_batch = context_for_batch
         self.transform = transform
         self.index_field = index_field
         self._num_workers = num_workers
@@ -519,7 +542,10 @@ class DataLoader:
         if self._closed:
             raise RuntimeError("DataLoader is closed")
         if self._pool is None:
-            item = _fetch_one_batch(self._snapshot_config(), self._entropy, self._next_k, self.transform)
+            context = None if self.context_for_batch is None else MappingProxyType(
+                deepcopy(dict(self.context_for_batch(self._next_k))))
+            item = _fetch_one_batch(self._snapshot_config(), self._entropy, self._next_k,
+                                    self.transform, context=context)
         else:
             item = self._pool.next_batch()
         self._next_k += 1
@@ -566,7 +592,8 @@ class DataLoader:
         build = partial(_fetch_one_batch, self._snapshot_config(), self._entropy,
                         transform=self.transform)
         self._pool = ProcessBatches(build, workers=self._num_workers,
-                                    prefetch=self._prefetch, start=self._next_k)
+                                    prefetch=self._prefetch, start=self._next_k,
+                                    context_for_batch=self.context_for_batch)
 
     def _stop_workers(self) -> None:
         if self._pool is not None:

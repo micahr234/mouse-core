@@ -12,6 +12,8 @@ from typing import Any, ClassVar, cast
 import numpy as np
 import torch
 
+from mouse_core.data.callbacks import accepts_context
+
 # Step-backed ``text`` ``format=`` is an f-string. The step value is the
 # name ``field`` (``"{field+1}"``, ``"{field:.0f}"``). Consts name nothing.
 TEXT_FORMAT_KEY = "field"
@@ -29,7 +31,8 @@ class TokenizerModalitySpec:
     ``text`` formats an optional input scalar into a variable-length token run.
     A callable ``format(ctx)`` may instead return any text, including an empty
     string. It receives the payload and, with input_field, the selected/lookup
-    value under ``ctx["field"]``.
+    value under ``ctx["field"]``. Declare ``format(payload, *, context)`` to
+    also receive runtime context, separate from the payload and objective labels.
     ``token`` uses the same formatting and lookup rules but must produce exactly
     one token for nonempty output. ``special=True`` registers a literal token
     in the vocabulary.
@@ -68,10 +71,11 @@ class TokenizerModalitySpec:
     position_fourier_min: float | None = None
     position_fourier_max: float | None = None
     lookup: Sequence[str] | None = None
-    format: str | Callable[[Mapping[str, Any]], str] | None = None
+    format: str | Callable[..., str] | None = None
     fourier_min: float | None = None
     fourier_max: float | None = None
     _format_code: CodeType | None = field(default=None, init=False, repr=False, compare=False)
+    _format_context: bool = field(default=False, init=False, repr=False, compare=False)
     max_tokens: int | None = None
     head_output: bool = False
 
@@ -155,6 +159,7 @@ class TokenizerModalitySpec:
 
     def _init_text(self) -> None:
         if callable(self.format):
+            self._format_context = accepts_context(self.format)
             if self.special:
                 raise TypeError("Special tokens require a literal format string")
             if self.input_field is None:

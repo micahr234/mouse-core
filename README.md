@@ -244,7 +244,57 @@ inference choices belong to your function, not the tokenizer. For cached
 inference, keep generated text in the history stable when rebuilding it.
 Named callbacks save/load by import reference; redefine notebook callbacks
 before loading their saved tokenizer. [Notebook 02](examples/02_train_offline_dqn.ipynb)
-demonstrates random compute text and ordinary FrozenLake DQN training.
+demonstrates a fixed compute-token count and ordinary FrozenLake DQN training.
+
+For a compute curriculum, pass a schedule to `DataLoader`. This runtime context is
+separate from event payloads and objective labels:
+
+```python
+def training_context(batch_index):
+    count = min(10, max(0, (batch_index - 1_000) // 1_000))
+    return {"compute_tokens": count}
+
+
+def compute_text(payload, *, context):
+    if not payload.get("action_requested", False):
+        return ""
+    return " ." * context["compute_tokens"]
+
+
+# Use compute_text as the field's format, then construct the pipeline.
+train_transform = compose(stages=(augmenter.events, tokenizer.encode))
+loader = DataLoader(
+    stores=stores,
+    token_budget=16_384,
+    sample_ranges=environment_episode_ranges,
+    transform=train_transform,
+    context_for_batch=training_context,
+    num_workers=4,
+    prefetch=4,
+)
+```
+
+The schedule runs once in the main process when each zero-based batch is scheduled.
+A snapshot travels with that batch, including through prefetching and process workers.
+`compose` forwards it to stages declaring `*, context` or `**kwargs`; one-argument
+stages remain valid. Signature inspection happens only at construction. Tokenizer
+format callbacks opt in the same way, retaining the payload as their first argument.
+Treat scheduled context as read-only; its top-level mapping is immutable. Keep its
+values small because context uses the control pipe, while result tensors still use
+shared memory. Context is not saved in tokenizer configuration.
+
+All tokenizer entry points (`__call__`, `encode`, `stream`, `pack_rows`) also accept
+`context=` for direct use. Context-aware callbacks receive `None` if it is omitted.
+The finite `EpochDataLoader` pretokenizes samples and does not provide a per-batch
+schedule; use `DataLoader` for this curriculum.
+
+Already-prefetched batches keep their assigned settings. `loader.refresh()` discards
+those batches, refreshes the stores, and reevaluates the schedule from the next
+unconsumed batch index. Recreating a loader starts at index zero. For gradient
+accumulation, map batch index to optimizer step in your schedule. Keep inference
+compute counts fixed during cached episodes. Notebook 02 uses a constant count through the same context API and validates that
+spaced periods produce exact token counts with its selected tokenizer. Its callback
+can be changed to a schedule like the one above without rebuilding the tokenizer.
 
 Episode prompts are ordinary fields on the coordinator's `_episode_start` event.
 Emit that event before the first observation of every outer episode. The prompt then

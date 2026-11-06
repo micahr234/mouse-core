@@ -1,24 +1,23 @@
 """Bounded, ordered process workers with reusable shared-memory result slots.
 
-Only task indices, array descriptors and errors cross the pipes. The parent owns
-all shared-memory allocations and copies results before recycling a slot, so a
+Only task indices, small per-job contexts, array descriptors and errors cross
+the pipes. The parent owns all shared-memory allocations and copies results before recycling a slot, so a
 returned batch remains valid after the next read, refresh or close.
 """
 from __future__ import annotations
-from tensordict import TensorDict
 
-from collections import deque
 import multiprocessing as mp
+import traceback
+from collections import deque
 from multiprocessing.connection import Connection, wait
 from multiprocessing.shared_memory import SharedMemory
-import traceback
+from types import MappingProxyType
 from typing import cast
 
 import cloudpickle
 import numpy as np
 import torch
-
-
+from tensordict import TensorDict
 
 
 def _arrays(batch):
@@ -58,8 +57,12 @@ def _worker(connection, build_name):
             job = connection.recv()
             if job is None:
                 return
-            index, name, capacity = job
-            batch = build(index)
+            index, name, capacity, context_payload = job
+            if context_payload is None:
+                batch = build(index)
+            else:
+                context = MappingProxyType(cloudpickle.loads(context_payload))
+                batch = build(index, context=context)
             metadata, arrays, descriptors, required = _arrays(batch)
             if required > capacity:
                 connection.send(("resize", required))
@@ -87,7 +90,8 @@ def _worker(connection, build_name):
 class ProcessBatches:
     """Persistent spawned workers; at most ``prefetch`` unconsumed batches."""
 
-    def __init__(self, build, *, workers, prefetch, start=0):
+    def __init__(self, build, *, workers, prefetch, start=0, context_for_batch=None):
+        self._context_for_batch = context_for_batch
         self._processes = []
         self._connections: list[Connection] = []
         self._active: dict[Connection, tuple[int, int]] = {}
@@ -99,7 +103,8 @@ class ProcessBatches:
         self._closed = False
         self._payload: SharedMemory | None = None
         # cloudpickle supports notebook-local functions and format callbacks.
-        # Serialization is once at startup, never once per batch.
+        # The transform is serialized once at startup. Only small scheduled
+        # context snapshots are serialized per batch.
         try:
             payload = cloudpickle.dumps(build)
         except Exception as exc:
@@ -136,7 +141,10 @@ class ProcessBatches:
             index = self._next_submit
             self._next_submit += 1
             self._active[connection] = (index, slot)
-            connection.send((index, memory.name if memory else None, memory.size if memory else 0))
+            context_payload = None if self._context_for_batch is None else cloudpickle.dumps(
+                dict(self._context_for_batch(index)))
+            connection.send((index, memory.name if memory else None,
+                             memory.size if memory else 0, context_payload))
 
     def next_batch(self):
         if self._closed:

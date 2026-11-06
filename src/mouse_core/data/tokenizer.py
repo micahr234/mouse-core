@@ -17,7 +17,6 @@ the model via :func:`~mouse_core.models.io.push_model_to_hub`.
 """
 
 from __future__ import annotations
-from tensordict import TensorDict
 
 import json
 import math
@@ -29,21 +28,22 @@ from typing import Any, cast
 
 import numpy as np
 import torch
+from tensordict import TensorDict
 
-from mouse_core.data.events import EventLog, INDEX_FIELDS
-from mouse_core.data.step_sampling import _StepBoundary
+from mouse_core.data.events import INDEX_FIELDS, EventLog
 from mouse_core.data.io_fields import coerce_io_fields
 from mouse_core.data.modality import (
     KIND_IMAGE,
     KIND_TEXT,
     KIND_TOKEN,
-    _field_label,
-    render_text_format,
     TokenizerModalitySpec,
+    _field_label,
     copy_keep_fields,
+    render_text_format,
     resolve_tokenizer_modalities,
     unwrap_scalar,
 )
+from mouse_core.data.step_sampling import _StepBoundary
 from mouse_core.data.token_batch import StepTokens, pack_token_batch
 
 
@@ -94,6 +94,9 @@ class Tokenizer:
     No readout is appended implicitly. ``encode(events)`` groups
     those arrays using ``step_field`` and returns completed ``StepTokens`` for
     a finalized sample. Pass ``transform=tokenizer.encode`` to a data loader.
+    All encoding entry points accept ``context=`` and forward it to format
+    callbacks declaring ``*, context``. It is never merged into event payloads.
+    Without a supplied context, these callbacks receive ``None``.
 
     The required ``tokenizers={name: pretrained_name_or_callable}`` dictionary
     defines the backends, even when there is only one. It includes image
@@ -179,7 +182,7 @@ class Tokenizer:
         encoders = {name: _TextEncoder(backend) for name, backend in self.tokenizers.items()}
         self._text_encoders = tuple(encoders[name] for name in field_tokenizers)
 
-    def __call__(self, event: Mapping) -> dict[str, np.ndarray]:
+    def __call__(self, event: Mapping, *, context=None) -> dict[str, np.ndarray]:
         """Encode matching fields from one decoded event, without adding a step."""
         if not isinstance(event, Mapping) or not {"provider", "payload"} <= event.keys():
             raise TypeError("Tokenizer expects a provider/payload event")
@@ -191,19 +194,19 @@ class Tokenizer:
         if meta and not isinstance(payload, Mapping):
             raise TypeError("Configured event input fields require an object payload")
         values = _tokenize_fields(row=payload, meta=meta, tokenizers=self._backends,
-                                  tokenizer_routes=self._routes, numeric_routes=self._numeric_routes, text_encoders=self._text_encoders)
+                                  tokenizer_routes=self._routes, numeric_routes=self._numeric_routes, text_encoders=self._text_encoders, context=context)
         return values
 
-    def stream(self, *, include_objectives: bool = True) -> EventTokenStream:
-        return EventTokenStream(self, include_objectives=include_objectives)
+    def stream(self, *, include_objectives: bool = True, context=None) -> EventTokenStream:
+        return EventTokenStream(self, include_objectives=include_objectives, context=context)
 
-    def encode(self, events, *, include_objectives: bool = True) -> list[StepTokens]:
+    def encode(self, events, *, include_objectives: bool = True, context=None) -> list[StepTokens]:
         """Encode a finalized sample of raw events or persisted JSON payloads.
 
         The sample must contain complete steps. Unlike ``stream.push``, this
         method flushes the final step at the end of the supplied sequence.
         """
-        stream = self.stream(include_objectives=include_objectives)
+        stream = self.stream(include_objectives=include_objectives, context=context)
         steps = []
         for event in events:
             completed = stream.push(event, encoded_payload=not isinstance(events, EventLog))
@@ -214,11 +217,11 @@ class Tokenizer:
             steps.append(last)
         return steps
 
-    def pack_rows(self, *, rows) -> tuple[TensorDict, TensorDict]:
+    def pack_rows(self, *, rows, context=None) -> tuple[TensorDict, TensorDict]:
         """Return model inputs and objective step mappings for inference, without labels."""
         steps, sids = [], []
         for index, events in enumerate(rows):
-            encoded = self.encode(events, include_objectives=False)
+            encoded = self.encode(events, include_objectives=False, context=context)
             steps.extend(encoded)
             sids.extend([index] * len(encoded))
         inputs, objective_data = pack_token_batch(steps=steps, sequence_ids=sids if steps else None,
@@ -237,8 +240,9 @@ class EventTokenStream:
     stream per sequence; the Tokenizer itself has no mutable stream state.
     """
 
-    def __init__(self, tokenizer: Tokenizer, *, include_objectives: bool = True):
+    def __init__(self, tokenizer: Tokenizer, *, include_objectives: bool = True, context=None):
         self.tokenizer = tokenizer
+        self.context = context
         self.include_objectives = include_objectives
         self._boundary = _StepBoundary(tokenizer.step_field, tokenizer.episode_field)
         self._pieces: list[dict[str, np.ndarray]] = []
@@ -251,7 +255,7 @@ class EventTokenStream:
                  if key not in INDEX_FIELDS or value is not None}
         if encoded_payload and isinstance(event["payload"], str):
             event = {**event, "payload": json.loads(event["payload"])}
-        piece = self.tokenizer(event)
+        piece = self.tokenizer(event, context=self.context)
         boundary = replace(self._boundary)
         changed = boundary.advance(event)
         if not changed and not self._pieces:
@@ -298,10 +302,10 @@ class EventTokenStream:
         return completed
 
 
-def _field_text_value(spec: TokenizerModalitySpec, row: dict[str, Any]) -> str | None:
+def _field_text_value(spec: TokenizerModalitySpec, row: dict[str, Any], *, context=None) -> str | None:
     assert spec.format is not None
     if spec.input_field is None:
-        return _render_field(spec, row=row, field=None)
+        return _render_field(spec, row=row, field=None, context=context)
     raw = row.get(spec.input_field)
     if raw is None:
         return None
@@ -312,13 +316,13 @@ def _field_text_value(spec: TokenizerModalitySpec, row: dict[str, Any]) -> str |
         if not 0 <= value < len(spec.lookup):
             raise ValueError(f"lookup field {_field_label(spec)!r} ID {value} is outside [0, {len(spec.lookup)})")
         value = spec.lookup[int(value)]
-    return _render_field(spec, row=row, field=value)
+    return _render_field(spec, row=row, field=value, context=context)
 
 
-def _render_field(spec: TokenizerModalitySpec, *, row: dict[str, Any], field: Any) -> str:
+def _render_field(spec: TokenizerModalitySpec, *, row: dict[str, Any], field: Any, context=None) -> str:
     if callable(spec.format):
-        context = {**row, "field": field} if spec.input_field is not None else dict(row)
-        text = spec.format(context)
+        payload = {**row, "field": field} if spec.input_field is not None else dict(row)
+        text = spec.format(payload, context=context) if spec._format_context else spec.format(payload)
         if not isinstance(text, str):
             raise TypeError("A text format callback must return a string")
         return text
@@ -523,7 +527,7 @@ def _image_token_ids(image_tokenizer: Any, value: Any, *, in_name: str) -> list[
     return img_ids
 
 
-def _tokenize_fields(*, row, meta, tokenizers, tokenizer_routes, numeric_routes, text_encoders):
+def _tokenize_fields(*, row, meta, tokenizers, tokenizer_routes, numeric_routes, text_encoders, context=None):
     token_ids: list[int] = []
     tokenizer_ids: list[int] = []
     numeric_values: list[float] = []
@@ -565,7 +569,7 @@ def _tokenize_fields(*, row, meta, tokenizers, tokenizer_routes, numeric_routes,
         tokenizer = tokenizers[field_id]
         text_ids = text_encoders[field_id]
         if m.kind in (KIND_TEXT, KIND_TOKEN):
-            rendered = _field_text_value(spec, row)
+            rendered = _field_text_value(spec, row, context=context)
             if rendered is None or rendered == "":
                 continue
             if tokenizer is None:

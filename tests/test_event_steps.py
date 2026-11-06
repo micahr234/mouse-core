@@ -42,11 +42,12 @@ def test_every_event_emits_independently_and_steps_follow_only_markers():
 def test_stream_buffers_a_partial_step_and_tokenizes_each_event_once():
     calls = []
     class CountingTokenizer(Tokenizer):
-        def __call__(self, event):
+        def __call__(self, event, *, context=None):
             calls.append(event['payload'])
-            return super().__call__(event)
+            assert context == {"schedule_step": 3}
+            return super().__call__(event, context=context)
     tok = CountingTokenizer(tokenizers={"default": IntIdTokenizer()}, input_fields=make_tokenizer().input_fields)
-    stream = tok.stream()
+    stream = tok.stream(context={"schedule_step": 3})
     events = recorded().events
     assert stream.push(events[0]) is None
     assert stream.push(events[1]) is None

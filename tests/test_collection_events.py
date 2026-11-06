@@ -311,7 +311,7 @@ class _CharacterTokenizer:
         return {'input_ids': torch.tensor([[ord(char) for char in text]])}
 
 
-def _notebook_transform(filename, *, tokenizer_only=False, compute_range=(0, 0)):
+def _notebook_transform(filename, *, tokenizer_only=False, compute_tokens=0):
     """Build each example with test-owned settings; parity tests disable compute text."""
     notebook = json.loads((EXAMPLES / filename).read_text())
     source = next(''.join(cell['source']) for cell in notebook['cells']
@@ -325,11 +325,18 @@ def _notebook_transform(filename, *, tokenizer_only=False, compute_range=(0, 0))
 
     def tokenizer_factory(**kwargs):
         sources = kwargs.pop('tokenizers')
+        for field in kwargs['input_fields']:
+            formatter = field.get('format')
+            if compute_tokens is not None and callable(formatter) and formatter.__name__ == 'compute_text':
+                def fixed_compute(payload, formatter=formatter):
+                    return formatter(payload, context={
+                        'compute_tokens': compute_tokens,
+                    })
+                field['format'] = fixed_compute
         return Tokenizer(tokenizers={name: _CharacterTokenizer() for name in sources}, **kwargs)
 
     namespace: dict[str, Any] = dict(Augmenter=Augmenter, Tokenizer=tokenizer_factory, compose=compose,
-                                    random=random.Random(7), COMPUTE_MIN_REPEATS=compute_range[0],
-                                    COMPUTE_MAX_REPEATS=compute_range[1],
+                                    random=random.Random(7),
                                     MAX_ACTIONS=4, MAX_OBS_DISCRETE=64, MAX_STEPS_PER_EPISODE=3,
                                     REPEAT_COUNT=1, PRETRAINED='unused', TOKENIZER_SOURCES={'text': 'unused'})
     exec(compile(ast.Module(body=body, type_ignores=[]), filename, 'exec'), namespace)

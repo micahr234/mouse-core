@@ -1,13 +1,14 @@
 """Save/load references for named format callbacks.
 
 Callbacks receive the event payload and return text; an empty string emits no
-tokens. Define notebook callbacks before loading their saved tokenizer. Lambdas
+tokens. They may declare ``*, context`` to receive separate runtime settings. Define notebook callbacks before loading their saved tokenizer. Lambdas
 and nested functions work at runtime but cannot be saved.
 """
 
 from __future__ import annotations
 
 import importlib
+import inspect
 from collections.abc import Callable
 from typing import Any, cast
 
@@ -58,3 +59,19 @@ def resolve_callable_ref(ref: str) -> Callable[..., Any]:
     if not callable(obj):
         raise TypeError(f"tokenizer callback ref {ref!r} is not callable")
     return cast(Callable[..., Any], obj)
+
+
+def accepts_context(fn: Callable[..., Any]) -> bool:
+    """Inspect once at setup; context is an explicit keyword-only opt-in."""
+    try:
+        parameters = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        or (
+            parameter.name == "context"
+            and parameter.kind == inspect.Parameter.KEYWORD_ONLY
+        )
+        for parameter in parameters
+    )
