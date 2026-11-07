@@ -1,0 +1,771 @@
+{
+  "date": "2026-11-07",
+  "gpu": "NVIDIA GeForce RTX 3090 Ti",
+  "gpu_memory_mib": 24564,
+  "driver": "595.99.02",
+  "python": "3.15.2",
+  "torch": "2.15.0.dev20261005+cu130",
+  "transformers": "5.22.2",
+  "numpy": "2.5.4",
+  "triton": "3.8.0+gitc01b6774",
+  "baseline_commit": "8301b00b363047e38ffb0dadb72425803cb14c96",
+  "baseline_source_sha256": "9f0ebe4a733c4686d8b1c6a53fe0b4fb7bf563f63832a1569f459db22de358ac",
+  "final_source_sha256": "498d09c73f5bd1642d2af8f16e789ad75c90327f59f891dd2665de0ad5ef5646",
+  "model": {
+    "architecture": "qwen3",
+    "layers": 4,
+    "hidden": 1024,
+    "heads": 16,
+    "kv_heads": 8,
+    "head_dim": 128,
+    "ffn": 3072,
+    "parameters_millions": 64.4,
+    "base_dtype": "bf16",
+    "lora_rank": 16,
+    "lora_alpha": 32,
+    "lora_dtype": "fp32"
+  },
+  "attention": {
+    "max_previous_token_distance": 16383,
+    "ring_slots_per_row": 16384,
+    "page_tokens": 16,
+    "query_budget": 1024
+  },
+  "workloads": {
+    "short": [
+      512,
+      512,
+      512,
+      512
+    ],
+    "high_variance": [
+      17,
+      3000,
+      5,
+      900,
+      4000,
+      61,
+      2400,
+      1
+    ],
+    "long": [
+      16384,
+      16384,
+      16384,
+      16384
+    ]
+  },
+  "methodology": [
+    "Serial GPU jobs; synchronized wall-clock median including host scheduling. Two warmup calls; compile first-call time reported separately and excluded.",
+    "Memory is peak allocated bytes above warmed baseline, rounded to MiB. Resident session allocation is reported separately. Shared pool stays fixed.",
+    "Decode advances logical positions between samples. Long workload crosses ring wrap; different iteration counts change short-history endpoints slightly.",
+    "Final comparison repeated in reverse order; additional eight-token chunks and 256-token page trial. No concurrent GPU training/tests during timings.",
+    "GPU kernel durations summed once from Chrome trace kernel events, five calls after five warmups; diagnostics are separate from throughput timing."
+  ],
+  "changes": [
+    "Allow PyTorch FlexAttention to select its specialized FlexDecoding kernel for eligible short queries.",
+    "Compile projection, indexed KV gathering/insertion, attention and MLP together. Keep HF cache writes outside compilation to avoid aliased-pool copies.",
+    "Replace full-history masked scatter with explicit new-token indices; use views instead of contiguous KV layout copies; skip gather when all keys are new.",
+    "Vectorize addresses using the actual HF block table and ring positions; retain HF allocation, scheduler, circular writes and reset ownership.",
+    "Correct bench_profile CUDA totals to exclude CPU/compiler annotations attributing time to the same device events."
+  ],
+  "validation": {
+    "result": "185 tests passed across main run and focused rerun",
+    "details": "183 passed in combined run; two tests still referenced removed private compilation helpers. Updated assertions; both passed in focused rerun. No numerical/cache correctness failures.",
+    "suites": [
+      "tests/test_continuous_decode.py",
+      "tests/test_attention_window.py",
+      "tests/test_packed_train.py",
+      "tests/test_kv_cache.py"
+    ],
+    "static": "Pyright: no errors/warnings in continuous_decode.py and bench_profile.py",
+    "profiler_accounting": "Synthetic annotated CPU event plus CUDA event counted device time once."
+  },
+  "limitations": [
+    "Synthetic model workloads on one GPU; excludes environment simulation, tokenization, Q-head/action selection and downstream end-to-end evaluation.",
+    "Fixed KV pool memory is unchanged. Temporary gathered KV remains; this is not direct attention over pages.",
+    "Uses HF internal KV views and block table; address-oracle and full decode tests guard this version-sensitive integration.",
+    "Native FlexDecoding selection depends on query shapes and model configuration. Large query batches continue through the general FlexAttention kernel.",
+    "First-call compilation is costly and variable; no cold-start speedup claim.",
+    "No dedicated contiguous per-environment cache was implemented or benchmarked; current rings remain logical rings within the shared HF pool."
+  ],
+  "gpu_profiles": {
+    "baseline": {
+      "label": "baseline",
+      "steps": 5,
+      "kernel_ms_per_decode": 56.9126846,
+      "kernel_count_per_decode": 288.0,
+      "top_kernels_ms": [
+        [
+          "triton_tem_fused_flex_attention_0",
+          36.2279192
+        ],
+        [
+          "void at::native::vectorized_elementwise_kernel<4, at::native::launch_masked_scatter_kernel(at::TensorBase const&, at::TensorBase const&, at::TensorBase const&, at::TensorBase const&)::{lambda()#1}::operator()() const::{lambda()#11}::operator()() const::{lambda(c10::BFloat16, bool, long)#1}, std::array<char*, 4ul>, false>(int, at::native::launch_masked_scatter_kernel(at::TensorBase const&, at::TensorBase const&, at::TensorBase const&, at::TensorBase const&)::{lambda()#1}::operator()() const::{lambda()#11}::operator()() const::{lambda(c10::BFloat16, bool, long)#1}, std::array<char*, 4ul>)",
+          7.464141799999998
+        ],
+        [
+          "void at_cuda_detail::cub::detail::scan::DeviceScanKernel<at_cuda_detail::cub::detail::scan::policy_hub<long, long, long, unsigned int, at::cuda::cub::(anonymous namespace)::SumOp<long> >::Policy1000, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::transform_iterator<at::cuda::cub::(anonymous namespace)::CountMaskOp, unsigned char const*, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default>, long*, at_cuda_detail::cub::ScanTileState<long, true>, at::cuda::cub::(anonymous namespace)::SumOp<long>, at_cuda_detail::cub::detail::InputValue<long, long*>, unsigned int, long, false, long>(thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::transform_iterator<at::cuda::cub::(anonymous namespace)::CountMaskOp, unsigned char const*, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default, thrust::THRUST_300001_SM_750_800_860_900_1000_1200_NS::use_default>, long*, at_cuda_detail::cub::ScanTileState<long, true>, int, at::cuda::cub::(anonymous namespace)::SumOp<long>, at_cuda_detail::cub::detail::InputValue<long, long*>, unsigned int)",
+          5.912451200000001
+        ],
+        [
+          "void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1} const&)::{lambda(int)#1}>(int, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#12}::operator()() const::{lambda(c10::BFloat16)#1} const&)::{lambda(int)#1})",
+          2.5904464
+        ],
+        [
+          "void at::native::vectorized_gather_kernel<16, long>(char*, char*, long*, int, long, long, long, long, bool)",
+          2.3797491999999996
+        ],
+        [
+          "void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#11}::operator()() const::{lambda(bool)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#11}::operator()() const::{lambda(bool)#1} const&)::{lambda(int)#1}>(int, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#11}::operator()() const::{lambda(bool)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#11}::operator()() const::{lambda(bool)#1} const&)::{lambda(int)#1})",
+          1.3532486
+        ],
+        [
+          "triton_red_fused__to_copy_arange_bitwise_and_clamp_constant_pad_nd_eq_ge_gt_index_lt_permute_sub_sum_unsqueeze_view_1",
+          0.1869522
+        ],
+        [
+          "ampere_bf16_s16816gemm_bf16_64x64_sliced1x2_ldg8_f2f_stages_64x6_tn",
+          0.1549194
+        ],
+        [
+          "ampere_sgemm_32x32_sliced1x4_tn",
+          0.1200586
+        ],
+        [
+          "void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_64x64_32x6_tn_align8>(cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_64x64_32x6_tn_align8::Params)",
+          0.0771788
+        ],
+        [
+          "void cutlass::Kernel2<cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_128x2_tn_align8>(cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_128x2_tn_align8::Params)",
+          0.0710852
+        ],
+        [
+          "void cublasLt::splitKreduce_kernel<32, 16, int, float, float, float, float, false, float, float, float, true, false, false, false>(cublasLt::cublasSplitKParams<float>, float const*, float const*, float*, float*, float const*, float const*, float const*, float const*, float*, void*, long, float*, int*, float*, float*, float const*, float const*, float const*, float const*, float const*)",
+          0.04604239999999998
+        ]
+      ]
+    },
+    "optimized": {
+      "label": "optimized",
+      "steps": 5,
+      "kernel_ms_per_decode": 39.665804800000004,
+      "kernel_count_per_decode": 224.0,
+      "top_kernels_ms": [
+        [
+          "triton_tem_fused__to_copy_add_flex_attention_mean_mul_pow_rsqrt_transpose_unsqueeze_view_6",
+          36.3462468
+        ],
+        [
+          "triton_poi_fused_index_select_4",
+          2.3771714
+        ],
+        [
+          "triton_red_fused__to_copy_arange_bitwise_and_clamp_constant_pad_nd_eq_ge_gt_index_lt_permute_sub_sum_unsqueeze_view_1",
+          0.18699759999999999
+        ],
+        [
+          "ampere_bf16_s16816gemm_bf16_64x64_sliced1x2_ldg8_f2f_stages_64x6_tn",
+          0.15490720000000005
+        ],
+        [
+          "ampere_sgemm_32x32_sliced1x4_tn",
+          0.12222839999999997
+        ],
+        [
+          "void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_64x64_32x6_tn_align8>(cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_64x64_32x6_tn_align8::Params)",
+          0.07691600000000001
+        ],
+        [
+          "void cutlass::Kernel2<cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_128x2_tn_align8>(cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_128x2_tn_align8::Params)",
+          0.07289100000000001
+        ],
+        [
+          "void cublasLt::splitKreduce_kernel<32, 16, int, float, float, float, float, false, float, float, float, true, false, false, false>(cublasLt::cublasSplitKParams<float>, float const*, float const*, float*, float*, float const*, float const*, float const*, float const*, float*, void*, long, float*, int*, float*, float*, float const*, float const*, float const*, float const*, float const*)",
+          0.04665059999999998
+        ],
+        [
+          "void gemmSN_TN_kernel<float, 128, 16, 2, 4, 4, 4, true, cublasGemvTensorStridedBatched<float const>, cublasGemvTensorStridedBatched<float const>, cublasGemvTensorStridedBatched<float> >(cublasGemmSmallNParams<cublasGemvTensorStridedBatched<float const>, cublasGemvTensorStridedBatched<float const>, cublasGemvTensorStridedBatched<float>, float>)",
+          0.041362199999999995
+        ],
+        [
+          "ampere_sgemm_128x32_tn",
+          0.0399174
+        ],
+        [
+          "void at::native::radixSortKVInPlace<-2, -1, 32, 32, int, long, unsigned int>(at::cuda::detail::TensorInfo<int, unsigned int>, unsigned int, unsigned int, unsigned int, at::cuda::detail::TensorInfo<long, unsigned int>, unsigned int, bool)",
+          0.030605399999999998
+        ],
+        [
+          "void at::native::index_elementwise_kernel<128, 4, at::native::index_copy_kernel_impl<at::native::OpaqueType<2> >(at::TensorIterator&, long, long, long)::{lambda(int)#1}>(long, at::native::index_copy_kernel_impl<at::native::OpaqueType<2> >(at::TensorIterator&, long, long, long)::{lambda(int)#1})",
+          0.026963400000000012
+        ]
+      ]
+    },
+    "final": {
+      "label": "final",
+      "steps": 5,
+      "device_event_ms_per_decode": 5.129546,
+      "kernel_ms_per_decode": 4.9755806,
+      "kernel_count_per_decode": 236.0,
+      "top_kernels_ms": [
+        [
+          "triton_poi_fused_index_select_4",
+          2.3764548
+        ],
+        [
+          "triton_tem_fused__to_copy_add_flex_attention_mean_mul_pow_rsqrt_transpose_unsqueeze_view_6",
+          1.5958506000000001
+        ],
+        [
+          "triton_red_fused__to_copy_arange_bitwise_and_clamp_constant_pad_nd_eq_ge_gt_index_lt_permute_sub_sum_unsqueeze_view_1",
+          0.1958932
+        ],
+        [
+          "ampere_bf16_s16816gemm_bf16_64x64_sliced1x2_ldg8_f2f_stages_64x6_tn",
+          0.16160900000000003
+        ],
+        [
+          "ampere_sgemm_32x32_sliced1x4_tn",
+          0.12668240000000006
+        ],
+        [
+          "void cutlass::Kernel2<cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_64x64_32x6_tn_align8>(cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_64x64_32x6_tn_align8::Params)",
+          0.08023800000000002
+        ],
+        [
+          "void cutlass::Kernel2<cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_128x2_tn_align8>(cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_32x32_128x2_tn_align8::Params)",
+          0.075598
+        ],
+        [
+          "void cublasLt::splitKreduce_kernel<32, 16, int, float, float, float, float, false, float, float, float, true, false, false, false>(cublasLt::cublasSplitKParams<float>, float const*, float const*, float*, float*, float const*, float const*, float const*, float const*, float*, void*, long, float*, int*, float*, float*, float const*, float const*, float const*, float const*, float const*)",
+          0.04864719999999999
+        ],
+        [
+          "void gemmSN_TN_kernel<float, 128, 16, 2, 4, 4, 4, true, cublasGemvTensorStridedBatched<float const>, cublasGemvTensorStridedBatched<float const>, cublasGemvTensorStridedBatched<float> >(cublasGemmSmallNParams<cublasGemvTensorStridedBatched<float const>, cublasGemvTensorStridedBatched<float const>, cublasGemvTensorStridedBatched<float>, float>)",
+          0.0434948
+        ],
+        [
+          "ampere_sgemm_128x32_tn",
+          0.041971600000000005
+        ],
+        [
+          "void at::native::radixSortKVInPlace<-2, -1, 32, 32, int, long, unsigned int>(at::cuda::detail::TensorInfo<int, unsigned int>, unsigned int, unsigned int, unsigned int, at::cuda::detail::TensorInfo<long, unsigned int>, unsigned int, bool)",
+          0.032096200000000005
+        ],
+        [
+          "void at::native::index_elementwise_kernel<128, 4, at::native::index_copy_kernel_impl<at::native::OpaqueType<2> >(at::TensorIterator&, long, long, long)::{lambda(int)#1}>(long, at::native::index_copy_kernel_impl<at::native::OpaqueType<2> >(at::TensorIterator&, long, long, long)::{lambda(int)#1})",
+          0.028218199999999992
+        ]
+      ]
+    }
+  },
+  "reproduction": {
+    "command": ".venv/bin/python /tmp/run_eval_variant.py SOURCE --layers 4 --workloads short high_variance long --step 1 --iters 20",
+    "source_override_driver": "import importlib.util\nimport runpy\nimport sys\nfrom pathlib import Path\nimport mouse_core.models.backbone.base as base\nsource = Path(sys.argv[1])\nspec = importlib.util.spec_from_file_location('eval_candidate', source)\nmodule = importlib.util.module_from_spec(spec)\nsys.modules[spec.name] = module\nspec.loader.exec_module(module)\nbase.ContinuousDecodeSession = module.ContinuousDecodeSession\nscript = '/home/user/Repos/mouse-core/bench/bench_inference.py'\nsys.argv = [script, *sys.argv[2:]]\nrunpy.run_path(script, run_name='__main__')\n",
+    "profile_driver": "\"\"\"Diagnostic GPU kernel durations; timings here are not throughput measurements.\"\"\"\nimport importlib.util\nimport json\nimport sys\nfrom pathlib import Path\nimport torch\nfrom torch.profiler import profile, ProfilerActivity\nfrom mouse_core.models import Backbone, LoRAConfig\nimport mouse_core.models.backbone.base as base\n\nsource, label = sys.argv[1:]\nspec = importlib.util.spec_from_file_location('eval_profile_candidate', source)\nmodule = importlib.util.module_from_spec(spec)\nsys.modules[spec.name] = module\nspec.loader.exec_module(module)\nbase.ContinuousDecodeSession = module.ContinuousDecodeSession\ntorch.manual_seed(0)\ntorch.set_float32_matmul_precision('high')\nmodel = Backbone(architecture='qwen3', dtype=torch.bfloat16, hidden_dim=1024,\n                 num_layers=4, num_heads=16, num_key_value_heads=8, head_dim=128,\n                 intermediate_size=3072, lora=LoRAConfig(rank=16, alpha=32.0),\n                 max_attention_distance_tokens=16383).cuda().eval()\nwith torch.no_grad():\n    for name, param in model.named_parameters():\n        if '.lora_' in name:\n            param.data = param.data.float()\n            if '.lora_B.' in name:\n                torch.nn.init.normal_(param, std=0.02)\n    session = model.decode_session(4, max_batch_tokens=1024)\n    inputs = torch.randn(4, 16384, 1024, device='cuda', dtype=torch.bfloat16)\n    next_inputs = torch.randn(4, 1, 1024, device='cuda', dtype=torch.bfloat16)\n    session.forward(embeds=inputs, lengths=[16384]*4)\n    for _ in range(5):\n        session.forward(embeds=next_inputs, lengths=[1]*4)\n    torch.cuda.synchronize()\n    steps = 5\n    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=False) as prof:\n        for _ in range(steps):\n            session.forward(embeds=next_inputs, lengths=[1]*4)\n        torch.cuda.synchronize()\n    path = Path(f'/tmp/core_eval_{label}_trace.json')\n    prof.export_chrome_trace(str(path))\n    events = json.loads(path.read_text())['traceEvents']\n    kernels = [e for e in events if e.get('cat') == 'kernel' and e.get('ph') == 'X']\n    totals = {}\n    for event in kernels:\n        name = event['name']\n        totals[name] = totals.get(name, 0) + event['dur'] / 1000 / steps\n    averages = prof.key_averages()\n    actual_device_ms = sum(e.self_device_time_total for e in averages if e.device_type == torch.autograd.DeviceType.CUDA) / 1000 / steps\n    report = dict(label=label, steps=steps, device_event_ms_per_decode=actual_device_ms, kernel_ms_per_decode=sum(totals.values()),\n                  kernel_count_per_decode=len(kernels)/steps,\n                  top_kernels_ms=sorted(totals.items(), key=lambda kv: -kv[1])[:12])\n    Path(f'/tmp/core_eval_{label}_gpu.json').write_text(json.dumps(report, indent=2)+'\\n')\n    print(json.dumps(report, indent=2), flush=True)\n    session.close()\n",
+    "baseline_source": "git show 8301b00b363047e38ffb0dadb72425803cb14c96:src/mouse_core/models/backbone/continuous_decode.py",
+    "harness_sha256": "df9336849dee83051553bce9c44e230b36250245d8d76cf5bd5a42e75a8bd9b7"
+  },
+  "runs": [
+    {
+      "label": "baseline",
+      "iterations": 12,
+      "description": "Baseline before changes",
+      "measurements": [
+        {
+          "workload": "short",
+          "session_mib": 1025,
+          "query_tokens_per_row": 1,
+          "prefill_median_ms": 14.21,
+          "prefill_transient_peak_mib": 56,
+          "decode_median_ms": 6.49,
+          "decode_transient_peak_mib": 27,
+          "raw_summary": "short           session=1025 MB pool=65536 tokens B=4 S=  512 tokens=  2048 step=1 | prefill    14.21 ms [14.2,14.3] (+    56 MB) |   144,102 tok/s | decode     6.49 ms [6.5,6.7] (+    27 MB) |      617 tok/s | first prefill 4298 ms, first decode 3274 ms"
+        },
+        {
+          "workload": "high_variance",
+          "session_mib": 2049,
+          "query_tokens_per_row": 1,
+          "prefill_median_ms": 83.26,
+          "prefill_transient_peak_mib": 142,
+          "decode_median_ms": 14.87,
+          "decode_transient_peak_mib": 134,
+          "raw_summary": "high_variance   session=2049 MB pool=131072 tokens B=8 S= 4000 tokens= 10384 step=1 | prefill    83.26 ms [83.2,83.7] (+   142 MB) |   124,714 tok/s | decode    14.87 ms [14.7,15.1] (+   134 MB) |      538 tok/s | first prefill 1982 ms, first decode 15 ms"
+        },
+        {
+          "workload": "long",
+          "session_mib": 1025,
+          "query_tokens_per_row": 1,
+          "prefill_median_ms": 899.34,
+          "prefill_transient_peak_mib": 413,
+          "decode_median_ms": 78.38,
+          "decode_transient_peak_mib": 836,
+          "raw_summary": "long            session=1025 MB pool=65536 tokens B=4 S=16384 tokens= 65536 step=1 | prefill   899.34 ms [898.7,907.8] (+   413 MB) |    72,871 tok/s | decode    78.38 ms [78.2,79.1] (+   836 MB) |       51 tok/s | first prefill 912 ms, first decode 80 ms"
+        }
+      ]
+    },
+    {
+      "label": "views",
+      "iterations": 12,
+      "description": "Remove contiguous layout copies only",
+      "measurements": [
+        {
+          "workload": "short",
+          "session_mib": 1025,
+          "query_tokens_per_row": 1,
+          "prefill_median_ms": 13.7,
+          "prefill_transient_peak_mib": 56,
+          "decode_median_ms": 6.56,
+          "decode_transient_peak_mib": 27,
+          "raw_summary": "short           session=1025 MB pool=65536 tokens B=4 S=  512 tokens=  2048 step=1 | prefill    13.70 ms [13.7,13.8] (+    56 MB) |   149,472 tok/s | decode     6.56 ms [6.5,6.8] (+    27 MB) |      610 tok/s | first prefill 8309 ms, first decode 6393 ms"
+        },
+        {
+          "workload": "high_variance",
+          "session_mib": 2049,
+          "query_tokens_per_row": 1,
+          "prefill_median_ms": 82.08,
+          "prefill_transient_peak_mib": 142,
+          "decode_median_ms": 14.43,
+          "decode_transient_peak_mib": 134,
+          "raw_summary": "high_variance   session=2049 MB pool=131072 tokens B=8 S= 4000 tokens= 10384 step=1 | prefill    82.08 ms [81.4,83.8] (+   142 MB) |   126,513 tok/s | decode    14.43 ms [14.4,14.5] (+   134 MB) |      555 tok/s | first prefill 4314 ms, first decode 15 ms"
+        },
+        {
+          "workload": "long",
+          "session_mib": 1025,
+          "query_tokens_per_row": 1,
+          "prefill_median_ms": 870.73,
+          "prefill_transient_peak_mib": 413,
+          "decode_median_ms": 76.66,
+          "decode_transient_peak_mib": 836,
+          "raw_summary": "long            session=1025 MB pool=65536 tokens B=4 S=16384 tokens= 65536 step=1 | prefill   870.73 ms [869.5,875.5] (+   413 MB) |    75,266 tok/s | decode    76.66 ms [76.2,80.6] (+   836 MB) |       52 tok/s | first prefill 877 ms, first decode 82 ms"
+        }
+      ]
+    },
+    {
+      "label": "compiled",
+      "iterations": 12,
+      "description": "REJECTED: compiled mutation of aliased HF cache views",
+      "measurements": [
+        {
+          "workload": "short",
+          "session_mib": 1025,
+          "query_tokens_per_row": 1,
+          "prefill_median_ms": 87.65,
+          "prefill_transient_peak_mib": 1042,
+          "decode_median_ms": 60.89,
+          "decode_transient_peak_mib": 2057,
+          "raw_summary": "short           session=1025 MB pool=65536 tokens B=4 S=  512 tokens=  2048 step=1 | prefill    87.65 ms [87.6,87.8] (+  1042 MB) |    23,365 tok/s | decode    60.89 ms [60.9,61.1] (+  2057 MB) |       66 tok/s | first prefill 15891 ms, first decode 15199 ms"
+        },
+        {
+          "workload": "high_variance",
+          "session_mib": 2049,
+          "query_tokens_per_row": 1,
+          "prefill_median_ms": 1275.78,
+          "prefill_transient_peak_mib": 4195,
+          "decode_median_ms": 124.8,
+          "decode_transient_peak_mib": 4138,
+          "raw_summary": "high_variance   session=2049 MB pool=131072 tokens B=8 S= 4000 tokens= 10384 step=1 | prefill  1275.78 ms [1275.6,1281.5] (+  4195 MB) |     8,139 tok/s | decode   124.80 ms [124.8,124.9] (+  4138 MB) |       64 tok/s | first prefill 20687 ms, first decode 125 ms"
+        },
+        {
+          "workload": "long",
+          "session_mib": 1025,
+          "query_tokens_per_row": 1,
+          "prefill_median_ms": 4287.54,
+          "prefill_transient_peak_mib": 2312,
+          "decode_median_ms": 118.68,
+          "decode_transient_peak_mib": 2307,
+          "raw_summary": "long            session=1025 MB pool=65536 tokens B=4 S=16384 tokens= 65536 step=1 | prefill  4287.54 ms [4285.1,4294.9] (+  2312 MB) |    15,285 tok/s | decode   118.68 ms [118.6,121.0] (+  2307 MB) |       34 tok/s | first prefill 4296 ms, first decode 121 ms"
+        }
+      ]
+    },
+    {
+      "label": "hfwrite",
+      "iterations": 12,
+      "description": "Compiled read/attention/MLP; indexed insertion; HF writes outside compilation",
+      "measurements": [
+        {
+          "workload": "short",
+          "session_mib": 1025,
+          "query_tokens_per_row": 1,
+          "prefill_median_ms": 12.44,
+          "prefill_transient_peak_mib": 52,
+          "decode_median_ms": 5.77,
+          "decode_transient_peak_mib": 16,
+          "raw_summary": "short           session=1025 MB pool=65536 tokens B=4 S=  512 tokens=  2048 step=1 | prefill    12.44 ms [12.4,12.9] (+    52 MB) |   164,616 tok/s | decode     5.77 ms [5.6,5.9] (+    16 MB) |      693 tok/s | first prefill 8594 ms, first decode 9137 ms"
+        },
+        {
+          "workload": "high_variance",
+          "session_mib": 2049,
+          "query_tokens_per_row": 1,
+          "prefill_median_ms": 73.88,
+          "prefill_transient_peak_mib": 130,
+          "decode_median_ms": 12.03,
+          "decode_transient_peak_mib": 50,
+          "raw_summary": "high_variance   session=2049 MB pool=131072 tokens B=8 S= 4000 tokens= 10384 step=1 | prefill    73.88 ms [73.8,75.4] (+   130 MB) |   140,546 tok/s | decode    12.03 ms [12.0,12.1] (+    50 MB) |      665 tok/s | first prefill 8108 ms, first decode 13 ms"
+        },
+        {
+          "workload": "long",
+          "session_mib": 1025,
+          "query_tokens_per_row": 1,
+          "prefill_median_ms": 747.01,
+          "prefill_transient_peak_mib": 295,
+          "decode_median_ms": 61.79,
+          "decode_transient_peak_mib": 266,
+          "raw_summary": "long            session=1025 MB pool=65536 tokens B=4 S=16384 tokens= 65536 step=1 | prefill   747.01 ms [746.7,1163.7] (+   295 MB) |    87,731 tok/s | decode    61.79 ms [61.7,62.2] (+   266 MB) |       65 tok/s | first prefill 753 ms, first decode 64 ms"
+        }
+      ]
+    },
+    {
+      "label": "numpy",
+      "iterations": 12,
+      "description": "Above plus vectorized HF page lookup; still forces general Flex kernel",
+      "measurements": [
+        {
+          "workload": "short",
+          "session_mib": 1025,
+          "query_tokens_per_row": 1,
+          "prefill_median_ms": 12.38,
+          "prefill_transient_peak_mib": 52,
+          "decode_median_ms": 4.71,
+          "decode_transient_peak_mib": 16,
+          "raw_summary": "short           session=1025 MB pool=65536 tokens B=4 S=  512 tokens=  2048 step=1 | prefill    12.38 ms [12.4,12.5] (+    52 MB) |   165,391 tok/s | decode     4.71 ms [4.6,4.9] (+    16 MB) |      849 tok/s | first prefill 5720 ms, first decode 3211 ms"
+        },
+        {
+          "workload": "high_variance",
+          "session_mib": 2049,
+          "query_tokens_per_row": 1,
+          "prefill_median_ms": 72.86,
+          "prefill_transient_peak_mib": 130,
+          "decode_median_ms": 9.24,
+          "decode_transient_peak_mib": 50,
+          "raw_summary": "high_variance   session=2049 MB pool=131072 tokens B=8 S= 4000 tokens= 10384 step=1 | prefill    72.86 ms [72.8,73.5] (+   130 MB) |   142,518 tok/s | decode     9.24 ms [9.2,9.3] (+    50 MB) |      865 tok/s | first prefill 6318 ms, first decode 10 ms"
+        },
+        {
+          "workload": "long",
+          "session_mib": 1025,
+          "query_tokens_per_row": 1,
+          "prefill_median_ms": 736.4,
+          "prefill_transient_peak_mib": 295,
+          "decode_median_ms": 44.34,
+          "decode_transient_peak_mib": 266,
+          "raw_summary": "long            session=1025 MB pool=65536 tokens B=4 S=16384 tokens= 65536 step=1 | prefill   736.40 ms [734.8,739.5] (+   295 MB) |    88,995 tok/s | decode    44.34 ms [43.3,44.8] (+   266 MB) |       90 tok/s | first prefill 740 ms, first decode 45 ms"
+        }
+      ]
+    },
+    {
+      "label": "optimized_repeat",
+      "iterations": 20,
+      "description": "Repeat vectorized version with general Flex kernel",
+      "measurements": [
+        {
+          "workload": "short",
+          "session_mib": 1025,
+          "query_tokens_per_row": 1,
+          "prefill_median_ms": 12.19,
+          "prefill_transient_peak_mib": 52,
+          "decode_median_ms": 4.66,
+          "decode_transient_peak_mib": 17,
+          "raw_summary": "short           session=1025 MB pool=65536 tokens B=4 S=  512 tokens=  2048 step=1 | prefill    12.19 ms [12.0,12.7] (+    52 MB) |   167,942 tok/s | decode     4.66 ms [4.6,5.0] (+    17 MB) |      858 tok/s | first prefill 5384 ms, first decode 3199 ms"
+        },
+        {
+          "workload": "high_variance",
+          "session_mib": 2049,
+          "query_tokens_per_row": 1,
+          "prefill_median_ms": 73.57,
+          "prefill_transient_peak_mib": 130,
+          "decode_median_ms": 9.35,
+          "decode_transient_peak_mib": 50,
+          "raw_summary": "high_variance   session=2049 MB pool=131072 tokens B=8 S= 4000 tokens= 10384 step=1 | prefill    73.57 ms [73.2,75.9] (+   130 MB) |   141,137 tok/s | decode     9.35 ms [9.3,9.4] (+    50 MB) |      856 tok/s | first prefill 2801 ms, first decode 10 ms"
+        },
+        {
+          "workload": "long",
+          "session_mib": 1025,
+          "query_tokens_per_row": 1,
+          "prefill_median_ms": 735.66,
+          "prefill_transient_peak_mib": 295,
+          "decode_median_ms": 43.07,
+          "decode_transient_peak_mib": 266,
+          "raw_summary": "long            session=1025 MB pool=65536 tokens B=4 S=16384 tokens= 65536 step=1 | prefill   735.66 ms [735.0,746.9] (+   295 MB) |    89,084 tok/s | decode    43.07 ms [43.0,43.2] (+   266 MB) |       93 tok/s | first prefill 750 ms, first decode 45 ms"
+        }
+      ]
+    },
+    {
+      "label": "autodecode",
+      "iterations": 12,
+      "description": "Above plus automatic FlexDecoding selection",
+      "measurements": [
+        {
+          "workload": "short",
+          "session_mib": 1025,
+          "query_tokens_per_row": 1,
+          "prefill_median_ms": 12.43,
+          "prefill_transient_peak_mib": 52,
+          "decode_median_ms": 4.94,
+          "decode_transient_peak_mib": 16,
+          "raw_summary": "short           session=1025 MB pool=65536 tokens B=4 S=  512 tokens=  2048 step=1 | prefill    12.43 ms [12.4,12.5] (+    52 MB) |   164,797 tok/s | decode     4.94 ms [4.9,5.1] (+    16 MB) |      810 tok/s | first prefill 8043 ms, first decode 8367 ms"
+        },
+        {
+          "workload": "high_variance",
+          "session_mib": 2049,
+          "query_tokens_per_row": 1,
+          "prefill_median_ms": 74.4,
+          "prefill_transient_peak_mib": 130,
+          "decode_median_ms": 5.56,
+          "decode_transient_peak_mib": 50,
+          "raw_summary": "high_variance   session=2049 MB pool=131072 tokens B=8 S= 4000 tokens= 10384 step=1 | prefill    74.40 ms [74.3,76.2] (+   130 MB) |   139,575 tok/s | decode     5.56 ms [5.5,5.7] (+    50 MB) |    1,440 tok/s | first prefill 8031 ms, first decode 6 ms"
+        },
+        {
+          "workload": "long",
+          "session_mib": 1025,
+          "query_tokens_per_row": 1,
+          "prefill_median_ms": 739.56,
+          "prefill_transient_peak_mib": 295,
+          "decode_median_ms": 8.58,
+          "decode_transient_peak_mib": 266,
+          "raw_summary": "long            session=1025 MB pool=65536 tokens B=4 S=16384 tokens= 65536 step=1 | prefill   739.56 ms [739.0,1161.4] (+   295 MB) |    88,615 tok/s | decode     8.58 ms [8.6,8.7] (+   266 MB) |      466 tok/s | first prefill 747 ms, first decode 10 ms"
+        }
+      ]
+    },
+    {
+      "label": "final_repeat",
+      "iterations": 20,
+      "description": "Repeat final implementation",
+      "measurements": [
+        {
+          "workload": "short",
+          "session_mib": 1025,
+          "query_tokens_per_row": 1,
+          "prefill_median_ms": 12.36,
+          "prefill_transient_peak_mib": 52,
+          "decode_median_ms": 4.72,
+          "decode_transient_peak_mib": 17,
+          "raw_summary": "short           session=1025 MB pool=65536 tokens B=4 S=  512 tokens=  2048 step=1 | prefill    12.36 ms [11.9,12.5] (+    52 MB) |   165,749 tok/s | decode     4.72 ms [4.7,4.9] (+    17 MB) |      847 tok/s | first prefill 5735 ms, first decode 3159 ms"
+        },
+        {
+          "workload": "high_variance",
+          "session_mib": 2049,
+          "query_tokens_per_row": 1,
+          "prefill_median_ms": 72.77,
+          "prefill_transient_peak_mib": 130,
+          "decode_median_ms": 5.21,
+          "decode_transient_peak_mib": 50,
+          "raw_summary": "high_variance   session=2049 MB pool=131072 tokens B=8 S= 4000 tokens= 10384 step=1 | prefill    72.77 ms [72.7,72.9] (+   130 MB) |   142,696 tok/s | decode     5.21 ms [5.2,5.4] (+    50 MB) |    1,535 tok/s | first prefill 6191 ms, first decode 6 ms"
+        },
+        {
+          "workload": "long",
+          "session_mib": 1025,
+          "query_tokens_per_row": 1,
+          "prefill_median_ms": 738.47,
+          "prefill_transient_peak_mib": 295,
+          "decode_median_ms": 8.46,
+          "decode_transient_peak_mib": 266,
+          "raw_summary": "long            session=1025 MB pool=65536 tokens B=4 S=16384 tokens= 65536 step=1 | prefill   738.47 ms [738.2,746.4] (+   295 MB) |    88,745 tok/s | decode     8.46 ms [8.4,8.6] (+   266 MB) |      473 tok/s | first prefill 744 ms, first decode 10 ms"
+        }
+      ]
+    },
+    {
+      "label": "baseline_repeat",
+      "iterations": 20,
+      "description": "Repeat baseline after final implementation",
+      "measurements": [
+        {
+          "workload": "short",
+          "session_mib": 1025,
+          "query_tokens_per_row": 1,
+          "prefill_median_ms": 14.31,
+          "prefill_transient_peak_mib": 56,
+          "decode_median_ms": 6.44,
+          "decode_transient_peak_mib": 27,
+          "raw_summary": "short           session=1025 MB pool=65536 tokens B=4 S=  512 tokens=  2048 step=1 | prefill    14.31 ms [13.9,14.4] (+    56 MB) |   143,117 tok/s | decode     6.44 ms [6.4,6.6] (+    27 MB) |      621 tok/s | first prefill 4584 ms, first decode 3218 ms"
+        },
+        {
+          "workload": "high_variance",
+          "session_mib": 2049,
+          "query_tokens_per_row": 1,
+          "prefill_median_ms": 83.76,
+          "prefill_transient_peak_mib": 142,
+          "decode_median_ms": 14.9,
+          "decode_transient_peak_mib": 135,
+          "raw_summary": "high_variance   session=2049 MB pool=131072 tokens B=8 S= 4000 tokens= 10384 step=1 | prefill    83.76 ms [82.9,85.9] (+   142 MB) |   123,971 tok/s | decode    14.90 ms [14.8,15.0] (+   135 MB) |      537 tok/s | first prefill 1978 ms, first decode 15 ms"
+        },
+        {
+          "workload": "long",
+          "session_mib": 1025,
+          "query_tokens_per_row": 1,
+          "prefill_median_ms": 902.83,
+          "prefill_transient_peak_mib": 413,
+          "decode_median_ms": 78.92,
+          "decode_transient_peak_mib": 836,
+          "raw_summary": "long            session=1025 MB pool=65536 tokens B=4 S=16384 tokens= 65536 step=1 | prefill   902.83 ms [902.1,913.2] (+   413 MB) |    72,590 tok/s | decode    78.92 ms [78.7,79.5] (+   836 MB) |       51 tok/s | first prefill 914 ms, first decode 81 ms"
+        }
+      ]
+    },
+    {
+      "label": "final_chunk8",
+      "iterations": 12,
+      "description": "Final implementation, eight new tokens per row",
+      "measurements": [
+        {
+          "workload": "short",
+          "session_mib": 1025,
+          "query_tokens_per_row": 8,
+          "prefill_median_ms": 12.46,
+          "prefill_transient_peak_mib": 52,
+          "decode_median_ms": 4.95,
+          "decode_transient_peak_mib": 19,
+          "raw_summary": "short           session=1025 MB pool=65536 tokens B=4 S=  512 tokens=  2048 step=8 | prefill    12.46 ms [12.1,12.6] (+    52 MB) |   164,327 tok/s | decode     4.95 ms [4.9,5.1] (+    19 MB) |    6,470 tok/s | first prefill 5686 ms, first decode 5856 ms"
+        },
+        {
+          "workload": "high_variance",
+          "session_mib": 2049,
+          "query_tokens_per_row": 8,
+          "prefill_median_ms": 73.7,
+          "prefill_transient_peak_mib": 130,
+          "decode_median_ms": 5.44,
+          "decode_transient_peak_mib": 56,
+          "raw_summary": "high_variance   session=2049 MB pool=131072 tokens B=8 S= 4000 tokens= 10384 step=8 | prefill    73.70 ms [73.4,74.1] (+   130 MB) |   140,888 tok/s | decode     5.44 ms [5.4,5.5] (+    56 MB) |   11,772 tok/s | first prefill 2943 ms, first decode 6 ms"
+        },
+        {
+          "workload": "long",
+          "session_mib": 1025,
+          "query_tokens_per_row": 8,
+          "prefill_median_ms": 743.68,
+          "prefill_transient_peak_mib": 295,
+          "decode_median_ms": 9.72,
+          "decode_transient_peak_mib": 267,
+          "raw_summary": "long            session=1025 MB pool=65536 tokens B=4 S=16384 tokens= 65536 step=8 | prefill   743.68 ms [738.8,745.9] (+   295 MB) |    88,124 tok/s | decode     9.72 ms [9.6,12.5] (+   267 MB) |    3,293 tok/s | first prefill 749 ms, first decode 11 ms"
+        }
+      ]
+    },
+    {
+      "label": "baseline_chunk8",
+      "iterations": 12,
+      "description": "Baseline, eight new tokens per row",
+      "measurements": [
+        {
+          "workload": "short",
+          "session_mib": 1025,
+          "query_tokens_per_row": 8,
+          "prefill_median_ms": 14.42,
+          "prefill_transient_peak_mib": 56,
+          "decode_median_ms": 6.6,
+          "decode_transient_peak_mib": 33,
+          "raw_summary": "short           session=1025 MB pool=65536 tokens B=4 S=  512 tokens=  2048 step=8 | prefill    14.42 ms [14.3,14.8] (+    56 MB) |   142,036 tok/s | decode     6.60 ms [6.5,6.9] (+    33 MB) |    4,846 tok/s | first prefill 4321 ms, first decode 3963 ms"
+        },
+        {
+          "workload": "high_variance",
+          "session_mib": 2049,
+          "query_tokens_per_row": 8,
+          "prefill_median_ms": 84.14,
+          "prefill_transient_peak_mib": 142,
+          "decode_median_ms": 15.52,
+          "decode_transient_peak_mib": 145,
+          "raw_summary": "high_variance   session=2049 MB pool=131072 tokens B=8 S= 4000 tokens= 10384 step=8 | prefill    84.14 ms [83.9,84.5] (+   142 MB) |   123,419 tok/s | decode    15.52 ms [15.1,16.0] (+   145 MB) |    4,123 tok/s | first prefill 2037 ms, first decode 15 ms"
+        },
+        {
+          "workload": "long",
+          "session_mib": 1025,
+          "query_tokens_per_row": 8,
+          "prefill_median_ms": 907.72,
+          "prefill_transient_peak_mib": 413,
+          "decode_median_ms": 78.96,
+          "decode_transient_peak_mib": 836,
+          "raw_summary": "long            session=1025 MB pool=65536 tokens B=4 S=16384 tokens= 65536 step=8 | prefill   907.72 ms [905.7,918.5] (+   413 MB) |    72,198 tok/s | decode    78.96 ms [78.8,79.9] (+   836 MB) |      405 tok/s | first prefill 913 ms, first decode 81 ms"
+        }
+      ]
+    },
+    {
+      "label": "page256",
+      "iterations": 20,
+      "description": "Final implementation with 256-token pages instead of 16",
+      "measurements": [
+        {
+          "workload": "short",
+          "session_mib": 1032,
+          "query_tokens_per_row": 1,
+          "prefill_median_ms": 12.3,
+          "prefill_transient_peak_mib": 52,
+          "decode_median_ms": 4.83,
+          "decode_transient_peak_mib": 17,
+          "raw_summary": "short           session=1032 MB pool=65536 tokens B=4 S=  512 tokens=  2048 step=1 | prefill    12.30 ms [12.1,12.7] (+    52 MB) |   166,484 tok/s | decode     4.83 ms [4.8,5.0] (+    17 MB) |      828 tok/s | first prefill 5741 ms, first decode 3188 ms"
+        },
+        {
+          "workload": "high_variance",
+          "session_mib": 2056,
+          "query_tokens_per_row": 1,
+          "prefill_median_ms": 72.7,
+          "prefill_transient_peak_mib": 130,
+          "decode_median_ms": 5.12,
+          "decode_transient_peak_mib": 50,
+          "raw_summary": "high_variance   session=2056 MB pool=131072 tokens B=8 S= 4000 tokens= 10384 step=1 | prefill    72.70 ms [72.6,72.8] (+   130 MB) |   142,829 tok/s | decode     5.12 ms [5.1,5.3] (+    50 MB) |    1,563 tok/s | first prefill 2804 ms, first decode 6 ms"
+        },
+        {
+          "workload": "long",
+          "session_mib": 1032,
+          "query_tokens_per_row": 1,
+          "prefill_median_ms": 741.53,
+          "prefill_transient_peak_mib": 295,
+          "decode_median_ms": 8.32,
+          "decode_transient_peak_mib": 266,
+          "raw_summary": "long            session=1032 MB pool=65536 tokens B=4 S=16384 tokens= 65536 step=1 | prefill   741.53 ms [737.4,747.4] (+   295 MB) |    88,379 tok/s | decode     8.32 ms [8.2,8.4] (+   266 MB) |      481 tok/s | first prefill 745 ms, first decode 10 ms"
+        }
+      ]
+    },
+    {
+      "label": "baseline_autodecode",
+      "iterations": 12,
+      "description": "Baseline with only forced-general-Flex option removed",
+      "measurements": [
+        {
+          "workload": "short",
+          "session_mib": 1025,
+          "query_tokens_per_row": 1,
+          "prefill_median_ms": 14.1,
+          "prefill_transient_peak_mib": 56,
+          "decode_median_ms": 6.64,
+          "decode_transient_peak_mib": 27,
+          "raw_summary": "short           session=1025 MB pool=65536 tokens B=4 S=  512 tokens=  2048 step=1 | prefill    14.10 ms [14.0,14.4] (+    56 MB) |   145,278 tok/s | decode     6.64 ms [6.6,6.8] (+    27 MB) |      602 tok/s | first prefill 6975 ms, first decode 5183 ms"
+        },
+        {
+          "workload": "high_variance",
+          "session_mib": 2049,
+          "query_tokens_per_row": 1,
+          "prefill_median_ms": 84.14,
+          "prefill_transient_peak_mib": 142,
+          "decode_median_ms": 9.6,
+          "decode_transient_peak_mib": 134,
+          "raw_summary": "high_variance   session=2049 MB pool=131072 tokens B=8 S= 4000 tokens= 10384 step=1 | prefill    84.14 ms [83.5,87.5] (+   142 MB) |   123,417 tok/s | decode     9.60 ms [9.5,9.6] (+   134 MB) |      834 tok/s | first prefill 4278 ms, first decode 11 ms"
+        },
+        {
+          "workload": "long",
+          "session_mib": 1025,
+          "query_tokens_per_row": 1,
+          "prefill_median_ms": 908.44,
+          "prefill_transient_peak_mib": 413,
+          "decode_median_ms": 44.0,
+          "decode_transient_peak_mib": 836,
+          "raw_summary": "long            session=1025 MB pool=65536 tokens B=4 S=16384 tokens= 65536 step=1 | prefill   908.44 ms [907.9,916.3] (+   413 MB) |    72,141 tok/s | decode    44.00 ms [43.9,44.2] (+   836 MB) |       91 tok/s | first prefill 910 ms, first decode 45 ms"
+        }
+      ]
+    }
+  ],
+  "page_size_decision": "Keep 16 for this pass. 256-token pages gave no consistent latency improvement (short 4.83 vs4.72ms, ragged5.12 vs5.21ms, long8.32 vs8.46ms) and added about7MiB resident session allocation. No page-size invariant is assumed.",
+  "runtime_net_lines_added": 35,
+  "downstream_validation": {
+    "mouse-experiment": {
+      "before_median_s": 1.3532496169791557,
+      "after_median_s": 1.2758785060141236,
+      "reduction_fraction": 0.05717430841602367,
+      "validation": "87 selected GPU integration tests passed across reruns",
+      "report": "/home/user/Repos/mouse-experiment/bench/results/core_eval_2026-11-07.json"
+    },
+    "v2b": {
+      "before_median_s": 1.7733221279922873,
+      "after_median_s": 1.7177932739723474,
+      "reduction_fraction": 0.0313134614086209,
+      "validation": "51 GPU integration tests plus 7 benchmark bookkeeping cases passed",
+      "report": "/home/user/Repos/v2b/bench/results/core_eval_2026-11-07.json"
+    }
+  }
+}

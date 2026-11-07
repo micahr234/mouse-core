@@ -6,10 +6,6 @@ one ``group_id`` (one dataloader sample)::
 
     allowed(q, k) = k <= q and sequence_ids[k] == sequence_ids[q]
 
-With ``max_attention_distance_tokens=W``, additionally require the distance
-within that sequence to be at most W. This is the same mask used in cached
-inference; windowing never permits attention across an outer-episode boundary.
-
 Groups are equality classes of ``group_id``, not necessarily
 contiguous runs: an id that recurs later in the stream attends back to
 its earlier occurrence and continues its RoPE counter. The stream is
@@ -56,7 +52,6 @@ from torch.nn.attention.flex_attention import BlockMask, flex_attention
 from torch.utils.checkpoint import checkpoint as _checkpoint
 from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
 
-from mouse_core.models.backbone.attention_window import attention_window_size
 from mouse_core.models.backbone.flex_utils import (
     _BLOCK_SIZE,
     _FlexKernel,
@@ -114,35 +109,31 @@ _segment_lock = threading.Lock()
 
 def _segment_mask_mod(b, h, q_idx, kv_idx):
     seg = _segment_holder["segment"]
-    return ((kv_idx <= q_idx) & (seg[q_idx] == seg[kv_idx])
-            & (q_idx - kv_idx < _segment_holder["window_size"]))
+    return (kv_idx <= q_idx) & (seg[q_idx] == seg[kv_idx])
 
 
 def _run_layer_rebound(
     body: Callable[..., torch.Tensor],
     segment: torch.Tensor,
-    window_size: torch.Tensor,
     *args: object,
 ) -> torch.Tensor:
-    """Run one decoder layer with its segment IDs and attention-window bound.
+    """Run one decoder layer with its segment IDs.
 
     Gradient checkpointing re-executes this during ``backward()``. By then a
     later ``packed_forward`` (reasoner generation passes, gradient
     accumulation, a second model on another batch) may have replaced
     ``_segment_holder["segment"]``, so the recompute must rebind the ids this
-    forward's BlockMask was built from, including its window, before the kernel reads them.
+    forward's BlockMask was built from before the kernel reads them.
     """
     with _segment_lock:
         _segment_holder["segment"] = segment
-        _segment_holder["window_size"] = window_size
     return body(*args)
 
 
-def _flex_block_mask(segment: torch.Tensor, window_size: torch.Tensor, L: int, device: torch.device) -> BlockMask:
-    """Block-sparse causal mask within segments, limited by the shared window."""
+def _flex_block_mask(segment: torch.Tensor, L: int, device: torch.device) -> BlockMask:
+    """Block-sparse causal mask within complete episodes."""
     with _segment_lock:
         _segment_holder["segment"] = segment
-        _segment_holder["window_size"] = window_size
         return flex_block_mask(
             _segment_mask_mod,
             B=1,
@@ -375,7 +366,6 @@ def packed_forward(
         raise ValueError("sequence_ids must have shape [L]")
 
     hf = cast(Any, model)  # HF stacks are nn.Module; pyright sees children as Tensor|Module
-    window_size = attention_window_size(hf.config)
     device, dtype = module_device_dtype(hf)
     check_autocast_dtype(autocast_dtype, dtype)
     if torch.is_autocast_enabled(device.type):
@@ -396,10 +386,7 @@ def packed_forward(
 
     plan = _packing_plan(sequence_ids.to(device))
     flex_segment = plan.sequence_ids
-    # Full attention is the special case where the window covers the stream.
-    # Capture the bound as a tensor, including in checkpoint recomputations.
-    flex_window = torch.tensor(window_size, device=device)
-    block_mask = _flex_block_mask(flex_segment, flex_window, L, device)
+    block_mask = _flex_block_mask(flex_segment, L, device)
     flex_fn = _flex_fn(device)
 
     cfg = hf.config
@@ -425,7 +412,7 @@ def packed_forward(
                 layer, h, cos, sin, block_mask, flex_fn, n_heads, n_kv_heads, head_dim,
             )
             h = (
-                _checkpoint(_run_layer_rebound, body, flex_segment, flex_window, *args, use_reentrant=False)
+                _checkpoint(_run_layer_rebound, body, flex_segment, *args, use_reentrant=False)
                 if recompute
                 else body(*args)
             )

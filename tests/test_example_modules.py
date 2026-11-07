@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from transformers.generation import ContinuousBatchingConfig
 from torch import nn
 
 from mouse_core import AdamW, polyak_update
@@ -74,9 +75,8 @@ def _example(path, **overrides):
 
     def backbone_factory(**kwargs):
         construction.append(("backbone", kwargs))
-        return Backbone(architecture="qwen3", hidden_dim=8, num_layers=1, num_heads=2,
-                        dtype=torch.float32,
-                        max_attention_distance_tokens=kwargs.get("max_attention_distance_tokens", 16383))
+        return Backbone(architecture="qwen3", hidden_dim=8, num_layers=1, num_heads=2, head_dim=16,
+                        dtype=torch.float32)
 
     namespace.update(Embedding=embedding_factory, Backbone=backbone_factory)
     source = next("".join(cell["source"]) for cell in notebook["cells"]
@@ -564,7 +564,7 @@ def test_inference_notebook_uses_hf_cache_with_existing_q_head():
     _, ns = _example(
         EXAMPLES / "15_inference.ipynb",
         DECODE_MAX_BATCH_TOKENS=1,
-        DECODE_CACHE_CAPACITY_TOKENS=64,
+        DECODE_CACHE_CAPACITY_TOKENS=ContinuousBatchingConfig().page_size,
     )
     ns["modules"].eval()
     encoder, q_head = ns["encoder"], ns["q_head"]
@@ -590,7 +590,7 @@ def test_inference_notebook_keeps_outer_prefix_and_resets_rows(monkeypatch):
     from mouse_core.models.backbone import ContinuousDecodeSession
     notebook, ns = _example(
         EXAMPLES / "15_inference.ipynb", NUM_ENVS=1,
-        DECODE_MAX_BATCH_TOKENS=2, DECODE_CACHE_CAPACITY_TOKENS=128,
+        DECODE_MAX_BATCH_TOKENS=2, DECODE_CACHE_CAPACITY_TOKENS=ContinuousBatchingConfig().page_size,
     )
     ns["modules"].eval()
 

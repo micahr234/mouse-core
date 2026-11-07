@@ -1,0 +1,31 @@
+{
+  "status": "implemented locally and verified; not published",
+  "selection": [
+    "full-episode HF paged allocation",
+    "direct Flex KV page reads",
+    "whole observation submissions",
+    "batched CPU action/score transfers"
+  ],
+  "checks": {
+    "core": "77 passed (CPU/GPU cache, dense-oracle, training-gradient tests)",
+    "core_typecheck": "0 errors, 0 warnings",
+    "mouse_experiment_cpu": "2039 passed, 31 skipped; changed checkpoint fixture separately rechecked: 67 passed, 31 skipped",
+    "mouse_experiment_gpu": "157 passed initially; four unsupported head-width fixtures corrected and all four passed on rerun",
+    "v2b_cpu": "448 passed, 14 skipped",
+    "v2b_gpu": "46 passed",
+    "operator_configuration": "7 applicable experiment TOMLs validated in each downstream repository",
+    "full_model_smoke": "24 FrozenLake environments, Qwen3-0.6B, independent nonzero action heads, 32 rows/env; warmup and timed trajectories matched. This short run is an integration check, not a long-history memory/performance recommendation."
+  },
+  "sources": {
+    "/home/user/Repos/mouse-core/src/mouse_core/models/backbone/continuous_decode.py": "9ea877dbcd6a25c38652c581dd33a80b921d249ab56c33788fee8d8fa1bc6133",
+    "/home/user/Repos/mouse-core/src/mouse_core/models/backbone/packed_train.py": "0334346ffba573d5fe078ee8e468d58b4d83d8290ddbd1f104d39ef02b65b625",
+    "/home/user/Repos/mouse-experiment/src/mouse_experiment/rollout.py": "50fd0d3f1b986d54476d49e007cb4a50f0b2263ebd2c5cb4d91855f48648abfc",
+    "/home/user/Repos/mouse-experiment/src/mouse_experiment/encoder.py": "0808f15e0605b5994c7e168e6b7f9f05135901bc6b91f51106445458b0a8962e",
+    "/home/user/Repos/mouse-experiment/src/mouse_experiment/config.py": "95a2fd6c93518a2ad36b860af5b024044784e1e474cf9ee75270b2b99eac71ce",
+    "/home/user/Repos/v2b/src/mouse_experiment/rollout.py": "f71d12799e7126ddb2030754161d5c6e59987608a482123ae8312747c9c428e0",
+    "/home/user/Repos/v2b/src/mouse_experiment/encoder.py": "b76362e0038e2c7b44ba7b5aa0da61e60400fa4786777b4cf4657701aefd279e",
+    "/home/user/Repos/v2b/src/mouse_experiment/config.py": "b6b4584d19666d0c29380ebd704c526f8bec7a0c9d985a8dbb49a95943d82fe1"
+  },
+  "dependency_status": "Both downstream environments retain GitHub Core commit 8301b00b363047e38ffb0dadb72425803cb14c96. Verification used temporary process-local source imports. Reinstall after the user reviews and pushes Core.",
+  "configuration": "Operator total cache budgets preserve their previous aggregate allocations. Future tuning targets 24 environments with training resident; no environment-count sweep was run."
+}

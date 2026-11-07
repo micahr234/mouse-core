@@ -12,32 +12,56 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, cast
 
+import numpy as np
 import torch
-from torch.nn.attention.flex_attention import flex_attention
+from torch.nn.attention.flex_attention import BlockMask, FlexKernelOptions, flex_attention
 from transformers.generation import ContinuousBatchingConfig
-from transformers.generation.continuous_batching.cache import PagedAttentionCache
+from transformers.generation.continuous_batching.cache import PagedAttentionCache, FullAttentionCacheAllocator
 from transformers.generation.continuous_batching.distributed import DistributedHelper
 from transformers.generation.continuous_batching.requests import RequestState
 from transformers.generation.continuous_batching.scheduler import FIFOScheduler
 
 from mouse_core.models.backbone.flex_utils import (
     _BLOCK_SIZE, _FLEX_RECOMPILE_LIMIT, _use_flex_compile, check_autocast_dtype,
-    flex_block_mask, module_device_dtype,
+    module_device_dtype,
 )
 from mouse_core.models.backbone.packed_train import _attention_inputs, _attention_output
-from mouse_core.models.backbone.attention_window import attention_window_size
 
 Readout = torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, ...]]
-_PAGE_SIZE = 16
+_PAGE_SIZE = ContinuousBatchingConfig().page_size
+_compiled_layer: Any = None
 _compiled_inputs: Any = None
-_compiled_output: Any = None
 
 
-def _continuous_flex_attention(q, k, v, **kwargs):
-    # Keep this entry point separate from packed training's compiled function.
-    # Otherwise inference dtype/layout variants consume its Dynamo recompile
-    # budget and can change the kernel selected during checkpoint recomputation.
-    return flex_attention(q, k, v, **kwargs)
+def _decode_layer(layer, h, q, n_heads, n_kv_heads, head_dim,
+                  key_cache, value_cache, query_index, query_width, block_mask):
+    """Attend directly to HF-owned KV pages; pad only the new query tokens."""
+    batch = block_mask.kv_num_blocks.shape[0]
+    queries = q.new_zeros((batch * query_width, n_heads, head_dim))
+    queries.index_copy_(0, query_index, q[0].transpose(0, 1))
+    kernel_options: FlexKernelOptions | None = (
+        {"BLOCK_M": _BLOCK_SIZE}
+        if query_width < 128 and query_width * (n_heads // n_kv_heads) > _BLOCK_SIZE
+        else None
+    )
+    attention_output = flex_attention(
+        queries.view(batch, query_width, n_heads, head_dim).transpose(1, 2),
+        key_cache.transpose(0, 1).unsqueeze(0),
+        value_cache.transpose(0, 1).unsqueeze(0),
+        block_mask=block_mask, scale=layer.self_attn.scaling,
+        enable_gqa=n_heads != n_kv_heads, kernel_options=kernel_options,
+    )
+    output = attention_output.transpose(1, 2).reshape(batch * query_width, n_heads, head_dim)
+    output = output.index_select(0, query_index).transpose(0, 1).unsqueeze(0)
+    return _attention_output(layer, h, output)
+
+
+def _physical_indices(allocator, request_id, positions):
+    """Vectorized lookup into HF's per-request pages (no allocation policy)."""
+    slots = positions
+    pages = np.asarray(allocator.block_table[request_id], dtype=np.int64)
+    return (pages[slots // allocator.tokens_per_page] * allocator.block_physical_stride
+            + slots % allocator.tokens_per_page)
 
 
 @dataclass
@@ -48,16 +72,14 @@ class _Submission:
     layers: list[tuple[torch.Tensor, ...]] = field(default_factory=list)
 
 
-def _packed_mask(q_owner, k_owner, q_position, k_position, window_size):
-    # The closure's tensor captures become inputs to the compiled Flex kernel.
-    # Clamping protects Flex's padded block indices, including short batches.
+def _paged_mask(past_lengths, query_lengths, owners, logical_pages, stride, page_size):
     def mask(b, h, q, k):
-        qi = q.clamp(max=q_owner.shape[0] - 1)
-        ki = k.clamp(max=k_owner.shape[0] - 1)
-        distance = q_position[qi] - k_position[ki]
-        allowed = ((q < q_owner.shape[0]) & (k < k_owner.shape[0])
-                   & (q_owner[qi] == k_owner[ki]) & (distance >= 0))
-        return allowed & (distance < window_size)
+        block, offset = k // stride, k % stride
+        logical_k = logical_pages[block] * page_size + offset
+        position = past_lengths[b] + q
+        return ((owners[block] == b) & (offset < page_size)
+                & (logical_k < past_lengths[b] + query_lengths[b])
+                & (logical_k <= position))
     return mask
 
 
@@ -65,19 +87,20 @@ class ContinuousDecodeSession:
     """Bounded, token-budgeted inference with persistent independent episode rows.
 
     Create with ``backbone.decode_session``. ``forward`` accepts the
-    left-padded embedding layout; decoder layers only process
-    real tokens. Alternatively, call ``submit(row, embeds)`` as environments become
-    ready and ``step()`` to run one scheduled batch and retrieve completed inputs.
+    left-padded embedding layout; projections and MLPs process only real
+    tokens, while attention pads the scheduled environment rows. Alternatively,
+    call ``submit(row, embeds)`` as environments become ready and ``step()`` to run
+    one scheduled batch and retrieve completed inputs.
     Calls must be serialized by the caller; there is no background worker.
 
-    ``cache_capacity_tokens`` is the shared pool capacity, in multiples of 16;
-    each live episode rounds its allocation up to a page. ``max_batch_tokens``
+    ``cache_capacity_tokens`` is the shared pool capacity, in multiples of HF's
+    default page size; each live episode rounds its allocation up to a page. ``max_batch_tokens``
     limits queries in one forward. Neither setting changes the attention mask.
-    HF's circular allocator retains at most distance + 1 tokens
-    per row (rounded to pages); absolute positions keep advancing. Chunked input
-    reads the old KV before overwriting it, including chunks longer than the ring.
-    Insufficient capacity raises before submitting. The cache never discards keys
-    the model's training mask would allow, or recomputes a truncated history.
+    HF's full-attention allocator retains each outer episode until reset_rows
+    returns its pages to the shared pool and restarts rotary positions at zero.
+    Insufficient shared pool capacity also raises before submitting. The cache
+    never discards keys the model's training mask would allow, or recomputes a
+    truncated history.
 
     Close after rollout, before updating model/embedding weights. A backbone
     weight change while cache entries exist raises; resetting ALL rows explicitly
@@ -95,30 +118,24 @@ class ContinuousDecodeSession:
             if type(value) is not int or value <= 0:
                 raise ValueError(f"{name} must be a positive integer.")
         if cache_capacity_tokens % _PAGE_SIZE:
-            raise ValueError("cache_capacity_tokens must be a multiple of 16 (the KV page size).")
+            raise ValueError(f"cache_capacity_tokens must be a multiple of {_PAGE_SIZE} (HF's default KV page size).")
         self.model: Any = model
         cfg = self.model.config
-        self._window_size = attention_window_size(cfg)
-        if self._window_size is None:
-            raise ValueError("Core requires a finite attention window.")
+        if getattr(cfg, "use_sliding_window", False) or any(
+            kind != "full_attention" for kind in (getattr(cfg, "layer_types", None) or [])
+        ):
+            raise ValueError("Continuous decoding requires full attention in every layer.")
         self.B = batch_size
         self.max_batch_tokens = max_batch_tokens
         self.cache_capacity_tokens = cache_capacity_tokens
         self.device, self.dtype = module_device_dtype(model)
         self.autocast_dtype = check_autocast_dtype(autocast_dtype, self.dtype)
-        # A tensor bound keeps different window lengths on the same compiled
-        # mask graph; full attention uses an effectively unlimited bound.
-        self._mask_window = torch.tensor(
-            self._window_size,
-            device=self.device, dtype=torch.long,
-        )
         self._cache: PagedAttentionCache | None = PagedAttentionCache(
             cfg,
             ContinuousBatchingConfig(
                 max_batch_tokens=max_batch_tokens,
                 num_blocks=cache_capacity_tokens // _PAGE_SIZE,
                 max_memory_percent=1.0,
-                page_size=_PAGE_SIZE,
                 allow_block_sharing=False,
                 max_blocks_per_request=0,
                 auto_switch_to_flash=False,
@@ -135,19 +152,25 @@ class ContinuousDecodeSession:
         self._lengths = [0] * batch_size
         self._pending: dict[int, _Submission] = {}
         self._versions = self._weight_versions()
-        global _compiled_inputs, _compiled_output
+        global _compiled_layer, _compiled_inputs
         if _use_flex_compile(self.device):
+            if _compiled_layer is None:
+                # Separate from training to keep inference specialization out of
+                # the checkpoint-recomputation compilation budget.
+                _compiled_layer = cast(Any, torch.compile)(
+                    _decode_layer, dynamic=True, fullgraph=True,
+                    recompile_limit=_FLEX_RECOMPILE_LIMIT,
+                )
             if _compiled_inputs is None:
-                _compiled_inputs = torch.compile(_attention_inputs, dynamic=True)
-                _compiled_output = torch.compile(_attention_output, dynamic=True)
-            self._project, self._finish_layer = _compiled_inputs, _compiled_output
-            self._flex = cast(Any, torch.compile)(
-                _continuous_flex_attention, dynamic=True, fullgraph=True,
-                recompile_limit=_FLEX_RECOMPILE_LIMIT,
-            )
+                _compiled_inputs = cast(Any, torch.compile)(
+                    _attention_inputs, dynamic=True, fullgraph=True,
+                    recompile_limit=_FLEX_RECOMPILE_LIMIT,
+                )
+            self._inputs = _compiled_inputs
+            self._layer = _compiled_layer
         else:
-            self._project, self._finish_layer = _attention_inputs, _attention_output
-            self._flex = flex_attention
+            self._inputs = _attention_inputs
+            self._layer = _decode_layer
 
     @property
     def lengths(self) -> tuple[int, ...]:
@@ -164,8 +187,6 @@ class ContinuousDecodeSession:
     def _check(self) -> tuple[PagedAttentionCache, FIFOScheduler]:
         if self._cache is None or self._scheduler is None:
             raise RuntimeError("Continuous decode session is closed.")
-        if attention_window_size(self.model.config) != self._window_size:
-            raise RuntimeError("Attention window changed; close the cache and create a new session.")
         if self.model.training:
             raise RuntimeError("Continuous decoding requires model.eval().")
         if torch.is_autocast_enabled(self.device.type):
@@ -193,8 +214,7 @@ class ContinuousDecodeSession:
             lengths[row] += pending.embeds.shape[0] - processed
         for row, count in additions.items():
             lengths[row] += count
-        retained = [min(n, self._window_size) for n in lengths]
-        needed = sum((n + _PAGE_SIZE - 1) // _PAGE_SIZE for n in retained) * _PAGE_SIZE
+        needed = sum((n + _PAGE_SIZE - 1) // _PAGE_SIZE for n in lengths) * _PAGE_SIZE
         if needed > self.cache_capacity_tokens:
             raise ValueError(
                 f"KV capacity exceeded: {needed} tokens including page rounding, "
@@ -240,26 +260,56 @@ class ContinuousDecodeSession:
             # Each scheduled input is a contiguous slice of its submitted embeddings.
             h = torch.cat([self._pending[row].embeds[state.tokens_to_process[0]:state.tokens_to_process[-1] + 1]
                            for row, state in zip(rows, states, strict=True)])
-            q_owner, k_owner, q_pos, k_pos, read, write = [], [], [], [], [], []
-            allocator = cache.layer_to_allocator[0]
+            allocator = cast(FullAttentionCacheAllocator, cache.layer_to_allocator[0])
+            # HF blocks interleave layers and K/V pages. Translate page indices,
+            # not their contents; the same block map applies to each shifted layer view.
+            past_lengths = np.asarray([state.position_offset for state in states], dtype=np.int64)
+            query_lengths = np.asarray(chunks, dtype=np.int64)
+            query_width = max(chunks)
+            page_size, stride = allocator.tokens_per_page, allocator.block_physical_stride
+            cache_rows = allocator._kv_token_views[allocator.layer_indices[-1]][1].shape[0]
+            num_blocks = (cache_rows + stride - 1) // stride
+            owners = np.full(num_blocks, -1, dtype=np.int64)
+            logical_pages = np.zeros(num_blocks, dtype=np.int64)
+            q_blocks = (query_width + _BLOCK_SIZE - 1) // _BLOCK_SIZE
+            max_pages = max(len(allocator.block_table[state.request_id]) for state in states)
+            indices = np.zeros((len(rows), 1, q_blocks, max_pages), dtype=np.int32)
+            block_counts = np.zeros((len(rows), 1, q_blocks), dtype=np.int32)
+            full_indices = np.zeros_like(indices)
+            full_counts = np.zeros_like(block_counts)
+            columns = [[] for _ in range(3)]
             for owner, (state, count) in enumerate(zip(states, chunks, strict=True)):
                 past = state.position_offset
-                q_owner.extend([owner] * count)
-                key_count = allocator.get_seqlen_k(past, count)
-                k_owner.extend([owner] * key_count)
-                q_pos.extend(range(past, past + count))
-                k_pos.extend(range(past + count - key_count, past + count))
-                read.extend(allocator.get_read_indices(state.request_id, past, count))
-                write.extend(allocator.get_write_indices(state.request_id, past, count))
-            # One host-to-device copy for the scheduling metadata.
-            metadata = (q_owner, k_owner, q_pos, k_pos, read, write)
-            qo, ko, qp, kp, ri, wi = torch.tensor(
-                [index for part in metadata for index in part], device=self.device, dtype=torch.long,
-            ).split([len(part) for part in metadata])
-            mask = flex_block_mask(
-                _packed_mask(qo, ko, qp, kp, self._mask_window), B=1, Q_LEN=len(q_pos), KV_LEN=len(k_pos),
-                device=self.device, block_size=_BLOCK_SIZE, compile_masks=_use_flex_compile(self.device),
+                pages = np.asarray(allocator.block_table[state.request_id], dtype=np.int64)
+                owners[pages] = owner
+                logical_pages[pages] = np.arange(len(pages))
+                for tile in range((count + _BLOCK_SIZE - 1) // _BLOCK_SIZE):
+                    used = (past + min(count, (tile + 1) * _BLOCK_SIZE) + page_size - 1) // page_size
+                    full = min(used, (past + tile * _BLOCK_SIZE + 1) // page_size)
+                    block_counts[owner, 0, tile] = used - full
+                    indices[owner, 0, tile, :used - full] = pages[full:used] * (stride // page_size)
+                    full_counts[owner, 0, tile] = full
+                    full_indices[owner, 0, tile, :full] = pages[:full] * (stride // page_size)
+                positions = np.arange(past, past + count, dtype=np.int64)
+                values = (positions, _physical_indices(allocator, state.request_id, positions),
+                          owner * query_width + np.arange(count, dtype=np.int64))
+                for column, value in zip(columns, values, strict=True):
+                    column.append(value)
+            metadata = [past_lengths, query_lengths, owners, logical_pages,
+                        *(np.concatenate(column) for column in columns)]
+            past, counts, owners_gpu, logical_gpu, qp, wi, qi = torch.from_numpy(np.concatenate(metadata)).to(self.device).split(
+                [len(column) for column in metadata])
+            block_arrays = [block_counts, indices, full_counts, full_indices]
+            blocks_gpu = torch.from_numpy(np.concatenate([array.ravel() for array in block_arrays])).to(self.device)
+            count_gpu, index_gpu, full_count_gpu, full_index_gpu = blocks_gpu.split([array.size for array in block_arrays])
+            mask = BlockMask.from_kv_blocks(
+                count_gpu.view(block_counts.shape), index_gpu.view(indices.shape),
+                full_count_gpu.view(full_counts.shape), full_index_gpu.view(full_indices.shape),
+                BLOCK_SIZE=(_BLOCK_SIZE, page_size),
+                mask_mod=_paged_mask(past, counts, owners_gpu, logical_gpu, stride, page_size),
+                seq_lengths=(query_width, cache_rows), compute_q_blocks=False,
             )
+            write_only = wi[:0]
             cos, sin = self.model.rotary_emb(h.unsqueeze(0), qp.unsqueeze(0))
             cfg = self.model.config
             head_dim = getattr(cfg, "head_dim", None) or cfg.hidden_size // cfg.num_attention_heads
@@ -268,20 +318,17 @@ class ContinuousDecodeSession:
             context = nullcontext() if self.autocast_dtype is None else torch.autocast(self.device.type, dtype=self.autocast_dtype)
             with context:
                 for layer_index, layer in enumerate(self.model.layers):
-                    q, k, v = self._project(
+                    # HF owns these strided views, including page/trash storage.
+                    key_cache, value_cache = allocator._kv_token_views[layer_index]
+                    q, k, v = self._inputs(
                         layer, h, cos, sin, cfg.num_attention_heads, cfg.num_key_value_heads, head_dim,
                     )
-                    k, v = allocator.update(
-                        k[0].transpose(0, 1), v[0].transpose(0, 1), layer_index, ri, wi,
+                    # New full-attention pages never overwrite live episode history.
+                    allocator.update(k[0].transpose(0, 1), v[0].transpose(0, 1), layer_index, write_only, wi)
+                    h = self._layer(
+                        layer, h, q, cfg.num_attention_heads, cfg.num_key_value_heads, head_dim,
+                        key_cache[:cache_rows], value_cache[:cache_rows], qi, query_width, mask,
                     )
-                    attention_output = self._flex(
-                        q.contiguous(), k.transpose(0, 1).unsqueeze(0).contiguous(),
-                        v.transpose(0, 1).unsqueeze(0).contiguous(),
-                        block_mask=mask, scale=layer.self_attn.scaling,
-                        enable_gqa=cfg.num_attention_heads != cfg.num_key_value_heads,
-                        kernel_options={"FORCE_USE_FLEX_ATTENTION": True},
-                    )
-                    h = self._finish_layer(layer, h, attention_output)
                     if need_layers:
                         layer_outputs.append(h.split(chunks))
                 outputs = self.model.norm(h).split(chunks)
@@ -346,10 +393,9 @@ class ContinuousDecodeSession:
             self._pending.clear()
             self._lengths = [0] * self.B
             # A changed layout requires allocating a new pool, even after reset.
-            if (module_device_dtype(self.model) != (self.device, self.dtype)
-                    or attention_window_size(self.model.config) != self._window_size):
+            if module_device_dtype(self.model) != (self.device, self.dtype):
                 self.close()
-                raise RuntimeError("Model device/dtype or attention window changed; create a new decode session.")
+                raise RuntimeError("Model device/dtype changed; create a new decode session.")
             self._versions = self._weight_versions()
         else:
             self._check()

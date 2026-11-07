@@ -126,9 +126,9 @@ def test_cuda_fp32_decode_is_compiled_and_matches_full_forward() -> None:
         preds_b, cache = _fwd(model, [steps[150:]], cache=cache, use_cache=True)
         incremental = torch.cat([preds_a['action_value'], preds_b['action_value']], dim=1)
     session = cache.sessions[0]
-    assert hasattr(session._flex, "_torchdynamo_orig_callable")
+    assert hasattr(session._layer, "_torchdynamo_orig_callable")
     from mouse_core.models.backbone import continuous_decode as decode_mod
-    assert decode_mod._compiled_inputs is not None
+    assert decode_mod._compiled_layer is not None
     full_q = _as_rect(full['action_value'])
     assert torch.allclose(incremental, full_q, atol=0.0001), (incremental - full_q).abs().max().item()
 
@@ -161,7 +161,7 @@ def test_cuda_bf16_lora_compiled_train_matches_cached_decode() -> None:
         assert torch.allclose(incremental, full_q, atol=0.05), (incremental - full_q).abs().max().item()
         assert cache is not None
         from mouse_core.models.backbone import continuous_decode as decode_mod
-        assert decode_mod._compiled_inputs is not None
+        assert decode_mod._compiled_layer is not None
     finally:
         packed_train_mod._compiled_layer = was
 
@@ -548,11 +548,14 @@ def test_flex_decode_session_drops_without_cyclic_gc() -> None:
         gc.enable()
 
 def test_ragged_batched_decode_across_page_boundary_matches_full_forward() -> None:
-    """A row that spans several 16-token pages, batched with a short row, must
+    """A row that spans HF pages, batched with a short row, must
     match its unbatched full forward (page remap + RoPE across pages)."""
     torch.manual_seed(5)
     model = _tiny_model('qwen3')
-    long_row = _steps(80)
+    from transformers.generation import ContinuousBatchingConfig
+    half_page_steps = ContinuousBatchingConfig().page_size // 4
+    long_count = 2 * half_page_steps + 4
+    long_row = _steps(long_count)
     short_row = _steps(4, start=200)
     with torch.no_grad():
         ref_long = _fwd(model, [long_row])[0]['action_value']
@@ -560,7 +563,7 @@ def test_ragged_batched_decode_across_page_boundary_matches_full_forward() -> No
         cache = None
         collected = [[], []]
         consumed = [0, 0]
-        for lengths in ([40, 1], [25, 0], [15, 3]):
+        for lengths in ([half_page_steps, 1], [half_page_steps, 0], [4, 3]):
             batch = [long_row[consumed[0]:consumed[0] + lengths[0]], short_row[consumed[1]:consumed[1] + lengths[1]]]
             consumed = [c + n for c, n in zip(consumed, lengths)]
             preds, cache = _fwd(model, batch, cache=cache, use_cache=True)
@@ -570,7 +573,7 @@ def test_ragged_batched_decode_across_page_boundary_matches_full_forward() -> No
                     collected[b].append(preds['action_value'][b, padded - n:])
         assert cache is not None
         session = cache.sessions[0]
-    assert session.lengths == (160, 8)
+    assert session.lengths == (2 * long_count, 8)
     assert torch.allclose(torch.cat(collected[0], dim=0), ref_long, atol=1e-05)
     assert torch.allclose(torch.cat(collected[1], dim=0), ref_short, atol=1e-05)
 

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from torch.autograd import DeviceType
 from torch.autograd.profiler import EventList
 from torch.profiler import ProfilerActivity, profile
 
@@ -89,7 +90,10 @@ def _safe_label(label: str) -> str:
 def _print_summary(prof: profile, *, label: str, steps: int, cuda: bool) -> None:
     averages: EventList = prof.key_averages()
     cpu_us = sum(e.self_cpu_time_total for e in averages)
-    device_us = sum(e.self_device_time_total for e in averages) if cuda else 0.0
+    # CPU/compiler annotations also carry attributed CUDA time. Count only
+    # actual device events so the same kernels are not counted twice.
+    device_us = sum(e.self_device_time_total for e in averages
+                    if e.device_type == DeviceType.CUDA) if cuda else 0.0
     cpu_ms = cpu_us / 1e3
     device_ms = device_us / 1e3
     ratio = (cpu_ms / device_ms) if device_ms > 0 else float("inf")

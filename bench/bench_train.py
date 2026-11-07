@@ -86,7 +86,6 @@ def main() -> None:
     parser.add_argument("--ffn", type=int, default=3072)
     parser.add_argument("--no-lora", action="store_true", help="fully trainable fp32 backbone")
     parser.add_argument("--iters", type=int, default=10)
-    parser.add_argument("--max-attention-distance-tokens", type=int, default=16383)
     parser.add_argument(
         "--workloads",
         nargs="+",
@@ -96,8 +95,8 @@ def main() -> None:
                         default=["eager", "compiled", "compiled+checkpoint"])
     add_profile_args(parser)
     args = parser.parse_args()
-    if args.iters < 1 or args.max_attention_distance_tokens < 0:
-        parser.error("iters must be positive and attention distance nonnegative")
+    if args.iters < 1:
+        parser.error("iters must be positive")
 
     if "eager" in args.modes and any(mode != "eager" for mode in args.modes[:args.modes.index("eager")]):
         parser.error("eager must precede compiled modes: compiled decoder installation is process-wide")
@@ -120,7 +119,6 @@ def main() -> None:
         head_dim=args.head_dim,
         intermediate_size=args.ffn,
         lora=lora,
-        max_attention_distance_tokens=args.max_attention_distance_tokens,
     )
     backbone.to(device)
     for name, p in backbone.named_parameters():
@@ -135,7 +133,7 @@ def main() -> None:
         f"{props.name} | torch {torch.__version__} | layers={args.layers} base dtype={dtype} "
         f"lora={'off' if lora is None else f'r{lora.rank}'} params={sum(p.numel() for p in backbone.parameters())/1e6:.1f}M "
         f"trainable={sum(p.numel() for p in trainable)/1e6:.2f}M "
-        f"attention_distance={args.max_attention_distance_tokens} TF32=high wall timing"
+        f"full-episode attention TF32=high wall timing"
     )
 
     for mode in args.modes:

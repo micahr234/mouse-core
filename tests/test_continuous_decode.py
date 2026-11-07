@@ -4,6 +4,7 @@ from __future__ import annotations
 import pytest
 import torch
 from torch import nn
+from transformers.generation import ContinuousBatchingConfig
 from transformers.generation.continuous_batching.cache import PagedAttentionCache
 from transformers.generation.continuous_batching.scheduler import FIFOScheduler
 
@@ -11,15 +12,16 @@ from mouse_core.models import Backbone, DecodeCache
 from mouse_core.models.backbone import ContinuousDecodeSession
 
 
+PAGE_SIZE = ContinuousBatchingConfig().page_size
+
 DEVICES = ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"))]
 
 
-def backbone(architecture="qwen3", device="cpu", autocast_dtype=None, distance=16383):
+def backbone(architecture="qwen3", device="cpu", autocast_dtype=None):
     torch.manual_seed(81)
     model = Backbone(architecture=architecture, dtype=torch.float32, hidden_dim=32,
                      num_layers=2, num_heads=2, num_key_value_heads=1,
-                     train_autocast_dtype=autocast_dtype, decode_autocast_dtype=autocast_dtype,
-                     max_attention_distance_tokens=distance).to(device).eval()
+                     train_autocast_dtype=autocast_dtype, decode_autocast_dtype=autocast_dtype).to(device).eval()
     with torch.no_grad():
         for name, param in model.named_parameters():
             if name.endswith(("q_proj.weight", "k_proj.weight")):
@@ -39,11 +41,11 @@ def reference(model, tokens, *, layers=False):
 @torch.no_grad()
 def test_incremental_ragged_chunking_matches_training_mask(architecture, budget, device):
     model = backbone(architecture, device)
-    cache = model.decode_session(3, max_batch_tokens=budget, cache_capacity_tokens=256)
+    cache = model.decode_session(3, max_batch_tokens=budget, cache_capacity_tokens=3 * PAGE_SIZE)
     assert isinstance(cache._cache, PagedAttentionCache)
     assert isinstance(cache._scheduler, FIFOScheduler)
     histories = [torch.empty(0, 32, device=device) for _ in range(3)]
-    # Cross KV pages, pause rows, prefill while others decode, and reset one episode.
+    # Pause rows, prefill while others decode, and reset one episode.
     for lengths, reset in [([17, 2, 0], []), ([1, 0, 9], []), ([2, 8, 1], [1]), ([0, 0, 0], [])]:
         if reset:
             cache.reset_rows(reset)
@@ -69,7 +71,7 @@ def test_incremental_ragged_chunking_matches_training_mask(architecture, budget,
 @torch.no_grad()
 def test_ready_rows_arrive_during_prefill_and_reuse_finished_slots():
     model = backbone()
-    cache = model.decode_session(3, max_batch_tokens=4, cache_capacity_tokens=128)
+    cache = model.decode_session(3, max_batch_tokens=4, cache_capacity_tokens=2 * PAGE_SIZE)
     first = torch.randn(10, 32)
     second = torch.randn(1, 32)
     cache.submit(0, first)
@@ -99,7 +101,7 @@ def test_ready_rows_arrive_during_prefill_and_reuse_finished_slots():
 @torch.no_grad()
 def test_cancel_partial_prefill_releases_capacity_and_restarts_positions():
     model = backbone()
-    cache = model.decode_session(2, max_batch_tokens=4, cache_capacity_tokens=32)
+    cache = model.decode_session(2, max_batch_tokens=4, cache_capacity_tokens=2 * PAGE_SIZE)
     cache.submit(0, torch.randn(16, 32))
     cache.step()
     cache.reset_rows([0])
@@ -117,16 +119,16 @@ def test_cancel_partial_prefill_releases_capacity_and_restarts_positions():
 @torch.no_grad()
 def test_capacity_never_evicts_live_history_and_rejected_batch_is_atomic():
     model = backbone()
-    cache = model.decode_session(2, max_batch_tokens=8, cache_capacity_tokens=32)
+    cache = model.decode_session(2, max_batch_tokens=8, cache_capacity_tokens=2 * PAGE_SIZE)
     x = torch.randn(2, 1, 32)
     cache.forward(embeds=x, lengths=[1, 1])
     with pytest.raises(ValueError, match="KV capacity exceeded"):
-        cache.forward(embeds=torch.randn(2, 16, 32), lengths=[1, 16])
+        cache.forward(embeds=torch.randn(2, PAGE_SIZE, 32), lengths=[1, PAGE_SIZE])
     assert cache.lengths == (1, 1)
     assert not cache.has_pending
-    y = torch.randn(2, 15, 32)
-    result = cache.forward(embeds=y, lengths=[15, 15])
-    torch.testing.assert_close(result[0], reference(model, torch.cat([x[0], y[0]]))[-15:])
+    y = torch.randn(2, PAGE_SIZE - 1, 32)
+    result = cache.forward(embeds=y, lengths=[PAGE_SIZE - 1, PAGE_SIZE - 1])
+    torch.testing.assert_close(result[0], reference(model, torch.cat([x[0], y[0]]))[-(PAGE_SIZE - 1):])
     cache.reset_rows([1])
     z = torch.randn(1, 32)
     cache.submit(0, z)
@@ -138,8 +140,8 @@ def test_capacity_never_evicts_live_history_and_rejected_batch_is_atomic():
 @torch.no_grad()
 def test_pending_chunks_reserve_capacity():
     model = backbone()
-    cache = model.decode_session(2, max_batch_tokens=4, cache_capacity_tokens=32)
-    cache.submit(0, torch.randn(32, 32))
+    cache = model.decode_session(2, max_batch_tokens=4, cache_capacity_tokens=2 * PAGE_SIZE)
+    cache.submit(0, torch.randn(2 * PAGE_SIZE, 32))
     cache.step()
     with pytest.raises(ValueError, match="KV capacity exceeded"):
         cache.submit(1, torch.randn(1, 32))
@@ -149,7 +151,7 @@ def test_pending_chunks_reserve_capacity():
 @torch.no_grad()
 def test_weight_versions_require_explicit_full_reset():
     model = backbone()
-    cache = model.decode_session(2, max_batch_tokens=8, cache_capacity_tokens=32)
+    cache = model.decode_session(2, max_batch_tokens=8, cache_capacity_tokens=2 * PAGE_SIZE)
     x = torch.randn(2, 1, 32)
     cache.forward(embeds=x, lengths=[1, 1])
     next(model.parameters()).add_(0.1)
@@ -167,7 +169,7 @@ def test_weight_versions_require_explicit_full_reset():
 @torch.no_grad()
 def test_hidden_states_feed_multiple_existing_rl_heads(architecture):
     model = backbone(architecture)
-    cache = model.decode_session(1, max_batch_tokens=3, cache_capacity_tokens=32)
+    cache = model.decode_session(1, max_batch_tokens=3, cache_capacity_tokens=2 * PAGE_SIZE)
     heads = nn.ModuleDict({'q': nn.Linear(32, 4), 'policy': nn.Linear(32, 4), 'value': nn.Linear(32, 1)})
     x = torch.randn(1, 13, 32)  # Can already include numeric or compute embeddings.
     h = model(x, cache=cache, lengths=[13])
@@ -180,10 +182,10 @@ def test_hidden_states_feed_multiple_existing_rl_heads(architecture):
 
 @pytest.mark.parametrize('kwargs, message', [
     ({'batch_size': 0}, 'batch_size'), ({'max_batch_tokens': 0}, 'max_batch_tokens'),
-    ({'cache_capacity_tokens': 17}, 'multiple of 16'), ({'cache_capacity_tokens': True}, 'positive integer'),
+    ({'cache_capacity_tokens': PAGE_SIZE + 1}, f'multiple of {PAGE_SIZE}'), ({'cache_capacity_tokens': True}, 'positive integer'),
 ])
 def test_invalid_capacity_configuration(kwargs, message):
-    opts = dict(batch_size=2, max_batch_tokens=4, cache_capacity_tokens=32)
+    opts = dict(batch_size=2, max_batch_tokens=4, cache_capacity_tokens=2 * PAGE_SIZE)
     opts.update(kwargs)
     with pytest.raises(ValueError, match=message):
         ContinuousDecodeSession(backbone().model, **opts)
@@ -192,13 +194,13 @@ def test_invalid_capacity_configuration(kwargs, message):
 def test_live_mask_cannot_be_changed_by_cache_configuration():
     model = backbone()
     model.model.config.layer_types = ["full_attention", "sliding_attention"]
-    with pytest.raises(ValueError, match="same sliding"):
-        model.decode_session(1, max_batch_tokens=4, cache_capacity_tokens=32)
+    with pytest.raises(ValueError, match="full attention"):
+        model.decode_session(1, max_batch_tokens=4, cache_capacity_tokens=2 * PAGE_SIZE)
 
 
 def test_invalid_inputs_do_not_poison_session():
     model = backbone()
-    cache = model.decode_session(2, max_batch_tokens=4, cache_capacity_tokens=32)
+    cache = model.decode_session(2, max_batch_tokens=4, cache_capacity_tokens=2 * PAGE_SIZE)
     for row, x in [(2, torch.randn(1, 32)), (0, torch.randn(0, 32)), (0, torch.randn(1, 31))]:
         with pytest.raises(ValueError):
             cache.submit(row, x)
@@ -219,7 +221,7 @@ def test_invalid_inputs_do_not_poison_session():
 
 def test_failed_forward_closes_partially_written_cache(monkeypatch):
     model = backbone()
-    cache = model.decode_session(1, max_batch_tokens=4, cache_capacity_tokens=32)
+    cache = model.decode_session(1, max_batch_tokens=4, cache_capacity_tokens=2 * PAGE_SIZE)
     cache.submit(0, torch.randn(2, 32))
     def fail(*args, **kwargs):
         raise RuntimeError('injected decoder failure')
@@ -231,11 +233,10 @@ def test_failed_forward_closes_partially_written_cache(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
-@pytest.mark.parametrize("distance", [16383, 3])
 @torch.no_grad()
-def test_cuda_mixed_precision(distance):
-    model = backbone(device='cuda', autocast_dtype=torch.bfloat16, distance=distance)
-    cache = model.decode_session(2, max_batch_tokens=16, cache_capacity_tokens=128)
+def test_cuda_mixed_precision():
+    model = backbone(device='cuda', autocast_dtype=torch.bfloat16)
+    cache = model.decode_session(2, max_batch_tokens=16, cache_capacity_tokens=2 * PAGE_SIZE)
     x = torch.randn(2, 25, 32, device='cuda')
     result = cache.forward(embeds=x, lengths=[25, 7])
     expected = reference(model, x[0])
@@ -246,25 +247,66 @@ def test_cuda_mixed_precision(distance):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("distance", [16383, 3])
 @torch.no_grad()
-def test_cuda_bf16_base_with_fp32_lora(distance):
+def test_cuda_bf16_base_with_fp32_lora():
     from mouse_core.models import LoRAConfig
     torch.manual_seed(72)
     model = Backbone(
         architecture="qwen3", dtype=torch.bfloat16, hidden_dim=32,
         num_layers=2, num_heads=2, num_key_value_heads=1,
         lora=LoRAConfig(rank=4, alpha=8),
-        max_attention_distance_tokens=distance,
     ).cuda().eval()
     for name, param in model.named_parameters():
         if "lora_B" in name:
             param.normal_(std=0.02)
-    cache = model.decode_session(2, max_batch_tokens=7, cache_capacity_tokens=128)
+    cache = model.decode_session(2, max_batch_tokens=7, cache_capacity_tokens=2 * PAGE_SIZE)
     x = torch.randn(2, 17, 32, device="cuda", dtype=torch.bfloat16)
     result = cache.forward(embeds=x, lengths=[17, 1])
     expected = reference(model, x[0])
     torch.testing.assert_close(result[0], expected, atol=0.04, rtol=0.02)
     assert cache._cache.dtype == torch.bfloat16
     assert all(p.dtype == torch.float32 for n, p in model.named_parameters() if "lora_" in n)
+    cache.close()
+
+
+@pytest.mark.parametrize("tokens", [1, PAGE_SIZE + 1, 2 * PAGE_SIZE + 1])
+def test_physical_addresses_match_hf_allocator(tokens):
+    """Match HF's address oracle across interleaved full-episode pages."""
+    import numpy as np
+    from mouse_core.models.backbone.continuous_decode import _physical_indices
+    session = backbone().decode_session(2, cache_capacity_tokens=4 * PAGE_SIZE)
+    assert session._cache is not None
+    allocator = session._cache.layer_to_allocator[0]
+    try:
+        # Use the scheduler to reserve sectors and interleave each row's pages.
+        first = min(tokens, allocator.tokens_per_page)
+        session.forward(embeds=torch.randn(2, first, 32), lengths=[first, first])
+        if tokens > first:
+            session.forward(embeds=torch.randn(2, tokens - first, 32), lengths=[tokens - first, 0])
+        for past in sorted({0, min(1, tokens - 1), tokens - 1}):
+            for count in sorted({1, tokens - past}):
+                read = _physical_indices(allocator, '0', np.arange(past + count, dtype=np.int64))
+                assert read.tolist() == allocator.get_read_indices('0', past, count)
+                write = _physical_indices(allocator, '0', np.arange(past, past + count, dtype=np.int64))
+                assert write.tolist() == allocator.get_write_indices('0', past, count)
+    finally:
+        session.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("tokens_per_row", [32, 66, 96])
+@torch.no_grad()
+def test_cuda_batched_gqa_decode_matches_full_episodes(tokens_per_row):
+    # Exercise both ordinary decode and GQA query tiles larger than the mask
+    # block, now within each environment row rather than a packed global row.
+    model = backbone(device="cuda", autocast_dtype=torch.bfloat16)
+    cache = model.decode_session(3, max_batch_tokens=3 * tokens_per_row, cache_capacity_tokens=6 * PAGE_SIZE)
+    history = torch.empty(3, 0, 32, device="cuda")
+    for _ in range(3):
+        x = torch.randn(3, tokens_per_row, 32, device="cuda")
+        history = torch.cat([history, x], dim=1)
+        got = cache.forward(embeds=x, lengths=[tokens_per_row] * 3)
+        for row in range(3):
+            expected = reference(model, history[row])[-tokens_per_row:]
+            torch.testing.assert_close(got[row], expected, atol=4e-3, rtol=4e-3)
     cache.close()

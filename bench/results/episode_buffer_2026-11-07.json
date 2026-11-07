@@ -1,0 +1,123 @@
+{
+  "date": "2026-11-07",
+  "purpose": "Measure complete-episode FrozenLake buffer bounds and memory/concurrency tradeoffs",
+  "model": "Qwen/Qwen3-0.6B full 28-layer pretrained backbone; fresh seeded policy and LoRA, fp32 weights with bf16 decode",
+  "protocol": "One full warmup then two measured fresh evals per separate process, 512 rows per environment, two PyTorch threads, greedy policy and identical seeds within each concurrency setting. All variants run sequentially on one RTX 3090 Ti.",
+  "page_size": 256,
+  "page_policy": "Use ContinuousBatchingConfig default; no Core override",
+  "overflow_policy": "Always raise before attention when an outer episode exceeds max_attention_distance_tokens + 1; training counts sequence-ID equality classes and decode includes pending submissions before mutation.",
+  "failed_cases": [
+    {
+      "buffer_tokens": 5376,
+      "num_envs": 32,
+      "stage": "HF cache memory preflight before first rollout",
+      "estimated_footprint_bytes": 22283669504,
+      "available_memory_bytes": 22270640128,
+      "error": "MemoryError",
+      "log": "\nLoading weights:   0%|          | 0/310 [00:00<?, ?it/s]\nLoading weights: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 310/310 [00:00<00:00, 13635.58it/s]\nTraceback (most recent call last):\n  File \"/home/user/Repos/mouse-experiment/bench/rollout_profile.py\", line 134, in <module>\n    main()\n    ~~~~^^\n  File \"/home/user/Repos/mouse-experiment/bench/rollout_profile.py\", line 106, in main\n    result = collect(config=current, adapter=adapter, model=model, tokenizer=tokenizer,\n                     index=0, optimizer_step=args.optimizer_step)\n  File \"/home/user/Repos/mouse-experiment/src/mouse_experiment/rollout.py\", line 38, in run_evaluation\n    return _collect(\n        config=config,\n    ...<5 lines>...\n        exploration=None if exploration.greedy else exploration,\n    )\n  File \"/home/user/Repos/mouse-experiment/src/mouse_experiment/rollout.py\", line 92, in _collect\n    scores = decoder.scores(adapter.num_actions, streams=active) if needs_scores else None\n             ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/user/Repos/mouse-experiment/.venv/lib/python3.15/site-packages/torch/utils/_contextlib.py\", line 158, in inference_mode\n    return func(*args, **kwargs)\n  File \"/home/user/Repos/mouse-experiment/src/mouse_experiment/decoding.py\", line 80, in scores\n    out = prefill_eval_cache(\n        model=self.model,\n    ...<4 lines>...\n        chunk_steps=self.prefill_chunk,\n    )\n  File \"/home/user/Repos/mouse-experiment/src/mouse_experiment/runtime.py\", line 191, in prefill_eval_cache\n    out = model(packed, use_cache=True)\n  File \"/home/user/Repos/mouse-experiment/.venv/lib/python3.15/site-packages/torch/nn/modules/module.py\", line 1787, in _wrapped_call_impl\n    return self._call_impl(*args, **kwargs)\n           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^\n  File \"/home/user/Repos/mouse-experiment/.venv/lib/python3.15/site-packages/torch/nn/modules/module.py\", line 1798, in _call_impl\n    return forward_call(*args, **kwargs)\n  File \"/home/user/Repos/mouse-experiment/src/mouse_experiment/encoder.py\", line 495, in forward\n    out = self.encoder(tokens, cache=cache, use_cache=use_cache)\n  File \"/home/user/Repos/mouse-experiment/.venv/lib/python3.15/site-packages/torch/nn/modules/module.py\", line 1787, in _wrapped_call_impl\n    return self._call_impl(*args, **kwargs)\n           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^\n  File \"/home/user/Repos/mouse-experiment/.venv/lib/python3.15/site-packages/torch/nn/modules/module.py\", line 1798, in _call_impl\n    return forward_call(*args, **kwargs)\n  File \"/home/user/Repos/mouse-experiment/src/mouse_experiment/encoder.py\", line 115, in forward\n    sessions=(self.backbone.decode_session(\n              ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^\n        batch_size=tokens[\"num_sequences\"], max_batch_tokens=self.decode_max_batch_tokens\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    ),)\n    ^\n  File \"/home/user/Repos/mouse-experiment/.venv/lib/python3.15/site-packages/mouse_core/models/backbone/base.py\", line 224, in decode_session\n    return ContinuousDecodeSession(\n        model, batch_size=batch_size, max_batch_tokens=max_batch_tokens,\n        cache_capacity_tokens=cache_capacity_tokens, autocast_dtype=self.decode_autocast_dtype,\n    )\n  File \"/home/user/Repos/mouse-experiment/.venv/lib/python3.15/site-packages/mouse_core/models/backbone/continuous_decode.py\", line 149, in __init__\n    self._cache: PagedAttentionCache | None = PagedAttentionCache(\n                                              ~~~~~~~~~~~~~~~~~~~^\n        cfg,\n        ^^^^\n    ...<12 lines>...\n        model_supports_logits_to_keep=True,\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    )\n    ^\n  File \"/home/user/Repos/mouse-experiment/.venv/lib/python3.15/site-packages/transformers/generation/continuous_batching/cache.py\", line 194, in __init__\n    ).infer_max_batch_tokens_and_num_sectors()\n      ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^\n  File \"/home/user/Repos/mouse-experiment/.venv/lib/python3.15/site-packages/transformers/generation/continuous_batching/cache.py\", line 690, in infer_max_batch_tokens_and_num_sectors\n    return self._check_footprint(max_batch_tokens, num_sectors)\n           ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/user/Repos/mouse-experiment/.venv/lib/python3.15/site-packages/transformers/generation/continuous_batching/cache.py\", line 696, in _check_footprint\n    raise MemoryError(\n        f\"Memory footprint {memory_footprint} is more than available memory {self.available_memory}\"\n    )\nMemoryError: Memory footprint 22283669504 is more than available memory 22270640128\n"
+    }
+  ],
+  "checks": {
+    "core_gpu_and_cpu_cache_tests": 101,
+    "experiment_decoder_and_bound_tests_cpu": 13,
+    "experiment_decoder_and_bound_tests_gpu": 13,
+    "v2b_daily_reset_and_overflow_tests_cpu": 4,
+    "pyright": "0 errors, 0 warnings in changed Core runtime files",
+    "fixed_concurrency_trajectory_hashes_match": true,
+    "v2b_daily_reset_and_overflow_tests_gpu": 4,
+    "inference_benchmark_auto_buffer_gpu_smoke": "passed: 512-token history + 2 warmup + 1 measured append, automatically selected distance 514",
+    "benchmark_undersized_buffer_preflights": "both inference and continuous-decode CLIs reject before model allocation"
+  },
+  "limitations": [
+    "The final 32-environment/5376-token case reduces the query budget from 1024 to 256; do not attribute its result solely to buffer size.",
+    "Two measured windows per case, one order, no confidence interval; sub-percent timing differences are inconclusive.",
+    "Fresh policy/adapters: tests execution and complete-history retention, not trained-policy quality or how much history a policy can afford to lose.",
+    "Bounds apply to the snapshotted schemas, tokenizer, prompts, horizons and compute budgets; rerun bound tool after changes. Runtime guards catch overflow regardless.",
+    "Different concurrency counts include more stream seeds; fingerprints are compared only at fixed concurrency.",
+    "Some short CPU-only validation tests overlapped the first baseline timing; its second sample is also recorded. No concurrent GPU workloads were launched.",
+    "Measured source hashes are in each raw run; subsequent documentation-only cleanup does not change runtime. Larger packed-layout cases were stopped after the reproducible 16-environment slowdown to investigate it, then the full matrix was run with separate attention rows."
+  ],
+  "fixes": "Replace packed cross-environment attention with separate padded attention batch rows; keep projections/MLPs on real tokens and the existing HF scheduler/cache. Real full-model test exposed PyTorch FlexDecoding choosing a 256-wide GQA query tile against a 128-wide mask block. Core caps only oversized short-query tiles; three bf16 GPU regression cases match full-history reference.",
+  "dependency_handling": "Temporary non-editable local Core wheel for measurement and integration tests, then restore original GitHub package files and metadata. No dependency declaration or operator TOML changed by this study.",
+  "runs": [
+    {
+      "buffer_tokens": 16384,
+      "max_attention_distance_tokens": 16383,
+      "num_envs": 8,
+      "decode_max_batch_tokens": 1024,
+      "theoretical_kv_pool_gib": 14.0,
+      "median_seconds": 18.832388464477845,
+      "actions_per_second": 202.89513500676097,
+      "peak_allocated_gib": 16.444572925567627,
+      "max_episode_tokens": 2631,
+      "supports_current_conservative_training_bound": true,
+      "command": "HF_HUB_OFFLINE=1 .venv/bin/python bench/rollout_profile.py experiments/frozenlake/multi_dqn.toml --steps 512 --envs 8 --threads 2 --repeats 2 --attention-distance 16383 --decode-max-batch-tokens 1024 --output runs/window_16384_envs_8.json"
+    },
+    {
+      "buffer_tokens": 4096,
+      "max_attention_distance_tokens": 4095,
+      "num_envs": 8,
+      "decode_max_batch_tokens": 1024,
+      "theoretical_kv_pool_gib": 3.5,
+      "median_seconds": 18.720155410992447,
+      "actions_per_second": 204.11155335581853,
+      "peak_allocated_gib": 5.944572925567627,
+      "max_episode_tokens": 2631,
+      "supports_current_conservative_training_bound": false,
+      "command": "HF_HUB_OFFLINE=1 .venv/bin/python bench/rollout_profile.py experiments/frozenlake/multi_dqn.toml --steps 512 --envs 8 --threads 2 --repeats 2 --attention-distance 4095 --decode-max-batch-tokens 1024 --output runs/window_4096_envs_8.json"
+    },
+    {
+      "buffer_tokens": 8192,
+      "max_attention_distance_tokens": 8191,
+      "num_envs": 16,
+      "decode_max_batch_tokens": 1024,
+      "theoretical_kv_pool_gib": 14.0,
+      "median_seconds": 25.217810339468997,
+      "actions_per_second": 305.8552624582238,
+      "peak_allocated_gib": 16.51574993133545,
+      "max_episode_tokens": 2631,
+      "supports_current_conservative_training_bound": true,
+      "command": "HF_HUB_OFFLINE=1 .venv/bin/python bench/rollout_profile.py experiments/frozenlake/multi_dqn.toml --steps 512 --envs 16 --threads 2 --repeats 2 --attention-distance 8191 --decode-max-batch-tokens 1024 --output runs/window_8192_envs_16.json"
+    },
+    {
+      "buffer_tokens": 5376,
+      "max_attention_distance_tokens": 5375,
+      "num_envs": 24,
+      "decode_max_batch_tokens": 1024,
+      "theoretical_kv_pool_gib": 13.78125,
+      "median_seconds": 31.622478417499224,
+      "actions_per_second": 367.2703905957306,
+      "peak_allocated_gib": 16.380202293395996,
+      "max_episode_tokens": 2631,
+      "supports_current_conservative_training_bound": true,
+      "command": "HF_HUB_OFFLINE=1 .venv/bin/python bench/rollout_profile.py experiments/frozenlake/multi_dqn.toml --steps 512 --envs 24 --threads 2 --repeats 2 --attention-distance 5375 --decode-max-batch-tokens 1024 --output runs/window_5376_envs_24.json"
+    },
+    {
+      "buffer_tokens": 4096,
+      "max_attention_distance_tokens": 4095,
+      "num_envs": 32,
+      "decode_max_batch_tokens": 1024,
+      "theoretical_kv_pool_gib": 14.0,
+      "median_seconds": 38.6149873190443,
+      "actions_per_second": 401.0877919507062,
+      "peak_allocated_gib": 16.679646492004395,
+      "max_episode_tokens": 2631,
+      "supports_current_conservative_training_bound": false,
+      "command": "HF_HUB_OFFLINE=1 .venv/bin/python bench/rollout_profile.py experiments/frozenlake/multi_dqn.toml --steps 512 --envs 32 --threads 2 --repeats 2 --attention-distance 4095 --decode-max-batch-tokens 1024 --output runs/window_4096_envs_32.json"
+    },
+    {
+      "buffer_tokens": 5376,
+      "max_attention_distance_tokens": 5375,
+      "num_envs": 32,
+      "decode_max_batch_tokens": 256,
+      "theoretical_kv_pool_gib": 18.375,
+      "median_seconds": 39.12382306350628,
+      "actions_per_second": 395.8713333014436,
+      "peak_allocated_gib": 21.054646492004395,
+      "max_episode_tokens": 2631,
+      "supports_current_conservative_training_bound": true,
+      "command": "HF_HUB_OFFLINE=1 .venv/bin/python bench/rollout_profile.py experiments/frozenlake/multi_dqn.toml --steps 512 --envs 32 --threads 2 --repeats 2 --attention-distance 5375 --decode-max-batch-tokens 256 --output runs/window_5376_envs_32.json"
+    }
+  ],
+  "full_report": "/home/user/Repos/mouse-experiment/bench/results/frozenlake_window_2026-11-07.json"
+}

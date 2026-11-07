@@ -437,7 +437,8 @@ backbone.eval()
 session = backbone.decode_session(
     batch_size=4,
     max_batch_tokens=1024,
-    # Omit capacity to reserve a full circular window for every row.
+    # Shared memory budget; no per-episode attention cutoff.
+    cache_capacity_tokens=65536,
 )
 # Left-padded inputs with the number of real tokens in each row.
 features = backbone(embeds, cache=session, lengths=lengths)
@@ -448,7 +449,9 @@ session.close()  # before updating model or embedding weights
 
 The adapter uses Transformers' `FIFOScheduler` and `PagedAttentionCache`, with
 Mouse's decoder layers and compiled FlexAttention on CUDA. Each forward processes
-only real query tokens and is bounded by `max_batch_tokens`. It also offers
+real query tokens up to `max_batch_tokens`. Attention uses one batch row per
+scheduled environment, with queries padded to that batch's longest query;
+projections and MLPs process only real tokens. It also offers
 `submit(row, embeds)` and `step()` for a caller that receives environments at
 different times: a step returns a dictionary of completed submissions' hidden
 states, while their KV remains cached for the next action. These calls are
@@ -456,44 +459,33 @@ serialized by the caller; the adapter does not create background environment
 workers. `DecodeCache` accepts these sessions too. [Notebook 15](examples/15_inference.ipynb)
 uses this path with FrozenLake; its environment loop is still lockstep.
 
-Configure the maximum previous-token distance once on the backbone:
+Training and inference use full causal attention within each outer episode.
+There is no explicit attention-distance limit or episode-length overflow check.
+RoPE positions count tokens from the beginning of each outer episode and restart
+at zero on reset; inner resets retain their history.
 
-```python
-backbone = Backbone(
-    pretrained="Qwen/Qwen3-0.6B",
-    dtype=torch.float32,
-    max_attention_distance_tokens=16383,
-)
-```
+The shared KV pool is a memory budget, not an attention window. Each episode
+acquires HF pages as its input grows and returns them on `reset_rows`. The pool
+stays allocated across those resets. By default, `decode_session` budgets 16,384
+tokens per batch row in one shared pool; a row may use another row's unused
+capacity. Pass `cache_capacity_tokens` to choose an explicit total, divisible by
+HF's default page size (currently 256 tokens). If live histories plus pending
+inputs exceed that pool, submission fails before cache mutation. It never drops
+old tokens to make room. Training has no corresponding KV-pool restriction.
 
-Every training and inference layer applies the same rule: causal attention within
-an outer episode, with `query_position - key_position <= max_attention_distance_tokens`.
-The distance counts tokens within that episode, even in interleaved packed input.
-The window is always finite (default distance 16383); `None` is rejected.
-`0` allows self only. With distance W,
-HF's circular allocator retains at most W + 1 KV tokens per row, rounded up to
-16-token pages. Rotary positions continue increasing across wraparound. Cached
-hidden states are retained; a truncated prefix is never recomputed.
-
-Choose W above the longest tokenized outer episode to keep effective full-episode
-attention while using fixed memory. Include the prompt, observations, action/reward
-text, separators, and all compute tokens in that bound. If an episode exceeds W + 1,
-the configured rolling mask applies consistently during training and inference.
-Outer resets still release that row and restart its positions; inner resets do not.
-Notebooks 02 and 15 use the same explicit distance. Weights-only checkpoints do not
-save construction settings, so use the same window when constructing the model.
-
-The pool capacity is a separate shared-memory budget. To guarantee room for B
-simultaneous full rings, allocate `B * ceil((W + 1) / 16) * 16` token slots. A
-smaller pool can serve shorter live histories but raises if the mask-visible KV
-will not fit; it does not shrink the attention window to make room. Memory also
-includes query activations and temporary gathered keys, bounded by the per-forward
-token budget rather than by the number of steps already processed.
+FlexAttention reads the HF-owned KV pages directly. A sparse block map translates
+logical episode positions into physical page addresses, marking wholly causal
+pages as full blocks and checking causal boundaries only where necessary. Query
+padding accommodates uneven observation chunks; projections and MLPs process
+only real tokens. There is no separate gathered history tensor and no rounding
+to fixed attention-shape buckets. HF's query-token budget can split a large
+observation across scheduled forwards; its output is returned after the whole
+submitted observation has been processed.
 
 `decode_session(batch_size)` is the only cached-decode factory. It reserves
-capacity for every row's full window and uses a 1024-token query budget. Supply
+a shared memory budget and uses a 1024-token query budget. Supply
 `max_batch_tokens` and optionally `cache_capacity_tokens` to tune scheduling and
-memory. There is no growing-cache or unwindowed backend.
+memory. Attention covers complete outer episodes in every path.
 
 This embedding adapter uses the lower-level HF scheduler/cache, not its
 vocabulary-sampling `generate_batch` runner. It does not yet use HF CUDA graph
@@ -624,22 +616,23 @@ classes or compare forward code sharing the same class name.
 
 Run these only when GPUs are available. The training and inference harnesses use
 synchronized wall time, including CPU scheduling/launch work, rather than just
-CUDA event time. They accept `--max-attention-distance-tokens` (default 16383,
-plus the current token) to match training and inference masks. Inference also
-accepts `--max-batch-tokens` to control the HF scheduler query budget.
+CUDA event time. Inference accepts `--cache-capacity-tokens` for the total
+shared KV pool and `--max-batch-tokens` for the scheduler's query budget.
+Omitting capacity derives enough page-rounded space for the requested histories
+and all warmup/timed appends. Attention always covers the full outer episode.
 
 ```bash
-.venv/bin/python bench/bench_train.py --layers 4 --workloads short --modes compiled --max-attention-distance-tokens 16383
-.venv/bin/python bench/bench_inference.py --layers 4 --workloads short --step 1 --max-batch-tokens 1024 --max-attention-distance-tokens 16383
-.venv/bin/python bench/bench_continuous_decode.py --device cuda --iterations 20 --max-batch-tokens 1024 --max-attention-distance-tokens 16383
+.venv/bin/python bench/bench_train.py --layers 4 --workloads short --modes compiled
+.venv/bin/python bench/bench_inference.py --layers 4 --workloads short --step 1 --max-batch-tokens 1024
+.venv/bin/python bench/bench_continuous_decode.py --device cuda --iterations 20 --max-batch-tokens 1024
 ```
 
 `bench_continuous_decode.py` records raw warmup/timed samples, versions, shapes,
-query budget, attention distance and fixed pool capacity for uniform/ragged rows.
-Logical decode positions advance during measurement; retained history stays
-window-bounded. `bench_inference.py` reports resident session allocation separately
-from transient peak allocation above the warmed baseline. The HF circular cache
-is allocated up front; it does not grow or use CUDA graph capture in this path.
+query budget and shared pool capacity for uniform/ragged rows. Explicitly
+undersized capacity fails before allocating the model. `bench_inference.py`
+reports resident session allocation separately from transient peak allocation.
+The HF pool is allocated up front; requests acquire pages as they grow and
+release them at outer-episode boundaries. This path does not use CUDA graphs.
 
 First calls are reported separately, but warmup does not guarantee that later
 shapes avoid compilation. Run each comparison in a fresh process; the compiled
@@ -650,6 +643,93 @@ CPU/device diagnostics outside the timing samples. These synthetic workloads
 exclude tokenization and environments; downstream train/eval harnesses measure
 those production paths. Use `bench/bench_dataloader.py` and
 `bench/bench_worker_transport.py` separately to examine preparation/transport.
-A smaller configured window reduces pool capacity, but need not reduce attention
-work when actual histories already fit below both compared limits. Older CUDA
+A smaller shared pool reduces reserved KV memory without reducing attention
+work when the same full histories fit in both compared capacities. Older CUDA
 event timing reports are not directly comparable to these wall-time reports.
+
+
+Measured on an RTX 3090 Ti on 2026-11-07, a small simplification of this path
+reduced short/ragged decode latency by roughly 10–15% and prefill latency by
+5–10%. It checks each submitted batch once and combines scheduling metadata into
+one device transfer. Packed training now uses sorted sequence IDs directly,
+removing the boundary-to-ID round trip. Full optimizer-step gains were smaller
+and variable (about 2% for the longer tested workload); long-history decoding
+improved only about 1.5%. Across the two runtime files, 18 lines were added and
+18 removed, with no new settings or execution modes. These are synthetic model
+measurements, not downstream end-to-end speedups. Configuration, repeated
+before/after measurements, source hashes, and validation are recorded in
+[`bench/results/core_simplification_2026-11-07.json`](bench/results/core_simplification_2026-11-07.json).
+
+An earlier eval pass, before the selected full-episode direct-page implementation,
+removed forced general Flex kernels on the same GPU, allowing
+native FlexDecoding for eligible short queries. That version vectorized HF page lookup
+and compiled indexed KV gathering, attention, and the decoder body together while
+leaving circular cache writes with HF. Those gathering and circular-retention
+paths have since been replaced by full-episode direct page reads. Against commit `8301b00`, repeated median
+wall times for four-layer Qwen3-shaped bf16/LoRA inference were:
+
+| History workload | Before decode | After decode | Before/after temporary peak |
+|---|---:|---:|---:|
+| Four rows, 512 tokens each | 6.44 ms | 4.72 ms | 27 / 17 MiB |
+| Eight ragged rows, 1–4,000 tokens | 14.90 ms | 5.21 ms | 135 / 50 MiB |
+| Four rows, 16,384 tokens each | 78.92 ms | 8.46 ms | 836 / 266 MiB |
+
+These calls add one token per row. Eight-token chunks also improved (long history:
+78.96 to 9.72 ms). Long-history GPU kernel time fell from 56.9 to 5.0 ms; fixed
+pool allocation stayed about 1,025 MiB. Prefill improved roughly 13–18%. This is
+model inference, excluding environments/tokenization and first-call compilation.
+Changing pages from 16 to HF's default 256 produced no consistent latency gain
+and added about 7 MiB of session storage. A subsequent cleanup adopts HF's
+default instead of maintaining a Core override; the measurements above used 16. The benchmark
+profiler now counts CUDA device events once, excluding attributed CPU annotations.
+Full measurements, rejected variants, source hashes, and correctness checks are in
+[`bench/results/eval_cache_2026-11-07.json`](bench/results/eval_cache_2026-11-07.json).
+
+Temporary downstream installs also passed the selected GPU integration checks.
+Fresh production-path eval windows with smaller local weights improved about 6%
+in Mouse Experiment/FrozenLake and 1–3% in V2B, where the end-to-end benefit was
+small. Those measurements include environment/tokenizer work and are recorded
+with the Core report above. Both original GitHub installations were restored.
+
+
+A follow-up with the full pretrained Qwen3-0.6B backbone found that packed
+cross-environment attention scaled poorly for short action queries. Core now gives
+each scheduled environment its own attention batch row, while projections/MLPs
+still process only real tokens. The HF scheduler, paged pool, causal semantics,
+and episode-local rotary positions are retained. On the same RTX 3090 Ti:
+
+| Environments | Buffer tokens per environment | Previous actions/s | New actions/s | New peak allocated GPU memory |
+|---:|---:|---:|---:|---:|
+| 8 | 16,384 | 60.7 | 202.9 | 16.44 GiB |
+| 16 | 8,192 | 36.5 | 305.9 | 16.52 GiB |
+| 24 | 5,376 | — | 367.3 | 16.38 GiB |
+| 32 | 4,096 | — | 401.1 | 16.68 GiB |
+| 32 | 5,376 | — | 395.9 | 21.05 GiB |
+
+Each case uses 512 rollout rows per environment, one full warmup and two timed
+fresh evaluations, with the same seeded fresh policy at fixed concurrency. Both
+old/new comparisons produced identical trajectory hashes. These are execution
+measurements, not trained-policy quality results; small timing differences and
+scaling beyond the tested cases are not established. Environments step serially
+on the host in this path; concurrency here means batched model evaluation.
+
+The current FrozenLake schema/configuration has a conservative bound of 2,731
+tokens per outer episode for evaluation and 5,131 for Multi-DQN training with
+five additional compute tokens per readout. The measured episodes reached 2,631.
+A 4,096-token buffer fits this evaluation but not that training; 5,376 tokens
+(distance 5,375) fits both and rounds to HF's default 256-token pages. This is a
+starting point for the current configuration, not a universal default. With this
+buffer, 24 environments fit at the original 1,024-query budget. The final
+32-environment case uses `decode_max_batch_tokens=256`: the 1,024-query budget
+was rejected by HF memory preflight before the first rollout (estimated footprint
+22,283,669,504 bytes versus 22,270,640,128 available). Lowering the query budget
+limits work scheduled per forward, without shortening retained history. Training
+and evaluation now fault if an episode exceeds its buffer, including pending
+decode chunks, rather than silently discarding history. Operator settings were
+left unchanged. Attention padding can increase temporary memory for uneven rows.
+
+The full-model summary and validation are in
+[`bench/results/episode_buffer_2026-11-07.json`](bench/results/episode_buffer_2026-11-07.json).
+The linked Mouse Experiment report includes raw samples, source snapshots,
+profiling diagnostics, and reproduction commands. Original downstream GitHub
+installations were restored after testing.

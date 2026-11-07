@@ -36,8 +36,7 @@ from mouse_core.models.backbone.packed_train import (
     check_autocast_dtype,
 )
 from mouse_core.models.lora import LoRAConfig, apply_lora
-from mouse_core.models.backbone.continuous_decode import ContinuousDecodeSession
-from mouse_core.models.backbone.attention_window import attention_window_size
+from mouse_core.models.backbone.continuous_decode import ContinuousDecodeSession, _PAGE_SIZE
 
 
 class BaseBackbone(nn.Module, ABC):
@@ -204,11 +203,11 @@ class BaseBackbone(nn.Module, ABC):
         self, batch_size: int, *, max_batch_tokens: int = 1024,
         cache_capacity_tokens: int | None = None,
     ) -> ContinuousDecodeSession:
-        """HF continuous batching with a fixed circular KV pool and FlexAttention.
+        """HF continuous batching with a fixed shared KV pool and FlexAttention.
 
-        By default reserve one full attention window per row (rounded to
-        16-token pages). An explicit shared capacity may be smaller for sparse
-        workloads; insufficient capacity raises instead of shortening history.
+        By default budget 16,384 tokens per row in one shared pool. This is a
+        memory budget, not a per-episode attention limit: rows borrow unused
+        capacity. Insufficient capacity raises instead of shortening history.
         ``max_batch_tokens`` bounds queries per scheduled decoder forward.
         Use ``forward`` for a batch or ``submit``/``step`` for independently
         ready rows. Reset a row only at its outer-episode boundary.
@@ -216,11 +215,8 @@ class BaseBackbone(nn.Module, ABC):
         model = getattr(self, "model", None)
         if model is None:
             raise NotImplementedError(f"{type(self).__name__} does not support cached decoding.")
-        window_size = attention_window_size(model.config)
-        if window_size is None:
-            raise ValueError("Core requires a finite attention window.")
         if cache_capacity_tokens is None:
-            cache_capacity_tokens = batch_size * ((window_size + 15) // 16) * 16
+            cache_capacity_tokens = batch_size * ((16384 + _PAGE_SIZE - 1) // _PAGE_SIZE) * _PAGE_SIZE
         return ContinuousDecodeSession(
             model, batch_size=batch_size, max_batch_tokens=max_batch_tokens,
             cache_capacity_tokens=cache_capacity_tokens, autocast_dtype=self.decode_autocast_dtype,

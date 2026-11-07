@@ -19,7 +19,6 @@ from mouse_core.models.backbone.base import (
     _rope_parameters_from_config,
 )
 from mouse_core.models.backbone.packed_train import _DecoderStack, packed_forward
-from mouse_core.models.backbone.attention_window import configure_attention_window
 from mouse_core.models.backbone.llama import _LlamaBackboneConfig, llama_config_kwargs
 from mouse_core.models.backbone.qwen3 import _Qwen3BackboneConfig, qwen3_config_kwargs
 from mouse_core.models.lora import LoRAConfig
@@ -197,11 +196,9 @@ class Backbone(BaseBackbone):
       ``hidden_dim``, ``num_layers``, ``num_heads``, … (tests, ablations).
     - ``architecture="hf"`` rebuilds a saved generic stack from ``hf_config``.
 
-    ``max_attention_distance_tokens=W`` allows attention to self and at most W
-    earlier tokens within the same outer episode, in every layer and execution
-    path. The default is 16383; ``0`` allows self only. Set W
-    above the longest tokenized episode for effective full-episode attention
-    with bounded circular KV storage at inference. RoPE positions do not wrap.
+    Attention is causal within each outer episode, with no distance limit.
+    Cached inference retains every token until that episode is reset; its
+    shared KV pool budget is independent of training attention semantics.
 
     CPU forwards require ``torch.no_grad()``; FlexAttention training requires CUDA.
 
@@ -232,15 +229,10 @@ class Backbone(BaseBackbone):
         hub_kwargs: dict[str, Any] | None = None,
         lora: LoRAConfig | None = None,
         rope_enabled: bool = True,
-        max_attention_distance_tokens: int = 16383,
         hf_config: dict[str, Any] | None = None,
         **config_kwargs: Any,
     ) -> None:
         super().__init__()
-        if (
-            type(max_attention_distance_tokens) is not int or max_attention_distance_tokens < 0
-        ):
-            raise ValueError("max_attention_distance_tokens must be a nonnegative integer.")
         if type(rope_enabled) is not bool:
             raise TypeError("rope_enabled must be a boolean.")
         if "use_norm" in config_kwargs:
@@ -319,8 +311,6 @@ class Backbone(BaseBackbone):
                 int(self.model.config.head_dim)
             )
         self._config_kwargs["rope_enabled"] = rope_enabled
-        configure_attention_window(self.model, max_attention_distance_tokens)
-        self._config_kwargs["max_attention_distance_tokens"] = max_attention_distance_tokens
 
     def enable_kernels(self) -> None:
         """Opt into HF kernels on this existing decoder, without replacing it.
@@ -332,11 +322,6 @@ class Backbone(BaseBackbone):
         available device/training implementations; speedups need benchmarking.
         """
         cast(Any, self.model).set_use_kernels(True)
-
-    @property
-    def max_attention_distance_tokens(self) -> int:
-        """Maximum direct attention distance into the past, shared by all paths."""
-        return self._config_kwargs["max_attention_distance_tokens"]
 
     @property
     def rope_enabled(self) -> bool:

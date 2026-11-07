@@ -1,0 +1,209 @@
+{
+  "date": "2026-11-07",
+  "gpu": "NVIDIA GeForce RTX 3090 Ti",
+  "gpu_memory_mib": 24564,
+  "driver": "595.99.02",
+  "torch": "2.15.0.dev20261005+cu130",
+  "baseline_runtime_commit": "e3664019e7c9381b7d728c519b2f023b1051ecbb",
+  "candidate_runtime_commit": "8301b00b363047e38ffb0dadb72425803cb14c96",
+  "source_files": {
+    "src/mouse_core/models/backbone/continuous_decode.py": {
+      "before_sha256": "c5c3bc93318ec927d2db17f43eec6e45717b3023d080d52385fa27e77e36790e",
+      "after_sha256": "9f0ebe4a733c4686d8b1c6a53fe0b4fb7bf563f63832a1569f459db22de358ac"
+    },
+    "src/mouse_core/models/backbone/packed_train.py": {
+      "before_sha256": "2428c381986f9c6275ccab0f7bd50c67d367e310eeae99b1148186f84532526b",
+      "after_sha256": "08f19d74c8d6cd3ad13f581bbf068ecfddbc82bf8c5b3b00dff43418b31ba668"
+    }
+  },
+  "timing": "Median synchronized wall milliseconds. Two warmup calls precede each operation. First-call times excluded from comparisons.",
+  "isolation": "Serial GPU processes; no concurrent training/test workload. Decode and training comparisons repeated in reverse order. Long decode has one pair only.",
+  "baseline_execution": "Current benchmark harnesses, loading the saved baseline runtime module for the selected path. All other components/configuration held fixed. Baseline files match the named Git commit byte-for-byte.",
+  "decode_arguments": [
+    "--layers",
+    "4",
+    "--step",
+    "1",
+    "--max-attention-distance-tokens",
+    "16383",
+    "--max-batch-tokens",
+    "1024"
+  ],
+  "decode_model": {
+    "architecture": "qwen3",
+    "hidden": 1024,
+    "heads": 16,
+    "kv_heads": 8,
+    "head_dim": 128,
+    "ffn": 3072,
+    "layers": 4,
+    "base": "bf16",
+    "lora_rank": 16,
+    "lora_dtype": "fp32"
+  },
+  "train_arguments": [
+    "--layers",
+    "4",
+    "--hidden",
+    "256",
+    "--heads",
+    "8",
+    "--kv-heads",
+    "4",
+    "--head-dim",
+    "32",
+    "--ffn",
+    "1024",
+    "--no-lora",
+    "--modes",
+    "compiled"
+  ],
+  "train_model": {
+    "architecture": "qwen3",
+    "hidden": 256,
+    "heads": 8,
+    "kv_heads": 4,
+    "head_dim": 32,
+    "ffn": 1024,
+    "layers": 4,
+    "dtype": "fp32",
+    "tf32": "high",
+    "lora": false
+  },
+  "changes": [
+    "Decode validates each public batch once, then enqueues its rows without repeating whole-model/version/capacity checks per row.",
+    "Decode uploads six scheduling-index lists in one tensor transfer and splits device views.",
+    "Packed training uses already-sorted sequence IDs directly; removes variable-size boundary extraction and repeat_interleave reconstruction."
+  ],
+  "production_lines": {
+    "added": 18,
+    "removed": 18
+  },
+  "interpretation": "Short/ragged decode latency decreased about 10-15%; prefill decreased about 5-10%. Long decode changed about 1.5%. Training forward metadata is cheaper, but complete optimizer-step gains are modest/noisy: short 0.5-7.2%, longer 2.0-2.2%. No end-to-end downstream or trained-policy speed claim.",
+  "limitations": [
+    "Synthetic backbones; no tokenizer/environment/data-loader time included.",
+    "Compilation/disk caches make first-call times unsuitable for before/after comparison.",
+    "Separate-process variability matters for small gains. No confidence interval or broad hardware generalization.",
+    "Memory allocation was essentially unchanged; long decode transient peak rounded to 835 vs 836 MiB."
+  ],
+  "validation": {
+    "tests": "tests/test_continuous_decode.py tests/test_attention_window.py tests/test_packed_train.py",
+    "result": "142 passed",
+    "seconds": 114.27,
+    "static_checks": "Pyright: 0 errors, 0 warnings on changed runtime files and packed training tests"
+  },
+  "runs": [
+    {
+      "kind": "decode",
+      "iterations": 30,
+      "execution_order": [
+        "before",
+        "after"
+      ],
+      "workloads": [
+        "short",
+        "high_variance"
+      ],
+      "summary_lines": {
+        "before": [
+          "short           session=1025 MB pool=65536 tokens B=4 S=  512 tokens=  2048 step=1 | prefill    15.21 ms [15.0,22.6] (+    56 MB) |   134,670 tok/s | decode     7.77 ms [7.7,7.9] (+    29 MB) |      515 tok/s | first prefill 13743 ms, first decode 9855 ms",
+          "high_variance   session=2049 MB pool=131072 tokens B=8 S= 4000 tokens= 10384 step=1 | prefill    94.83 ms [94.4,95.3] (+   142 MB) |   109,506 tok/s | decode    16.97 ms [16.9,17.2] (+   137 MB) |      472 tok/s | first prefill 7026 ms, first decode 18 ms"
+        ],
+        "after": [
+          "short           session=1025 MB pool=65536 tokens B=4 S=  512 tokens=  2048 step=1 | prefill    13.80 ms [13.7,14.2] (+    56 MB) |   148,456 tok/s | decode     6.57 ms [6.5,6.7] (+    29 MB) |      608 tok/s | first prefill 9934 ms, first decode 6698 ms",
+          "high_variance   session=2049 MB pool=131072 tokens B=8 S= 4000 tokens= 10384 step=1 | prefill    89.94 ms [89.7,90.8] (+   142 MB) |   115,458 tok/s | decode    15.22 ms [15.1,15.9] (+   137 MB) |      526 tok/s | first prefill 7399 ms, first decode 16 ms"
+        ]
+      },
+      "profiler_after_timed_samples": true
+    },
+    {
+      "kind": "decode",
+      "iterations": 40,
+      "execution_order": [
+        "after",
+        "before"
+      ],
+      "workloads": [
+        "short",
+        "high_variance"
+      ],
+      "summary_lines": {
+        "after": [
+          "short           session=1025 MB pool=65536 tokens B=4 S=  512 tokens=  2048 step=1 | prefill    14.10 ms [13.9,14.6] (+    56 MB) |   145,198 tok/s | decode     6.66 ms [6.6,7.0] (+    29 MB) |      601 tok/s | first prefill 4590 ms, first decode 3289 ms",
+          "high_variance   session=2049 MB pool=131072 tokens B=8 S= 4000 tokens= 10384 step=1 | prefill    83.63 ms [83.4,85.9] (+   142 MB) |   124,161 tok/s | decode    15.00 ms [14.8,15.2] (+   137 MB) |      533 tok/s | first prefill 2038 ms, first decode 15 ms"
+        ],
+        "before": [
+          "short           session=1025 MB pool=65536 tokens B=4 S=  512 tokens=  2048 step=1 | prefill    15.43 ms [15.2,15.6] (+    56 MB) |   132,764 tok/s | decode     7.48 ms [7.4,8.1] (+    29 MB) |      535 tok/s | first prefill 4236 ms, first decode 3177 ms",
+          "high_variance   session=2049 MB pool=131072 tokens B=8 S= 4000 tokens= 10384 step=1 | prefill    91.26 ms [90.6,94.7] (+   142 MB) |   113,779 tok/s | decode    16.79 ms [16.6,17.0] (+   137 MB) |      476 tok/s | first prefill 1968 ms, first decode 17 ms"
+        ]
+      },
+      "profiler_after_timed_samples": false
+    },
+    {
+      "kind": "decode",
+      "iterations": 12,
+      "execution_order": [
+        "before",
+        "after"
+      ],
+      "workloads": [
+        "long"
+      ],
+      "summary_lines": {
+        "before": [
+          "long            session=1025 MB pool=65536 tokens B=4 S=16384 tokens= 65536 step=1 | prefill   979.51 ms [979.1,989.4] (+   413 MB) |    66,907 tok/s | decode    79.82 ms [78.8,80.8] (+   835 MB) |       50 tok/s | first prefill 13010 ms, first decode 3815 ms"
+        ],
+        "after": [
+          "long            session=1025 MB pool=65536 tokens B=4 S=16384 tokens= 65536 step=1 | prefill   885.80 ms [885.2,886.1] (+   413 MB) |    73,985 tok/s | decode    78.63 ms [78.3,83.6] (+   836 MB) |       51 tok/s | first prefill 13087 ms, first decode 3666 ms"
+        ]
+      },
+      "profiler_after_timed_samples": false
+    },
+    {
+      "kind": "train",
+      "iterations": 40,
+      "execution_order": [
+        "before",
+        "after"
+      ],
+      "workloads": [
+        "short",
+        "mid_recurring"
+      ],
+      "summary_lines": {
+        "before": [
+          "short           L=   512 sequences=   4 | fwd     2.46 ms (+    14 MB) | fwd+bwd     5.74 ms [5.7,6.7] (+    51 MB) | step     6.10 ms (+    51 MB) |    89,149 tok/s | first fwd 7891 ms, first fwd+bwd 7461 ms |",
+          "mid_recurring   L=  4096 sequences=   3 | fwd     4.11 ms (+    53 MB) | fwd+bwd    12.02 ms [12.0,12.6] (+   355 MB) | step    12.20 ms (+   355 MB) |   340,896 tok/s | first fwd 6 ms, first fwd+bwd 15 ms |"
+        ],
+        "after": [
+          "short           L=   512 sequences=   4 | fwd     2.26 ms (+    14 MB) | fwd+bwd     5.42 ms [5.4,9.0] (+    51 MB) | step     5.66 ms (+    51 MB) |    94,535 tok/s | first fwd 5693 ms, first fwd+bwd 2323 ms |",
+          "mid_recurring   L=  4096 sequences=   3 | fwd     3.78 ms (+    53 MB) | fwd+bwd    11.78 ms [11.7,11.9] (+   355 MB) | step    11.96 ms (+   355 MB) |   347,846 tok/s | first fwd 5 ms, first fwd+bwd 14 ms |"
+        ]
+      },
+      "profiler_after_timed_samples": false
+    },
+    {
+      "kind": "train",
+      "iterations": 40,
+      "execution_order": [
+        "after",
+        "before"
+      ],
+      "workloads": [
+        "short",
+        "mid_recurring"
+      ],
+      "summary_lines": {
+        "after": [
+          "short           L=   512 sequences=   4 | fwd     2.43 ms (+    14 MB) | fwd+bwd     5.40 ms [5.3,5.8] (+    51 MB) | step     6.09 ms (+    51 MB) |    94,779 tok/s | first fwd 4579 ms, first fwd+bwd 2221 ms |",
+          "mid_recurring   L=  4096 sequences=   3 | fwd     3.88 ms (+    53 MB) | fwd+bwd    12.29 ms [12.1,12.6] (+   355 MB) | step    12.10 ms (+   355 MB) |   333,387 tok/s | first fwd 5 ms, first fwd+bwd 14 ms |"
+        ],
+        "before": [
+          "short           L=   512 sequences=   4 | fwd     2.57 ms (+    14 MB) | fwd+bwd     5.85 ms [5.6,12.0] (+    51 MB) | step     6.12 ms (+    51 MB) |    87,528 tok/s | first fwd 4273 ms, first fwd+bwd 2104 ms |",
+          "mid_recurring   L=  4096 sequences=   3 | fwd     4.09 ms (+    53 MB) | fwd+bwd    12.18 ms [12.1,15.9] (+   355 MB) | step    12.37 ms (+   355 MB) |   336,321 tok/s | first fwd 6 ms, first fwd+bwd 15 ms |"
+        ]
+      },
+      "profiler_after_timed_samples": false
+    }
+  ]
+}

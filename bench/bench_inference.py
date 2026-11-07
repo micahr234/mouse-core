@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from transformers.generation import ContinuousBatchingConfig
 
 from mouse_core.models.backbone import Backbone
 from mouse_core.models.lora import LoRAConfig
@@ -117,7 +118,8 @@ def main() -> None:
         help="new tokens every row adds on the decode step (any constant S)",
     )
     parser.add_argument("--iters", type=int, default=10)
-    parser.add_argument("--max-attention-distance-tokens", type=int, default=16383)
+    parser.add_argument("--cache-capacity-tokens", type=int,
+                        help="shared pool; defaults to page-rounded histories plus all timed appends")
     parser.add_argument("--max-batch-tokens", type=int, default=1024)
     parser.add_argument(
         "--workloads",
@@ -126,10 +128,14 @@ def main() -> None:
     )
     add_profile_args(parser)
     args = parser.parse_args()
-    if args.iters < 1 or args.max_attention_distance_tokens < 0:
-        parser.error("iters must be positive and attention distance nonnegative")
-    if args.step < 1 or args.max_batch_tokens < 1:
-        raise SystemExit("--step and --max-batch-tokens must be >= 1")
+    if args.iters < 1 or args.step < 1 or args.max_batch_tokens < 1:
+        parser.error("iters, step and max-batch-tokens must be positive")
+    page_size = ContinuousBatchingConfig().page_size
+    capacities = {name: sum(((n + (args.iters + 2) * args.step + page_size - 1) // page_size) * page_size
+                            for n in _workload(name)) for name in args.workloads}
+    if args.cache_capacity_tokens is not None:
+        if args.cache_capacity_tokens % page_size or args.cache_capacity_tokens < max(capacities.values()):
+            parser.error(f"cache capacity must be a multiple of {page_size} and at least {max(capacities.values())}")
 
     if not torch.cuda.is_available():
         raise SystemExit("this benchmark needs CUDA")
@@ -148,7 +154,6 @@ def main() -> None:
         head_dim=args.head_dim,
         intermediate_size=args.ffn,
         lora=lora,
-        max_attention_distance_tokens=args.max_attention_distance_tokens,
     )
     backbone.to(device)
     backbone.eval()
@@ -162,7 +167,7 @@ def main() -> None:
         f"{props.name} | torch {torch.__version__} | layers={args.layers} base dtype={dtype} "
         f"lora={'off' if lora is None else f'r{lora.rank}'} params={sum(p.numel() for p in backbone.parameters())/1e6:.1f}M "
         f"| FlexAttention TF32=high step={args.step} "
-        f"attention_distance={args.max_attention_distance_tokens} query_budget={args.max_batch_tokens} wall timing"
+        f"query_budget={args.max_batch_tokens} wall timing"
     )
 
     step_s = args.step
@@ -175,7 +180,8 @@ def main() -> None:
         step_embeds = torch.randn(B, step_s, args.hidden, device=device, dtype=dtype)
         step_lens = [step_s] * B
         before_session = torch.cuda.memory_allocated(device)
-        session = backbone.decode_session(batch_size=B, max_batch_tokens=args.max_batch_tokens)
+        session = backbone.decode_session(batch_size=B, max_batch_tokens=args.max_batch_tokens,
+                                          cache_capacity_tokens=args.cache_capacity_tokens or capacities[wname])
         session_mb = (torch.cuda.memory_allocated(device) - before_session) / 2**20
 
         def prefill() -> None:
@@ -188,7 +194,7 @@ def main() -> None:
         iters = args.iters
         first_p, med_p, lo_p, hi_p, peak_p = _timed(prefill, iters)
         # Restore the requested context before measuring incremental decoding.
-        # Logical positions advance across iterations; retained history is window-bounded.
+        # Positions advance across iterations; preflight reserves all measured appends.
         session.reset_rows()
         session.forward(embeds=prefill_embeds, lengths=prefill_lens)
         first_d, med_d, lo_d, hi_d, peak_d = _timed(decode_step, iters)
