@@ -17,7 +17,7 @@ from typing import Any, cast
 
 import torch
 
-from mouse_core.models.backbone import TrainKernel, Backbone, install_compiled_decoder, packed_forward
+from mouse_core.models.backbone import Backbone, install_compiled_decoder, packed_forward
 from mouse_core.models.lora import LoRAConfig
 from mouse_core.optim import AdamW
 
@@ -101,11 +101,9 @@ def main() -> None:
     device = torch.device("cuda")
     torch.manual_seed(0)
     lora = None if args.no_lora else LoRAConfig(rank=16, alpha=32.0)
-    kernels: list[TrainKernel] = ["flex"]
     dtype = torch.float32 if lora is None else torch.bfloat16
     backbone = Backbone(
-        train_kernel=kernels[0],
-        decode_kernel="flex",
+        architecture="qwen3",
         dtype=dtype,
         hidden_dim=args.hidden,
         num_layers=args.layers,
@@ -134,66 +132,64 @@ def main() -> None:
         if "compiled" in mode:
             install_compiled_decoder()
         backbone.gradient_checkpointing = "checkpoint" in mode
-        for kernel in kernels:
-            print(f"\n### mode: {mode} | train_kernel: {kernel}")
-            for wname in args.workloads:
-                seq = _workload(wname, device)
-                L = seq.shape[0]
-                embeds = torch.randn(L, args.hidden, device=device, dtype=dtype, requires_grad=True)
+        print(f"\n### mode: {mode} | FlexAttention")
+        for wname in args.workloads:
+            seq = _workload(wname, device)
+            L = seq.shape[0]
+            embeds = torch.randn(L, args.hidden, device=device, dtype=dtype, requires_grad=True)
 
-                def fwd(kernel: TrainKernel = kernel) -> torch.Tensor:
-                    with torch.no_grad():
-                        return packed_forward(
-                            model=backbone.model, embeds=embeds, sequence_ids=seq,
-                            train_kernel=kernel,
-                        )
-
-                def fwd_bwd(kernel: TrainKernel = kernel) -> None:
-                    out = packed_forward(
+            def fwd() -> torch.Tensor:
+                with torch.no_grad():
+                    return packed_forward(
                         model=backbone.model, embeds=embeds, sequence_ids=seq,
-                        checkpoint=backbone.gradient_checkpointing, train_kernel=kernel,
                     )
-                    out.float().square().mean().backward()
-                    embeds.grad = None
-                    for p in trainable:
-                        p.grad = None
 
-                def train_step(kernel: TrainKernel = kernel) -> None:
-                    out = packed_forward(
-                        model=backbone.model, embeds=embeds, sequence_ids=seq,
-                        checkpoint=backbone.gradient_checkpointing, train_kernel=kernel,
-                    )
-                    out.float().square().mean().backward()
-                    optimizer.step()
-                    optimizer.zero_grad(set_to_none=True)
-                    embeds.grad = None
-
-                iters = args.iters if L <= 4096 else max(3, args.iters // 2)
-                first_f, med_f, _, _, peak_f = _timed(fwd, iters)
-                first_b, med_b, lo_b, hi_b, peak_b = _timed(fwd_bwd, iters)
-                _, med_s, _, _, peak_s = _timed(train_step, iters)
-                print(
-                    f"  {wname:15s} L={L:6d} sequences={int(seq.unique().numel()):4d} | "
-                    f"fwd {med_f:8.2f} ms (+{peak_f:6.0f} MB) | fwd+bwd {med_b:8.2f} ms [{lo_b:.1f},{hi_b:.1f}] "
-                    f"(+{peak_b:6.0f} MB) | step {med_s:8.2f} ms (+{peak_s:6.0f} MB) | "
-                    f"{L / med_b * 1e3:>9,.0f} tok/s | first fwd {first_f:.0f} ms, first fwd+bwd {first_b:.0f} ms | "
+            def fwd_bwd() -> None:
+                out = packed_forward(
+                    model=backbone.model, embeds=embeds, sequence_ids=seq,
+                    checkpoint=backbone.gradient_checkpointing,
                 )
-                if wants_profile(args):
-                    tag = f"{mode} {kernel} {wname}"
-                    profile_call(
-                        fwd, label=f"{tag} fwd", steps=iters,
-                        cuda=True, trace_dir=args.profile_trace,
-                    )
-                    profile_call(
-                        fwd_bwd, label=f"{tag} fwd+bwd", steps=iters,
-                        cuda=True, trace_dir=args.profile_trace,
-                    )
-                    profile_call(
-                        train_step, label=f"{tag} step", steps=iters,
-                        cuda=True, trace_dir=args.profile_trace,
-                    )
-                del embeds
-                torch.cuda.empty_cache()
+                out.float().square().mean().backward()
+                embeds.grad = None
+                for p in trainable:
+                    p.grad = None
+
+            def train_step() -> None:
+                out = packed_forward(
+                    model=backbone.model, embeds=embeds, sequence_ids=seq,
+                    checkpoint=backbone.gradient_checkpointing,
+                )
+                out.float().square().mean().backward()
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                embeds.grad = None
+
+            iters = args.iters if L <= 4096 else max(3, args.iters // 2)
+            first_f, med_f, _, _, peak_f = _timed(fwd, iters)
+            first_b, med_b, lo_b, hi_b, peak_b = _timed(fwd_bwd, iters)
+            _, med_s, _, _, peak_s = _timed(train_step, iters)
+            print(
+                f"  {wname:15s} L={L:6d} sequences={int(seq.unique().numel()):4d} | "
+                f"fwd {med_f:8.2f} ms (+{peak_f:6.0f} MB) | fwd+bwd {med_b:8.2f} ms [{lo_b:.1f},{hi_b:.1f}] "
+                f"(+{peak_b:6.0f} MB) | step {med_s:8.2f} ms (+{peak_s:6.0f} MB) | "
+                f"{L / med_b * 1e3:>9,.0f} tok/s | first fwd {first_f:.0f} ms, first fwd+bwd {first_b:.0f} ms | "
+            )
+            if wants_profile(args):
+                tag = f"{mode} flex {wname}"
+                profile_call(
+                    fwd, label=f"{tag} fwd", steps=iters,
+                    cuda=True, trace_dir=args.profile_trace,
+                )
+                profile_call(
+                    fwd_bwd, label=f"{tag} fwd+bwd", steps=iters,
+                    cuda=True, trace_dir=args.profile_trace,
+                )
+                profile_call(
+                    train_step, label=f"{tag} step", steps=iters,
+                    cuda=True, trace_dir=args.profile_trace,
+                )
+            del embeds
+            torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":

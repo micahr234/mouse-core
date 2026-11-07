@@ -29,18 +29,15 @@ from typing import Any, Self, cast
 import torch
 import torch.nn as nn
 
-from mouse_core.models.backbone.flex_decode import (
-    DecodeKernel,
-    FlexDecodeSession,
-    check_decode_kernel,
+from mouse_core.models.backbone.flex_utils import (
     module_device_dtype,
 )
 from mouse_core.models.backbone.packed_train import (
-    TrainKernel,
     check_autocast_dtype,
-    check_train_kernel,
 )
 from mouse_core.models.lora import LoRAConfig, apply_lora
+from mouse_core.models.backbone.continuous_decode import ContinuousDecodeSession
+from mouse_core.models.backbone.attention_window import attention_window_size
 
 
 class BaseBackbone(nn.Module, ABC):
@@ -67,13 +64,10 @@ class BaseBackbone(nn.Module, ABC):
     step time. Set ``backbone.gradient_checkpointing = True`` before
     training; it is not saved with the model.
 
-    Attention kernels are required constructor arguments of every
-    transformer backbone, so the choices are always explicit:
+    Transformer backbones always use block-sparse FlexAttention for uncached
+    forwards and paged FlexAttention for cached decode. Training requires CUDA;
+    CPU supports inference only.
 
-    - ``train_kernel="flex"`` uses block-sparse FlexAttention for uncached
-      forwards. Training requires CUDA; CPU supports inference only.
-    - ``decode_kernel="flex"`` uses paged FlexAttention for cached decode.
-      No alternate attention backend or automatic substitution is supported.
     - ``train_autocast_dtype`` / ``decode_autocast_dtype`` (default
       ``None``) declare mixed precision per path for a fp32 backbone: the
       packed training forward / cached decode run their matmuls in
@@ -86,23 +80,15 @@ class BaseBackbone(nn.Module, ABC):
       ambient ``torch.autocast`` region — precision is declared here,
       never inferred.
 
-    Like ``gradient_checkpointing`` they are execution choices for the
-    current machine, not model properties: not saved with the model
-    (``load_model`` takes them as arguments) and reassignable at any time
-    (``backbone.train_kernel = "flex"``).
+    Like ``gradient_checkpointing``, autocast settings are execution choices
+    for the current machine. Configure them on the model before loading weights.
     """
 
     lora: LoRAConfig | None = None
     gradient_checkpointing: bool = False
     uses_packed: bool = False
-    train_kernel: TrainKernel
-    decode_kernel: DecodeKernel
     train_autocast_dtype: torch.dtype | None = None
     decode_autocast_dtype: torch.dtype | None = None
-
-    def _set_kernels(self, train_kernel: TrainKernel, decode_kernel: DecodeKernel) -> None:
-        self.train_kernel = check_train_kernel(train_kernel)
-        self.decode_kernel = check_decode_kernel(decode_kernel)
 
     def _set_autocast(
         self,
@@ -165,7 +151,7 @@ class BaseBackbone(nn.Module, ABC):
     def forward(
         self, embeds: torch.Tensor, *,
         sequence_ids: torch.Tensor | None = None,
-        cache: FlexDecodeSession | None = None,
+        cache: ContinuousDecodeSession | None = None,
         lengths: list[int] | None = None,
         output_hidden_states: bool = False,
         **kwargs: Any,
@@ -204,7 +190,7 @@ class BaseBackbone(nn.Module, ABC):
         return packed_forward(
             model=cast(nn.Module, self.model), embeds=embeds, sequence_ids=sequence_ids,
             output_hidden_states=output_hidden_states, checkpoint=self.gradient_checkpointing,
-            train_kernel=self.train_kernel, autocast_dtype=self.train_autocast_dtype,
+            autocast_dtype=self.train_autocast_dtype,
         )
 
     @abstractmethod
@@ -214,23 +200,31 @@ class BaseBackbone(nn.Module, ABC):
         """Implement a rectangular uncached forward over embedding tensors."""
         ...
 
-    def decode_session(self, batch_size: int) -> FlexDecodeSession:
-        """Create a cached-decode session over ``batch_size`` sequences.
+    def decode_session(
+        self, batch_size: int, *, max_batch_tokens: int = 1024,
+        cache_capacity_tokens: int | None = None,
+    ) -> ContinuousDecodeSession:
+        """HF continuous batching with a fixed circular KV pool and FlexAttention.
 
-        ``Model.forward`` calls this on the first ``use_cache=True`` call and
-        carries the session inside its ``DecodeCache``. The session runs
-        ``self.decode_kernel`` under ``self.decode_autocast_dtype`` (KV pool
-        in the compute dtype); its paged KV pool sizes itself as rows grow.
-        Requires the backbone to expose a ``transformers`` decoder stack as
-        ``self.model``.
+        By default reserve one full attention window per row (rounded to
+        16-token pages). An explicit shared capacity may be smaller for sparse
+        workloads; insufficient capacity raises instead of shortening history.
+        ``max_batch_tokens`` bounds queries per scheduled decoder forward.
+        Use ``forward`` for a batch or ``submit``/``step`` for independently
+        ready rows. Reset a row only at its outer-episode boundary.
         """
         model = getattr(self, "model", None)
         if model is None:
-            raise NotImplementedError(
-                f"{type(self).__name__} does not support cached decoding."
-            )
-        check_decode_kernel(self.decode_kernel)  # "flex" is the only kernel; paged FlexAttention.
-        return FlexDecodeSession(model, batch_size=batch_size, autocast_dtype=self.decode_autocast_dtype)
+            raise NotImplementedError(f"{type(self).__name__} does not support cached decoding.")
+        window_size = attention_window_size(model.config)
+        if window_size is None:
+            raise ValueError("Core requires a finite attention window.")
+        if cache_capacity_tokens is None:
+            cache_capacity_tokens = batch_size * ((window_size + 15) // 16) * 16
+        return ContinuousDecodeSession(
+            model, batch_size=batch_size, max_batch_tokens=max_batch_tokens,
+            cache_capacity_tokens=cache_capacity_tokens, autocast_dtype=self.decode_autocast_dtype,
+        )
 
 
 def _reject_dtype_cast(what: str, *args: Any, **kwargs: Any) -> None:

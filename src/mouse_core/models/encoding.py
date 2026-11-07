@@ -12,20 +12,19 @@ from dataclasses import dataclass
 import torch
 
 
-from mouse_core.models.backbone.flex_decode import FlexDecodeSession
+from mouse_core.models.backbone.continuous_decode import ContinuousDecodeSession
 
 
 @dataclass
 class DecodeCache:
     """KV state carried between ``use_cache=True`` calls.
 
-    Holds one session per backbone stage: :class:`~mouse_core.models.backbone.flex_decode.FlexDecodeSession`.
+    Holds one Hugging Face continuous decode session per backbone stage.
     Pass ``out["cache"]`` back as ``cache=``. Call :meth:`close` when the
-    rollout is finished so VMM pages unmap before the next train step
-    (``__del__`` is too late if a CUDA graph still holds views).
+    rollout is finished to release the HF pool before the next train step.
     """
 
-    sessions: tuple[FlexDecodeSession, ...]
+    sessions: tuple[ContinuousDecodeSession, ...]
 
     def reset_rows(self, rows: Sequence[int] | None = None) -> None:
         """Restart the given batch rows (all rows when ``None``).
@@ -37,7 +36,7 @@ class DecodeCache:
             session.reset_rows(rows)
 
     def close(self) -> None:
-        """Unmap every session's VMM pool and drop captured CUDA graphs."""
+        """Release every session's KV pool and execution resources."""
         for session in self.sessions:
             session.close()
 

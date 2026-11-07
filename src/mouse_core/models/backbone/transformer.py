@@ -15,12 +15,11 @@ from torch import nn
 
 from mouse_core.models.backbone.base import (
     BaseBackbone,
-    DecodeKernel,
-    TrainKernel,
     _load_transformer_weights,
     _rope_parameters_from_config,
 )
 from mouse_core.models.backbone.packed_train import _DecoderStack, packed_forward
+from mouse_core.models.backbone.attention_window import configure_attention_window
 from mouse_core.models.backbone.llama import _LlamaBackboneConfig, llama_config_kwargs
 from mouse_core.models.backbone.qwen3 import _Qwen3BackboneConfig, qwen3_config_kwargs
 from mouse_core.models.lora import LoRAConfig
@@ -73,7 +72,7 @@ def grouping_unsupported_reason(cfg: Any) -> str | None:
 
 
 def is_packed_compatible(model: nn.Module) -> bool:
-    """True when ``packed_forward`` / ``FlexDecodeSession`` can walk this stack."""
+    """True when ``packed_forward`` / ``ContinuousDecodeSession`` can walk this stack."""
     if grouping_unsupported_reason(getattr(model, "config", None)) is not None:
         return False
     if not all(hasattr(model, name) for name in ("layers", "rotary_emb", "norm")):
@@ -182,10 +181,8 @@ class _IdentityRotaryEmbedding(nn.Module):
 class Backbone(BaseBackbone):
     """Decoder stack using FlexAttention for packed, rectangular, and cached inputs.
 
-    ``train_kernel`` (``"flex"``),
-    ``decode_kernel`` (``"flex"``), and ``dtype`` are required:
-    the uncached-forward kernel, the cached-decode kernel, and the dtype of
-    the base weights (``torch.float32`` to fine-tune them,
+    ``dtype`` is required and specifies the dtype of the base weights
+    (``torch.float32`` to fine-tune them,
     ``preferred_dtype(device=device)`` for a frozen LoRA base or inference).
     The transformer's final normalization is removed. The backbone returns
     the final decoder layer's residual stream; projection and prediction
@@ -199,6 +196,12 @@ class Backbone(BaseBackbone):
     - ``architecture="qwen3"`` or ``"llama"`` builds that stack from
       ``hidden_dim``, ``num_layers``, ``num_heads``, … (tests, ablations).
     - ``architecture="hf"`` rebuilds a saved generic stack from ``hf_config``.
+
+    ``max_attention_distance_tokens=W`` allows attention to self and at most W
+    earlier tokens within the same outer episode, in every layer and execution
+    path. The default is 16383; ``0`` allows self only. Set W
+    above the longest tokenized episode for effective full-episode attention
+    with bounded circular KV storage at inference. RoPE positions do not wrap.
 
     CPU forwards require ``torch.no_grad()``; FlexAttention training requires CUDA.
 
@@ -219,8 +222,6 @@ class Backbone(BaseBackbone):
     def __init__(
         self,
         *,
-        train_kernel: TrainKernel,
-        decode_kernel: DecodeKernel,
         dtype: torch.dtype,
         train_autocast_dtype: torch.dtype | None = None,
         decode_autocast_dtype: torch.dtype | None = None,
@@ -231,10 +232,15 @@ class Backbone(BaseBackbone):
         hub_kwargs: dict[str, Any] | None = None,
         lora: LoRAConfig | None = None,
         rope_enabled: bool = True,
+        max_attention_distance_tokens: int = 16383,
         hf_config: dict[str, Any] | None = None,
         **config_kwargs: Any,
     ) -> None:
         super().__init__()
+        if (
+            type(max_attention_distance_tokens) is not int or max_attention_distance_tokens < 0
+        ):
+            raise ValueError("max_attention_distance_tokens must be a nonnegative integer.")
         if type(rope_enabled) is not bool:
             raise TypeError("rope_enabled must be a boolean.")
         if "use_norm" in config_kwargs:
@@ -242,7 +248,6 @@ class Backbone(BaseBackbone):
                 "Backbone no longer accepts use_norm; "
                 "the final output normalization is always removed."
             )
-        self._set_kernels(train_kernel, decode_kernel)
         if not isinstance(dtype, torch.dtype) or not dtype.is_floating_point:
             raise TypeError(f"dtype must be a floating point torch.dtype, got {dtype!r}.")
         self._set_autocast(train_autocast_dtype, decode_autocast_dtype, dtype)
@@ -314,17 +319,24 @@ class Backbone(BaseBackbone):
                 int(self.model.config.head_dim)
             )
         self._config_kwargs["rope_enabled"] = rope_enabled
+        configure_attention_window(self.model, max_attention_distance_tokens)
+        self._config_kwargs["max_attention_distance_tokens"] = max_attention_distance_tokens
 
     def enable_kernels(self) -> None:
         """Opt into HF kernels on this existing decoder, without replacing it.
 
         Call after moving the model to its execution device and before creating
-        decode sessions. Packed/cached attention remains Mouse's configured
-        implementation; kernels can replace supported norm/MLP operations.
+        decode sessions. Packed/cached attention remains FlexAttention; kernels
+        can replace supported norm/MLP operations.
         Requires the kernels project extra. HF selects the
         available device/training implementations; speedups need benchmarking.
         """
         cast(Any, self.model).set_use_kernels(True)
+
+    @property
+    def max_attention_distance_tokens(self) -> int:
+        """Maximum direct attention distance into the past, shared by all paths."""
+        return self._config_kwargs["max_attention_distance_tokens"]
 
     @property
     def rope_enabled(self) -> bool:
@@ -524,7 +536,7 @@ class Backbone(BaseBackbone):
         groups = torch.arange(batch, device=embeds.device)[:, None].expand(-1, length)
         out = packed_forward(
             model=self.model, embeds=embeds[valid], sequence_ids=groups[valid],
-            position_ids=positions[valid], train_kernel=self.train_kernel,
+            position_ids=positions[valid],
             autocast_dtype=self.train_autocast_dtype, checkpoint=self.gradient_checkpointing,
             output_hidden_states=output_hidden_states,
         )
@@ -555,7 +567,6 @@ def _qwen3_kwargs_from_pretrained(
         intermediate_size=hf_cfg.intermediate_size,
         rms_norm_eps=getattr(hf_cfg, "rms_norm_eps", 1e-6),
         attention_bias=getattr(hf_cfg, "attention_bias", False),
-        use_sliding_window=getattr(hf_cfg, "use_sliding_window", False),
     )
     rope_parameters = _rope_parameters_from_config(hf_cfg)
     if rope_parameters is not None:

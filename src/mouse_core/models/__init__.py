@@ -7,7 +7,6 @@ from mouse_core.models.embedding import Embedding, MultiEmbedding
 from mouse_core.models.autoregressive_reasoner import AutoregressiveReasoner, ReasoningReadout, ReasoningTrace
 from mouse_core.models.heads import DiscretizedActionHead, DiscretizedLinear
 from mouse_core.models.io import load_model, push_model_to_hub, save_model
-from mouse_core.models.kv_policy import cache_needs_rebuild, rebuild_starts, resolve_cache_bounds
 from mouse_core.models.lora import LoRAConfig
 from mouse_core.models.mlp import MLP
 from mouse_core.models.vocabulary_head import VocabularyHead
@@ -34,9 +33,6 @@ __all__ = [
     "DiscretizedActionHead", "DiscretizedLinear",
     "preferred_dtype",
     "sample_reasoning_splits",
-    "cache_needs_rebuild",
-    "rebuild_starts",
-    "resolve_cache_bounds",
     "save_model",
     "load_model",
     "push_model_to_hub",

@@ -38,14 +38,14 @@ def load_model[T: nn.Module](
 ) -> T:
     """Load weights into the required caller-constructed model and return it.
 
-    Configure architecture, kernels, precision, and device in your implementation
+    Configure architecture, precision, and device in your implementation
     before loading. Loading preserves that instance's class and trainability.
     No default model or architecture reconstruction is provided. Extra keyword
     arguments (for example ``revision`` or ``token``) go to Hub downloads.
     """
     obsolete = set(kwargs) & {"train_kernel", "decode_kernel", "dtype", "train_autocast_dtype", "decode_autocast_dtype"}
     if obsolete:
-        raise TypeError(f"configure {sorted(obsolete)} on the supplied model before loading.")
+        raise TypeError(f"load_model does not accept execution arguments: {sorted(obsolete)}.")
     local = Path(repo_id_or_path)
     if local.exists():
         config_path, weights_path = local / "config.json", local / "pytorch_model.bin"

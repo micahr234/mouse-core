@@ -20,7 +20,7 @@ from tests._token_batch_helpers import batch_to_token_batch, token_tokenizer
 
 
 def _model(*, architecture: Literal['llama', 'qwen3'] | None=None, reasoning: bool=False) -> Model:
-    backbone = IdentityBackbone(hidden_dim=8) if architecture is None else Backbone(architecture=architecture, hidden_dim=8, num_layers=1, num_heads=2, train_kernel="flex", decode_kernel='flex', dtype=torch.float32)
+    backbone = IdentityBackbone(hidden_dim=8) if architecture is None else Backbone(architecture=architecture, hidden_dim=8, num_layers=1, num_heads=2, dtype=torch.float32)
     return simple_model(backbone=backbone, projection=MLP(in_features=8, out_features=8, hidden_dim=12, num_layers=2), heads={'q': MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0), 'policy': MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0)}, reasoner=LatentReasoner(hidden_dim=8, num_thoughts=2) if reasoning else None)
 
 

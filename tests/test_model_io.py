@@ -104,19 +104,18 @@ def test_composed_model_roundtrip(tmp_path) -> None:
 
 def test_loading_requires_a_model_and_preserves_its_runtime(tmp_path) -> None:
     source = simple_model(
-        backbone=Backbone(architecture='qwen3', train_kernel="flex", decode_kernel='flex', dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2),
+        backbone=Backbone(architecture='qwen3', dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2),
         heads={'action_value': MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.)},
          reasoner=None,
     )
     save_model(model=source, path=tmp_path)
     target = simple_model(
-        backbone=Backbone(architecture='qwen3', train_kernel='flex', decode_kernel='flex', dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2),
+        backbone=Backbone(architecture='qwen3', dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2),
         heads={'action_value': MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.)},
          reasoner=None,
     )
     loaded = load_model(model=target, repo_id_or_path=tmp_path)
     assert loaded is target
-    assert loaded.backbone.train_kernel == "flex"
     assert next(loaded.parameters()).requires_grad
     with pytest.raises(TypeError, match="model"):
         load_model(repo_id_or_path=tmp_path)  # type: ignore[call-arg]
@@ -125,7 +124,7 @@ def test_loading_requires_a_model_and_preserves_its_runtime(tmp_path) -> None:
 def test_num_frequencies_roundtrip(tmp_path) -> None:
     embedding = Embedding(hidden_dim=8, vocab_size=32, numeric_field_names=("sensor.value",), num_frequencies=3)
     hidden_dim = 8
-    backbone = Backbone(architecture='qwen3', train_kernel="flex", decode_kernel='flex', dtype=torch.float32, hidden_dim=hidden_dim, num_layers=1, num_heads=2)
+    backbone = Backbone(architecture='qwen3', dtype=torch.float32, hidden_dim=hidden_dim, num_layers=1, num_heads=2)
     assert embedding.features.numeric[0] is not None
     with torch.no_grad():
         embedding.features.numeric[0].proj.weight.fill_(0.25)
@@ -143,7 +142,7 @@ def test_num_frequencies_roundtrip(tmp_path) -> None:
 
 def test_fourier_stays_trainable_when_lora_freezes_the_stack() -> None:
     embedding = Embedding(hidden_dim=8, vocab_size=32, numeric_field_names=("sensor.value",), num_frequencies=2)
-    backbone = Backbone(architecture='qwen3', train_kernel="flex", decode_kernel='flex', dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2, lora=LoRAConfig(rank=2))
+    backbone = Backbone(architecture='qwen3', dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2, lora=LoRAConfig(rank=2))
     assert embedding.features.numeric[0] is not None
     assert embedding.features.numeric[0].proj.weight.requires_grad
     assert any(not param.requires_grad for param in backbone.model.parameters())
@@ -167,7 +166,7 @@ def test_identity_num_frequencies_roundtrip(tmp_path) -> None:
 
 
 def test_explicit_model_checkpoints_roundtrip_without_backbone_output_norm(tmp_path) -> None:
-    backbone = Backbone(architecture='qwen3', train_kernel="flex", decode_kernel='flex', dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2)
+    backbone = Backbone(architecture='qwen3', dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2)
     head = MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0)
     model = simple_model(backbone=backbone, heads={'action_value': head}, reasoner=None)
     with torch.no_grad():
@@ -202,15 +201,11 @@ def test_mlp_defaults_to_full_input_gradients() -> None:
     assert h.grad is not None and h.grad.abs().sum() > 0
 
 
-def test_transformer_backbone_requires_kernels_and_dtype() -> None:
-    with pytest.raises(TypeError, match="train_kernel.*decode_kernel.*dtype"):
-        Backbone(architecture="qwen3", hidden_dim=8, num_layers=1, num_heads=2)  # type: ignore[call-arg]
-    with pytest.raises(ValueError, match="train_kernel"):
-        Backbone(architecture="qwen3", train_kernel=cast(Any, "sdpa"), decode_kernel="flex", dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2)
-    with pytest.raises(ValueError, match="decode_kernel"):
-        Backbone(architecture="qwen3", train_kernel="flex", decode_kernel=cast(Any, "sdpa"), dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2)
+def test_transformer_backbone_requires_floating_dtype() -> None:
     with pytest.raises(TypeError, match="dtype"):
-        Backbone(architecture="qwen3", train_kernel="flex", decode_kernel="flex", dtype=torch.int8, hidden_dim=8, num_layers=1, num_heads=2)
+        Backbone(architecture="qwen3", hidden_dim=8, num_layers=1, num_heads=2)  # type: ignore[call-arg]
+    with pytest.raises(TypeError, match="dtype"):
+        Backbone(architecture="qwen3", dtype=torch.int8, hidden_dim=8, num_layers=1, num_heads=2)
 
 
 def test_identity_embed_tokens_roundtrip(tmp_path) -> None:
@@ -245,7 +240,7 @@ def test_model_card_requires_the_application_implementation(tmp_path) -> None:
 
 def _lora_model(dtype: torch.dtype) -> Model:
     hidden_dim = 8
-    backbone = Backbone(architecture='qwen3', train_kernel="flex", decode_kernel='flex', dtype=dtype, hidden_dim=hidden_dim, num_layers=1, num_heads=2, lora=LoRAConfig(rank=2))
+    backbone = Backbone(architecture='qwen3', dtype=dtype, hidden_dim=hidden_dim, num_layers=1, num_heads=2, lora=LoRAConfig(rank=2))
     heads = MLP(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, propagate_gradient=1.0)
     return simple_model(backbone=backbone, heads={'action_value': heads}, reasoner=None).eval()
 

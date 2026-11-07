@@ -41,7 +41,7 @@ def _backbone(
     architecture: Literal["llama", "qwen3"] = "qwen3",
     dtype: torch.dtype = torch.float32,
 ):
-    return Backbone(architecture=architecture, train_kernel="flex", decode_kernel='flex', dtype=dtype, hidden_dim=_HIDDEN, num_layers=2, num_heads=2, max_position_embeddings=64, lora=lora)
+    return Backbone(architecture=architecture, dtype=dtype, hidden_dim=_HIDDEN, num_layers=2, num_heads=2, max_position_embeddings=64, lora=lora)
 
 
 def _model(lora: LoRAConfig | None=LoRAConfig(rank=4, alpha=8.0), *, reasoner: bool=False, dtype: torch.dtype=torch.float32) -> Model:
@@ -235,7 +235,7 @@ def test_only_lora_params_receive_gradients() -> None:
 
 def test_module_device_dtype_skips_lora_adapters() -> None:
     """Flex train/decode must not take dtype from an fp32 adapter that happens to be first."""
-    from mouse_core.models.backbone.flex_decode import module_device_dtype
+    from mouse_core.models.backbone.flex_utils import module_device_dtype
 
     class _Adapter(nn.Module):
         def __init__(self) -> None:

@@ -18,7 +18,7 @@ def test_llama_backbone_loads_pretrained_checkpoint(tmp_path) -> None:
     source = _save_tiny_llama(tmp_path)
     with warnings.catch_warnings():
         warnings.simplefilter('error')
-        backbone = Backbone(train_kernel="flex", decode_kernel="flex", dtype=torch.float32, pretrained=tmp_path, num_layers=1)
+        backbone = Backbone(dtype=torch.float32, pretrained=tmp_path, num_layers=1)
     assert backbone.hidden_dim == 8
     assert len(backbone.model.layers) == 1
     loaded_layer = cast(Any, backbone.model.layers[0])
@@ -32,7 +32,7 @@ def test_backbones_remove_output_norm_and_preserve_decoder_weights(tmp_path) -> 
     source.save_pretrained(tmp_path)
     with warnings.catch_warnings():
         warnings.simplefilter('error')
-        backbone = Backbone(train_kernel="flex", decode_kernel="flex", dtype=torch.float32, pretrained=tmp_path).eval()
+        backbone = Backbone(dtype=torch.float32, pretrained=tmp_path).eval()
     assert isinstance(backbone.model.norm, torch.nn.Identity)
     assert 'model.norm.weight' not in backbone.state_dict()
     cast(Any, source).norm = torch.nn.Identity()
@@ -40,7 +40,7 @@ def test_backbones_remove_output_norm_and_preserve_decoder_weights(tmp_path) -> 
     embeds = torch.randn(1, 5, 8) * 50.
     with torch.no_grad():
         torch.testing.assert_close(backbone(embeds), source(inputs_embeds=embeds).last_hidden_state)
-    qwen = Backbone(architecture="qwen3", train_kernel="flex", decode_kernel="flex", dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2)
+    qwen = Backbone(architecture="qwen3", dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2)
     assert isinstance(qwen.model.norm, torch.nn.Identity)
 
 
@@ -50,7 +50,7 @@ def test_transformer_backbone_rejects_norm_switch(use_norm: bool) -> None:
     with pytest.raises(TypeError, match="no longer accepts use_norm"):
         Backbone(
             architecture="qwen3",
-            train_kernel="flex", decode_kernel="flex", dtype=torch.float32,
+            dtype=torch.float32,
             hidden_dim=8, num_layers=1, num_heads=2, use_norm=use_norm,
         )
 
@@ -58,7 +58,7 @@ def test_transformer_backbone_rejects_norm_switch(use_norm: bool) -> None:
 def test_llama_backbone_warns_on_unloaded_tensors(tmp_path) -> None:
     _save_tiny_llama(tmp_path)
     with pytest.warns(UserWarning, match='did not receive pretrained weights') as records:
-        Backbone(train_kernel="flex", decode_kernel="flex", dtype=torch.float32, pretrained=tmp_path, intermediate_size=32)
+        Backbone(dtype=torch.float32, pretrained=tmp_path, intermediate_size=32)
     message = str(records[0].message)
     assert 'layers.0.mlp.gate_proj.weight' in message
     assert 'layers.1.mlp.down_proj.weight' in message
@@ -69,7 +69,7 @@ def test_llama_backbone_warns_on_unconsumed_pretrained_tensors(tmp_path) -> None
     config = LlamaConfig(vocab_size=16, hidden_size=8, intermediate_size=16, num_hidden_layers=1, num_attention_heads=2, num_key_value_heads=2, max_position_embeddings=32, attention_bias=True)
     LlamaModel(config).save_pretrained(tmp_path)
     with pytest.warns(UserWarning, match='no matching backbone tensor') as records:
-        Backbone(train_kernel="flex", decode_kernel="flex", dtype=torch.float32, pretrained=tmp_path, attention_bias=False)
+        Backbone(dtype=torch.float32, pretrained=tmp_path, attention_bias=False)
     messages = ' '.join(str(r.message) for r in records)
     assert 'layers.0.self_attn.q_proj.bias' in messages
 
@@ -78,7 +78,7 @@ def test_num_layers_truncation_does_not_warn_about_dropped_layers(tmp_path) -> N
     _save_tiny_llama(tmp_path)
     with warnings.catch_warnings():
         warnings.simplefilter('error')
-        Backbone(train_kernel="flex", decode_kernel="flex", dtype=torch.float32, pretrained=tmp_path, num_layers=1)
+        Backbone(dtype=torch.float32, pretrained=tmp_path, num_layers=1)
 
 
 def test_qwen2_checkpoint_uses_packed_kernels(tmp_path) -> None:
@@ -87,7 +87,7 @@ def test_qwen2_checkpoint_uses_packed_kernels(tmp_path) -> None:
     config = Qwen2Config(vocab_size=16, hidden_size=8, intermediate_size=16, num_hidden_layers=1, num_attention_heads=2, num_key_value_heads=2, max_position_embeddings=32)
     Qwen2Model(config).save_pretrained(tmp_path)
     backbone = Backbone(
-        train_kernel="flex", decode_kernel="flex", dtype=torch.float32, pretrained=tmp_path)
+        dtype=torch.float32, pretrained=tmp_path)
     assert backbone.architecture == "hf"
     assert backbone.uses_packed is True
     assert backbone.hidden_dim == 8
@@ -109,7 +109,7 @@ def test_hybrid_linear_attention_is_rejected(tmp_path) -> None:
     )
     with pytest.raises(ValueError, match="hybrid linear/full-attention"):
         Backbone(
-            train_kernel="flex", decode_kernel="flex", dtype=torch.float32, pretrained=tmp_path,
+            dtype=torch.float32, pretrained=tmp_path,
         )
 
 
@@ -118,19 +118,19 @@ def test_non_flex_compatible_decoder_is_rejected(tmp_path) -> None:
     config = GPT2Config(vocab_size=16, n_embd=8, n_layer=1, n_head=2, n_inner=16, n_positions=32)
     GPT2Model(config).save_pretrained(tmp_path)
     with pytest.raises(ValueError, match="packed-compatible rotary decoder"):
-        Backbone(train_kernel="flex", decode_kernel="flex", dtype=torch.float32, pretrained=tmp_path)
+        Backbone(dtype=torch.float32, pretrained=tmp_path)
 
 
 def test_architecture_is_required_without_pretrained() -> None:
     with pytest.raises(TypeError, match="pretrained= or architecture="):
         Backbone(
-            train_kernel="flex", decode_kernel="flex", dtype=torch.float32,
+            dtype=torch.float32,
             hidden_dim=8, num_layers=1, num_heads=2,
         )
 
 
 def test_qwen3_backbone_direct_constructor_exposes_hidden_dim() -> None:
-    backbone = Backbone(architecture="qwen3", train_kernel="flex", decode_kernel="flex", dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2)
+    backbone = Backbone(architecture="qwen3", dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2)
     assert backbone.hidden_dim == 8
     assert backbone.uses_packed is True
     assert backbone.architecture == "qwen3"
@@ -142,7 +142,7 @@ def test_generic_hf_backbone_roundtrip(tmp_path) -> None:
     from mouse_core.models.mlp import MLP
     config = Qwen2Config(vocab_size=16, hidden_size=8, num_hidden_layers=1, num_attention_heads=2, num_key_value_heads=2, intermediate_size=16, max_position_embeddings=32)
     Qwen2Model(config).save_pretrained(tmp_path / 'qwen2')
-    backbone = Backbone(train_kernel="flex", decode_kernel='flex', dtype=torch.float32, pretrained=tmp_path / 'qwen2')
+    backbone = Backbone(dtype=torch.float32, pretrained=tmp_path / 'qwen2')
     model = simple_model(backbone=backbone, heads=({'action_value': (head := MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0))}), reasoner=None)
     save_model(model=model, path=tmp_path / 'ckpt')
     loaded = load_model(model=fresh_model(model), repo_id_or_path=tmp_path / 'ckpt')
@@ -166,7 +166,7 @@ def test_qwen3_backbone_copies_pretrained_rope_parameters(tmp_path) -> None:
         rope_parameters={"rope_theta": 123456.0, "rope_type": "default"},
     )
     Qwen3Model(config).save_pretrained(tmp_path)
-    backbone = Backbone(train_kernel="flex", decode_kernel="flex", dtype=torch.float32, pretrained=tmp_path)
+    backbone = Backbone(dtype=torch.float32, pretrained=tmp_path)
     rope = backbone.model.config.rope_parameters
     assert rope is not None
     assert rope["rope_theta"] == 123456.0

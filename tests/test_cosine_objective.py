@@ -210,21 +210,21 @@ def test_offline_dqn_cosine_example(monkeypatch):
         construction.append(("embedding", pretrained))
         return Embedding(hidden_dim=8, vocab_size=32)
 
-    def make_backbone(*, pretrained, train_kernel, decode_kernel, dtype):
-        construction.append(("backbone", pretrained, train_kernel, decode_kernel, dtype))
+    def make_backbone(*, pretrained, dtype):
+        construction.append(("backbone", pretrained, dtype))
         return Backbone(architecture="qwen3", hidden_dim=8, num_layers=1,
-                        num_heads=2, train_kernel=train_kernel, decode_kernel=decode_kernel,
+                        num_heads=2,
                         dtype=dtype)
 
     monkeypatch.setitem(namespace, "Embedding", make_embedding)
     monkeypatch.setitem(namespace, "Backbone", make_backbone)
     encoder = namespace["Encoder"](
-        pretrained="local-test", tokenizer_sources={"text": "local-test"}, train_kernel="flex", decode_kernel="flex",
+        pretrained="local-test", tokenizer_sources={"text": "local-test"},
         dtype=torch.float32,
     )
     assert construction == [
         ("embedding", "local-test"),
-        ("backbone", "local-test", "flex", "flex", torch.float32),
+        ("backbone", "local-test", torch.float32),
     ]
     q_head = namespace["QHead"](hidden_dim=8, num_actions=3, num_layers=1, scale=0.1)
     assert q_head.mlp.in_features == q_head.mlp.hidden_dim == 8

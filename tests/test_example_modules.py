@@ -75,7 +75,8 @@ def _example(path, **overrides):
     def backbone_factory(**kwargs):
         construction.append(("backbone", kwargs))
         return Backbone(architecture="qwen3", hidden_dim=8, num_layers=1, num_heads=2,
-                        train_kernel="flex", decode_kernel="flex", dtype=torch.float32)
+                        dtype=torch.float32,
+                        max_attention_distance_tokens=kwargs.get("max_attention_distance_tokens", 16383))
 
     namespace.update(Embedding=embedding_factory, Backbone=backbone_factory)
     source = next("".join(cell["source"]) for cell in notebook["cells"]
@@ -288,8 +289,8 @@ def test_embedding_requires_prepared_inputs_on_the_model_device():
 def test_embedding_and_backbone_are_independently_constructed():
     embedding = Embedding(hidden_dim=8, vocab_size=32, num_frequencies=2, numeric_field_names=("sensor.value",))
     backbone = Backbone(architecture="qwen3", hidden_dim=8, num_layers=1,
-                        num_heads=2, train_kernel="flex",
-                        decode_kernel="flex", dtype=torch.float32)
+                        num_heads=2,
+                        dtype=torch.float32)
     assert not hasattr(backbone, "embedding")
     assert getattr(backbone.model, "embed_tokens") is None
     assert len(embedding.features.numeric) == 1
@@ -298,7 +299,7 @@ def test_embedding_and_backbone_are_independently_constructed():
 
 @torch.no_grad()
 def test_backbone_requires_explicit_packed_metadata():
-    backbone = Backbone(architecture='qwen3', hidden_dim=8, num_layers=1, num_heads=2, train_kernel="flex", decode_kernel='flex', dtype=torch.float32)
+    backbone = Backbone(architecture='qwen3', hidden_dim=8, num_layers=1, num_heads=2, dtype=torch.float32)
     embed = torch.randn(5, 8)
     with pytest.raises(ValueError, match="require sequence_ids"):
         backbone(embed)
@@ -556,3 +557,100 @@ def test_pendulum_notebook_logs_only_position_and_keeps_independent_episodes(mon
         if 'env' in namespace:
             namespace['env'].close()
         torch.set_num_threads(threads)
+
+
+@torch.no_grad()
+def test_inference_notebook_uses_hf_cache_with_existing_q_head():
+    _, ns = _example(
+        EXAMPLES / "15_inference.ipynb",
+        DECODE_MAX_BATCH_TOKENS=1,
+        DECODE_CACHE_CAPACITY_TOKENS=64,
+    )
+    ns["modules"].eval()
+    encoder, q_head = ns["encoder"], ns["q_head"]
+    tokens = _tokens(0, 1)
+    expected = q_head(encoder(tokens)["z"])
+    cached = encoder(tokens, use_cache=True)
+    cache = cached["cache"]
+    try:
+        from mouse_core.models.backbone import ContinuousDecodeSession
+        assert isinstance(cache.sessions[0], ContinuousDecodeSession)
+        torch.testing.assert_close(q_head(cached["z"])[0], expected)
+        cache.reset_rows()
+        repeated = encoder(tokens, use_cache=True, cache=cache)
+        torch.testing.assert_close(q_head(repeated["z"])[0], expected)
+    finally:
+        cache.close()
+
+
+@torch.no_grad()
+def test_inference_notebook_keeps_outer_prefix_and_resets_rows(monkeypatch):
+    import gymnasium as gym
+    from tests._token_batch_helpers import IntIdTokenizer
+    from mouse_core.models.backbone import ContinuousDecodeSession
+    notebook, ns = _example(
+        EXAMPLES / "15_inference.ipynb", NUM_ENVS=1,
+        DECODE_MAX_BATCH_TOKENS=2, DECODE_CACHE_CAPACITY_TOKENS=128,
+    )
+    ns["modules"].eval()
+
+    class Env:
+        names = ["test"]
+        action_space = SimpleNamespace(spaces=[gym.spaces.Discrete(3)])
+
+        def __init__(self):
+            self.envs = [self]
+            self.index = -1
+
+        def step(self, actions):
+            self.index += 1
+            t = self.index % 6
+            # Two inner episodes per outer episode, then the next outer reset.
+            return [({"observation": t + 2, "episode_terminated": t in (2, 5),
+                      "episode_truncated": False}, 0.0, t == 5, False, {})]
+
+        def render(self):
+            return None
+
+    tokenizer = Tokenizer(
+        tokenizers={"text": IntIdTokenizer()},
+        input_fields=[
+            dict(type="text", provider="coordinator", input_field="_episode_start", format="15"),
+            dict(type="text", provider="environment", input_field="observation", format="{field}"),
+            dict(type="token", provider="environment", input_field="action_requested", format="1", head_output=True),
+        ],
+    )
+    env = Env()
+    ns.update(eval_env=env, logs=[EventLog(name="test")], trackers=[RepeatTaskTracker()],
+              eval_contexts=[[]], tokenizer=tokenizer, gym=gym)
+    _notebook_functions(notebook, {"run_eval"}, ns)
+    original_forward = ContinuousDecodeSession.forward
+    snapshots = []
+    histories = [[]]
+    original_reset = ContinuousDecodeSession.reset_rows
+
+    def reset(session, rows=None):
+        for row in range(session.B) if rows is None else rows:
+            histories[row] = []
+        return original_reset(session, rows)
+
+    def forward(session, *, embeds, lengths, output_hidden_states=False):
+        result = original_forward(session, embeds=embeds, lengths=lengths,
+                                  output_hidden_states=output_hidden_states)
+        for row, count in enumerate(lengths):
+            if count:
+                histories[row].append(embeds[row, -count:])
+                full = torch.cat(histories[row])
+                expected = ns["encoder"].backbone(full, sequence_ids=torch.zeros(len(full), dtype=torch.long))
+                torch.testing.assert_close(result[row, -count:], expected[-count:])
+        snapshots.append(session.lengths)
+        return result
+
+    monkeypatch.setattr(ContinuousDecodeSession, "reset_rows", reset)
+    monkeypatch.setattr(ContinuousDecodeSession, "forward", forward)
+    ns["run_eval"](num_steps=9, temperature=0.0)
+    # The inner reset retains the prefix/history; only the next outer episode shrinks KV.
+    sizes = [item[0] for item in snapshots]
+    assert sum(b < a for a, b in zip(sizes, sizes[1:])) == 1
+    assert len(ns["eval_contexts"][0]) == 3
+    assert len(ns["trackers"][0].tasks) == 1

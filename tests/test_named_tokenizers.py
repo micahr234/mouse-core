@@ -252,7 +252,7 @@ def test_named_embeddings_match_cached_and_packed_backbone_readouts():
     tok = _tokenizer()
     embedding = _embedding().eval()
     backbone = Backbone(architecture='qwen3', hidden_dim=8, num_layers=1, num_heads=2,
-                        train_kernel="flex", decode_kernel='flex', dtype=torch.float32).eval()
+                        dtype=torch.float32).eval()
     inputs, inputs_objective_data = tok.pack_rows(rows=[_events()])
     with torch.no_grad():
         features = backbone(_embed(embedding, inputs), sequence_ids=inputs['sequence_ids'])

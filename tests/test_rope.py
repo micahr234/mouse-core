@@ -7,7 +7,6 @@ import torch
 from transformers import GPT2Config
 
 from mouse_core.models import Backbone, LoRAConfig
-from mouse_core.models.backbone import TrainKernel
 
 
 @pytest.fixture(autouse=True)
@@ -19,25 +18,24 @@ def limited_threads():
 
 
 def backbone(architecture: Literal["llama", "qwen3"], *, rope_enabled: bool,
-             train_kernel: TrainKernel = "flex", lora: bool = False) -> Backbone:
+             lora: bool = False) -> Backbone:
     return Backbone(
         architecture=architecture, hidden_dim=16, num_layers=2, num_heads=2,
         num_key_value_heads=1, intermediate_size=32,
-        train_kernel=train_kernel, decode_kernel="flex", dtype=torch.float32,
+        dtype=torch.float32,
         rope_enabled=rope_enabled,
         lora=LoRAConfig(rank=2, alpha=2.0, dropout=0.0) if lora else None,
     )
 
 
 @pytest.mark.parametrize("architecture", ["llama", "qwen3"])
-@pytest.mark.parametrize("train_kernel", ["flex"])
 @pytest.mark.parametrize("checkpoint", [False, True])
 @pytest.mark.flex_training
 def test_disabled_rope_matches_zero_position_reference_and_gradients(
-    architecture, train_kernel, checkpoint,
+    architecture, checkpoint,
 ):
     torch.manual_seed(16)
-    disabled = backbone(architecture, rope_enabled=False, train_kernel=train_kernel).eval()
+    disabled = backbone(architecture, rope_enabled=False).eval()
     disabled.gradient_checkpointing = checkpoint
     reference = backbone(architecture, rope_enabled=True).eval()
     reference.load_state_dict(disabled.state_dict())
@@ -58,17 +56,6 @@ def test_disabled_rope_matches_zero_position_reference_and_gradients(
     torch.testing.assert_close(x.grad, reference_x.grad, atol=2e-6, rtol=2e-5)
     for (_, parameter), (_, ref_parameter) in zip(disabled.named_parameters(), reference.named_parameters()):
         torch.testing.assert_close(parameter.grad, ref_parameter.grad, atol=2e-5, rtol=2e-4)
-
-
-@pytest.mark.parametrize("architecture", ["llama", "qwen3"])
-def test_disabled_rope_flex_forward_matches_reference(architecture):
-    model = backbone(architecture, rope_enabled=False).eval()
-    x = torch.randn(6, 16)
-    ids = torch.tensor([0, 1, 0, 1, 0, 1])
-    with torch.no_grad():
-        expected = model(x, sequence_ids=ids)
-        model.train_kernel = "flex"
-        torch.testing.assert_close(model(x, sequence_ids=ids), expected, atol=2e-6, rtol=2e-5)
 
 
 @pytest.mark.parametrize("architecture", ["llama", "qwen3"])
@@ -124,4 +111,4 @@ def test_disabling_rope_rejects_non_rotary_decoder():
     config = GPT2Config(n_embd=8, n_layer=1, n_head=2, n_inner=16, vocab_size=16)
     with pytest.raises(ValueError, match="packed-compatible rotary decoder"):
         Backbone(architecture="hf", hf_config=config.to_dict(), rope_enabled=False,
-                 train_kernel="flex", decode_kernel="flex", dtype=torch.float32)
+                 dtype=torch.float32)

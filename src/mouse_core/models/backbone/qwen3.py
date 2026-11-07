@@ -27,7 +27,6 @@ class _Qwen3BackboneConfig:
     rope_parameters: dict | None = None
     rms_norm_eps: float = 1e-6
     attention_bias: bool = False
-    use_sliding_window: bool = False
 
     def __post_init__(self) -> None:
         if self.num_layers < 1:
@@ -60,7 +59,6 @@ class _Qwen3BackboneConfig:
             attention_bias=self.attention_bias,
             rms_norm_eps=self.rms_norm_eps,
             num_hidden_layers=self.num_layers,
-            use_sliding_window=self.use_sliding_window,
         )
         if self.rope_parameters is not None:
             config_kwargs["rope_parameters"] = self.rope_parameters
@@ -79,7 +77,6 @@ def qwen3_config_kwargs(model: Any) -> dict[str, Any]:
         intermediate_size=cfg.intermediate_size,
         rms_norm_eps=getattr(cfg, "rms_norm_eps", 1e-6),
         attention_bias=getattr(cfg, "attention_bias", False),
-        use_sliding_window=getattr(cfg, "use_sliding_window", False),
     )
     rope_parameters = getattr(cfg, "rope_parameters", None)
     if rope_parameters is not None:

@@ -17,7 +17,7 @@ from tests._token_batch_helpers import batch_to_token_batch, token_tokenizer
 
 
 def _backbone() -> Backbone:
-    return Backbone(architecture='qwen3', hidden_dim=8, num_layers=1, num_heads=2, train_kernel="flex", decode_kernel='flex', dtype=torch.float32)
+    return Backbone(architecture='qwen3', hidden_dim=8, num_layers=1, num_heads=2, dtype=torch.float32)
 
 
 def _batch(start=0, stop=3):

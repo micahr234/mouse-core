@@ -27,7 +27,7 @@ _TOKENS_PER_STEP = 3
 
 
 def _tiny_model(*, num_thoughts: int=2, with_reasoner: bool=True) -> Model:
-    backbone = Backbone(architecture='llama', train_kernel="flex", decode_kernel='flex', dtype=torch.float32, hidden_dim=_HIDDEN, num_layers=2, num_heads=2, max_position_embeddings=128, lora=LoRAConfig(rank=4))
+    backbone = Backbone(architecture='llama', dtype=torch.float32, hidden_dim=_HIDDEN, num_layers=2, num_heads=2, max_position_embeddings=128, lora=LoRAConfig(rank=4))
     heads = MLP(in_features=_HIDDEN, out_features=_ACTIONS, hidden_dim=_HIDDEN, num_layers=1, propagate_gradient=1.0)
     reasoner = LatentReasoner(hidden_dim=_HIDDEN, num_thoughts=num_thoughts) if with_reasoner else None
     return simple_model(backbone=backbone, heads={'action_value': heads}, reasoner=reasoner)

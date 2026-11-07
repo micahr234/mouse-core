@@ -1,11 +1,11 @@
-"""Benchmark cached FlexAttention decode (``FlexDecodeSession``) on CUDA.
+"""Benchmark cached FlexAttention decode (``ContinuousDecodeSession``) on CUDA.
 
 Measures, per workload: prefill of a context into an empty paged KV pool,
 then a decode step of ``--step`` new tokens per row against that history.
 Reports median CUDA-event time, peak allocated memory above the parameter
 baseline, tokens/second, and first-call (compile / page-grow / incremental
 CUDA-graph capture) time. ``--profile`` adds a ``torch.profiler`` CPU/CUDA
-breakdown after warmup. Decode is ``decode_kernel="flex"`` only.
+breakdown after warmup. Decode always uses FlexAttention.
 ``torch.set_float32_matmul_precision("high")`` is set so fp32 matches the
 README TF32 path.
 
@@ -136,8 +136,6 @@ def main() -> None:
     lora = None if args.no_lora else LoRAConfig(rank=16, alpha=32.0)
     dtype = torch.float32 if lora is None else torch.bfloat16
     backbone = Backbone(
-        train_kernel="flex",
-        decode_kernel="flex",
         dtype=dtype,
         hidden_dim=args.hidden,
         num_layers=args.layers,
@@ -158,7 +156,7 @@ def main() -> None:
     print(
         f"{props.name} | torch {torch.__version__} | layers={args.layers} base dtype={dtype} "
         f"lora={'off' if lora is None else f'r{lora.rank}'} params={sum(p.numel() for p in backbone.parameters())/1e6:.1f}M "
-        f"| decode_kernel=flex TF32=high step={args.step}"
+        f"| FlexAttention TF32=high step={args.step}"
     )
 
     step_s = args.step

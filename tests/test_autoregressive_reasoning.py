@@ -38,7 +38,7 @@ def model():
     torch.manual_seed(7)
     embedding = MultiEmbedding(embeddings={"text": Embedding(vocab_size=16, hidden_dim=16)})
     backbone = Backbone(architecture="qwen3", hidden_dim=16, num_layers=1, num_heads=2,
-                        max_position_embeddings=256, train_kernel="flex", decode_kernel="flex", dtype=torch.float32)
+                        max_position_embeddings=256, dtype=torch.float32)
     token_head = nn.Linear(16, 16)
     with torch.no_grad():
         token_head.weight.mul_(0.01)
@@ -101,7 +101,7 @@ def test_cache_rows_are_released_on_failed_generation(monkeypatch):
     monkeypatch.setattr(online.backbone, "decode_session", create)
     with pytest.raises(RuntimeError, match="did not emit an end token"):
         generate(online, tokens, backend="continuous", max_new_tokens=2)
-    assert len(sessions) == 1 and sessions[0]._closed
+    assert len(sessions) == 1 and sessions[0]._cache is None and sessions[0]._scheduler is None
     assert online.backbone.training
 
 
@@ -235,7 +235,7 @@ def test_restored_vocabulary_head_matches_original_checkpoint_without_second_mod
         raise AssertionError("Must not load another causal LM")
     monkeypatch.setattr(AutoModelForCausalLM, "from_pretrained", forbidden)
     embedding = Embedding(pretrained=tmp_path)
-    backbone = Backbone(pretrained=tmp_path, train_kernel="flex", decode_kernel="flex", dtype=torch.float32)
+    backbone = Backbone(pretrained=tmp_path, dtype=torch.float32)
     head = VocabularyHead.from_pretrained(tmp_path)
     ids = torch.tensor([1, 2, 3])
     with torch.no_grad():

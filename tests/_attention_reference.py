@@ -1,7 +1,7 @@
 """Full-attention test oracle; not a Mouse runtime backend."""
 
 import torch
-from mouse_core.models.backbone.flex_decode import packed_rope_positions
+from mouse_core.models.backbone.flex_utils import packed_rope_positions
 
 
 def _flat_sequence_causal_mask(

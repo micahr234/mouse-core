@@ -19,7 +19,6 @@ from mouse_core.data import EnvironmentProtocol, Augmenter, Datastore, EventLog,
 from mouse_core.data.event_transform import environment_decisions, latest_environment_decision
 from mouse_gym import RepeatTaskTracker
 from mouse_core.models import action_readouts, select_discrete_action
-from mouse_core.models.kv_policy import cache_needs_rebuild, rebuild_starts, resolve_cache_bounds
 from mouse_core.objectives import DqnObjective, boundary_discount
 
 
@@ -110,9 +109,7 @@ def _collect_outputs(filename, outputs, *, oracle_values=True, inference_chunks=
         encoder=encoder, q_head=lambda z: z, policy_head=lambda z: z, value_head=lambda z: z,
         tokenizer=_notebook_transform('02_train_offline_dqn.ipynb', tokenizer_only=True),
         select_discrete_action=select_discrete_action, action_readouts=action_readouts,
-        sample_discrete_action=lambda **kw: (torch.tensor([2]), torch.tensor([-.5])),
-        cache_needs_rebuild=cache_needs_rebuild, rebuild_starts=rebuild_starts,
-        resolve_cache_bounds=resolve_cache_bounds)
+        sample_discrete_action=lambda **kw: (torch.tensor([2]), torch.tensor([-.5])))
     exec(compile(ast.Module(body=definitions, type_ignores=[]), filename, 'exec'), namespace)
     if filename.startswith('01_'):
         source = next(''.join(cell['source']) for cell in notebook['cells']
@@ -126,7 +123,7 @@ def _collect_outputs(filename, outputs, *, oracle_values=True, inference_chunks=
         scores = [[]]
         for count in inference_chunks or [len(outputs)]:
             _, _, chunk_scores = namespace['run_eval'](
-                num_steps=count, max_cache=4, start_cache=2, temperature=0.)
+                num_steps=count, temperature=0.)
             scores[0].extend(chunk_scores[0])
         expected_scores = []
         task_reward = 0.

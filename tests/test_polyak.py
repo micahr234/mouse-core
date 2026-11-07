@@ -39,7 +39,7 @@ def _tiny_model() -> Model:
 
 def _llama_model() -> Model:
     hidden_dim = 16
-    backbone = Backbone(architecture='llama', train_kernel="flex", decode_kernel='flex', dtype=torch.float32, hidden_dim=hidden_dim, num_layers=2, num_heads=2, max_position_embeddings=64)
+    backbone = Backbone(architecture='llama', dtype=torch.float32, hidden_dim=hidden_dim, num_layers=2, num_heads=2, max_position_embeddings=64)
     head = _head(hidden_dim)
     return simple_model(backbone=backbone, heads={'action_value': head}, reasoner=None)
 

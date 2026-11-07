@@ -158,7 +158,7 @@ def test_model_checkpoint_preserves_both_conversions_and_q_values(tmp_path) -> N
     for key, value in model.state_dict().items():
         assert torch.equal(value, loaded.state_dict()[key])
     wrong = make_model(make_head(torch.tensor([[0., 0.], [1., 1.]])))
-    with pytest.raises(RuntimeError, match="size mismatch|Missing key"):
+    with pytest.raises(RuntimeError, match="Model state keys do not match saved weights"):
         load_model(model=wrong, repo_id_or_path=str(tmp_path))
 
 

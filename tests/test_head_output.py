@@ -96,7 +96,7 @@ _TOK = _head_output_tokenizer("action", "observation", "repeat_episode_done")
 
 
 def _tiny_model(*, with_reasoner: bool=False) -> Model:
-    backbone = Backbone(architecture='llama', train_kernel="flex", decode_kernel='flex', dtype=torch.float32, hidden_dim=_HIDDEN, num_layers=2, num_heads=2, max_position_embeddings=128)
+    backbone = Backbone(architecture='llama', dtype=torch.float32, hidden_dim=_HIDDEN, num_layers=2, num_heads=2, max_position_embeddings=128)
     heads = MLP(in_features=_HIDDEN, out_features=_ACTIONS, hidden_dim=_HIDDEN, num_layers=1, propagate_gradient=1.0)
     reasoner = LatentReasoner(hidden_dim=_HIDDEN, num_thoughts=2) if with_reasoner else None
     return simple_model(backbone=backbone, heads={'action_value': heads}, reasoner=reasoner)
@@ -233,7 +233,7 @@ def test_get_action_uses_last_valid_head_output_not_last_token() -> None:
     """
     torch.manual_seed(0)
     hidden = _HIDDEN
-    backbone = Backbone(architecture='llama', train_kernel="flex", decode_kernel='flex', dtype=torch.float32, hidden_dim=hidden, num_layers=2, num_heads=2, max_position_embeddings=128)
+    backbone = Backbone(architecture='llama', dtype=torch.float32, hidden_dim=hidden, num_layers=2, num_heads=2, max_position_embeddings=128)
     model = simple_model(backbone=backbone, heads=({'action_value': (head := MLP(in_features=hidden, out_features=_ACTIONS, hidden_dim=hidden, num_layers=1, propagate_gradient=1.0))}), reasoner=None).eval()
     tok = _head_output_tokenizer('action', 'observation', tail='tail')
     rows = [[{**step, 'tail': (i + 3) % 8} for i, step in enumerate(_rows(3))], [{**step, 'tail': (i + 5) % 8} for i, step in enumerate(_rows(1, offset=2))]]

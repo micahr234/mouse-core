@@ -101,7 +101,7 @@ Follow these three notebooks:
 
 The [FrozenLake autoregressive reasoning notebook](examples/23_train_autoregressive_reasoning_dqn.ipynb) adds autoregressive vocabulary reasoning to the same Mouse model and uses negative DQN error as a REINFORCE reward.
 
-Mouse transformer backbones support **FlexAttention only**, for packed training, rectangular forwards, and paged cached generation. Training requires CUDA; CPU supports inference under `torch.no_grad()`. The optional `kernels` extra can accelerate supported decoder modules when enabled with `backbone.enable_kernels()`; attention remains FlexAttention.
+Mouse transformer backbones always use **FlexAttention**, with no kernel selection arguments, for packed training, rectangular forwards, and paged cached generation. Training requires CUDA; CPU supports inference under `torch.no_grad()`. The optional `kernels` extra can accelerate supported decoder modules when enabled with `backbone.enable_kernels()`; attention remains FlexAttention.
 
 The `kernels` extra installs on standard Python 3.15 and is included in the `all` extra. Enable compatible kernels explicitly on the backbone; FlexAttention and continuous batching work independently.
 
@@ -372,6 +372,84 @@ rollouts, `action_readouts(scores, inputs, sequence_ids=...)` first selects the 
 marked token of each requested sequence using `head_token_mask` and `sequence_ids`.
 The caller decides which environments currently request actions. Example encoders
 return only `z` and `cache`.
+
+For Hugging Face scheduling and paged KV allocation, create a continuous decode
+session on the existing backbone. The same hidden-state interface serves Q,
+policy, value, and other heads; there is no second model or language-model head:
+
+```python
+backbone.eval()
+session = backbone.decode_session(
+    batch_size=4,
+    max_batch_tokens=1024,
+    # Omit capacity to reserve a full circular window for every row.
+)
+# Left-padded inputs with the number of real tokens in each row.
+features = backbone(embeds, cache=session, lengths=lengths)
+# At the OUTER episode boundary, recycle only that row's pages.
+session.reset_rows([2])
+session.close()  # before updating model or embedding weights
+```
+
+The adapter uses Transformers' `FIFOScheduler` and `PagedAttentionCache`, with
+Mouse's decoder layers and compiled FlexAttention on CUDA. Each forward processes
+only real query tokens and is bounded by `max_batch_tokens`. It also offers
+`submit(row, embeds)` and `step()` for a caller that receives environments at
+different times: a step returns a dictionary of completed submissions' hidden
+states, while their KV remains cached for the next action. These calls are
+serialized by the caller; the adapter does not create background environment
+workers. `DecodeCache` accepts these sessions too. [Notebook 15](examples/15_inference.ipynb)
+uses this path with FrozenLake; its environment loop is still lockstep.
+
+Configure the maximum previous-token distance once on the backbone:
+
+```python
+backbone = Backbone(
+    pretrained="Qwen/Qwen3-0.6B",
+    dtype=torch.float32,
+    max_attention_distance_tokens=16383,
+)
+```
+
+Every training and inference layer applies the same rule: causal attention within
+an outer episode, with `query_position - key_position <= max_attention_distance_tokens`.
+The distance counts tokens within that episode, even in interleaved packed input.
+The window is always finite (default distance 16383); `None` is rejected.
+`0` allows self only. With distance W,
+HF's circular allocator retains at most W + 1 KV tokens per row, rounded up to
+16-token pages. Rotary positions continue increasing across wraparound. Cached
+hidden states are retained; a truncated prefix is never recomputed.
+
+Choose W above the longest tokenized outer episode to keep effective full-episode
+attention while using fixed memory. Include the prompt, observations, action/reward
+text, separators, and all compute tokens in that bound. If an episode exceeds W + 1,
+the configured rolling mask applies consistently during training and inference.
+Outer resets still release that row and restart its positions; inner resets do not.
+Notebooks 02 and 15 use the same explicit distance. Weights-only checkpoints do not
+save construction settings, so use the same window when constructing the model.
+
+The pool capacity is a separate shared-memory budget. To guarantee room for B
+simultaneous full rings, allocate `B * ceil((W + 1) / 16) * 16` token slots. A
+smaller pool can serve shorter live histories but raises if the mask-visible KV
+will not fit; it does not shrink the attention window to make room. Memory also
+includes query activations and temporary gathered keys, bounded by the per-forward
+token budget rather than by the number of steps already processed.
+
+`decode_session(batch_size)` is the only cached-decode factory. It reserves
+capacity for every row's full window and uses a 1024-token query budget. Supply
+`max_batch_tokens` and optionally `cache_capacity_tokens` to tune scheduling and
+memory. There is no growing-cache or unwindowed backend.
+
+This embedding adapter uses the lower-level HF scheduler/cache, not its
+vocabulary-sampling `generate_batch` runner. It does not yet use HF CUDA graph
+buckets or background asynchronous batching. Fixed storage bounds KV memory;
+it does not imply that every workload is faster. Measure prefill and incremental
+latency for the intended model and row lengths:
+
+```bash
+PYTHONPATH=src .venv/bin/python bench/bench_continuous_decode.py \
+    --device cuda --hidden 1024 --layers 4 --max-batch-tokens 4096 --iterations 10
+```
 
 Augmentation uses `type="discrete_permute"` to permute categorical IDs and any
 associated `input_vector_field` values together. It requires `vocab_size`; there

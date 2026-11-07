@@ -5,7 +5,7 @@ from tests._model_helpers import ExampleModel as Model
 
 ``Model.forward`` accepts ragged batches when decoding: on every call each row
 may contribute any number of new steps (including zero). Decoding runs through
-a :class:`~mouse_core.models.backbone.flex_decode.FlexDecodeSession` (FlexAttention
+a :class:`~mouse_core.models.backbone.continuous_decode.ContinuousDecodeSession` (FlexAttention
 block-sparse attention with per-sequence KV slots and RoPE positions), carried
 inside the returned ``cache``. These tests verify that feeding sequences in
 chunks — alone, or batched with other sequences of different lengths — yields
@@ -19,7 +19,7 @@ import torch.nn as nn
 
 from mouse_core.models.backbone import Backbone
 from mouse_core.models.backbone import packed_train as packed_train_mod
-from mouse_core.models.backbone.packed_train import TrainKernel, install_compiled_decoder
+from mouse_core.models.backbone.packed_train import install_compiled_decoder
 from mouse_core.models.lora import LoRAConfig
 from mouse_core.models.mlp import MLP
 from tests._token_batch_helpers import batch_to_token_batch, token_tokenizer
@@ -33,9 +33,9 @@ def _as_rect(preds: torch.Tensor) -> torch.Tensor:
 
 _TOK = token_tokenizer("action", "repeat_episode_done")
 
-def _tiny_model(architecture: Literal['llama', 'qwen3']='qwen3', tokens: int=1, dtype: torch.dtype=torch.float32, train_kernel: TrainKernel="flex", **backbone_kwargs) -> Model:
-    hidden_dim = 16
-    backbone = Backbone(architecture=architecture, train_kernel=train_kernel, decode_kernel='flex', dtype=dtype, hidden_dim=hidden_dim, num_layers=2, num_heads=2, **backbone_kwargs)
+def _tiny_model(architecture: Literal['llama', 'qwen3']='qwen3', tokens: int=1, dtype: torch.dtype=torch.float32, **backbone_kwargs) -> Model:
+    hidden_dim = 32
+    backbone = Backbone(architecture=architecture, dtype=dtype, hidden_dim=hidden_dim, num_layers=2, num_heads=2, **backbone_kwargs)
     head = MLP(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, propagate_gradient=1.0)
     return simple_model(backbone=backbone, heads={'action_value': head}, reasoner=None).eval()
 
@@ -126,11 +126,9 @@ def test_cuda_fp32_decode_is_compiled_and_matches_full_forward() -> None:
         preds_b, cache = _fwd(model, [steps[150:]], cache=cache, use_cache=True)
         incremental = torch.cat([preds_a['action_value'], preds_b['action_value']], dim=1)
     session = cache.sessions[0]
-    assert session._flex._compiled is not None
-    assert session._flex._active is session._flex._compiled
-    assert session._compile_masks
-    from mouse_core.models.backbone import flex_decode as flex_decode_mod
-    assert flex_decode_mod._compiled_decode_layer is not None
+    assert hasattr(session._flex, "_torchdynamo_orig_callable")
+    from mouse_core.models.backbone import continuous_decode as decode_mod
+    assert decode_mod._compiled_inputs is not None
     full_q = _as_rect(full['action_value'])
     assert torch.allclose(incremental, full_q, atol=0.0001), (incremental - full_q).abs().max().item()
 
@@ -140,7 +138,7 @@ def test_cuda_bf16_lora_compiled_train_matches_cached_decode() -> None:
     """LoRA + compiled decoder body: packed forward == Flex cached decode."""
     torch.manual_seed(5)
     hidden_dim = 64
-    backbone = Backbone(architecture='qwen3', train_kernel="flex", decode_kernel='flex', dtype=torch.bfloat16, hidden_dim=hidden_dim, num_layers=2, num_heads=4, lora=LoRAConfig(rank=4, alpha=8.0))
+    backbone = Backbone(architecture='qwen3', dtype=torch.bfloat16, hidden_dim=hidden_dim, num_layers=2, num_heads=4, lora=LoRAConfig(rank=4, alpha=8.0))
     head = MLP(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, propagate_gradient=1.0)
     model = simple_model(backbone=backbone, heads={'action_value': head}, reasoner=None).eval().to(torch.device('cuda'))
     steps = _steps(8)
@@ -162,8 +160,8 @@ def test_cuda_bf16_lora_compiled_train_matches_cached_decode() -> None:
         assert full_q.dtype == torch.float32
         assert torch.allclose(incremental, full_q, atol=0.05), (incremental - full_q).abs().max().item()
         assert cache is not None
-        from mouse_core.models.backbone import flex_decode as flex_decode_mod
-        assert flex_decode_mod._compiled_decode_layer is not None
+        from mouse_core.models.backbone import continuous_decode as decode_mod
+        assert decode_mod._compiled_inputs is not None
     finally:
         packed_train_mod._compiled_layer = was
 
@@ -172,7 +170,7 @@ def test_cuda_bf16_lora_compiled_train_matches_cached_decode() -> None:
 def test_cuda_fp32_autocast_train_matches_cached_decode() -> None:
     """bf16 declared on both paths: FlexAttention packed train == Flex cached decode on a bf16 KV pool."""
     torch.manual_seed(6)
-    model = _tiny_model('qwen3', train_kernel="flex", train_autocast_dtype=torch.bfloat16, decode_autocast_dtype=torch.bfloat16).to(torch.device('cuda'))
+    model = _tiny_model('qwen3', train_autocast_dtype=torch.bfloat16, decode_autocast_dtype=torch.bfloat16).to(torch.device('cuda'))
     steps = _steps(8)
     for step, episode in zip(steps, (0, 0, 1, 1, 0, 0, 2, 0)):
         step['episode_index'] = episode
@@ -187,7 +185,7 @@ def test_cuda_fp32_autocast_train_matches_cached_decode() -> None:
     assert cache is not None
     session = cache.sessions[0]
     assert session.autocast_dtype is torch.bfloat16
-    assert session.k_cache.dtype == torch.bfloat16 and session.v_cache.dtype == torch.bfloat16
+    assert session._cache.dtype == torch.bfloat16
     full_q = _as_rect(full['action_value'])
     assert full_q.dtype == torch.float32
     assert torch.allclose(incremental, full_q, atol=0.05), (incremental - full_q).abs().max().item()
@@ -197,7 +195,7 @@ def test_cuda_fp32_autocast_train_matches_cached_decode() -> None:
 def test_cuda_split_autocast_bf16_train_fp32_decode() -> None:
     """train_autocast_dtype=bf16 with decode_autocast_dtype=None: fp32 KV pool, decode matches bf16 train."""
     torch.manual_seed(7)
-    model = _tiny_model('qwen3', train_kernel="flex", train_autocast_dtype=torch.bfloat16).to(torch.device('cuda'))
+    model = _tiny_model('qwen3', train_autocast_dtype=torch.bfloat16).to(torch.device('cuda'))
     steps = _steps(6)
     with torch.no_grad():
         full, _ = _fwd(model, [steps])
@@ -206,7 +204,7 @@ def test_cuda_split_autocast_bf16_train_fp32_decode() -> None:
         incremental = torch.cat([preds_a['action_value'], preds_b['action_value']], dim=1)
     session = cache.sessions[0]
     assert session.autocast_dtype is None
-    assert session.k_cache.dtype == torch.float32 and session.v_cache.dtype == torch.float32
+    assert session._cache.dtype == torch.float32
     full_q = _as_rect(full['action_value'])
     assert torch.allclose(incremental, full_q, atol=0.05), (incremental - full_q).abs().max().item()
 
@@ -219,188 +217,20 @@ def test_decode_rejects_ambient_autocast() -> None:
         _fwd(model, [steps], use_cache=True)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason='decode CUDA graph is CUDA-only')
-@pytest.mark.parametrize('S', [1, 4], ids=['S=1', 'S=4'])
-def test_cuda_step_cudagraph_matches_eager_decode(S: int) -> None:
-    """After compile warmup, a repeated incremental shape matches compiled decode."""
-    from mouse_core.models.backbone.flex_decode import FlexDecodeSession
-
-    torch.manual_seed(0)
-    device = torch.device('cuda')
-    backbone = Backbone(architecture="qwen3",
-        train_kernel="flex", decode_kernel="flex", dtype=torch.bfloat16,
-        hidden_dim=64, num_layers=2, num_heads=4, lora=LoRAConfig(rank=4, alpha=8.0)).to(device).eval()
-    for n, p in backbone.named_parameters():
-        if ".lora_B." in n:
-            torch.nn.init.normal_(p, std=0.05)
-    inner = cast(nn.Module, cast(Any, backbone).model)
-    B, D = 2, 64
-    pre = torch.randn(B, 8, D, device=device, dtype=torch.bfloat16)
-    preg = torch.zeros(B, 8, dtype=torch.long, device=device)
-    steps = [torch.randn(B, S, D, device=device, dtype=torch.bfloat16) for _ in range(12)]
-    stepg = torch.zeros(B, S, dtype=torch.long, device=device)
-    step_lens = [S, S]
-
-    def run(*, graph: bool) -> list[torch.Tensor]:
-        session = FlexDecodeSession(inner, batch_size=B)
-        if not graph:
-            session._graph_disabled = True
-        outs: list[torch.Tensor] = []
-        with torch.no_grad():
-            session.forward(embeds=pre, lengths=[8, 8])
-            for embeds in steps:
-                hidden = session.forward(
-                    embeds=embeds, lengths=step_lens
-                )
-                assert isinstance(hidden, torch.Tensor)
-                outs.append(hidden.clone())
-        if graph:
-            assert session._graph is not None
-            assert not session._graph_disabled
-        return outs
-
-    graphed = run(graph=True)
-    eager = run(graph=False)
-    for i, (a, b) in enumerate(zip(graphed, eager)):
-        assert torch.allclose(a.float(), b.float(), atol=5e-2, rtol=5e-2), (
-            i, (a - b).abs().max().item()
-        )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason='decode CUDA graph is CUDA-only')
-def test_cuda_step_graph_survives_chunk_shape_change() -> None:
-    """Replays after an intervening chunk of another shape must stay correct.
-
-    A different chunk shape replaces the mask-holder tensors the captured
-    graph closed over; without invalidation the next same-shape step would
-    replay against the stale (capture-time) query tables.
-    """
-    from mouse_core.models.backbone.flex_decode import FlexDecodeSession
-
-    torch.manual_seed(0)
-    device = torch.device('cuda')
-    backbone = Backbone(architecture="qwen3",
-        train_kernel="flex", decode_kernel="flex", dtype=torch.bfloat16,
-        hidden_dim=64, num_layers=2, num_heads=4).to(device).eval()
-    inner = cast(nn.Module, cast(Any, backbone).model)
-    B, D = 2, 64
-    pre = torch.randn(B, 8, D, device=device, dtype=torch.bfloat16)
-    preg = torch.zeros(B, 8, dtype=torch.long, device=device)
-    # Sustained S=1 captures a graph, S=4 replaces the holder tensors, then
-    # S=1 must recapture rather than replay against the old query tables.
-    chunk_sizes = [1] * 12 + [4] + [1] * 12
-    chunks = [torch.randn(B, s, D, device=device, dtype=torch.bfloat16) for s in chunk_sizes]
-
-    def run(*, graph: bool) -> list[torch.Tensor]:
-        session = FlexDecodeSession(inner, batch_size=B)
-        if not graph:
-            session._graph_disabled = True
-        outs: list[torch.Tensor] = []
-        with torch.no_grad():
-            session.forward(embeds=pre, lengths=[8, 8])
-            for embeds in chunks:
-                s = embeds.shape[1]
-                hidden = session.forward(
-                    embeds=embeds, lengths=[s, s],
-                )
-                assert isinstance(hidden, torch.Tensor)
-                outs.append(hidden.clone())
-        if graph:
-            assert session._graph is not None
-            assert not session._graph_disabled
-        return outs
-
-    graphed = run(graph=True)
-    eager = run(graph=False)
-    for i, (a, b) in enumerate(zip(graphed, eager, strict=True)):
-        assert torch.allclose(a.float(), b.float(), atol=5e-2, rtol=5e-2), (
-            i, (a - b).abs().max().item()
-        )
 
 
-def _cuda_graph_session(batch_size: int = 2) -> tuple[Any, torch.device, int]:
-    from mouse_core.models.backbone.flex_decode import FlexDecodeSession
-
-    device = torch.device("cuda")
-    backbone = Backbone(architecture="qwen3",
-        train_kernel="flex", decode_kernel="flex", dtype=torch.bfloat16,
-        hidden_dim=64, num_layers=2, num_heads=4, lora=LoRAConfig(rank=4, alpha=8.0)).to(device).eval()
-    inner = cast(nn.Module, cast(Any, backbone).model)
-    return FlexDecodeSession(inner, batch_size=batch_size), device, 64
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason='decode CUDA graph is CUDA-only')
-def test_cuda_identical_incremental_steps_capture() -> None:
-    """Transient layouts stay compiled; sustained reuse eventually captures."""
-    session, device, D = _cuda_graph_session()
-    B, S = 2, 1
-    pre = torch.randn(B, 8, D, device=device, dtype=torch.bfloat16)
-    preg = torch.zeros(B, 8, dtype=torch.long, device=device)
-    step = torch.randn(B, S, D, device=device, dtype=torch.bfloat16)
-    stepg = torch.zeros(B, S, dtype=torch.long, device=device)
-    with torch.no_grad():
-        session.forward(embeds=pre, lengths=[8, 8])
-        for _ in range(3):
-            session.forward(embeds=step, lengths=[S, S])
-            assert session._graph is None
-            assert not session._graph_disabled
-        for _ in range(12):
-            session.forward(embeds=step, lengths=[S, S])
-    assert session._graph is not None
-    assert not session._graph_disabled
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason='decode CUDA graph is CUDA-only')
-def test_cuda_page_grow_skips_capture_then_recaptures() -> None:
-    """A VMM grow step does not capture; the next stable step still can."""
-    session, device, D = _cuda_graph_session()
-    B, S = 2, 1
-    page = session.page
-    pre_len = page - 16
-    pre = torch.randn(B, pre_len, D, device=device, dtype=torch.bfloat16)
-    preg = torch.zeros(B, pre_len, dtype=torch.long, device=device)
-    step = torch.randn(B, S, D, device=device, dtype=torch.bfloat16)
-    stepg = torch.zeros(B, S, dtype=torch.long, device=device)
-    with torch.no_grad():
-        session.forward(embeds=pre, lengths=[pre_len, pre_len])
-        for _ in range(16):
-            session.forward(embeds=step, lengths=[S, S])
-        assert session._graph is not None
-        assert not session._graph_disabled
-        n_pages = session.n_pages
-        session.forward(embeds=step, lengths=[S, S])
-        assert session.n_pages > n_pages
-        assert session._graph is None
-        assert not session._graph_disabled
-        for _ in range(12):
-            session.forward(embeds=step, lengths=[S, S])
-        assert session._graph is not None
-        assert not session._graph_disabled
-        session.forward(embeds=step, lengths=[S, S])
-    assert session._graph is not None
-    assert not session._graph_disabled
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason='decode CUDA graph is CUDA-only')
-def test_cuda_eager_flex_skips_capture_without_disabling() -> None:
-    """Eager FlexAttention is not capturable and must not fail-close graphs."""
-    session, device, D = _cuda_graph_session()
-    session._flex._active = session._flex._eager
-    B, S = 2, 1
-    pre = torch.randn(B, 8, D, device=device, dtype=torch.bfloat16)
-    preg = torch.zeros(B, 8, dtype=torch.long, device=device)
-    step = torch.randn(B, S, D, device=device, dtype=torch.bfloat16)
-    stepg = torch.zeros(B, S, dtype=torch.long, device=device)
-    with torch.no_grad():
-        session.forward(embeds=pre, lengths=[8, 8])
-        for _ in range(4):
-            session.forward(embeds=step, lengths=[S, S])
-    assert session._graph is None
-    assert not session._graph_disabled
 
 
 def test_packed_rope_positions_count_same_sequence_tokens() -> None:
-    from mouse_core.models.backbone.flex_decode import packed_rope_positions
+    from mouse_core.models.backbone.flex_utils import packed_rope_positions
 
     seq = torch.tensor([0, 0, 0, 0, 0, 0, 1, 1, 1])
     pos = packed_rope_positions(sequence_ids=seq)
@@ -686,35 +516,18 @@ def test_reset_rows_restarts_one_sequence_without_rebuild(backbone_cls: Literal[
     assert torch.allclose(got0, ref0, atol=1e-05)
     assert torch.allclose(got1, ref1, atol=1e-05)
 
-def test_decode_mask_mod_is_module_level_and_shared() -> None:
-    """Every session uses the same mask_mod function object (stable for Dynamo)."""
-    from mouse_core.models.backbone.flex_decode import FlexDecodeSession, _logical_mask_mod, _physical_mask_mod
-    model = _tiny_model('qwen3')
-    inner = cast(nn.Module, cast(Any, model.backbone).model)
-    a = FlexDecodeSession(inner, batch_size=1)
-    b = FlexDecodeSession(inner, batch_size=2)
-    assert a._mask_holder is not b._mask_holder
-    assert _logical_mask_mod.__qualname__ == '_logical_mask_mod'
-    assert _physical_mask_mod.__qualname__ == '_physical_mask_mod'
-    from mouse_core.models.backbone.flex_decode import _logical_mask_mod as again
-    assert again is _logical_mask_mod
-    a.close()
-    b.close()
 
 
-def test_decode_cache_close_unmaps_and_drops_graph() -> None:
+def test_decode_cache_close_releases_hf_storage() -> None:
     from mouse_core.models import DecodeCache
-    from mouse_core.models.backbone.flex_decode import FlexDecodeSession
 
     session, hidden = _raw_session(2)
     with torch.no_grad():
         _decode(session, [2, 1], hidden)
     cache = DecodeCache(sessions=(session,))
     cache.close()
-    assert session._closed
-    assert session._graph is None
-    assert session._k_store._closed
-    assert session._v_store._closed
+    assert session._cache is None
+    assert session._scheduler is None
     with pytest.raises(RuntimeError, match="close"):
         _decode(session, [1, 0], hidden)
 
@@ -723,20 +536,19 @@ def test_flex_decode_session_drops_without_cyclic_gc() -> None:
     """mask_mod must not close over the session (that kept KV alive until gc)."""
     import gc
     import weakref
-    from mouse_core.models.backbone.flex_decode import FlexDecodeSession
     model = _tiny_model('qwen3')
     inner = cast(nn.Module, cast(Any, model.backbone).model)
-    session = FlexDecodeSession(inner, batch_size=2)
+    session = model.backbone.decode_session(2)
     wr = weakref.ref(session)
     gc.disable()
     try:
         del session
-        assert wr() is None, 'FlexDecodeSession stayed alive without cyclic GC'
+        assert wr() is None, 'ContinuousDecodeSession stayed alive without cyclic GC'
     finally:
         gc.enable()
 
 def test_ragged_batched_decode_across_page_boundary_matches_full_forward() -> None:
-    """A row that spans several 128-token pages, batched with a short row, must
+    """A row that spans several 16-token pages, batched with a short row, must
     match its unbatched full forward (page remap + RoPE across pages)."""
     torch.manual_seed(5)
     model = _tiny_model('qwen3')
@@ -758,17 +570,15 @@ def test_ragged_batched_decode_across_page_boundary_matches_full_forward() -> No
                     collected[b].append(preds['action_value'][b, padded - n:])
         assert cache is not None
         session = cache.sessions[0]
-    assert session.lengths.tolist() == [160, 8]
-    assert session.pages_in_use == 2 + 1
+    assert session.lengths == (160, 8)
     assert torch.allclose(torch.cat(collected[0], dim=0), ref_long, atol=1e-05)
     assert torch.allclose(torch.cat(collected[1], dim=0), ref_short, atol=1e-05)
 
 
 def _raw_session(batch_size: int):
-    from mouse_core.models.backbone.flex_decode import FlexDecodeSession
     model = _tiny_model('qwen3')
     inner = cast(nn.Module, cast(Any, model.backbone).model)
-    return (FlexDecodeSession(inner, batch_size=batch_size), model.backbone.hidden_dim)
+    return (model.backbone.decode_session(batch_size), model.backbone.hidden_dim)
 
 
 def _decode(session, counts: list[int], hidden: int) -> torch.Tensor:
@@ -778,63 +588,10 @@ def _decode(session, counts: list[int], hidden: int) -> torch.Tensor:
     return session.forward(embeds=embeds, lengths=counts)
 
 
-def test_paged_cache_footprint_tracks_row_lengths_not_batch_max() -> None:
-    """One long row plus short rows costs the sum of pages, not B x longest."""
-    torch.manual_seed(0)
-    session, hidden = _raw_session(4)
-    page = session.page
-    assert session.pages_in_use == 4  # one page per row up front
-    with torch.no_grad():
-        _decode(session, [3 * page + 5, 2, 0, 1], hidden)
-    assert session.lengths.tolist() == [3 * page + 5, 2, 0, 1]
-    assert session.pages_in_use == 4 + 3  # row 0 needs 4 pages; the rest keep 1
-    dense_pages = 4 * 4
-    assert session.pages_in_use < dense_pages
-    assert session.k_cache.shape[2] == session.n_pages * page
 
 
-def test_paged_cache_grows_pool_and_keeps_history() -> None:
-    torch.manual_seed(1)
-    session, hidden = _raw_session(2)
-    page = session.page
-    with torch.no_grad():
-        first = _decode(session, [page - 1, 1], hidden)
-        n_pages_before = session.n_pages
-        # Crossing into a second page for row 0 needs a free page: none left -> pool grows.
-        _decode(session, [2, 0], hidden)
-    assert session.n_pages > n_pages_before
-    assert session.n_pages == 3  # grows by the pages needed, not a doubling
-    assert session.pages_in_use == 3
-    assert session.lengths.tolist() == [page + 1, 1]
-    assert first.shape[0] == 2
-    # Row 1's first slot must have survived the pool grow: decoding row 1 alone
-    # from scratch in a fresh session with the same inputs is covered by the
-    # end-to-end tests; here we check the address map stayed consistent.
-    row1_page = session._row_pages[1][0]
-    assert session.page_table[1, 0].item() == row1_page
-    assert session._mask_holder["page_row"][row1_page].item() == 1
 
 
-def test_reset_rows_returns_pages_to_pool() -> None:
-    torch.manual_seed(2)
-    session, hidden = _raw_session(3)
-    page = session.page
-    with torch.no_grad():
-        _decode(session, [2 * page + 1, page + 1, 1], hidden)
-    assert session.pages_in_use == 3 + 2 + 1
-    session.reset_rows([0])
-    assert session.pages_in_use == 1 + 2 + 1
-    assert session.lengths.tolist() == [0, page + 1, 1]
-    assert session.page_table[0, 1:].eq(-1).all()
-    session.reset_rows()
-    assert session.pages_in_use == 3
-    assert session.lengths.tolist() == [0, 0, 0]
-    assert session.n_pages >= 6  # pool keeps its size; pages are just free again
-    with torch.no_grad():
-        # Freed pages are reused rather than growing the pool.
-        _decode(session, [page + 1, page + 1, page + 1], hidden)
-    assert session.pages_in_use == 6
-    assert session.n_pages >= 6
 
 
 @pytest.mark.parametrize('backbone_cls', ["qwen3", "llama"])
@@ -864,92 +621,3 @@ def test_decode_new_sample_matches_fresh_forward_after_reset(backbone_cls: Liter
             collected.append(preds['action_value'][:, -1])
         got = torch.stack(collected, dim=1)
     assert torch.allclose(got, _as_rect(ref), atol=1e-05)
-
-
-def test_expandable_kv_cpu_grow_keeps_prefix() -> None:
-    from mouse_core.models.backbone.expandable_kv import ExpandableKvTensor
-
-    store = ExpandableKvTensor((2, 2, 4, 8), dtype=torch.float32, device=torch.device("cpu"))
-    assert not store.uses_vmm
-    store.tensor[0, 0, 0, 0] = 3.5
-    store.tensor[0, 0, 3, 1] = 7.25
-    store.grow_token_dim(12)
-    assert store.tensor.shape == (2, 2, 12, 8)
-    assert store.tensor[0, 0, 0, 0].item() == 3.5
-    assert store.tensor[0, 0, 3, 1].item() == 7.25
-    assert store.tensor[0, 0, 4, 0].item() == 0.0
-    store.close()
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA VMM page-pool grow")
-def test_expandable_kv_cuda_grows_without_copy() -> None:
-    from mouse_core.models.backbone.expandable_kv import ExpandableKvTensor
-
-    device = torch.device("cuda")
-    # Large enough that growing past one 2 MiB VMM granule needs another map.
-    store = ExpandableKvTensor((4, 8, 128, 64), dtype=torch.bfloat16, device=device)
-    assert store.uses_vmm
-    ptr = store.tensor.data_ptr()
-    committed0 = store.committed_bytes
-    store.tensor[0, 0, 0, 0] = 1.5
-    store.tensor[0, 0, 127, 3] = 2.25
-    store.tensor[3, 7, 10, 5] = -4.0
-    store.grow_token_dim(128 * 8)
-    assert store.tensor.shape[2] == 128 * 8
-    assert store.tensor.data_ptr() == ptr
-    assert abs(float(store.tensor[0, 0, 0, 0]) - 1.5) < 0.1
-    assert abs(float(store.tensor[0, 0, 127, 3]) - 2.25) < 0.1
-    assert abs(float(store.tensor[3, 7, 10, 5]) + 4.0) < 0.1
-    assert float(store.tensor[0, 0, 128, 0]) == 0.0
-    # Physical commit grows by the extra mapping, not by allocating a second full copy.
-    assert store.committed_bytes >= committed0
-    assert store.committed_bytes < committed0 + int(store.tensor.nbytes)
-    # Moving the reservation must keep the prefix without a memcpy.
-    store._remap(max(store._reserve * 2, store._mapped * 2))
-    store._set_view((4, 8, 128 * 8, 64))
-    assert abs(float(store.tensor[0, 0, 0, 0]) - 1.5) < 0.1
-    assert abs(float(store.tensor[0, 0, 127, 3]) - 2.25) < 0.1
-    assert abs(float(store.tensor[3, 7, 10, 5]) + 4.0) < 0.1
-    store.close()
-    assert store.tensor.numel() == 0
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA VMM page-pool grow')
-def test_cuda_paged_pool_grows_in_place() -> None:
-    """Assigning a new page maps more VMM memory; the pool pointer does not move."""
-    from mouse_core.models.backbone.flex_decode import FlexDecodeSession
-    torch.manual_seed(11)
-    device = torch.device('cuda')
-    model = _tiny_model('qwen3', dtype=torch.bfloat16).to(device)
-    inner = cast(nn.Module, cast(Any, model.backbone).model)
-    session = FlexDecodeSession(inner, batch_size=2)
-    assert session._k_store.uses_vmm
-    ptr_k = session.k_cache.data_ptr()
-    ptr_v = session.v_cache.data_ptr()
-    page = session.page
-    hidden = model.backbone.hidden_dim
-    with torch.no_grad():
-        _decode(session, [page - 1, 1], hidden)
-        _decode(session, [2, 0], hidden)
-    assert session.n_pages == 3
-    assert session.pages_in_use == 3
-    assert session.k_cache.data_ptr() == ptr_k
-    assert session.v_cache.data_ptr() == ptr_v
-    torch.cuda.synchronize()
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph capture")
-def test_cuda_ragged_scatter_sizes_do_not_trigger_repeated_capture() -> None:
-    session, device, width = _cuda_graph_session()
-    step = torch.randn(2, 4, width, device=device, dtype=torch.bfloat16)
-    try:
-        with torch.no_grad():
-            for index in range(12):
-                session.forward(embeds=step, lengths=[4, 1 + index % 2])
-                assert session._graph is None
-            for _ in range(12):
-                session.forward(embeds=step, lengths=[4, 2])
-            assert session._graph is not None
-            assert not session._graph_disabled
-    finally:
-        session.close()

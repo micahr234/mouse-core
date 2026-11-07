@@ -381,7 +381,7 @@ def test_replay_loader_training_and_cached_inference(tmp_path):
     loader = EpochDataLoader(stores=[replay.to_store()], transform=tok.encode,
                              token_budget=1000, sample_ranges=environment_episode_ranges, seed=1)
     model = simple_model(backbone=Backbone(architecture='qwen3', hidden_dim=8, num_layers=1, num_heads=2,
-                                          train_kernel="flex", decode_kernel='flex', dtype=torch.float32),
+                                          dtype=torch.float32),
                          heads={'q': torch.nn.Linear(8, 2)}, reasoner=None,
                          embedding=Embedding(hidden_dim=8, vocab_size=32, num_frequencies=2, numeric_field_names=tok.numeric_field_names))
     inputs, data = loader.next_batch()

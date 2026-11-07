@@ -6,6 +6,10 @@ one ``group_id`` (one dataloader sample)::
 
     allowed(q, k) = k <= q and sequence_ids[k] == sequence_ids[q]
 
+With ``max_attention_distance_tokens=W``, additionally require the distance
+within that sequence to be at most W. This is the same mask used in cached
+inference; windowing never permits attention across an outer-episode boundary.
+
 Groups are equality classes of ``group_id``, not necessarily
 contiguous runs: an id that recurs later in the stream attends back to
 its earlier occurrence and continues its RoPE counter. The stream is
@@ -25,7 +29,7 @@ Mixed precision is declared at construction, never inferred:
 wraps the decoder stack in :func:`torch.autocast` — matmuls run in the
 autocast dtype while weights, norms, RoPE, and the residual stream stay
 fp32. ``decode_autocast_dtype`` is the separate declaration for cached decode
-(``FlexDecodeSession`` runs its layers under it and allocates the KV pool
+(``ContinuousDecodeSession`` runs its layers under it and allocates the KV pool
 in that dtype), so bf16 train can pair with exact fp32 eval decode.
 ``packed_forward`` raises if it is called inside an ambient
 ``torch.autocast`` region, so the declared precision is always the actual
@@ -44,7 +48,7 @@ import threading
 from collections.abc import Iterator
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Any, Callable, Literal, Protocol, cast, get_args, overload
+from typing import Any, Callable, Literal, Protocol, cast, overload
 
 import torch
 import torch.nn as nn
@@ -52,25 +56,15 @@ from torch.nn.attention.flex_attention import BlockMask, flex_attention
 from torch.utils.checkpoint import checkpoint as _checkpoint
 from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
 
-from mouse_core.models.backbone.flex_decode import (
+from mouse_core.models.backbone.attention_window import attention_window_size
+from mouse_core.models.backbone.flex_utils import (
     _BLOCK_SIZE,
     _FlexKernel,
     _use_flex_compile,
     check_autocast_dtype,
     flex_block_mask,
-    install_compiled_decode_layer,
     module_device_dtype,
 )
-
-TrainKernel = Literal["flex"]
-
-
-def check_train_kernel(kernel: object) -> TrainKernel:
-    """Return ``kernel`` if it names a training attention kernel, else raise ``ValueError``."""
-    if kernel not in get_args(TrainKernel):
-        raise ValueError(f"train_kernel must be one of {get_args(TrainKernel)}, got {kernel!r}.")
-    return cast(TrainKernel, kernel)
-
 
 _compiled_layer: Any | None = None
 _flex_kernels: dict[tuple[str, int | None], _FlexKernel] = {}
@@ -128,31 +122,35 @@ _segment_lock = threading.Lock()
 
 def _segment_mask_mod(b, h, q_idx, kv_idx):
     seg = _segment_holder["segment"]
-    return (kv_idx <= q_idx) & (seg[q_idx] == seg[kv_idx])
+    return ((kv_idx <= q_idx) & (seg[q_idx] == seg[kv_idx])
+            & (q_idx - kv_idx < _segment_holder["window_size"]))
 
 
 def _run_layer_rebound(
     body: Callable[..., torch.Tensor],
     segment: torch.Tensor,
+    window_size: torch.Tensor,
     *args: object,
 ) -> torch.Tensor:
-    """Run one decoder layer with ``segment`` bound as the flex mask table.
+    """Run one decoder layer with its segment IDs and attention-window bound.
 
     Gradient checkpointing re-executes this during ``backward()``. By then a
     later ``packed_forward`` (reasoner generation passes, gradient
     accumulation, a second model on another batch) may have replaced
     ``_segment_holder["segment"]``, so the recompute must rebind the ids this
-    forward's BlockMask was built from before the flex kernel reads them.
+    forward's BlockMask was built from, including its window, before the kernel reads them.
     """
     with _segment_lock:
         _segment_holder["segment"] = segment
+        _segment_holder["window_size"] = window_size
     return body(*args)
 
 
-def _flex_block_mask(segment: torch.Tensor, L: int, device: torch.device) -> BlockMask:
-    """Block-sparse Flex mask over the packed order: causal within each segment."""
+def _flex_block_mask(segment: torch.Tensor, window_size: torch.Tensor, L: int, device: torch.device) -> BlockMask:
+    """Block-sparse causal mask within segments, limited by the shared window."""
     with _segment_lock:
         _segment_holder["segment"] = segment
+        _segment_holder["window_size"] = window_size
         return flex_block_mask(
             _segment_mask_mod,
             B=1,
@@ -179,24 +177,13 @@ def _flex_fn(device: torch.device) -> Callable[..., torch.Tensor]:
     return kern
 
 
-def _decoder_layer(
-    layer: Any,
-    h: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    block_mask: BlockMask,
-    flex_fn: Callable[..., torch.Tensor],
-    n_heads: int,
-    n_kv_heads: int,
-    head_dim: int,
-) -> torch.Tensor:
-    """One packed-compatible decoder layer over a packed stream ``h [L, D]``.
-
-    Uses FlexAttention in eager and compiled decoder bodies.
-    """
+def _attention_inputs(
+    layer: Any, h: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+    n_heads: int, n_kv_heads: int, head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Shared Q/K/V projections and RoPE for packed training and HF decoding."""
     L = h.shape[0]
     attn = layer.self_attn
-    residual = h
     hn = layer.input_layernorm(h)
     q = attn.q_proj(hn).view(L, n_heads, head_dim)
     k = attn.k_proj(hn).view(L, n_kv_heads, head_dim)
@@ -216,32 +203,48 @@ def _decoder_layer(
         # follow v (the projection output dtype). RoPE itself stays fp32.
         q = q.to(v.dtype)
         k = k.to(v.dtype)
-    gqa = n_heads != n_kv_heads
-    # Force the main kernel for full-sequence forwards, including short inputs.
-    o = flex_fn(
-        q, k, v.transpose(0, 1).unsqueeze(0), block_mask=block_mask,
-        scale=attn.scaling, enable_gqa=gqa,
-        kernel_options={"FORCE_USE_FLEX_ATTENTION": True},
-    )[0].transpose(0, 1)
-    h = residual + attn.o_proj(o.reshape(L, n_heads * head_dim))
+    return q, k, v.transpose(0, 1).unsqueeze(0)
+
+
+def _attention_output(
+    layer: Any, h: torch.Tensor, attention_output: torch.Tensor,
+) -> torch.Tensor:
+    """Shared attention residual and feed-forward block."""
+    o = attention_output[0].transpose(0, 1).flatten(1)
+    h = h + layer.self_attn.o_proj(o)
     return h + layer.mlp(layer.post_attention_layernorm(h))
 
 
-def install_compiled_decoder() -> bool:
-    """Compile the per-layer train body and (on CUDA) the decode layer.
+def _decoder_layer(
+    layer: Any,
+    h: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    block_mask: BlockMask,
+    flex_fn: Callable[..., torch.Tensor],
+    n_heads: int,
+    n_kv_heads: int,
+    head_dim: int,
+) -> torch.Tensor:
+    """One packed-compatible decoder layer, shared with cached inference."""
+    q, k, v = _attention_inputs(layer, h, cos, sin, n_heads, n_kv_heads, head_dim)
+    output = flex_fn(
+        q, k, v, block_mask=block_mask, scale=layer.self_attn.scaling,
+        enable_gqa=n_heads != n_kv_heads,
+        kernel_options={"FORCE_USE_FLEX_ATTENTION": True},
+    )
+    return _attention_output(layer, h, output)
 
-    One ``torch.compile(dynamic=True)`` function serves every train layer of
-    every backbone in the process, any stream length and group count, and
-    ``output_hidden_states=True``. Decode compiles the same per-layer body
-    (attention inside; graph break after the KV scatter). Idempotent;
-    returns True if anything was installed.
+
+def install_compiled_decoder() -> bool:
+    """Compile the per-layer training body; inference compiles when a session opens.
+
+    Idempotent; returns True when a compiled training body is installed.
     """
     global _compiled_layer
     installed = False
     if _compiled_layer is None:
         _compiled_layer = torch.compile(_decoder_layer, dynamic=True)
-        installed = True
-    if install_compiled_decode_layer():
         installed = True
     return installed
 
@@ -303,7 +306,6 @@ def packed_forward(
     model: _PackedModel,
     embeds: torch.Tensor,
     sequence_ids: torch.Tensor,
-    train_kernel: TrainKernel,
     autocast_dtype: torch.dtype | None = None,
     output_hidden_states: Literal[False] = False,
     checkpoint: bool = False,
@@ -317,7 +319,6 @@ def packed_forward(
     model: _PackedModel,
     embeds: torch.Tensor,
     sequence_ids: torch.Tensor,
-    train_kernel: TrainKernel,
     autocast_dtype: torch.dtype | None = None,
     output_hidden_states: Literal[True],
     checkpoint: bool = False,
@@ -331,7 +332,6 @@ def packed_forward(
     model: _PackedModel,
     embeds: torch.Tensor,
     sequence_ids: torch.Tensor,
-    train_kernel: TrainKernel,
     autocast_dtype: torch.dtype | None = None,
     output_hidden_states: bool,
     checkpoint: bool = False,
@@ -344,7 +344,6 @@ def packed_forward(
     model: _PackedModel,
     embeds: torch.Tensor,
     sequence_ids: torch.Tensor,
-    train_kernel: TrainKernel,
     autocast_dtype: torch.dtype | None = None,
     output_hidden_states: bool = False,
     checkpoint: bool = False,
@@ -352,14 +351,15 @@ def packed_forward(
 ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
     """Full uncached forward over a flat packed stream ``embeds [L, D]``.
 
+    Always uses FlexAttention. CUDA supports training; CPU supports inference
+    under ``torch.no_grad()`` only.
+
     Args:
         model: A ``transformers`` decoder stack (``Qwen3Model`` /
             ``LlamaModel``) with ``layers``, ``rotary_emb``, ``norm``.
         embeds: Token embeddings ``[L, D]`` in stream order; cast to the
             model's base dtype.
         sequence_ids: ``[L]`` group id per token. One group is one sample.
-        train_kernel: Must be ``"flex"``. CUDA supports training; CPU supports
-            inference under ``torch.no_grad()`` only.
         position_ids: Optional explicit ``[L]`` rotary positions in stream order.
         autocast_dtype: ``None`` runs everything in the model's base dtype.
             ``torch.bfloat16`` / ``torch.float16`` (fp32 base weights only)
@@ -381,11 +381,9 @@ def packed_forward(
     L, _D = embeds.shape
     if sequence_ids.shape != (L,):
         raise ValueError("sequence_ids must have shape [L]")
-    check_train_kernel(train_kernel)
 
     hf = cast(Any, model)  # HF stacks are nn.Module; pyright sees children as Tensor|Module
-    if getattr(hf.config, "use_sliding_window", False):
-        raise ValueError("packed_forward does not support sliding-window attention.")
+    window_size = attention_window_size(hf.config)
     device, dtype = module_device_dtype(hf)
     check_autocast_dtype(autocast_dtype, dtype)
     if torch.is_autocast_enabled(device.type):
@@ -406,7 +404,10 @@ def packed_forward(
 
     plan = _packing_plan(sequence_ids.to(device))
     flex_segment = _segment_ids(plan)
-    block_mask = _flex_block_mask(flex_segment, L, device)
+    # Full attention is the special case where the window covers the stream.
+    # Capture the bound as a tensor, including in checkpoint recomputations.
+    flex_window = torch.tensor(window_size, device=device)
+    block_mask = _flex_block_mask(flex_segment, flex_window, L, device)
     flex_fn = _flex_fn(device)
 
     cfg = hf.config
@@ -432,7 +433,7 @@ def packed_forward(
                 layer, h, cos, sin, block_mask, flex_fn, n_heads, n_kv_heads, head_dim,
             )
             h = (
-                _checkpoint(_run_layer_rebound, body, flex_segment, *args, use_reentrant=False)
+                _checkpoint(_run_layer_rebound, body, flex_segment, flex_window, *args, use_reentrant=False)
                 if recompute
                 else body(*args)
             )

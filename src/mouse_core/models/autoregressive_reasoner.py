@@ -58,7 +58,7 @@ class AutoregressiveReasoner(nn.Module):
 
     The caller passes its actual modules; this object never creates or copies a
     transformer or embedding. Only the vocabulary head is registered here.
-    Generation uses Mouse's paged FlexDecodeSession with row recycling, or an
+    Generation uses Mouse's paged ContinuousDecodeSession with row recycling, or an
     uncached FlexAttention forward. This is not Transformers' generate_batch API.
     """
     def __init__(self, token_head: nn.Module) -> None:
