@@ -75,14 +75,14 @@ class _PackingPlan:
     """Stable regrouping of a flat stream by ``group_id``.
 
     Packed token ``i`` is original token ``order[i]``;
-    ``original = packed[inverse]``. ``cu_seqlens`` are the int32 segment
-    boundaries of the packed groups, and ``position_ids`` the RoPE position
+    ``original = packed[inverse]``. ``sequence_ids`` identify the packed
+    groups directly, and ``position_ids`` give the RoPE position
     of every packed token (its index inside its class).
     """
 
     order: torch.Tensor
     inverse: torch.Tensor
-    cu_seqlens: torch.Tensor
+    sequence_ids: torch.Tensor
     position_ids: torch.Tensor
 
 
@@ -95,23 +95,15 @@ def _packing_plan(sequence_ids: torch.Tensor) -> _PackingPlan:
     arange = torch.arange(L, device=device)
     is_start = torch.ones(L, dtype=torch.bool, device=device)
     is_start[1:] = packed_seq[1:] != packed_seq[:-1]
-    starts = arange[is_start]
-    cu_seqlens = torch.cat([starts, arange.new_tensor([L])]).to(torch.int32)
     segment_start = torch.cummax(torch.where(is_start, arange, arange.new_tensor(-1)), dim=0).values
     inverse = torch.empty_like(order)
     inverse[order] = arange
     return _PackingPlan(
         order=order,
         inverse=inverse,
-        cu_seqlens=cu_seqlens,
+        sequence_ids=packed_seq,
         position_ids=arange - segment_start,
     )
-
-
-def _segment_ids(plan: _PackingPlan) -> torch.Tensor:
-    """``[L]`` packed-segment index of every packed token."""
-    lengths = (plan.cu_seqlens[1:] - plan.cu_seqlens[:-1]).to(torch.long)
-    return torch.repeat_interleave(torch.arange(lengths.shape[0], device=lengths.device), lengths)
 
 
 # Stable mask_mod identity (reads the current stream's segment ids from a
@@ -403,7 +395,7 @@ def packed_forward(
         return (out, (x,) * n_layers) if output_hidden_states else out
 
     plan = _packing_plan(sequence_ids.to(device))
-    flex_segment = _segment_ids(plan)
+    flex_segment = plan.sequence_ids
     # Full attention is the special case where the window covers the stream.
     # Capture the bound as a tensor, including in checkpoint recomputations.
     flex_window = torch.tensor(window_size, device=device)

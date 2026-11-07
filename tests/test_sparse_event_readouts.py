@@ -206,8 +206,8 @@ def test_field_order_and_independent_events_with_mergeable_text():
         vocab={'[UNK]': 0, 'a': 1, 'b': 2, 'ab': 3},
         merges=[('a', 'b')], unk_token='[UNK]')), unk_token='[UNK]')
     tok = Tokenizer(tokenizers={"default": hf}, input_fields=[
-        dict(type='text', provider='environment', input_field='first', format='{field}'),
-        dict(type='text', provider='environment', input_field='second', format='{field}'),
+        dict(type='text', provider='environment', input_field='first', format='{first}'),
+        dict(type='text', provider='environment', input_field='second', format='{second}'),
     ])
     assert hf('ab', add_special_tokens=False)['input_ids'] == [3]
     log = EventLog()
@@ -235,7 +235,7 @@ def test_missing_inputs_skip_all_modalities(payload):
         raise AssertionError('Missing images must not be tokenized')
 
     tok = Tokenizer(tokenizers={'default': backend(), 'image': unexpected_image}, input_fields=[
-        dict(provider="environment", type='text', input_field='text', format='{field}'),
+        dict(provider="environment", type='text', input_field='text', format='{text}'),
         dict(provider="environment", type='token', input_field='marker', format='action', head_output=True),
         dict(provider="environment", type="token", input_field='number', numeric_field='number', format='reward', fourier_min=0., fourier_max=1.),
         dict(provider="environment", type='image', tokenizer='image', input_field='image'),

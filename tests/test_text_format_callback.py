@@ -12,7 +12,7 @@ from mouse_core.data import (
     load_tokenizer,
     save_tokenizer,
 )
-from tests.test_tokenizer_lookup import CharacterTokenizer
+from tests.test_tokenizer_functions import CharacterTokenizer
 
 
 def compute_text(ctx):
@@ -20,7 +20,7 @@ def compute_text(ctx):
 
 
 def selected_value(ctx):
-    return f"{ctx['prefix']}:{ctx['field']}"
+    return f"{ctx['prefix']}:{['A', 'B'][ctx['action']]}"
 
 
 def make_tokenizer(format=compute_text, **options):
@@ -94,7 +94,7 @@ def test_callback_called_once_only_when_field_emits_and_gets_a_context_copy():
     assert len(seen) == 1
 
 
-def test_input_selection_and_lookup_are_available_in_context():
+def test_input_selection_is_available_by_name():
     tok = Tokenizer(
         tokenizers={"text": CharacterTokenizer()},
         input_fields=[
@@ -103,7 +103,6 @@ def test_input_selection_and_lookup_are_available_in_context():
                 provider="sensor",
                 input_field="action",
                 input_index=1,
-                lookup=["A", "B"],
                 format=selected_value,
             )
         ],

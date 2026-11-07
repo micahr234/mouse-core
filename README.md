@@ -134,7 +134,9 @@ Repeated-task collectors record the zero-based `repeat_episode_index` only on
 the environment reset event starting each inner episode, using the live tracker.
 Subsequent action results and terminal events omit it. The saved index is used
 directly by the FrozenLake tokenizers to render a one-based `episode N` header
-before the reset observation. Inner termination and truncation append two
+before the reset observation. A separate tokenizer entry filters on the same
+reset-only field and emits the literal `x` action marker (`x,observation`).
+Inner termination and truncation append two
 newlines; those separators and headers do not create prediction readouts.
 Generic event views preserve this sparse field without reconstructing a counter.
 Recollect datasets with the current payload field names and reset indices
@@ -161,20 +163,32 @@ an event without the marker continues the current step. The first event needs a
 marker. Readout positions are ordinary input fields marked `head_output=True`.
 The existing `\n` token marks an action request only when its sparse field is present.
 Passive and terminal steps retain their tokens and labels without producing a readout.
-Every tokenizer field requires a concrete `provider` name; missing, blank, and `None` providers are rejected.
+`provider` and `input_field` are optional filters. Omit `provider` (or use `None`)
+to match every provider. Set `input_field` to a name or list of names; a declaration
+runs when any selected field is present and non-`None`. Missing selected fields are
+available as `None`; false, zero, and empty values still count as present. Omit
+`input_field` to expose every payload field and run on every matching event.
+Formats use actual payload names, such as `{observation}` or `{reward:.2f}`.
+Repeated or overlapping filters emit in declaration order.
 Using an existing Hugging Face tokenizer:
 
 ```python
 from functools import partial
 from mouse_core.data import DataLoader, Tokenizer, step_sample_ranges
 
+
+def action_name(action):
+    return ("a", "b", "c", "d")[action]
+
+
 tokenizer = Tokenizer(
     tokenizers={"text": hf_tokenizer},
     step_field="step_index",
     episode_field="episode_index",
     input_fields=[
-        {"type": "text", "provider": "agent", "input_field": "action", "lookup": ["a", "b", "c", "d"], "format": "{field}"},
-        {"type": "text", "provider": "environment", "input_field": "observation", "format": ",{field}"},
+        {"type": "text", "provider": "agent", "input_field": "action",
+         "format": "{action_name(action)}", "format_functions": {"action_name": action_name}},
+        {"type": "text", "provider": "environment", "input_field": "observation", "format": ",{observation}"},
         {"type": "token", "provider": "environment", "input_field": "action_requested",
          "format": "\n", "head_output": True},
     ],
@@ -211,9 +225,47 @@ Training labels remain explicit `objective_fields`; qualified fields such as
 the step. The examples reuse the existing `\n` token as the action-request readout.
 It must encode to exactly one ID. This leaves the tokenizer vocabulary and model
 embedding size unchanged, so the marker needs no new embedding row to train.
-For discrete actions, `lookup=["a", "b", "c", "d"]` renders IDs 0–3 as letters
-before applying `format`. Missing values are skipped; invalid IDs raise.
-Stored actions and objective labels remain numeric.
+Use `format_functions` to bind external functions inside a format expression,
+such as `{action_name(action)}` above. Mapping and validation belong to the
+function; stored actions and objective labels remain numeric. Functions can take
+multiple selected fields and keyword arguments. Formats use normal Python f-string
+expressions: arithmetic, conditions, indexing, attribute/method access,
+comprehensions, generators, lambdas, and format specifications. Python builtins
+such as `len`, `sum`, `str`, and `sorted` are available without registration:
+
+```python
+{"type": "text", "input_field": "rewards", "format": "{sum(rewards) / len(rewards):.2f}"}
+{"type": "text", "input_field": "observation", "format": "{' '.join(str(x) for x in observation)}"}
+```
+
+Event fields and registered functions are the supplied names; the caller's local
+variables and Mouse Core's module globals are not injected. Bindings take precedence
+over builtins. Registered function names must not collide with payload names.
+Each rendering gets a fresh namespace, including for nested expressions. Formats
+are trusted Python code, like callable formats; this is not a sandbox. Supply a
+plain string, not an `f`-prefixed string that Python would evaluate at setup time.
+
+Episode separators and fixed compute text need no callbacks:
+
+```python
+separator_field = {
+    "type": "text", "provider": "environment",
+    "input_field": ["inner_terminated", "inner_truncated"],
+    "format": "\n\n",
+}
+compute_field = {
+    "type": "text", "provider": "environment",
+    "input_field": "action_requested", "format": " ." * COMPUTE_TOKENS,
+}
+```
+
+The example collectors omit false ending flags, so presence alone selects the
+separator. It emits once even when both flags are present. Place compute text before
+the readout declaration; both can filter on `action_requested`. Verify the chosen
+backend encodes repeated compute text to the intended token count.
+`input_index` optionally selects a scalar from a single named vector; formats can
+also index arrays directly, such as `{observation[0]:.2f}`. Image declarations
+encode each selected image in selection order, or payload order with no filter.
 
 A `text` or `token` field can use a function for `format`. The function receives
 the event payload and returns text; return `""` to skip that field:
@@ -238,12 +290,15 @@ compute_field = {
 Each matching event calls the function once. Returned text goes through ordinary
 tokenization; characters or repetitions do not necessarily equal token count.
 Returning `""` emits no tokens. With `input_field`, missing values skip the
-callback and the selected/lookup value is available as `ctx["field"]`.
+callback when none of the selected fields is present. Callbacks receive a copy
+of the full payload, with selected values (including `input_index`) under their
+original names.
 `max_tokens` still limits the actual tokenized length. Callback randomness and
 inference choices belong to your function, not the tokenizer. For cached
 inference, keep generated text in the history stable when rebuilding it.
-Named callbacks save/load by import reference; redefine notebook callbacks
-before loading their saved tokenizer. [Notebook 02](examples/02_train_offline_dqn.ipynb)
+Named callbacks and `format_functions` save/load by import reference; redefine notebook functions
+before loading their saved tokenizer. Saved specs use `mouse-core-tokenizer-v5`;
+rebuild older specs with named fields and function bindings. [Notebook 02](examples/02_train_offline_dqn.ipynb)
 demonstrates a fixed compute-token count and ordinary FrozenLake DQN training.
 
 For a compute curriculum, pass a schedule to `DataLoader`. This runtime context is
@@ -318,8 +373,8 @@ tokenizer = Tokenizer(
         {"type": "text", "provider": "coordinator", "tokenizer": "text",
          "input_field": "_episode_start", "format": episode_prompt},
         {"type": "text", "provider": "agent", "tokenizer": "actions", "input_field": "action",
-         "lookup": ["a", "b", "c", "d"], "format": "{field}"},
-        {"type": "text", "provider": "environment", "tokenizer": "text", "input_field": "observation", "format": ",{field}"},
+         "format": "{action_name(action)}", "format_functions": {"action_name": action_name}},
+        {"type": "text", "provider": "environment", "tokenizer": "text", "input_field": "observation", "format": ",{observation}"},
         {"type": "token", "provider": "environment", "tokenizer": "text", "input_field": "action_requested",
          "format": "\n", "head_output": True},
     ],
@@ -487,7 +542,7 @@ GNU General Public License v3.0 — see [LICENSE](LICENSE).
 ### Optional numeric and position additions
 
 The token types are `text`, `token`, and `image`. `token` uses the same formatting,
-lookup, and indexing as `text`, but must produce exactly one token. `special=True`
+function calls, and indexing as `text`, but must produce exactly one token. `special=True`
 registers a literal token; dynamically formatted tokens use the existing vocabulary.
 
 Any of these types can add a numeric measurement and a position to every token
@@ -498,7 +553,7 @@ it produces, without emitting extra tokens:
     "type": "text",
     "provider": "charger",
     "input_field": "description",
-    "format": "Charger: {field}",
+    "format": "Charger: {description}",
     "numeric_field": "battery_energy_kwh",
     "fourier_min": 0.0,
     "fourier_max": 100.0,
@@ -563,3 +618,38 @@ Model weight exports record the fully qualified model class. `load_model` requir
 a caller-constructed instance of that class and matching state keys and tensor
 shapes; mismatches fail before applying weights. It does not deserialize Python
 classes or compare forward code sharing the same class name.
+
+
+### Model performance benchmarks
+
+Run these only when GPUs are available. The training and inference harnesses use
+synchronized wall time, including CPU scheduling/launch work, rather than just
+CUDA event time. They accept `--max-attention-distance-tokens` (default 16383,
+plus the current token) to match training and inference masks. Inference also
+accepts `--max-batch-tokens` to control the HF scheduler query budget.
+
+```bash
+.venv/bin/python bench/bench_train.py --layers 4 --workloads short --modes compiled --max-attention-distance-tokens 16383
+.venv/bin/python bench/bench_inference.py --layers 4 --workloads short --step 1 --max-batch-tokens 1024 --max-attention-distance-tokens 16383
+.venv/bin/python bench/bench_continuous_decode.py --device cuda --iterations 20 --max-batch-tokens 1024 --max-attention-distance-tokens 16383
+```
+
+`bench_continuous_decode.py` records raw warmup/timed samples, versions, shapes,
+query budget, attention distance and fixed pool capacity for uniform/ragged rows.
+Logical decode positions advance during measurement; retained history stays
+window-bounded. `bench_inference.py` reports resident session allocation separately
+from transient peak allocation above the warmed baseline. The HF circular cache
+is allocated up front; it does not grow or use CUDA graph capture in this path.
+
+First calls are reported separately, but warmup does not guarantee that later
+shapes avoid compilation. Run each comparison in a fresh process; the compiled
+decoder installation is process-wide, so eager must precede compiled modes if
+combined. The training-step samples update weights. Use `--profile` or
+`--profile-trace runs/traces` on the train/inference harnesses for additional
+CPU/device diagnostics outside the timing samples. These synthetic workloads
+exclude tokenization and environments; downstream train/eval harnesses measure
+those production paths. Use `bench/bench_dataloader.py` and
+`bench/bench_worker_transport.py` separately to examine preparation/transport.
+A smaller configured window reduces pool capacity, but need not reduce attention
+work when actual histories already fit below both compared limits. Older CUDA
+event timing reports are not directly comparable to these wall-time reports.

@@ -204,15 +204,20 @@ class ContinuousDecodeSession:
 
     def submit(self, row: int, embeds: torch.Tensor, *, output_hidden_states: bool = False) -> None:
         """Queue the next embedding chunk for one row, retaining its earlier KV."""
-        _, scheduler = self._check()
+        self._check()
         self._validate_submission(row, embeds)
         self._check_capacity({row: embeds.shape[0]})
+        self._enqueue(row, embeds, output_hidden_states=output_hidden_states)
+
+    def _enqueue(self, row: int, embeds: torch.Tensor, *, output_hidden_states: bool) -> None:
+        """Queue an input after the public entry point has validated the batch."""
+        assert self._scheduler is not None
         self._pending[row] = _Submission(embeds.detach().to(device=self.device, dtype=self.dtype), output_hidden_states)
         # HF schedules lists of IDs. These are local embedding indices, never
         # vocabulary IDs; prefix sharing MUST remain disabled for numeric inputs.
         state = RequestState(request_id=str(row), initial_tokens=list(range(embeds.shape[0])))
         state.position_offset = self._lengths[row]
-        scheduler.add_waiting_request(state)
+        self._scheduler.add_waiting_request(state)
 
     @torch.no_grad()
     def step(self) -> dict[int, Readout]:
@@ -246,8 +251,11 @@ class ContinuousDecodeSession:
                 k_pos.extend(range(past + count - key_count, past + count))
                 read.extend(allocator.get_read_indices(state.request_id, past, count))
                 write.extend(allocator.get_write_indices(state.request_id, past, count))
-            qo, ko, qp, kp, ri, wi = [torch.tensor(v, device=self.device, dtype=torch.long)
-                                     for v in (q_owner, k_owner, q_pos, k_pos, read, write)]
+            # One host-to-device copy for the scheduling metadata.
+            metadata = (q_owner, k_owner, q_pos, k_pos, read, write)
+            qo, ko, qp, kp, ri, wi = torch.tensor(
+                [index for part in metadata for index in part], device=self.device, dtype=torch.long,
+            ).split([len(part) for part in metadata])
             mask = flex_block_mask(
                 _packed_mask(qo, ko, qp, kp, self._mask_window), B=1, Q_LEN=len(q_pos), KV_LEN=len(k_pos),
                 device=self.device, block_size=_BLOCK_SIZE, compile_masks=_use_flex_compile(self.device),
@@ -313,7 +321,7 @@ class ContinuousDecodeSession:
         layers = tuple(torch.zeros_like(output) for _ in self.model.layers) if output_hidden_states else ()
         for row, count in enumerate(lengths):
             if count:
-                self.submit(row, embeds[row, -count:], output_hidden_states=output_hidden_states)
+                self._enqueue(row, embeds[row, -count:], output_hidden_states=output_hidden_states)
         while self._pending:
             for row, result in self.step().items():
                 if isinstance(result, tuple):

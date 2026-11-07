@@ -56,26 +56,24 @@ def test_offline_tokenizer_adds_fixed_compute_before_each_value_without_extra_re
     assert data["head_step_ids"].tolist() == list(range(15))
 
 
-def test_inference_callback_reconstructs_identical_text_without_sampling():
-    notebook = json.loads((EXAMPLES / "15_inference.ipynb").read_text())
-    node = next(
-        node
-        for cell in notebook["cells"]
-        if cell["cell_type"] == "code"
-        for node in ast.parse("".join(cell["source"])).body
-        if isinstance(node, ast.FunctionDef) and node.name == "compute_text"
-    )
-    ns: dict[str, Any] = {"INFERENCE_COMPUTE_TOKENS": 3}
-    exec(
-        compile(
-            ast.Module(body=[node], type_ignores=[]), "<inference-callback>", "exec"
-        ),
-        ns,
-    )
-    formatter = ns["compute_text"]
-    assert formatter({"action_requested": True}) == " ." * 3
-    assert formatter({"action_requested": True}) == " ." * 3
-    assert formatter({}) == ""
+def test_saved_constant_compute_reconstructs_identical_text_without_callbacks(tmp_path):
+    from mouse_core.data import load_tokenizer, save_tokenizer
+    from tests.test_collection_events import _CharacterTokenizer
+    import sys
+
+    tok = _notebook_transform(NOTEBOOK.name, tokenizer_only=True, compute_tokens=3)
+    # Notebook functions must be defined in the loading module's namespace.
+    function = next(spec.format_functions["action_name"] for spec in tok.input_fields if spec.format_functions)
+    function.__module__ = __name__
+    setattr(sys.modules[__name__], "action_name", function)
+    save_tokenizer(tokenizer=tok, path=tmp_path)
+    restored = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizers={"text": _CharacterTokenizer()})
+    for payload in ({"action_requested": True}, {}):
+        event = dict(provider="environment", payload=payload)
+        np.testing.assert_array_equal(tok(event)["token_ids"], restored(event)["token_ids"])
+    compute = next(spec for spec in restored.input_fields
+                   if spec.type == "text" and spec.input_field == "action_requested")
+    assert compute.format == " ." * 3
 
 
 @pytest.mark.flex_training
@@ -90,10 +88,10 @@ def test_offline_dqn_update_backpropagates_into_compute_positions():
         ],
     )
     tokenizer = _notebook_transform(
-        NOTEBOOK.name, tokenizer_only=True, compute_tokens=None
+        NOTEBOOK.name, tokenizer_only=True, compute_tokens=3
     )
     inputs, data = pack_token_batch(
-        steps=tokenizer.encode(log, context={"compute_tokens": 3})
+        steps=tokenizer.encode(log)
     )
     # The test model has a 32-entry table; keep layout, features, and labels intact.
     inputs["token_ids"] %= 32
@@ -125,7 +123,9 @@ def test_offline_dqn_update_backpropagates_into_compute_positions():
 def _compute_notebook_setup(filename, backend, **overrides):
     notebook = json.loads((EXAMPLES / filename).read_text())
     namespace: dict[str, Any] = {
-        "tokenizer": SimpleNamespace(tokenizers={"text": backend})
+        "tokenizer": SimpleNamespace(tokenizers={"text": backend}, input_fields=[
+            SimpleNamespace(type="text", provider="environment", input_field="action_requested", format=" ." * 3)
+        ])
     }
     settings = ast.parse("".join(notebook["cells"][1]["source"])).body
     for node in settings:
@@ -139,13 +139,8 @@ def _compute_notebook_setup(filename, backend, **overrides):
         if cell["cell_type"] != "code":
             continue
         for node in ast.parse("".join(cell["source"])).body:
-            if isinstance(node, ast.FunctionDef) and node.name in {
-                "compute_text",
-                "training_context",
-            }:
-                body.append(node)
-            elif isinstance(node, ast.Assign) and any(
-                isinstance(target, ast.Name) and target.id == "compute_token_ids"
+            if isinstance(node, ast.Assign) and any(
+                isinstance(target, ast.Name) and target.id in {"compute_text", "compute_token_ids"}
                 for target in node.targets
             ):
                 body.append(node)
@@ -194,55 +189,23 @@ def test_qwen_compute_text_has_exact_configured_token_counts():
     namespace = _compute_notebook_setup(NOTEBOOK.name, backend)
     (token,) = namespace["compute_token_ids"]
     assert token == 659
-    tok = Tokenizer(
-        tokenizers={"text": backend},
-        input_fields=[
-            dict(type="text", provider="environment", format=namespace["compute_text"]),
-            dict(
-                type="token",
-                provider="environment",
-                input_field="action_requested",
-                format="\n",
-                head_output=True,
-            ),
-        ],
-    )
     for count in (0, 1, 3, 10):
-        piece = tok(
-            dict(provider="environment", payload={"action_requested": True}),
-            context={"compute_tokens": count},
-        )
-        assert piece["token_ids"].tolist() == [token] * count + backend.encode(
-            "\n", add_special_tokens=False
-        )
+        tok = Tokenizer(tokenizers={"text": backend}, input_fields=[
+            dict(type="text", provider="environment", input_field="action_requested", format=" ." * count),
+            dict(type="token", provider="environment", input_field="action_requested", format="\n", head_output=True),
+        ])
+        piece = tok(dict(provider="environment", payload={"action_requested": True}))
+        assert piece["token_ids"].tolist() == [token] * count + backend.encode("\n", add_special_tokens=False)
         assert piece["head_token_mask"].tolist() == [False] * count + [True]
     inference = _compute_notebook_setup("15_inference.ipynb", backend)
-    text = inference["compute_text"]({"action_requested": True})
-    assert (
-        backend.encode(text, add_special_tokens=False)
-        == [token] * inference["INFERENCE_COMPUTE_TOKENS"]
-    )
+    assert backend.encode(inference["compute_text"], add_special_tokens=False) == [token] * 3
     assert len(backend.encode("." * 10, add_special_tokens=False)) == 1
 
 
-def test_notebook_compute_count_is_constant_across_batches_and_can_be_changed():
-    class Backend:
-        def encode(self, text, **kwargs):
-            return [659] * (len(text) // 2)
-
-    ns = _compute_notebook_setup(NOTEBOOK.name, Backend(), COMPUTE_TOKENS=3)
-    context_for_batch = ns["training_context"]
-    for index in (0, 1, 100):
-        context = context_for_batch(index)
-        assert context == {"compute_tokens": 3}
-        assert (
-            ns["compute_text"]({"action_requested": True}, context=context) == " ." * 3
-        )
-    ns["COMPUTE_TOKENS"] = 0
-    assert (
-        ns["compute_text"]({"action_requested": True}, context=context_for_batch(101))
-        == ""
-    )
-    ns["COMPUTE_TOKENS"] = 8
-    assert context_for_batch(102) == {"compute_tokens": 8}
-    assert ns["compute_text"]({}, context=context_for_batch(102)) == ""
+@pytest.mark.parametrize("count", [0, 3, 8])
+def test_notebook_compute_count_is_fixed_at_construction(count):
+    tokenizer = _notebook_transform(NOTEBOOK.name, tokenizer_only=True, compute_tokens=count)
+    event = dict(provider="environment", payload={"action_requested": True})
+    for _ in range(3):
+        assert tokenizer(event)["token_ids"].tolist() == [32, 46] * count + [10]
+    assert tokenizer(dict(provider="environment", payload={}))["token_ids"].size == 0

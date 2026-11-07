@@ -1,8 +1,9 @@
 """Benchmark FlexAttention packed training on CUDA.
 
 Measure eager, compiled, and checkpointed decoder bodies: forward, backward,
-optimizer step, tokens/second, and peak allocation. Compile warmup is reported
-separately. Example: python bench/bench_train.py --layers 8 --modes compiled
+optimizer step, tokens/second, and peak allocation. Synchronized wall times
+include CPU work. First-call time is reported separately; later shapes can still
+compile. Each sample updates weights in the training-step measurement. Example: python bench/bench_train.py --layers 8 --modes compiled
 """
 
 from __future__ import annotations
@@ -54,7 +55,7 @@ def _workload(name: str, device: torch.device) -> torch.Tensor:
 
 
 def _timed(fn: Callable[[], Any], iters: int) -> tuple[float, float, float, float, float]:
-    """(first-call ms, median ms, min ms, max ms, peak MB above baseline)."""
+    """Synchronized wall ms (including host work), then peak MB above baseline."""
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     fn()
@@ -64,15 +65,13 @@ def _timed(fn: Callable[[], Any], iters: int) -> tuple[float, float, float, floa
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
     base = torch.cuda.memory_allocated()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
     times: list[float] = []
     for _ in range(iters):
-        start.record()
-        fn()
-        end.record()
         torch.cuda.synchronize()
-        times.append(start.elapsed_time(end))
+        start = time.perf_counter()
+        fn()
+        torch.cuda.synchronize()
+        times.append((time.perf_counter() - start) * 1e3)
     peak = (torch.cuda.max_memory_allocated() - base) / 2**20
     return first, statistics.median(times), min(times), max(times), peak
 
@@ -87,17 +86,26 @@ def main() -> None:
     parser.add_argument("--ffn", type=int, default=3072)
     parser.add_argument("--no-lora", action="store_true", help="fully trainable fp32 backbone")
     parser.add_argument("--iters", type=int, default=10)
+    parser.add_argument("--max-attention-distance-tokens", type=int, default=16383)
     parser.add_argument(
         "--workloads",
         nargs="+",
         default=["short", "mid", "mid_recurring", "high_variance", "long", "long_recurring", "long_manysmall"],
     )
-    parser.add_argument("--modes", nargs="+", default=["eager", "compiled", "compiled+checkpoint"])
+    parser.add_argument("--modes", nargs="+", choices=["eager", "compiled", "compiled+checkpoint"],
+                        default=["eager", "compiled", "compiled+checkpoint"])
     add_profile_args(parser)
     args = parser.parse_args()
+    if args.iters < 1 or args.max_attention_distance_tokens < 0:
+        parser.error("iters must be positive and attention distance nonnegative")
 
+    if "eager" in args.modes and any(mode != "eager" for mode in args.modes[:args.modes.index("eager")]):
+        parser.error("eager must precede compiled modes: compiled decoder installation is process-wide")
+    if len(set(args.modes)) != len(args.modes):
+        parser.error("modes must not repeat")
     if not torch.cuda.is_available():
         raise SystemExit("this benchmark needs CUDA")
+    torch.set_float32_matmul_precision("high")
     device = torch.device("cuda")
     torch.manual_seed(0)
     lora = None if args.no_lora else LoRAConfig(rank=16, alpha=32.0)
@@ -112,6 +120,7 @@ def main() -> None:
         head_dim=args.head_dim,
         intermediate_size=args.ffn,
         lora=lora,
+        max_attention_distance_tokens=args.max_attention_distance_tokens,
     )
     backbone.to(device)
     for name, p in backbone.named_parameters():
@@ -125,7 +134,8 @@ def main() -> None:
     print(
         f"{props.name} | torch {torch.__version__} | layers={args.layers} base dtype={dtype} "
         f"lora={'off' if lora is None else f'r{lora.rank}'} params={sum(p.numel() for p in backbone.parameters())/1e6:.1f}M "
-        f"trainable={sum(p.numel() for p in trainable)/1e6:.2f}M"
+        f"trainable={sum(p.numel() for p in trainable)/1e6:.2f}M "
+        f"attention_distance={args.max_attention_distance_tokens} TF32=high wall timing"
     )
 
     for mode in args.modes:
@@ -164,7 +174,7 @@ def main() -> None:
                 optimizer.zero_grad(set_to_none=True)
                 embeds.grad = None
 
-            iters = args.iters if L <= 4096 else max(3, args.iters // 2)
+            iters = args.iters
             first_f, med_f, _, _, peak_f = _timed(fwd, iters)
             first_b, med_b, lo_b, hi_b, peak_b = _timed(fwd_bwd, iters)
             _, med_s, _, _, peak_s = _timed(train_step, iters)

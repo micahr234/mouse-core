@@ -1,13 +1,16 @@
 """Measure HF scheduled circular-cache RL inference on uniform and ragged inputs.
 
 Times include CPU scheduling, KV gathering and device execution, after warmup.
-No environment/tokenizer time or compile warmup is included in steady-state times.
+Environment/tokenizer time is excluded. Warmup samples are separate; new shapes
+can still compile later, so inspect raw samples before claiming steady state.
 Example: PYTHONPATH=src .venv/bin/python bench/bench_continuous_decode.py --device cuda
 """
 from __future__ import annotations
 
 import argparse
 import json
+from importlib.metadata import version
+import platform
 import statistics
 import time
 
@@ -25,8 +28,10 @@ def main():
     parser.add_argument('--max-attention-distance-tokens', type=int, default=16383)
     parser.add_argument('--iterations', type=int, default=10)
     args = parser.parse_args()
-    if args.hidden % 8 or min(args.layers, args.max_batch_tokens, args.iterations) <= 0:
-        parser.error('hidden must be divisible by 8; layers, token budget, iterations must be positive')
+    if args.hidden % 8 or min(args.hidden, args.layers, args.max_batch_tokens, args.iterations) <= 0 or args.max_attention_distance_tokens < 0:
+        parser.error('hidden must be positive and divisible by 8; layers, budget, iterations positive; distance nonnegative')
+    if args.device == 'cuda' and args.hidden < 128:
+        parser.error('CUDA FlexAttention requires head_dim >= 16 (hidden >= 128 for 8 heads)')
     torch.manual_seed(78)
     torch.set_float32_matmul_precision('high')
     model = Backbone(architecture='qwen3', dtype=torch.float32, hidden_dim=args.hidden,
@@ -51,7 +56,9 @@ def main():
         ):
             inputs = torch.randn(4, max(lengths), args.hidden, device=args.device)
             step_inputs = torch.randn(4, max(step_lengths), args.hidden, device=args.device)
+            before_session = torch.cuda.memory_allocated() if args.device == 'cuda' else None
             session = model.decode_session(4, max_batch_tokens=args.max_batch_tokens)
+            session_bytes = torch.cuda.memory_allocated() - before_session if before_session is not None else None
             def prefill():
                 session.reset_rows()
                 return session.forward(embeds=inputs, lengths=lengths)
@@ -59,17 +66,26 @@ def main():
                 return session.forward(embeds=step_inputs, lengths=step_lengths)
             try:
                 first_ms = measured(prefill)
-                decode()
-                for _ in range(3):
-                    prefill()
-                prefill_ms = statistics.median(measured(prefill) for _ in range(args.iterations))
+                first_decode_ms = measured(decode)
+                warmup_prefill_ms = [measured(prefill) for _ in range(3)]
+                prefill_samples = [measured(prefill) for _ in range(args.iterations)]
+                prefill_ms = statistics.median(prefill_samples)
                 prefill()
-                for _ in range(10):
-                    decode()
-                decode_ms = statistics.median(measured(decode) for _ in range(args.iterations))
+                warmup_decode_ms = [measured(decode) for _ in range(10)]
+                decode_samples = [measured(decode) for _ in range(args.iterations)]
+                decode_ms = statistics.median(decode_samples)
                 print(json.dumps(dict(workload=name, backend="hugging_face", device=args.device,
                                       layers=args.layers, hidden=args.hidden, max_batch_tokens=args.max_batch_tokens,
-                                      first_prefill_ms=round(first_ms, 3),
+                                      max_attention_distance_tokens=args.max_attention_distance_tokens,
+                                      cache_capacity_tokens=session.cache_capacity_tokens,
+                                      session_allocated_bytes=session_bytes,
+                                      context_lengths=lengths, query_lengths=step_lengths,
+                                      python=platform.python_version(), torch=torch.__version__,
+                                      transformers=version('transformers'),
+                                      gpu=torch.cuda.get_device_name() if args.device == 'cuda' else None,
+                                      first_prefill_ms=first_ms, first_decode_ms=first_decode_ms,
+                                      warmup_prefill_ms=warmup_prefill_ms, warmup_decode_ms=warmup_decode_ms,
+                                      prefill_samples_ms=prefill_samples, decode_samples_ms=decode_samples,
                                       prefill_ms=round(prefill_ms, 3), decode_ms=round(decode_ms, 3))), flush=True)
             finally:
                 session.close()

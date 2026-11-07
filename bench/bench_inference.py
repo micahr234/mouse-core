@@ -2,9 +2,10 @@
 
 Measures, per workload: prefill of a context into an empty paged KV pool,
 then a decode step of ``--step`` new tokens per row against that history.
-Reports median CUDA-event time, peak allocated memory above the parameter
-baseline, tokens/second, and first-call (compile / page-grow / incremental
-CUDA-graph capture) time. ``--profile`` adds a ``torch.profiler`` CPU/CUDA
+Reports synchronized median wall time (including host scheduling), transient
+peak allocation above the warmed baseline, resident session allocation,
+tokens/second, and first-call time. The HF paged pool is fixed at creation;
+this path does not use CUDA graphs. ``--profile`` adds a ``torch.profiler`` CPU/CUDA
 breakdown after warmup. Decode always uses FlexAttention.
 ``torch.set_float32_matmul_precision("high")`` is set so fp32 matches the
 README TF32 path.
@@ -79,7 +80,7 @@ def _left_pad(
 
 
 def _timed(fn: Callable[[], Any], iters: int) -> tuple[float, float, float, float, float]:
-    """(first-call ms, median ms, min ms, max ms, peak MB above baseline)."""
+    """Synchronized wall ms (including host work), then peak MB above baseline."""
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     fn()
@@ -89,15 +90,13 @@ def _timed(fn: Callable[[], Any], iters: int) -> tuple[float, float, float, floa
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
     base = torch.cuda.memory_allocated()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
     times: list[float] = []
     for _ in range(iters):
-        start.record()
-        fn()
-        end.record()
         torch.cuda.synchronize()
-        times.append(start.elapsed_time(end))
+        start = time.perf_counter()
+        fn()
+        torch.cuda.synchronize()
+        times.append((time.perf_counter() - start) * 1e3)
     peak = (torch.cuda.max_memory_allocated() - base) / 2**20
     return first, statistics.median(times), min(times), max(times), peak
 
@@ -118,6 +117,8 @@ def main() -> None:
         help="new tokens every row adds on the decode step (any constant S)",
     )
     parser.add_argument("--iters", type=int, default=10)
+    parser.add_argument("--max-attention-distance-tokens", type=int, default=16383)
+    parser.add_argument("--max-batch-tokens", type=int, default=1024)
     parser.add_argument(
         "--workloads",
         nargs="+",
@@ -125,8 +126,10 @@ def main() -> None:
     )
     add_profile_args(parser)
     args = parser.parse_args()
-    if args.step < 1:
-        raise SystemExit("--step must be >= 1")
+    if args.iters < 1 or args.max_attention_distance_tokens < 0:
+        parser.error("iters must be positive and attention distance nonnegative")
+    if args.step < 1 or args.max_batch_tokens < 1:
+        raise SystemExit("--step and --max-batch-tokens must be >= 1")
 
     if not torch.cuda.is_available():
         raise SystemExit("this benchmark needs CUDA")
@@ -136,6 +139,7 @@ def main() -> None:
     lora = None if args.no_lora else LoRAConfig(rank=16, alpha=32.0)
     dtype = torch.float32 if lora is None else torch.bfloat16
     backbone = Backbone(
+        architecture="qwen3",
         dtype=dtype,
         hidden_dim=args.hidden,
         num_layers=args.layers,
@@ -144,6 +148,7 @@ def main() -> None:
         head_dim=args.head_dim,
         intermediate_size=args.ffn,
         lora=lora,
+        max_attention_distance_tokens=args.max_attention_distance_tokens,
     )
     backbone.to(device)
     backbone.eval()
@@ -156,7 +161,8 @@ def main() -> None:
     print(
         f"{props.name} | torch {torch.__version__} | layers={args.layers} base dtype={dtype} "
         f"lora={'off' if lora is None else f'r{lora.rank}'} params={sum(p.numel() for p in backbone.parameters())/1e6:.1f}M "
-        f"| FlexAttention TF32=high step={args.step}"
+        f"| FlexAttention TF32=high step={args.step} "
+        f"attention_distance={args.max_attention_distance_tokens} query_budget={args.max_batch_tokens} wall timing"
     )
 
     step_s = args.step
@@ -168,7 +174,9 @@ def main() -> None:
         S = prefill_embeds.shape[1]
         step_embeds = torch.randn(B, step_s, args.hidden, device=device, dtype=dtype)
         step_lens = [step_s] * B
-        session = backbone.decode_session(batch_size=B)
+        before_session = torch.cuda.memory_allocated(device)
+        session = backbone.decode_session(batch_size=B, max_batch_tokens=args.max_batch_tokens)
+        session_mb = (torch.cuda.memory_allocated(device) - before_session) / 2**20
 
         def prefill() -> None:
             session.reset_rows()
@@ -177,15 +185,15 @@ def main() -> None:
         def decode_step() -> None:
             session.forward(embeds=step_embeds, lengths=step_lens)
 
-        iters = args.iters if tokens <= 4096 * 4 else max(3, args.iters // 2)
+        iters = args.iters
         first_p, med_p, lo_p, hi_p, peak_p = _timed(prefill, iters)
         # Restore the requested context before measuring incremental decoding.
-        # Each timed decode appends tokens, so its context grows across iterations.
+        # Logical positions advance across iterations; retained history is window-bounded.
         session.reset_rows()
         session.forward(embeds=prefill_embeds, lengths=prefill_lens)
         first_d, med_d, lo_d, hi_d, peak_d = _timed(decode_step, iters)
         print(
-            f"  {wname:15s} B={B} S={S:5d} tokens={tokens:6d} step={step_s} | "
+            f"  {wname:15s} session={session_mb:.0f} MB pool={session.cache_capacity_tokens} tokens B={B} S={S:5d} tokens={tokens:6d} step={step_s} | "
             f"prefill {med_p:8.2f} ms [{lo_p:.1f},{hi_p:.1f}] (+{peak_p:6.0f} MB) | "
             f"{tokens / med_p * 1e3:>9,.0f} tok/s | "
             f"decode {med_d:8.2f} ms [{lo_d:.1f},{hi_d:.1f}] (+{peak_d:6.0f} MB) | "

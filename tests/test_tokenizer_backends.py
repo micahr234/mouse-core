@@ -34,8 +34,8 @@ def configured(*, wrapper=False):
                     input_fields=[
         dict(provider="sensor", type='text', tokenizer='text', input_field='_episode_start', format='prefix'),
         dict(type='text', tokenizer='other', provider='agent', input_field='action',
-             lookup=['obs', 'action'], format='{field}'),
-        dict(type='text', tokenizer='text', provider='sensor', input_field='text', format='{field}'),
+              format="{(['obs', 'action'])[action]}"),
+        dict(type='text', tokenizer='text', provider='sensor', input_field='text', format='{text}'),
         dict(provider="sensor", type="token", tokenizer='text', input_field='number', numeric_field='number', format='reward',
              fourier_min=0., fourier_max=2.),
         dict(provider="sensor", type='token', tokenizer='text', input_field='request', format='<readout>',
@@ -97,8 +97,8 @@ def test_mergeable_fields_and_events_remain_separate_and_ordered():
     source = bpe_backend()
     assert source('ab', add_special_tokens=False)['input_ids'] == [3]
     tok = Tokenizer(tokenizers={'text': source}, input_fields=[
-        dict(provider="sensor", type='text', input_field='first', format='{field}'),
-        dict(provider="sensor", type='text', input_field='second', format='{field}'),
+        dict(provider="sensor", type='text', input_field='first', format='{first}'),
+        dict(provider="sensor", type='text', input_field='second', format='{second}'),
     ])
     steps = tok.encode([
         dict(provider='sensor', step_index=0, payload={'second': 'b', 'first': 'a'}),

@@ -33,7 +33,7 @@ def _tok_in(
         {"provider": "sensor",
             "type": "text",
             "input_field": name,
-            "format": "{field}",
+            "format": "{" + name + "}",
             **({"head_output": True} if name == head_output else {}),
         }
         for name in names
@@ -46,7 +46,7 @@ def _tok_in(
             {"provider": "sensor",
                 "type": "text",
                 "input_field": "repeat_episode_index",
-                "format": lambda ctx: f"{ctx['field']}" if ('step_index' in ctx and ctx['step_index'] == 0) else "",
+                "format": lambda ctx: f"{ctx['repeat_episode_index']}" if ('step_index' in ctx and ctx['step_index'] == 0) else "",
             }
         )
     return fields
@@ -90,13 +90,13 @@ def test_tokenizer_renames_objective_fields() -> None:
             {"provider": "sensor",
                 "type": "text",
                 "input_field": "act",
-                "format": "{field}",
+                "format": '{act}',
                 "head_output": True,
             },
             {"provider": "sensor",
                 "type": "text",
                 "input_field": "repeat_episode_index",
-                "format": lambda ctx: f"{ctx['field']}" if ('step_index' in ctx and ctx['step_index'] == 0) else "",
+                "format": lambda ctx: f"{ctx['repeat_episode_index']}" if ('step_index' in ctx and ctx['step_index'] == 0) else "",
             },
         ],
         objective_fields=_io(("q", "q_star")),

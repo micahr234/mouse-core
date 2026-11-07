@@ -316,24 +316,16 @@ def _notebook_transform(filename, *, tokenizer_only=False, compute_tokens=0):
     assignments = {'episode_prompt', 'augmenter', 'tokenizer', 'train_transform', 'transform'}
     body: list[ast.stmt] = [node for node in ast.parse(source).body if
             isinstance(node, ast.FunctionDef) and
-            (node.name.startswith('on_') or node.name in {'frozenlake_fields', 'behavior_fields', 'compute_text', 'episode_separator'})
+            (node.name.startswith('on_') or node.name in {'frozenlake_fields', 'behavior_fields', 'action_name'})
             or isinstance(node, ast.Assign) and any(isinstance(target, ast.Name)
                                                     and target.id in assignments for target in node.targets)]
 
     def tokenizer_factory(**kwargs):
         sources = kwargs.pop('tokenizers')
-        for field in kwargs['input_fields']:
-            formatter = field.get('format')
-            if compute_tokens is not None and callable(formatter) and formatter.__name__ == 'compute_text':
-                def fixed_compute(payload, formatter=formatter):
-                    return formatter(payload, context={
-                        'compute_tokens': compute_tokens,
-                    })
-                field['format'] = fixed_compute
         return Tokenizer(tokenizers={name: _CharacterTokenizer() for name in sources}, **kwargs)
 
     namespace: dict[str, Any] = dict(Augmenter=Augmenter, Tokenizer=tokenizer_factory, compose=compose,
-                                    random=random.Random(7),
+                                    random=random.Random(7), COMPUTE_TOKENS=compute_tokens, INFERENCE_COMPUTE_TOKENS=compute_tokens,
                                     MAX_ACTIONS=4, MAX_OBS_DISCRETE=64, MAX_STEPS_PER_EPISODE=3,
                                     REPEAT_COUNT=1, PRETRAINED='unused', TOKENIZER_SOURCES={'text': 'unused'})
     exec(compile(ast.Module(body=body, type_ignores=[]), filename, 'exec'), namespace)
@@ -383,8 +375,8 @@ def test_tokenizers_render_saved_repeat_indices_and_preserve_action_masks(filena
         ['episode 8\n'], [], [], ['episode 13\n'], [],
     ]
     rendered = [''.join(chr(int(token)) for token in step.token_ids) for step in steps]
-    assert re.search(r'episode 8\n,\d+\n$', rendered[0])
-    assert re.fullmatch(r'episode 13\n,\d+\n', rendered[3])
+    assert re.search(r'episode 8\nx,\d+\n$', rendered[0])
+    assert re.fullmatch(r'episode 13\nx,\d+\n', rendered[3])
     assert rendered[2].endswith(f',{ending}\n\n')
     assert rendered[4].endswith(f',{ending}\n\n')
     assert [row.get('repeat_episode_index') for row in rows] == [7, None, None, 12, None]

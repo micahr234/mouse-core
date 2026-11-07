@@ -55,7 +55,7 @@ def test_readers_use_explicit_names_and_preserve_source_events(prefix, ending):
 
 def test_underscore_payloads_can_be_explicit_inputs_and_objective_aliases():
     tokenizer = Tokenizer(tokenizers={'default': IntIdTokenizer()}, input_fields=[
-        dict(type='text', provider='environment', input_field='_label', format='{field}', head_output=True),
+        dict(type='text', provider='environment', input_field='_label', format='{_label}', head_output=True),
     ], objective_fields=[dict(input_field='_label', output_field='target')])
     event = dict(provider='environment', episode_index=0, step_index=0,
                  payload={'_label': 7, 'observation': 99})
@@ -69,7 +69,7 @@ def test_custom_episode_sampling_survives_shared_memory_workers(workers):
     protocol = EnvironmentProtocol(episode_start='_episode_start', terminated='_terminated', truncated='_truncated')
     log = recorded(protocol, protocol.terminated)
     tokenizer = Tokenizer(tokenizers={'default': IntIdTokenizer()}, input_fields=[
-        dict(type='text', provider='environment', input_field='observation', format='{field}', head_output=True),
+        dict(type='text', provider='environment', input_field='observation', format='{observation}', head_output=True),
     ], objective_fields=[dict(input_field='_label', output_field='target')])
     loader = DataLoader(stores=[log.to_store()], token_budget=4, prefetch=4, num_workers=workers,
                         sample_ranges=partial(environment_episode_ranges, protocol=protocol),

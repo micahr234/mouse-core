@@ -81,8 +81,7 @@ def test_packing_plan_matches_handoff_example() -> None:
     plan = _packing_plan(seq)
     assert plan.order.tolist() == [0, 1, 4, 5, 2, 3]
     assert plan.inverse.tolist() == [0, 1, 4, 5, 2, 3]
-    assert plan.cu_seqlens.tolist() == [0, 4, 6]
-    assert plan.cu_seqlens.dtype == torch.int32
+    assert plan.sequence_ids.tolist() == [0, 0, 0, 0, 1, 1]
     assert plan.position_ids.tolist() == [0, 1, 2, 3, 0, 1]
     assert plan.position_ids[plan.inverse].tolist() == [0, 1, 0, 1, 2, 3]
 
@@ -94,7 +93,7 @@ def test_packing_plan_non_self_inverse_permutation() -> None:
     assert plan.order.tolist() == [0, 2, 4, 1, 3]
     assert plan.inverse.tolist() == [0, 3, 1, 4, 2]
     assert plan.order.tolist() != plan.inverse.tolist()
-    assert plan.cu_seqlens.tolist() == [0, 3, 5]
+    assert plan.sequence_ids.tolist() == [0, 0, 0, 1, 1]
 
 
 @pytest.mark.parametrize("device", _DEVICES)
@@ -106,13 +105,12 @@ def test_packing_plan_invariants(device: str, L: int) -> None:
     assert torch.equal(plan.inverse[plan.order], arange)
     assert torch.equal(plan.order[plan.inverse], arange)
     packed_seq = seq[plan.order]
-    lengths = (plan.cu_seqlens[1:] - plan.cu_seqlens[:-1]).tolist()
-    assert all(n > 0 for n in lengths) and sum(lengths) == L
-    assert len(lengths) == len(set(int(s) for s in seq.tolist()))
-    for start, end in zip(plan.cu_seqlens[:-1].tolist(), plan.cu_seqlens[1:].tolist()):
-        assert packed_seq[start:end].unique().numel() == 1
-        # original order preserved inside a class
-        assert torch.equal(plan.order[start:end], plan.order[start:end].sort().values)
+    assert torch.equal(plan.sequence_ids, packed_seq)
+    for sequence_id in seq.unique():
+        selected = plan.sequence_ids == sequence_id
+        # Original order is preserved within each sequence, including recurring IDs.
+        assert torch.equal(plan.order[selected], torch.where(seq == sequence_id)[0])
+        assert torch.equal(plan.position_ids[selected], torch.arange(selected.sum(), device=device))
     assert torch.equal(
         plan.position_ids[plan.inverse], packed_rope_positions(sequence_ids=seq)
     )
@@ -121,7 +119,7 @@ def test_packing_plan_invariants(device: str, L: int) -> None:
 def test_packing_plan_ids_shared_across_sequences_stay_separate() -> None:
     seq = torch.tensor([0, 0, 1, 1])
     plan = _packing_plan(seq)
-    assert plan.cu_seqlens.tolist() == [0, 2, 4]
+    assert plan.sequence_ids.tolist() == [0, 0, 1, 1]
 
 
 
@@ -129,8 +127,20 @@ def test_packing_plan_ids_shared_across_sequences_stay_separate() -> None:
 def test_packing_plan_large_sparse_ids_do_not_collide() -> None:
     seq = torch.tensor([0, 2**40, 0, 2**40])
     plan = _packing_plan(seq)
-    assert plan.cu_seqlens.tolist() == [0, 2, 4]
+    assert plan.sequence_ids.tolist() == [0, 0, 2**40, 2**40]
     assert plan.order.tolist() == [0, 2, 1, 3]
+
+
+@pytest.mark.parametrize("device", _DEVICES)
+@torch.no_grad()
+def test_sparse_signed_sequence_ids_match_dense_attention(no_compiled_decoder, device):
+    model = _backbone(hidden=32, layers=2, heads=2, kv_heads=1).to(device).eval()
+    _scale_up(model)
+    embeds = torch.randn(19, 32, device=device)
+    ids = torch.tensor([-2**40, 7, 2**40, 7, -2**40] * 4, device=device)[:19]
+    actual = packed_forward(model=model.model, embeds=embeds, sequence_ids=ids)
+    expected = _reference(model, embeds, ids, ids)
+    torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
 
 
 # ---- RoPE position rule -------------------------------------------------------

@@ -86,7 +86,7 @@ def _example(path, **overrides):
         if isinstance(node, ast.ClassDef):
             body.append(node)
         elif isinstance(node, ast.Assign):
-            if any(isinstance(t, ast.Name) and t.id in {"tokenizer", "compute_token_ids"} for t in node.targets):
+            if any(isinstance(t, ast.Name) and t.id in {"tokenizer", "compute_token_ids", "compute_text"} for t in node.targets):
                 continue
             body.append(node)
     exec(compile(ast.Module(body=body, type_ignores=[]), str(path), "exec"), namespace)
@@ -113,8 +113,8 @@ def test_example_encoder_builds_and_trains_each_named_tokenizer_table():
     encoder = ns['encoder']
     assert set(encoder.embedding.embeddings) == {'text', 'actions'}
     tokenizer = Tokenizer(tokenizers={'text': IntIdTokenizer(), 'actions': IntIdTokenizer()}, input_fields=[
-        dict(provider="sensor", type='text', tokenizer='actions', input_field='action', format='{field}'),
-        dict(provider="sensor", type='text', tokenizer='text', input_field='observation', format='{field}', head_output=True),
+        dict(provider="sensor", type='text', tokenizer='actions', input_field='action', format='{action}'),
+        dict(provider="sensor", type='text', tokenizer='text', input_field='observation', format='{observation}', head_output=True),
     ])
     inputs, inputs_objective_data = tokenizer.pack_rows(rows=[measurement_events([{'action': 2, 'observation': 3}])])
     ns['q_head'](encoder(inputs)['z']).square().sum().backward()
@@ -359,7 +359,7 @@ def test_ppo_collection_restarts_replay_and_preserves_behavior_prefixes():
 
     from tests._token_batch_helpers import IntIdTokenizer
     tokenizer = Tokenizer(tokenizers={"text": IntIdTokenizer()}, input_fields=[
-            dict(type='text', provider='environment', input_field='observation', format='{field}'),
+            dict(type='text', provider='environment', input_field='observation', format='{observation}'),
             dict(type='token', provider='environment', format='1', head_output=True)],
         objective_fields=[
             {'input_field': 'action', 'missing_value': None},
@@ -616,7 +616,7 @@ def test_inference_notebook_keeps_outer_prefix_and_resets_rows(monkeypatch):
         tokenizers={"text": IntIdTokenizer()},
         input_fields=[
             dict(type="text", provider="coordinator", input_field="_episode_start", format="15"),
-            dict(type="text", provider="environment", input_field="observation", format="{field}"),
+            dict(type="text", provider="environment", input_field="observation", format='{observation}'),
             dict(type="token", provider="environment", input_field="action_requested", format="1", head_output=True),
         ],
     )

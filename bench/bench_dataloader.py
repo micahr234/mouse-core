@@ -37,10 +37,6 @@ import numpy as np
 from mouse_core.data import Augmenter, DataLoader, Datastore, EventLog, Tokenizer, compose
 
 
-def episode_separator(ctx):
-    ended = ctx.get("inner_terminated", False) or ctx.get("inner_truncated", False)
-    return "\n\n" if ended else ""
-
 _BENCH_DIR = Path(__file__).resolve().parent
 if str(_BENCH_DIR) not in sys.path:
     sys.path.insert(0, str(_BENCH_DIR))
@@ -69,7 +65,7 @@ episode_prompt = (
     "explored; avoid holes you have already fallen in; once you have a "
     "path to the goal, repeat it.\n"
     "At each action-request newline, predict the value of all actions. Format:\n"
-    "Each episode starts with an episode N header; inner endings are followed by a blank line.\n"
+    "Each episode starts with an episode N header and x for no action; inner endings are followed by a blank line.\n"
     "action,observation[,r=reward][,terminated][,truncated].\n"
 )
 
@@ -134,14 +130,15 @@ def _train_transform(*, tokenizer_source: str = "Qwen/Qwen3-0.6B", local_files_o
                 "input_field": "episode_start",
                 "format": episode_prompt,
             },
-            {"type": "text", "provider": "environment", "input_field": "repeat_episode_index", "format": "episode {field+1}\n"},
-            {"type": "text", "provider": "agent", "input_field": "action", "lookup": ["a", "b", "c", "d"], "format": "{field}"},
-            {"type": "text", "provider": "environment", "input_field": "observation", "format": ",{field}"},
+            {"type": "text", "provider": "environment", "input_field": "repeat_episode_index", "format": 'episode {repeat_episode_index+1}\n'},
+            {"type": "text", "provider": "environment", "input_field": "repeat_episode_index", "format": "x"},
+            {"type": "text", "provider": "agent", "input_field": "action", "format": '{(["a", "b", "c", "d"])[action]}'},
+            {"type": "text", "provider": "environment", "input_field": "observation", "format": ',{observation}'},
             {
                 "type": "text",
                 "provider": "environment",
                 "input_field": "reward",
-                "format": ",r={field:g}",
+                "format": ',r={reward:g}',
             },
             {
                 "type": "text",
@@ -165,7 +162,8 @@ def _train_transform(*, tokenizer_source: str = "Qwen/Qwen3-0.6B", local_files_o
             {
                 "type": "text",
                 "provider": "environment",
-                "format": episode_separator,
+                "input_field": ["inner_terminated", "inner_truncated"],
+                "format": "\n\n",
             },
         ],
         objective_fields=[

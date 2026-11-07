@@ -20,8 +20,8 @@ def tokenizer():
     backend.pre_tokenizer = Whitespace()
     position = dict(position_field='context', position_fourier_min=-1., position_fourier_max=1.)
     return Tokenizer(tokenizers={'text': PreTrainedTokenizerFast(tokenizer_object=backend, unk_token='[UNK]')}, input_fields=[
-        dict(type='text', provider='sensor', input_field='prefix', format='{field}', **position),
-        dict(type='text', provider='sensor', input_field='reading', format='a {field} b', **position),
+        dict(type='text', provider='sensor', input_field='prefix', format='{prefix}', **position),
+        dict(type='text', provider='sensor', input_field='reading', format='a {reading} b', **position),
         dict(type="token", provider='sensor', input_field='position', numeric_field='position', format='n', fourier_min=0., fourier_max=2., **position),
         dict(type="token", provider='sensor', input_field='angle', numeric_field='angle', format='n', fourier_min=0., fourier_max=2., **position),
         dict(type='token', provider='sensor', input_field='request', format='head', head_output=True),
@@ -93,7 +93,7 @@ def test_invalid_position_rejected(bad):
     {'position_fourier_min': 0., 'position_fourier_max': float('nan')}])
 def test_position_requires_valid_explicit_bounds(bounds):
     with pytest.raises(ValueError):
-        TokenizerModalitySpec(provider='sensor', type='text', input_field='reading', format='{field}',
+        TokenizerModalitySpec(provider='sensor', type='text', input_field='reading', format='{reading}',
                               position_field='context', **bounds)
 
 
@@ -109,7 +109,7 @@ def test_position_bounds_normalize_independently_without_clipping():
         replace(field, position_field=None)
 
 
-@pytest.mark.parametrize('provider', [None, '', ' ', 1])
+@pytest.mark.parametrize('provider', ['', ' ', 1])
 def test_provider_must_be_specific(provider):
     with pytest.raises(ValueError, match='provider'):
         TokenizerModalitySpec(provider=provider, type='text', format='a')
@@ -117,9 +117,12 @@ def test_provider_must_be_specific(provider):
         tokenizer()(dict(provider=provider, payload={'reading': 'a'}))
 
 
-def test_provider_cannot_be_omitted():
-    with pytest.raises(TypeError, match='provider'):
-        Tokenizer(tokenizers=tokenizer().tokenizers, input_fields=[dict(type='text', format='a')])
+def test_omitted_provider_matches_arbitrary_events():
+    tok = Tokenizer(tokenizers=tokenizer().tokenizers, input_fields=[dict(type='text', format='a')])
+    for provider in ('sensor', 'other'):
+        assert tok(dict(provider=provider, payload={}))['token_ids'].size == 1
+    with pytest.raises(ValueError, match='provider'):
+        tok(dict(provider=None, payload={}))
 
 
 def test_separate_numeric_fields_share_only_the_position_and_both_learn():
@@ -227,7 +230,7 @@ def test_numeric_and_position_additions_cover_every_emitted_token(kind, tmp_path
                 numeric_field='measurement', numeric_index=1, fourier_min=0., fourier_max=4.,
                 position_field='context', position_fourier_min=-2., position_fourier_max=2.)
     if kind != 'image':
-        spec['format'] = '{field}'
+        spec['format'] = '{content}'
     tok = Tokenizer(tokenizers={'data': (lambda image: image) if kind == 'image' else source.tokenizers['text']},
                     input_fields=[spec])
     content = [1, 2, 3] if kind == 'image' else 'a b a' if kind == 'text' else 'a'
@@ -259,7 +262,7 @@ def test_numeric_and_position_additions_cover_every_emitted_token(kind, tmp_path
 
 def test_token_formatting_lookup_and_single_token_constraint():
     tok = Tokenizer(tokenizers=tokenizer().tokenizers, input_fields=[
-        dict(type='token', provider='sensor', input_field='label', lookup=['a', 'a b'], format='{field}')])
+        dict(type='token', provider='sensor', input_field='label',  format="{(['a', 'a b'])[label]}")])
     assert tok(dict(provider='sensor', payload={'label': 0}))['token_ids'].tolist() == [1]
     with pytest.raises(ValueError, match='expected 1'):
         tok(dict(provider='sensor', payload={'label': 1}))

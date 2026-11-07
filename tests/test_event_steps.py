@@ -13,7 +13,7 @@ from tests._token_batch_helpers import IntIdTokenizer
 
 def make_tokenizer(**kwargs):
     return Tokenizer(tokenizers={"default": IntIdTokenizer()}, input_fields=[
-        dict(type='text', provider='sensor', input_field='value', format='{field}', head_output=True),
+        dict(type='text', provider='sensor', input_field='value', format='{value}', head_output=True),
     ], **kwargs)
 
 
@@ -261,7 +261,7 @@ def test_sparse_step_headers_keep_metadata_labels_identical_after_persistence():
 def test_event_prefix_and_readouts_match_full_and_cached_packing():
     tok = Tokenizer(tokenizers={"default": IntIdTokenizer()}, input_fields=[
         dict(type='token', provider='sensor', input_field='_episode_start', format='8'),
-        dict(type='text', provider='sensor', input_field='value', format='{field}'),
+        dict(type='text', provider='sensor', input_field='value', format='{value}'),
         dict(type='token', provider='sensor', format='9', head_output=True),
     ])
     events = [dict(provider='sensor', step_index=i, payload={'value': i + 1, **({'_episode_start': True} if i == 0 else {})}) for i in range(3)]

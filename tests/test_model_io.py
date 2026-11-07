@@ -303,9 +303,9 @@ def test_tokenizer_roundtrip(tmp_path) -> None:
     """save_tokenizer writes tokenizer.json; load_tokenizer is the recall path."""
     tokenizer = Tokenizer(
         input_fields=[
-            {"provider": "sensor", "type": "text", "input_field": "action", "format": "{field}"},
-            {"provider": "sensor", "type": "text", "input_field": "repeat_episode_done", "format": "{field}"},
-            {"provider": "sensor", "type": "text", "input_field": "done_code", "format": "{field}", "head_output": True},
+            {"provider": "sensor", "type": "text", "input_field": "action", "format": '{action}'},
+            {"provider": "sensor", "type": "text", "input_field": "repeat_episode_done", "format": '{repeat_episode_done}'},
+            {"provider": "sensor", "type": "text", "input_field": "done_code", "format": '{done_code}', "head_output": True},
             {"provider": "sensor",
                 "type": "text",
                 "input_field": "repeat_episode_index",
@@ -350,7 +350,7 @@ def test_load_tokenizer_missing_file_raises(tmp_path) -> None:
 
 def test_push_model_and_tokenizer_share_repository(monkeypatch) -> None:
     model = simple_model(backbone=IdentityBackbone(hidden_dim=8), heads=({'action_value': (head := MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0))}), reasoner=None)
-    tokenizer = Tokenizer(input_fields=[{"provider": "sensor", 'type': 'text', 'input_field': 'action', 'format': '{field}', 'head_output': True}, {"provider": "sensor", 'type': 'text', 'input_field': 'repeat_episode_index', 'format': format_episode_index}], objective_fields=[], tokenizers={"default": IntIdTokenizer()})
+    tokenizer = Tokenizer(input_fields=[{"provider": "sensor", 'type': 'text', 'input_field': 'action', 'format': '{action}', 'head_output': True}, {"provider": "sensor", 'type': 'text', 'input_field': 'repeat_episode_index', 'format': format_episode_index}], objective_fields=[], tokenizers={"default": IntIdTokenizer()})
     import mouse_core.models.io as io
     import huggingface_hub
     from pathlib import Path
@@ -426,7 +426,7 @@ def test_missing_vector_targets_roundtrip_and_do_not_train_unlabelled_rows(tmp_p
 
 
 def format_episode_index(ctx):
-    return str(ctx["field"]) if ctx.get("step_index") == 0 else ""
+    return str(ctx["repeat_episode_index"]) if ctx.get("step_index") == 0 else ""
 
 
 def test_load_rejects_different_class_with_identical_parameter_shapes(tmp_path):

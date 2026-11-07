@@ -33,14 +33,14 @@ def token_tokenizer(
     objective_fields: list[dict[str, Any]] | list[str] | None = None,
     **kwargs: Any,
 ) -> Tokenizer:
-    """Pack integer step fields as ``type="text"`` with ``format="{field}"``.
+    """Pack integer step fields as ``type="text"`` with formats using each field name.
 
     ``IntIdTokenizer`` turns that rendered integer into one vocab id, so an
     action value of ``1`` is still token id ``1``. The last listed field is
     ``head_output=True``. Reward floats stay on ``objective_fields`` only.
     """
     input_fields: list[dict[str, Any]] = [
-        {"provider": "sensor", "type": "text", "input_field": name, "format": "{field}"} for name in fields
+        {"provider": "sensor", "type": "text", "input_field": name, "format": "{" + name + "}"} for name in fields
     ]
     if input_fields:
         input_fields[-1]["head_output"] = True
@@ -56,7 +56,7 @@ def token_tokenizer(
             {"provider": "sensor",
                 "type": "text",
                 "input_field": "episode_index",
-                "format": lambda ctx: f"{ctx['field']}" if ('step_index' in ctx and ctx['step_index'] == 0) else "",
+                "format": lambda ctx: f"{ctx['episode_index']}" if ('step_index' in ctx and ctx['step_index'] == 0) else "",
             },
         )
     if objective_fields is None:

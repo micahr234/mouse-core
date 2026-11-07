@@ -69,7 +69,7 @@ def _objective_config(objective_fields):
 
 
 def _register_special_tokens(tokenizer, specs):
-    tokens = list(dict.fromkeys(render_text_format(spec, field=None) for spec in specs if spec.special))
+    tokens = list(dict.fromkeys(render_text_format(spec, payload={}) for spec in specs if spec.special))
     if tokens:
         tokenizer.add_tokens(tokens, special_tokens=True)
     result = {}
@@ -85,8 +85,9 @@ class Tokenizer:
     """Encode each event using an ordered field list, then assemble marked steps.
 
     ``tokenizer(event)`` returns an event's token arrays, possibly empty. It does
-    not interpret provider roles. Each field requires a specific ``provider``
-    name and only matches events from that provider. ``head_output=True`` marks
+    not interpret provider roles. An omitted ``provider`` matches every provider;
+    a name filters events to that provider. ``input_field`` optionally filters
+    payload names (one name or a list); formats use those names directly. ``head_output=True`` marks
     exactly the tokens that field emits, including optional special tokens.
     Matching fields emit in ``input_fields`` order, regardless of payload key
     order. Each field is tokenized separately; text never merges across fields
@@ -134,17 +135,13 @@ class Tokenizer:
         self.objective_fields, self.objective_missing_values = _objective_config(objective_fields)
         self.input_fields = tuple(field if isinstance(field, TokenizerModalitySpec) else TokenizerModalitySpec(**field)
                                   for field in input_fields)
-        self._provider_meta = {}
-        for provider in dict.fromkeys(spec.provider for spec in self.input_fields):
-            fields = [spec for spec in self.input_fields if spec.provider == provider]
-            _, meta = resolve_tokenizer_modalities(fields)
-            self._provider_meta[provider] = tuple(meta)
-        meta_by_spec = {id(meta.spec): meta for group in self._provider_meta.values() for meta in group}
-        self._meta = tuple(enumerate(meta_by_spec[id(spec)] for spec in self.input_fields))
+        _, meta = resolve_tokenizer_modalities(self.input_fields)
+        self._meta = tuple(enumerate(meta))
+        self._wildcard_meta = tuple((index, item) for index, item in self._meta if item.spec.provider is None)
         self._provider_meta = {
-            provider: tuple((index, meta) for index, meta in self._meta
-                            if meta.spec.provider == provider)
-            for provider in self._provider_meta
+            provider: tuple((index, item) for index, item in self._meta
+                            if item.spec.provider is None or item.spec.provider == provider)
+            for provider in {spec.provider for spec in self.input_fields if spec.provider is not None}
         }
         sources = dict(tokenizers)
         self.tokenizer_names = tuple(sorted(sources))
@@ -189,7 +186,7 @@ class Tokenizer:
         provider = event["provider"]
         if not isinstance(provider, str) or not provider.strip():
             raise ValueError("Event provider must be a specific nonempty string")
-        meta = self._provider_meta.get(provider, ())
+        meta = self._provider_meta.get(provider, self._wildcard_meta)
         payload = event["payload"]
         if meta and not isinstance(payload, Mapping):
             raise TypeError("Configured event input fields require an object payload")
@@ -302,31 +299,29 @@ class EventTokenStream:
         return completed
 
 
-def _field_text_value(spec: TokenizerModalitySpec, row: dict[str, Any], *, context=None) -> str | None:
-    assert spec.format is not None
+def _selected_payload(spec: TokenizerModalitySpec, row: Mapping[str, Any]) -> dict[str, Any] | None:
     if spec.input_field is None:
-        return _render_field(spec, row=row, field=None, context=context)
-    raw = row.get(spec.input_field)
-    if raw is None:
+        return {name: unwrap_scalar(value) for name, value in row.items()}
+    payload = {name: unwrap_scalar(row.get(name)) for name in spec.input_names}
+    if all(value is None for value in payload.values()):
         return None
-    value = _text_scalar(spec, raw)
-    if spec.lookup is not None:
-        if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
-            raise TypeError(f"lookup field {_field_label(spec)!r} requires an integer ID")
-        if not 0 <= value < len(spec.lookup):
-            raise ValueError(f"lookup field {_field_label(spec)!r} ID {value} is outside [0, {len(spec.lookup)})")
-        value = spec.lookup[int(value)]
-    return _render_field(spec, row=row, field=value, context=context)
+    if spec.input_index is not None:
+        name = spec.input_names[0]
+        payload[name] = _text_scalar(spec, payload[name])
+    return payload
 
 
-def _render_field(spec: TokenizerModalitySpec, *, row: dict[str, Any], field: Any, context=None) -> str:
+def _field_text_value(spec: TokenizerModalitySpec, row: Mapping[str, Any], *, context=None) -> str | None:
+    payload = _selected_payload(spec, row)
+    if payload is None:
+        return None
     if callable(spec.format):
-        payload = {**row, "field": field} if spec.input_field is not None else dict(row)
+        payload = {**row, **payload}
         text = spec.format(payload, context=context) if spec._format_context else spec.format(payload)
         if not isinstance(text, str):
             raise TypeError("A text format callback must return a string")
         return text
-    return render_text_format(spec, field=field)
+    return render_text_format(spec, payload=payload)
 
 
 def _numeric_scaled(spec: TokenizerModalitySpec, row: dict[str, Any]) -> float | None:
@@ -584,20 +579,14 @@ def _tokenize_fields(*, row, meta, tokenizers, tokenizer_routes, numeric_routes,
             )
             continue
 
-        in_name = str(spec.input_field)
-        value = row.get(in_name)
-        if value is None:
-            continue
-
-        if m.kind == KIND_IMAGE:
-            img_ids = _image_token_ids(tokenizer, value, in_name=in_name)
-            _emit(
-                img_ids,
-                spec=spec, field_id=field_id,
-                head_output=spec.head_output,
-            )
-        else:
+        if m.kind != KIND_IMAGE:
             raise ValueError(f"unsupported modality kind {m.kind!r}")
+        for in_name in spec.input_names if spec.input_field is not None else row:
+            value = row.get(in_name)
+            if value is None:
+                continue
+            img_ids = _image_token_ids(tokenizer, value, in_name=in_name)
+            _emit(img_ids, spec=spec, field_id=field_id, head_output=spec.head_output)
 
     return dict(
         token_ids=np.asarray(token_ids, dtype=np.int64),
@@ -611,7 +600,7 @@ def _tokenize_fields(*, row, meta, tokenizers, tokenizer_routes, numeric_routes,
     )
 
 
-TOKENIZER_FORMAT = "mouse-core-tokenizer-v4"
+TOKENIZER_FORMAT = "mouse-core-tokenizer-v5"
 TOKENIZER_FILENAME = "tokenizer.json"
 
 
@@ -646,6 +635,10 @@ def _input_fields_config(specs):
             if key.startswith("_") or value is None:
                 continue
             if key in ("head_output", "special") and value is False:
+                continue
+            if key == "format_functions":
+                if value:
+                    field[key] = {name: _jsonable_callback(fn) for name, fn in value.items()}
                 continue
             if key == "format" and callable(value):
                 field[key] = {"callable": _jsonable_callback(value)}
@@ -767,6 +760,9 @@ def load_tokenizer(
             if set(reference) != {"callable"}:
                 raise ValueError("Saved text format callback requires a callable reference")
             field["format"] = resolve_callable_ref(reference["callable"])
+        if "format_functions" in field:
+            field["format_functions"] = {name: resolve_callable_ref(ref)
+                                         for name, ref in field["format_functions"].items()}
         fields.append(field)
     result = Tokenizer(
         input_fields=fields,

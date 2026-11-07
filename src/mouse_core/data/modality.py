@@ -3,21 +3,19 @@
 from __future__ import annotations
 
 import ast
+import builtins
+import keyword
 import math
+import symtable
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from types import CodeType
-from typing import Any, ClassVar, cast
+from typing import Any, ClassVar
 
 import numpy as np
 import torch
 
 from mouse_core.data.callbacks import accepts_context
-
-# Step-backed ``text`` ``format=`` is an f-string. The step value is the
-# name ``field`` (``"{field+1}"``, ``"{field:.0f}"``). Consts name nothing.
-TEXT_FORMAT_KEY = "field"
-_FSTRING_BUILTINS = {"str": str, "repr": repr, "ascii": ascii}
 
 KIND_TEXT = "text"
 KIND_TOKEN = "token"
@@ -26,51 +24,43 @@ KIND_IMAGE = "image"
 
 @dataclass
 class TokenizerModalitySpec:
-    """Describe tokens from one concrete provider.
+    """An ordered token emission with optional provider and payload filters.
 
-    ``text`` formats an optional input scalar into a variable-length token run.
-    A callable ``format(ctx)`` may instead return any text, including an empty
-    string. It receives the payload and, with input_field, the selected/lookup
-    value under ``ctx["field"]``. Declare ``format(payload, *, context)`` to
-    also receive runtime context, separate from the payload and objective labels.
-    ``token`` uses the same formatting and lookup rules but must produce exactly
-    one token for nonempty output. ``special=True`` registers a literal token
-    in the vocabulary.
-    ``image`` encodes an image into discrete visual tokens.
+    Omitted provider matches every provider. ``input_field`` may be a name or
+    a list of names; the declaration runs when any selected value is present
+    and non-None. Omit it to expose the entire payload and run on every event.
+    Missing selected names are None. False, zero and empty strings are present.
 
-    ``input_index`` selects an element of a vector before formatting. A missing
-    or None input emits nothing. Without input_field, text/token are constants.
-    ``head_output`` marks prediction tokens.
+    Text/token formats are f-string expressions using payload names directly.
+    ``format_functions={"action_name": action_name}`` enables explicit calls
+    such as ``{action_name(action)}``. Expressions use normal Python builtins,
+    attribute access, comprehensions and lexical scoping.
+    Callable formats receive a payload copy, with selected values under their
+    original names, and may opt into separate runtime settings with ``format(payload, *, context)``.
+    ``input_index`` selects a scalar for a single named input. Images encode
+    each present selected input in selection order (payload order if omitted).
+    Token fields emit exactly one token unless their formatted text is empty.
+    ``special=True`` registers a literal token. ``head_output`` marks outputs.
 
-    Any type may set ``numeric_field`` and explicit finite ``fourier_min`` /
-    ``fourier_max`` bounds (min < max). ``numeric_index`` optionally selects a
-    vector element independently of input_index. The scalar is mapped to [-1,1]
-    without clipping, and a projection specific to (provider, numeric_field) is
-    added to every emitted token. Vector elements share their field's projection.
-
-    Independently, ``position_field`` selects a scalar with explicit finite
-    ``position_fourier_min`` / ``position_fourier_max`` bounds (min < max).
-    Its projection is shared across all fields and named token tables. Positions
-    also map to [-1,1] without clipping. Missing/None numeric or position values
-    add nothing; zero and signed values are valid. Neither addition emits tokens.
-
-    Each declaration requires a nonempty provider name; no wildcard is supported.
-    Declarations emit in list order. Content (input_field, input_index) pairs must
-    be unique within a provider, while constant declarations may repeat.
+    Numeric and position additions use independent payload fields and explicit
+    finite Fourier bounds (min < max), scaled to [-1,1] without clipping.
+    Missing additions contribute nothing. Numeric projections are specific to
+    (provider filter, numeric_field); positions share a projection.
+    Filters may overlap or repeat; declarations always emit in list order.
     """
 
     type: str
-    provider: str
+    provider: str | None = None
     tokenizer: str | None = None
     special: bool = False
-    input_field: str | None = None
+    input_field: str | Sequence[str] | None = None
     input_index: int | None = None
     numeric_field: str | None = None
     numeric_index: int | None = None
     position_field: str | None = None
     position_fourier_min: float | None = None
     position_fourier_max: float | None = None
-    lookup: Sequence[str] | None = None
+    format_functions: Mapping[str, Callable[..., Any]] = field(default_factory=dict)
     format: str | Callable[..., str] | None = None
     fourier_min: float | None = None
     fourier_max: float | None = None
@@ -121,8 +111,30 @@ class TokenizerModalitySpec:
             raise ValueError("tokenizer must be a nonempty backend name")
         if type(self.special) is not bool or (self.special and (self.type or "").lower() != "token"):
             raise ValueError("special=True is supported only for token fields")
-        if not isinstance(self.provider, str) or not self.provider.strip():
-            raise ValueError("provider must be a specific nonempty string")
+        if self.provider is not None and (not isinstance(self.provider, str) or not self.provider.strip()):
+            raise ValueError("provider must be a nonempty string or None")
+        if self.input_field is not None:
+            names = (self.input_field,) if isinstance(self.input_field, str) else self.input_field
+            if not isinstance(names, (list, tuple)) or not names:
+                raise ValueError("input_field must be a nonempty name or list of names, or None")
+            if any(not isinstance(name, str) or not name.strip() for name in names):
+                raise ValueError("input_field names must be nonempty strings")
+            if len(set(names)) != len(names):
+                raise ValueError("input_field names must be unique")
+            if not isinstance(self.input_field, str):
+                self.input_field = tuple(names)
+        if self.input_index is not None and not isinstance(self.input_field, str):
+            raise ValueError("input_index requires a single input_field name")
+        if not isinstance(self.format_functions, Mapping):
+            raise TypeError("format_functions must map names to callables")
+        for name, function in self.format_functions.items():
+            if not isinstance(name, str) or not name.isidentifier() or keyword.iskeyword(name) or name.startswith("__"):
+                raise ValueError("format_functions names must be public Python identifiers")
+            if not callable(function):
+                raise TypeError("format_functions values must be callable")
+            if name in self.input_names:
+                raise ValueError(f"Format function {name!r} conflicts with an input field")
+        self.format_functions = dict(self.format_functions)
         k = (self.type or "").lower()
         if k not in self._VALID_TYPES:
             raise ValueError(
@@ -130,14 +142,6 @@ class TokenizerModalitySpec:
                 f"expected one of {self._VALID_TYPES}"
             )
         object.__setattr__(self, "type", k)
-        if self.lookup is not None:
-            if k not in ("text", "token") or not self.input_field:
-                raise TypeError("lookup requires a text or token field with input_field=")
-            if not isinstance(self.lookup, (list, tuple)) or not self.lookup:
-                raise ValueError("lookup must be a nonempty list or tuple of strings")
-            if any(not isinstance(value, str) or not value for value in self.lookup):
-                raise ValueError("lookup entries must be nonempty strings")
-            object.__setattr__(self, "lookup", tuple(self.lookup))
         if k == "text":
             self._init_text()
             return
@@ -145,59 +149,31 @@ class TokenizerModalitySpec:
             self._init_token()
             return
         self._reject_input_index(k)
-        self._init_named_input()
         self._reject_text_format(k)
         _validate_max_tokens(self)
+
+    @property
+    def input_names(self) -> tuple[str, ...]:
+        if self.input_field is None:
+            return ()
+        return (self.input_field,) if isinstance(self.input_field, str) else tuple(self.input_field)
 
     def _init_token(self) -> None:
         self._reject_max_tokens("token")
         self._init_text()
-        if self.special:
-            self._format_code = _compile_text_format(
-                cast(str, self.format), who="special token", allow_field=False, literal="special token"
-            )
 
     def _init_text(self) -> None:
-        if callable(self.format):
-            self._format_context = accepts_context(self.format)
-            if self.special:
-                raise TypeError("Special tokens require a literal format string")
-            if self.input_field is None:
-                self._reject_input_index("text callback")
-                self._reject_no_input_knobs("text callback")
-            else:
-                _validate_input_index(self)
-            _validate_max_tokens(self)
-            return
-        if self.input_field is None:
-            self._reject_input_index("text const")
-            self._reject_no_input_knobs("text const")
-            if self.format is None:
-                raise ValueError(
-                    "text const field requires format= "
-                    "(a literal string, no placeholders)"
-                )
-            code = _compile_text_format(
-                cast(str, self.format), who="const", allow_field=False
-            )
-            object.__setattr__(self, "_format_code", code)
-            _validate_max_tokens(self)
-            return
         _validate_input_index(self)
-        code = _compile_text_format(
-            cast(str, self.format), who=self.input_field, allow_field=True
-        )
-        object.__setattr__(self, "_format_code", code)
         _validate_max_tokens(self)
-
-    def _init_named_input(self) -> None:
-        if not self.input_field:
-            raise ValueError(
-                f"tokenizer modality type={self.type!r} requires input_field="
-            )
+        if callable(self.format):
+            if self.special or self.format_functions:
+                raise TypeError("Callable formats cannot use special or format_functions")
+            self._format_context = accepts_context(self.format)
+            return
+        self._format_code = _compile_text_format(self)
 
     def _reject_text_format(self, kind: str) -> None:
-        if self.format is not None:
+        if self.format is not None or self.format_functions:
             raise TypeError(
                 f"tokenizer modality type={kind!r} does not accept format= "
                 "(text and token only)"
@@ -217,93 +193,66 @@ class TokenizerModalitySpec:
                 "(text and token fields with input_field= only)"
             )
 
-    def _reject_no_input_knobs(self, kind: str) -> None:
-        """Reject input fields on constant modalities."""
-        if self.input_field is not None:
-            raise TypeError(f"{kind} tokenizer modalities have no input_field=")
 
-
-def _compile_text_format(
-    format_str: str | None,
-    *,
-    who: str | None,
-    allow_field: bool,
-    literal: str | None = None,
-) -> CodeType:
-    """Compile ``format=`` as an f-string whose only name is ``field``."""
-    label = who or "text field"
-    if format_str is None or (literal is not None and format_str == ""):
-        if literal is not None:
-            raise ValueError(
-                f"{literal} field {label!r} requires format= "
-                "(a literal string, no placeholders)"
-            )
-        raise ValueError(f"text modality {label!r} requires format=")
+def _compile_text_format(spec: TokenizerModalitySpec) -> CodeType:
+    """Compile a Python f-string over event fields, functions and builtins."""
+    if not isinstance(spec.format, str):
+        raise ValueError(f"text modality {_field_label(spec)!r} requires format= string or callable")
+    # Raw triple quoting preserves both literal backslashes and escapes inside
+    # replacement expressions. repr(format) would double escapes inside them.
+    delimiter = next((quote * 3 for quote in ('"', "'") if quote * 3 not in spec.format), None)
+    if delimiter is None:
+        raise ValueError("format cannot contain both triple-quote delimiters")
     try:
-        tree = ast.parse("f" + repr(format_str), mode="eval")
+        source = "rf" + delimiter + "\n" + spec.format + "\n" + delimiter
+        tree = ast.parse(source, mode="eval")
+        assert isinstance(tree.body, ast.JoinedStr)
+        first, last = tree.body.values[0], tree.body.values[-1]
+        assert isinstance(first, ast.Constant) and isinstance(last, ast.Constant)
+        assert isinstance(first.value, str) and isinstance(last.value, str)
+        first.value = first.value[1:]
+        last.value = last.value[:-1]
     except SyntaxError as exc:
-        kind = f"{literal} field" if literal is not None else "text modality"
-        raise ValueError(
-            f"{kind} {label!r} format= is not an f-string ({exc.msg})"
-        ) from exc
-    names: list[str] = []
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.Call, ast.Attribute, ast.Subscript, ast.Lambda)):
-            if literal is not None:
-                raise ValueError(
-                    f"{literal} field {label!r} format= is a literal string "
-                    "and must not contain placeholders"
-                )
-            raise ValueError(
-                f"text modality {label!r} format= can use field in an "
-                "expression such as {field+1} or {field:.3f}, not a call"
-            )
-        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
-            names.append(node.id)
-    if allow_field:
-        others = sorted({name for name in names if name != TEXT_FORMAT_KEY})
-        has_placeholders = any(isinstance(node, ast.FormattedValue) for node in ast.walk(tree))
-        if others or has_placeholders and TEXT_FORMAT_KEY not in names:
-            extra = f" Got {others}." if others else ""
-            raise ValueError(
-                f"text modality {label!r} format= is an f-string and the "
-                f"step value is named {TEXT_FORMAT_KEY}, as in "
-                f"{{{TEXT_FORMAT_KEY}+1}} or {{{TEXT_FORMAT_KEY}:.3f}}."
-                f"{extra}"
-            )
-    elif names:
-        if literal is not None:
-            raise ValueError(
-                f"{literal} field {label!r} format= is a literal string "
-                "and must not contain placeholders"
-            )
-        raise ValueError(
-            f"text const field {label!r} format= is "
-            "a literal string and must not contain placeholders"
-        )
+        raise ValueError(f"format= is not an f-string ({exc.msg})") from exc
+    if spec.special:
+        if not spec.format or any(isinstance(node, ast.FormattedValue) for node in ast.walk(tree)):
+            raise ValueError("special token requires a nonempty literal string without placeholders")
+        if spec.format_functions:
+            raise ValueError("special token cannot use format_functions")
+    if spec.input_field is not None:
+        # Let Python distinguish external names from comprehension variables,
+        # lambda parameters, closures and assignment-expression bindings.
+        symbols = symtable.symtable(source, "<tokenizer format>", "eval")
+        assigned = {symbol.get_name() for symbol in symbols.get_symbols() if symbol.is_assigned()}
+        referenced = set()
+        scopes = [symbols]
+        while scopes:
+            scope = scopes.pop()
+            referenced.update(symbol.get_name() for symbol in scope.get_symbols()
+                              if symbol.is_global() and symbol.is_referenced())
+            scopes.extend(scope.get_children())
+        unknown = referenced - assigned - set(spec.input_names) - set(spec.format_functions) - set(vars(builtins))
+        if unknown:
+            raise ValueError(f"Format names {sorted(unknown)} are not selected by input_field or registered as functions")
     return compile(tree, "<tokenizer format>", "eval")
 
 
-def render_text_format(spec: TokenizerModalitySpec, *, field: Any) -> str:
-    """Fill ``spec.format`` as an f-string. ``field`` is the step value."""
+def render_text_format(spec: TokenizerModalitySpec, *, payload: Mapping[str, Any]) -> str:
+    """Render the selected payload under its original field names."""
     code = spec._format_code
     if code is None:
-        raise ValueError(
-            f"text modality {_field_label(spec)!r} format= was not compiled"
-        )
-    local = {"field": field} if spec.input_field is not None else {}
+        raise ValueError(f"text modality {_field_label(spec)!r} format= was not compiled")
+    collisions = payload.keys() & spec.format_functions.keys()
+    if collisions:
+        raise ValueError(f"Payload fields conflict with format_functions: {sorted(collisions)}")
+    # One fresh namespace lets nested Python scopes (generators, lambdas, etc.)
+    # resolve event fields and functions, without importing this module's globals.
+    namespace = {**payload, **spec.format_functions}
+    namespace["__builtins__"] = vars(builtins)
     try:
-        text = eval(  # noqa: S307 — format= is the caller's f-string
-            code,
-            {"__builtins__": _FSTRING_BUILTINS},
-            local,
-        )
+        return eval(code, namespace)
     except Exception as exc:
-        raise ValueError(
-            f"text modality {_field_label(spec)!r} format={spec.format!r} "
-            f"failed: {exc}"
-        ) from exc
-    return text
+        raise ValueError(f"text modality {_field_label(spec)!r} format={spec.format!r} failed: {exc}") from exc
 
 
 def _validate_input_index(spec: TokenizerModalitySpec) -> None:
@@ -446,20 +395,10 @@ def _as_finite_float(value: Any, *, who: str, name: str) -> float:
 def _field_label(spec: TokenizerModalitySpec) -> str:
     """Name used in errors. A const has no column."""
     if spec.input_field is None:
-        return "const"
+        return "all fields"
     if spec.input_index is None:
-        return spec.input_field
+        return ", ".join(spec.input_names)
     return f"{spec.input_field}[{spec.input_index}]"
-
-
-def expand_tokenizer_spec(spec: TokenizerModalitySpec) -> list[TokenizerModalitySpec]:
-    if spec.type in ("text", "token") and spec.input_field is None:
-        return [spec]
-    if not spec.input_field:
-        raise ValueError(
-            "input-backed tokenizer modalities must set input_field="
-        )
-    return [spec]
 
 
 @dataclass(frozen=True)
@@ -481,32 +420,11 @@ def resolve_tokenizer_modalities(
             spec = m
         else:
             spec = TokenizerModalitySpec(**dict(m))
-        specs.extend(expand_tokenizer_spec(spec))
+        specs.append(spec)
 
     meta: list[TokenizerModalityMeta] = []
-    seen_names: set[tuple[str, str]] = set()
-    seen_indexed: set[tuple[tuple[str, str], int]] = set()
-    indexed_names: set[tuple[str, str]] = set()
     for spec in specs:
         k = spec.type
-        if spec.input_field is not None:
-            name = (spec.provider, spec.input_field)
-            if spec.input_index is None:
-                if name in seen_names or name in indexed_names:
-                    raise ValueError(f"duplicate tokenizer field {spec.input_field!r} for provider {spec.provider!r}")
-                seen_names.add(name)
-            else:
-                key = (name, spec.input_index)
-                if key in seen_indexed:
-                    raise ValueError(
-                        f"duplicate tokenizer field {spec.input_field!r} with "
-                        f"input_index={spec.input_index}; each (input_field, "
-                        "input_index) pair must be unique"
-                    )
-                if name in seen_names:
-                    raise ValueError(f"duplicate tokenizer field {spec.input_field!r} for provider {spec.provider!r}")
-                seen_indexed.add(key)
-                indexed_names.add(name)
         if k == "text":
             meta.append(
                 TokenizerModalityMeta(spec=spec, kind=KIND_TEXT)

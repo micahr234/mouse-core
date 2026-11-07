@@ -286,8 +286,8 @@ def test_runtime_context_top_level_is_read_only(workers):
 def test_context_without_schedule_is_none_and_payload_selection_remains_available():
     def formatter(payload, *, context):
         assert context is None
-        assert payload["field"] == "chosen"
-        return payload["field"]
+        assert payload["items"] == 1
+        return ["unused", "chosen"][payload["items"]]
 
     tok = Tokenizer(
         tokenizers={"text": Characters()},
@@ -297,7 +297,6 @@ def test_context_without_schedule_is_none_and_payload_selection_remains_availabl
                 provider="sensor",
                 input_field="items",
                 input_index=1,
-                lookup=["unused", "chosen"],
                 format=formatter,
             ),
         ],

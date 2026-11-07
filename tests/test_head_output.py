@@ -69,19 +69,19 @@ def _head_output_tokenizer(
     value: str = "ab",
     tail: str | None = None,
 ) -> Tokenizer:
-    fields: list[dict] = [{"provider": "sensor", "type": "text", "input_field": name, "format": "{field}"} for name in token_fields]
+    fields: list[dict] = [{"provider": "sensor", "type": "text", "input_field": name, "format": "{" + name + "}"} for name in token_fields]
     fields.append(
         {"provider": "sensor",
             "type": "text",
             "input_field": "repeat_episode_index",
-            "format": lambda ctx: f"{ctx['field']}" if ('step_index' in ctx and ctx['step_index'] == 0) else "",
+            "format": lambda ctx: f"{ctx['repeat_episode_index']}" if ('step_index' in ctx and ctx['step_index'] == 0) else "",
         }
     )
     fields.append(
         {"provider": "sensor", "type": "text", "format": value, "head_output": True}
     )
     if tail is not None:
-        fields.append({"provider": "sensor", "type": "text", "input_field": tail, "format": "{field}"})
+        fields.append({"provider": "sensor", "type": "text", "input_field": tail, "format": "{" + tail + "}"})
     obj = [{"input_field": name} for name in token_fields]
     if tail is not None:
         obj.append({"input_field": tail})
@@ -131,7 +131,7 @@ def _packed(model: Model):
 @pytest.mark.parametrize('head', [False, True])
 def test_tokenizer_supports_zero_or_multiple_head_fields(head) -> None:
     tok = Tokenizer(tokenizers={"default": _FakeTokenizer()}, input_fields=[
-        dict(provider="sensor", type='text', input_field=name, format='{field}', head_output=head)
+        dict(provider="sensor", type='text', input_field=name, format="{" + name + "}", head_output=head)
         for name in ('action', 'obs')
     ])
     step = encode_measurement(tok, {'action': 1, 'obs': 2})
@@ -141,17 +141,17 @@ def test_tokenizer_supports_zero_or_multiple_head_fields(head) -> None:
 def test_step_without_head_output_token_is_retained() -> None:
     tok = Tokenizer(
         input_fields=[
-            {"provider": "sensor", "type": "text", "input_field": "action", "format": "{field}"},
+            {"provider": "sensor", "type": "text", "input_field": "action", "format": '{action}'},
             {"provider": "sensor",
                 "type": "text",
                 "input_field": "reward",
-                "format": "{field}",
+                "format": '{reward}',
                 "head_output": True,
             },
             {"provider": "sensor",
                 "type": "text",
                 "input_field": "repeat_episode_index",
-                "format": lambda ctx: f"{ctx['field']}" if ('step_index' in ctx and ctx['step_index'] == 0) else "",
+                "format": lambda ctx: f"{ctx['repeat_episode_index']}" if ('step_index' in ctx and ctx['step_index'] == 0) else "",
             },
         ],
         tokenizers={"default": _FakeTokenizer()},
