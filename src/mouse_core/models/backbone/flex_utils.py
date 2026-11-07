@@ -16,8 +16,9 @@ _compiled_create_block_mask: Any | None = None
 def check_autocast_dtype(autocast_dtype: object, dtype: torch.dtype) -> torch.dtype | None:
     """Validate a backbone autocast dtype (train or decode) against the base weight ``dtype``.
 
-    ``None`` means no autocast: every forward runs in the base dtype.
-    bf16/fp16 declare mixed precision and require fp32 base weights.
+    ``None`` disables autocast. Mixed precision accepts fp32 base weights or
+    base weights already matching the requested autocast dtype. Matching
+    autocast still matters for fp32 LoRA adapters alongside low-precision weights.
     """
     if autocast_dtype is None:
         return None
@@ -25,10 +26,9 @@ def check_autocast_dtype(autocast_dtype: object, dtype: torch.dtype) -> torch.dt
         raise ValueError(
             f"autocast_dtype must be torch.bfloat16, torch.float16, or None, got {autocast_dtype!r}."
         )
-    if dtype is not torch.float32:
+    if dtype is not torch.float32 and dtype is not autocast_dtype:
         raise ValueError(
-            f"autocast_dtype={autocast_dtype} requires fp32 base weights, got dtype={dtype}; "
-            "a bf16/fp16 backbone already computes in its base dtype."
+            f"autocast_dtype={autocast_dtype} requires fp32 or matching base weights, got dtype={dtype}."
         )
     return cast(torch.dtype, autocast_dtype)
 

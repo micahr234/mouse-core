@@ -167,10 +167,14 @@ def test_cuda_bf16_lora_compiled_train_matches_cached_decode() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='FlexAttention train / bf16 KV pool are CUDA-only')
-def test_cuda_fp32_autocast_train_matches_cached_decode() -> None:
+@pytest.mark.parametrize('dtype,lora', [(torch.float32, None),
+    (torch.bfloat16, LoRAConfig(rank=2, alpha=4.0))])
+def test_cuda_autocast_train_matches_cached_decode(dtype, lora) -> None:
     """bf16 declared on both paths: FlexAttention packed train == Flex cached decode on a bf16 KV pool."""
     torch.manual_seed(6)
-    model = _tiny_model('qwen3', train_autocast_dtype=torch.bfloat16, decode_autocast_dtype=torch.bfloat16).to(torch.device('cuda'))
+    model = _tiny_model('qwen3', dtype=dtype, lora=lora,
+                        train_autocast_dtype=torch.bfloat16,
+                        decode_autocast_dtype=torch.bfloat16).to(torch.device('cuda'))
     steps = _steps(8)
     for step, episode in zip(steps, (0, 0, 1, 1, 0, 0, 2, 0)):
         step['episode_index'] = episode

@@ -2,8 +2,9 @@
 
 The alternative to fine-tuning the whole backbone in fp32: the base weights
 are frozen and, on CUDA, bf16, and the only trainable backbone parameters
-are the LoRA factors, which are always fp32. Their rank-``r`` matmuls run
-in fp32 and the delta is cast back onto the base output, so updates land
+are the LoRA factors, which are always fp32. Their rank-``r`` matmuls use
+backbone autocast when enabled, otherwise FP32.
+The delta is cast back onto the base output, so updates land
 in fp32 tensors and nothing needs fp32 master weights or polyak shadows.
 """
 
@@ -29,13 +30,18 @@ class LoRAConfig:
         rank: Adapter rank ``r``.
         alpha: Scaling numerator; the delta is scaled by ``alpha / rank``.
         dropout: Dropout on the adapter input (``0`` disables it).
+        dtype: Stored adapter weight dtype. Only ``"float32"`` is supported;
+            backbone autocast independently controls eligible computation.
     """
 
     rank: int = 16
     alpha: float = 32.0
     dropout: float = 0.0
+    dtype: str = "float32"
 
     def __post_init__(self) -> None:
+        if self.dtype != "float32":
+            raise ValueError("LoRA dtype must be float32: trainable adapter weights require FP32 updates.")
         if int(self.rank) < 1:
             raise ValueError(f"rank must be >= 1, got {self.rank}.")
         if float(self.alpha) <= 0.0:
@@ -118,9 +124,9 @@ class LoRALinear(nn.Module):
         self.scale = config.alpha / config.rank
         self.dropout_p = config.dropout
         self.lora_A = nn.Linear(base.in_features, config.rank, bias=False,
-                                device=base.weight.device, dtype=torch.float32)
+                                device=base.weight.device, dtype=getattr(torch, config.dtype))
         self.lora_B = nn.Linear(config.rank, base.out_features, bias=False,
-                                device=base.weight.device, dtype=torch.float32)
+                                device=base.weight.device, dtype=getattr(torch, config.dtype))
         nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
         nn.init.zeros_(self.lora_B.weight)
         self.train(base.training)

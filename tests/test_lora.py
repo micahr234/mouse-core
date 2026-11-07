@@ -20,9 +20,9 @@ from mouse_core.models import (
 from mouse_core.models.backbone import Backbone
 from mouse_core.models.mlp import MLP
 from mouse_core.models.lora import LoRALinear, apply_lora, lora_modules
-from tests._token_batch_helpers import batch_to_token_batch, token_tokenizer
+from tests._token_batch_helpers import batch_to_token_batch, batch_to_packed, token_tokenizer
 
-_HIDDEN = 16
+_HIDDEN = 32  # Cached CUDA FlexAttention requires at least 16 dimensions per head.
 _ACTIONS = 4
 _TOK = token_tokenizer("action", "episode_done")
 _BATCH = [
@@ -285,7 +285,7 @@ def test_model_to_bf16_keeps_every_trainable_section_fp32() -> None:
 
 @pytest.mark.flex_training
 def test_bf16_backbone_forward_backward_on_cuda() -> None:
-    """LoRA adapters stay fp32 over a bf16 backbone, through masked SDPA on CPU."""
+    """LoRA adapters stay FP32 through BF16 training and cached CUDA decode."""
     torch.manual_seed(0)
     model = _model(dtype=torch.bfloat16).train()
     batch = _batch(model)
@@ -299,16 +299,19 @@ def test_bf16_backbone_forward_backward_on_cuda() -> None:
     assert lora_grads and all((g is not None and g.dtype == torch.float32 for g in lora_grads))
     model.eval()
     with torch.no_grad():
-        decoded = model(batch, use_cache=True)["predictions"]['action_value']
-    assert decoded.dtype == torch.float32
+        cached = model(batch, use_cache=True)
+        try:
+            assert cached["predictions"]["action_value"].dtype == torch.float32
+        finally:
+            cached["cache"].close()
 
 
 @pytest.mark.flex_training
 def test_bf16_reasoner_forward_on_cuda() -> None:
     torch.manual_seed(0)
     model = _model(reasoner=True, dtype=torch.bfloat16).train()
-    batch = _batch(model)
-    out = model(batch, reasoning=[1, -1])
+    batch, objective_data = batch_to_packed(_TOK, _BATCH)
+    out = model(batch, reasoning=[1, -1], objective_data=objective_data)
     out["predictions"]["action_value"].sum().backward()
     assert model.reasoner is not None
     assert model.reasoner.proj.weight.grad is not None
@@ -408,3 +411,17 @@ def test_delayed_backbone_shares_frozen_base_and_copies_adapters() -> None:
         else:
             assert p is online[name]
     assert all((p.requires_grad for n, p in online.items() if '.lora_' in n))
+
+
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16", None, torch.float32])
+def test_lora_rejects_unsupported_stored_dtype(dtype):
+    with pytest.raises(ValueError, match="dtype must be float32"):
+        LoRAConfig(dtype=dtype)
+
+
+def test_explicit_lora_dtype_constructs_fp32_adapters():
+    config = LoRAConfig(rank=2, dtype="float32")
+    layer = LoRALinear(torch.nn.Linear(4, 3, dtype=torch.bfloat16), config)
+    assert config.dtype == "float32"
+    assert layer.base.weight.dtype == torch.bfloat16
+    assert layer.lora_A.weight.dtype == layer.lora_B.weight.dtype == torch.float32

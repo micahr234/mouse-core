@@ -36,8 +36,9 @@ class ResidualBlock(nn.Module):
         self.to(device="cpu", dtype=torch.float32)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.float()
-        return x + self.output_linear(self.activation(self.input_linear(self.norm(x))))
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            x = x.float()
+            return x + self.output_linear(self.activation(self.input_linear(self.norm(x))))
 
 
 class MLP(nn.Module):
@@ -59,6 +60,7 @@ class MLP(nn.Module):
     ``propagate_gradient`` scales gradients into upstream modules, from zero
     (detach the input) to one (full flow), including through the skips.
     This MLP's own parameters always receive the full loss gradient.
+    Parameters and computation stay FP32, including inside ambient autocast.
     """
 
     def __init__(
@@ -126,8 +128,10 @@ class MLP(nn.Module):
         self.to(device="cpu", dtype=torch.float32)
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
-        if self.propagate_gradient == 0.0:
-            h = h.detach()
-        elif self.propagate_gradient != 1.0:
-            h = h + (1.0 - self.propagate_gradient) * (h.detach() - h)
-        return self.output_norm(self.layers(self.input_norm(h.float())))
+        with torch.autocast(device_type=h.device.type, enabled=False):
+            h = h.float()
+            if self.propagate_gradient == 0.0:
+                h = h.detach()
+            elif self.propagate_gradient != 1.0:
+                h = h + (1.0 - self.propagate_gradient) * (h.detach() - h)
+            return self.output_norm(self.layers(self.input_norm(h)))

@@ -104,7 +104,7 @@ def main() -> None:
         parser.error("modes must not repeat")
     if not torch.cuda.is_available():
         raise SystemExit("this benchmark needs CUDA")
-    torch.set_float32_matmul_precision("high")
+    torch.backends.cuda.matmul.fp32_precision = "ieee"
     device = torch.device("cuda")
     torch.manual_seed(0)
     lora = None if args.no_lora else LoRAConfig(rank=16, alpha=32.0)

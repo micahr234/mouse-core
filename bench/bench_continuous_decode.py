@@ -47,7 +47,7 @@ def main():
         if args.cache_capacity_tokens % page_size or args.cache_capacity_tokens < max(capacities.values()):
             parser.error(f'cache capacity must be a multiple of {page_size} and at least {max(capacities.values())}')
     torch.manual_seed(78)
-    torch.set_float32_matmul_precision('high')
+    torch.backends.cuda.matmul.fp32_precision = "ieee"
     model = Backbone(architecture='qwen3', dtype=torch.float32, hidden_dim=args.hidden,
                      num_layers=args.layers, num_heads=8, num_key_value_heads=4).to(args.device).eval()
 

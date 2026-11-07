@@ -75,7 +75,10 @@ class BaseBackbone(nn.Module, ABC):
       the autocast dtype (half the fp32 size). ``None`` runs that path in
       the base dtype, so e.g. ``train_autocast_dtype=torch.bfloat16`` with
       ``decode_autocast_dtype=None`` is mixed-precision training with
-      exact fp32 eval decode. Both forwards raise if called inside an
+      exact fp32 eval decode. Matching low-precision base weights also support
+      autocast: e.g. bf16 frozen weights with fp32 LoRA parameters and bf16
+      matmuls. Autocast does not change stored parameter dtypes. Both forwards
+      raise if called inside an
       ambient ``torch.autocast`` region — precision is declared here,
       never inferred.
 

@@ -314,15 +314,18 @@ def test_ambient_autocast_is_rejected(no_compiled_decoder: None) -> None:
 
 
 def test_autocast_dtype_is_validated(no_compiled_decoder: None) -> None:
-    """bf16/fp16 over fp32 base only — both declarations, at construction and at packed_forward."""
-    with pytest.raises(ValueError, match="fp32 base"):
-        _backbone("qwen3", dtype=torch.bfloat16, autocast_dtype=torch.bfloat16)
+    """Autocast accepts fp32 or matching base weights, not mixed half formats."""
+    for dtype in (torch.bfloat16, torch.float16):
+        bb = _backbone("qwen3", dtype=dtype, autocast_dtype=dtype)
+        assert bb.train_autocast_dtype is dtype
+    with pytest.raises(ValueError, match="fp32 or matching"):
+        _backbone("qwen3", dtype=torch.bfloat16, autocast_dtype=torch.float16)
     with pytest.raises(ValueError, match="autocast_dtype must be"):
         _backbone("qwen3", autocast_dtype=torch.float32)
-    with pytest.raises(ValueError, match="fp32 base"):
+    with pytest.raises(ValueError, match="fp32 or matching"):
         Backbone(architecture="qwen3",
             dtype=torch.bfloat16,
-            decode_autocast_dtype=torch.bfloat16, hidden_dim=64, num_layers=1, num_heads=4,
+            decode_autocast_dtype=torch.float16, hidden_dim=64, num_layers=1, num_heads=4,
         )
     bb = _backbone("qwen3")
     ids = torch.zeros(4, dtype=torch.long)
@@ -785,3 +788,29 @@ def test_packed_forward_rejects_removed_kernel_argument(value):
         packed_forward(model=bb.model, embeds=torch.zeros(3, 64),
                        sequence_ids=torch.zeros(3, dtype=torch.long),
                        **{"train_kernel": value})
+
+
+@_cuda
+@pytest.mark.parametrize("compiled", [False, True])
+def test_bf16_base_autocast_preserves_fp32_lora_gradients(no_compiled_decoder, compiled):
+    if compiled:
+        install_compiled_decoder()
+    torch.manual_seed(14)
+    bb = _backbone("qwen3", dtype=torch.bfloat16,
+                   autocast_dtype=torch.bfloat16, lora=LoRAConfig(rank=2, alpha=4.)).to("cuda")
+    embeds = torch.randn(12, 64, device="cuda", requires_grad=True)
+    seq = torch.arange(2, device="cuda").repeat_interleave(6)
+    out = bb(embeds, sequence_ids=seq)
+    assert out.dtype == torch.bfloat16 and torch.isfinite(out).all()
+    out.float().square().mean().backward()
+    grads = []
+    for name, parameter in bb.named_parameters():
+        if ".lora_" in name:
+            assert parameter.dtype == torch.float32
+            assert parameter.grad is not None and parameter.grad.dtype == torch.float32
+            assert torch.isfinite(parameter.grad).all()
+            grads.append(parameter.grad)
+        else:
+            assert parameter.dtype == torch.bfloat16 and not parameter.requires_grad
+    assert grads and any(g.count_nonzero() for g in grads)
+    assert embeds.grad is not None and torch.isfinite(embeds.grad).all()

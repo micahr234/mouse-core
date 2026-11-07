@@ -44,6 +44,24 @@ To run the notebooks, follow the [development setup](CONTRIBUTING.md#development
 
 MOUSE is in early development; APIs may change.
 
+## Backbone precision
+
+Frozen LoRA backbones can use `dtype=torch.bfloat16` together with
+`train_autocast_dtype=torch.bfloat16` and `decode_autocast_dtype=torch.bfloat16`.
+`LoRAConfig(dtype="float32")` explicitly declares stored adapter precision;
+FP32 is the supported trainable weight dtype. Base weights stay BF16;
+trainable LoRA weights stay FP32, with eligible matrix
+operations running in BF16 under autocast. FP32 base weights also support BF16
+or FP16 autocast. Low-precision base weights must match the autocast dtype.
+Autocast is scoped to the backbone and does not change stored head parameters.
+Core's MLP heads and separate embeddings are constructed in FP32. MLP heads
+and residual projections disable ambient autocast and compute in FP32; there
+is no head-precision setting. Full FP32 multiplication also requires disabling
+TF32: application entry points should set
+`torch.backends.cuda.matmul.fp32_precision = "ieee"` before forward and backward.
+Mouse Experiment and V2B now enforce this fixed runtime policy, as do Core's
+benchmarks. AdamW continues to update FP32 trainable weights.
+
 ## Supervised policy and value losses
 
 `SupervisedObjective` combines policy and value supervision. Set `loss_type` to

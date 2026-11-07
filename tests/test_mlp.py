@@ -205,3 +205,32 @@ def test_final_linear_has_no_output_activation(num_layers):
     result = head(torch.randn(2, 8, dtype=torch.bfloat16))
     assert result.dtype == torch.float32
     torch.testing.assert_close(result, torch.full((2, 3), -3.0), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("kind", ["mlp", "residual"])
+def test_head_computation_remains_fp32_inside_autocast(device, kind):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    module = (MLP(in_features=8, out_features=3, hidden_dim=16, num_layers=3)
+              if kind == "mlp" else ResidualBlock(in_features=8, hidden_dim=16)).to(device)
+    features = torch.randn(5, 8, device=device, dtype=torch.bfloat16).requires_grad_()
+    reference = module(features)
+    reference_grads = torch.autograd.grad(reference.square().sum(), tuple(module.parameters()))
+    linear_dtypes = []
+    handles = [layer.register_forward_hook(lambda _, args, output: linear_dtypes.append(output.dtype))
+               for layer in module.modules() if isinstance(layer, torch.nn.Linear)]
+    try:
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            output = module(features)
+        gradients = torch.autograd.grad(output.square().sum(), tuple(module.parameters()))
+    finally:
+        for handle in handles:
+            handle.remove()
+    assert output.dtype == torch.float32
+    assert linear_dtypes and set(linear_dtypes) == {torch.float32}
+    assert {p.dtype for p in module.parameters()} == {torch.float32}
+    torch.testing.assert_close(output, reference, atol=0, rtol=0)
+    for actual, expected in zip(gradients, reference_grads):
+        assert actual.dtype == torch.float32
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)

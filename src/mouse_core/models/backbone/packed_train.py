@@ -345,7 +345,7 @@ def packed_forward(
         sequence_ids: ``[L]`` group id per token. One group is one sample.
         position_ids: Optional explicit ``[L]`` rotary positions in stream order.
         autocast_dtype: ``None`` runs everything in the model's base dtype.
-            ``torch.bfloat16`` / ``torch.float16`` (fp32 base weights only)
+            ``torch.bfloat16`` / ``torch.float16`` (fp32 or matching base weights)
             wraps the decoder stack in ``torch.autocast``: matmuls run in this
             dtype, weights / norms / RoPE / residuals stay fp32. ``Model``
             passes ``Backbone.train_autocast_dtype``. Calling ``packed_forward``

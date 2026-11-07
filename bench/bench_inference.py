@@ -7,8 +7,8 @@ peak allocation above the warmed baseline, resident session allocation,
 tokens/second, and first-call time. The HF paged pool is fixed at creation;
 this path does not use CUDA graphs. ``--profile`` adds a ``torch.profiler`` CPU/CUDA
 breakdown after warmup. Decode always uses FlexAttention.
-``torch.set_float32_matmul_precision("high")`` is set so fp32 matches the
-README TF32 path.
+FP32 matrix multiplication uses IEEE precision (TF32 disabled), matching
+the training and evaluation runtime policy.
 
     .venv/bin/python bench/bench_inference.py --layers 8 --step 1
     .venv/bin/python bench/bench_inference.py --layers 28 --workloads mid long --step 1
@@ -139,7 +139,7 @@ def main() -> None:
 
     if not torch.cuda.is_available():
         raise SystemExit("this benchmark needs CUDA")
-    torch.set_float32_matmul_precision("high")
+    torch.backends.cuda.matmul.fp32_precision = "ieee"
     device = torch.device("cuda")
     torch.manual_seed(0)
     lora = None if args.no_lora else LoRAConfig(rank=16, alpha=32.0)
