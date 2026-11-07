@@ -5,9 +5,15 @@ from typing import Any
 
 import pytest
 
-from mouse_core.data import (DataLoader, EpochDataLoader, EventLog, Tokenizer,
-                             environment_episode_ranges, load_tokenizer, save_tokenizer,
-                             step_sample_ranges)
+from mouse_core.data import (
+    DataLoader,
+    EpochDataLoader,
+    EventLog,
+    Tokenizer,
+    load_tokenizer,
+    save_tokenizer,
+)
+from tests._sampling_policies import environment_episode_ranges, step_sample_ranges
 from tests._token_batch_helpers import IntIdTokenizer
 
 

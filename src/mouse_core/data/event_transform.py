@@ -239,6 +239,7 @@ def validate_environment_events(events, *, require_complete=False, protocol: Env
         pass
 
 
+
 def environment_decisions(events, *, protocol: EnvironmentProtocol = _DEFAULT_PROTOCOL):
     """Yield sparse views of optional coordinator → optional agent → environment steps.
 
@@ -251,48 +252,6 @@ def environment_decisions(events, *, protocol: EnvironmentProtocol = _DEFAULT_PR
         row["events"] = _packet_json(packet)
         yield deepcopy(row)
 
-
-def environment_episode_ranges(events, *, protocol: EnvironmentProtocol = _DEFAULT_PROTOCOL):
-    """Select indexed episodes after checking their start and final result.
-
-    An index change defines the episode boundary; it does not prove that the
-    episode is complete. Require a reset coordinator first and a terminated or
-    truncated environment result last. Only an unfinished final episode may
-    be omitted. Events after an ending and resets within an index are errors.
-    """
-    start, episode, ended = 0, None, False
-    end = 0
-    seen = set()
-    normalized = isinstance(events, EventLog)
-    sources = (record[0] for record in events._records) if normalized else events
-    for index, event in enumerate(sources):
-        event = _record(event, encoded_payload=not normalized, normalized=normalized)
-        end = index + 1
-        marker = _headers(event)["episode_index"]
-        payload = event["payload"]
-        is_start = event["provider"] == "coordinator" and payload.get(protocol.episode_start, False)
-        if marker != episode:
-            if episode is not None:
-                if not ended:
-                    raise ValueError("A new episode starts before the previous episode ends")
-                yield start, index
-            if marker in seen:
-                raise ValueError("Episode indices must form one contiguous run each")
-            if not is_start:
-                raise ValueError("Episode samples must begin with a reset coordinator")
-            seen.add(marker)
-            start, episode, ended = index, marker, False
-        elif ended:
-            raise ValueError("Events cannot follow the final result within an episode")
-        elif is_start:
-            raise ValueError("An episode index cannot contain multiple episode starts")
-        if event["provider"] == "coordinator":
-            _validate_coordinator_payload(payload, protocol=protocol)
-        if event["provider"] == "environment":
-            _validate_environment_payload(payload, protocol=protocol)
-            ended = payload.get(protocol.terminated, False) or payload.get(protocol.truncated, False)
-    if ended:
-        yield start, end
 
 
 def _latest_environment_step(log, *, protocol: EnvironmentProtocol = _DEFAULT_PROTOCOL):

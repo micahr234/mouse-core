@@ -20,11 +20,11 @@ from mouse_core.data import (
     Datastore,
     EventLog,
     EventTransform,
-    environment_episode_ranges,
     Tokenizer,
     environment_decisions,
     pack_token_batch,
 )
+from tests._sampling_policies import environment_episode_ranges
 from mouse_core.objectives import (
     DqnObjective,
     GrpoObjective,

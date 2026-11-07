@@ -175,6 +175,131 @@ validated payload JSON. Omit `episode_index` to preserve existing indices.
 whole batch if validation or iteration fails. Recording and storage remain
 independent of the environment protocol; callers explicitly select its validator.
 
+`Datastore.from_dataset(ds=dataset)` retains the loaded Hugging Face dataset's
+columnar buffers, including disk-backed Arrow storage and selected row order.
+It validates event envelopes and finite JSON in bounded batches, but does not
+rebuild Python event dictionaries or re-serialize persisted payloads. Encoded JSON
+whitespace is preserved. Live appends use an owned buffer; `to_dataset()` folds
+new events into immutable dataset blocks and reuses existing blocks. Returned
+snapshots remain unchanged after append or clear, and store reads return owned
+rows with absent optional indices omitted.
+
+The offline-store benchmark on one 358,795-event FrozenLake shard (three repeats,
+Python 3.15, CPU) measured these median times:
+
+| Stage | Before | Dataset-backed store |
+|---|---:|---:|
+| Import and validate persisted events | 10.967 s | 1.061 s |
+| Create dataset snapshot | 0.874 s | 0.000319 s |
+| Combined | 11.840 s | 1.061 s |
+
+That is an 11.2× improvement for these stages. Extrapolating to 32 similarly sized
+shards gives about 5.7 minutes saved; the full 32-shard load was not timed.
+The entire dataset and selected event contents matched exactly, as did all 847
+episode ranges and three seeded input/objective batches with each of zero and four
+workers. That storage-only measurement still used an eager episode scan, taking
+about 19 seconds per shard. The separate sampling optimization below removes that
+startup scan; the 11× figure above applies only to import and snapshot creation.
+The benchmark also includes worker startup in its first-batch measurements, so
+those values are not steady-state loader throughput.
+
+Run `bench/bench_offline_store.py SHARD.parquet --repeats 3 --workers 0 4 --output RESULT.json`
+against each revision with the same cached files. See the
+[comparison report](bench/results/offline_store_comparison_2026-11-07.json),
+[baseline measurements](bench/results/offline_store_before_2026-11-07.json), and
+[dataset-backed measurements](bench/results/offline_store_after_2026-11-07.json).
+
+Sampling policies belong to the engineer. Define them directly above the loader;
+Core validates event structure automatically and caches candidate eligibility.
+
+```python
+from mouse_core.data import DataLoader
+
+
+def sample_ranges(dataset):
+    """Keep all events belonging to one outer episode together."""
+    start, previous = 0, None
+    for index, episode in enumerate(dataset["episode_index"][:]):
+        if episode is not None and episode != previous:
+            if index:
+                yield start, index
+            start, previous = index, episode
+    if len(dataset):
+        yield start, len(dataset)
+
+
+def sample_eligible(events):
+    """Train only on episodes with a recorded final environment result."""
+    last = events[-1]
+    return last["provider"] == "environment" and (
+        last["payload"].get('_terminated') is True
+        or last["payload"].get('_truncated') is True
+    )
+
+
+loader = DataLoader(
+    stores=stores,
+    sample_ranges=sample_ranges,
+    sample_eligible=sample_eligible,
+    transform=train_transform,
+    token_budget=10000,
+    num_workers=4,
+    prefetch=4,
+)
+```
+
+This range function reads only episode headers, keeping each outer episode together,
+including a potentially unfinished tail. Eligibility examines the selected sample's
+decoded payloads and skips unfinished episodes. Define different functions for
+other episode conventions or step windows; Core does not export sampling policies.
+
+The loader always decodes and validates finite JSON-object payloads before
+eligibility and tokenization. Malformed JSON, nonfinite numbers, arrays, scalars,
+and null payloads raise errors rather than becoming rejected samples. Datastore
+remains a general finite-JSON event store; dictionary payloads are required at the
+training-loader boundary. The predicate and transform share the decoded events.
+Sample ranges are also checked for valid offsets and, when step markers are
+present, whole steps within one episode. There is no validation callback or
+option to disable these structural checks.
+
+`sample_eligible(events)` must return a bool. It defines domain eligibility, such
+as requiring a recorded final result; the loader does not impose a particular
+termination flag, environment protocol, or action schema. Use predicates that do
+not mutate events and depend only on their contents, not training progress or
+external mutable state. Replace the callable when changing policy. Define range
+and eligibility functions outside repeated training loops so the same policy can
+reuse its cache when the loader is rebuilt. All training notebooks show their
+local functions beside loader construction.
+
+The store caches ranges by sampling policy and content revision, and caches
+sample-check outcomes in one shared byte per candidate. Workers, refreshes, and
+new loaders over the same store reuse these results. Simultaneous first visits
+may perform the same check twice; there is no global lock in the sampling path.
+Rejections cannot cause infinite retries: each rejected candidate is excluded
+within the current batch, and exhausting candidates raises `no eligible samples`.
+The random stream is independent of cache warmth and worker count. Store weights
+are conditioned on the candidates that pass eligibility, so eligibility changes
+the training distribution.
+
+Appending events rebuilds only the changed store's header index and retains
+check results for ranges whose event offsets are unchanged. A growing tail is
+checked again. This currently rescans the changed store's headers, rather than
+maintaining an incremental header scanner. Unchanged offline stores need no scan.
+Clearing a store invalidates its cached indexes. Caches live with the in-memory
+store; they are not persisted between program launches. EpochDataLoader accepts
+the same callbacks and caches; it still prepares its samples up front for finite
+passes. Ingestion remains owned by the parent, with batched `extend` or
+`extend_event_log`; workers only read snapshots.
+
+See the [repeated cold/warm sampling benchmark](bench/results/sample_index_builtin_2026-11-07.md)
+for current indexing/refresh measurements, automatic structural validation,
+and exact batch parity.
+
+Basic envelope and finite-JSON checks also happen at ingestion. The loader's
+object requirement is checked when a candidate is first selected. Environment
+protocol checking is separate from this generic requirement: collection and event
+decoders may still use `validate_environment_events`, but it is not a loader hook.
+
 `Tokenizer` encodes each event's configured payload fields in `input_fields` order.
 A change in `step_field` starts the next step before that event's tokens;
 an event without the marker continues the current step. The first event needs a
@@ -191,8 +316,7 @@ Repeated or overlapping filters emit in declaration order.
 Using an existing Hugging Face tokenizer:
 
 ```python
-from functools import partial
-from mouse_core.data import DataLoader, Tokenizer, step_sample_ranges
+from mouse_core.data import DataLoader, Tokenizer
 
 
 def action_name(action):
@@ -214,7 +338,8 @@ tokenizer = Tokenizer(
 loader = DataLoader(
     stores=store,
     transform=tokenizer.encode,
-    sample_ranges=partial(step_sample_ranges, steps_per_sample=8),
+    sample_ranges=sample_ranges,
+    sample_eligible=sample_eligible,
     token_budget=4096,
     num_workers=4,
     prefetch=4,
@@ -227,12 +352,11 @@ token boundaries; `objective_data["step_sequence_ids"]` marks the corresponding 
 There is no separate group-ID return value. Workers use shared memory and return
 owned tensors, so batches remain valid after subsequent reads or `loader.close()`.
 
-Each sample above contains exactly eight consecutive whole steps from one episode.
-For whole completed environment episodes, use
-`sample_ranges=environment_episode_ranges` instead. Indexed datasets reject custom
-ranges that cut through a step or cross episodes. Budgets never truncate a sample.
-For a live log whose last step is still being recorded, pass
-`include_final_step=False` to `step_sample_ranges`.
+The example uses the local whole-episode functions defined above. To sample step
+windows instead, define a range function that groups consecutive step markers
+within one episode. Indexed datasets reject ranges that cut through a step or
+cross episodes. Budgets never truncate a sample. For live data, the engineer
+decides when the final step is complete and eligible.
 
 `tokenizer(event)` returns just that event's token arrays. `tokenizer.encode(events)`
 assembles a finalized sample, including its last step. For input arriving in partial
@@ -339,7 +463,8 @@ train_transform = compose(stages=(augmenter.events, tokenizer.encode))
 loader = DataLoader(
     stores=stores,
     token_budget=16_384,
-    sample_ranges=environment_episode_ranges,
+    sample_ranges=sample_ranges,
+    sample_eligible=sample_eligible,
     transform=train_transform,
     context_for_batch=training_context,
     num_workers=4,
@@ -372,7 +497,7 @@ can be changed to a schedule like the one above without rebuilding the tokenizer
 Episode prompts are ordinary fields on the coordinator's `_episode_start` event.
 Emit that event before the first observation of every outer episode. The prompt then
 belongs to that episode's attention sequence and is visible to all its inner episodes.
-`environment_episode_ranges` samples complete outer episodes; data producers and
+The local range and eligibility functions select complete outer episodes; data producers and
 samplers own these boundaries. Packing never invents or reinserts a prompt, including
 when a caller supplies a partial history. Cached decoding simply packs new events.
 

@@ -29,8 +29,9 @@ import numpy as np
 from tensordict import TensorDict
 
 from mouse_core.data.callbacks import accepts_context
-from mouse_core.data.datastore import _normalize_value
+from mouse_core.data.datastore import _normalize_value, _finite_float, _invalid_constant
 from mouse_core.data.process_batches import ProcessBatches
+from mouse_core.data.sample_index import SampleChecks, sample_index
 from mouse_core.data.step_sampling import _step_spans, _validate_step_ranges
 from mouse_core.data.token_batch import StepTokens, pack_token_batch
 
@@ -54,6 +55,7 @@ class _SnapshotConfig:
     index_field: str | None
     sample_field: str | None
     runs: tuple[np.ndarray, ...]
+    checks: tuple[SampleChecks, ...]
 
 
 class _ColumnView(Mapping[str, Any]):
@@ -199,22 +201,26 @@ def _rows_from_slice(
     return rows
 
 
-def _fetch_sequence(
-    cfg: _SnapshotConfig,
-    rng: np.random.Generator,
-) -> tuple[Any, int, int]:
-    """Choose one sample. Return ``(dataset, start, exclusive_end)``."""
-    if sum(cfg.ns) == 0:
+def _fetch_sequence(cfg, rng, rejected):
+    """Choose a candidate; exclusions are batch-local for worker-independent RNG."""
+    probabilities = cfg.probs
+    available = None
+    if any(rejected):
+        available = [np.asarray([i for i in range(len(runs)) if i not in excluded], dtype=np.int64)
+                     for runs, excluded in zip(cfg.runs, rejected)]
+        probabilities = cfg.probs * np.asarray([
+            len(left) / len(runs) if len(runs) else 0 for left, runs in zip(available, cfg.runs)])
+        if probabilities.sum() == 0:
+            raise ValueError("Cannot sample batches: no eligible samples in the stores.")
+        probabilities = probabilities / probabilities.sum()
+    elif sum(cfg.ns) == 0:
         raise ValueError("Cannot sample batches: no eligible samples in the stores.")
-    store_idx = int(rng.choice(len(cfg.datasets), p=cfg.probs))
-    ds = cfg.datasets[store_idx]
+    store_idx = int(rng.choice(len(cfg.datasets), p=probabilities))
     runs = cfg.runs[store_idx]
-    if len(runs) == 0:
-        raise ValueError(
-            f"Cannot sample {cfg.sample_field!r} from an empty store."
-        )
-    pick = int(rng.integers(0, len(runs)))
-    return ds, int(runs[pick, 0]), int(runs[pick, 1])
+    pick = int(rng.integers(0, len(runs) if available is None else len(available[store_idx])))
+    if available is not None:
+        pick = int(available[store_idx][pick])
+    return store_idx, pick, int(runs[pick, 0]), int(runs[pick, 1])
 
 
 def _batch_rng(entropy: int, k: int) -> np.random.Generator:
@@ -241,13 +247,36 @@ def _tokenize_event_window(
     index_field: str | None,
     transform: EventSequenceTransform,
     context=None,
+    events=None,
 ) -> list[StepTokens]:
     """Tokenize one complete ordered event sample, without trimming it."""
-    events = _rows_from_slice(ds=ds, start=start, end=end, index_field=index_field)
+    if events is None:
+        events = _decoded_events(ds, start, end, index_field)
     encoded = transform(events) if context is None else transform(events, context=context)
     if not isinstance(encoded, list) or not encoded or not all(isinstance(item, StepTokens) for item in encoded):
         raise TypeError("Event transform must return a nonempty list of StepTokens readouts")
     return encoded
+
+
+def _decoded_events(ds, start, end, index_field):
+    events = _rows_from_slice(ds=ds, start=start, end=end, index_field=index_field)
+    for offset, event in enumerate(events, start):
+        try:
+            payload = json.loads(event["payload"], parse_float=_finite_float,
+                                 parse_constant=_invalid_constant)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Event {offset} payload must be a valid finite JSON object") from exc
+        if not isinstance(payload, dict):
+            raise ValueError(f"Event {offset} payload must be a JSON object")
+        event["payload"] = payload
+    return events
+
+
+def _checked_sample(ds, start, end, index_field, checks, pick):
+    if checks.status[pick] == 2:
+        return False, None
+    events = _decoded_events(ds, start, end, index_field)
+    return checks.accepts(pick, events), events
 
 
 def _segment_token_count(steps: list[StepTokens]) -> int:
@@ -294,8 +323,14 @@ def _fetch_budget_batch(
     used = 0
     added = 0
     attempt = 0
+    rejected: list[set[int]] = [set() for _ in cfg.datasets]
     while True:
-        ds, start, end = _fetch_sequence(cfg, rng)
+        store_idx, pick, start, end = _fetch_sequence(cfg, rng, rejected)
+        ds, checks = cfg.datasets[store_idx], cfg.checks[store_idx]
+        accepted, events = _checked_sample(ds, start, end, cfg.index_field, checks, pick)
+        if not accepted:
+            rejected[store_idx].add(pick)
+            continue
         if callable(reseed):
             reseed(
                 generation=_sequence_generation(
@@ -320,6 +355,7 @@ def _fetch_budget_batch(
             index_field=cfg.index_field,
             transform=transform,
             context=context,
+            events=events,
         )
         cost = _segment_token_count(window) if count_tokens else end - start
         if cost < 1:
@@ -383,9 +419,16 @@ class DataLoader:
         Alternative callable receiving the raw event dataset and returning
         (start, exclusive_end) event offsets. Supports overlapping windows;
         indexed datasets require whole steps within one episode. Use
-        ``environment_episode_ranges`` for complete episodes or
-        ``partial(step_sample_ranges, steps_per_sample=N)`` for N whole steps.
-        Pass this or sample_field.
+        a function defined by the caller to select episodes or step windows.
+        Pass this or sample_field. Range functions must depend only on the
+        dataset and fixed policy settings; replace the callable to change policy.
+    sample_eligible :
+        Optional deterministic predicate receiving selected events with decoded
+        dictionary payloads. False skips the candidate. Core always checks that
+        payloads are finite JSON objects before calling this predicate or the
+        transform; malformed data raises. Eligibility must depend only on the
+        events and must not mutate them. Replace the callable to change policy.
+        Results are shared across workers and reused for unchanged candidates.
     step_field / episode_field :
         Boundary fields for validating sample ranges, including ``payload.key``
         paths. The standard ``step_index`` column is detected automatically;
@@ -431,6 +474,7 @@ class DataLoader:
         token_budget: int | None = None,
         sample_field: str | None = None,
         sample_ranges: Callable | None = None,
+        sample_eligible: Callable | None = None,
         step_field: str | None = None,
         episode_field: str | None = "episode_index",
         index_field: str | None = None,
@@ -472,6 +516,8 @@ class DataLoader:
             raise ValueError("sample_field must be a non-empty column name")
         if sample_ranges is not None and not callable(sample_ranges):
             raise TypeError("sample_ranges must be callable")
+        if sample_eligible is not None and not callable(sample_eligible):
+            raise TypeError("sample_eligible must be callable")
         if index_field in ("provider", "payload"):
             raise ValueError("index_field cannot overwrite provider or payload")
         if prefetch < 1:
@@ -491,6 +537,7 @@ class DataLoader:
         self.token_budget = token_budget
         self.sample_field = sample_field
         self.sample_ranges = sample_ranges
+        self.sample_eligible = sample_eligible
         self.step_field = step_field
         self.episode_field = episode_field
         self.weight_mode = weight_mode
@@ -586,6 +633,7 @@ class DataLoader:
             index_field=self.index_field,
             sample_field=self.sample_field,
             runs=self._runs,
+            checks=self._checks,
         )
 
     def _start_workers(self) -> None:
@@ -601,12 +649,16 @@ class DataLoader:
             self._pool = None
 
     def _resnapshot_stores(self) -> None:
-        self._datasets = [s.to_dataset() for s in self.stores]
-        self._runs = tuple(
-            _event_sample_ranges(ds=ds, sample_field=self.sample_field, sample_ranges=self.sample_ranges,
-                                 step_field=self.step_field, episode_field=self.episode_field)
-            for ds in self._datasets
-        )
+        build = partial(_event_sample_ranges, sample_field=self.sample_field,
+                        sample_ranges=self.sample_ranges, step_field=self.step_field,
+                        episode_field=self.episode_field)
+        indexes = [sample_index(store, build_ranges=lambda ds: build(ds=ds),
+                    policy=(self.sample_field, self.sample_ranges, self.step_field, self.episode_field, self.index_field),
+                    sample_eligible=self.sample_eligible)
+                   for store in self.stores]
+        self._datasets = [item[0] for item in indexes]
+        self._runs = tuple(item[1] for item in indexes)
+        self._checks = tuple(item[2] for item in indexes)
 
         self._ns = [len(ds) if len(runs) else 0 for ds, runs in zip(self._datasets, self._runs)]
 

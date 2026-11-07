@@ -10,9 +10,17 @@ import pytest
 import torch
 from datasets import load_from_disk
 
-from mouse_core.data import (EventLog, Tokenizer,
-                             EpochDataLoader, EventTransform, environment_decisions, environment_episode_ranges,
-                             latest_environment_decision, save_tokenizer, load_tokenizer)
+from mouse_core.data import (
+    EventLog,
+    Tokenizer,
+    EpochDataLoader,
+    EventTransform,
+    environment_decisions,
+    latest_environment_decision,
+    save_tokenizer,
+    load_tokenizer,
+)
+from tests._sampling_policies import environment_episode_ranges
 from mouse_core.models import Backbone, Embedding
 from tests._model_helpers import simple_model
 from tests._token_batch_helpers import IntIdTokenizer
@@ -487,7 +495,7 @@ def test_loader_index_overlay_follows_environment_readouts_without_altering_sour
     assert observed
     for events in observed:
         assert [event['source_offset'] for event in events] == list(range(10, 20))
-        assert all('source_offset' not in json.loads(event['payload']) for event in events)
+        assert all('source_offset' not in event['payload'] for event in events)
     assert store[:] == before
 
 

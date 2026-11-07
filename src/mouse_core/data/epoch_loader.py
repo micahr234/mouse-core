@@ -3,39 +3,52 @@ from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 import numpy as np
 import torch
-from mouse_core.data.dataloader import _event_sample_ranges, _segment_token_count, _tokenize_event_window
+from mouse_core.data.dataloader import _checked_sample, _event_sample_ranges, _segment_token_count, _tokenize_event_window
+from mouse_core.data.sample_index import sample_index
 from mouse_core.data.token_batch import pack_token_batch
 
 
 class EpochDataLoader:
     def __init__(self, *, stores, transform, token_budget, sample_field=None, sample_ranges=None, epochs=1,
-                 num_workers=0, seed=0, step_field=None, episode_field="episode_index"):
+                 num_workers=0, seed=0, step_field=None, episode_field="episode_index",
+                 sample_eligible=None):
         if epochs < 1 or token_budget < 1 or num_workers < 0:
             raise ValueError("epochs and token_budget must be positive; num_workers must be nonnegative")
         if (sample_field is None) == (sample_ranges is None):
             raise ValueError("Pass exactly one of sample_field or sample_ranges")
+        if sample_eligible is not None and not callable(sample_eligible):
+            raise TypeError("sample_eligible must be callable")
         windows = []
         for store in stores:
-            ds = store.to_dataset()
-            windows.extend((ds, int(start), int(end))
-                           for start, end in _event_sample_ranges(ds=ds, sample_field=sample_field,
-                               sample_ranges=sample_ranges, step_field=step_field, episode_field=episode_field))
+            ds, ranges, checks = sample_index(store,
+                build_ranges=lambda ds: _event_sample_ranges(ds=ds, sample_field=sample_field,
+                    sample_ranges=sample_ranges, step_field=step_field, episode_field=episode_field),
+                policy=(sample_field, sample_ranges, step_field, episode_field, None),
+                sample_eligible=sample_eligible)
+            windows.extend((ds, int(start), int(end), checks, pick)
+                           for pick, (start, end) in enumerate(ranges))
         if not windows:
             raise ValueError("EpochDataLoader requires at least one nonempty sample")
 
         def prepare(item):
-            index, (ds, start, end) = item
+            index, (ds, start, end, checks, pick) = item
+            accepted, events = _checked_sample(ds, start, end, None, checks, pick)
+            if not accepted:
+                return None
             pipeline = deepcopy(transform) if num_workers else transform
             reseed = getattr(pipeline, "reseed", None)
             if callable(reseed):
                 reseed(generation=index)
-            return _tokenize_event_window(ds=ds, start=start, end=end, index_field=None, transform=pipeline)
+            return _tokenize_event_window(ds=ds, start=start, end=end, index_field=None, transform=pipeline, events=events)
 
         if num_workers:
             with ThreadPoolExecutor(max_workers=num_workers) as pool:
-                self.samples = list(pool.map(prepare, enumerate(windows)))
+                prepared = list(pool.map(prepare, enumerate(windows)))
         else:
-            self.samples = [prepare(item) for item in enumerate(windows)]
+            prepared = [prepare(item) for item in enumerate(windows)]
+        self.samples = [sample for sample in prepared if sample is not None]
+        if not self.samples:
+            raise ValueError("EpochDataLoader requires at least one eligible sample")
         costs = [_segment_token_count(sample) for sample in self.samples]
         if any(cost > token_budget for cost in costs):
             raise ValueError("A complete sample exceeds token_budget; increase the budget")

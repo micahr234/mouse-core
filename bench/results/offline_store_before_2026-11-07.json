@@ -1,0 +1,59 @@
+{
+  "python": "3.15.2",
+  "rows": 358795,
+  "parquet_sha256": {
+    "/home/user/.cache/huggingface/hub/datasets--micahr234--mouse-dataset-100random/snapshots/ff16e269932cf6d4ad9ae052066c39b270dc5fe1/data/proc_frozenlake_0/train-00000-of-00001.parquet": "afc05b772bee55f07fccbbc1dbdd399f09fab04cbee05ec1f427cfa2b350460e"
+  },
+  "source_sha256": "246204362e7959383723405b96d3f2845996966b8a1a9db306b3ec2a7ca9bf52",
+  "read_seconds": 0.06385336897801608,
+  "trials": [
+    {
+      "import_seconds": 10.981601494015194,
+      "snapshot_seconds": 0.8953017010353506,
+      "combined_seconds": 11.876903195050545
+    },
+    {
+      "import_seconds": 10.966649968002457,
+      "snapshot_seconds": 0.8732107389951125,
+      "combined_seconds": 11.83986070699757
+    },
+    {
+      "import_seconds": 10.956269775982946,
+      "snapshot_seconds": 0.8735451289685443,
+      "combined_seconds": 11.82981490495149
+    }
+  ],
+  "loaders": [
+    {
+      "workers": 0,
+      "setup_seconds": 20.420895692019258,
+      "batches_seconds": 0.9477199940010905,
+      "episodes": 847,
+      "ranges_sha256": "fe81c62d64e266c28e1325e0c99b981b824398dc8f3bbbf72e7de28f91ab893e",
+      "batch_sha256": [
+        "5777d5c6717c33b0535a008c1c9dbc9870b02ebfbfec106465d6b7549b1c870d",
+        "7e879a0170256e6093ad807d99a78f61f733a0ee1e66db1932623c169c9db7aa",
+        "decb105558be6033a1652b5e26002fdc4b516aaa707bb67e45145566606be17d"
+      ]
+    },
+    {
+      "workers": 4,
+      "setup_seconds": 20.65731755399611,
+      "batches_seconds": 4.530165832024068,
+      "episodes": 847,
+      "ranges_sha256": "fe81c62d64e266c28e1325e0c99b981b824398dc8f3bbbf72e7de28f91ab893e",
+      "batch_sha256": [
+        "5777d5c6717c33b0535a008c1c9dbc9870b02ebfbfec106465d6b7549b1c870d",
+        "7e879a0170256e6093ad807d99a78f61f733a0ee1e66db1932623c169c9db7aa",
+        "decb105558be6033a1652b5e26002fdc4b516aaa707bb67e45145566606be17d"
+      ]
+    }
+  ],
+  "median_seconds": {
+    "import_seconds": 10.966649968002457,
+    "snapshot_seconds": 0.8735451289685443,
+    "combined_seconds": 11.83986070699757
+  },
+  "dataset_sha256": "1820ed3b71b32a7bbb7c57838b63c67f7ae47054a6f55353d5e5ece5ffef2fbd",
+  "selected_events_sha256": "457737814b1cd7a764fb3f5e7a0368297ddb9afaabb71e7c4a23fd51f1490403"
+}

@@ -6,7 +6,7 @@ from mouse_core.data import Datastore
 def measurement_replay(events):
     for event in events:
         yield {**{key: value for key, value in event.items() if key not in ('provider', 'payload')},
-               **json.loads(event['payload'])}
+               **(json.loads(event['payload']) if isinstance(event['payload'], str) else event['payload'])}
 
 
 def measurement_store(*, name=None):

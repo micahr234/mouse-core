@@ -877,3 +877,28 @@ def test_dataloader_token_budget_rejects_an_oversized_segment() -> None:
     )
     with pytest.raises(ValueError, match="does not fit"):
         loader.next_batch()
+
+
+
+@pytest.mark.parametrize('workers', [0, 4])
+def test_disk_backed_store_matches_live_seeded_batches(tmp_path, workers):
+    from datasets import load_from_disk
+    live = _store_with_actions()
+    _store_with_actions().to_dataset().save_to_disk(str(tmp_path / 'offline'))
+    offline = Datastore()
+    offline.from_dataset(ds=load_from_disk(str(tmp_path / 'offline')))
+    a = _loader(events_budget=6, num_workers=workers, seed=42, stores=live)
+    b = _loader(events_budget=6, num_workers=workers, seed=42, stores=offline)
+    try:
+        for _ in range(3):
+            actual, expected = a.next_batch(), b.next_batch()
+            for left, right in zip(actual, expected):
+                assert set(left.keys()) == set(right.keys())
+                for key in left.keys():
+                    if isinstance(left[key], torch.Tensor):
+                        torch.testing.assert_close(left[key], right[key], rtol=0, atol=0, equal_nan=True)
+                    else:
+                        assert left[key] == right[key]
+    finally:
+        a.close()
+        b.close()

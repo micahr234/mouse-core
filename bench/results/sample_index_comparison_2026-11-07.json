@@ -1,0 +1,77 @@
+{
+  "rows": 358795,
+  "episodes": 847,
+  "trials": 3,
+  "batches_per_trial": 12,
+  "parity": "Exact dataset, candidate ranges, 12 cold/warm batches, next batch after refresh, and appended ranges across both worker counts and all trials",
+  "results": {
+    "0": {
+      "before": {
+        "setup_seconds": 19.010706322966143,
+        "refresh_seconds": 18.98264066502452,
+        "refresh_first_seconds": 0.3445248479838483,
+        "reconstruction_seconds": 19.11066905898042,
+        "append_refresh_seconds": 19.120241988042835,
+        "warmup_checks_seconds": 7.100170478224754e-07,
+        "first_batch_ready_seconds": 19.32378884794889,
+        "cold_batch_mean_seconds": 0.31932105208397843,
+        "warm_batch_mean_seconds": 0.3208971604132482,
+        "cold_12_batches_seconds": 3.831852625007741,
+        "warm_12_batches_seconds": 3.850765924958978
+      },
+      "after": {
+        "setup_seconds": 0.5989051809883676,
+        "refresh_seconds": 5.941605195403099e-05,
+        "refresh_first_seconds": 0.40587804798269644,
+        "reconstruction_seconds": 0.00038117700023576617,
+        "append_refresh_seconds": 0.6112171790446155,
+        "warmup_checks_seconds": 7.051267993985675,
+        "first_batch_ready_seconds": 0.9672082109609619,
+        "cold_batch_mean_seconds": 0.3749118012492545,
+        "warm_batch_mean_seconds": 0.2904536989905561,
+        "cold_12_batches_seconds": 4.498941614991054,
+        "warm_12_batches_seconds": 3.485444387886673
+      }
+    },
+    "4": {
+      "before": {
+        "setup_seconds": 19.139949175994843,
+        "refresh_seconds": 19.39081680297386,
+        "refresh_first_seconds": 4.424025931977667,
+        "reconstruction_seconds": 19.242006150016095,
+        "append_refresh_seconds": 19.64605770201888,
+        "warmup_checks_seconds": 1.4220131561160088e-06,
+        "first_batch_ready_seconds": 23.626760869985446,
+        "cold_batch_mean_seconds": 0.42447995334320393,
+        "warm_batch_mean_seconds": 0.42528002091664047,
+        "cold_12_batches_seconds": 5.093759440118447,
+        "warm_12_batches_seconds": 5.103360250999685
+      },
+      "after": {
+        "setup_seconds": 0.7547983459662646,
+        "refresh_seconds": 0.23252010100986809,
+        "refresh_first_seconds": 4.481426054961048,
+        "reconstruction_seconds": 0.15772386296885088,
+        "append_refresh_seconds": 0.8446733219898306,
+        "warmup_checks_seconds": 6.830592995043844,
+        "first_batch_ready_seconds": 5.204383409989532,
+        "cold_batch_mean_seconds": 0.44225649774792447,
+        "warm_batch_mean_seconds": 0.4197167081729276,
+        "cold_12_batches_seconds": 5.307077972975094,
+        "warm_12_batches_seconds": 5.036600498075131
+      }
+    }
+  },
+  "shared_status_bytes_per_store_policy": 847,
+  "notes": [
+    "CPU only; no GPU/model training was timed.",
+    "Baseline includes the prior Arrow-backed Datastore optimization, but eager episode scanning.",
+    "All 847 episodes in the real shard are complete. Incomplete/rejected/malformed cases are covered by tests.",
+    "Warmup explicitly validates remaining candidates only to isolate warm-cache performance; production does not do an exhaustive warmup.",
+    "Cold new-path validation checks full environment action/result consistency, beyond the baseline range selector.",
+    "Changed stores still rescan their header columns; unchanged ranges retain validation outcomes.",
+    "Process refresh/reconstruction still incurs worker startup; caches persist only within the store lifetime.",
+    "The new status buffer has 847 logical bytes, excluding shared-memory page rounding and metadata."
+  ],
+  "new_module_sha256": "12461240497f63ea3a18f1e763fc8f96f835c7eaaa28a2385dc50bc5d9c43475"
+}

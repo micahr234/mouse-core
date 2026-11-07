@@ -12,7 +12,14 @@ import numpy as np
 import pytest
 import torch
 
-from mouse_core.data import Datastore, DataLoader, EpochDataLoader, EventLog, EventTransform, StepTokens
+from mouse_core.data import (
+    Datastore,
+    DataLoader,
+    EpochDataLoader,
+    EventLog,
+    EventTransform,
+    StepTokens,
+)
 from mouse_core.objectives import DqnObjective, boundary_discount, nstep_gate
 from tests._token_batch_helpers import token_tokenizer
 
@@ -46,12 +53,12 @@ class EncodeSample:
         # action-request fields. The loader must not try to replay it.
         self.seen.append(events)
         assert {e['provider'] for e in events} == {'sensor'}
-        assert [json.loads(e['payload'])['event_index'] for e in events] == list(range(len(events)))
-        assert len({json.loads(e['payload'])['episode_index'] for e in events}) == 1
+        assert [e['payload']['event_index'] for e in events] == list(range(len(events)))
+        assert len({e['payload']['episode_index'] for e in events}) == 1
         return [StepTokens(token_ids=np.array([1,2]), numeric_values=np.zeros(2),
                            numeric_mask=np.zeros(2, dtype=bool),
                            head_token_mask=np.array([False,True]),
-                           objective_fields={'final_source_event': json.loads(events[-1]['payload'])['event_index']})]
+                           objective_fields={'final_source_event': events[-1]['payload']['event_index']})]
 
 
 def test_source_event_budget_is_independent_of_tokenizer_readout_count():
@@ -65,10 +72,10 @@ def test_source_event_budget_is_independent_of_tokenizer_readout_count():
     assert data['final_source_event'].tolist() == [5]
     assert all(len(events) == 6 for events in encode.seen)
     for events in encode.seen:
-        offset = json.loads(events[0]['payload'])['episode_index'] * 6
+        offset = events[0]['payload']['episode_index'] * 6
         assert [e['source_offset'] for e in events] == list(range(offset, offset+6))
-        assert [json.loads(e['payload'])['timestamp'] for e in events] == ['100','99','98','97','96','95']
-        assert [json.loads(e['payload'])['sensor'] for e in events] == list(range(6))
+        assert [e['payload']['timestamp'] for e in events] == ['100','99','98','97','96','95']
+        assert [e['payload']['sensor'] for e in events] == list(range(6))
     assert store[:] == original
     with DataLoader(stores=store, events_budget=5,  sample_field='payload.episode_index',
                     transform=encode, num_workers=0) as loader:
@@ -119,10 +126,10 @@ def test_old_step_loader_api_is_removed():
 def test_explicit_windows_are_source_event_slices():
     seen = []
     def encode(events):
-        seen.append([json.loads(e['payload'])['event_index'] for e in events])
+        seen.append([e['payload']['event_index'] for e in events])
         return [StepTokens(token_ids=np.array([1]), numeric_values=np.zeros(1),
                            numeric_mask=np.zeros(1, dtype=bool), head_token_mask=np.ones(1, dtype=bool),
-                           objective_fields={'source_start': json.loads(events[0]['payload'])['event_index']})]
+                           objective_fields={'source_start': events[0]['payload']['event_index']})]
     loader = EpochDataLoader(stores=[source()], transform=encode, token_budget=2,
                              sample_ranges=lambda dataset: [(0,3),(2,6),(6,9),(8,12)])
     assert seen == [[0,1,2],[2,3,4,5]] * 2
@@ -137,13 +144,16 @@ def test_explicit_windows_are_source_event_slices():
 def _offline_sample_ranges(filename):
     path = Path(__file__).resolve().parents[1] / 'examples' / filename
     notebook = json.loads(path.read_text())
-    imports = [node for cell in notebook['cells'] if cell['cell_type'] == 'code'
-               for node in ast.parse(''.join(cell['source'])).body
-               if isinstance(node, ast.ImportFrom) and node.module == 'mouse_core.data']
-    assert any(alias.name == 'environment_episode_ranges' for node in imports for alias in node.names)
-    assert 'sample_ranges=environment_episode_ranges' in path.read_text()
-    from mouse_core.data import environment_episode_ranges
-    return environment_episode_ranges
+    definitions: list[ast.stmt] = [node for cell in notebook['cells'] if cell['cell_type'] == 'code'
+                   for node in ast.walk(ast.parse(''.join(cell['source'])))
+                   if isinstance(node, ast.FunctionDef) and node.name in ('sample_ranges', 'sample_eligible')]
+    assert len(definitions) == 2
+    namespace = {}
+    exec(compile(ast.Module(body=definitions, type_ignores=[]), str(path), 'exec'), namespace)
+    assert 'sample_ranges=sample_ranges' in path.read_text()
+    assert 'sample_eligible=sample_eligible' in path.read_text()
+    assert 'validate_sample=' not in path.read_text()
+    return {name: namespace[name] for name in ('sample_ranges', 'sample_eligible')}
 
 
 
@@ -222,14 +232,24 @@ def _repeated_tasks_with_unfinished_tail():
     log.event(provider='agent', episode_index=2, payload={
         'action': 1,
     })
-    return log.to_store()
+    store = Datastore()
+    events = log.events
+    for event in events:
+        for key in ('terminated', 'truncated'):
+            if key in event['payload']:
+                event['payload']['_' + key] = event['payload'][key]
+    store.extend(events)
+    return store
 
 @pytest.mark.parametrize('filename', OFFLINE_EXAMPLES)
 def test_offline_examples_sample_complete_tasks_and_preserve_unfinished_events(filename):
-    sample_ranges = _offline_sample_ranges(filename)
+    policy: dict[str, Any] = _offline_sample_ranges(filename)
     store = _repeated_tasks_with_unfinished_tail()
     original = store[:]
-    assert list(sample_ranges(store.to_dataset())) == [(0, 10), (10, 20)]
+    expected = [(0, 10), (10, 20)]
+    if "sample_eligible" in policy:
+        expected.append((20, len(store)))
+    assert list(policy["sample_ranges"](store.to_dataset())) == expected
     tokenizer = token_tokenizer('observation', objective_fields=[
         {'input_field': 'action', 'missing_value': None},
         *[{'input_field': key} for key in ('reward', 'terminated', 'truncated', 'episode_index')],
@@ -247,7 +267,7 @@ def test_offline_examples_sample_complete_tasks_and_preserve_unfinished_events(f
         gate=nstep_gate(n=10),
     )
     with DataLoader(stores=store, events_budget=20,
-                    sample_ranges=sample_ranges, transform=encode,
+                    **policy, transform=encode,
                     num_workers=0, seed=5) as loader:
         inputs, data = loader.next_batch()
         groups = data["step_sequence_ids"]
@@ -271,7 +291,7 @@ def test_offline_examples_sample_complete_tasks_and_preserve_unfinished_events(f
         assert data['truncated'][first + 3].item() == (episode == 1)
     assert seen
     for events in seen:
-        first, last = json.loads(events[0]['payload']), json.loads(events[-1]['payload'])
+        first, last = (e['payload'] for e in (events[0], events[-1]))
         assert first['episode_start']
         assert last['terminated'] or last['truncated']
         assert len(events) == 10
@@ -282,7 +302,7 @@ def test_offline_examples_sample_complete_tasks_and_preserve_unfinished_events(f
     partial = Datastore()
     partial.from_dataset(ds=store.to_dataset().select(range(20, 27)))
     with DataLoader(stores=partial, events_budget=20,
-                    sample_ranges=sample_ranges, transform=transform,
+                    **policy, transform=transform,
                     num_workers=0, seed=5) as loader:
         with pytest.raises(ValueError, match='no eligible samples'):
             loader.next_batch()

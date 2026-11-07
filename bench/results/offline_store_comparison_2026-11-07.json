@@ -1,0 +1,21 @@
+{
+  "rows": 358795,
+  "repeats": 3,
+  "before_median_seconds": {
+    "import_seconds": 10.966649968002457,
+    "snapshot_seconds": 0.8735451289685443,
+    "combined_seconds": 11.83986070699757
+  },
+  "after_median_seconds": {
+    "import_seconds": 1.0608926650020294,
+    "snapshot_seconds": 0.0003187420079484582,
+    "combined_seconds": 1.0612140669836663
+  },
+  "import_and_snapshot_speedup": 11.156901397519642,
+  "estimated_32_shard_saving_seconds": 344.9166924804449,
+  "comparison": "Exact content hashes, selected-event hashes, all episode ranges and three complete input/objective batches at each worker count (0, 4).",
+  "results_match": true,
+  "scope": "One cached FrozenLake shard; times exclude import of Python modules, reading parquet, validation of episode ranges and tokenization. No GPU. All event imports still validate malformed JSON and envelopes eagerly.",
+  "before": "offline_store_before_2026-11-07.json",
+  "after": "offline_store_after_2026-11-07.json"
+}

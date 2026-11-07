@@ -1,0 +1,59 @@
+{
+  "python": "3.15.2",
+  "rows": 358795,
+  "parquet_sha256": {
+    "/home/user/.cache/huggingface/hub/datasets--micahr234--mouse-dataset-100random/snapshots/ff16e269932cf6d4ad9ae052066c39b270dc5fe1/data/proc_frozenlake_0/train-00000-of-00001.parquet": "afc05b772bee55f07fccbbc1dbdd399f09fab04cbee05ec1f427cfa2b350460e"
+  },
+  "source_sha256": "d4174c54bd992f2113318eb7e65b691f80115f4f5110439445f1a2eaa4c212f4",
+  "read_seconds": 0.018274680012837052,
+  "trials": [
+    {
+      "import_seconds": 1.0650083990185522,
+      "snapshot_seconds": 0.0003180179628543556,
+      "combined_seconds": 1.0653264169814065
+    },
+    {
+      "import_seconds": 1.060452836973127,
+      "snapshot_seconds": 0.0003187420079484582,
+      "combined_seconds": 1.0607715789810754
+    },
+    {
+      "import_seconds": 1.0608926650020294,
+      "snapshot_seconds": 0.00032140198163688183,
+      "combined_seconds": 1.0612140669836663
+    }
+  ],
+  "loaders": [
+    {
+      "workers": 0,
+      "setup_seconds": 19.642964631028008,
+      "batches_seconds": 0.9412639779620804,
+      "episodes": 847,
+      "ranges_sha256": "fe81c62d64e266c28e1325e0c99b981b824398dc8f3bbbf72e7de28f91ab893e",
+      "batch_sha256": [
+        "5777d5c6717c33b0535a008c1c9dbc9870b02ebfbfec106465d6b7549b1c870d",
+        "7e879a0170256e6093ad807d99a78f61f733a0ee1e66db1932623c169c9db7aa",
+        "decb105558be6033a1652b5e26002fdc4b516aaa707bb67e45145566606be17d"
+      ]
+    },
+    {
+      "workers": 4,
+      "setup_seconds": 19.566063940001186,
+      "batches_seconds": 4.418388610007241,
+      "episodes": 847,
+      "ranges_sha256": "fe81c62d64e266c28e1325e0c99b981b824398dc8f3bbbf72e7de28f91ab893e",
+      "batch_sha256": [
+        "5777d5c6717c33b0535a008c1c9dbc9870b02ebfbfec106465d6b7549b1c870d",
+        "7e879a0170256e6093ad807d99a78f61f733a0ee1e66db1932623c169c9db7aa",
+        "decb105558be6033a1652b5e26002fdc4b516aaa707bb67e45145566606be17d"
+      ]
+    }
+  ],
+  "median_seconds": {
+    "import_seconds": 1.0608926650020294,
+    "snapshot_seconds": 0.0003187420079484582,
+    "combined_seconds": 1.0612140669836663
+  },
+  "dataset_sha256": "1820ed3b71b32a7bbb7c57838b63c67f7ae47054a6f55353d5e5ece5ffef2fbd",
+  "selected_events_sha256": "457737814b1cd7a764fb3f5e7a0368297ddb9afaabb71e7c4a23fd51f1490403"
+}

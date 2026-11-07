@@ -5,7 +5,8 @@ import numpy as np
 import pytest
 import torch
 
-from mouse_core.data import DataLoader, environment_episode_ranges, step_sample_ranges
+from mouse_core.data import DataLoader
+from tests._sampling_policies import environment_episode_ranges, step_sample_ranges
 from tests.test_collection_events import _collect_outputs, _notebook_transform, FROZENLAKE_PROTOCOL
 
 

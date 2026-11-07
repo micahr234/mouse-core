@@ -11,6 +11,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Cache sampling indexes and eligibility for unchanged stores. Make finite
+  JSON-object validation automatic in both loaders; remove the validation hook.
+  Range and eligibility functions belong to callers, and all training notebooks
+  define them beside their loader. Remove library episode/step sampling policies.
+  Share cached outcomes across workers and loader rebuilds, preserve unchanged
+  outcomes after appends, and reconsider growing tails. Add deterministic sampling,
+  malformed-payload, cache-lifetime, and startup/batch benchmarks.
+
+- Keep imported event stores backed by Hugging Face datasets, sharing existing
+  Arrow buffers across snapshots. Validate imports in bounded batches, retain
+  persisted JSON encodings, and buffer live appends without rebuilding offline
+  rows. Add a reproducible startup
+  benchmark and disk-backed snapshot/worker parity tests.
+
 - Reject model class, state-key, and tensor-shape mismatches before loading weights.
 
 - Move step/prediction mappings to `objective_data`; use `head_token_mask` for model readouts and sample one action per prediction.

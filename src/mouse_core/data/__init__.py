@@ -1,10 +1,9 @@
 from mouse_core.data.event_transform import (
-    EnvironmentProtocol, EventTransform, environment_decisions, environment_episode_ranges,
+    EnvironmentProtocol, EventTransform, environment_decisions,
     latest_environment_decision, latest_environment_packet,
     validate_environment_events, validate_latest_environment_step,
 )
 from mouse_core.data.events import EventLog
-from mouse_core.data.step_sampling import step_sample_ranges
 from mouse_core.data.dataloader import DataLoader
 from mouse_core.data.epoch_loader import EpochDataLoader
 from mouse_core.data.datastore import Datastore
@@ -28,11 +27,9 @@ __all__ = [
     "TokenizerModalitySpec",
     "Tokenizer",
     "EventTokenStream",
-    "step_sample_ranges",
     "EnvironmentProtocol",
     "EventTransform",
     "environment_decisions",
-    "environment_episode_ranges",
     "latest_environment_decision",
     "latest_environment_packet",
     "validate_environment_events",

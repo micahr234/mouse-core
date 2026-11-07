@@ -1,7 +1,8 @@
 from collections import Counter
 import numpy as np
 import pytest
-from mouse_core.data import EventTransform, environment_episode_ranges
+from mouse_core.data import EventTransform
+from tests._sampling_policies import environment_episode_ranges
 from mouse_core.data import Augmenter, EventLog, EpochDataLoader, StepTokens, compose
 
 

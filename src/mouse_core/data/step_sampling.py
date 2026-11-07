@@ -61,10 +61,25 @@ class _StepBoundary:
         return changed
 
 
+def _boundary_events(events, fields):
+    """Project header columns in batches, without reading or decoding payloads."""
+    if hasattr(events, "column_names") and all(not f.startswith("payload.") for f in fields if f):
+        columns = [f for f in dict.fromkeys(fields) if f in events.column_names]
+        if not columns:
+            # Preserve missing-marker errors, including on nonempty datasets.
+            yield from ({} for _ in range(len(events)))
+            return
+        for batch in events.select_columns(columns).iter(batch_size=8192):
+            yield from (dict(zip(columns, row)) for row in zip(*(batch[f] for f in columns)))
+    else:
+        yield from events
+
+
+
 def _step_spans(events, *, step_field: str, episode_field: str | None):
     boundary = _StepBoundary(step_field, episode_field)
     start, episode, end = 0, None, 0
-    for index, event in enumerate(events):
+    for index, event in enumerate(_boundary_events(events, (step_field, episode_field))):
         changed = boundary.advance(event, encoded_payload=not isinstance(events, EventLog))
         if changed and index:
             yield start, index, episode
@@ -74,34 +89,6 @@ def _step_spans(events, *, step_field: str, episode_field: str | None):
     if end:
         yield start, end, episode
 
-
-def step_sample_ranges(events, *, steps_per_sample: int, step_field: str = "step_index",
-                       episode_field: str = "episode_index", include_final_step: bool = True):
-    """Yield sliding windows of exactly N whole steps, within one episode.
-
-    Use ``partial(step_sample_ranges, steps_per_sample=N)`` as a loader's
-    ``sample_ranges``. Short episodes produce no windows; windows never shrink
-    to fit a budget. Each step is a contiguous marker run, including events
-    without a marker. Episode IDs are required at the beginning of each run.
-
-    A finalized dataset includes its last step. For a live snapshot whose tail
-    may still be receiving events, pass ``include_final_step=False``; the next
-    marker is then required to establish that the preceding step is complete.
-    """
-    if type(steps_per_sample) is not int or steps_per_sample < 1:
-        raise ValueError("steps_per_sample must be a positive integer")
-    spans = list(_step_spans(events, step_field=step_field, episode_field=episode_field))
-    if not include_final_step:
-        spans = spans[:-1]
-    if any(episode is None for _, _, episode in spans):
-        raise ValueError(f"Step sampling requires {episode_field!r}")
-    episode_start = 0
-    for index, (_, end, episode) in enumerate(spans):
-        if index and episode != spans[index - 1][2]:
-            episode_start = index
-        first = index + 1 - steps_per_sample
-        if first >= episode_start:
-            yield spans[first][0], end
 
 
 def _validate_step_ranges(events, ranges, *, step_field: str, episode_field: str | None):

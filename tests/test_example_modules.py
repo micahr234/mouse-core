@@ -18,7 +18,15 @@ from transformers.generation import ContinuousBatchingConfig
 from torch import nn
 
 from mouse_core import AdamW, polyak_update
-from mouse_core.data import environment_episode_ranges, DataLoader, EventLog, Tokenizer, compose, environment_decisions, latest_environment_decision
+from mouse_core.data import (
+    DataLoader,
+    EventLog,
+    Tokenizer,
+    compose,
+    environment_decisions,
+    latest_environment_decision,
+)
+from tests._sampling_policies import environment_episode_ranges
 
 from mouse_gym import RepeatTaskTracker
 from mouse_core.models import (

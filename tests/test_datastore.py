@@ -157,3 +157,104 @@ def test_projection_labels_never_leak_into_saved_events():
     encoded = EventTransform(encode=lambda row: {**row, 'advantage': 3.})(store[:])
     assert all(row['advantage'] == 3. for row in encoded)
     assert store.to_dataset().to_list() == source
+
+
+
+def test_disk_backing_survives_snapshots_appends_and_clear(tmp_path):
+    source = stream().to_dataset()
+    source.save_to_disk(str(tmp_path / 'source'))
+    loaded = load_from_disk(str(tmp_path / 'source'))
+    store = Datastore()
+    store.from_dataset(ds=loaded)
+    first = store.to_dataset()
+    assert first.cache_files == loaded.cache_files
+    assert first.to_list() == source.to_list()
+    # Returning a snapshot must not give callers control of store formatting.
+    first.set_format('numpy')
+    loaded.set_format('numpy')
+    assert store[:] == source.to_list()
+    store.append(data={'provider': 'sensor', 'payload': {'new': 1}})
+    second = store.to_dataset()
+    assert len(first) == len(source)
+    assert len(second) == len(source) + 1
+    assert all(file in second.cache_files for file in loaded.cache_files)
+    assert 'episode_index' not in store[-1][0]
+    store.clear()
+    assert not len(store)
+    assert len(second) == len(source) + 1
+    store.append(data={'provider': 'new', 'payload': None})
+    assert store.columns == ['provider', 'payload']
+
+
+def test_selected_dataset_order_duplicates_and_sparse_indices_are_preserved():
+    source = Dataset.from_list([
+        {'episode_index': 2, 'provider': 'sensor', 'payload': '{"x":1}'},
+        {'episode_index': None, 'provider': '', 'payload': 'invalid'},
+        {'episode_index': None, 'provider': 'sensor', 'payload': '[1,2]'},
+    ])
+    store = Datastore()
+    store.from_dataset(ds=source.select([2, 0, 2]))
+    assert store.to_dataset().to_list() == source.select([2, 0, 2]).to_list()
+    assert store[:] == [
+        {'provider': 'sensor', 'payload': '[1,2]'},
+        {'episode_index': 2, 'provider': 'sensor', 'payload': '{"x":1}'},
+        {'provider': 'sensor', 'payload': '[1,2]'},
+    ]
+    assert store[::-1] == list(reversed(store[:]))
+    assert store[[1, -1, 1]] == store[1] + store[2] + store[1]
+    assert store[3:3] == []
+    for bad in (3, -4):
+        with pytest.raises(IndexError):
+            store[bad]
+    result = store[0]
+    result[0]['payload'] = 'null'
+    assert store[0][0]['payload'] == '[1,2]'
+
+
+@pytest.mark.parametrize('payload', ['{broken', '{"x":NaN}', '[Infinity]', '-Infinity', '{"x":1e999}', None, 1])
+def test_dataset_payload_validation_is_eager_and_atomic(payload):
+    store = stream().to_store()
+    before = store.to_dataset().to_list()
+    with pytest.raises((ValueError, TypeError)):
+        store.from_dataset(ds=Dataset.from_dict({'provider': ['sensor'], 'payload': [payload]}))
+    assert store.to_dataset().to_list() == before
+
+
+@pytest.mark.parametrize('field,value', [('provider', ''), ('provider', None), ('provider', 3),
+                                        ('episode_index', -1), ('step_index', 1.5), ('step_index', True)])
+def test_dataset_header_validation_is_eager_and_atomic(field, value):
+    store = stream().to_store()
+    before = store.to_dataset().to_list()
+    event = {'provider': 'sensor', 'payload': '{}', field: value}
+    with pytest.raises(ValueError):
+        store.from_dataset(ds=Dataset.from_list([event]))
+    assert store.to_dataset().to_list() == before
+
+
+def test_dataset_import_keeps_encoded_json_and_drops_all_null_headers():
+    encoded = '{ "reading" : [1.0, null], "label": "\\u03b1" }'
+    store = Datastore()
+    store.from_dataset(ds=Dataset.from_dict({'episode_index': [None], 'provider': ['sensor'], 'payload': [encoded]}))
+    assert store.columns == ['provider', 'payload']
+    assert store.to_dataset()[0]['payload'] == encoded
+    assert EventLog.from_dataset(store.to_dataset())[0]['payload'] == json.loads(encoded)
+
+
+def test_mixed_import_append_and_failed_extend_preserve_order():
+    store = Datastore()
+    original = stream().to_dataset()
+    store.from_dataset(ds=original)
+    store.append(data={'provider': 'sensor', 'payload': 3})
+    store.from_dataset(ds=original.select([4, 0]))
+    store.extend_event_log(stream(), episode_index=8)
+    expected = original.to_list() + [{'provider': 'sensor', 'payload': '3'}] + original.select([4, 0]).to_list()
+    expected += [{**row, 'episode_index': 8} for row in original.to_list()]
+    assert store[:] == expected
+    def broken():
+        yield {'provider': 'sensor', 'payload': 4}
+        raise RuntimeError('failed producer')
+    with pytest.raises(RuntimeError, match='failed producer'):
+        store.extend(broken())
+    assert store[:] == expected
+    store.append(data=store)
+    assert store[:] == expected * 2

@@ -181,7 +181,8 @@ def test_batched_direct_cosine_requires_explicit_mode_and_aligned_shapes() -> No
 def test_offline_dqn_cosine_example(monkeypatch):
     import ast
     from mouse_core import AdamW, polyak_update
-    from mouse_core.data import DataLoader, EnvironmentProtocol, environment_episode_ranges
+    from mouse_core.data import DataLoader, EnvironmentProtocol
+    from tests._sampling_policies import environment_episode_ranges
     from functools import partial
     from mouse_core.objectives import DqnObjective, boundary_discount
     from copy import deepcopy

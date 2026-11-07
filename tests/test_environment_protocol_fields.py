@@ -5,10 +5,17 @@ import json
 import pytest
 
 from mouse_core.data import (
-    DataLoader, EnvironmentProtocol, EventLog, Tokenizer, environment_decisions,
-    environment_episode_ranges, latest_environment_decision, latest_environment_packet,
-    validate_environment_events, validate_latest_environment_step,
+    DataLoader,
+    EnvironmentProtocol,
+    EventLog,
+    Tokenizer,
+    environment_decisions,
+    latest_environment_decision,
+    latest_environment_packet,
+    validate_environment_events,
+    validate_latest_environment_step,
 )
+from tests._sampling_policies import environment_episode_ranges
 from tests._token_batch_helpers import IntIdTokenizer
 
 
