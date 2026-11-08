@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Finalize shared sample-check memory before interpreter teardown, including
+  caches retained by replay stores through shutdown; avoid NumPy-dependent destructors.
+
 - Cache sampling indexes and eligibility for unchanged stores. Make finite
   JSON-object validation automatic in both loaders; remove the validation hook.
   Range and eligibility functions belong to callers, and all training notebooks

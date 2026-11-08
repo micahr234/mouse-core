@@ -300,3 +300,34 @@ def test_sampling_policies_and_validation_hook_are_not_library_api():
     assert "validate_sample" not in inspect.signature(data.EpochDataLoader).parameters
     for name in ("episode_sample_ranges", "environment_episode_ranges", "step_sample_ranges", "environment_episode_is_complete"):
         assert not hasattr(data, name)
+
+
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_live_checks_are_finalized_before_interpreter_teardown(tmp_path, interrupted):
+    import os
+    from pathlib import Path
+    import subprocess
+    import sys
+    from mouse_core.data import sample_index as module
+    script = tmp_path / "exit_checks.py"
+    names = tmp_path / "names.txt"
+    script.write_text('''
+from pathlib import Path
+import sys
+from mouse_core.data.sample_index import SampleChecks
+# Keep caches reachable until interpreter exit, as a long-lived replay store does.
+checks = [SampleChecks(4, None) for _ in range(33)]
+Path(sys.argv[1]).write_text("\\n".join(c._memory.name for c in checks))
+if sys.argv[2] == "True":
+    raise KeyboardInterrupt
+''')
+    environment = dict(os.environ, CUDA_VISIBLE_DEVICES="", PYTHONDONTWRITEBYTECODE="1")
+    environment["PYTHONPATH"] = str(Path(module.__file__).resolve().parents[2])
+    result = subprocess.run([sys.executable, str(script), str(names), str(interrupted)],
+                            capture_output=True, text=True, env=environment, timeout=30)
+    assert (result.returncode != 0) == interrupted
+    assert "resource_tracker" not in result.stderr, result.stderr
+    assert "Exception ignored" not in result.stderr, result.stderr
+    for name in names.read_text().splitlines():
+        with pytest.raises(FileNotFoundError):
+            SharedMemory(name=name, track=False)

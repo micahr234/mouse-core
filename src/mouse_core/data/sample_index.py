@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from functools import partial
 from multiprocessing.shared_memory import SharedMemory
+from multiprocessing.util import Finalize
 
 import numpy as np
 
@@ -36,6 +37,16 @@ def _policy_key(value):
     return (type(value), value)
 
 
+def _release_memory(memory, owner):
+    # multiprocessing finalizers run before interpreter module teardown, even
+    # when stores/checks remain reachable. Workers only close their attachment.
+    try:
+        memory.close()
+    finally:
+        if owner:
+            memory.unlink()
+
+
 class SampleChecks:
     """One byte per candidate: unknown, accepted, or rejected.
 
@@ -45,27 +56,19 @@ class SampleChecks:
     """
     def __init__(self, size, sample_eligible):
         self.sample_eligible = sample_eligible
-        self._owner = True
         self._memory = SharedMemory(create=True, size=max(1, size))
         self.status = np.ndarray((size,), dtype=np.uint8, buffer=self._memory.buf)
         self.status.fill(0)
+        self._finalizer = Finalize(self, _release_memory, (self._memory, True), exitpriority=0)
 
     def __getstate__(self):
         return (self._memory.name, len(self.status), self.sample_eligible)
 
     def __setstate__(self, state):
         name, size, self.sample_eligible = state
-        self._owner = False
         self._memory = SharedMemory(name=name, track=False)
         self.status = np.ndarray((size,), dtype=np.uint8, buffer=self._memory.buf)
-
-    def __del__(self):
-        memory = getattr(self, "_memory", None)
-        if memory is not None:
-            self.status = np.empty(0, dtype=np.uint8)
-            memory.close()
-            if self._owner:
-                memory.unlink()
+        self._finalizer = Finalize(self, _release_memory, (self._memory, False), exitpriority=0)
 
     def accepts(self, index, events):
         result = self.status[index]
