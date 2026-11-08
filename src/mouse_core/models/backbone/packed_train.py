@@ -222,12 +222,16 @@ def _decoder_layer(
 def install_compiled_decoder() -> bool:
     """Compile the per-layer training body; inference compiles when a session opens.
 
-    Idempotent; returns True when a compiled training body is installed.
+    Uses max autotuning without CUDA graphs. The cold compile takes longer;
+    subsequent updates reuse the selected kernels. Idempotent; returns True
+    when a compiled training body is installed.
     """
     global _compiled_layer
     installed = False
     if _compiled_layer is None:
-        _compiled_layer = torch.compile(_decoder_layer, dynamic=True)
+        _compiled_layer = torch.compile(
+            _decoder_layer, dynamic=True, mode="max-autotune-no-cudagraphs",
+        )
         installed = True
     return installed
 

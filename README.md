@@ -62,6 +62,20 @@ TF32: application entry points should set
 Mouse Experiment and V2B now enforce this fixed runtime policy, as do Core's
 benchmarks. AdamW continues to update FP32 trainable weights.
 
+## Compiled training and target updates
+
+`install_compiled_decoder()` uses dynamic shapes and
+`mode="max-autotune-no-cudagraphs"` for the per-layer training body. Expect a
+longer cold compile while kernels are selected. FlexAttention remains the
+attention implementation. Set `backbone.gradient_checkpointing = True` to
+recompute layer activations during backward and reduce training memory.
+
+`polyak_update(target=..., source=..., tau=...)` updates only parameters whose
+**source** has `requires_grad=True`. Delayed target parameters normally have
+gradients disabled, so their own flag does not determine eligibility. Frozen
+base weights, identical shared tensors, and buffers are not updated. Names,
+shapes, devices, and dtypes are still validated before any update.
+
 ## Supervised policy and value losses
 
 `SupervisedObjective` combines policy and value supervision. Set `loss_type` to

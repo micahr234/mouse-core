@@ -409,8 +409,11 @@ def test_fp32_gradients_match_dense_reference(no_compiled_decoder: None) -> None
 
 
 @pytest.mark.flex_training
-def test_gradient_checkpointing_matches_plain_backward(no_compiled_decoder: None) -> None:
+@pytest.mark.parametrize("compiled", [False, True])
+def test_gradient_checkpointing_matches_plain_backward(no_compiled_decoder: None, compiled: bool) -> None:
     torch.manual_seed(3)
+    if compiled:
+        install_compiled_decoder()
     bb = _backbone("qwen3", layers=3, kv_heads=2)
     L = 31
     seq, grp = _stream(L, n_seq=2, n_grp=2, seed=8)
@@ -516,12 +519,19 @@ def test_cuda_bf16_lora_gradients_on_frozen_base(no_compiled_decoder: None) -> N
 # ---- compiled body --------------------------------------------------------------
 
 
-def test_install_compiled_decoder_idempotent(no_compiled_decoder: None) -> None:
+def test_install_compiled_decoder_idempotent(no_compiled_decoder: None, monkeypatch) -> None:
+    calls = []
+    def compile_body(body, **kwargs):
+        calls.append((body, kwargs))
+        return object()
+    monkeypatch.setattr(torch, "compile", compile_body)
     assert install_compiled_decoder() is True
     compiled = packed_train_mod._compiled_layer
     assert compiled is not None
     assert install_compiled_decoder() is False
     assert packed_train_mod._compiled_layer is compiled
+    assert calls == [(packed_train_mod._decoder_layer,
+                      {"dynamic": True, "mode": "max-autotune-no-cudagraphs"})]
 
 
 @pytest.mark.parametrize("cls", ["qwen3", "llama"])

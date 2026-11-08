@@ -310,3 +310,31 @@ def test_polyak_rejects_mismatch_before_updating_any_parameter(mismatch):
         polyak_update(target=target, source=source, tau=0.5)
     for name, p in target.named_parameters():
         torch.testing.assert_close(p, before[name])
+
+
+@pytest.mark.parametrize("tau", [0., .25, 1.])
+def test_polyak_updates_only_trainable_source_parameters(tau, monkeypatch):
+    from mouse_core import polyak_update
+    source, target = nn.Module(), nn.Module()
+    source.register_parameter("adapter", nn.Parameter(torch.tensor([5.])))
+    target.register_parameter("adapter", nn.Parameter(torch.tensor([1.]), requires_grad=False))
+    source.register_parameter("base", nn.Parameter(torch.tensor([9.]), requires_grad=False))
+    # A separate frozen-source copy must also stay unchanged, regardless of
+    # the target's requires_grad flag. Selection belongs to the online model.
+    target.register_parameter("base", nn.Parameter(torch.tensor([2.])))
+    source.register_parameter("shared", nn.Parameter(torch.tensor([3.])))
+    target.register_parameter("shared", source.shared)
+    source.register_parameter("frozen_shared", nn.Parameter(torch.tensor([4.]), requires_grad=False))
+    target.register_parameter("frozen_shared", source.frozen_shared)
+    calls = []
+    lerp = torch.Tensor.lerp_
+    def tracked_lerp(tensor, other, weight):
+        calls.append(tensor)
+        return lerp(tensor, other, weight)
+    monkeypatch.setattr(torch.Tensor, "lerp_", tracked_lerp)
+    polyak_update(target=target, source=source, tau=tau)
+    assert len(calls) == 1 and calls[0] is target.adapter
+    torch.testing.assert_close(target.adapter, torch.tensor([1. + 4. * tau]))
+    torch.testing.assert_close(target.base, torch.tensor([2.]))
+    torch.testing.assert_close(target.shared, torch.tensor([3.]))
+    torch.testing.assert_close(target.frozen_shared, torch.tensor([4.]))

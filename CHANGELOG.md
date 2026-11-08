@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Use max autotuning without CUDA graphs for compiled training. Restrict Polyak
+  averaging to trainable online parameters; skip frozen and shared self-updates
+  while preserving validation before mutation.
+
 - Finalize shared sample-check memory before interpreter teardown, including
   caches retained by replay stores through shutdown; avoid NumPy-dependent destructors.
 

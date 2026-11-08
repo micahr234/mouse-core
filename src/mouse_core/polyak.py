@@ -6,10 +6,12 @@ from torch import nn
 
 @torch.no_grad()
 def polyak_update(*, target: nn.Module, source: nn.Module, tau: float) -> None:
-    """Interpolate matching parameters in place; leave buffers unchanged.
+    """Interpolate trainable online parameters into their delayed counterparts.
 
     Parameters are matched by name. Names, shapes, devices, and dtypes must
     agree; validate the entire pair before changing any target parameter.
+    Select by source.requires_grad: delayed parameters are normally frozen.
+    Frozen source parameters, shared tensors, and buffers remain unchanged.
     """
     if not 0 <= tau <= 1:
         raise ValueError("Polyak rate must be in [0, 1].")
@@ -28,4 +30,5 @@ def polyak_update(*, target: nn.Module, source: nn.Module, tau: float) -> None:
             raise ValueError(f"Polyak parameter {name!r} must have matching shape, device, and dtype.")
     for name, target_param in targets.items():
         source_param = sources[name]
-        target_param.lerp_(source_param, tau)
+        if source_param.requires_grad and target_param is not source_param:
+            target_param.lerp_(source_param, tau)
