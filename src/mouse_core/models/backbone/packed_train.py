@@ -62,6 +62,7 @@ from mouse_core.models.backbone.flex_utils import (
 )
 
 _compiled_layer: Any | None = None
+_compiled_mode: str | None = None
 _flex_kernels: dict[tuple[str, int | None], _FlexKernel] = {}
 
 
@@ -219,21 +220,29 @@ def _decoder_layer(
     return _attention_output(layer, h, output)
 
 
-def install_compiled_decoder() -> bool:
-    """Compile the per-layer training body; inference compiles when a session opens.
+def install_compiled_decoder(*, mode: str = "max-autotune-no-cudagraphs") -> bool:
+    """Select the process-wide training decoder compiler mode.
 
-    Uses max autotuning without CUDA graphs. The cold compile takes longer;
-    subsequent updates reuse the selected kernels. Idempotent; returns True
-    when a compiled training body is installed.
+    ``default`` uses standard compilation; ``max-autotune-no-cudagraphs``
+    spends longer selecting kernels without CUDA graph replay. ``off`` removes
+    the compiled decoder body; FlexAttention still compiles its required kernel.
+    All presets exposed by the installed PyTorch Inductor are accepted.
+    Inference compilation is independent. Returns True when a compiled body is
+    installed or replaced, False for an unchanged mode or when disabling it.
     """
-    global _compiled_layer
-    installed = False
-    if _compiled_layer is None:
-        _compiled_layer = torch.compile(
-            _decoder_layer, dynamic=True, mode="max-autotune-no-cudagraphs",
-        )
-        installed = True
-    return installed
+    modes = ("off", *torch._inductor.list_mode_options())
+    if mode not in modes:
+        raise ValueError(f"Training compile mode must be one of: {', '.join(modes)}.")
+    global _compiled_layer, _compiled_mode
+    if mode == "off":
+        _compiled_layer = None
+        _compiled_mode = None
+        return False
+    if _compiled_layer is not None and _compiled_mode == mode:
+        return False
+    compiled = torch.compile(_decoder_layer, dynamic=True, mode=mode)
+    _compiled_layer, _compiled_mode = compiled, mode
+    return True
 
 
 class _DecoderStack(Protocol):

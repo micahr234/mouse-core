@@ -30,11 +30,13 @@ _DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
 def no_compiled_decoder() -> Iterator[None]:
     """Run eager and restore whatever compiled body other tests installed."""
     was = packed_train_mod._compiled_layer
+    previous_mode = packed_train_mod._compiled_mode
     packed_train_mod._compiled_layer = None
     try:
         yield
     finally:
         packed_train_mod._compiled_layer = was
+        packed_train_mod._compiled_mode = previous_mode
 
 
 def _backbone(architecture: str = "qwen3", *, hidden: int = 64, layers: int = 2, heads: int = 4, kv_heads: int = 4, head_dim: int | None = None, lora: LoRAConfig | None = None, dtype: torch.dtype = torch.float32, autocast_dtype: torch.dtype | None = None):
@@ -824,3 +826,43 @@ def test_bf16_base_autocast_preserves_fp32_lora_gradients(no_compiled_decoder, c
             assert parameter.dtype == torch.bfloat16 and not parameter.requires_grad
     assert grads and any(g.count_nonzero() for g in grads)
     assert embeds.grad is not None and torch.isfinite(embeds.grad).all()
+
+
+def test_decoder_compile_mode_switching_and_disable(no_compiled_decoder, monkeypatch):
+    calls = []
+    def compile_body(body, **kwargs):
+        calls.append((body, kwargs))
+        return object()
+    monkeypatch.setattr(torch, "compile", compile_body)
+    assert install_compiled_decoder(mode="default")
+    first = packed_train_mod._compiled_layer
+    assert not install_compiled_decoder(mode="default")
+    assert packed_train_mod._compiled_layer is first
+    assert install_compiled_decoder(mode="max-autotune-no-cudagraphs")
+    assert packed_train_mod._compiled_layer is not first
+    assert not install_compiled_decoder(mode="off")
+    assert packed_train_mod._compiled_layer is None
+    assert packed_train_mod._compiled_mode is None
+    assert not install_compiled_decoder(mode="off")
+    assert len(calls) == 2
+    assert install_compiled_decoder(mode="default")
+    assert [kw for _, kw in calls] == [
+        {"dynamic": True, "mode": mode}
+        for mode in ("default", "max-autotune-no-cudagraphs", "default")]
+
+
+@pytest.mark.parametrize("mode", ["invalid", True, None])
+def test_invalid_decoder_compile_mode_preserves_existing_body(no_compiled_decoder, monkeypatch, mode):
+    existing = object()
+    monkeypatch.setattr(packed_train_mod, "_compiled_layer", existing)
+    with pytest.raises(ValueError, match="compile mode"):
+        install_compiled_decoder(mode=mode)
+    assert packed_train_mod._compiled_layer is existing
+
+
+@pytest.mark.parametrize("mode", torch._inductor.list_mode_options())
+def test_training_compile_accepts_installed_pytorch_modes(no_compiled_decoder, monkeypatch, mode):
+    calls = []
+    monkeypatch.setattr(torch, "compile", lambda body, **kwargs: calls.append(kwargs) or object())
+    assert install_compiled_decoder(mode=mode)
+    assert calls == [{"dynamic": True, "mode": mode}]

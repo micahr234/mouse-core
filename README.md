@@ -64,11 +64,15 @@ benchmarks. AdamW continues to update FP32 trainable weights.
 
 ## Compiled training and target updates
 
-`install_compiled_decoder()` uses dynamic shapes and
-`mode="max-autotune-no-cudagraphs"` for the per-layer training body. Expect a
-longer cold compile while kernels are selected. FlexAttention remains the
-attention implementation. Set `backbone.gradient_checkpointing = True` to
-recompute layer activations during backward and reduce training memory.
+`install_compiled_decoder(mode=...)` selects the process-wide training compiler:
+`"off"` disables the compiled decoder body, `"default"` uses standard compilation,
+and `"max-autotune-no-cudagraphs"` (the API default) tunes kernels without CUDA
+graph replay. Repeating a mode is idempotent; changing it replaces the compiled
+body, and `"off"` removes it. Compiled modes use dynamic shapes. Autotuning has
+higher cold-start cost. FlexAttention remains the only attention implementation
+and still compiles its required kernel even with the decoder compiler off.
+Inference compilation is independent. Set `backbone.gradient_checkpointing = True`
+to recompute layer activations during backward and reduce training memory.
 
 `polyak_update(target=..., source=..., tau=...)` updates only parameters whose
 **source** has `requires_grad=True`. Delayed target parameters normally have
@@ -890,3 +894,7 @@ The full-model summary and validation are in
 The linked Mouse Experiment report includes raw samples, source snapshots,
 profiling diagnostics, and reproduction commands. Original downstream GitHub
 installations were restored after testing.
+
+Training compilation accepts every preset exposed by the installed PyTorch
+Inductor, including `max-autotune` and `reduce-overhead` (CUDA graphs where
+applicable), plus `off`.

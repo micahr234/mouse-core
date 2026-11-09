@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Accept all installed PyTorch Inductor training compiler modes rather than
+  restricting selection to previously benchmarked presets.
+
+- Add selectable training compiler modes: off or any installed PyTorch preset;
+  safely replace or disable a prior selection.
+
 - Use max autotuning without CUDA graphs for compiled training. Restrict Polyak
   averaging to trainable online parameters; skip frozen and shared self-updates
   while preserving validation before mutation.
