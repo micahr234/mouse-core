@@ -94,7 +94,7 @@ def _collect_outputs(filename, outputs, *, oracle_values=True, inference_chunks=
     env = Env()
     cache = SimpleNamespace(close=lambda: None, reset_rows=lambda **kw: None)
     def encoder(batch, **kwargs):
-        counts = np.bincount(batch["sequence_ids"][batch["head_token_mask"]], minlength=batch["num_sequences"])
+        counts = np.bincount(batch["sequence_ids"][batch["head_mask"]], minlength=batch["num_sequences"])
         return {'z': torch.tensor([0., 0., 1., 0.]).expand(batch["num_sequences"], int(counts.max()), 4),
                 'cache': cache}
 
@@ -327,7 +327,8 @@ def _notebook_transform(filename, *, tokenizer_only=False, compute_tokens=0):
     namespace: dict[str, Any] = dict(Augmenter=Augmenter, Tokenizer=tokenizer_factory, compose=compose,
                                     random=random.Random(7), COMPUTE_TOKENS=compute_tokens, INFERENCE_COMPUTE_TOKENS=compute_tokens,
                                     MAX_ACTIONS=4, MAX_OBS_DISCRETE=64, MAX_STEPS_PER_EPISODE=3,
-                                    REPEAT_COUNT=1, PRETRAINED='unused', TOKENIZER_SOURCES={'text': 'unused'})
+                                    REPEAT_COUNT=1, PRETRAINED='unused', TOKENIZER_SOURCES={'text': 'unused'},
+                                    NUM_SAMPLES=1, POLICY_SAMPLES=2)
     exec(compile(ast.Module(body=body, type_ignores=[]), filename, 'exec'), namespace)
     if tokenizer_only:
         return namespace['tokenizer']
@@ -366,7 +367,7 @@ def test_tokenizers_render_saved_repeat_indices_and_preserve_action_masks(filena
         if 'grpo' in filename:
             row.update(advantage=1., _old_log_prob=row.get('_old_log_prob', 0.))
     steps = transform(log)
-    assert [int(step.head_token_mask.sum()) for step in steps] == [1, 1, 0, 1, 0]
+    assert [int(step.head_mask.sum()) for step in steps] == [1, 1, 0, 1, 0]
 
     def markers(tokens):
         return re.findall(r'episode \d+\n', ''.join(chr(int(token)) for token in tokens))
@@ -387,7 +388,7 @@ def test_tokenizers_render_saved_repeat_indices_and_preserve_action_masks(filena
     ]
     replay_steps = _notebook_transform(filename)(persisted)
     assert [markers(step.token_ids) for step in replay_steps] == [markers(step.token_ids) for step in steps]
-    assert [int(step.head_token_mask.sum()) for step in replay_steps] == [1, 1, 0, 1, 0]
+    assert [int(step.head_mask.sum()) for step in replay_steps] == [1, 1, 0, 1, 0]
     assert json.dumps(persisted.events, sort_keys=True) == before
     for start in (0, 1):
         batch, labels = pack_token_batch(steps=steps[start:], sequence_ids=[0] * (len(steps) - start),
@@ -416,9 +417,9 @@ def test_rewards_preserve_replay_tokens_labels_and_dqn_updates(filename):
         return pack_token_batch(steps=transform(source), sequence_ids=[0, 0, 0], batch_size=1)
 
     inputs, labels = batch(log)
-    groups = labels["step_sequence_ids"]
+    groups = labels["sequence_ids"]
     replay_inputs, replay_labels = batch(replayed.to_dataset())
-    replay_groups = replay_labels["step_sequence_ids"]
+    replay_groups = replay_labels["sequence_ids"]
     np.testing.assert_array_equal(inputs['token_ids'], replay_inputs['token_ids'])
     assert labels['reward'].tolist() == [0., 0., 1.]
     for key in labels.keys():
@@ -429,9 +430,9 @@ def test_rewards_preserve_replay_tokens_labels_and_dqn_updates(filename):
 
     objective = DqnObjective(reward=None, value=None, gate=None, temperature=0.,
         discount=boundary_discount(gamma_step=.9, gamma_terminated=0., gamma_truncated=0.))
-    predictions = torch.arange(inputs["head_token_mask"].nonzero(as_tuple=True)[0].shape[0] * 4, dtype=torch.float32).reshape(inputs["head_token_mask"].nonzero(as_tuple=True)[0].shape[0], 4).requires_grad_()
+    predictions = torch.arange(inputs["head_mask"].nonzero(as_tuple=True)[0].shape[0] * 4, dtype=torch.float32).reshape(inputs["head_mask"].nonzero(as_tuple=True)[0].shape[0], 4).requires_grad_()
     backup = predictions.detach() / 3
-    losses, _ = objective(objective_data=labels, group_id=groups, head_step_ids=labels["head_step_ids"],  predictions=predictions,
+    losses, _ = objective(objective_data=labels, sequence_ids=groups, step_ids=labels["step_ids"],  predictions=predictions,
         backup_value_predictions=backup, backup_action_predictions=backup)
     assert torch.isfinite(losses['action_value'])
     losses['action_value'].backward()
@@ -446,7 +447,7 @@ def test_other_frozenlake_tokenizers_encode_events(filename):
     transform = _notebook_transform(filename)
     inputs, labels = pack_token_batch(steps=transform(log.to_dataset()),
         sequence_ids=[0, 0, 0], batch_size=1)
-    assert labels["step_sequence_ids"].shape[0] == 3
+    assert labels["sequence_ids"].shape[0] == 3
     expected = {'action', 'advantage', 'old_log_prob'} if 'grpo' in filename else {'q_star'}
     assert expected <= labels.keys()
     if 'grpo' not in filename:

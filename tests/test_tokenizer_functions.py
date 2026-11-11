@@ -39,7 +39,7 @@ def test_function_roundtrip_preserves_events_and_numeric_labels(tmp_path):
         steps = encoder.encode(events)
         assert [''.join(map(chr, step.token_ids)) for step in steps] == ['[A]\n', '[B]\n', '[C]\n', '[D]\n']
         assert [step.objective_fields['action'] for step in steps] == [0, 1, 2, 3]
-        assert all(step.head_token_mask.tolist() == [False, False, False, True] for step in steps)
+        assert all(step.head_mask.tolist() == [False, False, False, True] for step in steps)
         assert encoder.special_token_ids == {}
         assert encoder(dict(provider='sensor', payload={'action': 1}))['token_ids'].size == 0
         assert encoder(dict(provider='agent', payload={'action': None}))['token_ids'].size == 0

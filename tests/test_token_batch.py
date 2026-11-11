@@ -42,14 +42,14 @@ def test_tokenizer_pack_rows_packs_ragged_rows() -> None:
     ]
     inputs, inputs_objective_data = tok.pack_rows(rows=[measurement_events(payloads) for payloads in rows])
     assert inputs["num_sequences"] == 3
-    assert torch.bincount(inputs_objective_data["step_sequence_ids"], minlength=inputs["num_sequences"]).tolist() == [2, 0, 1]
+    assert torch.bincount(inputs_objective_data["sequence_ids"], minlength=inputs["num_sequences"]).tolist() == [2, 0, 1]
     manual, manual_objective_data = pack_token_batch(
         steps=[encode_measurement(tok, step) for row in rows for step in row],
         sequence_ids=[0, 0, 2],
         batch_size=3)
     assert inputs['token_ids'].tolist() == manual['token_ids'].tolist()
     assert inputs['sequence_ids'].tolist() == manual['sequence_ids'].tolist()
-    assert inputs["head_token_mask"].nonzero(as_tuple=True)[0].tolist() == manual["head_token_mask"].nonzero(as_tuple=True)[0].tolist()
+    assert inputs["head_mask"].nonzero(as_tuple=True)[0].tolist() == manual["head_mask"].nonzero(as_tuple=True)[0].tolist()
 
 
 def test_tokenizer_pack_rows_all_empty_keeps_batch_slots() -> None:
@@ -57,7 +57,7 @@ def test_tokenizer_pack_rows_all_empty_keeps_batch_slots() -> None:
     inputs, inputs_objective_data = tok.pack_rows(rows=[measurement_events(payloads) for payloads in [[], [], []]])
     assert inputs["num_sequences"] == 3
     assert inputs["token_ids"].shape[0] == 0
-    assert torch.bincount(inputs_objective_data["step_sequence_ids"], minlength=inputs["num_sequences"]).tolist() == [0, 0, 0]
+    assert torch.bincount(inputs_objective_data["sequence_ids"], minlength=inputs["num_sequences"]).tolist() == [0, 0, 0]
 
 
 def test_sparse_inference_inputs_and_strict_training_labels():
@@ -77,7 +77,7 @@ def test_sparse_inference_inputs_and_strict_training_labels():
     row = latest_environment_decision(log)
     inputs, inputs_objective_data = tok.pack_rows(rows=[log.events, []])
     assert inputs['token_ids'].tolist() == [2, 4]
-    assert torch.bincount(inputs_objective_data["step_sequence_ids"], minlength=inputs["num_sequences"]).tolist() == [1, 0]
+    assert torch.bincount(inputs_objective_data["sequence_ids"], minlength=inputs["num_sequences"]).tolist() == [1, 0]
     # Training stays strict; inference must not remove configured labels or invent them.
     with pytest.raises(KeyError, match='advantage'):
         tok.encode(log)
@@ -97,7 +97,7 @@ def test_sparse_inference_inputs_and_strict_training_labels():
     })
     sparse, sparse_objective_data = tok.pack_rows(rows=[missing_log.events])
     assert sparse['token_ids'].tolist() == [4]
-    assert torch.bincount(sparse_objective_data["step_sequence_ids"], minlength=sparse["num_sequences"]).tolist() == [1]
+    assert torch.bincount(sparse_objective_data["sequence_ids"], minlength=sparse["num_sequences"]).tolist() == [1]
 
 
 @pytest.mark.parametrize('provider', ['environment', 'agent'])
@@ -128,9 +128,9 @@ def test_objective_column_stays_int_when_all_steps_are_int() -> None:
     tok = _tok()
     steps = [encode_measurement(tok, {"action": a, "reward": a, "episode_index": 0}) for a in range(3)]
     inputs, objective = pack_token_batch(steps=steps, sequence_ids=[0, 0, 0], batch_size=1)
-    group_id = objective["step_sequence_ids"]
+    sequence_ids = objective["sequence_ids"]
     assert "group_id" not in objective
-    assert group_id.tolist() == [0, 0, 0]
+    assert sequence_ids.tolist() == [0, 0, 0]
     assert objective["reward"].dtype == torch.int64
 
 
@@ -229,7 +229,7 @@ def test_contiguous_sequence_ids_with_gaps_accepted() -> None:
     tok = _tok()
     steps = [encode_measurement(tok, {"action": 0, "reward": 0.0, "episode_index": 0}) for _ in range(3)]
     inputs, inputs_objective_data = pack_token_batch(steps=steps, sequence_ids=[0, 2, 2], batch_size=3)
-    assert torch.bincount(inputs_objective_data["step_sequence_ids"], minlength=inputs["num_sequences"]).tolist() == [1, 0, 2]
+    assert torch.bincount(inputs_objective_data["sequence_ids"], minlength=inputs["num_sequences"]).tolist() == [1, 0, 2]
 
 
 @pytest.mark.parametrize("ids", [[0.1, 0.9], [False, True], ["0", "1"]])
@@ -268,10 +268,11 @@ def test_tensor_inputs_and_objectives_have_independent_batch_dimensions():
     assert objective.batch_size == torch.Size([])
     assert inputs["num_sequences"] == 3
     assert "head_token_ids" not in inputs
-    assert "head_step_ids" not in inputs and "step_sequence_ids" not in inputs
-    assert inputs["head_token_mask"].dtype == torch.bool
-    assert objective["head_step_ids"].tolist() == [0, 1]
-    assert objective["step_sequence_ids"].tolist() == [0, 1]
+    assert "step_ids" not in inputs
+    assert inputs["sequence_ids"].shape == inputs["token_ids"].shape
+    assert inputs["head_mask"].dtype == torch.bool
+    assert objective["step_ids"].tolist() == [0, 1]
+    assert objective["sequence_ids"].tolist() == [0, 1]
     assert inputs.to("cpu") is inputs
     assert objective.to("cpu") is objective
     # Tensor storage survives inference use and can then be saved for backward.
@@ -285,6 +286,6 @@ def test_tensor_inputs_and_objectives_have_independent_batch_dimensions():
 def test_tensor_batch_construction_does_not_validate_indices():
     from mouse_core.data import make_token_batch
     inputs = make_token_batch(token_ids=[1], numeric_values=[0.0], numeric_mask=[False],
-                             sequence_ids=[7], head_token_mask=[True], num_sequences=1)
+                             sequence_ids=[7], head_mask=[True], num_sequences=1)
     assert inputs["sequence_ids"].tolist() == [7]
-    assert inputs["head_token_mask"].tolist() == [True]
+    assert inputs["head_mask"].tolist() == [True]

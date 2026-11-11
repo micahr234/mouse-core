@@ -61,7 +61,7 @@ class Objective[**P](ABC):
     and PPO takes ``value_predictions=``. ``SupervisedObjective`` takes
     ``actions=`` (integer action IDs for CE) or ``targets=`` (Q vectors for
     KL, MSE, and MAE). DQN, PPO, and GRPO
-    require ``group_id=`` (int64 ``[N]``) and ``head_step_ids=`` (int64 ``[P]``)
+    require ``sequence_ids=`` (int64 ``[N]``) and ``step_ids=`` (int64 ``[P]``)
     beside ``objective_data``. Pass the existing TensorDict mapping: it identifies
     the step owning every prediction row, including repeated readouts and gaps.
     The returned loss is a dict of terms. ``DqnObjective`` trains Q

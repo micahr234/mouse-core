@@ -331,10 +331,10 @@ def test_incremental_tokens_and_saved_spec_match_replay(tmp_path):
     rest, rest_objective_data = loaded.pack_rows(rows=[_events(rows[1:])])
     for field in ('token_ids', 'numeric_values', 'numeric_mask'):
         np.testing.assert_array_equal(full[field], np.concatenate([first[field], rest[field]]))
-    np.testing.assert_array_equal(full_objective_data["head_step_ids"], [0, 1, 2, 3])
+    np.testing.assert_array_equal(full_objective_data["step_ids"], [0, 1, 2, 3])
     for row in rows:
         tokens = _step(tok, row)
-        assert tokens.head_token_mask.sum() == 1
+        assert tokens.head_mask.sum() == 1
         assert 'source_step_index' not in tokens.objective_fields
         assert tokens.objective_fields['source_episode_index'] == row['episode_index']
     altered = deepcopy(rows[1])
@@ -352,7 +352,7 @@ def test_provider_fields_preserve_optional_environment_observations_in_order():
     # a separate readout without replaying the previous action or sensor value.
     np.testing.assert_array_equal(tokens.token_ids, [3, 2, 4])
     np.testing.assert_allclose(tokens.numeric_values, [0., .525, 0.])
-    np.testing.assert_array_equal(tokens.head_token_mask, [False, False, True])
+    np.testing.assert_array_equal(tokens.head_mask, [False, False, True])
     following = _step(tokenizer(), rows[2])
     np.testing.assert_array_equal(following.token_ids, [1, 4])
     np.testing.assert_allclose(following.numeric_values, [.1, 0.])
@@ -361,7 +361,7 @@ def test_provider_fields_preserve_optional_environment_observations_in_order():
 def test_events_without_matching_fields_emit_no_tokens():
     tok = Tokenizer(tokenizers={"default": IntIdTokenizer()}, input_fields=[])
     step = _step(tok, list(environment_decisions(collect()))[1])
-    assert step.token_ids.size == 0 and not step.head_token_mask.any()
+    assert step.token_ids.size == 0 and not step.head_mask.any()
 
 
 @pytest.mark.parametrize('excluded,expected_ids', [
@@ -376,7 +376,7 @@ def test_empty_provider_fields_explicitly_exclude_payloads(tmp_path, excluded, e
     loaded = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizers={"default": IntIdTokenizer()})
     tokens = _step(loaded, list(environment_decisions(collect()))[1])
     np.testing.assert_array_equal(tokens.token_ids, expected_ids)
-    assert tokens.head_token_mask.sum() == 1
+    assert tokens.head_mask.sum() == 1
 
 
 @pytest.mark.flex_training
@@ -393,17 +393,17 @@ def test_replay_loader_training_and_cached_inference(tmp_path):
                          heads={'q': torch.nn.Linear(8, 2)}, reasoner=None,
                          embedding=Embedding(hidden_dim=8, vocab_size=32, num_frequencies=2, numeric_field_names=tok.numeric_field_names))
     inputs, data = loader.next_batch()
-    group = data["step_sequence_ids"]
+    group = data["sequence_ids"]
     data = {key: value.to(torch.get_default_device()) for key, value in data.items()}
     group = group.to(torch.get_default_device())
-    assert data["head_step_ids"].tolist() == list(range(8))
+    assert data["step_ids"].tolist() == list(range(8))
     assert (~torch.isnan(data["action"])).tolist() == [False, True, False, True] * 2
     objective = DqnObjective(discount=boundary_discount(gamma_step=.9, gamma_terminated=0., gamma_truncated=1.),
                              reward=None, value=None, temperature=0.,  gate=None)
     prediction = model(inputs)['predictions']['q']
     losses, _ = objective(predictions=prediction, backup_action_predictions=prediction.detach(),
                           backup_value_predictions=prediction.detach(), objective_data=data,
-                          group_id=group, head_step_ids=fixture_head_steps(data))
+                          sequence_ids=group, step_ids=fixture_head_steps(data))
     optimizer = torch.optim.Adam(model.parameters(), lr=.01)
     before = [p.detach().clone() for p in model.parameters()]
     loss = torch.stack(list(losses.values())).sum()
@@ -462,10 +462,10 @@ def test_loader_counts_source_events_and_tokenizer_maps_readouts():
     with DataLoader(stores=store, events_budget=10,
                     sample_ranges=environment_episode_ranges, transform=tokenizer().encode, num_workers=0, seed=3) as loader:
         inputs, data = loader.next_batch()
-        groups = data["step_sequence_ids"]
-        assert data["step_sequence_ids"].shape[0] == 4
+        groups = data["sequence_ids"]
+        assert data["sequence_ids"].shape[0] == 4
         assert groups.tolist() == [0, 0, 0, 0]
-        assert data["head_step_ids"].tolist() == list(range(4))
+        assert data["step_ids"].tolist() == list(range(4))
         assert (~torch.isnan(data["action"])).tolist() == [False, True, False, True]
         assert data['reward'].tolist() == [0., .25, .75, 2.]
     assert store.to_dataset().to_list() == before
@@ -611,10 +611,10 @@ def test_episode_header_groups_events_with_logged_steps():
                      transform=tokenizer().encode,
                     num_workers=0, seed=3) as loader:
         inputs, labels = loader.next_batch()
-        groups = labels["step_sequence_ids"]
-    assert labels["step_sequence_ids"].shape[0] == 4
+        groups = labels["sequence_ids"]
+    assert labels["sequence_ids"].shape[0] == 4
     assert groups.tolist() == [0] * 4
-    assert labels["head_step_ids"].tolist() == list(range(4))
+    assert labels["step_ids"].tolist() == list(range(4))
     assert len(set(labels['source_episode_index'].tolist())) == 1
     assert all('step_index' in event and 'step_index' not in json.loads(event['payload'])
                for event in store[:])
@@ -668,7 +668,7 @@ def test_omitting_empty_coordinators_preserves_views_tokens_and_sampling():
     with DataLoader(stores=sparse.to_store(), sample_field='episode_index', events_budget=7,
                      transform=encode.encode, num_workers=0, seed=3) as loader:
         inputs, labels = loader.next_batch()
-    assert labels["step_sequence_ids"].shape[0] == 4
+    assert labels["sequence_ids"].shape[0] == 4
     assert (~torch.isnan(labels["action"])).tolist() == [False, True, False, True]
 
 

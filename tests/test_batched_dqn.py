@@ -46,7 +46,7 @@ def test_batched_loss_and_gradients_equal_independent_heads(gate_name, selected)
     objective = _objective(gate, lambda reward, **_: reward[:, None] * scales,
                            cql=0.0 if selected else 0.2)
     batched_loss, batched_metrics = objective(
-        objective_data=data, group_id=groups, head_step_ids=fixture_head_steps(data),  predictions=q,
+        objective_data=data, sequence_ids=groups, step_ids=fixture_head_steps(data),  predictions=q,
         backup_value_predictions=backup, backup_action_predictions=actions,
         return_backup_lengths=True,
     )
@@ -59,7 +59,7 @@ def test_batched_loss_and_gradients_equal_independent_heads(gate_name, selected)
         scalar = _objective(gate, lambda reward, **_: reward * scales[head],
                             cql=0.0 if selected else 0.2)
         losses, metrics = scalar(
-            objective_data=data, group_id=groups, head_step_ids=fixture_head_steps(data),  predictions=single,
+            objective_data=data, sequence_ids=groups, step_ids=fixture_head_steps(data),  predictions=single,
             backup_value_predictions=backup[:, head], backup_action_predictions=actions[:, head],
             return_backup_lengths=True,
         )
@@ -77,7 +77,7 @@ def test_batched_loss_and_gradients_equal_independent_heads(gate_name, selected)
 def test_shared_rewards_and_fixed_size_training_diagnostics():
     q = torch.randn(11, 5, 4, requires_grad=True)
     losses, metrics = _objective(None)(
-        objective_data=_data(), group_id=torch.zeros(7, dtype=torch.long), head_step_ids=fixture_head_steps(_data()),
+        objective_data=_data(), sequence_ids=torch.zeros(7, dtype=torch.long), step_ids=fixture_head_steps(_data()),
         predictions=q, backup_value_predictions=q.detach(), backup_action_predictions=q.detach(),
         include_statistics=False, return_backup_lengths=True,
     )
@@ -90,7 +90,7 @@ def test_batched_custom_gate_validates_head_dimension():
     q = torch.randn(11, 5, 4)
     with pytest.raises(ValueError, match="gate must return shape"):
         _objective(lambda **_: torch.zeros(7, 7, 2))(
-            objective_data=_data(), group_id=torch.zeros(7, dtype=torch.long), head_step_ids=fixture_head_steps(_data()),
+            objective_data=_data(), sequence_ids=torch.zeros(7, dtype=torch.long), step_ids=fixture_head_steps(_data()),
             predictions=q, backup_value_predictions=q, backup_action_predictions=q,
         )
 
@@ -100,7 +100,7 @@ def test_batched_reward_rejects_wrong_shape(shape):
     q = torch.randn(11, 3, 4)
     with pytest.raises(ValueError, match="reward must return shape"):
         _objective(None, lambda **_: torch.zeros(shape))(
-            objective_data=_data(), group_id=torch.zeros(7, dtype=torch.long), head_step_ids=fixture_head_steps(_data()),
+            objective_data=_data(), sequence_ids=torch.zeros(7, dtype=torch.long), step_ids=fixture_head_steps(_data()),
             predictions=q, backup_value_predictions=q, backup_action_predictions=q,
         )
 
@@ -109,7 +109,7 @@ def test_batched_reward_rejects_wrong_shape(shape):
 def test_invalid_prediction_rank_is_rejected(shape):
     with pytest.raises(ValueError, match="predictions must have shape"):
         _objective(None)(
-            objective_data={}, group_id=torch.zeros(2, dtype=torch.long), head_step_ids=torch.arange(2),
+            objective_data={}, sequence_ids=torch.zeros(2, dtype=torch.long), step_ids=torch.arange(2),
             predictions=torch.zeros(shape), backup_value_predictions=torch.ones(2, 3),
             backup_action_predictions=torch.ones(2, 3),
         )

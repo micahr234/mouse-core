@@ -306,7 +306,7 @@ class Gate(Protocol):
     same place the reward and γ of that transition are stored. Entries
     with ``s <= t`` are ignored. A ``0`` bootstraps ``V`` at that step.
     The objective then zeros any continuation that would leave the run
-    (``group_id``). For any horizon, the last step of an episode is not
+    (``sequence_ids``). For any horizon, the last step of an episode is not
     updated when its target depends on the next step's value. It is
     updated when the target does not.
     A target that needs a value beyond its sampled group always raises. A
@@ -701,7 +701,7 @@ def _align_objective_rows(
     """Index length-``N`` columns by ``step_of`` so they match ``[P]`` rows."""
     aligned: dict[str, torch.Tensor] = {}
     for key, values in objective_data.items():
-        if key != "head_step_ids" and values.shape[:1] == torch.Size([N]):
+        if key != "step_ids" and values.shape[:1] == torch.Size([N]):
             aligned[key] = values[step_of]
         else:
             aligned[key] = values

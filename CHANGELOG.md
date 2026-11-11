@@ -1,6 +1,6 @@
 # Changelog
 
-- Objectives now require the existing `objective_data["head_step_ids"]` mapping.
+- Objectives now require the existing `objective_data["step_ids"]` mapping.
   Removed the duplicate `head_output_count` objective column; counts are derived
   internally. Updated examples, replay action selection and training metrics.
 
@@ -10,6 +10,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+- Simplify batch names to `head_mask`, `sequence_ids`, and `step_ids`.
+  Sequential objectives accept `sequence_ids=` and `step_ids=`; examples and
+  tests use the same names throughout.
 
 - Accept all installed PyTorch Inductor training compiler modes rather than
   restricting selection to previously benchmarked presets.
@@ -40,7 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Reject model class, state-key, and tensor-shape mismatches before loading weights.
 
-- Move step/prediction mappings to `objective_data`; use `head_token_mask` for model readouts and sample one action per prediction.
+- Move step/prediction mappings to `objective_data`; use `head_mask` for model readouts and sample one action per prediction.
 
 - Replace `TokenBatch` with TensorDict inputs and return TensorDict objective
   labels. Use dictionary access and `.to(device)`; shapes give derived counts,
@@ -62,7 +66,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are serialized once per worker; augmenter synchronization is worker-local.
 - Remove `DataLoader.batch_size`: each event/token budget caps the whole batch.
 - `DataLoader`, `EpochDataLoader`, and `pack_token_batch` return
-  `(inputs, objective_data)`. Step boundaries live in `inputs["step_sequence_ids"]`
+  `(inputs, objective_data)`. Step boundaries live in `objective_data["sequence_ids"]`
   eliminating the duplicated third return value.
 - Install scripts and CI use standard Python 3.15 without `PYTHON_GIL=0`.
   The `all` extra includes `kernels`.
@@ -124,7 +128,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Replace modality IDs, name tables, and maps with an explicit boolean
   `numeric_mask`, emitted by the tokenizer and preserved through packing.
   Token inputs are now `token_ids`, `numeric_values`, `numeric_mask`,
-  `sequence_ids`, `head_token_ids`, and `head_step_ids`. Embedding accepts
+  `sequence_ids`, `head_token_ids`, and `step_ids`. Embedding accepts
   token IDs alone, or paired numeric values/mask for Fourier features.
   Remove unused per-modality positions and `ModalityInfo`. Cached outputs use
   `head_valid_mask`; token-level attention and packing accept `sequence_ids`.
@@ -233,13 +237,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   uses ``grpo``, ``SpObjective`` uses ``action``, and ``SvObjective``
   uses ``value``.
 - ``pack_token_batch`` and ``DataLoader.next_batch`` return
-  ``(inputs, objective_data, group_id)``. ``group_id`` is int64
+  ``(inputs, objective_data, sequence_ids)``. ``sequence_ids`` is int64
   ``[N]``, one id per step. It is not a key in ``objective_data``.
   Each sample the loader keeps in a batch gets a distinct id, and
   every step of that sample shares it. ``DqnObjective``,
   ``PpoObjective``, and ``GrpoObjective`` take it as required
-  ``group_id=``. Packed attention and pair weights stop where the
-  id changes. Token ``group_ids`` carry the same id.
+  ``sequence_ids=``. Packed attention and pair weights stop where the
+  id changes. Token ``sequence_ids`` carry the same id.
 - A sample is one group. ``DataLoader`` requires ``sample_field``:
   a sample is every contiguous row that shares one scalar value in
   that column. Pass exactly one of ``samples_budget`` (steps) or
@@ -247,7 +251,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   adds whole samples until the next sample would pass the budget. A
   sample that does not fit is left out, including a first sample that
   alone is over the budget (that raises). Each kept sample gets a
-  unique ``group_id``. Attention and TD / PPO / GRPO pair weights stop
+  unique ``sequence_ids``. Attention and TD / PPO / GRPO pair weights stop
   where that id changes. Training examples pass ``sample_field="task_index"``,
   ``token_budget``, and ``batch_size=1``.
 - ``pack_token_batch`` and ``Tokenizer.pack_rows`` take required
@@ -324,7 +328,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   horizon, the last step of a task is not updated when its target
   depends on the next step's value. It is updated when the target does
   not. ``"bootstrap"`` fills the value on the step before a group
-  boundary (end of the batch, or a ``group_id`` break: a chunk
+  boundary (end of the batch, or a ``sequence_ids`` break: a chunk
   boundary, time limit, or truncation whose rest was not sampled), so
   that step is updated from that value and stays. ``"ignore"`` leaves
   that off-data value out of the target and leaves the step out of the
@@ -737,7 +741,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   modalities.
 - ``packed_forward`` (``mouse_core.models.backbone.packed_train``): the one
   uncached training forward for transformer backbones. Tokens are stably
-  regrouped into contiguous ``(sequence_id, grouping_id)`` classes
+  regrouped into contiguous ``(sequence_ids, grouping_id)`` classes
   (recurring ids attend back and keep one RoPE counter), all decoder
   layers run in that order, and outputs are restored to stream order.
   ``train_kernel`` (required on the backbone, not saved) selects the
@@ -1221,7 +1225,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ``DataLoader.next_batch()`` and ``pack_token_batch(...)`` return
   ``(inputs, objective_data)``. ``inputs`` is the ``TokenBatch``;
   ``objective_data`` is a CPU ``TokenBatch`` of tokenizer
-  ``objective_fields`` (plus ``sequence_id`` and the grouping column).
+  ``objective_fields`` (plus ``sequence_ids`` and the grouping column).
   ``Model.forward`` / embedders take ``TokenBatch`` only and return
   a ``ModelOutput``. Move ``objective_data`` onto the
   model device before the objective.
@@ -1243,7 +1247,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ``SpObjective`` hard ``"ce"`` (``sp_ce``) samples uniformly among tied
   argmax actions instead of always taking the lowest index.
 - Transition objectives (DQN / layerwise DQN / PPO / GRPO) treat a **run** as
-  matching ``sequence_id`` and ``grouping_id``. Neighbor reads that would leave
+  matching ``sequence_ids`` and ``grouping_id``. Neighbor reads that would leave
   that run are multiplied by ``0`` (weighted mean; all-zero weights → loss
   ``0``) instead of dropping pairs and raising when none remain. Episode resets
   inside a run still train. SP / SV stay same-row.
@@ -1338,7 +1342,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``token_ids`` / ``scalars``). Tokenizer emits discrete ids or continuous
   values; embedder maps them. Token type comes from ``modality_map`` by name.
 - ``TokenBatch.objective_fields`` (was ``col_values``, then ``step_fields``):
-  step-level objective columns ``[N]`` / ``[N, dim]``, including ``sequence_id``
+  step-level objective columns ``[N]`` / ``[N, dim]``, including ``sequence_ids``
   and ``grouping_field``. Tokenizer ``objective_fields=`` selects which raw step
   keys are packed (replaces ``extra_fields`` for PPO/GRPO columns such as
   ``old_log_prob`` / ``advantage``).
@@ -1384,7 +1388,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - ``examples/07`` and ``08`` pass ``grouping_field="task_index"`` on
   ``PpoObjective`` / ``GrpoObjective``. Without it, a sampled window
-  that crosses a task on the same ``sequence_id`` trains the boundary
+  that crosses a task on the same ``sequence_ids`` trains the boundary
   pair (wrong action/reward from the new task). ``task_done`` on the
   last row of the old task discounts the incoming pair only.
 - ``left_align_content`` takes ``token_lengths`` so an idle decode row
@@ -1563,7 +1567,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ``TokenBatch.col_values`` (renamed to ``objective_fields``).
   Packing/padding short windows and pack-seam isolation are gone (one public path).
 - ``TokenBatch.lengths``: per-sequence step counts are derived from
-  ``objective_fields["sequence_id"]`` + ``B`` via ``TokenBatch.step_counts()``
+  ``objective_fields["sequence_ids"]`` + ``B`` via ``TokenBatch.step_counts()``
   (``step_counts_from_sequence_id``).
 - Dead packing helpers (``pack_and_pad_rows``, ``pack_live_step_tokens``,
   ``counts_from_prediction_indices``, …); only ``left_align_content`` remains.
@@ -1591,7 +1595,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ``step_token_indices`` renamed to ``prediction_indices`` (and
   ``counts_from_step_token_indices`` → ``counts_from_prediction_indices``).
 - ``TokenBatch``: variable per-sequence step counts; flat
-  ``prediction_indices`` ``[N]``, ``objective_fields`` ``[N]`` (+ ``sequence_id``).
+  ``prediction_indices`` ``[N]``, ``objective_fields`` ``[N]`` (+ ``sequence_ids``).
   No stored ``lengths`` / ``segment_ids`` fields.
 - ``Model.forward`` training path: predictions and ``objective_data`` are flat
   ``TokenBatch[N]`` (``N = len(prediction_indices)``). Flex / CPU document
@@ -1600,7 +1604,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   buffer + mask; RoPE resets per grouping-id run). Cached decode stays rectangular
   ``[B, S]``.
 - Objectives (DQN / Layerwise / PPO / GRPO): flat ``x[:-1]`` / ``x[1:]`` with
-  pair weight ``1`` when ``sequence_id[i] == sequence_id[i+1]`` and, when
+  pair weight ``1`` when ``sequence_ids[i] == sequence_ids[i+1]`` and, when
   ``grouping_field=`` is set, ``objective_data[grouping_field]`` matches across
   the pair; otherwise weight ``0``. All-zero weights yield loss ``0``.
 - Example notebooks build ``train_transform = compose(augmenter,
@@ -1703,7 +1707,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``torch.float32`` otherwise (exported from ``mouse_core.models``).
 - ``TokenBatch``: flat concatenated token stream (no padding) with parallel
   ``token_types`` / ``token_ids`` / ``scalars`` / ``sequence_ids`` / ``step_ids`` /
-  ``prediction_indices`` (step counts via ``sequence_id`` + ``B``). Built by
+  ``prediction_indices`` (step counts via ``sequence_ids`` + ``B``). Built by
   ``Encoder.prepare`` / ``make_preparer()`` and consumed by embedders and
   ``Model.forward``.
 - ``StaticFourierFeatures``: deterministic log-spaced Fourier features (buffers

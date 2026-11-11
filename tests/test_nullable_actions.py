@@ -190,7 +190,7 @@ def test_nullable_rows_through_objective_ignore_automatic_decisions(algorithm):
     inputs, data = pack_token_batch(
         steps=[encode_measurement(tok, row) for row in rows]
     )
-    groups = data["step_sequence_ids"]
+    groups = data["sequence_ids"]
     predictions = torch.tensor(
         [[1.0, 2.0], [float("nan")] * 2, [3.0, 4.0], [5.0, 6.0], [9.0, 10.0]],
         requires_grad=True,
@@ -199,7 +199,7 @@ def test_nullable_rows_through_objective_ignore_automatic_decisions(algorithm):
         gamma_step=0.9, gamma_terminated=0.0, gamma_truncated=0.0
     )
     kwargs: dict[str, Any] = dict(
-        objective_data=data, group_id=groups, head_step_ids=fixture_head_steps(data),  predictions=predictions
+        objective_data=data, sequence_ids=groups, step_ids=fixture_head_steps(data),  predictions=predictions
     )
     if algorithm == "dqn":
         obj = DqnObjective(

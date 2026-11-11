@@ -16,8 +16,8 @@ def test_same_number_of_predictions_and_steps_does_not_imply_identity():
     backup = torch.tensor([[99., 99.], [99., 99.], [6., 8.]])
     objective = DqnObjective(reward=None, value=None, gate=None, temperature=0.,
                             discount=boundary_discount(gamma_step=.5, gamma_terminated=0., gamma_truncated=0.))
-    losses, metrics = objective(objective_data=data, group_id=torch.zeros(3, dtype=torch.long),
-                                head_step_ids=steps, predictions=predictions,
+    losses, metrics = objective(objective_data=data, sequence_ids=torch.zeros(3, dtype=torch.long),
+                                step_ids=steps, predictions=predictions,
                                 backup_value_predictions=backup, backup_action_predictions=backup)
     # Both initial readouts target 2 + .5*8 = 6; next readout targets terminal reward 3.
     torch.testing.assert_close(metrics["backup"], torch.tensor([6., 6., 3.]))

@@ -43,7 +43,7 @@ class DecodeCache:
 
 def prepare_decode(
     *, embeds: torch.Tensor, tokens: TensorDict, sequence_ids: torch.Tensor,
-    head_token_mask: torch.Tensor,
+    head_mask: torch.Tensor,
 ) -> tuple[torch.Tensor, list[int], torch.Tensor, torch.Tensor]:
     """Prepare left-padded embeddings and head-token IDs for cached decoding.
 
@@ -55,7 +55,7 @@ def prepare_decode(
     if tokens["num_sequences"] > 0 and tokens["token_ids"].shape[0] == 0:
         raise ValueError("cached decode requires at least one non-empty row in batch.")
 
-    head_token_ids = head_token_mask.nonzero(as_tuple=True)[0]
+    head_token_ids = head_mask.nonzero(as_tuple=True)[0]
     head_counts = torch.bincount(sequence_ids[head_token_ids], minlength=tokens["num_sequences"]).tolist()
     token_lengths = torch.bincount(sequence_ids, minlength=tokens["num_sequences"]).tolist()
     max_heads = max(head_counts, default=0)

@@ -69,7 +69,7 @@ def test_variable_and_empty_text_preserves_data_and_head_positions():
     assert len(set(counts)) > 2
     for n, step in zip(counts, steps):
         assert step.token_ids.tolist() == [ord(".")] * n + [ord("V")]
-        assert step.head_token_mask.tolist() == [False] * n + [True]
+        assert step.head_mask.tolist() == [False] * n + [True]
     assert [s.objective_fields["reward"] for s in steps] == list(
         map(float, range(len(counts)))
     )
@@ -120,7 +120,7 @@ def test_callback_spec_roundtrips(tmp_path):
     )
     for a, b in zip(tok.encode(events([0, 1, 5])), restored.encode(events([0, 1, 5]))):
         np.testing.assert_array_equal(a.token_ids, b.token_ids)
-        np.testing.assert_array_equal(a.head_token_mask, b.head_token_mask)
+        np.testing.assert_array_equal(a.head_mask, b.head_mask)
 
 
 def test_max_tokens_applies_after_callback_tokenization():
@@ -169,10 +169,10 @@ def test_random_text_callback_runs_in_four_loader_processes():
         lengths = []
         for _ in range(2):
             inputs, data = loader.next_batch()
-            ends = inputs["head_token_mask"].nonzero(as_tuple=True)[0].tolist()
+            ends = inputs["head_mask"].nonzero(as_tuple=True)[0].tolist()
             starts = [0] + [end + 1 for end in ends[:-1]]
             lengths.extend(end - start for start, end in zip(starts, ends))
-            assert data["head_step_ids"].tolist() == list(range(16))
+            assert data["step_ids"].tolist() == list(range(16))
             assert data["reward"].tolist() == list(map(float, range(16)))
         assert all(1 <= length <= 10 for length in lengths)
         assert len(set(lengths)) > 1
@@ -193,7 +193,7 @@ def test_empty_format_never_calls_backend_or_emits_readouts(kind, format):
         ],
     )
     (step,) = tok.encode(events([1]))
-    assert step.T == 0 and step.head_token_mask.size == 0
+    assert step.T == 0 and step.head_mask.size == 0
 
 
 def test_token_format_callback_skips_or_emits_one_token():
@@ -211,6 +211,6 @@ def test_token_format_callback_skips_or_emits_one_token():
     for text, expected in [("", []), ("V", [ord("V")])]:
         piece = tok(dict(provider="environment", payload={"text": text}))
         assert piece["token_ids"].tolist() == expected
-        assert piece["head_token_mask"].tolist() == [True] * len(expected)
+        assert piece["head_mask"].tolist() == [True] * len(expected)
     with pytest.raises(ValueError, match="expected 1"):
         tok(dict(provider="environment", payload={"text": "VV"}))

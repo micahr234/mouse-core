@@ -82,7 +82,7 @@ def test_same_model_generation_variable_lengths_recycling_and_repeated_calls(bac
     for _ in range(2):
         traces = generate(online, tokens, backend=backend)
         assert [t.generated_ids for t in traces] == [(2, 3, 0), (3, 0), (0,), (2, 3, 0)]
-        assert [t.head_token_id for t in traces] == tokens["head_token_mask"].nonzero(as_tuple=True)[0].tolist()
+        assert [t.head_token_id for t in traces] == tokens["head_mask"].nonzero(as_tuple=True)[0].tolist()
         assert online.backbone.training and online.embedding.training and online.reasoner.token_head.training
         assert all(p.grad is None for p in online.parameters())
 
@@ -109,8 +109,8 @@ def test_cache_rows_are_released_on_failed_generation(monkeypatch):
 def test_final_token_representation_and_token_scores_match_manual_shared_forward():
     online = model()
     tokens = example_module().pack_prefixes([[2, 4], [3]])
-    traces = [ReasoningTrace(int(tokens["head_token_mask"].nonzero(as_tuple=True)[0][0]), (5, 6, 0), 0),
-              ReasoningTrace(int(tokens["head_token_mask"].nonzero(as_tuple=True)[0][1]), (0,), 0)]
+    traces = [ReasoningTrace(int(tokens["head_mask"].nonzero(as_tuple=True)[0][0]), (5, 6, 0), 0),
+              ReasoningTrace(int(tokens["head_mask"].nonzero(as_tuple=True)[0][1]), (0,), 0)]
     out = online.reasoner(tokens, traces, embedding=online.embedding, backbone=online.backbone,
                           tokenizer_name="text", temperature=0.8, score_tokens=True)
     expected_log_probs = []
@@ -193,7 +193,7 @@ def test_dqn_plus_reinforce_update_shared_backbone_head_and_delayed_target(backe
     objective = DqnObjective(reward=None, value=None, gate=None, temperature=0.,
                             discount=boundary_discount(gamma_step=0.9, gamma_terminated=0., gamma_truncated=0.))
     metrics = example.train_step(online, target, torch.optim.AdamW(online.parameters(), lr=1e-3), objective,
-        tokens=tokens, objective_data=data, group_id=groups, backend=backend, end_token_id=0,
+        tokens=tokens, objective_data=data, sequence_ids=groups, backend=backend, end_token_id=0,
         max_new_tokens=64, max_active_requests=2, reasoning_temperature=0.8, reinforce_weight=1.,
         target_tau=0.2, max_grad_norm=1.)
     assert all(np.isfinite(value) for value in metrics.values())
@@ -270,9 +270,9 @@ def test_frozenlake_replay_is_fixed_and_prefixes_do_not_include_future_steps():
         return [1, 2]
     tokens, data, groups = example.replay_batch(episodes, encode_prompt=encode, device=torch.device("cpu"))
     assert histories == ["State 0.\n"] * 3
-    assert data["step_sequence_ids"].shape[0] == 6 and tokens["head_token_mask"].nonzero(as_tuple=True)[0].shape[0] == 3
+    assert data["sequence_ids"].shape[0] == 6 and tokens["head_mask"].nonzero(as_tuple=True)[0].shape[0] == 3
     assert groups.tolist() == [0, 0, 1, 1, 2, 2]
-    assert data["head_step_ids"].tolist() == [0, 2, 4]
+    assert data["step_ids"].tolist() == [0, 2, 4]
     assert "head_output_count" not in data
     assert (~torch.isnan(data["action"])).tolist() == [False, True] * 3
     assert data["truncated"].tolist() == [False, True] * 3

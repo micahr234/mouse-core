@@ -283,7 +283,7 @@ class EventTokenStream:
     def _finish(self) -> StepTokens:
         pieces = self._pieces
         values = {name: np.concatenate([piece[name] for piece in pieces]) for name in
-                  ("token_ids", "numeric_values", "numeric_mask", "head_token_mask", "tokenizer_ids", "position_values", "position_mask", "numeric_field_ids")}
+                  ("token_ids", "numeric_values", "numeric_mask", "head_mask", "tokenizer_ids", "position_values", "position_mask", "numeric_field_ids")}
         objective = copy_keep_fields(self._labels,
                                     self.tokenizer.objective_fields if self.include_objectives else (),
                                     missing_values=self.tokenizer.objective_missing_values)
@@ -527,7 +527,7 @@ def _tokenize_fields(*, row, meta, tokenizers, tokenizer_routes, numeric_routes,
     tokenizer_ids: list[int] = []
     numeric_values: list[float] = []
     numeric_mask: list[bool] = []
-    head_token_mask: list[bool] = []
+    head_mask: list[bool] = []
     numeric_field_ids: list[int] = []
     position_values: list[float] = []
     position_mask: list[bool] = []
@@ -557,7 +557,7 @@ def _tokenize_fields(*, row, meta, tokenizers, tokenizer_routes, numeric_routes,
         numeric_field_ids.extend([numeric_routes[field_id] if is_numeric else -1] * len(emitted_ids))
         position_values.extend([0.0 if position is None else position] * len(emitted_ids))
         position_mask.extend([position is not None] * len(emitted_ids))
-        head_token_mask.extend([head_output] * len(emitted_ids))
+        head_mask.extend([head_output] * len(emitted_ids))
 
     for field_id, m in meta:
         spec = m.spec
@@ -596,7 +596,7 @@ def _tokenize_fields(*, row, meta, tokenizers, tokenizer_routes, numeric_routes,
         numeric_field_ids=np.asarray(numeric_field_ids, dtype=np.int64),
         position_values=np.asarray(position_values, dtype=np.float64),
         position_mask=np.asarray(position_mask, dtype=bool),
-        head_token_mask=np.asarray(head_token_mask, dtype=bool),
+        head_mask=np.asarray(head_mask, dtype=bool),
     )
 
 

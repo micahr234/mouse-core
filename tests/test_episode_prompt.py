@@ -53,8 +53,8 @@ def test_complete_outer_episodes_each_get_one_visible_prompt(num_workers):
         assert text.startswith(prompt) and text.count(prompt) == 1
         assert text.count("episode 1\n") == text.count("episode 2\n") == 1
         # Inner resets retain the same attention sequence as their prompt.
-        assert inputs["head_token_mask"][selected].sum().item() == 3
-        assert (objective["step_sequence_ids"] == sequence).sum().item() == 5
+        assert inputs["head_mask"][selected].sum().item() == 3
+        assert (objective["sequence_ids"] == sequence).sum().item() == 5
 
     for events in samples:
         full, _ = tokenizer.pack_rows(rows=[events])

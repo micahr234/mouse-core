@@ -17,7 +17,7 @@ def test_mismatch_modes_exclude_resets_and_separate_branches(mode, expected):
     actual = sampling_mismatch_weights(
         training_log_probs=torch.tensor([float('nan'), math.log(2), math.log(2),
                                          float('nan'), math.log(.25), math.log(4)]),
-        sampling_log_probs=torch.zeros(6), group_id=torch.tensor([0, 0, 0, 1, 1, 1]),
+        sampling_log_probs=torch.zeros(6), sequence_ids=torch.tensor([0, 0, 0, 1, 1, 1]),
         executed=torch.tensor([False, True, True, False, True, True]),
         mode=mode, ratio_min=.5, ratio_max=3.)
     torch.testing.assert_close(actual, torch.tensor(expected, dtype=torch.float64))
@@ -25,7 +25,7 @@ def test_mismatch_modes_exclude_resets_and_separate_branches(mode, expected):
 
 def test_episode_overflow_is_capped_before_exponentiation():
     actual = sampling_mismatch_weights(training_log_probs=torch.ones(4)*1000,
-        sampling_log_probs=torch.zeros(4), group_id=torch.zeros(4), executed=torch.ones(4).bool(),
+        sampling_log_probs=torch.zeros(4), sequence_ids=torch.zeros(4), executed=torch.ones(4).bool(),
         mode='episode_truncate', ratio_max=3.)
     torch.testing.assert_close(actual, torch.full((4,), 3., dtype=torch.float64))
 
@@ -38,7 +38,7 @@ def test_mismatch_weight_is_detached_and_separate_from_policy_clipping():
             'old_log_prob': torch.tensor([0., math.log(.1)]), 'sampling_weight': weights}
     objective = GrpoObjective(ent_coef=0., old_log_prob_key='training_log_prob',
                               sampling_weight_key='sampling_weight')
-    loss, metrics = objective(objective_data=data, group_id=torch.zeros(2, dtype=torch.long), head_step_ids=fixture_head_steps(data),  predictions=logits)
+    loss, metrics = objective(objective_data=data, sequence_ids=torch.zeros(2, dtype=torch.long), step_ids=fixture_head_steps(data),  predictions=logits)
     assert loss['grpo'].item() == pytest.approx(-6.)
     assert metrics['clipfrac'] == 0.
     loss['grpo'].backward()
@@ -51,4 +51,4 @@ def test_corrected_objective_requires_frozen_probabilities():
     objective = GrpoObjective(old_log_prob_key='training_log_prob', sampling_weight_key='sampling_weight')
     data = {'action': torch.tensor([0, 0]), 'advantage': torch.ones(2), 'sampling_weight': torch.ones(2)}
     with pytest.raises(KeyError, match='frozen training'):
-        objective(objective_data=data, group_id=torch.zeros(2, dtype=torch.long), head_step_ids=fixture_head_steps(data),  predictions=torch.zeros(2, 2))
+        objective(objective_data=data, sequence_ids=torch.zeros(2, dtype=torch.long), step_ids=fixture_head_steps(data),  predictions=torch.zeros(2, 2))

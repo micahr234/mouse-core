@@ -72,7 +72,7 @@ def test_fields_are_independent_ordered_and_keep_backend_identity_in_prefixes_an
     assert inputs['tokenizer_names'] == ('actions', 'text')
     assert inputs['tokenizer_ids'] is not None
     assert inputs['tokenizer_ids'].tolist() == [1, 1, 1, 0, 1, 1]
-    assert inputs["head_token_mask"].nonzero(as_tuple=True)[0].tolist() == [2, 5]
+    assert inputs["head_mask"].nonzero(as_tuple=True)[0].tolist() == [2, 5]
     continuing, continuing_objective_data = tok.pack_rows(rows=[_events().events[1:]])
     assert continuing['tokenizer_ids'] is not None
     assert continuing['tokenizer_ids'].tolist() == [0, 1, 1]
@@ -81,11 +81,11 @@ def test_fields_are_independent_ordered_and_keep_backend_identity_in_prefixes_an
     with DataLoader(stores=_events().to_store(), events_budget=3,
                     transform=deepcopy(tok).encode, sample_field='episode_index', num_workers=0, seed=0) as loader:
         loaded, labels = loader.next_batch()
-        group_id = labels["step_sequence_ids"]
+        sequence_ids = labels["sequence_ids"]
     np.testing.assert_array_equal(loaded['tokenizer_ids'], inputs['tokenizer_ids'])
     assert loaded['tokenizer_names'] == inputs['tokenizer_names']
     assert (~torch.isnan(labels["action"])).tolist() == [False, True]
-    assert group_id.tolist() == [0, 0]
+    assert sequence_ids.tolist() == [0, 0]
 
 
 def test_colliding_token_ids_use_independent_tables_and_gradients():
@@ -256,7 +256,7 @@ def test_named_embeddings_match_cached_and_packed_backbone_readouts():
     inputs, inputs_objective_data = tok.pack_rows(rows=[_events()])
     with torch.no_grad():
         features = backbone(_embed(embedding, inputs), sequence_ids=inputs['sequence_ids'])
-        expected = features[inputs["head_token_mask"].nonzero(as_tuple=True)[0]]
+        expected = features[inputs["head_mask"].nonzero(as_tuple=True)[0]]
         cache = None
         actual = []
         try:
@@ -264,7 +264,7 @@ def test_named_embeddings_match_cached_and_packed_backbone_readouts():
                 tokens, tokens_objective_data = tok.pack_rows(rows=[events])
                 t = tokens
                 embeds, lengths, heads, _ = prepare_decode(embeds=_embed(embedding, tokens), tokens=tokens,
-                    sequence_ids=t['sequence_ids'], head_token_mask=t["head_token_mask"])
+                    sequence_ids=t['sequence_ids'], head_mask=t["head_mask"])
                 if cache is None:
                     cache = backbone.decode_session(batch_size=1)
                 decoded = backbone(embeds, cache=cache, lengths=lengths)

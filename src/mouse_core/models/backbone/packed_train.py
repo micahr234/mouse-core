@@ -2,11 +2,11 @@
 
 :func:`packed_forward` runs a full (uncached) forward over the flat
 concatenated token stream ``embeds [L, D]``. Attention is causal within
-one ``group_id`` (one dataloader sample)::
+one sequence (one dataloader sample), identified by ``sequence_ids``::
 
     allowed(q, k) = k <= q and sequence_ids[k] == sequence_ids[q]
 
-Groups are equality classes of ``group_id``, not necessarily
+Groups are equality classes of ``sequence_ids``, not necessarily
 contiguous runs: an id that recurs later in the stream attends back to
 its earlier occurrence and continues its RoPE counter. The stream is
 stably regrouped so every class is one contiguous packed segment
@@ -68,7 +68,7 @@ _flex_kernels: dict[tuple[str, int | None], _FlexKernel] = {}
 
 @dataclass(frozen=True)
 class _PackingPlan:
-    """Stable regrouping of a flat stream by ``group_id``.
+    """Stable regrouping of a flat stream by ``sequence_ids``.
 
     Packed token ``i`` is original token ``order[i]``;
     ``original = packed[inverse]``. ``sequence_ids`` identify the packed

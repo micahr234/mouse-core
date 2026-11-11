@@ -210,7 +210,7 @@ def test_dataloader_same_seed_field_on_two_sequences_uses_two_seeds() -> None:
         transform=EventTransform(encode=compose(stages=(augmenter, _stamp_grouping, partial(encode_measurement, _tokenizer(objective_fields=_obj("action"))))), decode=measurement_replay),
     )
     inputs, obj = loader.next_batch()
-    group_id = obj["step_sequence_ids"]
+    sequence_ids = obj["sequence_ids"]
     actions = obj["action"]
 
     def _expected(*, generation: int) -> int:
@@ -221,8 +221,8 @@ def test_dataloader_same_seed_field_on_two_sequences_uses_two_seeds() -> None:
 
     gen0 = _sequence_generation(batch_index=0, sequence_index=0, stride=stride)
     gen1 = _sequence_generation(batch_index=0, sequence_index=1, stride=stride)
-    seq0 = [int(actions[i]) for i in range(len(actions)) if int(group_id[i]) == 0]
-    seq1 = [int(actions[i]) for i in range(len(actions)) if int(group_id[i]) == 1]
+    seq0 = [int(actions[i]) for i in range(len(actions)) if int(sequence_ids[i]) == 0]
+    seq1 = [int(actions[i]) for i in range(len(actions)) if int(sequence_ids[i]) == 1]
     assert seq0
     assert seq1
     assert all(a == _expected(generation=gen0) for a in seq0)
@@ -284,15 +284,15 @@ def _tb_signature(
     packed: tuple[TensorDict, dict[str, torch.Tensor]],
 ) -> tuple:
     tb, obj = packed
-    group_id = obj["step_sequence_ids"]
+    sequence_ids = obj["sequence_ids"]
     return (
         tb["num_sequences"],
         tb["token_ids"].shape[0],
-        obj["step_sequence_ids"].shape[0],
+        obj["sequence_ids"].shape[0],
         tuple(tb['numeric_mask'].tolist()),
         tuple(tb['token_ids'].tolist()),
         tuple(np.asarray(obj["action"].detach().cpu().numpy()).tolist()),
-        tuple(group_id.tolist()),
+        tuple(sequence_ids.tolist()),
     )
 
 
@@ -459,7 +459,7 @@ def test_dataloader_keeps_a_short_sample_and_packs_another_copy() -> None:
         stores=store,
     )
     tb, obj = loader.next_batch()
-    assert list(torch.bincount(obj["step_sequence_ids"], minlength=tb["num_sequences"])) == [3, 3]
+    assert list(torch.bincount(obj["sequence_ids"], minlength=tb["num_sequences"])) == [3, 3]
     actions = [int(a) for a in obj["action"]]
     assert actions == [1, 2, 3, 1, 2, 3]
 
@@ -469,7 +469,7 @@ def test_dataloader_allows_short_stores() -> None:
     append_measurement(store, fields={"action": 7, "reward": 1.0, "repeat_episode_done": 0, "episode_done": 0})
     loader = _loader(events_budget=4, num_workers=0, stores=store)
     tb, obj = loader.next_batch()
-    assert int(torch.bincount(obj["step_sequence_ids"], minlength=tb["num_sequences"])[0]) == 1
+    assert int(torch.bincount(obj["sequence_ids"], minlength=tb["num_sequences"])[0]) == 1
     assert int(obj["action"][0]) == 7
 
 
@@ -482,7 +482,7 @@ def test_dataloader_allows_empty_stores_until_sampling() -> None:
         append_measurement(store, fields={"action": 1, "reward": 0.0, "repeat_episode_done": 0, "episode_done": 0})
         loader.refresh()
         tb, obj = loader.next_batch()
-        assert int(torch.bincount(obj["step_sequence_ids"], minlength=tb["num_sequences"])[0]) == 1
+        assert int(torch.bincount(obj["sequence_ids"], minlength=tb["num_sequences"])[0]) == 1
     finally:
         loader.close()
 
@@ -502,15 +502,15 @@ def test_dataloader_transform_returns_token_batch() -> None:
     try:
         tb, obj = loader.next_batch()
         assert tb["num_sequences"] == 6
-        assert int(torch.bincount(obj["step_sequence_ids"], minlength=tb["num_sequences"]).sum()) == obj["step_sequence_ids"].shape[0]
-        assert obj["step_sequence_ids"].shape[0] == 6
-        assert all(int(n) == 1 for n in torch.bincount(obj["step_sequence_ids"], minlength=tb["num_sequences"]))
+        assert int(torch.bincount(obj["sequence_ids"], minlength=tb["num_sequences"]).sum()) == obj["sequence_ids"].shape[0]
+        assert obj["sequence_ids"].shape[0] == 6
+        assert all(int(n) == 1 for n in torch.bincount(obj["sequence_ids"], minlength=tb["num_sequences"]))
         embeds = embed_batch(embedding, tb)
-        head_token_ids = tb.to(embeds.device)["head_token_mask"].nonzero(as_tuple=True)[0]
+        head_token_ids = tb.to(embeds.device)["head_mask"].nonzero(as_tuple=True)[0]
         assert embeds.shape == (tb["token_ids"].shape[0], 8)
-        assert head_token_ids.shape == (obj["step_sequence_ids"].shape[0],)
+        assert head_token_ids.shape == (obj["sequence_ids"].shape[0],)
         assert "group_id" not in obj.keys()
-        assert obj["step_sequence_ids"].tolist() == [0, 1, 2, 3, 4, 5]
+        assert obj["sequence_ids"].tolist() == [0, 1, 2, 3, 4, 5]
     finally:
         loader.close()
 
@@ -553,10 +553,10 @@ def _sequences(loader: DataLoader, n: int) -> list[list[list[tuple[int, int]]]]:
     batches: list[list[list[tuple[int, int]]]] = []
     for _ in range(n):
         inputs, obj = loader.next_batch()
-        group_id = obj["step_sequence_ids"]
+        sequence_ids = obj["sequence_ids"]
         by_seq: dict[int, list[tuple[int, int]]] = {}
         for seq_id, store_index, sample_id in zip(
-            group_id, obj["store_index"], obj["sample_id"], strict=True
+            sequence_ids, obj["store_index"], obj["sample_id"], strict=True
         ):
             by_seq.setdefault(int(seq_id), []).append((int(store_index), int(sample_id)))
         batches.append([rows for _, rows in sorted(by_seq.items())])
@@ -618,10 +618,10 @@ def test_dataloader_samples_uniformly_over_runs() -> None:
     short_first = 0
     for _ in range(80):
         inputs, obj = loader.next_batch()
-        group_id = obj["step_sequence_ids"]
+        sequence_ids = obj["sequence_ids"]
         first = [
             int(index)
-            for index, seq in zip(obj["store_index"], group_id, strict=True)
+            for index, seq in zip(obj["store_index"], sequence_ids, strict=True)
             if int(seq) == 0
         ]
         if len(first) == 20:
@@ -682,7 +682,7 @@ def test_dataloader_events_budget_leaves_out_a_run_that_does_not_fit() -> None:
         stores=store,
     )
     tb, obj = loader.next_batch()
-    assert list(torch.bincount(obj["step_sequence_ids"], minlength=tb["num_sequences"])) == [3]
+    assert list(torch.bincount(obj["sequence_ids"], minlength=tb["num_sequences"])) == [3]
 
 
 def test_dataloader_first_sample_over_budget_raises() -> None:
@@ -737,7 +737,7 @@ def test_dataloader_events_budget_keeps_whole_runs() -> None:
     tb, obj = loader.next_batch()
     assert tb["num_sequences"] == 3
     assert tb["token_ids"].shape[0] == 12
-    _assert_whole_segments(tb, obj, obj["step_sequence_ids"], steps_per_segment=4)
+    _assert_whole_segments(tb, obj, obj["sequence_ids"], steps_per_segment=4)
 
 
 def _episode_store(*, n_episodes: int, steps: int) -> Datastore:
@@ -761,19 +761,19 @@ def _episode_store(*, n_episodes: int, steps: int) -> Datastore:
 def _assert_whole_segments(
     tb: TensorDict,
     obj: dict[str, torch.Tensor],
-    group_id: torch.Tensor,
+    sequence_ids: torch.Tensor,
     *,
     steps_per_segment: int,
 ) -> None:
     """Each sequence is one full episode and ends on ``episode_done``."""
     assert tb["num_sequences"] >= 1
     assert "group_id" not in obj.keys()
-    seq = [int(x) for x in group_id]
+    seq = [int(x) for x in sequence_ids]
     expected: list[int] = []
     for b in range(tb["num_sequences"]):
         expected.extend([b] * steps_per_segment)
     assert seq == expected
-    assert [int(c) for c in torch.bincount(obj["step_sequence_ids"], minlength=tb["num_sequences"])] == [steps_per_segment] * tb["num_sequences"]
+    assert [int(c) for c in torch.bincount(obj["sequence_ids"], minlength=tb["num_sequences"])] == [steps_per_segment] * tb["num_sequences"]
     indices = [int(x) for x in obj["store_index"]]
     dones = [int(x) for x in obj["episode_done"]]
     for b in range(tb["num_sequences"]):
@@ -803,7 +803,7 @@ def test_dataloader_token_budget_fills_the_batch_with_segments() -> None:
     tb, obj = loader.next_batch()
     assert tb["num_sequences"] == 2
     assert tb["token_ids"].shape[0] == 4
-    _assert_whole_segments(tb, obj, obj["step_sequence_ids"], steps_per_segment=2)
+    _assert_whole_segments(tb, obj, obj["sequence_ids"], steps_per_segment=2)
 
     short = _loader(
         token_budget=5,
@@ -818,7 +818,7 @@ def test_dataloader_token_budget_fills_the_batch_with_segments() -> None:
     # Each episode is 2 tokens. Two fit in 5; the third does not, so it is left out.
     assert tb["num_sequences"] == 2
     assert tb["token_ids"].shape[0] == 4
-    _assert_whole_segments(tb, obj, obj["step_sequence_ids"], steps_per_segment=2)
+    _assert_whole_segments(tb, obj, obj["sequence_ids"], steps_per_segment=2)
 
     two = _loader(
         token_budget=8,
@@ -832,7 +832,7 @@ def test_dataloader_token_budget_fills_the_batch_with_segments() -> None:
     tb, obj = two.next_batch()
     assert tb["num_sequences"] == 4
     assert tb["token_ids"].shape[0] == 8
-    _assert_whole_segments(tb, obj, obj["step_sequence_ids"], steps_per_segment=2)
+    _assert_whole_segments(tb, obj, obj["sequence_ids"], steps_per_segment=2)
 
 
 def test_dataloader_token_budget_does_not_split_a_segment() -> None:
@@ -854,11 +854,11 @@ def test_dataloader_token_budget_does_not_split_a_segment() -> None:
     )
     tb, obj = loader.next_batch()
     assert tb["num_sequences"] == 1
-    _assert_whole_segments(tb, obj, obj["step_sequence_ids"], steps_per_segment=2)
+    _assert_whole_segments(tb, obj, obj["sequence_ids"], steps_per_segment=2)
     token_seq = [int(x) for x in tb['sequence_ids']]
     assert token_seq == [0, 0, 0]
     assert tb["token_ids"].shape[0] == 3
-    step_positions = {int(i) for i in tb["head_token_mask"].nonzero(as_tuple=True)[0]}
+    step_positions = {int(i) for i in tb["head_mask"].nonzero(as_tuple=True)[0]}
     prefix_ids = [sid for i, sid in enumerate(token_seq) if i not in step_positions]
     assert prefix_ids == [0]
 

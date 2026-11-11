@@ -89,9 +89,9 @@ class AutoregressiveReasoner(nn.Module):
             numeric_field_ids=tensors["numeric_field_ids"], numeric_field_names=tokens['numeric_field_names'],
             position_values=tensors["position_values"], position_mask=tensors["position_mask"],
         )
-        starts = torch.searchsorted(tokens['sequence_ids'], tokens['sequence_ids'][tokens["head_token_mask"].nonzero(as_tuple=True)[0]])
+        starts = torch.searchsorted(tokens['sequence_ids'], tokens['sequence_ids'][tokens["head_mask"].nonzero(as_tuple=True)[0]])
         return [embeds[int(start):int(end) + 1]
-                for start, end in zip(starts, tokens["head_token_mask"].nonzero(as_tuple=True)[0], strict=True)]
+                for start, end in zip(starts, tokens["head_mask"].nonzero(as_tuple=True)[0], strict=True)]
 
     @staticmethod
     def _embed_generated(ids: Sequence[int], embedding: MultiEmbedding, tokenizer_name: str) -> torch.Tensor:
@@ -127,7 +127,7 @@ class AutoregressiveReasoner(nn.Module):
             raise ValueError("Reasoning tokenizer must be one of the existing embedding tables")
         table = embedding.embeddings[tokenizer_name]
         end_token_ids = self.end_token_ids(end_token_id=end_token_id, vocab_size=cast(int, table.vocab_size))
-        if not len(tokens["head_token_mask"].nonzero(as_tuple=True)[0]):
+        if not len(tokens["head_mask"].nonzero(as_tuple=True)[0]):
             return []
         with _evaluating(embedding, backbone, self.token_head):
             prefixes = self._prefixes(tokens, embedding)
@@ -186,7 +186,7 @@ class AutoregressiveReasoner(nn.Module):
                 if cache is not None:
                     cache.close()
         return [ReasoningTrace(int(head), tuple(ids), ids[-1])
-                for head, ids in zip(tokens["head_token_mask"].nonzero(as_tuple=True)[0], generated, strict=True)]
+                for head, ids in zip(tokens["head_mask"].nonzero(as_tuple=True)[0], generated, strict=True)]
 
     def forward(
         self, tokens: TensorDict, traces: Sequence[ReasoningTrace], *,
@@ -200,7 +200,7 @@ class AutoregressiveReasoner(nn.Module):
         uses the value token before any samples, so it is independent of them.
         Prefix numeric/position features and tokenizer routing are preserved.
         """
-        if not traces or [t.head_token_id for t in traces] != tokens["head_token_mask"].nonzero(as_tuple=True)[0].tolist():
+        if not traces or [t.head_token_id for t in traces] != tokens["head_mask"].nonzero(as_tuple=True)[0].tolist():
             raise ValueError("Traces must match all head-token positions in order")
         if not 0 < temperature < float("inf"):
             raise ValueError("temperature must be finite and positive")

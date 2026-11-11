@@ -8,7 +8,7 @@ from mouse_core.data import Augmenter, EventLog, EpochDataLoader, StepTokens, co
 
 def transform(row):
     return StepTokens(token_ids=np.array([1]), numeric_values=np.array([0.]),
-                      numeric_mask=np.array([False]), head_token_mask=np.array([True]),
+                      numeric_mask=np.array([False]), head_mask=np.array([True]),
                       objective_fields={'branch': row['branch']})
 
 
@@ -36,7 +36,7 @@ def test_every_branch_once_per_epoch_and_final_batch_retained(workers):
     seen = []
     while not loader.exhausted:
         inputs, data = loader.next_batch()
-        groups = data["step_sequence_ids"]
+        groups = data["sequence_ids"]
         for group in groups.unique_consecutive():
             branch = data['branch'][groups == group]
             assert len(branch.unique()) == 1
@@ -72,7 +72,7 @@ def test_epoch_workers_support_augmentation_and_match_in_process_results():
         while not loaders[0].exhausted:
             left, right = [loader.next_batch() for loader in loaders]
             assert left[1]['branch'].tolist() == right[1]['branch'].tolist()
-            assert left[1]["step_sequence_ids"].tolist() == right[1]["step_sequence_ids"].tolist()
+            assert left[1]["sequence_ids"].tolist() == right[1]["sequence_ids"].tolist()
     finally:
         for loader in loaders:
             loader.close()

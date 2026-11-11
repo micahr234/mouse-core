@@ -38,11 +38,11 @@ def test_every_event_emits_independently_and_steps_follow_only_markers():
     tok = make_tokenizer()
     event = {'provider': 'sensor', 'payload': {'value': 2}}
     assert tok(event)['token_ids'].tolist() == [2]
-    assert tok(event)['head_token_mask'].all()
+    assert tok(event)['head_mask'].all()
     assert tok({'provider': 'control', 'payload': None})['token_ids'].size == 0
     steps = tok.encode(recorded())
     assert [step.token_ids.tolist() for step in steps] == [[1], [1, 2], [1, 2, 3]] * 2
-    assert all(step.head_token_mask.all() for step in steps)
+    assert all(step.head_mask.all() for step in steps)
 
 
 def test_stream_buffers_a_partial_step_and_tokenizes_each_event_once():
@@ -101,7 +101,7 @@ def test_empty_input_step_has_no_readout_and_defaults_are_step_local():
     first, last = tok.encode(log)
     assert first.objective_fields == {'label': 2, 'action': 1, 'step_index': 0}
     assert last.token_ids.tolist() == []
-    assert not last.head_token_mask.any()
+    assert not last.head_mask.any()
     assert last.objective_fields == {'label': -1, 'action': None, 'step_index': 1}
 
 
@@ -110,7 +110,7 @@ def test_training_requires_labels_but_inference_does_not():
     with pytest.raises(KeyError, match='label'):
         tok.encode(recorded())
     packed, packed_objective_data = tok.pack_rows(rows=[recorded(), []])
-    assert packed_objective_data["step_sequence_ids"].shape[0] == 6
+    assert packed_objective_data["sequence_ids"].shape[0] == 6
     assert packed["num_sequences"] == 2
 
 
@@ -171,7 +171,7 @@ def test_loader_samples_exact_whole_step_windows(kind):
     try:
         for _ in range(2):
             inputs, labels = loader.next_batch()
-            groups = labels["step_sequence_ids"]
+            groups = labels["sequence_ids"]
             for group in groups.unique_consecutive():
                 mask = groups == group
                 indices = labels['step_index'][mask].tolist()
@@ -275,4 +275,4 @@ def test_event_prefix_and_readouts_match_full_and_cached_packing():
     first, first_objective_data = tok.pack_rows(rows=[events[:1]])
     rest, rest_objective_data = tok.pack_rows(rows=[events[1:]])
     assert full['token_ids'].tolist() == first['token_ids'].tolist() + rest['token_ids'].tolist() == [8, 1, 9, 2, 9, 3, 9]
-    assert full_objective_data["head_step_ids"].tolist() == [0, 1, 2]
+    assert full_objective_data["step_ids"].tolist() == [0, 1, 2]

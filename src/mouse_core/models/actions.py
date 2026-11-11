@@ -26,7 +26,7 @@ def action_readouts(
     selected = selected.astype(np.int64)
     if selected.size and (selected.min() < 0 or selected.max() >= inputs["num_sequences"]):
         raise ValueError("sequence_ids must identify sequences in the input batch")
-    head_sequences = inputs["sequence_ids"][inputs["head_token_mask"]]
+    head_sequences = inputs["sequence_ids"][inputs["head_mask"]]
     counts = torch.bincount(head_sequences, minlength=inputs["num_sequences"])
     selected = torch.as_tensor(selected, device=counts.device)
     if bool((counts[selected] == 0).any()):

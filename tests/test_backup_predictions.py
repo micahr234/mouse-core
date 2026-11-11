@@ -28,7 +28,7 @@ def test_backup_heads_choose_and_evaluate_independently_of_online_predictions(te
     data = {"action": torch.tensor([float("nan"), 0., 0.]), "reward": torch.zeros(3),
             "terminated": torch.tensor([False, False, True]), "truncated": torch.zeros(3, dtype=torch.bool)}
     losses, metrics = _objective(temperature)(
-        objective_data=data, group_id=torch.zeros(3, dtype=torch.int64), head_step_ids=torch.arange(3),
+        objective_data=data, sequence_ids=torch.zeros(3, dtype=torch.int64), step_ids=torch.arange(3),
         predictions=online, backup_value_predictions=values,
         backup_action_predictions=actions,
     )
@@ -52,4 +52,4 @@ def test_backup_inputs_validate_shape_and_dtype(name, bad):
     inputs = {"backup_value_predictions": torch.zeros(2, 2), "backup_action_predictions": torch.zeros(2, 2)}
     inputs[name] = bad
     with pytest.raises((TypeError, ValueError), match=name):
-        _objective()(objective_data=_data(), group_id=torch.zeros(2, dtype=torch.int64), head_step_ids=fixture_head_steps(_data()),  predictions=torch.zeros(2, 2), **inputs)
+        _objective()(objective_data=_data(), sequence_ids=torch.zeros(2, dtype=torch.int64), step_ids=fixture_head_steps(_data()),  predictions=torch.zeros(2, 2), **inputs)

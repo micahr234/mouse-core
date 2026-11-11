@@ -61,7 +61,7 @@ def test_constant_compute_and_readout_share_filter_and_stream_matches_encode():
               for i, payload in enumerate([{'action_requested': True}, {}, {'action_requested': True}])]
     steps = tok.encode(events)
     assert [s.token_ids.tolist() for s in steps] == [[32, 46, 32, 46, 10], [], [32, 46, 32, 46, 10]]
-    assert steps[0].head_token_mask.tolist() == [False] * 4 + [True]
+    assert steps[0].head_mask.tolist() == [False] * 4 + [True]
     stream = tok.stream()
     streamed = [step for event in events if (step := stream.push(event)) is not None] + [stream.flush()]
     for a, b in zip(steps, streamed):
@@ -69,7 +69,7 @@ def test_constant_compute_and_readout_share_filter_and_stream_matches_encode():
         np.testing.assert_array_equal(a.token_ids, b.token_ids)
     inputs, objectives = tok.pack_rows(rows=[events])
     assert inputs['token_ids'].tolist() == [32, 46, 32, 46, 10] * 2
-    assert objectives['head_step_ids'].tolist() == [0, 2]
+    assert objectives['step_ids'].tolist() == [0, 2]
 
 
 def test_multifield_wildcard_functions_roundtrip(tmp_path):
@@ -219,4 +219,4 @@ def test_format_functions_survive_loader_worker_serialization(workers):
         chunks = [rendered[index:index+5] for index in range(0, len(rendered), 5)]
         assert len(chunks) == 4
         assert all(chunk in {'A:2.5', 'B:2.5', 'C:2.5', 'D:2.5'} for chunk in chunks)
-        assert inputs['head_token_mask'].all()
+        assert inputs['head_mask'].all()

@@ -131,6 +131,6 @@ def test_tokenizer_full_matches_per_step_concat() -> None:
     assert np.array_equal(full['token_ids'], cat['token_ids'])
     assert np.allclose(full['numeric_values'], cat['numeric_values'])
     assert np.array_equal(full['sequence_ids'], cat['sequence_ids'])
-    assert np.array_equal(full["head_token_mask"].nonzero(as_tuple=True)[0], cat["head_token_mask"].nonzero(as_tuple=True)[0])
+    assert np.array_equal(full["head_mask"].nonzero(as_tuple=True)[0], cat["head_mask"].nonzero(as_tuple=True)[0])
     for key in ("action", "observation", "reward", "repeat_episode_done", "episode_done"):
         assert torch.equal(full_obj[key], cat_obj[key])

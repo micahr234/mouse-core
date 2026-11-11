@@ -55,13 +55,13 @@ def test_special_tokens_sparse_steps_and_roundtrip(tmp_path):
     assert tok.tokenizers['default'].decode([special], skip_special_tokens=True) == ''
     for source in (episode(), episode().to_dataset()):
         steps = tok.encode(source)
-        assert [int(step.head_token_mask.sum()) for step in steps] == [1, 0, 0, 1, 0]
+        assert [int(step.head_mask.sum()) for step in steps] == [1, 0, 0, 1, 0]
         packed, labels = pack_token_batch(steps=steps)
-        groups = labels["step_sequence_ids"]
-        assert labels["step_sequence_ids"].shape[0] == 5 and packed["head_token_mask"].nonzero(as_tuple=True)[0].shape[0] == 2
-        assert labels["head_step_ids"].tolist() == [0, 3]
-        assert torch.bincount(labels["step_sequence_ids"], minlength=packed["num_sequences"]).tolist() == [5]
-        assert packed['token_ids'][packed["head_token_mask"].nonzero(as_tuple=True)[0]].tolist() == [special, special]
+        groups = labels["sequence_ids"]
+        assert labels["sequence_ids"].shape[0] == 5 and packed["head_mask"].nonzero(as_tuple=True)[0].shape[0] == 2
+        assert labels["step_ids"].tolist() == [0, 3]
+        assert torch.bincount(labels["sequence_ids"], minlength=packed["num_sequences"]).tolist() == [5]
+        assert packed['token_ids'][packed["head_mask"].nonzero(as_tuple=True)[0]].tolist() == [special, special]
         assert packed['token_ids'].tolist().count(4) == 1  # episode prompt
         assert labels['reward'].tolist() == [0., 2., 3., 0., 7.]
         assert groups.tolist() == [0] * 5
@@ -78,11 +78,11 @@ def test_special_tokens_sparse_steps_and_roundtrip(tmp_path):
 
 def test_rewards_flow_through_steps_without_readouts():
     packed, labels = pack_token_batch(steps=tokenizer().encode(episode()))
-    groups = labels["step_sequence_ids"]
+    groups = labels["sequence_ids"]
     q = torch.tensor([[1., 0.], [4., 0.]], requires_grad=True)
     discount = boundary_discount(gamma_step=.5, gamma_terminated=0., gamma_truncated=0.)
     dqn = DqnObjective(discount=discount, reward=None, value=None, temperature=0., gate=None)
-    loss, metrics = dqn(objective_data=labels, group_id=groups, head_step_ids=labels["head_step_ids"],  predictions=q,
+    loss, metrics = dqn(objective_data=labels, sequence_ids=groups, step_ids=labels["step_ids"],  predictions=q,
                         backup_value_predictions=q.detach(), backup_action_predictions=q.detach())
     # 2 + .5 * 3 + .5**3 * 4; final decision receives the terminal reward.
     torch.testing.assert_close(metrics['backup'], torch.tensor([4., 7.]))
@@ -90,15 +90,15 @@ def test_rewards_flow_through_steps_without_readouts():
     loss['action_value'].backward()
     assert q.grad is not None and (q.grad[:, 0] != 0).all()
     values = torch.tensor([1., 4.], requires_grad=True)
-    logits = torch.zeros(packed["head_token_mask"].nonzero(as_tuple=True)[0].shape[0], 2, requires_grad=True)
+    logits = torch.zeros(packed["head_mask"].nonzero(as_tuple=True)[0].shape[0], 2, requires_grad=True)
     ppo = PpoObjective(discount=discount, reward=None, value=None, gae_lambda=0.,
                         normalize_advantage=False)
-    loss, metrics = ppo(objective_data=labels, group_id=groups, head_step_ids=labels["head_step_ids"],  predictions=logits, value_predictions=values)
+    loss, metrics = ppo(objective_data=labels, sequence_ids=groups, step_ids=labels["step_ids"],  predictions=logits, value_predictions=values)
     assert metrics['value_loss'] == pytest.approx(9.)
     loss['ppo'].backward()
     assert values.grad is not None and (values.grad != 0).all()
     grpo = GrpoObjective(clip_ratio_min=.8, clip_ratio_max=1.2)
-    losses, _ = grpo(objective_data=labels, group_id=groups, head_step_ids=labels["head_step_ids"],  predictions=torch.zeros(2, 2, requires_grad=True))
+    losses, _ = grpo(objective_data=labels, sequence_ids=groups, step_ids=labels["step_ids"],  predictions=torch.zeros(2, 2, requires_grad=True))
     assert all(torch.isfinite(value) for value in losses.values())
 
 
@@ -107,7 +107,7 @@ def test_cached_layout_keeps_passive_tokens_without_inventing_readouts():
     tokens, tokens_objective_data = pack_token_batch(steps=[*steps, *steps[1:3]], sequence_ids=[0]*5+[1]*2)
     tensors = tokens
     padded, lengths, ids, valid = prepare_decode(embeds=torch.ones(tokens["token_ids"].shape[0], 3), tokens=tokens,
-        sequence_ids=tensors['sequence_ids'], head_token_mask=tensors["head_token_mask"])
+        sequence_ids=tensors['sequence_ids'], head_mask=tensors["head_mask"])
     assert padded.shape[0] == 2 and min(lengths) > 0
     assert ids.shape == (2, 2) and valid.tolist() == [[True, True], [False, False]]
     for seed in range(10):
@@ -116,7 +116,7 @@ def test_cached_layout_keeps_passive_tokens_without_inventing_readouts():
     passive, passive_objective_data = pack_token_batch(steps=steps[1:3])
     t = passive
     _, lengths, ids, valid = prepare_decode(embeds=torch.ones(passive["token_ids"].shape[0], 3), tokens=passive,
-        sequence_ids=t['sequence_ids'], head_token_mask=t["head_token_mask"])
+        sequence_ids=t['sequence_ids'], head_mask=t["head_mask"])
     assert lengths == [passive["token_ids"].shape[0]] and ids.shape == valid.shape == (1, 0)
 
 
@@ -143,7 +143,7 @@ def test_explicit_provider_fields_keep_order_and_episode_prompt_once():
     log.event(provider='sensor', episode_index=0, step_index=1, payload={'value': 3})
     packed, packed_objective_data = tok.pack_rows(rows=[log])
     assert packed['token_ids'].tolist() == [4, 2, 1, 1]
-    assert packed_objective_data["head_step_ids"].tolist() == [0]
+    assert packed_objective_data["step_ids"].tolist() == [0]
     first, first_objective_data = tok.pack_rows(rows=[log[:3]])
     rest, rest_objective_data = tok.pack_rows(rows=[log[3:]])
     assert packed['token_ids'].tolist() == first['token_ids'].tolist() + rest['token_ids'].tolist()
@@ -187,11 +187,11 @@ def test_passive_only_step_window_has_no_prediction_loss():
         log.event(provider='environment', episode_index=0, step_index=step, payload={'reward': 1.})
     steps = tokenizer().encode(log)
     inputs, labels = pack_token_batch(steps=steps)
-    groups = labels["step_sequence_ids"]
+    groups = labels["sequence_ids"]
     q = torch.empty(0, 2, requires_grad=True)
     objective = DqnObjective(discount=boundary_discount(gamma_step=.5, gamma_terminated=0., gamma_truncated=0.),
         reward=None, value=None, temperature=0., gate=None)
-    losses, metrics = objective(objective_data=labels, group_id=groups, head_step_ids=labels["head_step_ids"],  predictions=q,
+    losses, metrics = objective(objective_data=labels, sequence_ids=groups, step_ids=labels["step_ids"],  predictions=q,
         backup_value_predictions=q.detach(), backup_action_predictions=q.detach())
     assert isinstance(metrics['backup'], torch.Tensor)
     assert losses['action_value'].item() == 0 and metrics['backup'].numel() == 0
@@ -254,4 +254,4 @@ def test_existing_action_marker_does_not_extend_vocabulary():
     assert len(hf) == size and tok.special_token_ids == {}
     event = {'provider': 'environment', 'payload': {'action_requested': True}}
     assert tok(event)['token_ids'].tolist() == [2]
-    assert tok(event)['head_token_mask'].tolist() == [True]
+    assert tok(event)['head_mask'].tolist() == [True]

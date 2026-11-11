@@ -44,7 +44,7 @@ def _require_done_flags(
 
 
 def _head_output_layout(
-    head_step_ids: torch.Tensor,
+    step_ids: torch.Tensor,
     *,
     N: int,
     P: int,
@@ -57,15 +57,15 @@ def _head_output_layout(
     Return each prediction's step and each step's last prediction row. A step
     without a prediction uses sentinel P, selecting the padding row below.
     """
-    if head_step_ids.dtype != torch.int64:
-        raise TypeError("head_step_ids must be int64.")
-    if head_step_ids.shape != (P,):
-        raise ValueError(f"head_step_ids must have shape [{P}] matching prediction rows.")
-    step_of = head_step_ids.to(device=device)
+    if step_ids.dtype != torch.int64:
+        raise TypeError("step_ids must be int64.")
+    if step_ids.shape != (P,):
+        raise ValueError(f"step_ids must have shape [{P}] matching prediction rows.")
+    step_of = step_ids.to(device=device)
     if bool(((step_of < 0) | (step_of >= N)).any()):
-        raise ValueError("head_step_ids must identify steps in [0, N).")
+        raise ValueError("step_ids must identify steps in [0, N).")
     if bool((step_of[1:] < step_of[:-1]).any()):
-        raise ValueError("head_step_ids must be in step order.")
+        raise ValueError("step_ids must be in step order.")
     counts = torch.bincount(step_of, minlength=N)
     last_rows = torch.where(counts > 0, counts.cumsum(0) - 1, P)
     return step_of, last_rows
@@ -77,9 +77,9 @@ def _step_predictions(predictions: torch.Tensor, last_rows: torch.Tensor) -> tor
     return torch.cat([predictions, padding], dim=0)[last_rows]
 
 
-def _expand_policy_readouts(objective_data, predictions, *, head_step_ids, n_steps, who):
+def _expand_policy_readouts(objective_data, predictions, *, step_ids, n_steps, who):
     step_of, last_rows = _head_output_layout(
-        head_step_ids, N=n_steps, P=predictions.shape[0], device=predictions.device,
+        step_ids, N=n_steps, P=predictions.shape[0], device=predictions.device,
     )
     if bool((step_of[1:] == step_of[:-1]).any()):
         raise ValueError(f"{who} expects at most one prediction row per step")
@@ -87,35 +87,35 @@ def _expand_policy_readouts(objective_data, predictions, *, head_step_ids, n_ste
             last_rows < predictions.shape[0])
 
 
-def _validate_request_actions(readout, executed, group_id):
-    if bool(((group_id[:-1] == group_id[1:]) & executed[1:] & ~readout[:-1]).any()):
+def _validate_request_actions(readout, executed, sequence_ids):
+    if bool(((sequence_ids[:-1] == sequence_ids[1:]) & executed[1:] & ~readout[:-1]).any()):
         raise ValueError("An executed action requires a readout on its preceding step")
 
 
 
 def _pair_weight(
     *,
-    group_id: torch.Tensor,
+    sequence_ids: torch.Tensor,
     N: int,
     device: torch.device | str | None,
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """``[N-1]`` weights: ``1.0`` when ``(i, i+1)`` share a sample, else ``0.0``.
 
-    A sample is one ``group_id``. The dataloader gives each sample it
-    keeps in a batch a distinct id, so a group change is the sample
-    boundary. ``group_id`` is int64 ``[N]``, one id per step, passed
+    A sample shares one value in ``sequence_ids``. The dataloader gives each sample it
+    keeps in a batch a distinct id, so a sequence ID change is the sample
+    boundary. ``sequence_ids`` is int64 ``[N]``, one id per step, passed
     beside ``objective_data``. ``N < 2`` raises.
     """
     if device is None:
         device = torch.device("cpu")
     if N < 2:
         raise ValueError(f"pair weight needs at least 2 steps, got {N}.")
-    if group_id.shape != torch.Size([N]):
+    if sequence_ids.shape != torch.Size([N]):
         raise ValueError(
-            f"group_id must have shape [{N}], got {tuple(group_id.shape)}."
+            f"sequence_ids must have shape [{N}], got {tuple(sequence_ids.shape)}."
         )
-    same_run = group_id[1:] == group_id[:-1]
+    same_run = sequence_ids[1:] == sequence_ids[:-1]
     return same_run.to(device=device, dtype=dtype)
 
 
@@ -533,7 +533,7 @@ class DqnObjective(Objective[...]):
     """Bellman TD(λ) objective with a delayed target network.
 
     Instantiate with hyperparameters, then call with
-    ``objective_data=``, ``group_id=`` (int64 ``[N]``, one id per step,
+    ``objective_data=``, ``sequence_ids=`` (int64 ``[N]``, one id per step,
     returned beside ``objective_data``), the online Q tensor as ``predictions=``, the
     backup value Q tensor as ``backup_value_predictions=``, and action-selection
     Q scores as ``backup_action_predictions=``. Backup tensors have shape ``[P, A]``.
@@ -563,7 +563,7 @@ class DqnObjective(Objective[...]):
     Q rows are **per head-output token** (``[P, A]``), not per step: a step may
     own several head-output tokens (tokenizer input field flagged
     ``head_output=True`` emitting more than one token). The
-    ``head_step_ids`` mapping already carried by ``TensorDict`` maps rows to
+    ``step_ids`` mapping already carried by ``TensorDict`` maps rows to
     steps, so the loss can align predictions with per-step labels. Every
     head-output row of step ``i`` trains toward the *same* TD target; the
     bootstrap reads the *last* head-output row of step ``i+1`` (the most
@@ -576,7 +576,7 @@ class DqnObjective(Objective[...]):
     one-step targets still bootstrap from the next component. Repeated output
     tokens within one row are readouts of the SAME decision, not components.
 
-    A **run** is one ``group_id`` (one dataloader sample). Neighbor
+    A **run** shares one value in ``sequence_ids`` (one dataloader sample). Neighbor
     reads (action / reward / done / next Q at ``i+1``) must stay in-run: an
     out-of-run pair still has a loss term, but it is multiplied by ``0`` so
     output ``i`` does not affect the scalar loss or the gradient. A group's
@@ -584,7 +584,7 @@ class DqnObjective(Objective[...]):
     are when that group is the whole batch: a backup never reads another
     group's reward or value. If every
     weight is ``0`` the loss is ``0``. A step whose ``terminated`` or
-    ``truncated`` flag is set is still in-run when ``group_id`` does not
+    ``truncated`` flag is set is still in-run when the value in ``sequence_ids`` does not
     change, and may train. Gamma is the Bellman discount from those flags
     at ``i+1`` inside a same-run pair — it is not a run mask.
 
@@ -774,8 +774,8 @@ class DqnObjective(Objective[...]):
         self,
         *,
         objective_data: dict[str, torch.Tensor],
-        group_id: torch.Tensor,
-        head_step_ids: torch.Tensor,
+        sequence_ids: torch.Tensor,
+        step_ids: torch.Tensor,
         predictions: torch.Tensor,
         backup_value_predictions: torch.Tensor,
         backup_action_predictions: torch.Tensor,
@@ -786,8 +786,8 @@ class DqnObjective(Objective[...]):
         self,
         *,
         objective_data: dict[str, torch.Tensor],
-        group_id: torch.Tensor,
-        head_step_ids: torch.Tensor,
+        sequence_ids: torch.Tensor,
+        step_ids: torch.Tensor,
         predictions: torch.Tensor,
         backup_value_predictions: torch.Tensor,
         backup_action_predictions: torch.Tensor,
@@ -801,8 +801,8 @@ class DqnObjective(Objective[...]):
         self,
         *,
         objective_data: dict[str, torch.Tensor],
-        group_id: torch.Tensor,
-        head_step_ids: torch.Tensor,
+        sequence_ids: torch.Tensor,
+        step_ids: torch.Tensor,
         predictions: torch.Tensor,
         backup_value_predictions: torch.Tensor | None = None,
         backup_action_predictions: torch.Tensor | None = None,
@@ -884,7 +884,7 @@ class DqnObjective(Objective[...]):
         # toward the same target, and the bootstrap reads step i+1's *last*
         # head-output row.
         step_of, last_rows = _head_output_layout(
-            head_step_ids, N=N, P=P, device=device
+            step_ids, N=N, P=P, device=device
         )
         q = _apply_value(
             transform=self.value,
@@ -909,7 +909,7 @@ class DqnObjective(Objective[...]):
         )
 
         pair_weight = _pair_weight(
-            group_id=group_id,
+            sequence_ids=sequence_ids,
             N=N,
             device=device,
             dtype=value_dtype,
@@ -937,7 +937,7 @@ class DqnObjective(Objective[...]):
         # reset. Keep the observation in the history, but never fit or maximize
         # its Q row. A backup passes through the automatic transition instead.
         readout = last_rows < P
-        _validate_request_actions(readout, executed, group_id)
+        _validate_request_actions(readout, executed, sequence_ids)
         automatic = torch.cat([~executed[1:] & (pair_weight > 0), executed.new_zeros(1)]) | ~readout
         online_mask = automatic[step_of].reshape((P,) + (1,) * (q.ndim - 1))
         backup_mask = automatic[step_of].reshape((P,) + (1,) * (q_target.ndim - 1))

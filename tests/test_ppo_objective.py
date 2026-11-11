@@ -36,13 +36,13 @@ class _PpoCall:
         self.objective = objective
 
     def __call__(self, *, objective_data: dict[str, torch.Tensor], predictions: dict[str, torch.Tensor]):
-        group_id = objective_data["group_id"] if "group_id" in objective_data else torch.zeros(
+        sequence_ids = objective_data["sequence_ids"] if "sequence_ids" in objective_data else torch.zeros(
             int(objective_data["action"].shape[0]), dtype=torch.int64
         )
-        data = {key: value for key, value in objective_data.items() if key != "group_id"}
+        data = {key: value for key, value in objective_data.items() if key != "sequence_ids"}
         return self.objective(
             objective_data=data,
-            group_id=group_id, head_step_ids=fixture_head_steps(data),
+            sequence_ids=sequence_ids, step_ids=fixture_head_steps(data),
             predictions=predictions["action"],
             value_predictions=predictions["value"],
         )
@@ -58,14 +58,14 @@ def _ppo(**overrides: object) -> _PpoCall:
     return _PpoCall(PpoObjective(**kwargs))  # type: ignore[arg-type]
 
 
-def _ppo_batch(*, n: int=8, a: int=3, with_old_log_prob: bool=True, group_id: list[int] | None=None) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+def _ppo_batch(*, n: int=8, a: int=3, with_old_log_prob: bool=True, sequence_ids: list[int] | None=None) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     action = torch.randint(0, a, (n,))
     reward = torch.randn(n)
     terminated = torch.zeros(n, dtype=torch.long)
     truncated = torch.zeros(n, dtype=torch.long)
-    data: dict[str, torch.Tensor] = {'action': action, 'reward': reward, 'terminated': terminated, 'truncated': truncated, 'group_id': torch.tensor(group_id if group_id is not None else [0] * (n // 2) + [1] * (n - n // 2))}
+    data: dict[str, torch.Tensor] = {'action': action, 'reward': reward, 'terminated': terminated, 'truncated': truncated, 'sequence_ids': torch.tensor(sequence_ids if sequence_ids is not None else [0] * (n // 2) + [1] * (n - n // 2))}
     ends = torch.ones(n, dtype=torch.bool)
-    ends[:-1] = data['group_id'][:-1] != data['group_id'][1:]
+    ends[:-1] = data['sequence_ids'][:-1] != data['sequence_ids'][1:]
     data['terminated'][ends] = 1
     if with_old_log_prob:
         data['old_log_prob'] = torch.randn(n)
@@ -116,13 +116,13 @@ def test_ppo_objective_closed_form_single_transition() -> None:
     assert abs(metrics['value_loss'] - 9.0) < 0.001
 
 def test_ppo_objective_skips_transitions_across_sequences() -> None:
-    objective_data = {'action': torch.tensor([0, 0, 0]), 'reward': torch.tensor([0.0, 1.0, 5.0]), 'terminated': torch.tensor([0, 0, 0]), 'truncated': torch.tensor([0, 0, 0]), 'old_log_prob': torch.tensor([0.0, 0.0, 0.0]), 'group_id': torch.tensor([0, 1, 1])}
+    objective_data = {'action': torch.tensor([0, 0, 0]), 'reward': torch.tensor([0.0, 1.0, 5.0]), 'terminated': torch.tensor([0, 0, 0]), 'truncated': torch.tensor([0, 0, 0]), 'old_log_prob': torch.tensor([0.0, 0.0, 0.0]), 'sequence_ids': torch.tensor([0, 1, 1])}
     predictions = {'action': torch.tensor([[20.0, -20.0], [20.0, -20.0], [20.0, -20.0]]), 'value': torch.tensor([[0.0], [2.0], [0.0]])}
     loss, _ = _ppo(discount=_disc(gamma_step=0.0), gae_lambda=1.0, vf_coef=1.0, ent_coef=0.0, normalize_advantage=False)(objective_data=objective_data, predictions=predictions)
     assert abs(loss["ppo"].item() - 6.0) < 0.001
 
 def test_ppo_objective_all_out_of_run_pairs_yield_zero_loss() -> None:
-    objective_data = {'action': torch.tensor([0, 1, 0]), 'reward': torch.tensor([0.0, 1.0, 5.0]), 'terminated': torch.tensor([0, 0, 0]), 'truncated': torch.tensor([0, 0, 0]), 'group_id': torch.tensor([0, 1, 2])}
+    objective_data = {'action': torch.tensor([0, 1, 0]), 'reward': torch.tensor([0.0, 1.0, 5.0]), 'terminated': torch.tensor([0, 0, 0]), 'truncated': torch.tensor([0, 0, 0]), 'sequence_ids': torch.tensor([0, 1, 2])}
     predictions = {'action': torch.zeros(3, 2), 'value': torch.zeros(3, 1)}
     loss, metrics = _ppo()(objective_data=objective_data, predictions=predictions)
     assert abs(loss["ppo"].item()) < 1e-05
@@ -152,7 +152,7 @@ def test_sample_discrete_action_shapes() -> None:
 def test_ppo_rejects_multi_head_output_rows(counts) -> None:
     objective_data, predictions = _ppo_batch(n=4)
     objective_data["readout_counts"] = torch.tensor(counts)
-    with pytest.raises(ValueError, match="one prediction row per step|head_step_ids must have shape"):
+    with pytest.raises(ValueError, match="one prediction row per step|step_ids must have shape"):
         _ppo()(objective_data=objective_data, predictions=predictions)
 
 

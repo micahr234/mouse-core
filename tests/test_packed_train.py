@@ -108,10 +108,10 @@ def test_packing_plan_invariants(device: str, L: int) -> None:
     assert torch.equal(plan.order[plan.inverse], arange)
     packed_seq = seq[plan.order]
     assert torch.equal(plan.sequence_ids, packed_seq)
-    for sequence_id in seq.unique():
-        selected = plan.sequence_ids == sequence_id
+    for sequence_ids in seq.unique():
+        selected = plan.sequence_ids == sequence_ids
         # Original order is preserved within each sequence, including recurring IDs.
-        assert torch.equal(plan.order[selected], torch.where(seq == sequence_id)[0])
+        assert torch.equal(plan.order[selected], torch.where(seq == sequence_ids)[0])
         assert torch.equal(plan.position_ids[selected], torch.arange(selected.sum(), device=device))
     assert torch.equal(
         plan.position_ids[plan.inverse], packed_rope_positions(sequence_ids=seq)
@@ -672,16 +672,16 @@ def test_flex_kernel_is_forward_only_on_cpu(no_compiled_decoder: None) -> None:
 # ---- Model integration -------------------------------------------------------------
 
 
-def test_prepare_group_id_col_matches_step_counts() -> None:
+def test_prepare_sequence_id_col_matches_step_counts() -> None:
     batch = [[{"action": s % 4, "reward": float(s)} for s in range(5)], [{"action": 1, "reward": 0.0}, {"action": 2, "reward": 1.0}, {"action": 3, "reward": 2.0}]]
     tb, objective_data = batch_to_packed(token_tokenizer("action"), batch)
-    group_id = objective_data["step_sequence_ids"]
-    assert list(torch.bincount(objective_data["step_sequence_ids"], minlength=tb["num_sequences"])) == [5, 3]
+    sequence_ids = objective_data["sequence_ids"]
+    assert list(torch.bincount(objective_data["sequence_ids"], minlength=tb["num_sequences"])) == [5, 3]
     assert "group_id" not in objective_data.keys()
-    assert group_id.tolist() == [0, 0, 0, 0, 0, 1, 1, 1]
-    assert tb["head_token_mask"].nonzero(as_tuple=True)[0].shape == (8,)
-    assert list(tb['sequence_ids'][tb["head_token_mask"].nonzero(as_tuple=True)[0]]).count(0) == 5
-    assert list(tb['sequence_ids'][tb["head_token_mask"].nonzero(as_tuple=True)[0]]).count(1) == 3
+    assert sequence_ids.tolist() == [0, 0, 0, 0, 0, 1, 1, 1]
+    assert tb["head_mask"].nonzero(as_tuple=True)[0].shape == (8,)
+    assert list(tb['sequence_ids'][tb["head_mask"].nonzero(as_tuple=True)[0]]).count(0) == 5
+    assert list(tb['sequence_ids'][tb["head_mask"].nonzero(as_tuple=True)[0]]).count(1) == 3
 
 
 @pytest.mark.parametrize('device', _DEVICES)
@@ -701,8 +701,8 @@ def test_model_forward_isolates_sequences(no_compiled_decoder: None, device: str
     q1 = preds1['action_value']
     assert torch.allclose(q0[3:], q1[3:], atol=1e-05, rtol=1e-05)
     assert not torch.allclose(q0[:3], q1[:3], atol=1e-05, rtol=1e-05)
-    assert int(tb["head_token_mask"].sum()) == 6
-    assert list(tb['sequence_ids'][tb["head_token_mask"].nonzero(as_tuple=True)[0]]) == [0, 0, 0, 1, 1, 1]
+    assert int(tb["head_mask"].sum()) == 6
+    assert list(tb['sequence_ids'][tb["head_mask"].nonzero(as_tuple=True)[0]]) == [0, 0, 0, 1, 1, 1]
 
 
 def test_model_train_isolates_samples_as_sequences(no_compiled_decoder: None) -> None:

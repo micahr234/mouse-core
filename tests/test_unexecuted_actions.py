@@ -36,16 +36,16 @@ def tensor_metric(metrics: dict[str, float | torch.Tensor], name: str) -> torch.
 
 
 def call_objective(algorithm: str, batch: dict[str, torch.Tensor], predictions: torch.Tensor):
-    group_id = torch.zeros(predictions.shape[0], dtype=torch.int64)
+    sequence_ids = torch.zeros(predictions.shape[0], dtype=torch.int64)
     if algorithm == 'dqn':
-        return objective()(objective_data=batch, group_id=group_id, head_step_ids=fixture_head_steps(batch),  predictions=predictions,
+        return objective()(objective_data=batch, sequence_ids=sequence_ids, step_ids=fixture_head_steps(batch),  predictions=predictions,
                            backup_value_predictions=predictions, backup_action_predictions=predictions)
     if algorithm == 'grpo':
-        return GrpoObjective()(objective_data=batch, group_id=group_id, head_step_ids=fixture_head_steps(batch),  predictions=predictions)
+        return GrpoObjective()(objective_data=batch, sequence_ids=sequence_ids, step_ids=fixture_head_steps(batch),  predictions=predictions)
     return PpoObjective(
         discount=boundary_discount(gamma_step=.9, gamma_terminated=0., gamma_truncated=0.),
         reward=None, value=None,
-    )(objective_data=batch, group_id=group_id, head_step_ids=fixture_head_steps(batch),  predictions=predictions,
+    )(objective_data=batch, sequence_ids=sequence_ids, step_ids=fixture_head_steps(batch),  predictions=predictions,
       value_predictions=torch.arange(predictions.shape[0], dtype=torch.float32, requires_grad=True))
 
 
@@ -56,7 +56,7 @@ def test_dead_actions_and_dead_q_cannot_change_dqn(gate):
     batch = data()
     q = torch.tensor([[1., 2.], [float('nan')]*2, [3., 4.], [5., 6.], [9., 10.]], requires_grad=True)
     target = torch.tensor([[1., 2.], [float('nan')]*2, [4., 5.], [5., 6.], [9., 10.]])
-    losses, metrics = objective(gate)(objective_data=batch, group_id=torch.zeros(5,dtype=torch.long), head_step_ids=fixture_head_steps(batch),
+    losses, metrics = objective(gate)(objective_data=batch, sequence_ids=torch.zeros(5,dtype=torch.long), step_ids=fixture_head_steps(batch),
         predictions=q, backup_value_predictions=target, backup_action_predictions=target)
     assert torch.isfinite(losses['action_value'])
     assert tensor_metric(metrics, 'backup_weight').tolist() == [1., 0., 1., 1., 0.]
@@ -65,7 +65,7 @@ def test_dead_actions_and_dead_q_cannot_change_dqn(gate):
     assert torch.isfinite(q.grad).all()
     assert q.grad[1].count_nonzero() == 0
     changed = {**batch, 'action': batch['action'].clone()}
-    other, other_metrics = objective(gate)(objective_data=changed, group_id=torch.zeros(5,dtype=torch.long), head_step_ids=fixture_head_steps(changed),
+    other, other_metrics = objective(gate)(objective_data=changed, sequence_ids=torch.zeros(5,dtype=torch.long), step_ids=fixture_head_steps(changed),
         predictions=q.detach().nan_to_num(12345.), backup_value_predictions=target.nan_to_num(-999.),
         backup_action_predictions=target.nan_to_num(999.))
     torch.testing.assert_close(losses['action_value'], other['action_value'])
@@ -97,7 +97,7 @@ def test_policy_loss_ignores_invalid_ids_nan_logits_and_stale_reset_logprobs(pol
 def test_mask_does_not_allow_invalid_executed_actions():
     batch = data(); batch['action'][1] = 999
     with pytest.raises(ValueError, match='action ids'):
-        objective()(objective_data=batch,group_id=torch.zeros(5,dtype=torch.long), head_step_ids=fixture_head_steps(batch),
+        objective()(objective_data=batch,sequence_ids=torch.zeros(5,dtype=torch.long), step_ids=fixture_head_steps(batch),
             predictions=torch.zeros(5,2),backup_value_predictions=torch.zeros(5,2),backup_action_predictions=torch.zeros(5,2))
 
 
@@ -106,12 +106,12 @@ def test_automatic_transitions_never_cross_episodes_and_multi_readouts_match():
     joined = {k:torch.cat([v,v]) for k,v in batch.items()}
     q = torch.arange(10,dtype=torch.float32).reshape(5,2)
     obj=objective(nstep_gate(n=20))
-    _,single=obj(objective_data=batch,group_id=torch.zeros(5,dtype=torch.long), head_step_ids=fixture_head_steps(batch),
+    _,single=obj(objective_data=batch,sequence_ids=torch.zeros(5,dtype=torch.long), step_ids=fixture_head_steps(batch),
         predictions=q,backup_value_predictions=q,backup_action_predictions=q)
     q2=torch.cat([q,q+1000])
     joined['readout_counts']=torch.full((10,),2,dtype=torch.long)
     q2=q2.repeat_interleave(2,dim=0)
-    _,combined=obj(objective_data=joined,group_id=torch.tensor([0]*5+[1]*5), head_step_ids=fixture_head_steps(joined),
+    _,combined=obj(objective_data=joined,sequence_ids=torch.tensor([0]*5+[1]*5), step_ids=fixture_head_steps(joined),
         predictions=q2,backup_value_predictions=q2,backup_action_predictions=q2)
     torch.testing.assert_close(tensor_metric(combined, 'backup')[:10],
                                tensor_metric(single, 'backup').repeat_interleave(2))

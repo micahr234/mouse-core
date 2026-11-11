@@ -52,17 +52,17 @@ def test_flat_sequence_causal_mask_allows_earlier_tokens_in_the_same_sequence() 
     assert mask[0, 0, 0, 2] < 0.0
 
 
-def test_model_forward_injects_group_id_and_runs_flat() -> None:
+def test_model_forward_injects_sequence_id_and_runs_flat() -> None:
     backbone = IdentityBackbone(hidden_dim=8)
     model = simple_model(backbone=backbone, heads=({'action_value': (head := MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0))}), reasoner=None)
     batch = [[{'action': i % 4} for i in range(3)], [{'action': 1}, {'action': 2}]]
     tb, objective_data = batch_to_packed(token_tokenizer('action'), batch)
-    group_id = objective_data["step_sequence_ids"]
+    sequence_ids = objective_data["sequence_ids"]
     predictions = model(tb)["predictions"]
     assert 'group_id' not in objective_data.keys()
-    assert group_id.tolist() == [0, 0, 0, 1, 1]
+    assert sequence_ids.tolist() == [0, 0, 0, 1, 1]
     assert predictions['action_value'].shape == (5, 4)
-    assert objective_data["step_sequence_ids"].shape[0] == 5
-    assert list(torch.bincount(objective_data["step_sequence_ids"], minlength=tb["num_sequences"])) == [3, 2]
+    assert objective_data["sequence_ids"].shape[0] == 5
+    assert list(torch.bincount(objective_data["sequence_ids"], minlength=tb["num_sequences"])) == [3, 2]
     preds2 = model(tb)["predictions"]
     assert preds2['action_value'].shape == (5, 4)

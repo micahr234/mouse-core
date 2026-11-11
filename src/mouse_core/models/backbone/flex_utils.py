@@ -102,7 +102,7 @@ def flex_block_mask(
 def packed_rope_positions(*, sequence_ids: torch.Tensor) -> torch.Tensor:
     """RoPE position of every token in a flat packed stream ``[L]``.
 
-    Position = number of earlier tokens with the same ``group_id``.
+    Position = number of earlier tokens with the same value in ``sequence_ids``.
     This is the counting rule cached decode uses and the same neighbourhood
     the attention masks allow (causal within one group, regardless of
     contiguity), so a sequence id that recurs after another id continues

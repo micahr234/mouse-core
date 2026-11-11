@@ -39,21 +39,21 @@ def test_offline_tokenizer_adds_fixed_compute_before_each_value_without_extra_re
     for before, after in zip(baseline, sampled):
         delta = len(after.token_ids) - len(before.token_ids)
         assert after.objective_fields == before.objective_fields
-        assert after.head_token_mask.sum() == before.head_token_mask.sum()
-        if before.head_token_mask.any():
+        assert after.head_mask.sum() == before.head_mask.sum()
+        if before.head_mask.any():
             count = delta // 2
             assert count == 3 and delta == 6
             np.testing.assert_array_equal(
                 after.token_ids[-delta - 1 : -1], [32, 46] * count
             )
-            assert after.token_ids[-1] == 10 and after.head_token_mask[-1]
+            assert after.token_ids[-1] == 10 and after.head_mask[-1]
         else:
             np.testing.assert_array_equal(after.token_ids, before.token_ids)
     assert [len(s.token_ids) for s in compute.encode(source)] == [
         len(s.token_ids) for s in sampled
     ]
     _, data = pack_token_batch(steps=sampled)
-    assert data["head_step_ids"].tolist() == list(range(15))
+    assert data["step_ids"].tolist() == list(range(15))
 
 
 def test_saved_constant_compute_reconstructs_identical_text_without_callbacks(tmp_path):
@@ -114,7 +114,7 @@ def test_offline_dqn_update_backpropagates_into_compute_positions():
     finally:
         hook.remove()
     assert torch.isfinite(loss)
-    last_compute = inputs["head_token_mask"].nonzero(as_tuple=True)[0] - 1
+    last_compute = inputs["head_mask"].nonzero(as_tuple=True)[0] - 1
     assert embeddings[0].grad is not None
     assert embeddings[0].grad[last_compute].abs().sum() > 0
     assert all(p.grad is None for p in ns["delayed_encoder"].parameters())
@@ -140,39 +140,12 @@ def _compute_notebook_setup(filename, backend, **overrides):
             continue
         for node in ast.parse("".join(cell["source"])).body:
             if isinstance(node, ast.Assign) and any(
-                isinstance(target, ast.Name) and target.id in {"compute_text", "compute_token_ids"}
+                isinstance(target, ast.Name) and target.id == "compute_text"
                 for target in node.targets
-            ):
-                body.append(node)
-            elif isinstance(node, ast.If) and "compute_token_ids" in ast.unparse(
-                node.test
-            ):
-                body.append(node)
-            elif (
-                isinstance(node, ast.For)
-                and isinstance(node.target, ast.Name)
-                and node.target.id == "compute_count"
             ):
                 body.append(node)
     exec(compile(ast.Module(body=body, type_ignores=[]), filename, "exec"), namespace)
     return namespace
-
-
-@pytest.mark.parametrize("filename", [NOTEBOOK.name, "15_inference.ipynb"])
-def test_compute_setup_rejects_merging_or_multitoken_markers(filename):
-    class MergingBackend:
-        def encode(self, text, **kwargs):
-            return [13] if text else []
-
-    with pytest.raises(ValueError, match="exact token count"):
-        _compute_notebook_setup(filename, MergingBackend())
-
-    class MultitokenBackend:
-        def encode(self, text, **kwargs):
-            return [32, 46] if text else []
-
-    with pytest.raises(ValueError, match="exactly one token"):
-        _compute_notebook_setup(filename, MultitokenBackend())
 
 
 def test_qwen_compute_text_has_exact_configured_token_counts():
@@ -186,8 +159,7 @@ def test_qwen_compute_text_has_exact_configured_token_counts():
         )
     except OSError:
         pytest.skip("Qwen tokenizer is not cached locally")
-    namespace = _compute_notebook_setup(NOTEBOOK.name, backend)
-    (token,) = namespace["compute_token_ids"]
+    (token,) = backend.encode(" .", add_special_tokens=False)
     assert token == 659
     for count in (0, 1, 3, 10):
         tok = Tokenizer(tokenizers={"text": backend}, input_fields=[
@@ -196,7 +168,7 @@ def test_qwen_compute_text_has_exact_configured_token_counts():
         ])
         piece = tok(dict(provider="environment", payload={"action_requested": True}))
         assert piece["token_ids"].tolist() == [token] * count + backend.encode("\n", add_special_tokens=False)
-        assert piece["head_token_mask"].tolist() == [False] * count + [True]
+        assert piece["head_mask"].tolist() == [False] * count + [True]
     inference = _compute_notebook_setup("15_inference.ipynb", backend)
     assert backend.encode(inference["compute_text"], add_special_tokens=False) == [token] * 3
     assert len(backend.encode("." * 10, add_special_tokens=False)) == 1

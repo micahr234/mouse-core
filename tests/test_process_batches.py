@@ -16,7 +16,7 @@ def _batch(index, length=3):
     step = StepTokens(
         token_ids=np.full(length, index, dtype=np.int64),
         numeric_values=np.zeros(length), numeric_mask=np.zeros(length, dtype=bool),
-        head_token_mask=np.arange(length) == length - 1,
+        head_mask=np.arange(length) == length - 1,
         objective_fields={"vector": np.arange(length, dtype=np.float32)},
     )
     return pack_token_batch(steps=[step])

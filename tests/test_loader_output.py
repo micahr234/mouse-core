@@ -37,22 +37,22 @@ def test_example_next_batch_keeps_complete_samples_and_aligned_labels(window, au
     with DataLoader(stores=log.to_store(), token_budget=2100,
                     sample_ranges=sample_ranges, transform=transform, num_workers=0, seed=7) as loader:
         inputs, objective_data = loader.next_batch()
-        group_id = objective_data["step_sequence_ids"]
+        sequence_ids = objective_data["sequence_ids"]
     assert inputs["num_sequences"] >= 2
-    assert objective_data["step_sequence_ids"].shape[0] == inputs["num_sequences"] * expected_size
+    assert objective_data["sequence_ids"].shape[0] == inputs["num_sequences"] * expected_size
     assert inputs["token_ids"].shape[0] <= 2100
-    assert group_id.dtype == torch.int64
-    assert group_id.shape == (objective_data["step_sequence_ids"].shape[0],)
-    np.testing.assert_array_equal(group_id.numpy(), objective_data["step_sequence_ids"])
+    assert sequence_ids.dtype == torch.int64
+    assert sequence_ids.shape == (objective_data["sequence_ids"].shape[0],)
+    np.testing.assert_array_equal(sequence_ids.numpy(), objective_data["sequence_ids"])
     for key, values in objective_data.items():
-        if key == "head_step_ids":
-            assert len(values) == int(inputs["head_token_mask"].sum())
+        if key == "step_ids":
+            assert len(values) == int(inputs["head_mask"].sum())
             continue
-        assert values.shape[0] == objective_data["step_sequence_ids"].shape[0] and values.device.type == 'cpu'
+        assert values.shape[0] == objective_data["sequence_ids"].shape[0] and values.device.type == 'cpu'
     assert 'group_id' not in objective_data
-    assert bool((inputs['token_ids'][inputs["head_token_mask"].nonzero(as_tuple=True)[0]] == ord('\n')).all())
-    np.testing.assert_array_equal(inputs['sequence_ids'][inputs["head_token_mask"].nonzero(as_tuple=True)[0]],
-                                  group_id[objective_data["head_step_ids"]].numpy())
+    assert bool((inputs['token_ids'][inputs["head_mask"].nonzero(as_tuple=True)[0]] == ord('\n')).all())
+    np.testing.assert_array_equal(inputs['sequence_ids'][inputs["head_mask"].nonzero(as_tuple=True)[0]],
+                                  sequence_ids[objective_data["step_ids"]].numpy())
     for group in range(inputs["num_sequences"]):
         start = group * expected_size
         indices = (list(range(5)) if augment else
@@ -60,8 +60,8 @@ def test_example_next_batch_keeps_complete_samples_and_aligned_labels(window, au
         assert len(indices) == expected_size
         assert indices == list(range(indices[0], indices[0] + expected_size))
         expected_heads = [start + local for local, index in enumerate(indices) if index in (0, 1, 3)]
-        actual_heads = objective_data["head_step_ids"][(objective_data["head_step_ids"] >= start) &
-                                           (objective_data["head_step_ids"] < start + expected_size)]
+        actual_heads = objective_data["step_ids"][(objective_data["step_ids"] >= start) &
+                                           (objective_data["step_ids"] < start + expected_size)]
         np.testing.assert_array_equal(actual_heads, expected_heads)
         assert (~torch.isnan(objective_data["action"]))[start:start + expected_size].tolist() == [
             index in (1, 2, 4) for index in indices]

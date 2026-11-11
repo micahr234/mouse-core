@@ -57,7 +57,7 @@ class ExampleModel(Model):
         numeric_values = tensors["numeric_values"]
         numeric_mask = tensors["numeric_mask"]
         sequence_ids = tensors["sequence_ids"]
-        head_token_ids = tensors["head_token_mask"].nonzero(as_tuple=True)[0]
+        head_token_ids = tensors["head_mask"].nonzero(as_tuple=True)[0]
         embed = self.embedding(
             token_ids, numeric_values=numeric_values, numeric_mask=numeric_mask,
             numeric_field_ids=tensors["numeric_field_ids"], numeric_field_names=batch['numeric_field_names'],
@@ -76,7 +76,7 @@ class ExampleModel(Model):
         if use_cache:
             embed, lengths, head_token_ids, head_valid_mask = prepare_decode(
                 embeds=embed, tokens=batch, sequence_ids=sequence_ids,
-                head_token_mask=tensors["head_token_mask"],
+                head_mask=tensors["head_mask"],
             )
             if cache is None:
                 cache = DecodeCache(sessions=(self.backbone.decode_session(batch_size=batch["num_sequences"]),))

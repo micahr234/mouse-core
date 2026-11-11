@@ -26,7 +26,7 @@ class _EncodeOneTokenPerEvent:
             token_ids=np.array([generation + event["source_offset"]]),
             numeric_values=np.zeros(1),
             numeric_mask=np.zeros(1, dtype=bool),
-            head_token_mask=np.ones(1, dtype=bool),
+            head_mask=np.ones(1, dtype=bool),
             objective_fields={"source_offset": event["source_offset"]},
         ) for event in events]
 
@@ -53,10 +53,10 @@ def test_event_budget_shortcut_preserves_sampling_and_generations(budget):
             DataLoader(**options, token_budget=budget, transform=token_transform) as tokens:
         for _ in range(4):
             event_batch, event_data = events.next_batch()
-            event_groups = event_data["step_sequence_ids"]
+            event_groups = event_data["sequence_ids"]
             token_batch, token_data = tokens.next_batch()
-            token_groups = token_data["step_sequence_ids"]
-            for field in ("token_ids", "sequence_ids", "head_token_mask", "numeric_values", "numeric_mask"):
+            token_groups = token_data["sequence_ids"]
+            for field in ("token_ids", "sequence_ids", "head_mask", "numeric_values", "numeric_mask"):
                 np.testing.assert_array_equal(event_batch[field], token_batch[field])
             assert torch.equal(event_groups, token_groups)
             assert torch.equal(event_data["source_offset"], token_data["source_offset"])

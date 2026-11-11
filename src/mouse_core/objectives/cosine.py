@@ -147,14 +147,14 @@ class CosineObjective(Objective[...]):
         objective_data: dict[str, torch.Tensor],
         predictions: torch.Tensor,
         targets: torch.Tensor,
-        group_id: torch.Tensor,
-        head_step_ids: torch.Tensor,
+        sequence_ids: torch.Tensor,
+        step_ids: torch.Tensor,
         transition: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
         reset_key: str | None,
     ) -> tuple[dict[str, torch.Tensor], dict[str, float | torch.Tensor]]:
         """Predict the next encoding from each current encoding and incoming action.
 
-        Encodings are ``[P, D]`` readouts aligned by ``head_step_ids`` to
+        Encodings are ``[P, D]`` readouts aligned by ``step_ids`` to
         ``N`` steps, with zero or one readout per step. With
         ``batched_heads=True``, predictions are ``[P, K, D]`` and targets
         may be shared ``[P, D]`` or per-head ``[P, K, D]``. The transition
@@ -191,8 +191,8 @@ class CosineObjective(Objective[...]):
             raise TypeError("predictions and targets must be floating-point encodings.")
         if predictions.device != targets.device:
             raise ValueError("predictions and targets must share a device.")
-        predictions, _, readout = _expand_policy_readouts(objective_data, predictions, head_step_ids=head_step_ids, n_steps=group_id.numel(), who="Cosine")
-        targets, _, _ = _expand_policy_readouts(objective_data, targets, head_step_ids=head_step_ids, n_steps=group_id.numel(), who="Cosine")
+        predictions, _, readout = _expand_policy_readouts(objective_data, predictions, step_ids=step_ids, n_steps=sequence_ids.numel(), who="Cosine")
+        targets, _, _ = _expand_policy_readouts(objective_data, targets, step_ids=step_ids, n_steps=sequence_ids.numel(), who="Cosine")
         n = predictions.shape[0]
 
         def column(name: str, value: torch.Tensor) -> torch.Tensor:
@@ -200,10 +200,10 @@ class CosineObjective(Objective[...]):
                 raise ValueError(f"{name} must have shape [N] on the encodings device.")
             return value
 
-        groups = column("group_id", group_id)
+        groups = column("sequence_ids", sequence_ids)
         actions = column("action", objective_data["action"])
         if groups.dtype != torch.int64:
-            raise TypeError("group_id must be int64.")
+            raise TypeError("sequence_ids must be int64.")
         terminated = column("terminated", objective_data["terminated"]).bool()
         truncated = column("truncated", objective_data["truncated"]).bool()
         valid = (groups[:-1] == groups[1:]) & ~terminated[:-1] & ~truncated[:-1]

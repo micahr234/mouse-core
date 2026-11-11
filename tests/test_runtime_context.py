@@ -65,7 +65,7 @@ def store():
 
 def assert_count(batch, count):
     inputs, labels = batch
-    heads = inputs["head_token_mask"].nonzero(as_tuple=True)[0].tolist()
+    heads = inputs["head_mask"].nonzero(as_tuple=True)[0].tolist()
     assert heads
     starts = [0] + [head + 1 for head in heads[:-1]]
     assert [end - start for start, end in zip(starts, heads)] == [count] * len(heads)
@@ -96,7 +96,7 @@ def test_context_is_separate_from_payload_and_reaches_all_tokenizer_entry_points
     )
     packed, labels = tok.pack_rows(rows=[source], context=context)
     assert packed["token_ids"].tolist() == expected * 2
-    assert set(labels.keys()) == {"step_sequence_ids", "head_step_ids"}
+    assert set(labels.keys()) == {"sequence_ids", "step_ids"}
     stream = tok.stream(context=context)
     assert stream.push(source[0]) is None
     completed = stream.push(source[1])

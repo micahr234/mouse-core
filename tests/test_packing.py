@@ -22,7 +22,7 @@ def test_prepare_decode_pads_ragged_rows_and_keeps_every_marked_head() -> None:
     embeds = torch.arange(1., 7.).unsqueeze(-1).requires_grad_()
     padded, lengths, head_ids, valid = prepare_decode(
         embeds=embeds, tokens=tokens, sequence_ids=tensors["sequence_ids"],
-        head_token_mask=tensors["head_token_mask"],
+        head_mask=tensors["head_mask"],
     )
     assert lengths == [4, 0, 2]
     assert padded.squeeze(-1).tolist() == [[1., 2., 3., 4.], [0., 0., 0., 0.], [0., 0., 5., 6.]]
@@ -40,5 +40,5 @@ def test_prepare_decode_rejects_an_entirely_idle_batch() -> None:
     with pytest.raises(ValueError, match="at least one non-empty row"):
         prepare_decode(
             embeds=torch.empty(0, 4), tokens=tokens, sequence_ids=tensors["sequence_ids"],
-            head_token_mask=tensors["head_token_mask"],
+            head_mask=tensors["head_mask"],
         )

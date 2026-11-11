@@ -83,7 +83,7 @@ class StepTokens:
     token_ids: np.ndarray  # [T] vocabulary rows
     numeric_values: np.ndarray  # [T] scaled values; zero for nonnumeric tokens
     numeric_mask: np.ndarray  # [T] bool
-    head_token_mask: np.ndarray  # [T] bool
+    head_mask: np.ndarray  # [T] bool
     objective_fields: dict[str, Any] = field(default_factory=dict)
     tokenizer_ids: np.ndarray | None = None
     numeric_field_ids: np.ndarray | None = None
@@ -102,7 +102,7 @@ class StepTokens:
         self.tokenizer_names = tuple(self.tokenizer_names)
         self.tokenizer_ids = _tokenizer_ids(self.tokenizer_ids, token_ids.shape, self.tokenizer_names)
         for name, dtype in (("token_ids", np.int64), ("numeric_values", np.float32),
-                            ("numeric_mask", np.bool_), ("head_token_mask", np.bool_)):
+                            ("numeric_mask", np.bool_), ("head_mask", np.bool_)):
             array = np.asarray(getattr(self, name), dtype=dtype)
             if array.shape != token_ids.shape:
                 raise ValueError(f"{name} must have shape [{token_ids.size}], got {array.shape}")
@@ -115,7 +115,7 @@ class StepTokens:
 
 def make_token_batch(
     *, token_ids, numeric_values, numeric_mask, sequence_ids,
-    head_token_mask, num_sequences: int,
+    head_mask, num_sequences: int,
     tokenizer_ids=None, tokenizer_names=("default",),
     numeric_field_ids=None, numeric_field_names=(),
     position_values=None, position_mask=None,
@@ -132,7 +132,7 @@ def make_token_batch(
     from zero. Numeric-field IDs select Fourier projections (-1 when absent).
     position_values stays float64 until the position features are formed.
 
-    head_token_mask [L] selects tokens passed to prediction heads. Step mappings
+    head_mask [L] selects tokens passed to prediction heads. Step mappings
     belong to objective_data, not model inputs. Names and num_sequences are
     non-tensor metadata; the count includes empty decode sequences.
     """
@@ -143,7 +143,7 @@ def make_token_batch(
         "numeric_values": torch.as_tensor(numeric_values, dtype=torch.float32, device="cpu"),
         "numeric_mask": torch.as_tensor(numeric_mask, dtype=torch.bool, device="cpu"),
         "sequence_ids": torch.as_tensor(sequence_ids, dtype=torch.int64, device="cpu"),
-        "head_token_mask": torch.as_tensor(head_token_mask, dtype=torch.bool, device="cpu"),
+        "head_mask": torch.as_tensor(head_mask, dtype=torch.bool, device="cpu"),
         "tokenizer_ids": (torch.zeros(shape, dtype=torch.int64, device="cpu") if tokenizer_ids is None
                           else torch.as_tensor(tokenizer_ids, dtype=torch.int64, device="cpu")),
         "numeric_field_ids": (torch.full(shape, -1, dtype=torch.int64, device="cpu") if numeric_field_ids is None
@@ -162,7 +162,7 @@ def empty_token_batch(*, num_sequences: int = 0) -> TensorDict:
     """No tokens or steps, retaining empty decode sequences."""
     return make_token_batch(
         token_ids=[], numeric_values=[], numeric_mask=[], sequence_ids=[],
-        head_token_mask=[],
+        head_mask=[],
         num_sequences=num_sequences,
     )
 
@@ -190,7 +190,7 @@ def _stack_objective_fields(steps: Sequence[StepTokens]) -> dict[str, np.ndarray
     for actions that do not exist, which objectives exclude. Ragged integer
     columns raise: there is no integer sentinel, so the caller must pad them
     explicitly or store the field as float. ``group_id`` is not a column:
-    step_sequence_ids belongs to objective_data. A scalar ``action`` may be
+    per-step sequence_ids belongs to objective_data. A scalar ``action`` may be
     ``None`` for an automatic transition. Packing represents it as NaN in
     the float64 action tensor; source steps retain their nullable actions.
     """
@@ -200,10 +200,10 @@ def _stack_objective_fields(steps: Sequence[StepTokens]) -> dict[str, np.ndarray
         keys.update(st.objective_fields)
     if "group_id" in keys:
         raise ValueError(
-            "group_id is not an objective column; use objective_data['step_sequence_ids']."
+            "group_id is not an objective column; use objective_data['sequence_ids']."
         )
     if "head_output_count" in keys:
-        raise ValueError("head_output_count is not an objective column; use objective_data['head_step_ids'].")
+        raise ValueError("head_output_count is not an objective column; use objective_data['step_ids'].")
     if "action_executed" in keys:
         raise ValueError(
             "action_executed is not supported; store action=None "
@@ -296,7 +296,7 @@ def pack_token_batch(
     """Pack per-step :class:`StepTokens` into model and objective inputs.
 
     Returns ``(inputs, objective_data)``. Step sequence boundaries live in
-    ``objective_data["step_sequence_ids"]``.
+    ``objective_data["sequence_ids"]``.
 
     Ragged float vector columns in ``objective_data`` are right-padded with
     ``-inf``, the sentinel objectives exclude as "action does not exist".
@@ -307,8 +307,8 @@ def pack_token_batch(
     an input column or a stored field on :class:`StepTokens`.
 
     """
-    empty_objective = TensorDict({"step_sequence_ids": torch.empty(0, dtype=torch.int64, device="cpu"),
-                                  "head_step_ids": torch.empty(0, dtype=torch.int64, device="cpu")}, batch_size=[], device="cpu")
+    empty_objective = TensorDict({"sequence_ids": torch.empty(0, dtype=torch.int64, device="cpu"),
+                                  "step_ids": torch.empty(0, dtype=torch.int64, device="cpu")}, batch_size=[], device="cpu")
     if not steps:
         if batch_size is None:
             return empty_token_batch(num_sequences=0), empty_objective
@@ -338,7 +338,7 @@ def pack_token_batch(
     token_ids: list[np.ndarray] = []
     numeric_values: list[np.ndarray] = []
     tokenizer_ids: list[np.ndarray] = []
-    head_token_masks: list[np.ndarray] = []
+    head_masks: list[np.ndarray] = []
     step_lengths: list[int] = []
 
     inferred_B = (max(seq_per_step) + 1) if seq_per_step else 0
@@ -370,14 +370,14 @@ def pack_token_batch(
         numeric_values.append(st.numeric_values)
         assert st.tokenizer_ids is not None
         tokenizer_ids.append(st.tokenizer_ids)
-        head_token_masks.append(st.head_token_mask)
+        head_masks.append(st.head_mask)
         step_lengths.append(t)
 
     # Compute packed metadata in bulk, including zero-token/passive steps.
     lengths = np.asarray(step_lengths, dtype=np.int64)
-    head_token_mask = np.concatenate(head_token_masks)
-    head_token_ids = np.flatnonzero(head_token_mask)
-    head_step_ids = np.searchsorted(np.cumsum(lengths), head_token_ids, side="right")
+    head_mask = np.concatenate(head_masks)
+    head_token_ids = np.flatnonzero(head_mask)
+    step_ids = np.searchsorted(np.cumsum(lengths), head_token_ids, side="right")
     fields = _stack_objective_fields(steps)
     inputs = make_token_batch(
         position_values=np.concatenate(position_values),
@@ -388,12 +388,12 @@ def pack_token_batch(
         token_ids=np.concatenate(token_ids),
         numeric_values=np.concatenate(numeric_values),
         sequence_ids=np.repeat(seq_per_step, lengths),
-        head_token_mask=head_token_mask,
+        head_mask=head_mask,
         tokenizer_ids=np.concatenate(tokenizer_ids),
         tokenizer_names=tokenizer_names,
         num_sequences=B,
     )
     objective_data = _fields_to_tensors(fields)
-    objective_data["head_step_ids"] = torch.from_numpy(head_step_ids)
-    objective_data["step_sequence_ids"] = torch.tensor(seq_per_step, dtype=torch.int64, device="cpu")
+    objective_data["step_ids"] = torch.from_numpy(step_ids)
+    objective_data["sequence_ids"] = torch.tensor(seq_per_step, dtype=torch.int64, device="cpu")
     return inputs, TensorDict(objective_data, batch_size=[], device="cpu")

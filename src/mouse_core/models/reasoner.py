@@ -163,8 +163,8 @@ def sample_reasoning_splits(
     receive gradient.
     """
     rng = generator if generator is not None else np.random.default_rng()
-    counts = torch.bincount(objective_data["step_sequence_ids"], minlength=batch["num_sequences"]).cpu().numpy()
-    head_steps = objective_data['head_step_ids'].cpu().numpy()
+    counts = torch.bincount(objective_data["sequence_ids"], minlength=batch["num_sequences"]).cpu().numpy()
+    head_steps = objective_data['step_ids'].cpu().numpy()
     splits = np.full(batch["num_sequences"], -1, dtype=np.int64)
     offset = 0
     for b in range(batch["num_sequences"]):
@@ -178,13 +178,13 @@ def sample_reasoning_splits(
 
 def _first_head_output_rows(objective_data: TensorDict) -> np.ndarray:
     """Row index into ``head_token_ids`` of each step's first head-output token."""
-    head_step_ids = objective_data['head_step_ids'].cpu().numpy()
-    if head_step_ids.size == 0:
-        return np.full(objective_data["step_sequence_ids"].shape[0], -1, dtype=np.int64)
-    first = np.ones(head_step_ids.size, dtype=bool)
-    first[1:] = head_step_ids[1:] != head_step_ids[:-1]
-    rows = np.full(objective_data["step_sequence_ids"].shape[0], -1, dtype=np.int64)
-    rows[head_step_ids[first]] = np.flatnonzero(first)
+    step_ids = objective_data['step_ids'].cpu().numpy()
+    if step_ids.size == 0:
+        return np.full(objective_data["sequence_ids"].shape[0], -1, dtype=np.int64)
+    first = np.ones(step_ids.size, dtype=bool)
+    first[1:] = step_ids[1:] != step_ids[:-1]
+    rows = np.full(objective_data["sequence_ids"].shape[0], -1, dtype=np.int64)
+    rows[step_ids[first]] = np.flatnonzero(first)
     return rows
 
 
@@ -234,7 +234,7 @@ def _plan_insertions(
 
     Returns ``None`` when no sequence hosts a burst (all splits ``-1``).
     """
-    counts = torch.bincount(objective_data["step_sequence_ids"], minlength=batch["num_sequences"]).cpu().numpy()
+    counts = torch.bincount(objective_data["sequence_ids"], minlength=batch["num_sequences"]).cpu().numpy()
     splits = np.asarray(splits, dtype=np.int64).reshape(-1)
     _validate_splits(splits, counts)
 
@@ -244,7 +244,7 @@ def _plan_insertions(
 
     R = int(num_thoughts)
     L = batch["token_ids"].shape[0]
-    pred = batch['head_token_mask'].nonzero(as_tuple=True)[0].cpu().numpy()
+    pred = batch['head_mask'].nonzero(as_tuple=True)[0].cpu().numpy()
     seq = batch['sequence_ids'].cpu().numpy()
     offsets = np.concatenate([np.zeros(1, dtype=np.int64), np.cumsum(counts)])
 

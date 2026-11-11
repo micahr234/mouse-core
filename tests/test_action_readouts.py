@@ -13,7 +13,7 @@ def _inputs(*rows):
         for heads in row:
             steps.append(StepTokens(
                 token_ids=np.arange(len(heads)), numeric_values=np.zeros(len(heads)),
-                numeric_mask=np.zeros(len(heads), dtype=bool), head_token_mask=np.array(heads, dtype=bool),
+                numeric_mask=np.zeros(len(heads), dtype=bool), head_mask=np.array(heads, dtype=bool),
             ))
             sequences.append(sequence)
     return pack_token_batch(steps=steps, sequence_ids=sequences, batch_size=len(rows))
@@ -24,11 +24,11 @@ def _scores(inputs, cached):
     # per step and left-pads ragged/empty rows exactly as notebook models do.
     features = torch.arange(inputs["token_ids"].shape[0] * 3, dtype=torch.float32).reshape(-1, 3)
     if not cached:
-        return features[inputs["head_token_mask"].nonzero(as_tuple=True)[0]]
+        return features[inputs["head_mask"].nonzero(as_tuple=True)[0]]
     tensors = inputs.to('cpu')
     padded, _, heads, _ = prepare_decode(
         embeds=features, tokens=inputs, sequence_ids=tensors['sequence_ids'],
-        head_token_mask=tensors["head_token_mask"],
+        head_mask=tensors["head_mask"],
     )
     return padded.gather(1, heads.unsqueeze(-1).expand(-1, -1, 3))
 
@@ -74,7 +74,7 @@ def test_cached_action_sampling_preserves_every_valid_prediction(temperature):
     inputs, _ = _inputs([[True, True], [False], [True]], [], [[True]])
     packed = _scores(inputs, False)
     cached = _scores(inputs, True)
-    counts = torch.bincount(inputs["sequence_ids"][inputs["head_token_mask"]], minlength=3)
+    counts = torch.bincount(inputs["sequence_ids"][inputs["head_mask"]], minlength=3)
     valid = torch.arange(cached.shape[1])[None, :] >= (cached.shape[1] - counts[:, None])
     torch.manual_seed(5)
     expected = select_discrete_action(scores=packed, temperature=temperature)

@@ -84,7 +84,7 @@ def test_grpo_likelihood_ratio_matches_collected_episode_policy(temperature):
             'advantage': torch.tensor([0., 1., -1., 1.])}
     objective = GrpoObjective(clip_ratio_min=0.8, clip_ratio_max=1.2, ent_coef=0.01, num_actions=3)
     losses, metrics = objective(
-        objective_data=data, group_id=torch.zeros(4, dtype=torch.int64), head_step_ids=fixture_head_steps(data),
+        objective_data=data, sequence_ids=torch.zeros(4, dtype=torch.int64), step_ids=fixture_head_steps(data),
         predictions=tempered_policy_logits(scores, torch.full((4,), temperature)),
     )
     assert metrics['approx_kl'] == pytest.approx(0., abs=1e-7)

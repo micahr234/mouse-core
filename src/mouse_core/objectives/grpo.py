@@ -66,7 +66,7 @@ def group_relative_advantages(
 
 
 @torch.no_grad()
-def sampling_mismatch_weights(*, training_log_probs, sampling_log_probs, group_id,
+def sampling_mismatch_weights(*, training_log_probs, sampling_log_probs, sequence_ids,
                               executed, mode, ratio_min=None, ratio_max=3.0):
     if mode not in ("none", "action_truncate", "action_mask", "episode_truncate", "episode_mask"):
         raise ValueError("unknown sampling mismatch correction mode")
@@ -77,7 +77,7 @@ def sampling_mismatch_weights(*, training_log_probs, sampling_log_probs, group_i
     if ratio_min is not None and ratio_max is not None and ratio_min >= ratio_max:
         raise ValueError("ratio_min must be less than ratio_max")
     shape = training_log_probs.shape
-    if len(shape) != 1 or any(x.shape != shape for x in (sampling_log_probs, group_id, executed)):
+    if len(shape) != 1 or any(x.shape != shape for x in (sampling_log_probs, sequence_ids, executed)):
         raise ValueError("mismatch fields must be aligned one-dimensional tensors")
     result = torch.ones_like(training_log_probs, dtype=torch.float64)
     if mode == "none":
@@ -89,7 +89,7 @@ def sampling_mismatch_weights(*, training_log_probs, sampling_log_probs, group_i
     if not bool(torch.isfinite(difference).all()):
         raise ValueError("executed action log probabilities must be finite")
     if mode.startswith("episode_"):
-        _, inverse = torch.unique_consecutive(group_id[active], return_inverse=True)
+        _, inverse = torch.unique_consecutive(sequence_ids[active], return_inverse=True)
         sums = difference.new_zeros(int(inverse.max()) + 1 if inverse.numel() else 0)
         sums.scatter_add_(0, inverse, difference)
         difference = sums[inverse]
@@ -110,7 +110,7 @@ class GrpoObjective(Objective[...]):
     """Clipped GRPO policy objective (no value / critic head).
 
     Instantiate with hyperparameters, then call with
-    ``objective_data=``, ``group_id=`` (int64 ``[N]``, one id per step,
+    ``objective_data=``, ``sequence_ids=`` (int64 ``[N]``, one id per step,
     returned beside ``objective_data``), and ``predictions=``.
 
     Call with the policy logits as ``predictions=``:
@@ -145,12 +145,12 @@ class GrpoObjective(Objective[...]):
             ],
         )
         inputs, objective_data = loader.next_batch()
-        group_id = objective_data.to(device)["step_sequence_ids"]
+        sequence_ids = objective_data.to(device)["sequence_ids"]
         out = model(inputs)
         losses, metrics = objective(
             objective_data=objective_data.to(device),
-            group_id=group_id.to(device),
-            head_step_ids=objective_data.to(device)["head_step_ids"],
+            sequence_ids=sequence_ids.to(device),
+            step_ids=objective_data.to(device)["step_ids"],
             predictions=out["predictions"]["action"],
         )
         loss = torch.stack(tuple(losses.values())).sum()
@@ -161,7 +161,7 @@ class GrpoObjective(Objective[...]):
 
     Timing matches :class:`~mouse_core.objectives.dqn.DqnObjective`: token
     ``i`` is state ``s_i``; action / behavior log-prob / advantage at ``i+1``
-    describe the transition out of ``s_i``. A run is the same ``group_id``
+    describe the transition out of ``s_i``. A run shares one value in ``sequence_ids``
     (one dataloader sample). Neighbor
     reads must stay in-run: out-of-run pairs are multiplied by ``0``
     (all-zero weights → loss ``0``).
@@ -214,8 +214,8 @@ class GrpoObjective(Objective[...]):
         self,
         *,
         objective_data: dict[str, torch.Tensor],
-        group_id: torch.Tensor,
-        head_step_ids: torch.Tensor,
+        sequence_ids: torch.Tensor,
+        step_ids: torch.Tensor,
         predictions: torch.Tensor,
         _tensor_metrics: bool = False,
     ) -> tuple[dict[str, torch.Tensor], dict[str, float | torch.Tensor]]: ...
@@ -225,8 +225,8 @@ class GrpoObjective(Objective[...]):
         self,
         *,
         objective_data: dict[str, torch.Tensor],
-        group_id: torch.Tensor,
-        head_step_ids: torch.Tensor,
+        sequence_ids: torch.Tensor,
+        step_ids: torch.Tensor,
         predictions: torch.Tensor,
         backup_value_predictions: None = None,
         backup_action_predictions: None = None,
@@ -239,8 +239,8 @@ class GrpoObjective(Objective[...]):
         self,
         *,
         objective_data: dict[str, torch.Tensor],
-        group_id: torch.Tensor,
-        head_step_ids: torch.Tensor,
+        sequence_ids: torch.Tensor,
+        step_ids: torch.Tensor,
         predictions: torch.Tensor,
         backup_value_predictions: torch.Tensor | None = None,
         backup_action_predictions: torch.Tensor | None = None,
@@ -285,8 +285,8 @@ class GrpoObjective(Objective[...]):
                 }
                 losses, metrics = self(
                     objective_data=head_data,
-                    group_id=group_id,
-                    head_step_ids=head_step_ids,
+                    sequence_ids=sequence_ids,
+                    step_ids=step_ids,
 
                     predictions=logits[:, head, :],
                     _tensor_metrics=True,
@@ -307,7 +307,7 @@ class GrpoObjective(Objective[...]):
                 f"got {tuple(logits.shape)}."
             )
         original_data = objective_data
-        logits, objective_data, readout = _expand_policy_readouts(objective_data, logits, head_step_ids=head_step_ids, n_steps=group_id.numel(), who="GRPO")
+        logits, objective_data, readout = _expand_policy_readouts(objective_data, logits, step_ids=step_ids, n_steps=sequence_ids.numel(), who="GRPO")
         N, A = logits.shape
         device = cast(torch.device, logits.device)
         dtype = cast(torch.dtype, logits.dtype)
@@ -335,7 +335,7 @@ class GrpoObjective(Objective[...]):
                 f"got {tuple(action.shape)}."
             )
         executed = executed_actions(action)
-        _validate_request_actions(readout, executed, group_id)
+        _validate_request_actions(readout, executed, sequence_ids)
         action = canonical_actions(action)
         _require_action_ids(action, A)
 
@@ -354,7 +354,7 @@ class GrpoObjective(Objective[...]):
         advantage = advantage_full[1:].detach().to(dtype=dtype)
 
         pair_weight = _pair_weight(
-            group_id=group_id,
+            sequence_ids=sequence_ids,
             N=N,
             device=device,
             dtype=dtype,
@@ -389,7 +389,7 @@ class GrpoObjective(Objective[...]):
         log_ratio = new_log_prob - old_log_prob
         if self.importance_sampling_level == "episode":
             _, inverse, counts = torch.unique_consecutive(
-                group_id[1:][active], return_inverse=True, return_counts=True
+                sequence_ids[1:][active], return_inverse=True, return_counts=True
             )
             sums = log_ratio.new_zeros(counts.shape).scatter_add(0, inverse, log_ratio)
             log_ratio = (sums / counts.to(dtype=dtype))[inverse]

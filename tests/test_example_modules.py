@@ -42,8 +42,10 @@ from mouse_core.objectives import (
 from tests._token_batch_helpers import batch_to_token_batch, token_tokenizer
 
 EXAMPLES = Path(__file__).resolve().parents[1] / "examples"
+# The replica/layer contract is exercised in test_value_diffusion_notebook.py.
 NOTEBOOKS = [path for path in sorted(EXAMPLES.glob("*.ipynb"))
-             if "class Encoder(Model):" in path.read_text()]
+             if "class Encoder(Model):" in path.read_text()
+             and path.name != "24_train_offline_value_diffusion.ipynb"]
 
 
 def _tokens(*actions):
@@ -150,7 +152,7 @@ def test_encoders_and_heads_have_separate_gradients_and_cached_readouts(path):
     finally:
         hook.remove()
     assert set(out) == {"z", "cache"}
-    torch.testing.assert_close(out["z"], features[-1][tokens["head_token_mask"].nonzero(as_tuple=True)[0]])
+    torch.testing.assert_close(out["z"], features[-1][tokens["head_mask"].nonzero(as_tuple=True)[0]])
     heads = _heads(ns)
     torch.stack([head(out["z"]).square().mean() for head in heads]).sum().backward()
     for module in (encoder.embedding, encoder.backbone, *heads):
@@ -191,13 +193,13 @@ def test_notebook_training_uses_all_online_modules_and_updates_targets(path):
         "q_star": torch.tensor([[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]]),
         "environment_step": torch.ones(3, dtype=torch.bool),
     }
-    group_id = torch.zeros(3, dtype=torch.int64)
+    sequence_ids = torch.zeros(3, dtype=torch.int64)
 
     class Loader:
         def __init__(self, **kwargs):
             pass
         def next_batch(self):
-            return tokens, TensorDict(dict(data, head_step_ids=torch.arange(len(group_id), device=group_id.device), step_sequence_ids=group_id), batch_size=[])
+            return tokens, TensorDict(dict(data, step_ids=torch.arange(len(sequence_ids), device=sequence_ids.device), sequence_ids=sequence_ids), batch_size=[])
         def refresh(self):
             pass
         def close(self):
@@ -404,7 +406,7 @@ def test_ppo_collection_restarts_replay_and_preserves_behavior_prefixes():
                             transform=tokenizer.encode)
         try:
             inputs, objective_data = loader.next_batch()
-            group_id = objective_data["step_sequence_ids"]
+            sequence_ids = objective_data["sequence_ids"]
             out = ns['encoder'](inputs)
             definition = next(node for cell in notebook['cells'] if cell['cell_type'] == 'code'
                               for node in ast.parse(''.join(cell['source'])).body
@@ -414,7 +416,7 @@ def test_ppo_collection_restarts_replay_and_preserves_behavior_prefixes():
             exec(compile(ast.Module(body=[definition], type_ignores=[]), '<notebook>', 'exec'), ns)
             objective = ns['objective']
 
-            losses, _ = objective(objective_data=objective_data, group_id=group_id, head_step_ids=objective_data["head_step_ids"],
+            losses, _ = objective(objective_data=objective_data, sequence_ids=sequence_ids, step_ids=objective_data["step_ids"],
                                   predictions=ns['policy_head'](out['z']),
                                   value_predictions=ns['value_head'](out['z']))
             assert torch.isfinite(losses['ppo'])
@@ -422,7 +424,7 @@ def test_ppo_collection_restarts_replay_and_preserves_behavior_prefixes():
             assert objective_data['old_log_prob'][3].item() == 0.0
             with pytest.raises(ValueError, match='cross-group backup'):
                 objective(objective_data={name: values[:2] for name, values in objective_data.items()},
-                          group_id=group_id[:2], head_step_ids=fixture_head_steps({name: values[:2] for name, values in objective_data.items()}),  predictions=ns['policy_head'](out['z'][:2]),
+                          sequence_ids=sequence_ids[:2], step_ids=fixture_head_steps({name: values[:2] for name, values in objective_data.items()}),  predictions=ns['policy_head'](out['z'][:2]),
                           value_predictions=ns['value_head'](out['z'][:2]))
         finally:
             loader.close()
@@ -439,11 +441,11 @@ def test_grpo_behavior_probability_uses_the_complete_training_prefix():
     seen = []
 
     def encoder(tokens, **kwargs):
-        seen.append(int(torch.bincount(tokens["sequence_ids"][tokens["head_token_mask"]], minlength=tokens["num_sequences"]).max()) if tokens["num_sequences"] else 0)
+        seen.append(int(torch.bincount(tokens["sequence_ids"][tokens["head_mask"]], minlength=tokens["num_sequences"]).max()) if tokens["num_sequences"] else 0)
         # Make the logits depend on the first observation, so dropping an old
         # prefix would silently change the action distribution.
         first = float(tokens['token_ids'][0])
-        return {'z': torch.tensor([[first, 0., -first]]).expand(tokens["head_token_mask"].nonzero(as_tuple=True)[0].shape[0], -1)}
+        return {'z': torch.tensor([[first, 0., -first]]).expand(tokens["head_mask"].nonzero(as_tuple=True)[0].shape[0], -1)}
 
     ns.update(tokenizer=tokenizer, encoder=encoder, policy_head=lambda z: z,
               sample_discrete_action=sample_discrete_action)

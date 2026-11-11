@@ -1,7 +1,7 @@
 """Sample complete event sequences into one event or token budget per batch.
 
 Each sampled segment is an independent sequence. Token-level ``sequence_ids`` live in inputs; step-level
-``step_sequence_ids`` and prediction-level ``head_step_ids`` live in objective_data.
+``sequence_ids`` and prediction-level ``step_ids`` live in objective_data.
 The loader returns
 ``(inputs, objective_data)``. A budget limits the whole returned batch.
 

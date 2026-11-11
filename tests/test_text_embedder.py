@@ -113,7 +113,7 @@ def test_text_tokenizer_when_not_equals_omits_value() -> None:
     ]
     tb, obj = batch_to_packed(tokenizer, batch)
     embeds = embed_batch(backbone, tb)
-    indices = tb.to(embeds.device)["head_token_mask"].nonzero(as_tuple=True)[0]
+    indices = tb.to(embeds.device)["head_mask"].nonzero(as_tuple=True)[0]
     assert obj["reward"].dtype == torch.float32
     assert obj["action"].dtype == torch.float64
     assert obj["reward"].tolist() == [0.0, 1.0]
@@ -127,8 +127,8 @@ def test_text_tokenizer_when_not_equals_omits_value() -> None:
     assert st0.T < st1.T
     assert embeds.shape[0] == st0.T + st1.T
     assert indices.tolist() == [
-        int(np.flatnonzero(st0.head_token_mask)[0]),
-        st0.T + int(np.flatnonzero(st1.head_token_mask)[0]),
+        int(np.flatnonzero(st0.head_mask)[0]),
+        st0.T + int(np.flatnonzero(st1.head_mask)[0]),
     ]
     seen: list[str] = []
 
@@ -213,7 +213,7 @@ def test_text_tokenizer_omitted_input_field_is_const() -> None:
     assert step.token_ids.tolist() == [ord(c) % 20 + 1 for c in "3"] + [
         ord(c) % 20 + 1 for c in ",value"
     ]
-    assert step.head_token_mask.tolist() == [False] * len("3") + [True] * len(",value")
+    assert step.head_mask.tolist() == [False] * len("3") + [True] * len(",value")
 
 
 def test_text_tokenizer_const_format_keeps_the_word_field() -> None:
@@ -534,7 +534,7 @@ def test_text_tokenizer_repeated_filters_emit_in_order() -> None:
     ], tokenizers={"default": _FakeTokenizer()})
     step = encode_measurement(tokenizer, {"value": 12})
     assert step.token_ids.tolist() == _enc("12x")
-    assert step.head_token_mask.tolist() == [False, False, True]
+    assert step.head_mask.tolist() == [False, False, True]
 
 
 def _capture_tokenizer(seen: list[str]):
@@ -801,7 +801,7 @@ def test_token_modality_is_single_embed_row() -> None:
     )
     tb = batch_to_token_batch(tokenizer, [[{"action": 16}]])
     embeds = embed_batch(backbone, tb)
-    indices = tb.to(embeds.device)["head_token_mask"].nonzero(as_tuple=True)[0]
+    indices = tb.to(embeds.device)["head_mask"].nonzero(as_tuple=True)[0]
     assert embeds.shape[0] == 1
     assert int(indices[0].item()) == 0
     assert torch.equal(embeds[0], emb.weight[16])
@@ -864,7 +864,7 @@ def test_identity_embed_image_token_ids() -> None:
     batch = [[{"observation": 3, "pixels": [1, 2, 3]}]]
     tb, obj = batch_to_packed(tokenizer, batch)
     embeds = embed_batch(backbone, tb)
-    indices = tb.to(embeds.device)["head_token_mask"].nonzero(as_tuple=True)[0]
+    indices = tb.to(embeds.device)["head_mask"].nonzero(as_tuple=True)[0]
     assert "pixels" in obj.keys()
     assert embeds.ndim == 2 and embeds.shape[1] == D
     # "3" (1 char → 1 token), then the two image tokens (the head-output tokens).
@@ -972,7 +972,7 @@ def test_token_repeat_episode_index_emits_only_on_step_zero() -> None:
     )
     zero = encode_measurement(tok, {"action": 1, "repeat_episode_index": 4, "step_index": 0, "episode_index": 0})
     assert zero.token_ids.tolist() == [1, 4]
-    assert zero.head_token_mask.tolist() == [True, False]
+    assert zero.head_mask.tolist() == [True, False]
     later = encode_measurement(tok, {"action": 1, "repeat_episode_index": 4, "step_index": 2, "episode_index": 0})
     assert later.token_ids.tolist() == [1]
     again = encode_measurement(tok, {"action": 1, "repeat_episode_index": 9, "step_index": 0, "episode_index": 0})
@@ -1091,8 +1091,8 @@ def test_zero_numeric_values_keep_their_mask_through_prefix_packing_and_embeddin
     assert not tensors["numeric_values"].any()
     assert tensors["numeric_mask"].dtype == torch.bool
     assert tensors["numeric_mask"].tolist() == [True, False, True, True, False, True]
-    assert tensors["head_token_mask"].nonzero(as_tuple=True)[0].tolist() == [1, 4]
-    assert batch_objective_data["head_step_ids"].tolist() == [0, 1]
+    assert tensors["head_mask"].nonzero(as_tuple=True)[0].tolist() == [1, 4]
+    assert batch_objective_data["step_ids"].tolist() == [0, 1]
 
     embedding = Embedding(hidden_dim=8, vocab_size=32, numeric_field_names=tokenizer.numeric_field_names, num_frequencies=2)
     assert embedding.features.numeric[0] is not None
@@ -1112,7 +1112,7 @@ def test_zero_numeric_values_keep_their_mask_through_prefix_packing_and_embeddin
 
     continued, continued_objective_data = pack_token_batch(steps=[step], sequence_ids=[0])
     assert continued['numeric_mask'].tolist() == [True, False, True]
-    assert continued["head_token_mask"].nonzero(as_tuple=True)[0].tolist() == [1]
+    assert continued["head_mask"].nonzero(as_tuple=True)[0].tolist() == [1]
 
 
 def test_text_only_embedding_accepts_just_token_ids() -> None:
@@ -1304,7 +1304,7 @@ def test_token_field_emits_one_text_token() -> None:
     )
     step = encode_measurement(tokenizer, {"action": 0})
     assert step.token_ids.tolist() == _encoded("0") + _encoded("\n")
-    assert step.head_token_mask.tolist() == [False, True]
+    assert step.head_mask.tolist() == [False, True]
     wide = Tokenizer(
         input_fields=[{"provider": "sensor", "type": "token", "format": "ab", "head_output": True}],
         tokenizers={"default": _FakeTokenizer()},

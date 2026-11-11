@@ -57,7 +57,7 @@ class EncodeSample:
         assert len({e['payload']['episode_index'] for e in events}) == 1
         return [StepTokens(token_ids=np.array([1,2]), numeric_values=np.zeros(2),
                            numeric_mask=np.zeros(2, dtype=bool),
-                           head_token_mask=np.array([False,True]),
+                           head_mask=np.array([False,True]),
                            objective_fields={'final_source_event': events[-1]['payload']['event_index']})]
 
 
@@ -67,8 +67,8 @@ def test_source_event_budget_is_independent_of_tokenizer_readout_count():
     with DataLoader(stores=store, events_budget=6,  sample_field='payload.episode_index',
                     transform=encode, index_field='source_offset', num_workers=0, seed=1) as loader:
         inputs, data = loader.next_batch()
-        group = data["step_sequence_ids"]
-    assert data["step_sequence_ids"].shape[0] == 1 and group.tolist() == [0]
+        group = data["sequence_ids"]
+    assert data["sequence_ids"].shape[0] == 1 and group.tolist() == [0]
     assert data['final_source_event'].tolist() == [5]
     assert all(len(events) == 6 for events in encode.seen)
     for events in encode.seen:
@@ -90,7 +90,7 @@ def test_epoch_loader_encodes_whole_event_samples_once():
     assert len(encode.seen) == 2
     assert len(loader) == 3
     inputs, data = loader.next_batch()
-    groups = data["step_sequence_ids"]
+    groups = data["sequence_ids"]
     assert data['final_source_event'].tolist() == [5,5]
     assert groups.tolist() == [0,1]
     loader.close()
@@ -128,7 +128,7 @@ def test_explicit_windows_are_source_event_slices():
     def encode(events):
         seen.append([e['payload']['event_index'] for e in events])
         return [StepTokens(token_ids=np.array([1]), numeric_values=np.zeros(1),
-                           numeric_mask=np.zeros(1, dtype=bool), head_token_mask=np.ones(1, dtype=bool),
+                           numeric_mask=np.zeros(1, dtype=bool), head_mask=np.ones(1, dtype=bool),
                            objective_fields={'source_start': events[0]['payload']['event_index']})]
     loader = EpochDataLoader(stores=[source()], transform=encode, token_budget=2,
                              sample_ranges=lambda dataset: [(0,3),(2,6),(6,9),(8,12)])
@@ -270,11 +270,11 @@ def test_offline_examples_sample_complete_tasks_and_preserve_unfinished_events(f
                     **policy, transform=encode,
                     num_workers=0, seed=5) as loader:
         inputs, data = loader.next_batch()
-        groups = data["step_sequence_ids"]
-    assert data["step_sequence_ids"].shape[0] == 8
+        groups = data["sequence_ids"]
+    assert data["sequence_ids"].shape[0] == 8
     assert groups.tolist() == [0] * 4 + [1] * 4
-    values = torch.full((data["step_sequence_ids"].shape[0], 2), 1000., requires_grad=True)
-    losses, metrics = objective(objective_data=data, group_id=groups, head_step_ids=fixture_head_steps(data),
+    values = torch.full((data["sequence_ids"].shape[0], 2), 1000., requires_grad=True)
+    losses, metrics = objective(objective_data=data, sequence_ids=groups, step_ids=fixture_head_steps(data),
         predictions=values, backup_value_predictions=values.detach(),
         backup_action_predictions=values.detach())
     assert torch.isfinite(losses['action_value'])

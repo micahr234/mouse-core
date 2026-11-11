@@ -39,7 +39,7 @@ def test_component_and_environment_horizons(gate, expected):
     data, values = _fixture()
     online = torch.zeros_like(values, requires_grad=True)
     losses, metrics = _objective(gate)(objective_data=data,
-        group_id=torch.zeros(5, dtype=torch.int64), head_step_ids=fixture_head_steps(data),  predictions=online,
+        sequence_ids=torch.zeros(5, dtype=torch.int64), step_ids=fixture_head_steps(data),  predictions=online,
         backup_value_predictions=values, backup_action_predictions=values)
     assert isinstance(metrics["backup"], torch.Tensor)
     torch.testing.assert_close(metrics["backup"][:4], torch.tensor(expected[:4]))
@@ -58,7 +58,7 @@ def test_variable_component_counts_and_group_isolation():
     data["reward"] = torch.tensor([0., 0., 0., 3., 7.])
     objective = _objective(nstep_gate(n=1, step_key="environment_step"))
     def targets(data, values, groups):
-        result = objective(objective_data=data, group_id=groups, head_step_ids=fixture_head_steps(data),
+        result = objective(objective_data=data, sequence_ids=groups, step_ids=fixture_head_steps(data),
             predictions=torch.zeros_like(values), backup_value_predictions=values,
             backup_action_predictions=values)[1]["backup"]
         assert isinstance(result, torch.Tensor)
@@ -76,7 +76,7 @@ def test_boundary_flags_propagate_through_component_return(flag, expected):
     data, values = _fixture()
     data[flag][2] = True
     _, metrics = _objective(nstep_gate(n=1, step_key="environment_step"))(
-        objective_data=data, group_id=torch.zeros(5, dtype=torch.int64), head_step_ids=fixture_head_steps(data),
+        objective_data=data, sequence_ids=torch.zeros(5, dtype=torch.int64), step_ids=fixture_head_steps(data),
         predictions=torch.zeros_like(values), backup_value_predictions=values,
         backup_action_predictions=values)
     assert isinstance(metrics["backup"], torch.Tensor)
@@ -119,7 +119,7 @@ def test_all_components_receive_reward_without_extra_discount(components):
     values = torch.zeros(count, 2)
     values[-1, 1] = 10.
     _, metrics = _objective(nstep_gate(n=1, step_key="environment_step"))(
-        objective_data=data, group_id=torch.zeros(count, dtype=torch.int64), head_step_ids=fixture_head_steps(data),
+        objective_data=data, sequence_ids=torch.zeros(count, dtype=torch.int64), step_ids=fixture_head_steps(data),
         predictions=values, backup_value_predictions=values, backup_action_predictions=values)
     backup = metrics["backup"]
     assert isinstance(backup, torch.Tensor)
@@ -215,10 +215,10 @@ def test_sequential_notebook_collects_and_trains(mode, monkeypatch):
             steps=namespace["tokenizer"].encode(raw_history),
             sequence_ids=[0] * len(history), batch_size=1,
         )
-        groups = data["step_sequence_ids"]
+        groups = data["sequence_ids"]
         assert objective.discount(**data)[-1] == 0
-        values = torch.full((inputs["head_token_mask"].nonzero(as_tuple=True)[0].shape[0], namespace["MAX_ACTIONS"]), 1000.)
-        _, metrics = objective(objective_data=data, group_id=groups, head_step_ids=data["head_step_ids"],
+        values = torch.full((inputs["head_mask"].nonzero(as_tuple=True)[0].shape[0], namespace["MAX_ACTIONS"]), 1000.)
+        _, metrics = objective(objective_data=data, sequence_ids=groups, step_ids=data["step_ids"],
             predictions=values, backup_value_predictions=values,
             backup_action_predictions=values)
         # The final executed action learns its actual reward, with no value
@@ -226,7 +226,7 @@ def test_sequential_notebook_collects_and_trains(mode, monkeypatch):
         assert metrics["backup"][-1].item() == pytest.approx(history[-1]["reward"])
         with pytest.raises(ValueError, match="cross-group backup"):
             objective(objective_data={key: value[:-1] for key, value in data.items()},
-                group_id=groups[:-1], head_step_ids=data["head_step_ids"],  predictions=values,
+                sequence_ids=groups[:-1], step_ids=data["step_ids"],  predictions=values,
                 backup_value_predictions=values, backup_action_predictions=values)
         for index, applied in enumerate(applied_actions[-episode_steps:]):
             # One vector per physical step, assembled in the recorded component order.

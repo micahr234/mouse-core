@@ -48,7 +48,7 @@ Use `DataLoader(..., num_workers=4, prefetch=4)` for four persistent processes
 with bounded shared-memory transfer. Standard Python works; no GIL override is
 needed. One event/token budget applies to the whole batch, and `next_batch()`
 returns `(inputs, objective_data)`. Loss boundaries are available as
-`objective_data.to(device)["step_sequence_ids"]`.
+`objective_data.to(device)["sequence_ids"]`.
 
 Spawned processes support notebook-local preprocessing through `cloudpickle`.
 In Python scripts, construct loaders under `if __name__ == "__main__":`.

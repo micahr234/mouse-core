@@ -412,7 +412,7 @@ def test_missing_vector_targets_roundtrip_and_do_not_train_unlabelled_rows(tmp_p
         assert steps[1].objective_fields['q_star'].size == 0
         inputs, labels = pack_token_batch(
             steps=steps, sequence_ids=[0, 0, 0], batch_size=1)
-        assert labels["step_sequence_ids"].shape[0] == 3
+        assert labels["sequence_ids"].shape[0] == 3
         assert torch.isneginf(labels['q_star'][1]).all()
         predictions = torch.zeros((3, 2), requires_grad=True)
         losses, _ = SupervisedObjective(loss_type='mse', target_temperature=None)(

@@ -190,7 +190,7 @@ def _timed(fn: Callable[[], tuple[TensorDict, TensorDict]], iters: int) -> tuple
         t0 = time.perf_counter()
         sample, sample_objective_data = fn()
         times.append((time.perf_counter() - t0) * 1e3)
-        steps += sample_objective_data["step_sequence_ids"].shape[0]
+        steps += sample_objective_data["sequence_ids"].shape[0]
         tokens += sample["token_ids"].shape[0]
     return first, statistics.mean(times), max(times), steps / iters, tokens / iters
 

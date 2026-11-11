@@ -42,11 +42,11 @@ def test_selected_matches_dense_targets_loss_and_gradients(multiple_readouts, te
                      policy_delayed=True, value_delayed=True)]))
     loss = objective(gates[gate_name], temperature=temperature)
     dense_losses, dense_metrics = loss(
-        predictions=q, objective_data=data, group_id=groups, head_step_ids=fixture_head_steps(data),
+        predictions=q, objective_data=data, sequence_ids=groups, step_ids=fixture_head_steps(data),
         backup_value_predictions=delayed, backup_action_predictions=delayed,
     )
     losses, metrics = loss(
-        predictions=selected, objective_data=data, group_id=groups, head_step_ids=fixture_head_steps(data),
+        predictions=selected, objective_data=data, sequence_ids=groups, step_ids=fixture_head_steps(data),
         backup_value_predictions=delayed, backup_action_predictions=delayed,
     )
     torch.testing.assert_close(losses["action_value"], dense_losses["action_value"])
@@ -66,7 +66,7 @@ def test_selected_uses_maximum_of_delayed_actions():
                 terminated=torch.tensor([False, False, True]), truncated=torch.zeros(3, dtype=torch.bool))
     loss = DqnObjective(reward=None, value=None, gate=None, temperature=0.0,
         discount=boundary_discount(gamma_step=0.5, gamma_terminated=0.0, gamma_truncated=0.0))
-    losses, metrics = loss(objective_data=data, group_id=torch.zeros(3, dtype=torch.long), head_step_ids=fixture_head_steps(data),
+    losses, metrics = loss(objective_data=data, sequence_ids=torch.zeros(3, dtype=torch.long), step_ids=fixture_head_steps(data),
                           predictions=q, backup_value_predictions=delayed, backup_action_predictions=delayed)
     backup = metrics["backup"]
     assert isinstance(backup, torch.Tensor)
@@ -87,6 +87,6 @@ def test_selected_rejects_gate_that_needs_online_action_comparison(policy_delaye
 
 def test_selected_rejects_cql():
     with pytest.raises(ValueError, match="CQL requires all-action"):
-        objective(cql_weight=0.5)(objective_data={}, group_id=torch.zeros(3, dtype=torch.long), head_step_ids=torch.arange(3),
+        objective(cql_weight=0.5)(objective_data={}, sequence_ids=torch.zeros(3, dtype=torch.long), step_ids=torch.arange(3),
             predictions=torch.ones(3), backup_value_predictions=torch.ones(3, 2),
             backup_action_predictions=torch.ones(3, 2))

@@ -56,7 +56,7 @@ _BATCH = [_rows(4), _rows(3, offset=1)]
 def test_head_output_is_text_stream() -> None:
     model = _tiny_model()
     batch, objective_data = _token_batch(model, _BATCH)
-    assert batch['numeric_mask'][batch["head_token_mask"].nonzero(as_tuple=True)[0]].tolist() == [False] * objective_data["step_sequence_ids"].shape[0]
+    assert batch['numeric_mask'][batch["head_mask"].nonzero(as_tuple=True)[0]].tolist() == [False] * objective_data["sequence_ids"].shape[0]
 
 
 def test_reasoning_none_matches_plain_forward() -> None:
@@ -107,11 +107,11 @@ def test_reasoning_extends_stream_and_shifts_predictions() -> None:
     batch, objective_data = _token_batch(model, _BATCH)
     with torch.no_grad():
         out = model(batch, objective_data=objective_data, reasoning=[1, 0])
-    assert out["predictions"]["action_value"].shape == (objective_data["step_sequence_ids"].shape[0], _ACTIONS)
+    assert out["predictions"]["action_value"].shape == (objective_data["sequence_ids"].shape[0], _ACTIONS)
     assert out["last_hidden_state"] is not None
     assert out["last_hidden_state"].shape[0] == batch["token_ids"].shape[0] + 2 * 3
     assert out["head_token_ids"] is not None
-    assert out["head_token_ids"].shape[0] == objective_data["step_sequence_ids"].shape[0]
+    assert out["head_token_ids"].shape[0] == objective_data["sequence_ids"].shape[0]
 
 
 def test_burst_changes_only_burst_and_later_steps() -> None:

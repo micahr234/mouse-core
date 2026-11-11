@@ -74,7 +74,7 @@ def _gae_advantages(
         values: ``[N]`` value predictions ``V(s_i)``.
         discounts: ``[N-1]`` per-transition discount (from terminated / truncated).
         valid: ``[N-1]`` mask — False at run boundaries (different
-            ``group_id``).
+            ``sequence_ids``).
         gae_lambda: GAE λ.
 
     Returns:
@@ -125,7 +125,7 @@ class PpoObjective(Objective[...]):
     """Clipped PPO policy+value objective with GAE.
 
     Instantiate with hyperparameters, then call with
-    ``objective_data=``, ``group_id=`` (int64 ``[N]``, one id per step,
+    ``objective_data=``, ``sequence_ids=`` (int64 ``[N]``, one id per step,
     returned beside ``objective_data``), and ``predictions=`` to compute the loss.
 
     Call with the policy logits as ``predictions=`` and the value
@@ -142,7 +142,7 @@ class PpoObjective(Objective[...]):
     are shared. ``old_log_prob`` may also have shape ``[N, K]`` for distinct
     behavior policies, where ``N`` is the number of environment steps.
 
-    A run is one ``group_id`` (one dataloader sample). Neighbor reads must stay in-run: out-of-run
+    A run shares one value in ``sequence_ids`` (one dataloader sample). Neighbor reads must stay in-run: out-of-run
     pairs are multiplied by ``0`` (all-zero weights → loss ``0``). GAE
     advantages and returns for a group are the same in a batch that also
     holds other groups as they are when that group is the whole batch.
@@ -182,12 +182,12 @@ class PpoObjective(Objective[...]):
             ],
         )
         inputs, objective_data = loader.next_batch()
-        group_id = objective_data.to(device)["step_sequence_ids"]
+        sequence_ids = objective_data.to(device)["sequence_ids"]
         out = model(inputs)
         losses, metrics = objective(
             objective_data=objective_data.to(device),
-            group_id=group_id.to(device),
-            head_step_ids=objective_data.to(device)["head_step_ids"],
+            sequence_ids=sequence_ids.to(device),
+            step_ids=objective_data.to(device)["step_ids"],
             predictions=out["predictions"]["action"],
             value_predictions=out["predictions"]["value"],
         )
@@ -263,8 +263,8 @@ class PpoObjective(Objective[...]):
         self,
         *,
         objective_data: dict[str, torch.Tensor],
-        group_id: torch.Tensor,
-        head_step_ids: torch.Tensor,
+        sequence_ids: torch.Tensor,
+        step_ids: torch.Tensor,
         predictions: torch.Tensor,
         value_predictions: torch.Tensor,
         _tensor_metrics: bool = False,
@@ -275,8 +275,8 @@ class PpoObjective(Objective[...]):
         self,
         *,
         objective_data: dict[str, torch.Tensor],
-        group_id: torch.Tensor,
-        head_step_ids: torch.Tensor,
+        sequence_ids: torch.Tensor,
+        step_ids: torch.Tensor,
         predictions: torch.Tensor,
         value_predictions: torch.Tensor,
         backup_value_predictions: None = None,
@@ -289,8 +289,8 @@ class PpoObjective(Objective[...]):
         self,
         *,
         objective_data: dict[str, torch.Tensor],
-        group_id: torch.Tensor,
-        head_step_ids: torch.Tensor,
+        sequence_ids: torch.Tensor,
+        step_ids: torch.Tensor,
         predictions: torch.Tensor,
         backup_value_predictions: torch.Tensor | None = None,
         backup_action_predictions: torch.Tensor | None = None,
@@ -333,8 +333,8 @@ class PpoObjective(Objective[...]):
                     head_data = {**objective_data, self.old_log_prob_key: old_log_prob[:, head]}
                 losses, metrics = self(
                     objective_data=head_data,
-                    group_id=group_id,
-                    head_step_ids=head_step_ids,
+                    sequence_ids=sequence_ids,
+                    step_ids=step_ids,
 
                     predictions=logits[:, head, :],
                     value_predictions=values_raw[:, head],
@@ -356,8 +356,8 @@ class PpoObjective(Objective[...]):
                 f"got {tuple(logits.shape)}."
             )
         original_data = objective_data
-        logits, objective_data, readout = _expand_policy_readouts(objective_data, logits, head_step_ids=head_step_ids, n_steps=group_id.numel(), who="PPO")
-        values_raw, _, _ = _expand_policy_readouts(original_data, values_raw, head_step_ids=head_step_ids, n_steps=group_id.numel(), who="PPO")
+        logits, objective_data, readout = _expand_policy_readouts(objective_data, logits, step_ids=step_ids, n_steps=sequence_ids.numel(), who="PPO")
+        values_raw, _, _ = _expand_policy_readouts(original_data, values_raw, step_ids=step_ids, n_steps=sequence_ids.numel(), who="PPO")
         N, A = logits.shape
         device = cast(torch.device, logits.device)
         dtype = cast(torch.dtype, logits.dtype)
@@ -399,7 +399,7 @@ class PpoObjective(Objective[...]):
                 f"PPO objective expects action shape [{N}], got {tuple(action.shape)}."
             )
         executed = executed_actions(action)
-        _validate_request_actions(readout, executed, group_id)
+        _validate_request_actions(readout, executed, sequence_ids)
         action = canonical_actions(action)
         _require_action_ids(action, A)
 
@@ -429,7 +429,7 @@ class PpoObjective(Objective[...]):
         )
 
         pair_weight = _pair_weight(
-            group_id=group_id,
+            sequence_ids=sequence_ids,
             N=N,
             device=device,
             dtype=dtype,
