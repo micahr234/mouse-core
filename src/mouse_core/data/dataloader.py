@@ -8,7 +8,10 @@ The loader returns
 ``num_workers=0`` prepares synchronously. Positive worker counts use persistent
 spawned processes and bounded, reusable shared-memory result slots. Transforms
 (including notebook-local functions) are serialized once per worker generation.
-Returned arrays are owned by the consumer and survive refresh/close.
+In-memory source datasets are persisted to scoped, memory-mapped snapshots before
+spawning; unchanged sources reuse their files on refresh. Transforms should avoid
+capturing source stores or unbounded decoded caches. Returned arrays are owned by
+the consumer and survive refresh/close.
 
 Batch k uses SeedSequence(seed, spawn_key=(k,)); each sampled segment is reseeded
 with k * (budget + 1) + attempt. Worker count changes throughput, not the stream.
@@ -22,6 +25,7 @@ from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from functools import partial
+from time import perf_counter
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
@@ -31,6 +35,7 @@ from tensordict import TensorDict
 from mouse_core.data.callbacks import accepts_context
 from mouse_core.data.datastore import _normalize_value, _finite_float, _invalid_constant
 from mouse_core.data.process_batches import ProcessBatches
+from mouse_core.data.dataset_snapshot import DatasetSnapshot
 from mouse_core.data.sample_index import SampleChecks, sample_index
 from mouse_core.data.step_sampling import _step_spans, _validate_step_ranges
 from mouse_core.data.token_batch import StepTokens, pack_token_batch
@@ -488,6 +493,10 @@ class DataLoader:
         from mouse_core.data.datastore import Datastore as _DS
 
         self._pool: ProcessBatches | None = None
+        self._snapshots: list[DatasetSnapshot] = []
+        self._snapshot_seconds = 0.0
+        self._last_worker_diagnostics: dict[str, int | float | None] = {
+            "worker_payload_bytes": 0, "worker_startup_seconds": None}
         self._closed = False
         self._next_k = 0
 
@@ -563,24 +572,33 @@ class DataLoader:
         self._ns: list[int] = []
         self._probs: np.ndarray = np.empty(0)
         self._runs: tuple[np.ndarray, ...] = ()
-        self._resnapshot_stores()
-
-        if num_workers > 0:
-            self._start_workers()
+        try:
+            self._resnapshot_stores()
+            if num_workers > 0:
+                self._start_workers()
+        except BaseException:
+            self.close()
+            raise
 
     def refresh(self) -> None:
         """Drop prefetched batches and re-snapshot all stores.
 
         Numbering resumes at the next batch the consumer has not received,
         so batches after the refresh are rebuilt against the new snapshot
-        with their original indices.
+        with their original indices. Unchanged source snapshots reuse their files;
+        changed in-memory sources are persisted again. A failed refresh closes
+        the loader and releases its snapshots.
         """
         if self._closed:
             raise RuntimeError("DataLoader is closed")
         self._stop_workers()
-        self._resnapshot_stores()
-        if self._num_workers > 0:
-            self._start_workers()
+        try:
+            self._resnapshot_stores()
+            if self._num_workers > 0:
+                self._start_workers()
+        except BaseException:
+            self.close()
+            raise
 
     def next_batch(
         self,
@@ -599,9 +617,27 @@ class DataLoader:
         return item
 
     def close(self) -> None:
-        """Stop workers and release shared memory; already returned batches survive."""
+        """Stop workers, then release shared memory and owned snapshot files."""
         self._closed = True
         self._stop_workers()
+        self._datasets = []
+        for snapshot in self._snapshots:
+            snapshot.close()
+        self._snapshots.clear()
+
+    @property
+    def diagnostics(self) -> dict[str, int | float | None]:
+        """Current snapshot storage and worker startup costs.
+
+        Startup is None until all workers report readiness. Payload bytes are
+        serialized size, not an estimate of reconstructed Python memory.
+        """
+        workers = self._last_worker_diagnostics if self._pool is None else {
+            "worker_payload_bytes": self._pool.worker_payload_bytes,
+            "worker_startup_seconds": self._pool.worker_startup_seconds,
+        }
+        return {"snapshot_bytes": sum(snapshot.bytes_written for snapshot in self._snapshots),
+                "snapshot_seconds": self._snapshot_seconds, **workers}
 
     def __enter__(self) -> DataLoader:
         return self
@@ -645,10 +681,15 @@ class DataLoader:
 
     def _stop_workers(self) -> None:
         if self._pool is not None:
+            self._last_worker_diagnostics = {
+                "worker_payload_bytes": self._pool.worker_payload_bytes,
+                "worker_startup_seconds": self._pool.worker_startup_seconds,
+            }
             self._pool.close()
             self._pool = None
 
     def _resnapshot_stores(self) -> None:
+        started = perf_counter()
         build = partial(_event_sample_ranges, sample_field=self.sample_field,
                         sample_ranges=self.sample_ranges, step_field=self.step_field,
                         episode_field=self.episode_field)
@@ -656,7 +697,25 @@ class DataLoader:
                     policy=(self.sample_field, self.sample_ranges, self.step_field, self.episode_field, self.index_field),
                     sample_eligible=self.sample_eligible)
                    for store in self.stores]
-        self._datasets = [item[0] for item in indexes]
+        snapshots = []
+        try:
+            if self._num_workers:
+                for dataset, *_ in indexes:
+                    snapshot = next((old for old in self._snapshots if old.matches(dataset)), None)
+                    snapshots.append(snapshot if snapshot is not None else DatasetSnapshot(dataset))
+            datasets = ([snapshot.dataset for snapshot in snapshots] if self._num_workers
+                        else [item[0] for item in indexes])
+        except BaseException:
+            for snapshot in snapshots:
+                if snapshot not in self._snapshots:
+                    snapshot.close()
+            raise
+        previous, self._snapshots = self._snapshots, snapshots
+        self._datasets = datasets
+        for snapshot in previous:
+            if snapshot not in snapshots:
+                snapshot.close()
+        self._snapshot_seconds = perf_counter() - started
         self._runs = tuple(item[1] for item in indexes)
         self._checks = tuple(item[2] for item in indexes)
 

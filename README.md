@@ -410,6 +410,70 @@ the same callbacks and caches; it still prepares its samples up front for finite
 passes. Ingestion remains owned by the parent, with batched `extend` or
 `extend_event_log`; workers only read snapshots.
 
+With `num_workers > 0`, DataLoader persists in-memory or mixed Arrow datasets
+into scoped memory-mapped snapshots before spawning. Workers reopen files instead
+of deserializing a full copy of replay history. Fully mapped sources borrow their
+existing files, and unchanged source objects reuse their snapshot across refreshes.
+Use the loader as a context manager or call `close()`: workers stop before owned
+snapshot files are deleted. Returned batches remain valid. A failed constructor or
+refresh cleans up its snapshots; a failed refresh leaves the loader closed.
+
+This removes worker amplification of source payloads, but does not bound the
+parent's datastore, sampled events, or arbitrary state captured by a transform.
+Changed in-memory datasets are currently rewritten in full on refresh. For growing
+replay, ingest mapped Arrow shards to avoid repeatedly writing the entire history.
+Temporary snapshots use the system temporary directory (select its filesystem with
+`TMPDIR` before starting Python); provision enough disk space for old and new
+snapshots during replacement. `DatasetSnapshot(dataset, directory=...)` is also
+available for explicit ownership outside DataLoader.
+
+`loader.diagnostics` reports `snapshot_bytes` for currently owned files,
+`snapshot_seconds` for the latest source/index snapshot operation,
+`worker_payload_bytes` for the serialized worker callable and configuration, and
+`worker_startup_seconds` from process-pool construction through the last worker's
+deserialization. Startup is `None` until `next_batch()` consumes all readiness
+notifications. Payload bytes are not reconstructed Python memory. A large payload
+can expose a transform closure that still captures the source or a decoded cache.
+These measurements distinguish snapshot work and worker startup after evaluation
+from model execution. `ProcessBatches` exposes the same worker metrics directly.
+
+The CPU [memory benchmark](bench/bench_replay_memory.py)
+([recorded results](bench/results/replay_memory_2026-11-12.json)) grows an in-memory
+source from 8.2 to 65.6 MiB with two workers. Worker anonymous memory grew 0.92 MiB,
+versus 114.26 MiB for an unsnapshotted reference using the same transport; at the
+larger size the worker payload was 0.50 versus 66.12 MiB. Sample-range metadata still
+grows with row count, so payload size is not constant. Three repeated refreshes
+kept worker memory stable and passed worker, shared-memory, and snapshot cleanup
+checks. These are steady-state CPU measurements, excluding transient peaks and
+parent replay memory. This host uses tmpfs for `/tmp`, so snapshots occupy RAM
+once there; set `TMPDIR` to an actual disk filesystem to offload that storage.
+
+For deterministic tokenization, Core provides an explicit `TokenCache`. Cache only
+complete samples whose result is determined by the key and `content_version`;
+include every tokenizer, scaling, projection, and label dependency in that identity.
+Random augmentation or changing batch context belongs after the cached stage unless
+its inputs are also part of the key. No transform is cached automatically.
+
+```python
+from mouse_core.data import TokenCache
+
+with TokenCache(content_version="tokenizer-and-label-revision-1",
+                max_memory_bytes=64 * 1024 * 1024) as cache:
+    cache.put("immutable-sample-id", encoded_steps)
+    # A transform may capture cache; spawned readers carry only path/version/budget.
+    # Keep this owner open until the DataLoader and all its workers have closed.
+    steps = cache.get("immutable-sample-id")
+```
+
+Keys are immutable: writing a duplicate raises `KeyError`. Spawned handles are
+read-only and never delete the owner's files. Reads return independent mutable
+samples, so packing or augmentation cannot corrupt future reads. Each handle has
+a byte-bounded decoded LRU; zero disables retention, and oversized samples bypass
+it. `memory_bytes` and `cached_samples` report retained samples, excluding caller
+copies, transient allocations, interpreter overhead, and disk storage. The cache
+uses trusted local pickle files and removes its unique directory when its owner
+closes. It is temporary storage, not a portable dataset or checkpoint format.
+
 See the [repeated cold/warm sampling benchmark](bench/results/sample_index_builtin_2026-11-07.md)
 for current indexing/refresh measurements, automatic structural validation,
 and exact batch parity.

@@ -1,0 +1,53 @@
+{
+  "scope": "Local mouse-core RAM protections and V2B package rename; no publication",
+  "core_full_cpu": {
+    "passed": 1692,
+    "skipped": 118,
+    "warnings": 2,
+    "seconds": 229.05
+  },
+  "core_focused_replay_worker_cache_tests": {
+    "passed": 120,
+    "seconds": 102.52
+  },
+  "core_final_token_cache_tests": {
+    "passed": 34,
+    "seconds": 8.97,
+    "note": "Final cache changes checked separately after full suite started."
+  },
+  "core_changed_modules_pyright": {
+    "errors": 0,
+    "warnings": 0
+  },
+  "core_full_source_pyright": {
+    "errors": 9,
+    "files": [
+      "src/mouse_core/models/embedding/features.py",
+      "src/mouse_core/models/embedding/multi.py"
+    ],
+    "baseline": "Both files identical to HEAD. Read-only review found type inference/narrowing issues; runtime scaling, finite output, gradient, and validation smoke checks passed."
+  },
+  "memory_benchmark": "replay_memory_2026-11-12.json",
+  "v2b_full_cpu": {
+    "passed": 1365,
+    "skipped": 23
+  },
+  "v2b_followup_cpu": {
+    "passed": 222
+  },
+  "v2b_local_core_cuda": {
+    "passed_unique_cases": 99,
+    "gpu": "NVIDIA GeForce RTX 3090 Ti",
+    "note": "98 initially passed; corrected standalone head test device placement, then all 8 head tests passed."
+  },
+  "v2b_source_pyright": {
+    "errors": 0,
+    "warnings": 0
+  },
+  "limitations": [
+    "Source snapshots prevent per-worker replay copies, not parent history growth or arbitrary transform captures.",
+    "This host uses tmpfs for /tmp; set TMPDIR to disk-backed storage to offload snapshots.",
+    "Changed in-memory datasets are rewritten in full on refresh.",
+    "V2B local Core integration tested through PYTHONPATH; dependency pin unchanged."
+  ]
+}

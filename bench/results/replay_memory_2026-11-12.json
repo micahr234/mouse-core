@@ -1,0 +1,382 @@
+{
+  "platform": "Linux-7.0.0-42-generic-x86_64-with-glibc2.43",
+  "python": "3.15.2",
+  "cpu_only": true,
+  "workers": 2,
+  "prefetch": 2,
+  "warmup_batches": 32,
+  "events_per_batch": 8,
+  "blob_bytes_per_event": 2048,
+  "seed": 17,
+  "stages": [
+    {
+      "mode": "automatic_snapshot",
+      "stage": "8_MiB",
+      "source_arrow_bytes": 8596394,
+      "construct_or_refresh_seconds": 0.025559486006386578,
+      "diagnostics": {
+        "snapshot_bytes": 8599551,
+        "snapshot_seconds": 0.021715917042456567,
+        "worker_payload_bytes": 68650,
+        "worker_startup_seconds": 4.095625668996945
+      },
+      "parent_memory": {
+        "pid": 1026297,
+        "rss_bytes": 902615040,
+        "pss_bytes": 589423616,
+        "uss_bytes": 550653952,
+        "anonymous_bytes": 550100992,
+        "swap_bytes": 0
+      },
+      "workers": [
+        {
+          "pid": 1026547,
+          "rss_bytes": 866263040,
+          "pss_bytes": 547602432,
+          "uss_bytes": 506417152,
+          "anonymous_bytes": 504565760,
+          "swap_bytes": 0
+        },
+        {
+          "pid": 1026548,
+          "rss_bytes": 865738752,
+          "pss_bytes": 547012608,
+          "uss_bytes": 505835520,
+          "anonymous_bytes": 504541184,
+          "swap_bytes": 0
+        }
+      ],
+      "total": {
+        "rss_bytes": 1732001792,
+        "pss_bytes": 1094615040,
+        "uss_bytes": 1012252672,
+        "anonymous_bytes": 1009106944,
+        "swap_bytes": 0
+      }
+    },
+    {
+      "mode": "automatic_snapshot",
+      "stage": "64_MiB",
+      "source_arrow_bytes": 68801690,
+      "construct_or_refresh_seconds": 0.22845121897989884,
+      "diagnostics": {
+        "snapshot_bytes": 68814255,
+        "snapshot_seconds": 0.16666493500815704,
+        "worker_payload_bytes": 527402,
+        "worker_startup_seconds": 4.122097862011287
+      },
+      "parent_memory": {
+        "pid": 1026297,
+        "rss_bytes": 1099051008,
+        "pss_bytes": 790739968,
+        "uss_bytes": 744529920,
+        "anonymous_bytes": 744005632,
+        "swap_bytes": 0
+      },
+      "workers": [
+        {
+          "pid": 1026732,
+          "rss_bytes": 873758720,
+          "pss_bytes": 561244160,
+          "uss_bytes": 513904640,
+          "anonymous_bytes": 504995840,
+          "swap_bytes": 0
+        },
+        {
+          "pid": 1026733,
+          "rss_bytes": 872783872,
+          "pss_bytes": 560256000,
+          "uss_bytes": 512892928,
+          "anonymous_bytes": 505077760,
+          "swap_bytes": 0
+        }
+      ],
+      "total": {
+        "rss_bytes": 1746542592,
+        "pss_bytes": 1121500160,
+        "uss_bytes": 1026797568,
+        "anonymous_bytes": 1010073600,
+        "swap_bytes": 0
+      }
+    },
+    {
+      "mode": "automatic_snapshot",
+      "stage": "64_MiB_refresh_1",
+      "source_arrow_bytes": 68801690,
+      "construct_or_refresh_seconds": 0.06482107704505324,
+      "diagnostics": {
+        "snapshot_bytes": 68814255,
+        "snapshot_seconds": 2.154003595933318e-05,
+        "worker_payload_bytes": 527402,
+        "worker_startup_seconds": 4.02865972899599
+      },
+      "parent_memory": {
+        "pid": 1026297,
+        "rss_bytes": 1099055104,
+        "pss_bytes": 790726656,
+        "uss_bytes": 744468480,
+        "anonymous_bytes": 744009728,
+        "swap_bytes": 0
+      },
+      "workers": [
+        {
+          "pid": 1026818,
+          "rss_bytes": 871374848,
+          "pss_bytes": 559883264,
+          "uss_bytes": 512765952,
+          "anonymous_bytes": 505004032,
+          "swap_bytes": 0
+        },
+        {
+          "pid": 1026819,
+          "rss_bytes": 872538112,
+          "pss_bytes": 560645120,
+          "uss_bytes": 513306624,
+          "anonymous_bytes": 504983552,
+          "swap_bytes": 0
+        }
+      ],
+      "total": {
+        "rss_bytes": 1743912960,
+        "pss_bytes": 1120528384,
+        "uss_bytes": 1026072576,
+        "anonymous_bytes": 1009987584,
+        "swap_bytes": 0
+      }
+    },
+    {
+      "mode": "automatic_snapshot",
+      "stage": "64_MiB_refresh_2",
+      "source_arrow_bytes": 68801690,
+      "construct_or_refresh_seconds": 0.06765643099788576,
+      "diagnostics": {
+        "snapshot_bytes": 68814255,
+        "snapshot_seconds": 3.064697375521064e-05,
+        "worker_payload_bytes": 527402,
+        "worker_startup_seconds": 4.0585082689649425
+      },
+      "parent_memory": {
+        "pid": 1026297,
+        "rss_bytes": 1099055104,
+        "pss_bytes": 791362560,
+        "uss_bytes": 744701952,
+        "anonymous_bytes": 744009728,
+        "swap_bytes": 0
+      },
+      "workers": [
+        {
+          "pid": 1026900,
+          "rss_bytes": 870588416,
+          "pss_bytes": 560645120,
+          "uss_bytes": 513720320,
+          "anonymous_bytes": 505053184,
+          "swap_bytes": 0
+        },
+        {
+          "pid": 1026901,
+          "rss_bytes": 869056512,
+          "pss_bytes": 559454208,
+          "uss_bytes": 512802816,
+          "anonymous_bytes": 505036800,
+          "swap_bytes": 0
+        }
+      ],
+      "total": {
+        "rss_bytes": 1739644928,
+        "pss_bytes": 1120099328,
+        "uss_bytes": 1026523136,
+        "anonymous_bytes": 1010089984,
+        "swap_bytes": 0
+      }
+    },
+    {
+      "mode": "automatic_snapshot",
+      "stage": "64_MiB_refresh_3",
+      "source_arrow_bytes": 68801690,
+      "construct_or_refresh_seconds": 0.06622275104746222,
+      "diagnostics": {
+        "snapshot_bytes": 68814255,
+        "snapshot_seconds": 2.5311019271612167e-05,
+        "worker_payload_bytes": 527402,
+        "worker_startup_seconds": 4.000132818007842
+      },
+      "parent_memory": {
+        "pid": 1026297,
+        "rss_bytes": 1099055104,
+        "pss_bytes": 793085952,
+        "uss_bytes": 744513536,
+        "anonymous_bytes": 744009728,
+        "swap_bytes": 0
+      },
+      "workers": [
+        {
+          "pid": 1027003,
+          "rss_bytes": 867831808,
+          "pss_bytes": 562169856,
+          "uss_bytes": 513159168,
+          "anonymous_bytes": 504991744,
+          "swap_bytes": 0
+        },
+        {
+          "pid": 1027004,
+          "rss_bytes": 868622336,
+          "pss_bytes": 562688000,
+          "uss_bytes": 513581056,
+          "anonymous_bytes": 505147392,
+          "swap_bytes": 0
+        }
+      ],
+      "total": {
+        "rss_bytes": 1736454144,
+        "pss_bytes": 1124857856,
+        "uss_bytes": 1026740224,
+        "anonymous_bytes": 1010139136,
+        "swap_bytes": 0
+      }
+    },
+    {
+      "mode": "in_memory_transport_reference",
+      "stage": "8_MiB",
+      "source_arrow_bytes": 8596394,
+      "construct_or_refresh_seconds": 0.014524140977300704,
+      "diagnostics": {
+        "worker_payload_bytes": 8665576,
+        "worker_startup_seconds": 3.9175416689831764
+      },
+      "parent_memory": {
+        "pid": 1026297,
+        "rss_bytes": 1058766848,
+        "pss_bytes": 752162816,
+        "uss_bytes": 699260928,
+        "anonymous_bytes": 697880576,
+        "swap_bytes": 0
+      },
+      "workers": [
+        {
+          "pid": 1027077,
+          "rss_bytes": 876875776,
+          "pss_bytes": 567913472,
+          "uss_bytes": 515162112,
+          "anonymous_bytes": 515162112,
+          "swap_bytes": 0
+        },
+        {
+          "pid": 1027078,
+          "rss_bytes": 876920832,
+          "pss_bytes": 567864320,
+          "uss_bytes": 515149824,
+          "anonymous_bytes": 515051520,
+          "swap_bytes": 0
+        }
+      ],
+      "total": {
+        "rss_bytes": 1753796608,
+        "pss_bytes": 1135777792,
+        "uss_bytes": 1030311936,
+        "anonymous_bytes": 1030213632,
+        "swap_bytes": 0
+      }
+    },
+    {
+      "mode": "in_memory_transport_reference",
+      "stage": "64_MiB",
+      "source_arrow_bytes": 68801690,
+      "construct_or_refresh_seconds": 0.07995239499723539,
+      "diagnostics": {
+        "worker_payload_bytes": 69330402,
+        "worker_startup_seconds": 3.9744161780108698
+      },
+      "parent_memory": {
+        "pid": 1026297,
+        "rss_bytes": 1119432704,
+        "pss_bytes": 772269056,
+        "uss_bytes": 699416576,
+        "anonymous_bytes": 697880576,
+        "swap_bytes": 0
+      },
+      "workers": [
+        {
+          "pid": 1027143,
+          "rss_bytes": 998686720,
+          "pss_bytes": 648181760,
+          "uss_bytes": 575037440,
+          "anonymous_bytes": 575021056,
+          "swap_bytes": 0
+        },
+        {
+          "pid": 1027144,
+          "rss_bytes": 998543360,
+          "pss_bytes": 648285184,
+          "uss_bytes": 575197184,
+          "anonymous_bytes": 575004672,
+          "swap_bytes": 0
+        }
+      ],
+      "total": {
+        "rss_bytes": 1997230080,
+        "pss_bytes": 1296466944,
+        "uss_bytes": 1150234624,
+        "anonymous_bytes": 1150025728,
+        "swap_bytes": 0
+      }
+    }
+  ],
+  "cleanup": [
+    {
+      "after": "growth_refresh",
+      "workers_gone": true,
+      "shared_memory_unlinked": true,
+      "obsolete_snapshot_directories_removed": true
+    },
+    {
+      "after": "repeat_refresh_1",
+      "workers_gone": true,
+      "shared_memory_unlinked": true,
+      "obsolete_snapshot_directories_removed": true
+    },
+    {
+      "after": "repeat_refresh_2",
+      "workers_gone": true,
+      "shared_memory_unlinked": true,
+      "obsolete_snapshot_directories_removed": true
+    },
+    {
+      "after": "repeat_refresh_3",
+      "workers_gone": true,
+      "shared_memory_unlinked": true,
+      "obsolete_snapshot_directories_removed": true
+    },
+    {
+      "after": "automatic_loader_close",
+      "workers_gone": true,
+      "shared_memory_unlinked": true,
+      "obsolete_snapshot_directories_removed": true
+    },
+    {
+      "after": "reference_8_MiB_close",
+      "workers_gone": true,
+      "shared_memory_unlinked": true,
+      "obsolete_snapshot_directories_removed": true
+    },
+    {
+      "after": "reference_64_MiB_close",
+      "workers_gone": true,
+      "shared_memory_unlinked": true,
+      "obsolete_snapshot_directories_removed": true
+    }
+  ],
+  "limitations": [
+    "Synthetic JSON events, fixed small transform and batch size; not a training or GPU benchmark.",
+    "USS/PSS are Linux smaps_rollup snapshots after warmup, not transient peak memory.",
+    "Both modes use the new direct-buffer worker transport; the reference isolates automatic mmap snapshot protection.",
+    "Per-sample indices and eligibility metadata legitimately grow with row count and remain in the worker payload.",
+    "The parent retains the in-memory source; mmap snapshots prevent worker copies, not parent replay growth.",
+    "No claim that arbitrary user transform closures or objects are bounded by snapshot protection.",
+    "This recorded host uses tmpfs for /tmp, so snapshot files occupy RAM once there; set TMPDIR to an actual disk filesystem to offload snapshot storage."
+  ],
+  "temporary_storage": {
+    "directory": "/tmp",
+    "mount": "/tmp",
+    "filesystem": "tmpfs"
+  }
+}

@@ -1,13 +1,17 @@
 """Process transport ownership, failure, and notebook callback contracts."""
 import os
 import threading
+import time
+import weakref
 from multiprocessing.shared_memory import SharedMemory
 
+import cloudpickle
 import numpy as np
 import pytest
 import torch
 
 from mouse_core.data import StepTokens, pack_token_batch
+from mouse_core.data import process_batches
 from mouse_core.data.process_batches import ProcessBatches
 from tests.test_dataloader import _loader
 
@@ -106,3 +110,116 @@ def test_loader_close_is_terminal_and_old_batch_survives_refresh():
 def test_removed_fill_count_is_rejected():
     with pytest.raises(TypeError, match="batch_size"):
         _loader(events_budget=3, batch_size=1)
+
+
+def test_worker_diagnostics_include_idle_workers_and_exclude_consumer_delay():
+    # An idle worker still needs to report readiness when prefetch < workers.
+    started = time.perf_counter()
+    pool = ProcessBatches(_batch, workers=2, prefetch=1, start=7)
+    try:
+        assert pool.worker_payload_bytes == len(cloudpickle.dumps(_batch))
+        assert pool.worker_startup_seconds is None
+        # Observe notifications waiting in the pipes without consuming them.
+        for connection in pool._connections:
+            assert connection.poll(30), "worker did not report startup"
+        time.sleep(0.2)
+        inputs, _ = pool.next_batch()
+        assert inputs["token_ids"].tolist() == [7, 7, 7]
+        assert pool.worker_startup_seconds is not None
+        assert 0 < pool.worker_startup_seconds < time.perf_counter() - started - 0.15
+        assert not pool._starting
+        diagnostics = pool.worker_payload_bytes, pool.worker_startup_seconds
+    finally:
+        pool.close()
+    assert (pool.worker_payload_bytes, pool.worker_startup_seconds) == diagnostics
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_worker_mapping_survives_deserialized_views_and_closes_after_callable_cycles(monkeypatch, fail):
+    # Exercise a deserializer retaining views rather than assume pickle always
+    # copies its input. The callable deliberately owns an unreachable cycle.
+    payload = SharedMemory(create=True, size=16)
+    output = SharedMemory(create=True, size=65536)
+    payload.buf[:] = bytes(range(16))
+    references = []
+
+    class Connection:
+        def __init__(self):
+            self.jobs = iter([(3, output.name, output.size, None), None])
+            self.messages = []
+            self.closed = False
+
+        def recv(self):
+            return next(self.jobs)
+
+        def send(self, message):
+            self.messages.append(message)
+
+        def close(self):
+            self.closed = True
+
+    def loads(buffer):
+        assert isinstance(buffer, memoryview)
+        assert buffer.readonly
+
+        class Build:
+            def __init__(self):
+                self.values = np.frombuffer(buffer, dtype=np.uint8)
+                self.cycle = self
+
+            def __call__(self, index):
+                if fail:
+                    raise ValueError(f"retained view still readable: {self.values[7]}")
+                return _batch(index + int(self.values[7]))
+
+        build = Build()
+        references.append(weakref.ref(build))
+        return build
+
+    connection = Connection()
+    monkeypatch.setattr(process_batches.cloudpickle, "loads", loads)
+    monkeypatch.setattr(process_batches.torch, "set_num_threads", lambda _: None)
+    try:
+        process_batches._worker(connection, payload.name)
+        assert connection.closed
+        assert [message[0] for message in connection.messages] == ["started", "error" if fail else "ready"]
+        assert references[0]() is None
+        if fail:
+            assert "retained view still readable: 7" in connection.messages[1][1]
+        else:
+            descriptors = connection.messages[1][2]
+            _, _, shape, dtype, offset = next(item for item in descriptors if item[1] == "token_ids")
+            actual = np.ndarray(shape, dtype=dtype, buffer=output.buf, offset=offset).copy()
+            assert actual.tolist() == [10, 10, 10]
+        # The worker closes its mapping but never unlinks the parent's payload.
+        assert bytes(payload.buf) == bytes(range(16))
+    finally:
+        output.close()
+        output.unlink()
+        payload.close()
+        payload.unlink()
+
+
+def _fail_during_deserialization():
+    raise ValueError("test startup deserialization exploded")
+
+
+class _StartupFailure:
+    def __reduce__(self):
+        return _fail_during_deserialization, ()
+
+
+def test_startup_deserialization_failure_reports_traceback_and_releases_payload():
+    pool = ProcessBatches(_StartupFailure(), workers=2, prefetch=1)
+    assert pool._payload is not None
+    payload_name = pool._payload.name
+    try:
+        with pytest.raises(RuntimeError, match="test startup deserialization exploded"):
+            pool.next_batch()
+        assert pool._closed
+        assert pool.worker_startup_seconds is None
+        assert pool.worker_payload_bytes > 0
+        with pytest.raises(FileNotFoundError):
+            SharedMemory(name=payload_name)
+    finally:
+        pool.close()

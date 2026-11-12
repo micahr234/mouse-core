@@ -7,6 +7,8 @@ from mouse_core.data.events import EventLog
 from mouse_core.data.dataloader import DataLoader
 from mouse_core.data.epoch_loader import EpochDataLoader
 from mouse_core.data.datastore import Datastore
+from mouse_core.data.dataset_snapshot import DatasetSnapshot
+from mouse_core.data.token_cache import TokenCache
 from mouse_core.data.hub import load_stores_from_hub, push_stores_to_hub, push_to_hub
 from mouse_core.data.augmenter import (
     Augmenter,
@@ -23,6 +25,8 @@ __all__ = [
     "DataLoader",
     "EpochDataLoader",
     "Datastore",
+    "DatasetSnapshot",
+    "TokenCache",
     "SequenceAugmentFieldSpec",
     "TokenizerModalitySpec",
     "Tokenizer",

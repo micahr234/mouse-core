@@ -6,11 +6,13 @@ returned batch remains valid after the next read, refresh or close.
 """
 from __future__ import annotations
 
+import gc
 import multiprocessing as mp
 import traceback
 from collections import deque
 from multiprocessing.connection import Connection, wait
 from multiprocessing.shared_memory import SharedMemory
+from time import perf_counter
 from types import MappingProxyType
 from typing import cast
 
@@ -42,40 +44,47 @@ def _arrays(batch):
     return metadata, arrays, descriptors, max(1, offset)
 
 
+def _prepare_batches(connection, build):
+    while True:
+        job = connection.recv()
+        if job is None:
+            return
+        index, name, capacity, context_payload = job
+        if context_payload is None:
+            batch = build(index)
+        else:
+            context = MappingProxyType(cloudpickle.loads(context_payload))
+            batch = build(index, context=context)
+        metadata, arrays, descriptors, required = _arrays(batch)
+        if required > capacity:
+            connection.send(("resize", required))
+            name = connection.recv()
+        memory = SharedMemory(name=name, track=False)
+        try:
+            for (_, _, array), (_, _, shape, dtype, offset) in zip(arrays, descriptors):
+                view = np.ndarray(shape, dtype=dtype, buffer=memory.buf, offset=offset)
+                np.copyto(view, array)
+                del view
+        finally:
+            memory.close()
+        connection.send(("ready", metadata, descriptors))
+
+
 def _worker(connection, build_name):
     # Spawn never inherits the training process's CUDA context. This worker
     # executes CPU data preparation only; do not initialize CUDA here.
-    torch.set_num_threads(1)
+    payload = payload_view = build = None
     try:
+        torch.set_num_threads(1)
         payload = SharedMemory(name=build_name, track=False)
-        try:
-            assert payload.buf is not None
-            build = cloudpickle.loads(bytes(payload.buf))
-        finally:
-            payload.close()
-        while True:
-            job = connection.recv()
-            if job is None:
-                return
-            index, name, capacity, context_payload = job
-            if context_payload is None:
-                batch = build(index)
-            else:
-                context = MappingProxyType(cloudpickle.loads(context_payload))
-                batch = build(index, context=context)
-            metadata, arrays, descriptors, required = _arrays(batch)
-            if required > capacity:
-                connection.send(("resize", required))
-                name = connection.recv()
-            memory = SharedMemory(name=name, track=False)
-            try:
-                for (_, _, array), (_, _, shape, dtype, offset) in zip(arrays, descriptors):
-                    view = np.ndarray(shape, dtype=dtype, buffer=memory.buf, offset=offset)
-                    np.copyto(view, array)
-                    del view
-            finally:
-                memory.close()
-            connection.send(("ready", metadata, descriptors))
+        assert payload.buf is not None
+        # Unpickling accepts a buffer directly. Avoid a payload-sized bytes
+        # allocation in every worker, and keep the mapping alive in case a
+        # deserializer retains views into it.
+        payload_view = payload.buf.toreadonly()
+        build = cloudpickle.loads(payload_view)
+        connection.send(("started", perf_counter()))
+        _prepare_batches(connection, build)
     except EOFError:
         pass
     except BaseException:
@@ -84,16 +93,31 @@ def _worker(connection, build_name):
         except (BrokenPipeError, EOFError, OSError):
             pass
     finally:
-        connection.close()
+        # The batch-loop frame is gone before releasing the startup mapping.
+        # Collect callable cycles as well, since they can own buffer views.
+        build = None
+        gc.collect()
+        try:
+            if payload_view is not None:
+                payload_view.release()
+            if payload is not None:
+                payload.close()
+        finally:
+            connection.close()
 
 
 class ProcessBatches:
     """Persistent spawned workers; at most ``prefetch`` unconsumed batches."""
 
     def __init__(self, build, *, workers, prefetch, start=0, context_for_batch=None):
+        self._startup_started = perf_counter()
+        self._startup_ready_at = self._startup_started
+        self._worker_startup_seconds: float | None = None
+        self._worker_payload_bytes = 0
         self._context_for_batch = context_for_batch
         self._processes = []
         self._connections: list[Connection] = []
+        self._starting: set[Connection] = set()
         self._active: dict[Connection, tuple[int, int]] = {}
         self._ready = {}
         self._slots: list[SharedMemory | None] = [None] * prefetch
@@ -109,6 +133,7 @@ class ProcessBatches:
             payload = cloudpickle.dumps(build)
         except Exception as exc:
             raise TypeError("Cannot serialize the data transform for process workers") from exc
+        self._worker_payload_bytes = len(payload)
         context = mp.get_context("spawn")
         try:
             self._payload = SharedMemory(create=True, size=len(payload))
@@ -127,10 +152,30 @@ class ProcessBatches:
                 child.close()
                 self._processes.append(process)
                 self._connections.append(parent)
+                self._starting.add(parent)
             self._schedule()
         except BaseException:
             self.close()
             raise
+
+    @property
+    def worker_payload_bytes(self) -> int:
+        """Serialized transform bytes shared with each worker in this generation.
+
+        This is transport size, not a bound on deserialized worker memory.
+        The diagnostic remains available after close.
+        """
+        return self._worker_payload_bytes
+
+    @property
+    def worker_startup_seconds(self) -> float | None:
+        """Construction to the last worker finishing deserialization, in seconds.
+
+        Includes serialization and process startup. None until next_batch has
+        observed every startup notification; excludes delayed consumption and
+        batch preparation. The last observed value remains available after close.
+        """
+        return self._worker_startup_seconds
 
     def _schedule(self):
         for connection in self._connections:
@@ -151,12 +196,20 @@ class ProcessBatches:
             raise RuntimeError("DataLoader is closed")
         try:
             while self._next_read not in self._ready:
-                for ready_connection in wait(list(self._active), timeout=0.05):
+                for ready_connection in wait(list(self._active.keys() | self._starting), timeout=0.05):
                     connection = cast(Connection, ready_connection)
                     try:
                         message = connection.recv()
                     except (EOFError, OSError) as exc:
                         raise RuntimeError("Data preparation worker disconnected unexpectedly") from exc
+                    if message[0] == "started":
+                        self._starting.remove(connection)
+                        self._startup_ready_at = max(self._startup_ready_at, message[1])
+                        if not self._starting:
+                            self._worker_startup_seconds = self._startup_ready_at - self._startup_started
+                        continue
+                    if message[0] == "error":
+                        raise RuntimeError("A data preparation worker raised an exception:\n" + message[1])
                     index, slot = self._active[connection]
                     if message[0] == "resize":
                         memory = self._slots[slot]
@@ -169,8 +222,6 @@ class ProcessBatches:
                         memory = SharedMemory(create=True, size=capacity)
                         self._slots[slot] = memory
                         connection.send(memory.name)
-                    elif message[0] == "error":
-                        raise RuntimeError("A data preparation worker raised an exception:\n" + message[1])
                     else:
                         self._ready[index] = (slot, message[1], message[2])
                         del self._active[connection]
@@ -225,6 +276,7 @@ class ProcessBatches:
             self._payload = None
         self._active.clear()
         self._ready.clear()
+        self._starting.clear()
 
     def __del__(self):
         if hasattr(self, "_closed"):
