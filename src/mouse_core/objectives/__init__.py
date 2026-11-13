@@ -3,7 +3,7 @@ from mouse_core.objectives.replicate import ReplicateObjective
 from mouse_core.objectives.base import Objective
 from mouse_core.objectives.cosine import CosineObjective
 from mouse_core.objectives.dqn import DqnObjective
-from mouse_core.objectives.value_diffusion import ValueDiffusionObjective
+from mouse_core.objectives.diffusion_dqn import DiffusionDqnObjective
 from mouse_core.objectives.transforms import (
     Discount,
     Gate,
@@ -33,7 +33,7 @@ __all__ = [
     "Reward",
     "Value",
     "DqnObjective",
-    "ValueDiffusionObjective",
+    "DiffusionDqnObjective",
     "affine_reward",
     "affine_value",
     "boundary_discount",

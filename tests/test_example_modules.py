@@ -42,10 +42,10 @@ from mouse_core.objectives import (
 from tests._token_batch_helpers import batch_to_token_batch, token_tokenizer
 
 EXAMPLES = Path(__file__).resolve().parents[1] / "examples"
-# The replica/layer contract is exercised in test_value_diffusion_notebook.py.
 NOTEBOOKS = [path for path in sorted(EXAMPLES.glob("*.ipynb"))
              if "class Encoder(Model):" in path.read_text()
-             and path.name != "24_train_offline_value_diffusion.ipynb"]
+             # Its velocity head is exercised in test_diffusion_dqn.py.
+             and path.name != "24_train_offline_diffusion_dqn.ipynb"]
 
 
 def _tokens(*actions):

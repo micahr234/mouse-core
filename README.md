@@ -126,101 +126,22 @@ shared `[P]` or per head `[P, K]`. The default `mask_key=None` keeps all rows
 with eligible targets. See the [policy example](examples/09_train_offline_sp.ipynb)
 and [value example](examples/05_train_offline_sv.ipynb).
 
-## Value diffusion objective
-
-[Example 24](examples/24_train_offline_value_diffusion.ipynb) defines `ValueFlow`
-alongside `Encoder`, including its RMSNorm, context projection, return/time
-features, velocity MLP, trajectory storage, and Euler integration. `ValueFlow` inherits
-directly from `nn.Module`; its full implementation is in the notebook.
-The transformer supplies its final value-token readout `[P,H]`; the flow model
-RMS-normalizes this context and combines it with Fourier features of the current
-return and time. Each action has a scalar return flow. Integration steps are
-independent of transformer depth.
-
-`ValueDiffusionObjective` follows DQN's calling style: supply replay labels,
-sequence/readout indices, online predictions, and delayed backup predictions.
-It handles replay alignment, automatic-step rewards, discounts, greedy selection,
-terminal masking, and the [Value Forcing Q-only loss](https://arxiv.org/html/2611.02160v1#A4.SS5).
-The objective builds the online velocity's Bellman-transformed input with
-`inputs`, including replay alignment, greedy selection, and terminal masking. Both network evaluations finish before the
-objective receives their predictions. All learned models and noise draws stay
-outside the objective.
-
-```python
-objective = ValueDiffusionObjective(
-    discount=boundary_discount(
-        gamma_step=GAMMA_STEP, gamma_terminated=0.0, gamma_truncated=0.0,
-    ),
-    reward=None,
-)
-with torch.no_grad():
-    sequences, noise_ids = torch.unique(sequence_ids[step_ids], return_inverse=True)
-    z0 = torch.randn(len(sequences), device=device)[noise_ids]
-    noise = torch.randn_like(z0)  # N, independent of Z's initial draw.
-    delayed_trajectory = delayed_flow.trajectory(delayed_out["z"], initial_samples=z0)
-    z_tau = delayed_trajectory.samples
-    flow_inputs = objective.inputs(
-        objective_data=objective_data, sequence_ids=sequence_ids, step_ids=step_ids,
-        backup_samples=z_tau, backup_action_predictions=delayed_trajectory.returns,
-        noise_levels=delayed_trajectory.noise_levels, noise=noise,
-    )
-    delayed_predictions = delayed_flow(
-        delayed_out["z"], z_tau, times=delayed_trajectory.noise_levels,
-    )
-predictions = flow(out["z"], flow_inputs, times=delayed_trajectory.noise_levels)
-losses, metrics = objective(
-    objective_data=objective_data, sequence_ids=sequence_ids, step_ids=step_ids,
-    predictions=predictions,
-    backup_value_predictions=delayed_predictions,
-    backup_action_predictions=delayed_trajectory.returns, noise=noise,
-)
-```
-
-After sampling the delayed path, both Q-velocity networks are evaluated explicitly.
-The delayed batched forward reevaluates the velocities used during integration.
-The input and velocity target use the same delayed trajectory and correction draw. Z's initial draw
-is shared across each replay sequence, so s and s′ use the same starting noise;
-N remains independent per readout. At each flow time, the same next-state sample
-z_tau constructs the online input and supplies the delayed target velocity.
-
-The model has two operations:
-
-- `flow(features, samples, times=times)` predicts velocities without sampling.
-- `flow.trajectory(features, initial_samples=seeds)` retains intermediate samples
-  and velocities `[P,T,A]`, with endpoint returns `[P,A]`, for the delayed backup.
-
-For inference, draw one noise value per readout to form `seeds` with shape `[P]`.
-The trajectory method expands it across actions. Under `torch.no_grad()`, call
-`flow.trajectory(features, initial_samples=seeds).returns` for `[P,A]` action values.
-Pass a seeded `generator=` to `torch.randn` for reproducible noise draws.
-No sampling occurs inside the transformer.
-
-Example 24 uses one delayed trajectory and reuses its endpoint values for greedy
-action selection. It draws independent correction noise and evaluates the complete
-delayed branch under `torch.no_grad()`. Selection and bootstrap evaluation both
-use the delayed model (plain DQN). Online gradients
-pass through the velocity network, context RMSNorm, and transformer embedding.
-At each flow time t it constructs:
-
-- Online input: `x = t*r + g*z_next + (1-t)*sqrt(1-g*g)*epsilon`.
-- Velocity target: `u = r + g*v_next - sqrt(1-g*g)*epsilon`.
-
-Rewards follow ordinary DQN: the paper's practical `(1-gamma)` reward scaling
-is not applied implicitly. This discrete-action example uses delayed greedy
-action selection and supervises the integration grid rather than sampling flow times.
-
-At termination g=0, these become `(t*r+(1-t)*epsilon, r-epsilon)`.
-DQN incoming-action alignment, automatic-step backups, and missing terminal
-readouts are supported. Loss metrics include `per_flow_step`, `backup`, and
-`backup_weight`. The objective also reports `effective_discount`; the example logs `flow_inputs`.
-All metrics are detached.
-
-Euler integration uses `arange(num_steps)/num_steps`, with the last update ending
-at 1. An explicit `noise_levels=` schedule must match the step count and increase
-from zero within `[0,1]`. [Example 24](examples/24_train_offline_value_diffusion.ipynb)
-shows training, delayed updates, and local checkpoint saving.
-
 ## Start with FrozenLake
+
+[Example 24](examples/24_train_offline_diffusion_dqn.ipynb) copies example 2 with
+a joint action-vector diffusion head conditioned on the backbone's final features.
+It starts each action from independent Gaussian noise and predicts all velocities
+from the complete action vector. `DiffusionDqnObjective` extends the
+[Q-only Value Forcing loss](https://arxiv.org/html/2611.02160v1#A4.SS5): the taken
+action alone receives a one-step Bellman velocity loss at every diffusion step.
+Other actions retain delayed current-state samples as input context, with no
+direct loss. The paper's scalar flow-matching result does not automatically
+extend to this coupled, selected-action loss or identify counterfactual return
+correlations.
+The Gaussian correction is
+computed from the supplied discount (including zero at outer termination).
+The environment, tokenizer, and encoder are unchanged. There are no n-step gates;
+automatic reset rows follow the existing one-step DQN alignment.
 
 Follow these three notebooks:
 
@@ -230,13 +151,6 @@ Follow these three notebooks:
 3. [Run inference](examples/15_inference.ipynb) — load that checkpoint and evaluate with cached history.
 
 The [FrozenLake autoregressive reasoning notebook](examples/23_train_autoregressive_reasoning_dqn.ipynb) adds autoregressive vocabulary reasoning to the same Mouse model and uses negative DQN error as a REINFORCE reward.
-
-The experimental [offline value diffusion notebook](examples/24_train_offline_value_diffusion.ipynb)
-follows example 2's FrozenLake data pipeline and notebook layout. It defines an encoder,
-ValueFlow network, and training loop, using `ValueDiffusionObjective` for the velocity loss.
-The complete flow model, including trajectory generation and integration, is defined in the notebook.
-`ValueFlow` owns the velocity network and trajectory integration. The loop evaluates all
-models explicitly; the objective constructs Q-only inputs/targets and reduces the loss. The tokenizer is identical to the ordinary DQN example.
 
 Mouse transformer backbones always use **FlexAttention**, with no kernel selection arguments, for packed training, rectangular forwards, and paged cached generation. Training requires CUDA; CPU supports inference under `torch.no_grad()`. The optional `kernels` extra can accelerate supported decoder modules when enabled with `backbone.enable_kernels()`; attention remains FlexAttention.
 
