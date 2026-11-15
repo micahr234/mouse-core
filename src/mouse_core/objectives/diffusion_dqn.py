@@ -1,5 +1,7 @@
 """One-step Value Forcing extended to a jointly evolving action vector."""
 
+import math
+
 import torch
 
 from mouse_core.objectives.base import Objective
@@ -20,8 +22,12 @@ class DiffusionDqnObjective(Objective[...]):
     ``prepare`` aligns incoming replay labels and constructs detached flow inputs
     and targets. Networks and noise sampling remain in the caller. Paths and
     velocities are [P, T, A]; action scores are [P, A], times [T], noise [P].
-    P counts readouts, T diffusion steps, and A actions. The independent Gaussian
-    correction draw is shared across diffusion times for each readout.
+    P counts readouts, T diffusion steps, and A actions. ``noise`` contains
+    independent standard Gaussian draws, one per readout shared across diffusion
+    times. Backup paths start from N(noise_mean, noise_std**2), independently
+    of these correction draws. Fixed mean and standard deviation are shared
+    across states and actions; zero standard deviation gives deterministic starts.
+    The correction preserves this Gaussian prior for discounts in [0, 1].
 
     Only the taken action receives a velocity loss. Its input is the scalar
     Q-only Bellman sample; other input coordinates retain their delayed
@@ -35,9 +41,19 @@ class DiffusionDqnObjective(Objective[...]):
     the paper's optional reward normalization is not applied implicitly.
     """
 
-    def __init__(self, *, discount: Discount | None, reward: Reward | None = None) -> None:
+    def __init__(
+        self, *, discount: Discount | None, reward: Reward | None = None,
+        noise_mean: float = 0.0, noise_std: float = 1.0,
+    ) -> None:
         self.discount = _require_transform(discount, name="discount")
         self.reward = _require_transform(reward, name="reward")
+        for name, value in (("noise_mean", noise_mean), ("noise_std", noise_std)):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ValueError(f"{name} must be a finite number.")
+        if noise_std < 0:
+            raise ValueError("noise_std must be nonnegative.")
+        self.noise_mean = float(noise_mean)
+        self.noise_std = float(noise_std)
 
     @torch.no_grad()
     def prepare(
@@ -61,6 +77,8 @@ class DiffusionDqnObjective(Objective[...]):
         for tensor in (backup_samples, backup_value_predictions, backup_action_predictions, times, noise):
             if tensor.dtype != torch.float32 or tensor.device != backup_samples.device:
                 raise ValueError("Flow tensors must be float32 on the same device.")
+        if not bool(torch.isfinite(noise).all()):
+            raise ValueError("noise must contain finite standard Gaussian draws.")
 
         device = backup_samples.device
         action = objective_data["action"]
@@ -95,7 +113,7 @@ class DiffusionDqnObjective(Objective[...]):
         values = _step_predictions(values, last_rows).masked_fill(
             (automatic | (discount == 0))[:, None], 0,
         )
-        # One existing DQN scan gives R, G, G*z_next, G*v_next. It only
+        # One existing DQN scan gives R, gamma, gamma*z_next, gamma*v_next. It only
         # continues through automatic rows; a real decision always stops it.
         rewards = values.new_zeros(n, 2 + 2 * t)
         rewards[:, 0] = reward
@@ -107,8 +125,9 @@ class DiffusionDqnObjective(Objective[...]):
         _raise_if_cross_group_backup(in_run=pair_weight > 0, participate=participate[:, 0])
         backup = _pair_values_to_rows(backup, step_of)
         weight = _pair_values_to_rows(pair_weight, step_of)
-        r, g = backup[:, :1], backup[:, 1:2]
-        correction = (1 - g.square()).clamp_min(0).sqrt() * noise[:, None]
+        r, gamma = backup[:, :1], backup[:, 1:2]
+        correction = ((1 - gamma) * self.noise_mean
+                      + (1 - gamma.square()).clamp_min(0).sqrt() * self.noise_std * noise[:, None])
         bellman_inputs = times * r + backup[:, 2:2 + t] + (1 - times) * correction
         bellman_targets = r + backup[:, 2 + t:] - correction
         next_step = (step_of + 1).clamp_max(n - 1)

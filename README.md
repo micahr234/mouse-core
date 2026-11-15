@@ -130,16 +130,70 @@ and [value example](examples/05_train_offline_sv.ipynb).
 
 [Example 24](examples/24_train_offline_diffusion_dqn.ipynb) copies example 2 with
 a joint action-vector diffusion head conditioned on the backbone's final features.
-It starts each action from independent Gaussian noise and predicts all velocities
-from the complete action vector. `DiffusionDqnObjective` extends the
+Its velocity network automatically uses the backbone feature dimension `D`.
+Context passes through RMSNorm (`eps=1e-5`) without affine parameters or a learned projection. Each noisy
+action latent value receives 64 sine/cosine pairs; these encodings are concatenated
+and projected without RMSNorm. `DIFFUSION_LATENT_MIN` and `DIFFUSION_LATENT_MAX`
+define a shared reference range for all actions, defaulting to 0–20.
+Time has independent `DIFFUSION_TIME_MIN`/`DIFFUSION_TIME_MAX` bounds of 0–1.
+Each scalar is encoded using `u = (x - min)/(max - min)` and phases
+`pi*(k/K)*u`, for `k=1,...,K`. The highest phase spans zero to `pi` across the
+range; values outside it remain unclipped, including negative latent values.
+The bounds must be finite with finite positive width and affect only encoding,
+not flow states or targets. Latent bounds use the same units as the reward-scaled
+returns. The full encoding repeats after `2*K*(max-min)` units: 2560 return units
+at the defaults. Four actions produce 512 raw return components.
+Encoded returns and a sinusoidal time basis
+have independent projections into the same `D`-dimensional space as context,
+with expected initial branch RMS approximately one. Fixed nonnegative constants
+`DIFFUSION_CONTEXT_EMBEDDING_SCALE`, `DIFFUSION_LATENT_EMBEDDING_SCALE`, and
+`DIFFUSION_TIME_EMBEDDING_SCALE` multiply the three branches before summation.
+Each defaults to 1.0; zero disables its branch. Their weighted sum is divided by
+`sqrt(3)`, independently of the chosen multipliers. Each scalar multiplier is
+divided by `sqrt(3)` before tensor multiplication, so a multiplier of `sqrt(3)`
+gives exactly unit gain without multiply-then-divide rounding.
+Frequency counts and reference bounds are
+adjustable: the time defaults of 64 frequencies and bounds 0–1 give 128 raw components,
+then a learned 128→D projection, without complete cycles on `[0, 1]`.
+`DIFFUSION_NUM_BLOCKS` (default 2) configures the number of RMSNorm/SwiGLU
+residual blocks, using Qwen3-0.6B's threefold inner expansion, followed by a
+linear velocity readout. Zero blocks sends the summed input embeddings
+directly to that linear readout.
+Target updates use one `POLYAK_TAU_VALUE` for the entire velocity network,
+including latent/time projections, residual blocks, and final linear weights
+and bias. The rate must be finite and in `[0,1]`; zero freezes the delayed head
+and one copies online parameters directly.
+`VELOCITY_OUTPUT_INITIALIZATION_SCALE` (default 1.0) scales only that linear
+readout's initial weights and bias, once at construction. Forward computation,
+noise sampling, and other layers'
+initialization are unchanged. Each action starts from
+independent Gaussian noise with fixed `DIFFUSION_NOISE_MEAN` (default 0.0)
+and `DIFFUSION_NOISE_STD` (default 1.0). The mean and standard deviation are
+shared across actions and states, are not learned, and are independent of
+latent Fourier bounds. Zero standard deviation gives deterministic starts.
+Configure the head and objective with the same finite mean and finite,
+nonnegative standard deviation. For each readout, the Bellman correction is
+`(1-gamma)*mu + sqrt(1-gamma**2)*sigma*epsilon`, where `epsilon ~ N(0,1)` is
+independent of selector and backup starting noise and fixed across flow times.
+This preserves the Gaussian prior for every discount in `[0,1]`, including
+fractional discounts and nonzero noise means. The head
+predicts all velocities from the complete action vector.
+`DiffusionDqnObjective` extends the
 [Q-only Value Forcing loss](https://arxiv.org/html/2611.02160v1#A4.SS5): the taken
 action alone receives a one-step Bellman velocity loss at every diffusion step.
+`DIFFUSION_ACTION_SAMPLES` (default 1) independent complete delayed trajectories
+are batched and their endpoint value vectors averaged before selecting the
+maximum action. One additional, independently initialized delayed trajectory
+supplies the backup samples and velocities for that fixed action at every
+diffusion time. Online collection and evaluation can each choose their sample
+count with `q_head.q_values(z, action_samples=count)`; this call-local override
+leaves the training count unchanged. Omitting it uses the head's configured count.
+Each trajectory still uses all `DIFFUSION_STEPS` Euler steps (default 10).
 Other actions retain delayed current-state samples as input context, with no
 direct loss. The paper's scalar flow-matching result does not automatically
 extend to this coupled, selected-action loss or identify counterfactual return
 correlations.
-The Gaussian correction is
-computed from the supplied discount (including zero at outer termination).
+The Gaussian correction uses the supplied discount, including zero at outer termination.
 The environment, tokenizer, and encoder are unchanged. There are no n-step gates;
 automatic reset rows follow the existing one-step DQN alignment.
 
