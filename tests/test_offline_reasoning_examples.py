@@ -40,7 +40,7 @@ def test_offline_checkpoint_loads_and_evaluates_only_in_inference_notebook(tmp_p
             exec(compile(code, filename, 'exec'), namespace)
             if index == 1:
                 namespace.update(PRETRAINED=str(source), load_stores_from_hub=lambda **_: recorded_stores(),
-                    TOKEN_BUDGET=64, NUM_WORKERS=0, MAX_EPISODE_STEPS=2, NUM_CYCLES=0, MAX_REASONING_STEPS=2,
+                    SAMPLE_BUDGET=2, NUM_WORKERS=0, MAX_EPISODE_STEPS=2, NUM_CYCLES=0, MAX_REASONING_STEPS=2,
                     GENERATION_START_TOKEN='word2', MAX_NEW_TOKENS=64, MAX_ACTIVE_REQUESTS=2)
     assert len(uploads) == 1
     assert 'pytorch_model.bin' in uploads[0]['files']

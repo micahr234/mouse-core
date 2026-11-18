@@ -1,4 +1,4 @@
-"""Finite shuffled passes over whole samples, packed within a token budget."""
+"""Finite shuffled passes over whole samples, with a token or sample budget."""
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 import numpy as np
@@ -9,10 +9,22 @@ from mouse_core.data.token_batch import pack_token_batch
 
 
 class EpochDataLoader:
-    def __init__(self, *, stores, transform, token_budget, sample_field=None, sample_ranges=None, epochs=1,
+    """Visit every eligible sample once per epoch without splitting samples.
+
+    Pass exactly one of ``token_budget`` or ``sample_budget``. A sample budget
+    fixes the number of samples per batch regardless of token length. The final
+    batch of each epoch retains any remaining samples, even when it is smaller.
+    """
+
+    def __init__(self, *, stores, transform, token_budget=None, sample_budget=None,
+                 sample_field=None, sample_ranges=None, epochs=1,
                  num_workers=0, seed=0, step_field=None, episode_field="episode_index",
                  sample_eligible=None):
-        if epochs < 1 or token_budget < 1 or num_workers < 0:
+        if (token_budget is None) == (sample_budget is None):
+            raise ValueError("Pass exactly one of token_budget or sample_budget")
+        if sample_budget is not None and (type(sample_budget) is not int or sample_budget < 1):
+            raise ValueError("sample_budget must be a positive integer")
+        if epochs < 1 or (token_budget is not None and token_budget < 1) or num_workers < 0:
             raise ValueError("epochs and token_budget must be positive; num_workers must be nonnegative")
         if (sample_field is None) == (sample_ranges is None):
             raise ValueError("Pass exactly one of sample_field or sample_ranges")
@@ -49,8 +61,11 @@ class EpochDataLoader:
         self.samples = [sample for sample in prepared if sample is not None]
         if not self.samples:
             raise ValueError("EpochDataLoader requires at least one eligible sample")
-        costs = [_segment_token_count(sample) for sample in self.samples]
-        if any(cost > token_budget for cost in costs):
+        costs = ([1] * len(self.samples) if sample_budget is not None else
+                 [_segment_token_count(sample) for sample in self.samples])
+        budget = sample_budget if sample_budget is not None else token_budget
+        assert budget is not None
+        if any(cost > budget for cost in costs):
             raise ValueError("A complete sample exceeds token_budget; increase the budget")
         self.batches = []
         self.epoch_ends = []
@@ -58,7 +73,7 @@ class EpochDataLoader:
         for _ in range(epochs):
             batch, used = [], 0
             for index in rng.permutation(len(self.samples)):
-                if batch and used + costs[index] > token_budget:
+                if batch and used + costs[index] > budget:
                     self.batches.append(batch)
                     batch, used = [], 0
                 batch.append(int(index))

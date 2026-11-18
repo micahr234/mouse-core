@@ -11,6 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Standardize every Procedural FrozenLake training notebook on eight complete
+  outer episodes per batch, including all inner repeats. GRPO retains its final
+  partial batch.
+
+- Add `sample_budget` to `DataLoader` and `EpochDataLoader` to batch a fixed number
+  of complete samples independently of token length. Sample boundaries and
+  eligibility remain caller-defined; epoch passes retain their final partial batch.
+
 - Initialize residual reasoning's learnable per-element input RMSNorm scale to
   `0.02`, shared by generation and training forward calls.
 

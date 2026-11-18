@@ -1,4 +1,4 @@
-"""Sample complete event sequences into one event or token budget per batch.
+"""Sample complete event sequences into one sample, event, or token budget per batch.
 
 Each sampled segment is an independent sequence. Token-level ``sequence_ids`` live in inputs; step-level
 ``sequence_ids`` and prediction-level ``step_ids`` live in objective_data.
@@ -57,6 +57,7 @@ class _SnapshotConfig:
     probs: np.ndarray
     events_budget: int | None
     token_budget: int | None
+    sample_budget: int | None
     index_field: str | None
     sample_field: str | None
     runs: tuple[np.ndarray, ...]
@@ -237,7 +238,7 @@ def _sequence_generation(*, batch_index: int, sequence_index: int, stride: int) 
     """Unique augmenter generation for one sampled segment of batch ``k``.
 
     ``stride`` is ``budget + 1``. The budget is
-    ``events_budget`` or ``token_budget``. Each segment costs at least
+    ``sample_budget``, ``events_budget`` or ``token_budget``. Each segment costs at least
     one unit, so a fill draws at most ``budget + 1`` generations and the
     next batch does not collide.
     """
@@ -304,6 +305,8 @@ def _append_window(
 
 def _budget_of(cfg: _SnapshotConfig) -> tuple[int, str, str]:
     """``(limit, parameter name, unit)`` for the active budget."""
+    if cfg.sample_budget is not None:
+        return cfg.sample_budget, "sample_budget", "samples"
     if cfg.token_budget is not None:
         return cfg.token_budget, "token_budget", "packed tokens"
     assert cfg.events_budget is not None
@@ -346,7 +349,7 @@ def _fetch_budget_batch(
             )
         attempt += 1
         # Event counts are known before decoding or tokenizing.
-        if not count_tokens and used + (end - start) > budget:
+        if cfg.events_budget is not None and used + (end - start) > budget:
             if added == 0:
                 raise ValueError(
                     f"Sampled segment is {end - start} {unit} and does not fit "
@@ -362,7 +365,8 @@ def _fetch_budget_batch(
             context=context,
             events=events,
         )
-        cost = _segment_token_count(window) if count_tokens else end - start
+        cost = (1 if cfg.sample_budget is not None else
+                _segment_token_count(window) if count_tokens else end - start)
         if cost < 1:
             raise ValueError(
                 f"Sampled segment produced no {unit} "
@@ -384,6 +388,8 @@ def _fetch_budget_batch(
         used += cost
         n_sequences += 1
         added += 1
+        if cfg.sample_budget is not None and used == budget:
+            break
     return pack_token_batch(
         steps=steps,
         sequence_ids=sequence_ids,
@@ -414,8 +420,14 @@ class DataLoader:
         Source events per batch. Whole samples are added until the next sample
         would pass the budget. A sample that does not fit is left out.
         The first sample of a batch is left out too when it alone is over
-        the budget, and that raises. Pass this or ``token_budget``, not
-        both. Requires a sample boundary policy.
+        the budget, and that raises. Pass exactly one of ``events_budget``,
+        ``token_budget``, or ``sample_budget``. Requires a sample boundary policy.
+    sample_budget :
+        Exact number of complete eligible samples per batch, sampled with
+        replacement. Each selected range counts once regardless of its event
+        or token length; samples are never trimmed. Select complete episodes
+        with ``sample_field`` or ``sample_ranges`` and use ``sample_eligible``
+        to exclude unfinished episodes. Token length and memory use can vary.
     sample_field :
         Scalar column that defines a sample. A sample is every contiguous
         row that shares one value in this column. Each sample is one
@@ -444,8 +456,8 @@ class DataLoader:
         tokenizer. Whole samples are added until the next
         sample would pass the budget. A sample that does not fit is left
         out. The first sample of a batch is left out too when it alone is
-        over the budget, and that raises. Pass this or ``events_budget``,
-        not both. Requires a sample boundary policy.
+        over the budget, and that raises. Mutually exclusive with
+        ``events_budget`` and ``sample_budget``. Requires a sample boundary policy.
     transform :
         Required ``list[event] → list[StepTokens]`` callable applied once per sample.
         Compose pipeline stages outside the loader; packing is loader-owned.
@@ -477,6 +489,7 @@ class DataLoader:
         transform: EventSequenceTransform,
         events_budget: int | None = None,
         token_budget: int | None = None,
+        sample_budget: int | None = None,
         sample_field: str | None = None,
         sample_ranges: Callable | None = None,
         sample_eligible: Callable | None = None,
@@ -511,10 +524,12 @@ class DataLoader:
             )
         if weight_mode not in ("per_store", "per_event"):
             raise ValueError(f"weight_mode must be 'per_store' or 'per_event', got {weight_mode!r}")
-        if (events_budget is None) == (token_budget is None):
+        if sum(value is not None for value in (events_budget, token_budget, sample_budget)) != 1:
             raise ValueError(
-                "Pass exactly one of events_budget or token_budget."
+                "Pass exactly one of events_budget, token_budget, or sample_budget."
             )
+        if sample_budget is not None and (type(sample_budget) is not int or sample_budget < 1):
+            raise ValueError("sample_budget must be a positive integer.")
         if events_budget is not None and events_budget < 1:
             raise ValueError(f"events_budget must be >= 1, got {events_budget}.")
         if token_budget is not None and token_budget < 1:
@@ -544,6 +559,7 @@ class DataLoader:
         self.stores = stores
         self.events_budget = events_budget
         self.token_budget = token_budget
+        self.sample_budget = sample_budget
         self.sample_field = sample_field
         self.sample_ranges = sample_ranges
         self.sample_eligible = sample_eligible
@@ -655,7 +671,7 @@ class DataLoader:
         )
         return (
             f"DataLoader(stores=[{store_info}], events_budget={self.events_budget}, "
-            f"token_budget={self.token_budget}, "
+            f"token_budget={self.token_budget}, sample_budget={self.sample_budget}, "
             f"sample_field={self.sample_field!r}, seed={self.seed})"
         )
 
@@ -666,6 +682,7 @@ class DataLoader:
             probs=self._probs.copy(),
             events_budget=self.events_budget,
             token_budget=self.token_budget,
+            sample_budget=self.sample_budget,
             index_field=self.index_field,
             sample_field=self.sample_field,
             runs=self._runs,

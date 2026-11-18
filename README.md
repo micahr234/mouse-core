@@ -438,6 +438,18 @@ including a potentially unfinished tail. Eligibility examines the selected sampl
 decoded payloads and skips unfinished episodes. Define different functions for
 other episode conventions or step windows; Core does not export sampling policies.
 
+To hold the number of episodes fixed as compute/value tokens change, replace
+`token_budget=10000` with `sample_budget=8` in the loader above. Each batch then
+contains exactly eight complete eligible outer episodes sampled with replacement,
+regardless of their token lengths. Inner repeats remain inside their outer episode.
+Token count and memory use may vary; there is no additional token cap or truncation.
+Pass exactly one of `sample_budget`, `token_budget`, or `events_budget`.
+
+`EpochDataLoader` also accepts `sample_budget` instead of `token_budget`. It visits
+each eligible sample once per shuffled epoch, retaining a smaller final batch when
+necessary. In both loaders, the sample boundary policy defines what counts as one
+sample; choose episode boundaries to count episodes, rather than steps.
+
 The loader always decodes and validates finite JSON-object payloads before
 eligibility and tokenization. Malformed JSON, nonfinite numbers, arrays, scalars,
 and null payloads raise errors rather than becoming rejected samples. Datastore
