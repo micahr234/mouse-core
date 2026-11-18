@@ -177,7 +177,9 @@ def test_one_position_projection_shared_across_named_token_tables():
 
 
 @pytest.mark.flex_training(default_device=False)
-def test_offline_dqn_time_notebook_runs_local_training_and_saves(tmp_path):
+def test_offline_dqn_time_notebook_trains_and_uploads(tmp_path, monkeypatch):
+    from tests._hub_example_fixture import capture_upload
+    capture_upload(monkeypatch, tmp_path / "checkpoint")
     from transformers import Qwen3Config, Qwen3Model
     from mouse_core.models import load_model
     base = tmp_path / 'base'
@@ -203,7 +205,7 @@ def test_offline_dqn_time_notebook_runs_local_training_and_saves(tmp_path):
             exec(compile(''.join(cell['source']), f'{notebook}:cell{index}', 'exec'), ns)
             if index == 1:
                 ns.update(PRETRAINED=str(base), TOKEN_BUDGET=1024, TRAIN_STEPS=1, NUM_CYCLES=1,
-                          OUTPUT_DIR=tmp_path / 'checkpoint', device=torch.device('cuda'))
+                          device=torch.device('cuda'))
         assert torch.isfinite(ns['loss'])
         time_projection = ns['encoder'].embedding.features.position.proj
         assert time_projection.weight.grad is not None

@@ -25,6 +25,19 @@ class Model(nn.Module, ABC):
         """Define the model's computation in the implementation subclass."""
         ...
 
+    @torch.no_grad()
+    def generate(self, *args: Any, **kwargs: Any) -> Any:
+        """Shared synchronous inference entry point for collection and evaluation.
+
+        Uses this model's forward and generation rules with dropout disabled.
+        Pass the returned episode cache into subsequent calls, reset its rows
+        at episode boundaries, and close it before updating model weights.
+        Gradient-enabled training replay continues to call ``forward``.
+        """
+        if self.training:
+            self.eval()
+        return self(*args, **kwargs)
+
     def parameter_groups(self, *, lr: Mapping[str, float]) -> list[dict[str, Any]]:
         """Give each trainable parameter exactly one module's learning rate."""
         modules = _module_groups(self, tuple(lr), cover_trainable=True)

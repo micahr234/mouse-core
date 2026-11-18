@@ -16,6 +16,7 @@ from torch.utils.checkpoint import checkpoint
 
 from mouse_core.models.backbone.base import BaseBackbone
 from mouse_core.models.embedding import MultiEmbedding
+from mouse_core.models.generation import generate
 
 
 @dataclass(frozen=True)
@@ -131,60 +132,25 @@ class AutoregressiveReasoner(nn.Module):
             return []
         with _evaluating(embedding, backbone, self.token_head):
             prefixes = self._prefixes(tokens, embedding)
-            count = len(prefixes)
-            slots = min(count, max_active_requests)
-            active: list[int | None] = list(range(slots))
-            pending = slots
             generated: list[list[int]] = [[] for _ in prefixes]
-            chunks = prefixes[:slots]
-            cache = backbone.decode_session(batch_size=slots) if backend == "continuous" else None
-            try:
-                while any(request is not None for request in active):
-                    if cache is not None:
-                        lengths = [len(chunk) for chunk in chunks]
-                        width = max(lengths)
-                        padded = prefixes[0].new_zeros((slots, width, backbone.hidden_dim))
-                        for slot, chunk in enumerate(chunks):
-                            if len(chunk):
-                                padded[slot, -len(chunk):] = chunk
-                        hidden = cast(torch.Tensor, backbone(padded, cache=cache, lengths=lengths))[:, -1]
+            def advance(requests: list[int], hidden: torch.Tensor) -> list[torch.Tensor | None]:
+                logits = self.token_head(hidden.float()) / temperature
+                if logits.shape[-1] != table.vocab_size:
+                    raise ValueError("Vocabulary head must match the selected embedding table")
+                draws = (torch.multinomial(logits.softmax(-1), 1).squeeze(-1) if do_sample
+                         else logits.argmax(-1)).tolist()
+                chunks: list[torch.Tensor | None] = []
+                for request, token in zip(requests, draws, strict=True):
+                    generated[request].append(token)
+                    if token in end_token_ids:
+                        chunks.append(None)
+                    elif len(generated[request]) == max_new_tokens:
+                        raise RuntimeError(f"Reasoning request {request} did not emit an end token within {max_new_tokens} tokens")
                     else:
-                        rows = [torch.cat((prefixes[request], self._embed_generated(
-                            generated[request], embedding, tokenizer_name)))
-                            for request in active if request is not None]
-                        features, lengths = self._packed(backbone, rows)
-                        ends = torch.tensor(lengths, device=features.device).cumsum(0) - 1
-                        hidden = features.new_zeros((slots, backbone.hidden_dim))
-                        hidden[[slot for slot, request in enumerate(active) if request is not None]] = features[ends]
-                    live_slots = [slot for slot, request in enumerate(active) if request is not None]
-                    logits = self.token_head(hidden[live_slots].float()) / temperature
-                    if logits.shape[-1] != table.vocab_size:
-                        raise ValueError("Vocabulary head must match the selected embedding table")
-                    draws = (torch.multinomial(logits.softmax(-1), 1).squeeze(-1) if do_sample
-                             else logits.argmax(-1)).tolist()
-                    reset = []
-                    for slot, token in zip(live_slots, draws, strict=True):
-                        request = active[slot]
-                        assert request is not None
-                        generated[request].append(token)
-                        if token in end_token_ids:
-                            reset.append(slot)
-                            if pending < count:
-                                active[slot] = pending
-                                chunks[slot] = prefixes[pending]
-                                pending += 1
-                            else:
-                                active[slot] = None
-                                chunks[slot] = prefixes[0][:0]
-                        elif len(generated[request]) == max_new_tokens:
-                            raise RuntimeError(f"Reasoning request {request} did not emit an end token within {max_new_tokens} tokens")
-                        else:
-                            chunks[slot] = self._embed_generated([token], embedding, tokenizer_name)
-                    if cache is not None:
-                        cache.reset_rows(reset)
-            finally:
-                if cache is not None:
-                    cache.close()
+                        chunks.append(self._embed_generated([token], embedding, tokenizer_name))
+                return chunks
+            generate(backbone=backbone, prompts=prefixes, advance=advance, backend=backend,
+                     max_active_requests=max_active_requests)
         return [ReasoningTrace(int(head), tuple(ids), ids[-1])
                 for head, ids in zip(tokens["head_mask"].nonzero(as_tuple=True)[0], generated, strict=True)]
 

@@ -3,6 +3,7 @@ from mouse_core.models.actions import action_readouts, select_discrete_action
 from mouse_core.models.backbone import Backbone, BaseBackbone, IdentityBackbone
 from mouse_core.models.base import Model, preferred_dtype
 from mouse_core.models.encoding import DecodeCache, prepare_decode
+from mouse_core.models.generation import generate
 from mouse_core.models.embedding import Embedding, MultiEmbedding
 from mouse_core.models.autoregressive_reasoner import AutoregressiveReasoner, ReasoningReadout, ReasoningTrace
 from mouse_core.models.heads import DiscretizedActionHead, DiscretizedLinear
@@ -11,9 +12,11 @@ from mouse_core.models.lora import LoRAConfig
 from mouse_core.models.mlp import MLP
 from mouse_core.models.vocabulary_head import VocabularyHead
 from mouse_core.models.reasoner import LatentReasoner, sample_reasoning_splits
+from mouse_core.models.residual_reasoner import ResidualReasoner, ResidualBatch
 
 __all__ = [
     "Model",
+    "generate",
     "select_discrete_action",
     "action_readouts",
     "DecodeCache",
@@ -25,6 +28,8 @@ __all__ = [
     "AutoregressiveReasoner",
     "ReasoningTrace",
     "ReasoningReadout",
+    "ResidualReasoner",
+    "ResidualBatch",
     "VocabularyHead",
     "MLP",
     "Embedding",

@@ -197,11 +197,14 @@ def test_empty_readouts_have_differentiable_zero_loss():
 def test_example_preserves_encoder_tokenizer_and_data_pipeline():
     base = [''.join(c['source']) for c in json.loads((EXAMPLES/'02_train_offline_dqn.ipynb').read_text())['cells']]
     sources = notebook_sources()
-    assert sources[3] == base[3]  # Dataset loading.
-    assert sources[5] == base[5]  # Whole tokenizer, augmentation and loader cell.
+    def section_code(cells, title):
+        index = next(i for i, source in enumerate(cells) if source.startswith(title + '\n'))
+        return cells[index + 1]
+    for title in ('## Load Data', '## Tokenizer', '## Replay'):
+        assert section_code(sources, title) == section_code(base, title)
     def encoder(source):
         return ast.dump(next(n for n in ast.parse(source).body if isinstance(n, ast.ClassDef) and n.name == 'Encoder'))
-    assert encoder(sources[7]) == encoder(base[7])
+    assert encoder(section_code(sources, '## Build Encoder and Heads')) == encoder(section_code(base, '## Build Encoder and Heads'))
     for cell in json.loads(NOTEBOOK.read_text())['cells']:
         if cell['cell_type'] == 'code':
             compile(''.join(cell['source']), str(NOTEBOOK), 'exec')

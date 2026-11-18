@@ -89,6 +89,7 @@ def _snapshot(steps: Sequence[StepTokens]) -> list[StepTokens]:
             numeric_values=np.array(step.numeric_values, copy=True),
             numeric_mask=np.array(step.numeric_mask, copy=True),
             head_mask=np.array(step.head_mask, copy=True),
+            autoregressive_mask=optional_array(step.autoregressive_mask),
             tokenizer_ids=optional_array(step.tokenizer_ids),
             numeric_field_ids=optional_array(step.numeric_field_ids),
             position_values=optional_array(step.position_values),

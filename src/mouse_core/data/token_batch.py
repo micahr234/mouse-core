@@ -74,6 +74,7 @@ class StepTokens:
     ``tokenizer_ids`` selects a name in ``tokenizer_names`` for each token;
     IDs remain local to that tokenizer's vocabulary and embedding table.
     ``numeric_mask`` marks numeric tokens even when their scaled value is zero.
+    ``autoregressive_mask`` marks generation starts (a subset of head tokens).
     Optional ``position_values`` / ``position_mask`` carry numeric context per token.
     Omitted arrays become zeros and a false mask; zero can be present.
     A passive step can contain no head tokens, or even no input tokens, while
@@ -91,11 +92,19 @@ class StepTokens:
     tokenizer_names: tuple[str, ...] = ("default",)
     position_values: np.ndarray | None = None
     position_mask: np.ndarray | None = None
+    autoregressive_mask: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         token_ids = np.asarray(self.token_ids, dtype=np.int64)
         if token_ids.ndim != 1:
             raise ValueError("StepTokens requires a 1-D token_ids array")
+        if self.autoregressive_mask is None:
+            self.autoregressive_mask = np.zeros(token_ids.shape, dtype=bool)
+        self.autoregressive_mask = np.asarray(self.autoregressive_mask)
+        if self.autoregressive_mask.shape != token_ids.shape or self.autoregressive_mask.dtype != np.bool_:
+            raise ValueError("autoregressive_mask must be boolean and match token_ids")
+        if np.any(self.autoregressive_mask & ~np.asarray(self.head_mask, dtype=bool)):
+            raise ValueError("Autoregressive starts must also be head-output tokens")
         self.position_values, self.position_mask = _position_arrays(self.position_values, self.position_mask, token_ids.shape)
         self.numeric_field_names = tuple(self.numeric_field_names)
         self.numeric_field_ids = _numeric_field_ids(self.numeric_field_ids, self.numeric_mask, self.numeric_field_names)
@@ -119,6 +128,7 @@ def make_token_batch(
     tokenizer_ids=None, tokenizer_names=("default",),
     numeric_field_ids=None, numeric_field_names=(),
     position_values=None, position_mask=None,
+    autoregressive_mask=None,
 ) -> TensorDict:
     """Build CPU tensor inputs without scanning or validating batch contents.
 
@@ -132,8 +142,10 @@ def make_token_batch(
     from zero. Numeric-field IDs select Fourier projections (-1 when absent).
     position_values stays float64 until the position features are formed.
 
-    head_mask [L] selects tokens passed to prediction heads. Step mappings
-    belong to objective_data, not model inputs. Names and num_sequences are
+    head_mask [L] selects tokens passed to prediction heads.
+    autoregressive_mask [L] identifies tokenizer-defined generation starts and
+    defaults to false. Generation implementations decide how to consume them.
+    Step mappings belong to objective_data, not model inputs. Names and num_sequences are
     non-tensor metadata; the count includes empty decode sequences.
     """
     ids = torch.as_tensor(token_ids, dtype=torch.int64, device="cpu")
@@ -144,6 +156,8 @@ def make_token_batch(
         "numeric_mask": torch.as_tensor(numeric_mask, dtype=torch.bool, device="cpu"),
         "sequence_ids": torch.as_tensor(sequence_ids, dtype=torch.int64, device="cpu"),
         "head_mask": torch.as_tensor(head_mask, dtype=torch.bool, device="cpu"),
+        "autoregressive_mask": (torch.zeros(shape, dtype=torch.bool, device="cpu") if autoregressive_mask is None
+                                else torch.as_tensor(autoregressive_mask, dtype=torch.bool, device="cpu")),
         "tokenizer_ids": (torch.zeros(shape, dtype=torch.int64, device="cpu") if tokenizer_ids is None
                           else torch.as_tensor(tokenizer_ids, dtype=torch.int64, device="cpu")),
         "numeric_field_ids": (torch.full(shape, -1, dtype=torch.int64, device="cpu") if numeric_field_ids is None
@@ -339,6 +353,7 @@ def pack_token_batch(
     numeric_values: list[np.ndarray] = []
     tokenizer_ids: list[np.ndarray] = []
     head_masks: list[np.ndarray] = []
+    autoregressive_masks: list[np.ndarray] = []
     step_lengths: list[int] = []
 
     inferred_B = (max(seq_per_step) + 1) if seq_per_step else 0
@@ -371,6 +386,8 @@ def pack_token_batch(
         assert st.tokenizer_ids is not None
         tokenizer_ids.append(st.tokenizer_ids)
         head_masks.append(st.head_mask)
+        assert st.autoregressive_mask is not None
+        autoregressive_masks.append(st.autoregressive_mask)
         step_lengths.append(t)
 
     # Compute packed metadata in bulk, including zero-token/passive steps.
@@ -389,6 +406,7 @@ def pack_token_batch(
         numeric_values=np.concatenate(numeric_values),
         sequence_ids=np.repeat(seq_per_step, lengths),
         head_mask=head_mask,
+        autoregressive_mask=np.concatenate(autoregressive_masks),
         tokenizer_ids=np.concatenate(tokenizer_ids),
         tokenizer_names=tokenizer_names,
         num_sequences=B,

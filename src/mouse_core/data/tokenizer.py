@@ -283,7 +283,7 @@ class EventTokenStream:
     def _finish(self) -> StepTokens:
         pieces = self._pieces
         values = {name: np.concatenate([piece[name] for piece in pieces]) for name in
-                  ("token_ids", "numeric_values", "numeric_mask", "head_mask", "tokenizer_ids", "position_values", "position_mask", "numeric_field_ids")}
+                  ("token_ids", "numeric_values", "numeric_mask", "head_mask", "autoregressive_mask", "tokenizer_ids", "position_values", "position_mask", "numeric_field_ids")}
         objective = copy_keep_fields(self._labels,
                                     self.tokenizer.objective_fields if self.include_objectives else (),
                                     missing_values=self.tokenizer.objective_missing_values)
@@ -528,6 +528,7 @@ def _tokenize_fields(*, row, meta, tokenizers, tokenizer_routes, numeric_routes,
     numeric_values: list[float] = []
     numeric_mask: list[bool] = []
     head_mask: list[bool] = []
+    autoregressive_mask: list[bool] = []
     numeric_field_ids: list[int] = []
     position_values: list[float] = []
     position_mask: list[bool] = []
@@ -558,6 +559,7 @@ def _tokenize_fields(*, row, meta, tokenizers, tokenizer_routes, numeric_routes,
         position_values.extend([0.0 if position is None else position] * len(emitted_ids))
         position_mask.extend([position is not None] * len(emitted_ids))
         head_mask.extend([head_output] * len(emitted_ids))
+        autoregressive_mask.extend([spec.autoregressive] * len(emitted_ids))
 
     for field_id, m in meta:
         spec = m.spec
@@ -597,6 +599,7 @@ def _tokenize_fields(*, row, meta, tokenizers, tokenizer_routes, numeric_routes,
         position_values=np.asarray(position_values, dtype=np.float64),
         position_mask=np.asarray(position_mask, dtype=bool),
         head_mask=np.asarray(head_mask, dtype=bool),
+        autoregressive_mask=np.asarray(autoregressive_mask, dtype=bool),
     )
 
 
@@ -634,7 +637,7 @@ def _input_fields_config(specs):
         for key, value in data.items():
             if key.startswith("_") or value is None:
                 continue
-            if key in ("head_output", "special") and value is False:
+            if key in ("head_output", "special", "autoregressive") and value is False:
                 continue
             if key == "format_functions":
                 if value:

@@ -128,7 +128,9 @@ def test_all_components_receive_reward_without_extra_discount(components):
 
 @pytest.mark.parametrize("mode", ["next_action", "n_actions", "next_step"])
 @pytest.mark.flex_training(default_device=False)
-def test_sequential_notebook_collects_and_trains(mode, monkeypatch):
+def test_sequential_notebook_collects_and_trains(mode, monkeypatch, tmp_path):
+    from tests._hub_example_fixture import capture_upload
+    capture_upload(monkeypatch, tmp_path / "checkpoint")
     import json
     from pathlib import Path
 

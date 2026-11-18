@@ -200,7 +200,8 @@ def test_offline_dqn_cosine_example(monkeypatch):
         boundary_discount=boundary_discount, CosineObjective=CosineObjective, Path=Path,
     )
     definitions: list[ast.stmt] = [node for node in ast.parse(
-        "".join(notebook["cells"][7]["source"])
+        next("".join(cell["source"]) for cell in notebook["cells"]
+             if "class TransitionModel" in "".join(cell["source"]))
     ).body if isinstance(node, ast.ClassDef)]
     exec(compile(ast.Module(body=definitions, type_ignores=[]), str(path), "exec"), namespace)
     # Keep construction inside Encoder, substituting small local factories

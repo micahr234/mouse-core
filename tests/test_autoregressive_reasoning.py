@@ -10,6 +10,8 @@ from types import SimpleNamespace
 from pathlib import Path
 from typing import Any, cast
 
+from tests._reasoning_replay_fixture import recorded_stores, pack_prefixes, reasoning_loader
+
 import numpy as np
 import pytest
 import torch
@@ -28,7 +30,7 @@ def example_module():
         if cell["cell_type"] == "code":
             nodes.extend(node for node in ast.parse("".join(cell["source"])).body
                          if isinstance(node, (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.ClassDef)))
-    # encode_prompt reads notebook settings; these tests exercise the replay and model directly.
+    # Bind test-owned data and runtime settings when exercising notebook functions.
     namespace = {}
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
     return SimpleNamespace(**namespace)
@@ -76,7 +78,7 @@ def generate(online, tokens, *, backend, max_new_tokens=8, do_sample=False):
 @pytest.mark.parametrize("backend", ["uncached", "continuous"])
 def test_same_model_generation_variable_lengths_recycling_and_repeated_calls(backend):
     online = chain_model().train()
-    tokens = example_module().pack_prefixes([[6, 1], [5, 4, 2], [6, 3], [1]])
+    tokens = pack_prefixes([[6, 1], [5, 4, 2], [6, 3], [1]])
     assert len([m for m in online.modules() if isinstance(m, Backbone)]) == 1
     assert not any(isinstance(m, (Backbone, MultiEmbedding)) for m in online.reasoner.modules())
     for _ in range(2):
@@ -89,12 +91,12 @@ def test_same_model_generation_variable_lengths_recycling_and_repeated_calls(bac
 
 def test_cache_rows_are_released_on_failed_generation(monkeypatch):
     online = chain_model()
-    tokens = example_module().pack_prefixes([[1], [2], [3]])
+    tokens = pack_prefixes([[1], [2], [3]])
     sessions = []
     real_create = online.backbone.decode_session
 
-    def create(*, batch_size):
-        session = real_create(batch_size=batch_size)
+    def create(*, batch_size, **kwargs):
+        session = real_create(batch_size=batch_size, **kwargs)
         sessions.append(session)
         return session
 
@@ -108,7 +110,7 @@ def test_cache_rows_are_released_on_failed_generation(monkeypatch):
 @pytest.mark.flex_training
 def test_final_token_representation_and_token_scores_match_manual_shared_forward():
     online = model()
-    tokens = example_module().pack_prefixes([[2, 4], [3]])
+    tokens = pack_prefixes([[2, 4], [3]])
     traces = [ReasoningTrace(int(tokens["head_mask"].nonzero(as_tuple=True)[0][0]), (5, 6, 0), 0),
               ReasoningTrace(int(tokens["head_mask"].nonzero(as_tuple=True)[0][1]), (0,), 0)]
     out = online.reasoner(tokens, traces, embedding=online.embedding, backbone=online.backbone,
@@ -180,27 +182,26 @@ def test_dqn_plus_reinforce_update_shared_backbone_head_and_delayed_target(backe
     head_before = online.reasoner.token_head.weight.detach().clone()
     decoder = dict(online.backbone.named_parameters())["model.layers.0.mlp.down_proj.weight"]
     decoder_before = decoder.detach().clone()
-    histories = []
-
-    def encode(history):
-        histories.append(history)
-        return [4, 1] if not history else [4, 5, 1]
-
-    episodes = example.make_replay(seed=3, num_episodes=2, horizon=2, is_slippery=False)
-    tokens, data, groups = example.replay_batch(episodes, encode_prompt=encode, device=torch.get_default_device())
-    assert histories[0] == "State 0.\n"
-    assert len(histories) == sum(len(ep) - 1 for ep in episodes)
+    loader = reasoning_loader(example)
     objective = DqnObjective(reward=None, value=None, gate=None, temperature=0.,
                             discount=boundary_discount(gamma_step=0.9, gamma_terminated=0., gamma_truncated=0.))
-    metrics = example.train_step(online, target, torch.optim.AdamW(online.parameters(), lr=1e-3), objective,
-        tokens=tokens, objective_data=data, sequence_ids=groups, backend=backend, end_token_id=0,
-        max_new_tokens=64, max_active_requests=2, reasoning_temperature=0.8, reinforce_weight=1.,
-        target_tau=0.2, max_grad_norm=1.)
+    example.run_train.__globals__.update(
+        online=online, target=target, optimizer=torch.optim.AdamW(online.parameters(), lr=1e-3),
+        objective=objective, loader=loader, device=torch.get_default_device(),
+        GENERATION_BACKEND=backend, END_GENERATION_TOKEN_ID=0, MAX_NEW_TOKENS=64,
+        MAX_ACTIVE_REQUESTS=2, REASONING_TEMPERATURE=0.8, REINFORCE_WEIGHT=1.,
+        POLYAK_TAU_EMBEDDING=.1, POLYAK_TAU_BACKBONE=.2, POLYAK_TAU_VALUE=.3,
+        POLYAK_TAU_REASONING_HEAD=.4, MAX_GRAD_NORM=1.)
+    try:
+        loss, metrics = example.run_train(num_steps=1)
+    finally:
+        loader.close()
+    assert torch.isfinite(loss) and not loss.requires_grad
     assert all(np.isfinite(value) for value in metrics.values())
     assert not torch.equal(head_before, online.reasoner.token_head.weight)
     assert not torch.equal(decoder_before, decoder)
     assert all(p.grad is None for p in target.parameters())
-    torch.testing.assert_close(target.reasoner.token_head.weight, head_before.lerp(online.reasoner.token_head.weight, 0.2))
+    torch.testing.assert_close(target.reasoner.token_head.weight, head_before.lerp(online.reasoner.token_head.weight, 0.4))
 
 
 def local_checkpoint(path, *, tied=False):
@@ -253,30 +254,31 @@ def test_notebook_model_checkpoint_reload(tmp_path, backend):
     save_model(model=online, path=output)
     restored = model()
     load_model(model=restored, repo_id_or_path=output)
-    tokens = example.pack_prefixes([[1, 2]])
+    tokens = pack_prefixes([[1, 2]])
     traces = generate(restored, tokens, backend=backend)
     with torch.no_grad():
         q, _, _ = restored(tokens, traces, temperature=0.8, score_tokens=False)
     assert q.shape == (1, 4) and torch.isfinite(q).all()
 
 
-def test_frozenlake_replay_is_fixed_and_prefixes_do_not_include_future_steps():
+def test_frozenlake_loader_preserves_complete_episodes_and_readout_alignment():
     example = example_module()
-    episodes = example.make_replay(seed=11, num_episodes=3, horizon=1, is_slippery=False)
-    assert episodes == example.make_replay(seed=11, num_episodes=3, horizon=1, is_slippery=False)
-    histories = []
-    def encode(history):
-        histories.append(history)
-        return [1, 2]
-    tokens, data, groups = example.replay_batch(episodes, encode_prompt=encode, device=torch.device("cpu"))
-    assert histories == ["State 0.\n"] * 3
-    assert data["sequence_ids"].shape[0] == 6 and tokens["head_mask"].nonzero(as_tuple=True)[0].shape[0] == 3
-    assert groups.tolist() == [0, 0, 1, 1, 2, 2]
+    loader = reasoning_loader(example, stores=recorded_stores(episodes=3, horizon=1))
+    try:
+        tokens, data = loader.next_batch()
+    finally:
+        loader.close()
+    assert data["sequence_ids"].tolist() == [0, 0, 1, 1, 2, 2]
     assert data["step_ids"].tolist() == [0, 2, 4]
     assert "head_output_count" not in data
     assert (~torch.isnan(data["action"])).tolist() == [False, True] * 3
     assert data["truncated"].tolist() == [False, True] * 3
-    assert all((row["action"] is None or 0 <= row["action"] < 4) and 0 <= row["observation"] < 16 for ep in episodes for row in ep)
+    # Three isolated episodes: each initial readout precedes its terminal tokens.
+    heads = tokens["head_mask"].nonzero(as_tuple=True)[0]
+    assert tokens["sequence_ids"][heads].tolist() == [0, 1, 2]
+    for head, group in zip(heads.tolist(), range(3)):
+        start = int((tokens["sequence_ids"] == group).nonzero()[0])
+        assert tokens["token_ids"][start:head + 1].tolist() == [2, 3, 9]
 
 
 def test_kernel_opt_in_targets_existing_decoder(monkeypatch):
@@ -321,7 +323,7 @@ def test_zero_weight_reinforce_rows_ignore_nonfinite_placeholders():
 def test_custom_end_token_replaces_model_defaults(backend):
     online = chain_model()
     online.reasoner.token_head.default_end_token_ids = (0, 2)
-    tokens = example_module().pack_prefixes([[1]])
+    tokens = pack_prefixes([[1]])
     kwargs = dict(embedding=online.embedding, backbone=online.backbone, tokenizer_name="text",
                   max_new_tokens=8, backend=backend, max_active_requests=1, do_sample=False, temperature=1.0)
     default = online.reasoner.generate(tokens, **kwargs)
@@ -356,25 +358,26 @@ def test_missing_model_default_requires_explicit_end_token():
 
 
 @pytest.mark.flex_training(default_device=False)
-def test_complete_frozenlake_notebook_trains_evaluates_and_saves_locally(tmp_path):
+def test_complete_frozenlake_notebook_trains_and_uploads_checkpoint(tmp_path, monkeypatch):
     path = Path(__file__).parents[1] / "examples/23_train_autoregressive_reasoning_dqn.ipynb"
     notebook = json.loads(path.read_text())
     source = tmp_path / "source"
     local_checkpoint(source)
     output = tmp_path / "trained"
+    from tests._hub_example_fixture import capture_upload
+    capture_upload(monkeypatch, output)
     namespace = {}
     for index, cell in enumerate(notebook["cells"]):
         if cell["cell_type"] != "code":
             continue
         exec(compile("".join(cell["source"]), f"{path}:cell{index}", "exec"), namespace)
         if index == 1:
-            namespace.update(PRETRAINED=str(source), REPLAY_EPISODES=2, EPISODES_PER_UPDATE=2,
+            namespace.update(PRETRAINED=str(source), load_stores_from_hub=lambda **_: recorded_stores(), TOKEN_BUDGET=64, NUM_WORKERS=0, GENERATION_START_TOKEN="word2",
                              MAX_EPISODE_STEPS=2, TRAIN_STEPS=1, MAX_NEW_TOKENS=64,
-                             MAX_ACTIVE_REQUESTS=2, EVAL_EPISODES=1, OUTPUT=output)
+                             MAX_ACTIVE_REQUESTS=2)
     online = namespace["online"]
     assert sum(isinstance(module, Backbone) for module in online.modules()) == 1
     assert online.reasoner.token_head.default_end_token_ids == (0,)
-    assert len(namespace["returns"]) == 1
     assert output.is_dir() and (output / "tokenizer/tokenizer.json").exists()
     assert np.isfinite(namespace["metrics"]["dqn_loss"])
     assert np.isfinite(namespace["metrics"]["reinforce_loss"])

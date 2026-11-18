@@ -311,8 +311,8 @@ class _CharacterTokenizer:
 def _notebook_transform(filename, *, tokenizer_only=False, compute_tokens=0):
     """Build each example with test-owned settings; parity tests disable compute text."""
     notebook = json.loads((EXAMPLES / filename).read_text())
-    source = next(''.join(cell['source']) for cell in notebook['cells']
-                  if cell['cell_type'] == 'code' and 'episode_prompt = ' in ''.join(cell['source']))
+    source = '\n\n'.join(''.join(cell['source']) for cell in notebook['cells']
+                         if cell['cell_type'] == 'code')
     assignments = {'episode_prompt', 'augmenter', 'tokenizer', 'train_transform', 'transform'}
     body: list[ast.stmt] = [node for node in ast.parse(source).body if
             isinstance(node, ast.FunctionDef) and

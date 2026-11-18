@@ -11,6 +11,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Initialize residual reasoning's learnable per-element input RMSNorm scale to
+  `0.02`, shared by generation and training forward calls.
+
+- Align all training examples with example 02's optimizer and target conventions.
+  Autoregressive and residual DQN now use MouseCore AdamW, separate embedding,
+  backbone, and head learning rates, and component-specific Polyak rates, with
+  an explicit rate for the extra generation head. Standardize loader controls,
+  transform names, gradient clearing, work-count validation, and offline cleanup.
+  Add CPU regression checks for independent target rates in every DQN example.
+
+- Residual generation now returns complete `ResidualBatch` token sequences for
+  ordinary online and target forward calls. Removed the public replay API;
+  post-stop training branches have isolated attention boundaries, and forward
+  rebuilds differentiable residual sums without generating or inserting tokens.
+
+- Generate residual reasoning only with the online model. Replay its same latent
+  history through online and delayed transformers, using online stopping positions
+  for both value readouts before the DQN loss.
+
+- Use the standard `DataLoader` in reasoning examples 23 and 25. Remove manual
+  episode lists and batch packing; format sampled events through the tokenizer
+  and let the loader supply objective mappings. Save and reload the same packing
+  tokenizer for autoregressive evaluation in example 15.
+
+- Give every example the same section order and code formatting. Separate
+  tokenizer construction, replay setup, and model construction; expand tokenizer
+  fields consistently and document the layout in `examples/README.md`.
+
+- Align notebook run functions around notebook-owned models, optimizers, replay
+  and settings. Reasoning examples now use `run_train(num_steps=...)`; training
+  functions return detached losses and metrics, and save sections share one title.
+
+- Standardize example outputs on Hugging Face: update local-only saves in examples
+  19 and 21–25, add the missing upload in 20, and load reasoning bundles from Hub
+  repositories in example 15. Preserve tokenizers, action tables and inference settings.
+
+- Make reasoning examples 23 and 25 strictly offline: load recorded event stores,
+  generate reasoning over sampled episodes, and train. Move their environment
+  evaluation to standalone checkpoint-loading sections in example 15.
+
+- Add `Model.generate` as the common inference wrapper. Residual generation can
+  reuse caller-owned episode caches, retaining all reasoning states between actions
+  until episode reset. Training replays the same retained history, and the last
+  state supplies action values when generation reaches its hard cap.
+
+- Share token and residual inference scheduling through `models.generate`, with
+  immediate admission into finished slots, stable request IDs, configurable
+  concurrency and cache budgets, and cache cleanup on failure.
+
+- Add a residual-reasoning FrozenLake DQN example and `ResidualReasoner`:
+  detached state inputs, trainable context embeddings, differentiable residual accumulation, one packed
+  transformer training replay, and uncached/paged generation. A deterministic
+  stop head learns from task error plus a cost per extra update; generation stops
+  independently for each decision within a configurable cap. Token fields can
+  declare `autoregressive=True` to select the start embedding; preserve their
+  `autoregressive_mask` through streaming, batching, token caches and saved specs.
+
 - Simplify batch names to `head_mask`, `sequence_ids`, and `step_ids`.
   Sequential objectives accept `sequence_ids=` and `step_ids=`; examples and
   tests use the same names throughout.

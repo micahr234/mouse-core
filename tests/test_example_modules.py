@@ -211,8 +211,9 @@ def test_notebook_training_uses_all_online_modules_and_updates_targets(path):
 
     ns.update(loader=Loader(), DataLoader=Loader, EpochDataLoader=Loader,
               stores=[[1]], store=[1], MAX_STEPS_PER_EPISODE=30,
-              transform=lambda row: row, tokenizer=SimpleNamespace(encode=lambda events: events), ACTION_COMPONENTS=2,
+              train_transform=lambda row: row, tokenizer=SimpleNamespace(encode=lambda events: events), ACTION_COMPONENTS=2,
               branch_advantages=[data['advantage']])
+    _notebook_functions(notebook, {"sample_ranges", "sample_eligible"}, ns)
     cell = next("".join(c["source"]) for c in notebook["cells"]
                 if "def run_train(" in "".join(c["source"]))
     exec(compile(cell, str(path), "exec"), ns)
@@ -240,7 +241,8 @@ def test_notebook_training_uses_all_online_modules_and_updates_targets(path):
 
         ns["objective"] = check_active_observations
     result = ns["run_train"](**kwargs)
-    assert torch.isfinite(torch.as_tensor(result[0]))
+    assert isinstance(result[0], torch.Tensor)
+    assert torch.isfinite(result[0]) and not result[0].requires_grad
     for name, module in ns["modules"].items():
         assert any(not torch.equal(old, new) for old, new in zip(before[name], module.parameters()))
     if delayed_before is not None:
@@ -502,7 +504,9 @@ def test_cartpole_encoder_uses_configured_fourier_features_for_observations():
 
 
 @pytest.mark.flex_training(default_device=False)
-def test_pendulum_notebook_logs_only_position_and_keeps_independent_episodes(monkeypatch):
+def test_pendulum_notebook_logs_only_position_and_keeps_independent_episodes(monkeypatch, tmp_path):
+    from tests._hub_example_fixture import capture_upload
+    capture_upload(monkeypatch, tmp_path / "checkpoint")
     gym = pytest.importorskip('gymnasium')
     pytest.importorskip('mouse_gym')
     make = gym.make
