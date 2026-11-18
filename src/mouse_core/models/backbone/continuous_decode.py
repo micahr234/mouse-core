@@ -130,22 +130,34 @@ class ContinuousDecodeSession:
         self.cache_capacity_tokens = cache_capacity_tokens
         self.device, self.dtype = module_device_dtype(model)
         self.autocast_dtype = check_autocast_dtype(autocast_dtype, self.dtype)
-        self._cache: PagedAttentionCache | None = PagedAttentionCache(
-            cfg,
-            ContinuousBatchingConfig(
-                max_batch_tokens=max_batch_tokens,
-                num_blocks=cache_capacity_tokens // _PAGE_SIZE,
-                max_memory_percent=1.0,
-                allow_block_sharing=False,
-                max_blocks_per_request=0,
-                auto_switch_to_flash=False,
-                use_cuda_graph=False,
-                use_async_batching=False,
-            ),
-            device=self.device, dtype=autocast_dtype or self.dtype,
-            distributed_helper=DistributedHelper(None, None),
-            model_supports_logits_to_keep=True,
-        )
+        try:
+            self._cache: PagedAttentionCache | None = PagedAttentionCache(
+                cfg,
+                ContinuousBatchingConfig(
+                    max_batch_tokens=max_batch_tokens,
+                    num_blocks=cache_capacity_tokens // _PAGE_SIZE,
+                    max_memory_percent=1.0,
+                    allow_block_sharing=False,
+                    max_blocks_per_request=0,
+                    auto_switch_to_flash=False,
+                    use_cuda_graph=False,
+                    use_async_batching=False,
+                ),
+                device=self.device, dtype=autocast_dtype or self.dtype,
+                distributed_helper=DistributedHelper(None, None),
+                model_supports_logits_to_keep=True,
+            )
+        except MemoryError as exc:
+            raise MemoryError(
+                "Cannot allocate the continuous decode cache with "
+                f"cache_capacity_tokens={cache_capacity_tokens}, "
+                f"max_batch_tokens={max_batch_tokens}, batch_size={batch_size}, "
+                f"cache_dtype={autocast_dtype or self.dtype}. "
+                "The entire KV pool is allocated at session creation, independently "
+                "of the training batch size. Reduce cache_capacity_tokens while "
+                "retaining enough space for all live outer episodes, or reduce "
+                f"concurrent episodes and the pool together. Original error: {exc}"
+            ) from exc
         self._scheduler: FIFOScheduler | None = FIFOScheduler(
             self._cache, safety_margin=0.0, max_requests_per_batch=batch_size,
         )

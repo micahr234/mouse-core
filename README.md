@@ -74,11 +74,52 @@ and still compiles its required kernel even with the decoder compiler off.
 Inference compilation is independent. Set `backbone.gradient_checkpointing = True`
 to recompute layer activations during backward and reduce training memory.
 
-`polyak_update(target=..., source=..., tau=...)` updates only parameters whose
-**source** has `requires_grad=True`. Delayed target parameters normally have
-gradients disabled, so their own flag does not determine eligibility. Frozen
-base weights, identical shared tensors, and buffers are not updated. Names,
-shapes, devices, and dtypes are still validated before any update.
+`MouseOptimizer` owns both online optimization and delayed-target averaging.
+Each named group specifies its online module, learning rate, and optional target
+module and Polyak rate. Group names are labels, not module lookup paths. Groups
+must not overlap. For example, with `online` and a frozen `target` containing
+`embedding`, `backbone`, and `value_head` modules:
+
+```python
+from mouse_core import MouseOptimizer
+
+optimizer = MouseOptimizer(
+    optimizer={"name": "adamw", "weight_decay": 0.0, "betas": (0.9, 0.95), "eps": 1e-8},
+    groups={
+        "embedding": {"online": online.embedding, "lr": 1e-5,
+                      "target": target.embedding, "polyak_tau": 0.01},
+        "backbone": {"online": online.backbone, "lr": 1e-4,
+                     "target": target.backbone, "polyak_tau": 0.01},
+        "value_head": {"online": online.value_head, "lr": 1e-3,
+                       "target": target.value_head, "polyak_tau": 0.001},
+    },
+)
+optimizer.zero_grad()
+loss.backward()
+optimizer.step()  # AdamW first, then each target's Polyak update
+```
+
+One optimizer applies to every group. Select `adamw`, `adam`, `sgd`, or `rmsprop`
+by name or supply a dictionary of global options. Weight decay and algorithm
+settings such as betas, epsilon, and momentum cannot be overridden per group.
+Online and target modules are accepted only inside groups.
+
+Groups without a target omit both `target` and `polyak_tau`, as in supervised
+learning and GRPO. Extra components such as residual norms and stop heads each
+have their own group. Trainability comes from the model's `requires_grad` flags;
+LoRA's frozen base stays frozen and its adapters remain trainable. Frozen source
+weights, shared tensors, and buffers are never interpolated. Independent target
+parameters must be frozen. Pair names, shapes, devices, dtypes, and all rates are
+validated before the online update. Changing trainability requires rebuilding
+the optimizer.
+
+`lr` and `polyak_tau` accept numbers or callable schedules such as `Piecewise`.
+`step()` tracks a zero-based index; `step(index)` supplies it explicitly. Optimizer
+state includes the next index for resuming schedules. Target/model weights are
+saved separately. Advanced packed heads can provide a per-parameter mapping of scalar or broadcast
+Tensor taus. All training notebooks use this wrapper. The standalone
+`polyak_update(target=..., source=..., tau=...)` remains available for explicit
+interpolation outside the coupled training path.
 
 ## Supervised policy and value losses
 

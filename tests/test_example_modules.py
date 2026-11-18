@@ -17,7 +17,7 @@ import torch
 from transformers.generation import ContinuousBatchingConfig
 from torch import nn
 
-from mouse_core import AdamW, polyak_update
+from mouse_core import MouseOptimizer
 from mouse_core.data import (
     DataLoader,
     EventLog,

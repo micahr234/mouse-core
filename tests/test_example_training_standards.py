@@ -10,7 +10,7 @@ import pytest
 import torch
 from torch import nn
 
-from mouse_core import AdamW, polyak_update
+from mouse_core import MouseOptimizer
 from mouse_core.models import Model
 
 EXAMPLES = Path(__file__).parents[1] / 'examples'
@@ -22,7 +22,7 @@ def source(path):
 
 
 TRAINERS = [p for p in sorted(EXAMPLES.glob('*.ipynb')) if 'def run_train(' in source(p)]
-DQN = [p for p in TRAINERS if 'polyak_update(' in source(p)]
+DQN = [p for p in TRAINERS if 'polyak_tau' in source(p)]
 
 
 def calls(tree, name):
@@ -36,12 +36,12 @@ def test_common_optimizer_and_loader_controls(path):
     assignments = {t.id: n for n in ast.walk(tree) if isinstance(n, ast.Assign)
                    for t in n.targets if isinstance(t, ast.Name)}
     opt = assignments['optimizer'].value
-    assert isinstance(opt, ast.Call) and isinstance(opt.func, ast.Name) and opt.func.id == 'AdamW'
+    assert isinstance(opt, ast.Call) and isinstance(opt.func, ast.Name) and opt.func.id == 'MouseOptimizer'
     options = {k.arg: k.value for k in opt.keywords}
-    assert ast.literal_eval(options['betas']) == (.9, .95)
-    assert ast.literal_eval(options['eps']) == 1e-8
-    assert ast.literal_eval(options['weight_decay']) == 0.
-    rates = {n.id for n in ast.walk(options['params']) if isinstance(n, ast.Name) and n.id.startswith('LR_')}
+    settings = ast.literal_eval(options['optimizer'])
+    assert settings == {'name': 'adamw', 'betas': (.9, .95), 'eps': 1e-8, 'weight_decay': 0.}
+    assert 'online' not in options and 'target' not in options
+    rates = {n.id for n in ast.walk(options['groups']) if isinstance(n, ast.Name) and n.id.startswith('LR_')}
     assert {'LR_EMBEDDING', 'LR_BACKBONE', 'LR_HEADS'} <= rates
     for loader in calls(tree, 'DataLoader') + calls(tree, 'EpochDataLoader'):
         assert isinstance(loader.func, ast.Name)
@@ -56,42 +56,49 @@ def test_common_optimizer_and_loader_controls(path):
 @pytest.mark.parametrize('path', DQN, ids=lambda p: p.stem)
 @pytest.mark.parametrize('rates', [(0., .25, 1., .6), (.7, 0., .1, 1.)])
 def test_each_notebook_updates_components_with_independent_rates(path, rates):
-    """Execute the actual notebook update calls with visibly different rates."""
+    """Execute the notebook optimizer with independent component rates."""
     tree = ast.parse(source(path))
-    update_calls = calls(tree, 'polyak_update')
-    assert update_calls
-    encoder = SimpleNamespace(embedding=nn.Linear(2, 2), backbone=nn.Linear(2, 2), reasoner=nn.Linear(2, 2))
-    online = SimpleNamespace(embedding=nn.Linear(2, 2), backbone=nn.Linear(2, 2), value_head=nn.Linear(2, 2),
-        reasoner=SimpleNamespace(norm=nn.Linear(2, 2), stop_head=nn.Linear(2, 2), token_head=nn.Linear(2, 2)))
+    optimizer = next(n for n in tree.body if isinstance(n, ast.Assign)
+                     and any(isinstance(t, ast.Name) and t.id == 'optimizer' for t in n.targets))
+    encoder = nn.ModuleDict(dict(embedding=nn.Linear(2, 2), backbone=nn.Linear(2, 2), reasoner=nn.Linear(2, 2)))
+    # Only example 10 has the older latent reasoner.
+    if not path.name.startswith('10_'):
+        del encoder['reasoner']
+    online = ReasoningModules('23' if path.name.startswith('23_') else '25')
     q_head = nn.Linear(2, 2)
-    ns = dict(encoder=encoder, delayed_encoder=deepcopy(encoder), online=online, target=deepcopy(online),
-              q_head=q_head, backup_value_head=deepcopy(q_head), q_heads={'n2': q_head},
-              backup_value_heads={'n2': deepcopy(q_head)}, key='n2', polyak_update=polyak_update)
+    q_heads = nn.ModuleDict({'n2': q_head})
+    modules = nn.ModuleDict({'encoder': encoder, 'q_heads' if path.name.startswith('13_') else 'q_head':
+                             q_heads if path.name.startswith('13_') else q_head})
+    ns = dict(encoder=encoder, delayed_encoder=deepcopy(encoder).requires_grad_(False),
+              online=online, target=deepcopy(online).requires_grad_(False), modules=modules,
+              q_head=q_head, backup_value_head=deepcopy(q_head).requires_grad_(False), q_heads=q_heads,
+              backup_value_heads=deepcopy(q_heads).requires_grad_(False), transition=None,
+              MouseOptimizer=MouseOptimizer, LR_EMBEDDING=0., LR_BACKBONE=0., LR_HEADS=0.)
     ns.update(zip(('POLYAK_TAU_EMBEDDING', 'POLYAK_TAU_BACKBONE', 'POLYAK_TAU_VALUE',
                    'POLYAK_TAU_REASONING_HEAD'), rates, strict=True))
+    exec(compile(ast.Module(body=[optimizer], type_ignores=[]), str(path), 'exec'), ns)
+    opt = ns['optimizer']
     seen = set()
-    for call in update_calls:
-        kw = {k.arg: k.value for k in call.keywords}
-        component = ast.unparse(kw['source'])
-        expected = (rates[0] if component.endswith('.embedding') else
-                    rates[3] if component.endswith(('.token_head', '.stop_head')) else
-                    rates[2] if component.endswith('.value_head') or component.startswith('q_head') else rates[1])
-        evaluate = lambda expr: eval(compile(ast.Expression(expr), str(path), 'eval'), ns)
-        src, dst = evaluate(kw['source']), evaluate(kw['target'])
-        # A whole-model update is deliberately unsupported: it hides component rates.
-        assert isinstance(src, nn.Linear) and isinstance(dst, nn.Linear)
-        assert id(dst) not in seen, 'A delayed component must update once per step'
+    for name, settings in opt.groups.items():
+        src = settings['online']
+        dst = settings.get('target')
+        if dst is None:
+            continue
+        assert id(dst) not in seen
         seen.add(id(dst))
         with torch.no_grad():
-            for param in src.parameters():
-                param.fill_(4.)
+            for param in src.parameters(): param.fill_(4.)
+            for param in dst.parameters(): param.fill_(-2.)
+    opt.step()
+    for name, settings in opt.groups.items():
+        expected = (rates[0] if name.endswith('embedding') else
+                    rates[3] if name.endswith(('token_head', 'stop_head')) else
+                    rates[2] if name.endswith('value_head') or name.startswith('q_head') else rates[1])
+        dst = settings.get('target')
+        if dst is not None:
             for param in dst.parameters():
-                param.fill_(-2.)
-                param.requires_grad_(False)
-        exec(compile(ast.fix_missing_locations(ast.Module(body=[ast.Expr(call)], type_ignores=[])), str(path), 'exec'), ns)
-        for param in dst.parameters():
-            torch.testing.assert_close(param, torch.full_like(param, -2. + 6. * expected))
-            assert param.grad is None
+                torch.testing.assert_close(param, torch.full_like(param, -2. + 6. * expected))
+                assert param.grad is None
     assert len(seen) >= 3
 
 
@@ -119,7 +126,9 @@ def test_reasoning_optimizers_cover_parameters_once_at_component_rates(kind):
     optimizer = next(n for n in tree.body if isinstance(n, ast.Assign)
                      and any(isinstance(t, ast.Name) and t.id == 'optimizer' for t in n.targets))
     model = ReasoningModules(kind)
-    ns: dict[str, Any] = dict(online=model, AdamW=AdamW, LR_EMBEDDING=.001, LR_BACKBONE=.002, LR_HEADS=.003)
+    ns: dict[str, Any] = dict(online=model, target=deepcopy(model).requires_grad_(False), MouseOptimizer=MouseOptimizer,
+        LR_EMBEDDING=.001, LR_BACKBONE=.002, LR_HEADS=.003, POLYAK_TAU_EMBEDDING=.1,
+        POLYAK_TAU_BACKBONE=.2, POLYAK_TAU_VALUE=.3, POLYAK_TAU_REASONING_HEAD=.4)
     exec(compile(ast.Module(body=[optimizer], type_ignores=[]), str(path), 'exec'), ns)
     actual = {}
     for group in ns['optimizer'].param_groups:

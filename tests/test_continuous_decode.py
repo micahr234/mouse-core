@@ -191,6 +191,23 @@ def test_invalid_capacity_configuration(kwargs, message):
         ContinuousDecodeSession(backbone().model, **opts)
 
 
+def test_cache_memory_error_explains_inference_pool_and_preserves_cause(monkeypatch):
+    from transformers.generation.continuous_batching.cache import PagedAttentionMemoryHandler
+
+    # Exercise HF's actual footprint rejection without allocating a large cache
+    # or depending on available GPU memory.
+    monkeypatch.setattr(PagedAttentionMemoryHandler, 'get_available_memory', lambda self: 0)
+    with pytest.raises(MemoryError, match='Cannot allocate the continuous decode cache') as raised:
+        backbone(autocast_dtype=torch.bfloat16).decode_session(
+            2, max_batch_tokens=4, cache_capacity_tokens=2 * PAGE_SIZE)
+    message = str(raised.value)
+    for detail in (f'cache_capacity_tokens={2 * PAGE_SIZE}', 'max_batch_tokens=4',
+                   'batch_size=2', 'cache_dtype=torch.bfloat16', 'training batch size'):
+        assert detail in message
+    assert isinstance(raised.value.__cause__, MemoryError)
+    assert 'Memory footprint' in str(raised.value.__cause__)
+
+
 def test_live_mask_cannot_be_changed_by_cache_configuration():
     model = backbone()
     model.model.config.layer_types = ["full_attention", "sliding_attention"]

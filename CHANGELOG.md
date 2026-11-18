@@ -11,6 +11,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add `MouseOptimizer`: named groups explicitly contain online modules, learning
+  rates, target modules and Polyak schedules. One selectable optimizer and its
+  settings (including weight decay) apply globally. One step validates all groups, updates the
+  online parameters, then averages their targets. Preserve LoRA trainability,
+  support packed-head rates and checkpoint schedule position, and migrate every
+  training notebook to the same optimizer path.
+
+- Explain continuous decode allocation failures with the requested KV capacity,
+  query budget, active-row limit, and cache dtype; preserve the original memory
+  error and never silently shrink episode history.
+
 - Standardize every Procedural FrozenLake training notebook on eight complete
   outer episodes per batch, including all inner repeats. GRPO retains its final
   partial batch.
