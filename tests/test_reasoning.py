@@ -1,6 +1,7 @@
 """Coconut-style latent reasoning: generation, bookkeeping, gradients, delayed copy."""
 
 from __future__ import annotations
+from tensordict import TensorDict
 from tests._model_helpers import fresh_model, ExampleModel as Model
 from typing import Any, cast
 from tests._model_helpers import copy_model, simple_model
@@ -85,7 +86,7 @@ def test_plan_insertions_bookkeeping() -> None:
     batch, objective_data = _token_batch(model, _BATCH)
     # Seq 0: 4 steps × 3 tokens, head-outputs [2, 5, 8, 11]; seq 1: 3 steps
     # × 3 tokens. Burst at seq 0 step 1 (first head-output token 5), R = 2.
-    plan = _plan_insertions(batch, objective_data, np.array([1, -1]), num_thoughts=2)
+    plan = _plan_insertions(batch, TensorDict(objective_data, batch_size=[]), np.array([1, -1]), num_thoughts=2)
     assert plan is not None
     assert plan.ext_length == batch["token_ids"].shape[0] + 2
     assert plan.anchors.tolist() == [5]
@@ -170,7 +171,7 @@ def test_sample_reasoning_splits_eligibility() -> None:
     rng = np.random.default_rng(0)
     seen: set[int] = set()
     for _ in range(50):
-        splits = sample_reasoning_splits(batch=batch, objective_data=objective_data, generator=rng)
+        splits = sample_reasoning_splits(batch=batch, objective_data=TensorDict(objective_data, batch_size=[]), generator=rng)
         assert splits.shape == (2,)
         assert splits[1] == -1
         assert int(splits[0]) in (0, 1, 2)

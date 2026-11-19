@@ -82,7 +82,7 @@ class MouseOptimizer:
     such as weight_decay, betas, eps or momentum. These settings cannot be
     overridden per group; only learning rates and Polyak rates vary by group.
 
-    Learning rates and taus may be numbers or zero-based callable schedules.
+    Learning rates and taus may be numbers or zero-based training-batch schedules.
     A tau may map parameter names to scalar/broadcast tensor rates. All rates
     and pairs are validated before the online update. Targets follow the final
     online weights. Frozen source weights, shared parameters and buffers stay put.
@@ -96,7 +96,6 @@ class MouseOptimizer:
         self.groups: dict[str, dict[str, Any]] = {}
         self._sources: dict[str, nn.Module] = {}
         self._parameters: dict[str, dict[str, nn.Parameter]] = {}
-        self._next_step = 0
         online_ids: set[int] = set()
         for name, settings in groups.items():
             if not isinstance(name, str) or not name:
@@ -221,12 +220,15 @@ class MouseOptimizer:
         self.inner.step()
 
     @torch.no_grad()
-    def step(self, step: int | None = None, **kwargs: Any) -> None:
-        """Apply one online update, then one target update using the same step."""
-        if step is None:
-            step = self._next_step
+    def step(self, step: int, **kwargs: Any) -> None:
+        """Apply one update at the explicit zero-based training-batch index.
+
+        With gradient accumulation, pass the index of the last batch in the
+        group. The caller owns batch counting, evaluation and accumulation;
+        schedules never infer their position from the number of updates.
+        """
         if type(step) is not int or step < 0:
-            raise ValueError("optimizer step must be a nonnegative integer")
+            raise ValueError("training step must be a nonnegative integer")
         if {id(p) for module in self._sources.values() for p in module.parameters() if p.requires_grad} != self._trainable:
             raise ValueError("Trainability changed; rebuild the optimizer after changing requires_grad.")
         rates, pairs = self._prepare_step(step)
@@ -237,7 +239,6 @@ class MouseOptimizer:
             self.inner.param_groups[index]["lr"] = rate
         self._step_online(step, **kwargs)
         self._step_targets(pairs)
-        self._next_step = step + 1
 
     def _step_targets(self, pairs) -> None:
         for source, target, tau in pairs:
@@ -247,23 +248,23 @@ class MouseOptimizer:
         native = isinstance(self.inner, torch.optim.Optimizer)
         state = ({"algorithm": type(self.inner).__name__.lower(), "inner": self.inner.state_dict()}
                  if native else self.inner.state_dict())
-        return {**state, "next_step": self._next_step, "groups": self._group_signature()}
+        return {**state, "groups": self._group_signature()}
 
     def _group_signature(self):
         return [(name, list(parameters), self.groups[name].get("target") is not None)
                 for name, parameters in self._parameters.items()]
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
-        if state["groups"] != self._group_signature():
-            raise ValueError("Optimizer checkpoint parameter groups do not match.")
-        if type(state["next_step"]) is not int or state["next_step"] < 0:
-            raise ValueError("Invalid optimizer checkpoint step.")
         native = isinstance(self.inner, torch.optim.Optimizer)
         algorithm = type(self.inner).__name__.lower() if native else None
         if state.get("algorithm") != algorithm:
             raise ValueError("Different optimizer states are not interchangeable")
+        expected = {"groups", "inner", "algorithm"} if native else {"groups", "inner"}
+        if state.keys() != expected:
+            raise ValueError("Optimizer checkpoint fields do not match the current format.")
+        if state["groups"] != self._group_signature():
+            raise ValueError("Optimizer checkpoint parameter groups do not match.")
         self.inner.load_state_dict(state["inner"] if native else {"inner": state["inner"]})
-        self._next_step = state["next_step"]
 
     def state_to(self, device: torch.device | str) -> None:
         """Move optimizer moments without moving online or target parameters."""

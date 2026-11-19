@@ -6,7 +6,7 @@ def pack_prefixes(prompts):
     """Independent synthetic requests for reasoner unit tests, not replay sampling."""
     import numpy as np
     from mouse_core.data import make_token_batch
-    lengths = np.asarray([len(prompt) for prompt in prompts])
+    lengths = np.asarray([len(prompt) for prompt in prompts], dtype=np.int64)
     ids = np.concatenate(prompts)
     return make_token_batch(
         token_ids=ids, numeric_values=np.zeros(len(ids)), numeric_mask=np.zeros(len(ids), bool),
@@ -65,3 +65,18 @@ def recorded_stores(*, episodes=2, horizon=2):
                 payload={'observation': step % 16, **({'_truncated': True} if step == horizon
                                                      else {'action_requested': True})}))
     return [store]
+
+
+def configure_notebook_optimizer(example, notebook):
+    """Execute the notebook's real optimizer setup with test-owned modules/rates."""
+    import ast
+    import json
+    namespace = example.run_train.__globals__
+    nodes: list[ast.stmt] = [node for cell in json.loads(notebook.read_text())['cells']
+             if cell['cell_type'] == 'code'
+             for node in ast.parse(''.join(cell['source'])).body
+             if isinstance(node, ast.Assign)
+             and any(isinstance(target, ast.Name) and target.id == 'optimizer' for target in node.targets)]
+    assert len(nodes) == 1
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(notebook), 'exec'), namespace)
+    namespace['training_step'] = 0

@@ -16,7 +16,7 @@ def example(request):
 
 def test_loader_skips_partial_prefixes_and_unfinished_tails(example):
     complete = recorded_stores(episodes=1)[0]
-    events = [dict(row, payload=json.loads(row['payload'])) for row in complete.to_dataset()]
+    events = [dict(row, payload=json.loads(row['payload'])) for row in complete.to_dataset().to_list()]
     partial, unfinished = Datastore(name='partial'), Datastore(name='unfinished')
     for event in events[2:]:
         partial.append(data=event)

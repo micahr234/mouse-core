@@ -63,6 +63,7 @@ def test_snapshot_preserves_selection_duplicates_features_and_format(tmp_path):
 def test_borrowed_files_survive_close_and_mixed_sources_are_fully_mapped(tmp_path):
     source().save_to_disk(str(tmp_path / 'source'))
     mapped = load_from_disk(str(tmp_path / 'source'))
+    assert isinstance(mapped, Dataset)
     with DatasetSnapshot(mapped) as snapshot:
         assert snapshot.path is None and snapshot.bytes_written == 0
         assert snapshot.dataset.cache_files == mapped.cache_files
@@ -118,7 +119,9 @@ def test_growing_replay_refresh_preserves_batches_and_releases_snapshots(workers
                 equal_batches(batch, expected.next_batch())
                 retained.append((batch, tuple(part.clone() for part in batch)))
             diagnostics = actual.diagnostics
+            assert diagnostics['snapshot_bytes'] is not None
             assert diagnostics['snapshot_bytes'] > 0
+            assert diagnostics['snapshot_seconds'] is not None
             assert diagnostics['snapshot_seconds'] >= 0
             startup = diagnostics['worker_startup_seconds']
             assert startup is None or startup >= 0

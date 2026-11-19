@@ -1,6 +1,7 @@
 """Explicit head-output tokens: flagging, packing, objectives, multi-token readout."""
 
 from __future__ import annotations
+from tensordict import TensorDict
 
 from tests._prediction_layout import fixture_head_steps
 from tests._event_fixtures import encode_measurement
@@ -382,7 +383,7 @@ def test_plan_anchors_on_first_head_output_token() -> None:
     batch, objective_data = _packed(model)
     # Seq 0: 3 steps × 5 tokens; head-output pairs (3,4), (8,9), (13,14).
     # Burst at step 1 → anchor 8 (the *first* head-output token).
-    plan = _plan_insertions(batch, objective_data, np.array([1, -1]), num_thoughts=2)
+    plan = _plan_insertions(batch, TensorDict(objective_data, batch_size=[]), np.array([1, -1]), num_thoughts=2)
     assert plan is not None
     assert plan.anchors.tolist() == [8]
     assert plan.latent_positions.tolist() == [8, 9]

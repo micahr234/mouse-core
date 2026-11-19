@@ -45,6 +45,7 @@ def test_example_next_batch_keeps_complete_samples_and_aligned_labels(window, au
     assert sequence_ids.shape == (objective_data["sequence_ids"].shape[0],)
     np.testing.assert_array_equal(sequence_ids.numpy(), objective_data["sequence_ids"])
     for key, values in objective_data.items():
+        assert isinstance(values, torch.Tensor)
         if key == "step_ids":
             assert len(values) == int(inputs["head_mask"].sum())
             continue

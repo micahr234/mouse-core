@@ -42,7 +42,7 @@ class MultiEmbedding(nn.Module):
             num_frequencies=num_frequencies, position_num_frequencies=position_num_frequencies,
         )
         tables = [module.embed_tokens.weight.detach() for module in embeddings.values()]
-        rms = torch.sqrt(sum(table.square().sum() for table in tables) / sum(table.numel() for table in tables))
+        rms = torch.sqrt(torch.stack([table.square().sum() for table in tables]).sum() / sum(table.numel() for table in tables))
         self.features.scale_initial_weights(rms)
 
     def forward(

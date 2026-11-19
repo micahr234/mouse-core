@@ -69,7 +69,7 @@ def test_each_notebook_updates_components_with_independent_rates(path, rates):
     q_heads = nn.ModuleDict({'n2': q_head})
     modules = nn.ModuleDict({'encoder': encoder, 'q_heads' if path.name.startswith('13_') else 'q_head':
                              q_heads if path.name.startswith('13_') else q_head})
-    ns = dict(encoder=encoder, delayed_encoder=deepcopy(encoder).requires_grad_(False),
+    ns: dict[str, Any] = dict(encoder=encoder, delayed_encoder=deepcopy(encoder).requires_grad_(False),
               online=online, target=deepcopy(online).requires_grad_(False), modules=modules,
               q_head=q_head, backup_value_head=deepcopy(q_head).requires_grad_(False), q_heads=q_heads,
               backup_value_heads=deepcopy(q_heads).requires_grad_(False), transition=None,
@@ -89,7 +89,7 @@ def test_each_notebook_updates_components_with_independent_rates(path, rates):
         with torch.no_grad():
             for param in src.parameters(): param.fill_(4.)
             for param in dst.parameters(): param.fill_(-2.)
-    opt.step()
+    opt.step(0)
     for name, settings in opt.groups.items():
         expected = (rates[0] if name.endswith('embedding') else
                     rates[3] if name.endswith(('token_head', 'stop_head')) else

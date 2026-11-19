@@ -124,5 +124,5 @@ def test_embedding_trainability_is_independent_of_backbone_lora():
     assert any(not p.requires_grad for p in backbone.parameters())
     assert all(p.requires_grad for p in embedding.parameters())
     embedding.embed_tokens.requires_grad_(False)
-    assert embedding.features.numeric[0] is not None and embedding.features.numeric[0].proj.weight.requires_grad
+    assert embedding.features.numeric[0] is not None and embedding.features.numeric[0].get_parameter("proj.weight").requires_grad
     assert any(p.requires_grad for p in backbone.parameters())

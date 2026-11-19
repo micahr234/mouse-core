@@ -9,7 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from tests._reasoning_replay_fixture import recorded_stores, reasoning_loader
+from tests._reasoning_replay_fixture import configure_notebook_optimizer, recorded_stores, reasoning_loader
 
 import numpy as np
 import pytest
@@ -368,11 +368,12 @@ def test_notebook_dqn_update_replays_online_trajectory_through_both_models(tmp_p
         seen_backups.append(kwargs['backup_value_predictions'].clone())
         return objective(**kwargs)
     example.run_train.__globals__.update(
-        online=online, target=target, optimizer=torch.optim.AdamW(online.parameters(), lr=1e-3),
+        online=online, target=target, LR_EMBEDDING=1e-3, LR_BACKBONE=1e-3, LR_HEADS=1e-3,
         objective=check_objective, loader=loader, device=torch.device('cpu'),
         GENERATION_BACKEND='uncached', MAX_ACTIVE_REQUESTS=2,
         POLYAK_TAU_EMBEDDING=.1, POLYAK_TAU_BACKBONE=.2, POLYAK_TAU_VALUE=.3,
         POLYAK_TAU_REASONING_HEAD=.4, MAX_GRAD_NORM=1., REASONING_STEP_COST=.01)
+    configure_notebook_optimizer(example, NOTEBOOK)
     try:
         loss, metrics = example.run_train(num_steps=1)
     finally:
@@ -765,11 +766,12 @@ def test_mixed_stops_align_final_values_actions_rewards_and_notebook_loss(monkey
     monkeypatch.setattr(online, 'generate', lambda *args, **kwargs: generated)
     example = example_module()
     example.run_train.__globals__.update(
-        online=online, target=target, optimizer=torch.optim.SGD(online.parameters(), lr=0.),
+        online=online, target=target, LR_EMBEDDING=0., LR_BACKBONE=0., LR_HEADS=0.,
         objective=check_objective, loader=SimpleNamespace(next_batch=lambda: (tokens, data)),
         device=torch.device('cpu'), GENERATION_BACKEND='uncached', MAX_ACTIVE_REQUESTS=1,
         POLYAK_TAU_EMBEDDING=0., POLYAK_TAU_BACKBONE=0., POLYAK_TAU_VALUE=0.,
         POLYAK_TAU_REASONING_HEAD=0., MAX_GRAD_NORM=1., REASONING_STEP_COST=.07)
+    configure_notebook_optimizer(example, NOTEBOOK)
     loss, metrics = example.run_train(num_steps=1)
     assert seen == [True]
     torch.testing.assert_close(loss, (expected_task + expected_cost).detach())

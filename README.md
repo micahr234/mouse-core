@@ -96,7 +96,7 @@ optimizer = MouseOptimizer(
 )
 optimizer.zero_grad()
 loss.backward()
-optimizer.step()  # AdamW first, then each target's Polyak update
+optimizer.step(step=0)  # Batch index; AdamW first, then each target's Polyak update
 ```
 
 One optimizer applies to every group. Select `adamw`, `adam`, `sgd`, or `rmsprop`
@@ -114,9 +114,13 @@ validated before the online update. Changing trainability requires rebuilding
 the optimizer.
 
 `lr` and `polyak_tau` accept numbers or callable schedules such as `Piecewise`.
-`step()` tracks a zero-based index; `step(index)` supplies it explicitly. Optimizer
-state includes the next index for resuming schedules. Target/model weights are
-saved separately. Advanced packed heads can provide a per-parameter mapping of scalar or broadcast
+`step(index)` requires the zero-based training-batch index. Every processed batch
+counts as a training step, including batches whose gradients are still accumulating.
+Call the optimizer only when applying the accumulated gradient, passing that final
+batch's index; learning-rate and Polyak schedules resolve at that index. Evaluation
+intervals and training budgets count batches independently of optimizer updates.
+Optimizer state stores moments and group identity; the training loop owns its batch
+position. Target/model weights are saved separately. Advanced packed heads can provide a per-parameter mapping of scalar or broadcast
 Tensor taus. All training notebooks use this wrapper. The standalone
 `polyak_update(target=..., source=..., tau=...)` remains available for explicit
 interpolation outside the coupled training path.
@@ -790,8 +794,9 @@ schedule; use `DataLoader` for this curriculum.
 
 Already-prefetched batches keep their assigned settings. `loader.refresh()` discards
 those batches, refreshes the stores, and reevaluates the schedule from the next
-unconsumed batch index. Recreating a loader starts at index zero. For gradient
-accumulation, map batch index to optimizer step in your schedule. Keep inference
+unconsumed batch index. Recreating a loader starts at index zero. With gradient
+accumulation, each batch still counts as one training step; keep schedules indexed
+by batches. Keep inference
 compute counts fixed during cached episodes. Notebook 02 uses a constant count through the same context API and validates that
 spaced periods produce exact token counts with its selected tokenizer. Its callback
 can be changed to a schedule like the one above without rebuilding the tokenizer.

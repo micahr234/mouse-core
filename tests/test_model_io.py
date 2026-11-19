@@ -127,7 +127,7 @@ def test_num_frequencies_roundtrip(tmp_path) -> None:
     backbone = Backbone(architecture='qwen3', dtype=torch.float32, hidden_dim=hidden_dim, num_layers=1, num_heads=2)
     assert embedding.features.numeric[0] is not None
     with torch.no_grad():
-        embedding.features.numeric[0].proj.weight.fill_(0.25)
+        embedding.features.numeric[0].get_parameter("proj.weight").fill_(0.25)
     heads = MLP(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, propagate_gradient=1.0)
     model = simple_model(embedding=embedding, backbone=backbone, heads={'action_value': heads}, reasoner=None)
     save_model(model=model, path=tmp_path)
@@ -136,7 +136,7 @@ def test_num_frequencies_roundtrip(tmp_path) -> None:
     assert loaded_model.embedding.features.num_frequencies == 3
     assert loaded.features.numeric[0] is not None
     assert model.embedding.features.numeric[0] is not None
-    assert torch.equal(loaded.features.numeric[0].proj.weight, model.embedding.features.numeric[0].proj.weight)
+    assert torch.equal(loaded.features.numeric[0].get_parameter("proj.weight"), model.embedding.features.numeric[0].get_parameter("proj.weight"))
     assert not any((key.endswith('bands') for key in model.state_dict()))
 
 
@@ -144,7 +144,7 @@ def test_fourier_stays_trainable_when_lora_freezes_the_stack() -> None:
     embedding = Embedding(hidden_dim=8, vocab_size=32, numeric_field_names=("sensor.value",), num_frequencies=2)
     backbone = Backbone(architecture='qwen3', dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2, lora=LoRAConfig(rank=2))
     assert embedding.features.numeric[0] is not None
-    assert embedding.features.numeric[0].proj.weight.requires_grad
+    assert embedding.features.numeric[0].get_parameter("proj.weight").requires_grad
     assert any(not param.requires_grad for param in backbone.model.parameters())
 
 
@@ -153,7 +153,7 @@ def test_identity_num_frequencies_roundtrip(tmp_path) -> None:
     backbone = IdentityBackbone(hidden_dim=8)
     assert embedding.features.numeric[0] is not None
     with torch.no_grad():
-        embedding.features.numeric[0].proj.weight.normal_()
+        embedding.features.numeric[0].get_parameter("proj.weight").normal_()
     heads = MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0)
     model = simple_model(embedding=embedding, backbone=backbone, heads={'action_value': heads}, reasoner=None)
     save_model(model=model, path=tmp_path)
@@ -162,7 +162,7 @@ def test_identity_num_frequencies_roundtrip(tmp_path) -> None:
     assert loaded_model.embedding.features.num_frequencies == 4
     assert loaded.features.numeric[0] is not None
     assert model.embedding.features.numeric[0] is not None
-    assert torch.equal(loaded.features.numeric[0].proj.weight, model.embedding.features.numeric[0].proj.weight)
+    assert torch.equal(loaded.features.numeric[0].get_parameter("proj.weight"), model.embedding.features.numeric[0].get_parameter("proj.weight"))
 
 
 def test_explicit_model_checkpoints_roundtrip_without_backbone_output_norm(tmp_path) -> None:

@@ -1,5 +1,7 @@
 """Real HF scheduling/cache + Mouse Flex inference, without downloaded models."""
 from __future__ import annotations
+from typing import Any, cast
+from mouse_core.models.backbone.transformer import Architecture
 
 import pytest
 import torch
@@ -17,7 +19,7 @@ PAGE_SIZE = ContinuousBatchingConfig().page_size
 DEVICES = ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"))]
 
 
-def backbone(architecture="qwen3", device="cpu", autocast_dtype=None):
+def backbone(architecture: Architecture="qwen3", device="cpu", autocast_dtype=None):
     torch.manual_seed(81)
     model = Backbone(architecture=architecture, dtype=torch.float32, hidden_dim=32,
                      num_layers=2, num_heads=2, num_key_value_heads=1,
@@ -85,6 +87,7 @@ def test_ready_rows_arrive_during_prefill_and_reuse_finished_slots():
     torch.testing.assert_close(result[0], reference(model, first))
     torch.testing.assert_close(result[1], reference(model, second))
     # Idle episode 0 remains in the allocator when episode 1 is replaced.
+    assert cache._cache is not None
     allocator = cache._cache.layer_to_allocator[0]
     blocks_before = list(allocator.block_table['0'])
     cache.reset_rows([1])
@@ -185,10 +188,10 @@ def test_hidden_states_feed_multiple_existing_rl_heads(architecture):
     ({'cache_capacity_tokens': PAGE_SIZE + 1}, f'multiple of {PAGE_SIZE}'), ({'cache_capacity_tokens': True}, 'positive integer'),
 ])
 def test_invalid_capacity_configuration(kwargs, message):
-    opts = dict(batch_size=2, max_batch_tokens=4, cache_capacity_tokens=2 * PAGE_SIZE)
+    opts: dict[str, Any] = dict(batch_size=2, max_batch_tokens=4, cache_capacity_tokens=2 * PAGE_SIZE)
     opts.update(kwargs)
     with pytest.raises(ValueError, match=message):
-        ContinuousDecodeSession(backbone().model, **opts)
+        ContinuousDecodeSession(cast(nn.Module, backbone().model), **opts)
 
 
 def test_cache_memory_error_explains_inference_pool_and_preserves_cause(monkeypatch):
@@ -258,7 +261,9 @@ def test_cuda_mixed_precision():
     result = cache.forward(embeds=x, lengths=[25, 7])
     expected = reference(model, x[0])
     torch.testing.assert_close(result[0], expected, atol=4e-3, rtol=4e-3)
+    assert cache._cache is not None
     assert cache._cache.dtype == torch.bfloat16
+    assert isinstance(result, torch.Tensor)
     assert result.dtype == torch.float32
     cache.close()
 
@@ -281,6 +286,7 @@ def test_cuda_bf16_base_with_fp32_lora():
     result = cache.forward(embeds=x, lengths=[17, 1])
     expected = reference(model, x[0])
     torch.testing.assert_close(result[0], expected, atol=0.04, rtol=0.02)
+    assert cache._cache is not None
     assert cache._cache.dtype == torch.bfloat16
     assert all(p.dtype == torch.float32 for n, p in model.named_parameters() if "lora_" in n)
     cache.close()

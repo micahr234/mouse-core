@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from pathlib import Path
 from typing import Any, cast
 
-from tests._reasoning_replay_fixture import recorded_stores, pack_prefixes, reasoning_loader
+from tests._reasoning_replay_fixture import configure_notebook_optimizer, recorded_stores, pack_prefixes, reasoning_loader
 
 import numpy as np
 import pytest
@@ -186,12 +186,13 @@ def test_dqn_plus_reinforce_update_shared_backbone_head_and_delayed_target(backe
     objective = DqnObjective(reward=None, value=None, gate=None, temperature=0.,
                             discount=boundary_discount(gamma_step=0.9, gamma_terminated=0., gamma_truncated=0.))
     example.run_train.__globals__.update(
-        online=online, target=target, optimizer=torch.optim.AdamW(online.parameters(), lr=1e-3),
+        online=online, target=target, LR_EMBEDDING=1e-3, LR_BACKBONE=1e-3, LR_HEADS=1e-3,
         objective=objective, loader=loader, device=torch.get_default_device(),
         GENERATION_BACKEND=backend, END_GENERATION_TOKEN_ID=0, MAX_NEW_TOKENS=64,
         MAX_ACTIVE_REQUESTS=2, REASONING_TEMPERATURE=0.8, REINFORCE_WEIGHT=1.,
         POLYAK_TAU_EMBEDDING=.1, POLYAK_TAU_BACKBONE=.2, POLYAK_TAU_VALUE=.3,
         POLYAK_TAU_REASONING_HEAD=.4, MAX_GRAD_NORM=1.)
+    configure_notebook_optimizer(example, Path(__file__).parents[1] / "examples/23_train_autoregressive_reasoning_dqn.ipynb")
     try:
         loss, metrics = example.run_train(num_steps=1)
     finally:

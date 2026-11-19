@@ -449,7 +449,7 @@ def test_other_frozenlake_tokenizers_encode_events(filename):
         sequence_ids=[0, 0, 0], batch_size=1)
     assert labels["sequence_ids"].shape[0] == 3
     expected = {'action', 'advantage', 'old_log_prob'} if 'grpo' in filename else {'q_star'}
-    assert expected <= labels.keys()
+    assert expected <= set(labels.keys())
     if 'grpo' not in filename:
         assert torch.isfinite(labels['q_star'][:2]).all()
         assert torch.isneginf(labels['q_star'][-1]).all()

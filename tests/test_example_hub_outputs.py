@@ -1,4 +1,5 @@
 """Execute example upload cells with a local Hub sink and reload their bundles."""
+from typing import Any
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -29,7 +30,7 @@ def test_upload_cell_preserves_model_tokenizer_and_custom_artifacts(tmp_path, mo
     modules = nn.ModuleDict({'encoder': nn.Linear(2, 2), 'q_head': nn.Linear(2, 4)})
     output = tmp_path / 'uploaded'
     uploads = capture_upload(monkeypatch, output)
-    namespace = dict(json=json, Path=Path, TemporaryDirectory=TemporaryDirectory, HfApi=HfApi, nn=nn,
+    namespace: dict[str, Any] = dict(json=json, Path=Path, TemporaryDirectory=TemporaryDirectory, HfApi=HfApi, nn=nn,
         modules=modules, encoder=modules['encoder'], q_head=modules['q_head'], transition=None,
         MODEL_ID='test/example', tokenizer=tokenizer, text_tokenizer=text,
         save_model=save_model, save_tokenizer=save_tokenizer, push_model_to_hub=push_model_to_hub,

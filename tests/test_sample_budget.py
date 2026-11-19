@@ -1,4 +1,5 @@
 """Sample budgets retain whole episodes independently of tokenization length."""
+from typing import Any
 from functools import partial
 
 import numpy as np
@@ -31,7 +32,7 @@ def transform(events, *, width=1, context=None):
     ) for event in events]
 
 
-def arguments():
+def arguments() -> dict[str, Any]:
     return dict(stores=[store()], sample_field='episode_index', sample_eligible=eligible,
                 transform=transform, num_workers=0, seed=12)
 

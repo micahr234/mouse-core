@@ -651,6 +651,7 @@ def test_inference_notebook_keeps_outer_prefix_and_resets_rows(monkeypatch):
     def forward(session, *, embeds, lengths, output_hidden_states=False):
         result = original_forward(session, embeds=embeds, lengths=lengths,
                                   output_hidden_states=output_hidden_states)
+        assert isinstance(result, torch.Tensor)
         for row, count in enumerate(lengths):
             if count:
                 histories[row].append(embeds[row, -count:])

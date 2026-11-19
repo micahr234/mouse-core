@@ -1099,14 +1099,15 @@ def test_zero_numeric_values_keep_their_mask_through_prefix_packing_and_embeddin
     with torch.no_grad():
         embedding.embed_tokens.weight.zero_()
         for projection in embedding.features.numeric:
-            projection.proj.weight.fill_(1.)
+            projection.get_parameter("proj.weight").fill_(1.)
     output = embed_batch(embedding, batch)
     numeric = tensors["numeric_mask"]
     assert torch.all(output[numeric] > 0)
     assert torch.count_nonzero(output[~numeric]) == 0
     output.sum().backward()
-    assert embedding.features.numeric[0].proj.weight.grad is not None
-    assert embedding.features.numeric[0].proj.weight.grad.abs().sum() > 0
+    gradient = embedding.features.numeric[0].get_parameter("proj.weight").grad
+    assert gradient is not None
+    assert gradient.abs().sum() > 0
     assert embedding.embed_tokens.weight.grad is not None
     assert embedding.embed_tokens.weight.grad.abs().sum() > 0
 
@@ -1251,7 +1252,7 @@ def test_numeric_embed_adds_fourier_of_the_scaled_value() -> None:
     )
     fresh = Embedding(hidden_dim=8, vocab_size=32, numeric_field_names=tokenizer.numeric_field_names, num_frequencies=4)
     assert fresh.features.numeric[0] is not None
-    assert torch.count_nonzero(fresh.features.numeric[0].proj.weight) > 0
+    assert torch.count_nonzero(fresh.features.numeric[0].get_parameter("proj.weight")) > 0
     low = encode_measurement(tokenizer, {"action": 0, "observation": -0.5})
     batch, batch_objective_data = pack_token_batch(
         steps=[low], sequence_ids=[0], batch_size=1
@@ -1285,7 +1286,7 @@ def test_numeric_embed_adds_fourier_of_the_scaled_value() -> None:
 
     loss = low_embeds.sum()
     loss.backward()
-    grad = fresh.features.numeric[0].proj.weight.grad
+    grad = fresh.features.numeric[0].get_parameter("proj.weight").grad
     assert grad is not None
     assert float(grad.abs().sum()) > 0.0
 

@@ -1,6 +1,7 @@
 """AdamW over fp32 trainable parameters (no GPU required)."""
 
 from __future__ import annotations
+from typing import Any, cast
 
 import copy
 import pytest
@@ -99,7 +100,7 @@ def test_adamw_param_group_learning_rates_step_independently() -> None:
 def test_adamw_param_group_rejects_a_mix_and_unknown_keys() -> None:
     p = torch.nn.Parameter(torch.ones(1))
     with pytest.raises(TypeError, match="param-group dicts"):
-        AdamW(params=[p, {"params": [p], "lr": 1e-3}],  fused=False)
+        AdamW(params=cast(Any, [p, {"params": [p], "lr": 1e-3}]),  fused=False)
     with pytest.raises(TypeError, match="missing 'params'"):
         AdamW(params=[{"lr": 1e-3}],  fused=False)
     with pytest.raises(TypeError, match="unsupported keys"):

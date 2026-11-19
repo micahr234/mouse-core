@@ -1,4 +1,5 @@
 """Analytic flow targets, replay alignment, and the actual example head/loop."""
+from typing import Any
 import ast
 from copy import deepcopy
 import json
@@ -11,7 +12,7 @@ import torch
 from torch import nn
 from tensordict import TensorDict
 
-from mouse_core import AdamW, polyak_update
+from mouse_core import MouseOptimizer
 from mouse_core.models.mlp import SwiGLU
 from mouse_core.objectives import DiffusionDqnObjective, boundary_discount
 
@@ -486,10 +487,11 @@ def test_gaussian_rejects_negative_std(noise_mean, noise_std):
 
 @pytest.mark.parametrize('obsolete', ['noise_min', 'noise_max'])
 def test_gaussian_api_rejects_obsolete_uniform_parameters(obsolete):
+    kwargs: dict[str, Any] = {obsolete: 1.}
     with pytest.raises(TypeError, match=obsolete):
-        DiffusionDqnObjective(discount=None, **{obsolete: 1.})
+        DiffusionDqnObjective(discount=None, **kwargs)
     with pytest.raises(TypeError, match=obsolete):
-        make_head(hidden_dim=8, num_actions=3, num_steps=2, time_frequencies=4, **{obsolete: 1.})
+        make_head(hidden_dim=8, num_actions=3, num_steps=2, time_frequencies=4, **kwargs)
 
 
 @pytest.mark.parametrize('noise_mean,noise_std', [(0., 1.), (2.5, 2.9), (-1., 2.), (2.5, 0.)])
@@ -976,7 +978,7 @@ def notebook_training_namespace(*, action_samples=1, noise_mean=0., noise_std=1.
         truncated=torch.zeros(4, dtype=torch.bool), sequence_ids=torch.zeros(4, dtype=torch.long),
         step_ids=torch.tensor([0, 2])), batch_size=[])
     inputs = torch.randn(2, 4)
-    ns: dict[str, Any] = dict(torch=torch, AdamW=AdamW, polyak_update=polyak_update,
+    ns: dict[str, Any] = dict(torch=torch, MouseOptimizer=MouseOptimizer,
         DiffusionDqnObjective=DiffusionDqnObjective, boundary_discount=boundary_discount,
         device=torch.device('cpu'), encoder=encoder, q_head=head, modules=modules,
         delayed_encoder=target_encoder, backup_value_head=target_head,
@@ -1099,20 +1101,9 @@ def test_velocity_target_can_freeze_or_copy_the_entire_head(num_blocks, head_tau
 
 
 @pytest.mark.parametrize('head_tau', [-1., 1.01, float('inf'), float('nan'), True, '1', None])
-def test_invalid_velocity_target_rate_fails_before_loading_a_batch_or_updating_parameters(head_tau):
-    ns = notebook_training_namespace()
-    ns['POLYAK_TAU_VALUE'] = head_tau
-    ns['loader'].next_batch = lambda: pytest.fail('Invalid target rates must fail before loading a batch.')
-    ns['optimizer'].step = lambda: pytest.fail('Invalid target rates must fail before optimizer mutation.')
-    modules = (ns['modules'], ns['delayed_encoder'], ns['backup_value_head'])
-    before = [{name: parameter.detach().clone() for name, parameter in module.named_parameters()}
-              for module in modules]
+def test_invalid_velocity_target_rate_fails_when_building_notebook_optimizer(head_tau):
     with pytest.raises(ValueError):
-        ns['run_train'](num_steps=1)
-    for module, previous in zip(modules, before, strict=True):
-        for name, parameter in module.named_parameters():
-            torch.testing.assert_close(parameter, previous[name], rtol=0, atol=0)
-            assert parameter.grad is None
+        notebook_training_namespace(head_tau=head_tau)
 
 
 @pytest.mark.parametrize('num_blocks', [0, 1, 2, 4])

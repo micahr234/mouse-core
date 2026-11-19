@@ -228,7 +228,7 @@ def test_dqn_metrics_backup_matches_loss_target() -> None:
         backup_value_predictions=delayed, backup_action_predictions=delayed)
     torch.testing.assert_close(metrics['backup'], torch.tensor([4., 10., 0.]))
     torch.testing.assert_close(metrics['backup_weight'], torch.tensor([1., 1., 0.]))
-    torch.testing.assert_close(loss['action_value'], ((online[:2, [0, 1]].diagonal() - metrics['backup'][:2]) ** 2).mean())
+    torch.testing.assert_close(loss['action_value'], ((online[:2, [0, 1]].diagonal() - torch.as_tensor(metrics['backup'])[:2]) ** 2).mean())
 
 def test_dqn_objective_rejects_wrong_action_shape() -> None:
     n, a = (4, 3)
@@ -1171,7 +1171,7 @@ def test_temperature_soft_value_is_logsumexp() -> None:
     expected = torch.log(torch.tensor(2.))
     torch.testing.assert_close(metrics['backup'], torch.tensor([expected, 0., 0.]))
     assert loss['action_value'].item() == pytest.approx(expected.square().item() / 2)
-    assert metrics['entropy'].item() == pytest.approx(expected.item())
+    assert torch.as_tensor(metrics['entropy']).item() == pytest.approx(expected.item())
 
 
 def test_temperature_matches_expected_q_plus_entropy() -> None:

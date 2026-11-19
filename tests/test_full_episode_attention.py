@@ -1,5 +1,6 @@
 """Full-episode attention and shared KV storage against dense oracles."""
 from __future__ import annotations
+from mouse_core.models.backbone.transformer import Architecture
 
 from transformers.generation import ContinuousBatchingConfig
 
@@ -16,7 +17,7 @@ from mouse_core.models.backbone.packed_train import packed_forward
 DEVICES = ['cpu', pytest.param('cuda', marks=pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required'))]
 
 
-def make_model(architecture='qwen3', device='cpu'):
+def make_model(architecture: Architecture='qwen3', device='cpu'):
     torch.manual_seed(19)
     b = Backbone(architecture=architecture, dtype=torch.float32, hidden_dim=32,
                  num_layers=2, num_heads=2, num_key_value_heads=1).to(device).eval()
@@ -58,6 +59,7 @@ def test_full_episode_mask_matches_dense_oracle_for_interleaved_episodes(archite
 def test_rows_borrow_shared_capacity_and_reset_reuses_pool(device):
     model = make_model(device=device)
     session = model.decode_session(2, max_batch_tokens=127, cache_capacity_tokens=3 * PAGE_SIZE)
+    assert session._cache is not None
     initial_pointer = session._cache.cache_tensor.data_ptr()
     x = torch.randn(2, 2 * PAGE_SIZE, 32, device=device)
     # One episode can use more than half the shared pool; there is no per-row limit.
@@ -74,6 +76,7 @@ def test_rows_borrow_shared_capacity_and_reset_reuses_pool(device):
     history = torch.cat([x[0], extra[0]])
     expected = dense_reference(model, history, torch.zeros(len(history), device=device, dtype=torch.long))
     torch.testing.assert_close(got[0], expected[-1:], rtol=1e-4, atol=1e-4)
+    assert session._cache is not None
     assert session._cache.cache_tensor.data_ptr() == initial_pointer
     session.reset_rows([0])
     got = session.forward(embeds=extra, lengths=[1, 1])
@@ -92,7 +95,8 @@ def test_dense_and_chunked_inputs_match_full_episode_attention():
     session = model.decode_session(2, max_batch_tokens=7, cache_capacity_tokens=2 * PAGE_SIZE)
     chunks = [session.forward(embeds=x[:, :11], lengths=[11, 11]),
               session.forward(embeds=x[:, 11:], lengths=[24, 24])]
-    torch.testing.assert_close(torch.cat(chunks, dim=1), expected)
+    assert all(isinstance(chunk, torch.Tensor) for chunk in chunks)
+    torch.testing.assert_close(torch.cat([chunk for chunk in chunks if isinstance(chunk, torch.Tensor)], dim=1), expected)
     session.close()
 
 
@@ -101,7 +105,9 @@ def test_decode_session_uses_hf_full_attention_pages():
     model = make_model()
     session = model.decode_session(3, cache_capacity_tokens=3 * PAGE_SIZE)
     assert isinstance(session, ContinuousDecodeSession)
+    assert session._cache is not None
     assert session._cache.layer_to_allocator[0].tokens_per_page == PAGE_SIZE
+    assert session._cache is not None
     assert type(session._cache.layer_to_allocator[0]) is FullAttentionCacheAllocator
     assert getattr(model.model.config, 'sliding_window', None) is None
     session.close()
@@ -126,6 +132,7 @@ def test_full_episode_training_gradients_and_checkpoint_rebind_match_dense_refer
         with torch.no_grad():
             other(torch.randn(23, 32, device='cuda'), sequence_ids=torch.zeros(23, dtype=torch.long, device='cuda'))
         result.square().mean().backward()
+        assert embeds.grad is not None
         return result.detach(), [embeds.grad.clone()] + [p.grad.clone() for p in model.parameters() if p.grad is not None]
 
     expected, gradients = run('dense')

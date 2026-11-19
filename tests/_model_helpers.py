@@ -68,6 +68,7 @@ class ExampleModel(Model):
                 raise ValueError("reasoning= is not supported with use_cache=True.")
             if self.reasoner is None:
                 raise ValueError("reasoning= requires a reasoner.")
+            assert objective_data is not None
             embed, sequence_ids, head_token_ids = self.reasoner.insert(
                 embeds=embed, tokens=batch, objective_data=objective_data, sequence_ids=sequence_ids,
                 head_token_ids=head_token_ids,

@@ -323,9 +323,9 @@ def test_polyak_updates_only_trainable_source_parameters(tau, monkeypatch):
     # the target's requires_grad flag. Selection belongs to the online model.
     target.register_parameter("base", nn.Parameter(torch.tensor([2.])))
     source.register_parameter("shared", nn.Parameter(torch.tensor([3.])))
-    target.register_parameter("shared", source.shared)
+    target.register_parameter("shared", source.get_parameter("shared"))
     source.register_parameter("frozen_shared", nn.Parameter(torch.tensor([4.]), requires_grad=False))
-    target.register_parameter("frozen_shared", source.frozen_shared)
+    target.register_parameter("frozen_shared", source.get_parameter("frozen_shared"))
     calls = []
     lerp = torch.Tensor.lerp_
     def tracked_lerp(tensor, other, weight):

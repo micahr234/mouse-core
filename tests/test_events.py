@@ -1,4 +1,5 @@
 """Generic event recording, explicit environment decoding, and live/replay parity."""
+from typing import cast
 
 from tests._prediction_layout import fixture_head_steps
 from copy import deepcopy
@@ -394,7 +395,7 @@ def test_replay_loader_training_and_cached_inference(tmp_path):
                          embedding=Embedding(hidden_dim=8, vocab_size=32, num_frequencies=2, numeric_field_names=tok.numeric_field_names))
     inputs, data = loader.next_batch()
     group = data["sequence_ids"]
-    data = {key: value.to(torch.get_default_device()) for key, value in data.items()}
+    data = {key: cast(torch.Tensor, value).to(torch.get_default_device()) for key, value in data.items()}
     group = group.to(torch.get_default_device())
     assert data["step_ids"].tolist() == list(range(8))
     assert (~torch.isnan(data["action"])).tolist() == [False, True, False, True] * 2

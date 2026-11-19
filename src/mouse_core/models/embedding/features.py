@@ -1,5 +1,6 @@
 """Field-specific numeric projections and one shared position projection."""
 from collections.abc import Sequence
+from typing import cast
 import torch
 from torch import nn
 from .fourier import FourierFeatures, check_num_frequencies
@@ -24,18 +25,21 @@ class FeatureAdditions(nn.Module):
         self.position_num_frequencies = check_num_frequencies(position_num_frequencies)
         if self.numeric_field_names and self.num_frequencies is None:
             raise ValueError("Numeric input fields require num_frequencies")
-        self.numeric = nn.ModuleList([
-            FourierFeatures(num_frequencies=self.num_frequencies, hidden_dim=hidden_dim)
-            for _ in self.numeric_field_names
-        ])
+        self.numeric = nn.ModuleList()
+        if self.num_frequencies is not None:
+            self.numeric.extend(
+                FourierFeatures(num_frequencies=self.num_frequencies, hidden_dim=hidden_dim)
+                for _ in self.numeric_field_names
+            )
         self.position = (None if self.position_num_frequencies is None else
                         PositionFeatures(num_frequencies=self.position_num_frequencies, hidden_dim=hidden_dim))
 
     def scale_initial_weights(self, rms):
         with torch.no_grad():
-            for module in (*self.numeric, self.position):
-                if module is not None:
-                    module.proj.weight.mul_(rms)
+            for module in self.numeric:
+                cast(FourierFeatures, module).proj.weight.mul_(rms)
+            if self.position is not None:
+                self.position.proj.weight.mul_(rms)
 
     def forward(self, embeddings, *, numeric_values=None, numeric_mask=None,
                 numeric_field_ids=None, numeric_field_names=(), position_values=None, position_mask=None):
@@ -43,7 +47,7 @@ class FeatureAdditions(nn.Module):
         tokens = embeddings[:, 0]
         if (numeric_values is None) != (numeric_mask is None):
             raise ValueError("numeric_values and numeric_mask must be supplied together")
-        if numeric_values is not None:
+        if numeric_values is not None and numeric_mask is not None:
             for value in (numeric_values, numeric_mask):
                 if not isinstance(value, torch.Tensor):
                     raise TypeError("Numeric values and mask must be tensors")
@@ -68,7 +72,7 @@ class FeatureAdditions(nn.Module):
                     if bool(selected.any()):
                         embeddings[selected] = embeddings[selected] + projection(numeric_values[selected])
         validate_position_tensors(tokens, position_values, position_mask)
-        if position_mask is not None and bool(position_mask.any()):
+        if position_values is not None and position_mask is not None and bool(position_mask.any()):
             if self.position is None:
                 raise RuntimeError("Position values require position_num_frequencies on the embedding")
             embeddings[position_mask] = embeddings[position_mask] + self.position(position_values[position_mask])

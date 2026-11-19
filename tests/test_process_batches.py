@@ -140,6 +140,7 @@ def test_worker_mapping_survives_deserialized_views_and_closes_after_callable_cy
     # copies its input. The callable deliberately owns an unreachable cycle.
     payload = SharedMemory(create=True, size=16)
     output = SharedMemory(create=True, size=65536)
+    assert payload.buf is not None
     payload.buf[:] = bytes(range(16))
     references = []
 
@@ -192,6 +193,7 @@ def test_worker_mapping_survives_deserialized_views_and_closes_after_callable_cy
             actual = np.ndarray(shape, dtype=dtype, buffer=output.buf, offset=offset).copy()
             assert actual.tolist() == [10, 10, 10]
         # The worker closes its mapping but never unlinks the parent's payload.
+        assert payload.buf is not None
         assert bytes(payload.buf) == bytes(range(16))
     finally:
         output.close()
