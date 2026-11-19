@@ -893,7 +893,7 @@ def test_text_tokenizer_keeps_length_one_vector_as_vector() -> None:
 
 def test_text_model_card_describes_tokenizer(tmp_path) -> None:
     from mouse_core.models.io import _write_model_card
-    model = simple_model(backbone=IdentityBackbone(hidden_dim=8), heads=({'action_value': (head := MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0))}), reasoner=None)
+    model = simple_model(backbone=IdentityBackbone(hidden_dim=8), heads=({'action_value': (head := MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0, rms_norm_eps=1e-6))}), reasoner=None)
     path = tmp_path / 'README.md'
     _write_model_card(repo_id='user/mouse-text', model=model, path=path)
     text = path.read_text()

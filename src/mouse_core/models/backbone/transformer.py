@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 from typing import Any, Literal, cast
 
+import math
 import torch
 from torch import nn
 
@@ -493,6 +494,13 @@ class Backbone(BaseBackbone):
         self._attach_lora(_as_module(self.model), lora)
 
     @property
+    def rms_norm_eps(self) -> float:
+        value = vars(self.model.config)["rms_norm_eps"]
+        if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+            raise ValueError("Backbone config rms_norm_eps must be finite and positive")
+        return float(value)
+
+    @property
     def hidden_dim(self) -> int:
         return _hidden_size(self.model.config)
 
@@ -550,7 +558,7 @@ def _qwen3_kwargs_from_pretrained(
         head_dim=getattr(hf_cfg, "head_dim", None),
         max_position_embeddings=hf_cfg.max_position_embeddings,
         intermediate_size=hf_cfg.intermediate_size,
-        rms_norm_eps=getattr(hf_cfg, "rms_norm_eps", 1e-6),
+        rms_norm_eps=vars(hf_cfg)["rms_norm_eps"],
         attention_bias=getattr(hf_cfg, "attention_bias", False),
     )
     rope_parameters = _rope_parameters_from_config(hf_cfg)
@@ -575,7 +583,7 @@ def _llama_kwargs_from_pretrained(
         num_key_value_heads=getattr(hf_cfg, "num_key_value_heads", hf_cfg.num_attention_heads),
         max_position_embeddings=hf_cfg.max_position_embeddings,
         intermediate_size=hf_cfg.intermediate_size,
-        rms_norm_eps=getattr(hf_cfg, "rms_norm_eps", 1e-5),
+        rms_norm_eps=vars(hf_cfg)["rms_norm_eps"],
         attention_bias=getattr(hf_cfg, "attention_bias", False),
     )
     rope_parameters = _rope_parameters_from_config(hf_cfg)

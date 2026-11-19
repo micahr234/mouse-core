@@ -68,7 +68,7 @@ def llama_config_kwargs(model: Any) -> dict[str, Any]:
         num_key_value_heads=getattr(cfg, "num_key_value_heads", cfg.num_attention_heads),
         max_position_embeddings=cfg.max_position_embeddings,
         intermediate_size=cfg.intermediate_size,
-        rms_norm_eps=getattr(cfg, "rms_norm_eps", 1e-5),
+        rms_norm_eps=vars(cfg)["rms_norm_eps"],
         attention_bias=getattr(cfg, "attention_bias", False),
     )
     rope_parameters = getattr(cfg, "rope_parameters", None)

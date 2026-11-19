@@ -20,7 +20,10 @@ def components(*, residual_connections, adaptive_depth, cap=3, real=False):
                          head_dim=4, max_position_embeddings=128, dtype=torch.float32)
                 if real else CausalBackbone())
     reasoner = SequentialReasoner(min_steps=1, hidden_dim=8, max_steps=cap,
-                                 residual_connections=residual_connections, adaptive_depth=adaptive_depth)
+                                 residual_connections=residual_connections, adaptive_depth=adaptive_depth, rms_norm_eps=1e-6)
+    with torch.no_grad():
+        reasoner.update_projection.weight.copy_(torch.eye(8).roll(1, 0) * .7)
+        reasoner.update_projection.bias.copy_(torch.linspace(-.03, .05, 8))
     head = nn.Linear(8, 4 + adaptive_depth)
     return embedding, backbone, reasoner, head
 
@@ -52,15 +55,16 @@ def reference_states(parts, tokens, generated):
             if not is_head:
                 history.append(table[token])
                 continue
-            state = table[token]
+            state = reasoner.start_embedding.weight[0]
             per_depth = []
             for depth in range(int(generated.lengths[decision])):
                 latent = (generated.states[decision, depth].detach()
-                          if reasoner.residual_connections else table[token])
+                          if reasoner.residual_connections else reasoner.start_embedding.weight[0])
                 history.append(reasoner.norm(latent))
                 packed = torch.stack(history)
                 hidden = backbone(packed, sequence_ids=torch.zeros(len(packed), dtype=torch.long))[-1]
-                state = state + hidden if reasoner.residual_connections else hidden
+                update = torch.nn.functional.linear(hidden * torch.rsqrt(hidden.square().mean(-1, keepdim=True) + 1e-6), reasoner.update_projection.weight, reasoner.update_projection.bias)
+                state = state + update if reasoner.residual_connections else update
                 per_depth.append(state)
             if reasoner.residual_connections:
                 history.append(reasoner.norm(generated.states[decision, int(generated.lengths[decision])].detach()))
@@ -89,7 +93,7 @@ def test_variant_positions_and_outputs_match_literal_token_history(residual_conn
     if not residual_connections:
         table = embedding.embeddings['text'].embed_tokens.weight
         torch.testing.assert_close(trace.tokens['latent_values'][trace.tokens['latent_mask']],
-                                   table[9].expand(int(lengths.sum()), -1))
+                                   reasoner.start_embedding.weight.expand(int(lengths.sum()), -1))
     actual = reasoner(trace, embedding=embedding, backbone=backbone)
     torch.testing.assert_close(actual, reference_states(parts, tokens, trace))
     torch.testing.assert_close(actual, trace.states[:, 1:])
@@ -99,6 +103,8 @@ def test_variant_positions_and_outputs_match_literal_token_history(residual_conn
         target[0].embeddings['text'].embed_tokens.weight.add_(.4)
         target[1].linear.weight.mul_(.7)
         target[2].norm.weight.mul_(1.5)
+        target[2].start_embedding.weight.add_(.1)
+        target[2].update_projection.weight.mul_(.8)
     delayed = target[2](trace, embedding=target[0], backbone=target[1])
     torch.testing.assert_close(delayed, reference_states(target, tokens, trace))
     assert not torch.allclose(delayed, actual)
@@ -183,7 +189,8 @@ def test_value_reasoning_trains_each_generated_output_and_repeated_initial_embed
     loss.backward()
     nonzero = values.grad != 0
     assert nonzero[0].nonzero().tolist() == [[0, 4], [1, 4], [2, 2]]
-    assert embedding.embeddings['text'].embed_tokens.weight.grad[9].abs().sum() > 0
+    assert reasoner.start_embedding.weight.grad.abs().sum() > 0
+    assert embedding.embeddings['text'].embed_tokens.weight.grad[9].count_nonzero() == 0
     assert reasoner.norm.weight.grad.abs().sum() > 0
 
 
@@ -191,4 +198,30 @@ def test_value_reasoning_trains_each_generated_output_and_repeated_initial_embed
 def test_reasoner_requires_boolean_mechanism_settings(residual_connections, adaptive_depth):
     with pytest.raises(ValueError, match='booleans'):
         SequentialReasoner(min_steps=1, hidden_dim=8, max_steps=2, residual_connections=residual_connections,
-                           adaptive_depth=adaptive_depth)
+                           adaptive_depth=adaptive_depth, rms_norm_eps=1e-6)
+
+
+def test_update_norm_zero_initialization_and_gradient_startup():
+    reasoner = SequentialReasoner(hidden_dim=8, min_steps=1, max_steps=3,
+                                  residual_connections=True, adaptive_depth=True, rms_norm_eps=1e-6)
+    assert not list(reasoner.update_norm.parameters())
+    assert torch.count_nonzero(reasoner.update_projection.weight) == 0
+    assert torch.count_nonzero(reasoner.update_projection.bias) == 0
+    hidden = torch.randn(3, 8, requires_grad=True)
+    target = torch.randn(3, 8)
+    optimizer = torch.optim.SGD(reasoner.update_projection.parameters(), lr=.01)
+    updates = reasoner.project_updates(hidden)
+    torch.testing.assert_close(updates, torch.zeros_like(hidden), rtol=0, atol=0)
+    (updates - target).square().mean().backward()
+    assert reasoner.update_projection.weight.grad.abs().sum() > 0
+    assert hidden.grad.count_nonzero() == 0
+    optimizer.step()
+    optimizer.zero_grad()
+    hidden.grad = None
+    updates = reasoner.project_updates(hidden)
+    expected_norm = hidden * torch.rsqrt(hidden.square().mean(-1, keepdim=True) + 1e-6)
+    expected = torch.nn.functional.linear(expected_norm, reasoner.update_projection.weight,
+                                          reasoner.update_projection.bias)
+    torch.testing.assert_close(updates, expected)
+    (updates - target).square().mean().backward()
+    assert hidden.grad.abs().sum() > 0

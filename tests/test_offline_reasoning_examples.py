@@ -14,13 +14,11 @@ from tests.test_autoregressive_reasoning import local_checkpoint
 EXAMPLES = Path(__file__).parents[1] / 'examples'
 
 
-@pytest.mark.parametrize('kind,filename,class_name', [
-    ('sequential', '25_train_residual_reasoning_dqn.ipynb', 'ResidualDqn'),
-    ('sequential', '26_train_value_reasoning_dqn.ipynb', 'ValueReasoningDqn'),
-    ('sequential', '27_train_combined_reasoning_dqn.ipynb', 'ValueReasoningDqn'),
-    ('autoregressive', '23_train_autoregressive_reasoning_dqn.ipynb', 'ReasoningDqn'),
-])
-def test_offline_checkpoint_loads_and_evaluates_only_in_inference_notebook(tmp_path, monkeypatch, kind, filename, class_name):
+@pytest.mark.parametrize('kind,filename,reasoning_loss,residual', [
+    ('sequential', '25_train_reasoning_dqn.ipynb', loss, residual)
+    for loss in ('all_tokens', 'last_token') for residual in (False, True)
+] + [('autoregressive', '23_train_autoregressive_reasoning_dqn.ipynb', None, None)])
+def test_offline_checkpoint_loads_and_evaluates_only_in_inference_notebook(tmp_path, monkeypatch, kind, filename, reasoning_loss, residual):
     source, output = tmp_path / 'base', tmp_path / 'saved'
     uploads = capture_upload(monkeypatch, output)
     local_checkpoint(source)
@@ -42,7 +40,8 @@ def test_offline_checkpoint_loads_and_evaluates_only_in_inference_notebook(tmp_p
             exec(compile(code, filename, 'exec'), namespace)
             if index == 1:
                 namespace.update(PRETRAINED=str(source), load_stores_from_hub=lambda **_: recorded_stores(),
-                    SAMPLE_BUDGET=2, NUM_WORKERS=0, MAX_EPISODE_STEPS=2, NUM_CYCLES=0, MAX_REASONING_STEPS=4, MIN_REASONING_STEPS=3,
+                    SAMPLE_BUDGET=2, NUM_WORKERS=0, MAX_EPISODE_STEPS=2, NUM_CYCLES=0, MAX_REASONING_STEPS=4, MIN_REASONING_STEPS=4 if reasoning_loss == "last_token" else 3,
+                    REASONING_LOSS=reasoning_loss, RESIDUAL_CONNECTIONS=residual,
                     GENERATION_START_TOKEN='word2', MAX_NEW_TOKENS=64, MAX_ACTIVE_REQUESTS=2)
     assert len(uploads) == 1
     assert 'pytorch_model.bin' in uploads[0]['files']
@@ -73,9 +72,10 @@ def test_offline_checkpoint_loads_and_evaluates_only_in_inference_notebook(tmp_p
     _, spec, backend, settings = loaded
     if kind == 'sequential':
         assert settings['residual_connections'] is namespace['online'].reasoner.residual_connections
-        assert settings['adaptive_depth'] is namespace['online'].reasoner.adaptive_depth
         assert settings['min_steps'] == namespace['online'].reasoner.min_steps
-        assert settings['objective'] == ('bellman' if settings['adaptive_depth'] else 'final')
+        assert settings['reasoning_loss'] == reasoning_loss
+        assert policy.reasoning_loss == reasoning_loss
+        assert policy.reasoner.adaptive_depth is (reasoning_loss == 'all_tokens')
     original_steps = namespace['train_transform'](recorded_stores(episodes=1)[0].to_dataset())
     if kind == 'sequential':
         encoded = inference['encode_reasoning_observation'](observation=0, action=None, reward=0.,

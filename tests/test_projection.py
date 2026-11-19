@@ -21,7 +21,7 @@ from tests._token_batch_helpers import batch_to_token_batch, token_tokenizer
 
 def _model(*, architecture: Literal['llama', 'qwen3'] | None=None, reasoning: bool=False) -> Model:
     backbone = IdentityBackbone(hidden_dim=8) if architecture is None else Backbone(architecture=architecture, hidden_dim=8, num_layers=1, num_heads=2, dtype=torch.float32)
-    return simple_model(backbone=backbone, projection=MLP(in_features=8, out_features=8, hidden_dim=12, num_layers=2), heads={'q': MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0), 'policy': MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0)}, reasoner=LatentReasoner(hidden_dim=8, num_thoughts=2) if reasoning else None)
+    return simple_model(backbone=backbone, projection=MLP(in_features=8, out_features=8, hidden_dim=12, num_layers=2, rms_norm_eps=1e-6), heads={'q': MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0, rms_norm_eps=1e-6), 'policy': MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0, rms_norm_eps=1e-6)}, reasoner=LatentReasoner(hidden_dim=8, num_thoughts=2) if reasoning else None)
 
 
 def _batch(start: int = 0, stop: int = 3):
@@ -144,7 +144,7 @@ def test_prediction_gradient_scale_also_controls_projection(scale: float) -> Non
 @pytest.mark.parametrize('num_layers', [2, 3])
 def test_projection_checkpoint_roundtrip(tmp_path: Path, num_layers: int) -> None:
     model = _model()
-    model.projection = MLP(in_features=8, out_features=8, hidden_dim=16, num_layers=num_layers)
+    model.projection = MLP(in_features=8, out_features=8, hidden_dim=16, num_layers=num_layers, rms_norm_eps=1e-6)
     expected = model(_batch())
     save_model(model=model, path=tmp_path)
     loaded = load_model(model=fresh_model(model), repo_id_or_path=str(tmp_path))
@@ -163,12 +163,12 @@ def test_projection_checkpoint_roundtrip(tmp_path: Path, num_layers: int) -> Non
 ])
 def test_projection_rejects_invalid_dimensions(kwargs: dict[str, Any]) -> None:
     with pytest.raises(ValueError):
-        MLP(out_features=8, **kwargs)
+        MLP(out_features=8, **kwargs, rms_norm_eps=1e-6)
 
 
 def test_projection_rejects_incompatible_backbone_width() -> None:
     model = _model()
-    model.projection = MLP(in_features=16, out_features=16, hidden_dim=16)
+    model.projection = MLP(in_features=16, out_features=16, hidden_dim=16, rms_norm_eps=1e-6)
     with pytest.raises(RuntimeError):
         model(_batch())
 
@@ -244,6 +244,6 @@ def test_prediction_scale_changes_only_final_linear_initialization(head_cls, num
 
 
 def test_feature_projection_omits_output_scale() -> None:
-    mlp = MLP(in_features=8, out_features=8, hidden_dim=8)
+    mlp = MLP(in_features=8, out_features=8, hidden_dim=8, rms_norm_eps=1e-6)
     assert mlp.scale is None
     assert type(mlp.layers[-1]) is torch.nn.Linear

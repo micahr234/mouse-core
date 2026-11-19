@@ -566,7 +566,7 @@ def test_cuda_bf16_lora_compiled_body_matches_eager_and_trains(no_compiled_decod
     torch.manual_seed(6)
     device = torch.device('cuda')
     backbone = _backbone('qwen3', kv_heads=2, lora=LoRAConfig(rank=4, alpha=8.0), dtype=torch.bfloat16)
-    head = MLP(in_features=64, out_features=4, hidden_dim=64, num_layers=1, propagate_gradient=1.0)
+    head = MLP(in_features=64, out_features=4, hidden_dim=64, num_layers=1, propagate_gradient=1.0, rms_norm_eps=1e-6)
     model = simple_model(backbone=backbone, heads={'action_value': head}, reasoner=None).to(device)
     bb = cast(Backbone, model.backbone)
     for n, p in bb.named_parameters():
@@ -688,7 +688,7 @@ def test_prepare_sequence_id_col_matches_step_counts() -> None:
 def test_model_forward_isolates_sequences(no_compiled_decoder: None, device: str) -> None:
     torch.manual_seed(2)
     backbone = Backbone(architecture='qwen3', dtype=torch.float32, hidden_dim=64, num_layers=2, num_heads=4, num_key_value_heads=4)
-    head = MLP(in_features=backbone.hidden_dim, out_features=4, hidden_dim=backbone.hidden_dim, num_layers=1, propagate_gradient=1.0)
+    head = MLP(in_features=backbone.hidden_dim, out_features=4, hidden_dim=backbone.hidden_dim, num_layers=1, propagate_gradient=1.0, rms_norm_eps=1e-6)
     model = simple_model(backbone=backbone, heads={'action_value': head}, reasoner=None).to(device).eval()
     batch = [[{'action': i % 4} for i in range(3)], [{'action': i % 4} for i in range(3)]]
     tb = batch_to_token_batch(token_tokenizer('action'), batch)
@@ -709,7 +709,7 @@ def test_model_train_isolates_samples_as_sequences(no_compiled_decoder: None) ->
     """Two samples packed as two sequences match a forward of the second sample alone."""
     torch.manual_seed(11)
     backbone = Backbone(architecture='qwen3', dtype=torch.float32, hidden_dim=32, num_layers=2, num_heads=4, num_key_value_heads=4)
-    head = MLP(in_features=backbone.hidden_dim, out_features=4, hidden_dim=backbone.hidden_dim, num_layers=1, propagate_gradient=1.0)
+    head = MLP(in_features=backbone.hidden_dim, out_features=4, hidden_dim=backbone.hidden_dim, num_layers=1, propagate_gradient=1.0, rms_norm_eps=1e-6)
     model = simple_model(backbone=backbone, heads={'action_value': head}, reasoner=None).eval()
     episode0 = [{'action': 0, 'repeat_episode_done': 0, 'episode_done': 0, 'episode_index': 0}, {'action': 1, 'repeat_episode_done': 0, 'episode_done': 0, 'episode_index': 0}, {'action': 2, 'repeat_episode_done': 1, 'episode_done': 2, 'episode_index': 0}]
     episode1 = [{'action': 3, 'repeat_episode_done': 0, 'episode_done': 0, 'episode_index': 1}, {'action': 1, 'repeat_episode_done': 0, 'episode_done': 0, 'episode_index': 1}]
@@ -726,7 +726,7 @@ def test_model_train_isolates_samples_as_sequences(no_compiled_decoder: None) ->
 def test_model_gradient_checkpointing_flag_reaches_backward(no_compiled_decoder: None) -> None:
     torch.manual_seed(12)
     backbone = Backbone(architecture='qwen3', dtype=torch.float32, hidden_dim=32, num_layers=2, num_heads=4)
-    head = MLP(in_features=32, out_features=4, hidden_dim=32, num_layers=1, propagate_gradient=1.0)
+    head = MLP(in_features=32, out_features=4, hidden_dim=32, num_layers=1, propagate_gradient=1.0, rms_norm_eps=1e-6)
     model = simple_model(backbone=backbone, heads={'action_value': head}, reasoner=None)
     tb = batch_to_token_batch(token_tokenizer('action'), [[{'action': i % 4} for i in range(5)], [{'action': 1}]])
 
@@ -749,7 +749,7 @@ def test_model_forwards_autocast_dtype_to_packed_forward(no_compiled_decoder: No
     torch.manual_seed(13)
     backbone = Backbone(architecture='qwen3', dtype=torch.float32, train_autocast_dtype=torch.bfloat16, hidden_dim=32, num_layers=2, num_heads=4)
     assert backbone.train_autocast_dtype is torch.bfloat16 and backbone.decode_autocast_dtype is None
-    head = MLP(in_features=32, out_features=4, hidden_dim=32, num_layers=1, propagate_gradient=1.0)
+    head = MLP(in_features=32, out_features=4, hidden_dim=32, num_layers=1, propagate_gradient=1.0, rms_norm_eps=1e-6)
     model = simple_model(backbone=backbone, heads={'action_value': head}, reasoner=None).to('cuda')
     tb = batch_to_token_batch(token_tokenizer('action'), [[{'action': i % 4} for i in range(5)], [{'action': 1}]])
     model(tb)["predictions"]['action_value'].square().sum().backward()

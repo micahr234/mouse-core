@@ -54,7 +54,7 @@ def test_flat_sequence_causal_mask_allows_earlier_tokens_in_the_same_sequence() 
 
 def test_model_forward_injects_sequence_id_and_runs_flat() -> None:
     backbone = IdentityBackbone(hidden_dim=8)
-    model = simple_model(backbone=backbone, heads=({'action_value': (head := MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0))}), reasoner=None)
+    model = simple_model(backbone=backbone, heads=({'action_value': (head := MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0, rms_norm_eps=1e-6))}), reasoner=None)
     batch = [[{'action': i % 4} for i in range(3)], [{'action': 1}, {'action': 2}]]
     tb, objective_data = batch_to_packed(token_tokenizer('action'), batch)
     sequence_ids = objective_data["sequence_ids"]

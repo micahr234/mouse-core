@@ -13,12 +13,12 @@ from tests._token_batch_helpers import batch_to_token_batch, token_tokenizer
 _TOK = token_tokenizer("action")
 
 def test_mlp_preserves_batch_dimensions() -> None:
-    head = MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0)
+    head = MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0, rms_norm_eps=1e-6)
     out = head(torch.randn(2, 5, 8))
     assert out.shape == (2, 5, 4)
 
 def test_output_name_is_explicit() -> None:
-    head = MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.)
+    head = MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1., rms_norm_eps=1e-6)
     model = simple_model(backbone=IdentityBackbone(hidden_dim=8), heads={"custom_action": head}, reasoner=None)
     assert tuple(model.heads) == ("custom_action",)
 
@@ -28,7 +28,7 @@ def test_mlp_prediction_save_load_roundtrip(tmp_path, num_layers, normalize_inpu
     torch.manual_seed(0)
     hidden_dim = 8
     head = MLP(in_features=hidden_dim, out_features=4, hidden_dim=12, num_layers=num_layers,
-               propagate_gradient=1.0, normalize_input=normalize_input, normalize_output=normalize_output)
+               propagate_gradient=1.0, normalize_input=normalize_input, normalize_output=normalize_output, rms_norm_eps=1e-6)
     model = simple_model(backbone=IdentityBackbone(hidden_dim=hidden_dim), heads={'action': head}, reasoner=None).eval()
     batch = [[{'action': 0, 'reward': 0.0}, {'action': 1, 'reward': 1.0}]]
     expected = model(batch_to_token_batch(_TOK, batch))["predictions"]
@@ -44,11 +44,11 @@ def test_mlp_prediction_save_load_roundtrip(tmp_path, num_layers, normalize_inpu
 @pytest.mark.parametrize("num_layers", [1, 2, 4])
 @pytest.mark.parametrize("hidden_dim", [5, 12])
 def test_layer_count_includes_residual_blocks_and_final_linear(num_layers, hidden_dim):
-    head = MLP(in_features=8, out_features=3, hidden_dim=hidden_dim, num_layers=num_layers)
+    head = MLP(in_features=8, out_features=3, hidden_dim=hidden_dim, num_layers=num_layers, rms_norm_eps=1e-6)
     assert len(head.layers) == num_layers
     assert isinstance(head.input_norm, torch.nn.RMSNorm)
     assert head.input_norm.normalized_shape == (8,)
-    assert head.input_norm.eps == 1e-5
+    assert head.input_norm.eps == 1e-6
     assert head.input_norm.elementwise_affine
     torch.testing.assert_close(head.input_norm.weight, torch.ones(8))
     blocks = list(head.layers[:-1])
@@ -79,7 +79,7 @@ def test_swiglu_splits_the_fused_linear_output():
 
 @pytest.mark.parametrize("hidden_dim", [3, 8, 16])
 def test_zero_residual_branch_preserves_features_and_gradients(hidden_dim):
-    block = ResidualBlock(in_features=8, hidden_dim=hidden_dim)
+    block = ResidualBlock(in_features=8, hidden_dim=hidden_dim, rms_norm_eps=1e-6)
     with torch.no_grad():
         block.output_linear.weight.zero_()
         block.output_linear.bias.zero_()
@@ -94,7 +94,7 @@ def test_zero_residual_branch_preserves_features_and_gradients(hidden_dim):
 @pytest.mark.parametrize("gradient_scale", [0.0, 0.25, 1.0])
 def test_gradient_scaling_includes_residual_skips_but_not_parameter_gradients(gradient_scale):
     head = MLP(in_features=8, out_features=3, hidden_dim=12, num_layers=3,
-               propagate_gradient=gradient_scale)
+               propagate_gradient=gradient_scale, rms_norm_eps=1e-6)
     reference = copy.deepcopy(head)
     reference.propagate_gradient = 1.0
     x = torch.randn(4, 8, requires_grad=True)
@@ -114,9 +114,9 @@ def test_gradient_scaling_includes_residual_skips_but_not_parameter_gradients(gr
 
 def test_initialization_scale_affects_only_the_final_linear():
     torch.manual_seed(91)
-    unscaled = MLP(in_features=8, out_features=3, hidden_dim=12, num_layers=3)
+    unscaled = MLP(in_features=8, out_features=3, hidden_dim=12, num_layers=3, rms_norm_eps=1e-6)
     torch.manual_seed(91)
-    scaled = MLP(in_features=8, out_features=3, hidden_dim=12, num_layers=3, scale=0.1)
+    scaled = MLP(in_features=8, out_features=3, hidden_dim=12, num_layers=3, scale=0.1, rms_norm_eps=1e-6)
     for name, parameter in scaled.named_parameters():
         expected = dict(unscaled.named_parameters())[name]
         if name.startswith("layers.2."):
@@ -126,7 +126,7 @@ def test_initialization_scale_affects_only_the_final_linear():
 
 @pytest.mark.parametrize("num_layers", [1, 3])
 def test_input_norm_precedes_residual_blocks_without_an_extra_final_norm(num_layers):
-    head = MLP(in_features=8, out_features=3, hidden_dim=12, num_layers=num_layers)
+    head = MLP(in_features=8, out_features=3, hidden_dim=12, num_layers=num_layers, rms_norm_eps=1e-6)
     with torch.no_grad():
         for block in head.layers[:-1]:
             assert isinstance(block, ResidualBlock)
@@ -140,7 +140,7 @@ def test_input_norm_precedes_residual_blocks_without_an_extra_final_norm(num_lay
     output = head.layers[-1]
     assert isinstance(output, torch.nn.Linear)
     assert isinstance(head.input_norm, torch.nn.RMSNorm)
-    features = torch.nn.functional.rms_norm(x, (8,), head.input_norm.weight, eps=1e-5)
+    features = torch.nn.functional.rms_norm(x, (8,), head.input_norm.weight, eps=1e-6)
     if num_layers > 1:
         features = features + 2.0
     expected = torch.nn.functional.linear(features, output.weight, output.bias)
@@ -151,7 +151,7 @@ def test_input_norm_precedes_residual_blocks_without_an_extra_final_norm(num_lay
 @pytest.mark.parametrize("num_layers", [1, 3])
 def test_input_norm_stabilizes_outputs_under_large_feature_rescaling(num_layers):
     torch.manual_seed(11)
-    head = MLP(in_features=8, out_features=3, hidden_dim=12, num_layers=num_layers)
+    head = MLP(in_features=8, out_features=3, hidden_dim=12, num_layers=num_layers, rms_norm_eps=1e-6)
     x = torch.randn(2, 5, 8)
     torch.testing.assert_close(head(100 * x), head(x), atol=1e-5, rtol=1e-4)
 
@@ -160,11 +160,11 @@ def test_input_norm_stabilizes_outputs_under_large_feature_rescaling(num_layers)
 def test_output_norm_normalizes_after_the_final_linear_with_learned_gain(num_layers):
     torch.manual_seed(11)
     head = MLP(in_features=8, out_features=3, hidden_dim=12, num_layers=num_layers,
-               normalize_input=False, normalize_output=True)
+               normalize_input=False, normalize_output=True, rms_norm_eps=1e-6)
     assert isinstance(head.input_norm, torch.nn.Identity)
     assert isinstance(head.output_norm, torch.nn.RMSNorm)
     assert head.output_norm.normalized_shape == (3,)
-    assert head.output_norm.eps == 1e-5
+    assert head.output_norm.eps == 1e-6
     assert head.output_norm.elementwise_affine
     torch.testing.assert_close(head.output_norm.weight, torch.ones(3))
     x = (10 * torch.randn(2, 5, 8)).requires_grad_()
@@ -191,12 +191,12 @@ def test_output_norm_normalizes_after_the_final_linear_with_learned_gain(num_lay
 @pytest.mark.parametrize("value", [0, 1, None, "false"])
 def test_normalization_options_require_booleans(field, value):
     with pytest.raises(ValueError, match=field):
-        MLP(in_features=8, out_features=3, hidden_dim=12, **{field: value})
+        MLP(in_features=8, out_features=3, hidden_dim=12, **{field: value}, rms_norm_eps=1e-6)
 
 
 @pytest.mark.parametrize("num_layers", [1, 3])
 def test_final_linear_has_no_output_activation(num_layers):
-    head = MLP(in_features=8, out_features=3, hidden_dim=12, num_layers=num_layers)
+    head = MLP(in_features=8, out_features=3, hidden_dim=12, num_layers=num_layers, rms_norm_eps=1e-6)
     with torch.no_grad():
         output = head.layers[-1]
         assert isinstance(output, torch.nn.Linear) and output.bias is not None
@@ -212,8 +212,8 @@ def test_final_linear_has_no_output_activation(num_layers):
 def test_head_computation_remains_fp32_inside_autocast(device, kind):
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("requires CUDA")
-    module = (MLP(in_features=8, out_features=3, hidden_dim=16, num_layers=3)
-              if kind == "mlp" else ResidualBlock(in_features=8, hidden_dim=16)).to(device)
+    module = (MLP(in_features=8, out_features=3, hidden_dim=16, num_layers=3, rms_norm_eps=1e-6)
+              if kind == "mlp" else ResidualBlock(in_features=8, hidden_dim=16, rms_norm_eps=1e-6)).to(device)
     features = torch.randn(5, 8, device=device, dtype=torch.bfloat16).requires_grad_()
     reference = module(features)
     reference_grads = torch.autograd.grad(reference.square().sum(), tuple(module.parameters()))

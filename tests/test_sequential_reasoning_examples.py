@@ -41,12 +41,15 @@ def example_module(number):
     return SimpleNamespace(**namespace)
 
 
-@pytest.mark.parametrize('number,residual', [('25', True), ('26', False), ('26', True), ('27', False), ('27', True)])
+@pytest.mark.parametrize('reasoning_loss', ['all_tokens', 'last_token'])
+@pytest.mark.parametrize('residual', [False, True])
 @pytest.mark.parametrize('min_steps,max_steps', [(1, 1), (1, 3), (3, 4)])
-def test_notebook_training_uses_its_selected_recurrence_and_target_depth(number, residual, min_steps, max_steps, monkeypatch):
+def test_notebook_training_uses_its_selected_recurrence_and_target_depth(reasoning_loss, residual, min_steps, max_steps, monkeypatch):
     torch.manual_seed(37)
-    example = example_module(number)
-    adaptive = number != '25'
+    example = example_module("25")
+    adaptive = reasoning_loss == "all_tokens"
+    if not adaptive:
+        min_steps = max_steps
     head = nn.Linear(8, 5 if adaptive else 4)
     if adaptive:
         with torch.no_grad():
@@ -54,10 +57,11 @@ def test_notebook_training_uses_its_selected_recurrence_and_target_depth(number,
             head.bias[-1] = 12.
     kwargs = dict(embedding=MultiEmbedding(embeddings={'text': Embedding(vocab_size=16, hidden_dim=8)}),
                   backbone=CausalBackbone(), value_head=head, max_steps=max_steps)
-    if adaptive:
-        online = example.ValueReasoningDqn(**kwargs, min_steps=min_steps, residual_connections=residual)
-    else:
-        online = example.ResidualDqn(**kwargs)
+    online = example.ReasoningDqn(**kwargs, min_steps=min_steps,
+        residual_connections=residual, reasoning_loss=reasoning_loss)
+    with torch.no_grad():
+        online.reasoner.update_projection.weight.copy_(torch.eye(8).roll(1, 0) * .7)
+        online.reasoner.update_projection.bias.fill_(.03)
     target = deepcopy(online).requires_grad_(False).eval()
     with torch.no_grad():
         target.backbone.linear.bias.add_(.35)
@@ -118,7 +122,7 @@ def test_notebook_training_uses_its_selected_recurrence_and_target_depth(number,
             MAX_ACTIVE_REQUESTS=2,
             POLYAK_TAU_EMBEDDING=.1, POLYAK_TAU_BACKBONE=.2, POLYAK_TAU_VALUE=.3,
             MAX_GRAD_NORM=1., REASONING_STEP_COST=.2, GAMMA_THINK=.4)
-        configure_notebook_optimizer(example, next(EXAMPLES.glob(f'{number}_*.ipynb')))
+        configure_notebook_optimizer(example, EXAMPLES / "25_train_reasoning_dqn.ipynb")
         try:
             loss, metrics = example.run_train(num_steps=1)
         finally:
@@ -152,6 +156,22 @@ def test_notebook_training_uses_its_selected_recurrence_and_target_depth(number,
         assert gradient[:, :-1].count_nonzero() == 0
     assert gradient[:, -1].abs().sum() > 0
     assert all(parameter.grad is None for parameter in target.parameters())
-    for component in ('embedding.', 'backbone.', 'reasoner.norm.', 'value_head.'):
+    for component in ('embedding.', 'backbone.', 'reasoner.norm.', 'reasoner.start_embedding.', 'reasoner.update_projection.', 'value_head.'):
         assert any(not torch.equal(original_weights[name], param)
                    for name, param in online.named_parameters() if name.startswith(component))
+
+
+@pytest.mark.parametrize('reasoning_loss,min_steps,max_steps,message', [
+    ('last_token', 1, 3, 'equal minimum and maximum'),
+    ('last_token', 3, 1, 'equal minimum and maximum'),
+    ('unsupported', 1, 3, 'reasoning_loss must be'),
+])
+def test_notebook_rejects_invalid_loss_and_adaptive_last_token_budget(reasoning_loss, min_steps, max_steps, message):
+    example = example_module('25')
+    with pytest.raises(ValueError, match=message):
+        example.ReasoningDqn(
+            embedding=MultiEmbedding(embeddings={'text': Embedding(vocab_size=16, hidden_dim=8)}),
+            backbone=CausalBackbone(), value_head=nn.Linear(8, 4),
+            min_steps=min_steps, max_steps=max_steps,
+            residual_connections=False, reasoning_loss=reasoning_loss,
+        )

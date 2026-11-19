@@ -143,7 +143,7 @@ def test_generic_hf_backbone_roundtrip(tmp_path) -> None:
     config = Qwen2Config(vocab_size=16, hidden_size=8, num_hidden_layers=1, num_attention_heads=2, num_key_value_heads=2, intermediate_size=16, max_position_embeddings=32)
     Qwen2Model(config).save_pretrained(tmp_path / 'qwen2')
     backbone = Backbone(dtype=torch.float32, pretrained=tmp_path / 'qwen2')
-    model = simple_model(backbone=backbone, heads=({'action_value': (head := MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0))}), reasoner=None)
+    model = simple_model(backbone=backbone, heads=({'action_value': (head := MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0, rms_norm_eps=1e-6))}), reasoner=None)
     save_model(model=model, path=tmp_path / 'ckpt')
     loaded = load_model(model=fresh_model(model), repo_id_or_path=tmp_path / 'ckpt')
     loaded_bb = cast(Backbone, loaded.backbone)

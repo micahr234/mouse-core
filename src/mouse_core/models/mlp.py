@@ -22,14 +22,17 @@ class SwiGLU(nn.Module):
 class ResidualBlock(nn.Module):
     """Pre-normalized Linear → SwiGLU → Linear with an identity skip."""
 
-    def __init__(self, *, in_features: int, hidden_dim: int) -> None:
+    def __init__(self, *, in_features: int, hidden_dim: int, rms_norm_eps: float) -> None:
         super().__init__()
+        if type(rms_norm_eps) not in (int, float) or not math.isfinite(rms_norm_eps) or rms_norm_eps <= 0:
+            raise ValueError("rms_norm_eps must be finite and positive")
+        self.rms_norm_eps = rms_norm_eps
         for name, value in (("in_features", in_features), ("hidden_dim", hidden_dim)):
             if type(value) is not int or value < 1:
                 raise ValueError(f"{name} must be an integer >= 1, got {value!r}.")
         self.in_features = self.out_features = in_features
         self.hidden_dim = hidden_dim
-        self.norm = nn.RMSNorm(in_features, eps=1e-5)
+        self.norm = nn.RMSNorm(in_features, eps=rms_norm_eps)
         self.input_linear = nn.Linear(in_features, 2 * hidden_dim)
         self.activation = SwiGLU()
         self.output_linear = nn.Linear(hidden_dim, in_features)
@@ -69,6 +72,7 @@ class MLP(nn.Module):
         in_features: int,
         out_features: int,
         hidden_dim: int,
+        rms_norm_eps: float,
         num_layers: int = 2,
         propagate_gradient: float = 1.0,
         scale: float | None = None,
@@ -76,6 +80,9 @@ class MLP(nn.Module):
         normalize_output: bool = False,
     ) -> None:
         super().__init__()
+        if type(rms_norm_eps) not in (int, float) or not math.isfinite(rms_norm_eps) or rms_norm_eps <= 0:
+            raise ValueError("rms_norm_eps must be finite and positive")
+        self.rms_norm_eps = rms_norm_eps
         for name, value in (
             ("in_features", in_features), ("out_features", out_features),
             ("hidden_dim", hidden_dim), ("num_layers", num_layers),
@@ -109,11 +116,11 @@ class MLP(nn.Module):
         self.normalize_input = normalize_input
         self.normalize_output = normalize_output
         self.input_norm = (
-            nn.RMSNorm(in_features, eps=1e-5, elementwise_affine=True)
+            nn.RMSNorm(in_features, eps=rms_norm_eps, elementwise_affine=True)
             if normalize_input else nn.Identity()
         )
         blocks = [
-            ResidualBlock(in_features=in_features, hidden_dim=hidden_dim)
+            ResidualBlock(in_features=in_features, hidden_dim=hidden_dim, rms_norm_eps=rms_norm_eps)
             for _ in range(num_layers - 1)
         ]
         output = (
@@ -122,7 +129,7 @@ class MLP(nn.Module):
         )
         self.layers = nn.Sequential(*blocks, output)
         self.output_norm = (
-            nn.RMSNorm(out_features, eps=1e-5, elementwise_affine=True)
+            nn.RMSNorm(out_features, eps=rms_norm_eps, elementwise_affine=True)
             if normalize_output else nn.Identity()
         )
         self.to(device="cpu", dtype=torch.float32)

@@ -45,7 +45,7 @@ def _backbone(
 
 
 def _model(lora: LoRAConfig | None=LoRAConfig(rank=4, alpha=8.0), *, reasoner: bool=False, dtype: torch.dtype=torch.float32) -> Model:
-    return simple_model(backbone=_backbone(lora, dtype=dtype), heads=({'action_value': (head := MLP(in_features=_HIDDEN, out_features=_ACTIONS, hidden_dim=_HIDDEN, num_layers=1, propagate_gradient=1.0))}), reasoner=LatentReasoner(hidden_dim=_HIDDEN, num_thoughts=1) if reasoner else None)
+    return simple_model(backbone=_backbone(lora, dtype=dtype), heads=({'action_value': (head := MLP(in_features=_HIDDEN, out_features=_ACTIONS, hidden_dim=_HIDDEN, num_layers=1, propagate_gradient=1.0, rms_norm_eps=1e-6))}), reasoner=LatentReasoner(hidden_dim=_HIDDEN, num_thoughts=1) if reasoner else None)
 
 
 def _batch(model: Model):

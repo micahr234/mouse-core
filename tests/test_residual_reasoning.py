@@ -27,7 +27,7 @@ from mouse_core.models import (
 from mouse_core.objectives import DqnObjective, boundary_discount
 from tests.test_autoregressive_reasoning import local_checkpoint
 
-NOTEBOOK = Path(__file__).parents[1] / 'examples/27_train_combined_reasoning_dqn.ipynb'
+NOTEBOOK = Path(__file__).parents[1] / 'examples/25_train_reasoning_dqn.ipynb'
 
 
 def example_module():
@@ -47,6 +47,10 @@ class CausalBackbone(BaseBackbone):
         super().__init__()
         self.linear = nn.Linear(hidden_dim, hidden_dim)
         self._hidden_dim = hidden_dim
+
+    @property
+    def rms_norm_eps(self):
+        return 1e-6
 
     @property
     def hidden_dim(self):
@@ -74,10 +78,15 @@ def model(*, real=False, max_steps=3):
     with torch.no_grad():
         value_head.weight[-1].zero_()
         value_head.bias[-1] = 100.
-    return example_module().ValueReasoningDqn(
+    result = example_module().ReasoningDqn(
         embedding=embedding, backbone=backbone, value_head=value_head, min_steps=1, max_steps=max_steps,
-        residual_connections=True,
+        residual_connections=True, reasoning_loss="all_tokens",
     ).to(torch.get_default_device())
+    # Exercise learned, nonzero updates rather than a zero-initialized recurrence.
+    with torch.no_grad():
+        result.reasoner.update_projection.weight.copy_(torch.eye(8).roll(1, 0) * .7)
+        result.reasoner.update_projection.bias.fill_(.03)
+    return result
 
 
 def batch(rows=((2, 3, 9), (4, 9), (9,))):
@@ -109,7 +118,7 @@ def test_real_transformer_rollout_replay_parity_and_request_batches(backend):
     assert online.training and online.backbone.training and online.reasoner.training
     assert all(p.grad is None for p in online.parameters())
     # The start token is consumed as z0, not also copied into the context.
-    initial = online.embedding(torch.tensor([9]), tokenizer_ids=torch.tensor([0]), tokenizer_names=('text',))
+    initial = online.reasoner.start_embedding.weight
     torch.testing.assert_close(trace.states[:, 0], initial.expand(4, -1))
     changed = tokens.clone()
     changed['token_ids'][-2] = 6
@@ -153,13 +162,13 @@ def test_single_replay_gradient_matches_explicit_detached_recurrence():
     for length in [3, 2, 1]:
         ids = tokens['token_ids'][offset:offset + length]
         embeds = reference.embedding(ids, tokenizer_ids=torch.zeros_like(ids), tokenizer_names=('text',))
-        context, state = embeds[:-1], embeds[-1].float()
+        context, state = embeds[:-1], reference.reasoner.start_embedding.weight[0]
         inputs = []
         for _ in range(3):
             inputs.append(reference.reasoner.norm(state.detach()))
             row = torch.cat((context, torch.stack(inputs)))
             hidden = reference.backbone(row, sequence_ids=torch.zeros(len(row), dtype=torch.long))
-            state = state + hidden[-1].float()
+            state = state + torch.nn.functional.linear(hidden[-1].float() * torch.rsqrt(hidden[-1].float().square().mean(-1, keepdim=True) + 1e-6), reference.reasoner.update_projection.weight, reference.reasoner.update_projection.bias)
         reference_values.append(reference.value_head(state))
         offset += length
     expected = torch.stack(reference_values)
@@ -168,7 +177,8 @@ def test_single_replay_gradient_matches_explicit_detached_recurrence():
     for name, parameter in online.named_parameters():
         torch.testing.assert_close(parameter.grad, dict(reference.named_parameters())[name].grad, atol=2e-5, rtol=2e-5)
     grads = online.embedding.embeddings['text'].embed_tokens.weight.grad
-    assert grads[9].abs().sum() > 0
+    assert grads[9].count_nonzero() == 0
+    assert online.reasoner.start_embedding.weight.grad.abs().sum() > 0
     assert (grads[[2, 3, 4]].abs().sum(-1) > 0).all()  # Train context tokens too.
     assert grads[[0, 1, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15]].count_nonzero() == 0
     assert online.reasoner.norm.weight.grad.abs().sum() > 0
@@ -183,7 +193,8 @@ def test_real_transformer_backward_reaches_all_residual_updates():
     q.square().sum().backward()
     assert online.reasoner.norm.weight.grad.abs().sum() > 0
     assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in online.backbone.parameters())
-    assert online.embedding.embeddings['text'].embed_tokens.weight.grad[9].abs().sum() > 0
+    assert online.embedding.embeddings['text'].embed_tokens.weight.grad[9].count_nonzero() == 0
+    assert online.reasoner.start_embedding.weight.grad.abs().sum() > 0
     assert (online.embedding.embeddings['text'].embed_tokens.weight.grad[[2, 3, 4]].abs().sum(-1) > 0).all()
 
 
@@ -272,7 +283,7 @@ def test_passive_batch_skips_generation_and_replay():
 @pytest.mark.parametrize('max_steps', [0, -1, True, 1.5])
 def test_invalid_reasoning_budget(max_steps):
     with pytest.raises(ValueError, match='positive integer'):
-        SequentialReasoner(min_steps=1, hidden_dim=8, max_steps=max_steps, residual_connections=True, adaptive_depth=True)
+        SequentialReasoner(min_steps=1, hidden_dim=8, max_steps=max_steps, residual_connections=True, adaptive_depth=True, rms_norm_eps=1e-6)
 
 
 class TextBackend:
@@ -320,7 +331,7 @@ def test_tokenizer_start_field_survives_stream_pack_cache_and_save_load(tmp_path
     inputs['token_ids'][3:] = torch.tensor([7, 8, 8, 9])
     torch.testing.assert_close(generate(online, inputs).states[0], first)
     other, _ = tokenizer('8').pack_rows(rows=[events])
-    assert not torch.allclose(generate(online, other).states[:, 0], trace.states[:, 0])
+    torch.testing.assert_close(generate(online, other).states[:, 0], trace.states[:, 0])
 
 
 @pytest.mark.parametrize('spec', [dict(type='text', head_output=True), dict(type='token', head_output=False)])
@@ -395,7 +406,7 @@ def test_notebook_dqn_update_replays_online_trajectory_through_both_models(tmp_p
     assert not torch.equal(original['reasoner.norm.weight'], online.reasoner.norm.weight)
     assert all(p.grad is None for p in target.parameters())
     for name, parameter in target.named_parameters():
-        rate = (.1 if name.startswith('embedding.') else .3 if name.startswith('value_head.')
+        rate = (.1 if name.startswith('embedding.') else .3 if name.startswith(('value_head.', 'reasoner.start_embedding.', 'reasoner.update_projection.'))
                 else .2)
         torch.testing.assert_close(parameter, target_before[name].lerp(dict(online.named_parameters())[name], rate))
     monkeypatch.setattr(online.reasoner, 'generate', original_generation)
@@ -550,12 +561,13 @@ def test_multiple_actions_retain_every_depth_with_detached_feedback():
                 if token != 9:
                     prefix.append(embed)
                     continue
-                z = embed.float()
+                z = online.reasoner.start_embedding.weight
                 prefix.append(online.reasoner.norm(z))
                 updates = []
                 for _ in range(4):
                     inputs = torch.cat(prefix)
-                    z = z + online.backbone(inputs, sequence_ids=torch.zeros(len(inputs), dtype=torch.long))[-1:]
+                    raw = online.backbone(inputs, sequence_ids=torch.zeros(len(inputs), dtype=torch.long))[-1:]
+                    z = z + torch.nn.functional.linear(raw * torch.rsqrt(raw.square().mean(-1, keepdim=True) + 1e-6), online.reasoner.update_projection.weight, online.reasoner.update_projection.bias)
                     prefix.append(online.reasoner.norm(z))
                     updates.append(z[0])
                 reference.append(torch.stack(updates))
@@ -671,12 +683,13 @@ def test_explicit_positions_and_target_weights_replay_the_same_latent_history(ma
                 if not isinstance(item, tuple) or item[1] != 0:
                     continue
                 decision = item[0]
-                state = token_table[9]
+                state = network.reasoner.start_embedding.weight[0]
                 outputs = []
                 for depth in range(int(lengths[decision])):
                     update_position = position + depth
-                    state = (state + (update_position + 1) * network.backbone.position_gain
-                             + inputs[:update_position + 1].sum(0) * network.backbone.context_gain)
+                    raw_update = ((update_position + 1) * network.backbone.position_gain
+                                  + inputs[:update_position + 1].sum(0) * network.backbone.context_gain)
+                    state = state + torch.nn.functional.linear(raw_update * torch.rsqrt(raw_update.square().mean(-1, keepdim=True) + 1e-6), network.reasoner.update_projection.weight, network.reasoner.update_projection.bias)
                     outputs.append(state)
                 outputs.extend([outputs[-1]] * (3 - len(outputs)))
                 expected.append(torch.stack(outputs))

@@ -75,7 +75,7 @@ def qwen3_config_kwargs(model: Any) -> dict[str, Any]:
         head_dim=getattr(cfg, "head_dim", None),
         max_position_embeddings=cfg.max_position_embeddings,
         intermediate_size=cfg.intermediate_size,
-        rms_norm_eps=getattr(cfg, "rms_norm_eps", 1e-6),
+        rms_norm_eps=vars(cfg)["rms_norm_eps"],
         attention_bias=getattr(cfg, "attention_bias", False),
     )
     rope_parameters = getattr(cfg, "rope_parameters", None)

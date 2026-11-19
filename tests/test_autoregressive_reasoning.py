@@ -46,7 +46,7 @@ def model():
         token_head.weight.mul_(0.01)
         token_head.bias.zero_()
         token_head.bias[0] = 6  # reliable, stochastic EOS for local update tests
-    value_head = MLP(in_features=16, out_features=4, hidden_dim=16, num_layers=1, scale=0.1)
+    value_head = MLP(in_features=16, out_features=4, hidden_dim=16, num_layers=1, scale=0.1, rms_norm_eps=1e-6)
     result = example_module().ReasoningDqn(embedding=embedding, backbone=backbone, value_head=value_head,
                                          token_head=token_head, tokenizer_name="text")
     assert result.embedding is embedding and result.backbone is backbone and result.value_head is value_head

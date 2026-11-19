@@ -82,7 +82,7 @@ def test_composed_model_roundtrip(tmp_path) -> None:
     torch.manual_seed(0)
     hidden_dim = 8
     backbone = IdentityBackbone(hidden_dim=hidden_dim)
-    heads = MLP(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, propagate_gradient=1.0)
+    heads = MLP(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, propagate_gradient=1.0, rms_norm_eps=1e-6)
     model = simple_model(backbone=backbone, heads={'action_value': heads}, reasoner=None).eval()
     batch = [[{'action': 0, 'reward': 0.0, 'repeat_episode_done': 0, 'episode_done': 0}, {'action': 1, 'reward': 1.0, 'repeat_episode_done': 0, 'episode_done': 0}, {'action': 2, 'reward': 2.0, 'repeat_episode_done': 1, 'episode_done': 0}]]
     expected = model(batch_to_token_batch(_TOK, batch))["predictions"]
@@ -105,13 +105,13 @@ def test_composed_model_roundtrip(tmp_path) -> None:
 def test_loading_requires_a_model_and_preserves_its_runtime(tmp_path) -> None:
     source = simple_model(
         backbone=Backbone(architecture='qwen3', dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2),
-        heads={'action_value': MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.)},
+        heads={'action_value': MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1., rms_norm_eps=1e-6)},
          reasoner=None,
     )
     save_model(model=source, path=tmp_path)
     target = simple_model(
         backbone=Backbone(architecture='qwen3', dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2),
-        heads={'action_value': MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.)},
+        heads={'action_value': MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1., rms_norm_eps=1e-6)},
          reasoner=None,
     )
     loaded = load_model(model=target, repo_id_or_path=tmp_path)
@@ -128,7 +128,7 @@ def test_num_frequencies_roundtrip(tmp_path) -> None:
     assert embedding.features.numeric[0] is not None
     with torch.no_grad():
         embedding.features.numeric[0].get_parameter("proj.weight").fill_(0.25)
-    heads = MLP(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, propagate_gradient=1.0)
+    heads = MLP(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, propagate_gradient=1.0, rms_norm_eps=1e-6)
     model = simple_model(embedding=embedding, backbone=backbone, heads={'action_value': heads}, reasoner=None)
     save_model(model=model, path=tmp_path)
     loaded_model = load_model(model=fresh_model(model), repo_id_or_path=tmp_path)
@@ -154,7 +154,7 @@ def test_identity_num_frequencies_roundtrip(tmp_path) -> None:
     assert embedding.features.numeric[0] is not None
     with torch.no_grad():
         embedding.features.numeric[0].get_parameter("proj.weight").normal_()
-    heads = MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0)
+    heads = MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0, rms_norm_eps=1e-6)
     model = simple_model(embedding=embedding, backbone=backbone, heads={'action_value': heads}, reasoner=None)
     save_model(model=model, path=tmp_path)
     loaded_model = load_model(model=fresh_model(model), repo_id_or_path=tmp_path)
@@ -167,7 +167,7 @@ def test_identity_num_frequencies_roundtrip(tmp_path) -> None:
 
 def test_explicit_model_checkpoints_roundtrip_without_backbone_output_norm(tmp_path) -> None:
     backbone = Backbone(architecture='qwen3', dtype=torch.float32, hidden_dim=8, num_layers=1, num_heads=2)
-    head = MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0)
+    head = MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0, rms_norm_eps=1e-6)
     model = simple_model(backbone=backbone, heads={'action_value': head}, reasoner=None)
     with torch.no_grad():
         output = head.layers[-1]
@@ -194,7 +194,7 @@ def test_legacy_checkpoint_formats_are_rejected(tmp_path, version: str) -> None:
 
 
 def test_mlp_defaults_to_full_input_gradients() -> None:
-    mlp = MLP(in_features=8, out_features=1, hidden_dim=8, num_layers=1)
+    mlp = MLP(in_features=8, out_features=1, hidden_dim=8, num_layers=1, rms_norm_eps=1e-6)
     h = torch.randn(2, 8, requires_grad=True)
     mlp(h).sum().backward()
     assert mlp.propagate_gradient == 1.0
@@ -212,7 +212,7 @@ def test_identity_embed_tokens_roundtrip(tmp_path) -> None:
     torch.manual_seed(0)
     hidden_dim = 8
     backbone = IdentityBackbone(hidden_dim=hidden_dim)
-    heads = MLP(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, propagate_gradient=1.0)
+    heads = MLP(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, propagate_gradient=1.0, rms_norm_eps=1e-6)
     model = simple_model(backbone=backbone, heads={'action_value': heads}, reasoner=None).eval()
     tokenizer = token_tokenizer('action', 'prev_action')
     batch = [[{'action': 0, 'prev_action': 1, 'reward': 0.5, 'grouping_id': 0}, {'action': 2, 'prev_action': 0, 'reward': 1.0, 'grouping_id': 0}]]
@@ -241,7 +241,7 @@ def test_model_card_requires_the_application_implementation(tmp_path) -> None:
 def _lora_model(dtype: torch.dtype) -> Model:
     hidden_dim = 8
     backbone = Backbone(architecture='qwen3', dtype=dtype, hidden_dim=hidden_dim, num_layers=1, num_heads=2, lora=LoRAConfig(rank=2))
-    heads = MLP(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, propagate_gradient=1.0)
+    heads = MLP(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, propagate_gradient=1.0, rms_norm_eps=1e-6)
     return simple_model(backbone=backbone, heads={'action_value': heads}, reasoner=None).eval()
 
 
@@ -294,7 +294,7 @@ def test_model_to_cuda_moves_without_casting() -> None:
 
 
 def test_save_model_does_not_write_tokenizer(tmp_path) -> None:
-    model = simple_model(backbone=IdentityBackbone(hidden_dim=8), heads=({'action_value': (head := MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0))}), reasoner=None)
+    model = simple_model(backbone=IdentityBackbone(hidden_dim=8), heads=({'action_value': (head := MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0, rms_norm_eps=1e-6))}), reasoner=None)
     save_model(model=model, path=tmp_path)
     assert not (tmp_path / 'tokenizer.json').exists()
 
@@ -349,7 +349,7 @@ def test_load_tokenizer_missing_file_raises(tmp_path) -> None:
 
 
 def test_push_model_and_tokenizer_share_repository(monkeypatch) -> None:
-    model = simple_model(backbone=IdentityBackbone(hidden_dim=8), heads=({'action_value': (head := MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0))}), reasoner=None)
+    model = simple_model(backbone=IdentityBackbone(hidden_dim=8), heads=({'action_value': (head := MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0, rms_norm_eps=1e-6))}), reasoner=None)
     tokenizer = Tokenizer(input_fields=[{"provider": "sensor", 'type': 'text', 'input_field': 'action', 'format': '{action}', 'head_output': True}, {"provider": "sensor", 'type': 'text', 'input_field': 'repeat_episode_index', 'format': format_episode_index}], objective_fields=[], tokenizers={"default": IntIdTokenizer()})
     import mouse_core.models.io as io
     import huggingface_hub

@@ -176,7 +176,7 @@ and [value example](examples/05_train_offline_sv.ipynb).
 [Example 24](examples/24_train_offline_diffusion_dqn.ipynb) copies example 2 with
 a joint action-vector diffusion head conditioned on the backbone's final features.
 Its velocity network automatically uses the backbone feature dimension `D`.
-Context passes through RMSNorm (`eps=1e-5`) without affine parameters or a learned projection. Each noisy
+Context passes through RMSNorm (epsilon from the backbone configuration) without affine parameters or a learned projection. Each noisy
 action latent value receives 64 sine/cosine pairs; these encodings are concatenated
 and projected without RMSNorm. `DIFFUSION_LATENT_MIN` and `DIFFUSION_LATENT_MAX`
 define a shared reference range for all actions, defaulting to 0–20.
@@ -261,21 +261,25 @@ The [example layout guide](examples/README.md) defines the shared section order,
 tokenizer field formatting, and formatter commands.
 
 The [FrozenLake autoregressive reasoning notebook](examples/23_train_autoregressive_reasoning_dqn.ipynb)
-uses vocabulary generation with a REINFORCE reward. Three separate sequential
-reasoning examples show the distinction between the recurrence and its loss:
+uses vocabulary generation with a REINFORCE reward.
+[Example 25 — Reasoning DQN](examples/25_train_reasoning_dqn.ipynb) exposes one
+reasoning model with independent loss and recurrence choices:
 
-| Example | Extra residual connection | Supervision | Stopping |
+| `REASONING_LOSS` | Supervision | Stopping | Head |
 | --- | --- | --- | --- |
-| [25 — Residual reasoning](examples/25_train_residual_reasoning_dqn.ipynb) | Yes | Final environment-action TD loss | Fixed budget |
-| [26 — Value reasoning](examples/26_train_value_reasoning_dqn.ipynb) | Optional; disabled in the example | Bellman loss at each reasoning state | Environment action or `think` |
-| [27 — Combined reasoning](examples/27_train_combined_reasoning_dqn.ipynb) | Enabled | Bellman loss at each reasoning state | Environment action or `think` |
+| `all_tokens` | Bellman loss at each generated reasoning state | Environment action or `think`, within minimum/maximum depths | A+1 actions |
+| `last_token` | TD loss only at the final reasoning state | Fixed budget; minimum must equal maximum | A environment actions |
 
-These notebooks load recorded standalone 4x4 FrozenLake episodes, generate fresh
+`RESIDUAL_CONNECTIONS` can be true or false with either loss. When true, updates
+accumulate through an extra residual path. When false, each position repeats the
+same initial reasoning token, and the transformer outputs are not fed back.
+
+The notebooks load recorded standalone 4x4 FrozenLake episodes, generate fresh
 reasoning and train. They never collect interactions or run evaluation. Set
 `DATASET_ID` to an existing dataset and match its environment settings. The standard
 `DataLoader` owns complete-episode sampling, packing, sequence IDs and
 prediction-to-step mappings. [Example 15](examples/15_inference.ipynb) loads each
-checkpoint's explicit recurrence, depth and objective settings for evaluation.
+checkpoint's explicit loss, recurrence and depth settings for evaluation.
 
 The tokenizer marks each requested decision with a single existing token:
 
@@ -284,12 +288,13 @@ The tokenizer marks each requested decision with a single existing token:
  "format": "\n", "head_output": True, "autoregressive": True}
 ```
 
-`SequentialReasoner(hidden_dim=..., min_steps=..., max_steps=..., residual_connections=...,
+`SequentialReasoner(rms_norm_eps=backbone.rms_norm_eps, hidden_dim=..., min_steps=..., max_steps=..., residual_connections=...,
 adaptive_depth=...)` separates the two mechanisms. With residual connections,
-`z_next = z + transformer_update`; each successive causal input is
+`z_next = z + update_projection(update_norm(transformer_output))`; each successive causal input is
 `RMSNorm(z.detach())`. The trainable RMSNorm scale starts at `0.02`. Without
-residual connections, every reasoning position receives the same initial token's
-normalized embedding. Its transformer output is the value representation; output
+residual connections, every reasoning position receives the same dedicated
+learnable start embedding after normalization. Its projected transformer output
+is the value representation; output
 states are never substituted for that repeated token. Causal attention and the
 backbone's ordinary internal residual connections remain in both variants.
 
@@ -299,16 +304,18 @@ After that, think continues and an environment action stops; think is masked at
 `max_steps`. The required minimum is between 1 and the maximum. Optional
 `select_actions(values, decision_indices, depths)` samples from the masked values.
 With `adaptive_depth=False`, generation always consumes the fixed budget and
-evaluates an A-action head only at its final depth. Fixed-budget residual reasoning
-has no learned stop head.
+evaluates an A-action head only at its final depth. Fixed-budget last-token supervision
+has no learned stop head, regardless of the residual setting.
 
 The resulting `ReasoningBatch` contains only the generated history and records
 each decision's executed `lengths`. Both networks replay this same batch; the
 delayed network never generates a separate trajectory. `forward` reconstructs
 all generated value representations in one call. Residual feedback is detached
 before its trainable normalization; context embeddings and accumulated residual
-updates remain differentiable. Repeated-token reasoning trains its initial token
-embedding through each occurrence. Cached chunks cannot be used as standalone
+updates remain differentiable. Repeated-token reasoning trains its dedicated start
+embedding through each occurrence. The start vector is independent of the
+newline marker and pretrained token tables. A shared learned H-to-H linear map
+projects transformer outputs in both modes (non-affine RMSNorm, epsilon from the backbone configuration, then zero-initialized weights and bias). Cached chunks cannot be used as standalone
 training batches.
 
 `value_reasoning_loss` supervises actual think choices and then the recorded
@@ -319,15 +326,16 @@ The environment target is
 Environment actions are unavailable before the minimum, and think is unavailable
 at the hard cap, in both policy and target calculations. The
 required `gamma_think` lies in [0, 1] and is explicitly 1.0 alongside the other
-objective discount factors in examples 26 and 27.
+objective discount factors in example 25.
 The loss averages squared TD errors over weighted generated transitions, excluding
 padding and invalid decisions. No loss trains ungenerated depths.
 
 `final_reasoning_loss` supervises only the recorded action at the final state. Its
 target is `reward - c * (K - 1) + gamma * max Q_target(next observation's final state)`.
-The residual sum propagates this final loss to every transformer update. The fixed
-budget is not a learned choice. In both objectives the first reasoning step is
-free, terminal discounts govern environment bootstrapping, and reported rewards
+When residual connections are enabled, the residual sum propagates this final
+loss to every accumulated transformer update. Without them, training follows the
+ordinary causal transformer computation. The fixed budget is not a learned choice.
+In both objectives the first reasoning step is free, terminal discounts govern environment bootstrapping, and reported rewards
 exclude internal reasoning costs.
 
 `mouse_core.models.generate` is the shared inference scheduler used by
@@ -968,7 +976,7 @@ These are alternatives to the starting workflow, not a required sequence.
 | Supervised learning | [05 — Value labels](examples/05_train_offline_sv.ipynb), [09 — Action labels](examples/09_train_offline_sp.ipynb) |
 | Latent reasoning | [10 — Reasoning DQN](examples/10_train_offline_reasoning_dqn.ipynb) |
 | Autoregressive reasoning | [23 — Vocabulary reasoning](examples/23_train_autoregressive_reasoning_dqn.ipynb) |
-| Sequential reasoning | [25 — Residual](examples/25_train_residual_reasoning_dqn.ipynb), [26 — Value](examples/26_train_value_reasoning_dqn.ipynb), [27 — Combined](examples/27_train_combined_reasoning_dqn.ipynb) |
+| Sequential reasoning | [25 — Reasoning DQN](examples/25_train_reasoning_dqn.ipynb) |
 | Return horizons | [13 — N-step DQN](examples/13_train_offline_n_step_dqn.ipynb), [14 — Value-gap traces](examples/14_train_offline_value_gap_dqn.ipynb) |
 | Numeric observations | [17 — Collect CartPole](examples/17_collect_cartpole.ipynb), [18 — Train CartPole DQN](examples/18_train_offline_cartpole_dqn.ipynb) |
 | Continuous actions | [19 — Pendulum action tables](examples/19_train_online_pendulum_dqn.ipynb), [20 — Sequential Reacher actions](examples/20_train_sequential_actions_dqn.ipynb) |
@@ -1190,3 +1198,7 @@ installations were restored after testing.
 Training compilation accepts every preset exposed by the installed PyTorch
 Inductor, including `max-autotune` and `reduce-overhead` (CUDA graphs where
 applicable), plus `off`.
+
+Custom MLP and reasoning norms require an explicit `rms_norm_eps`. Example factories
+read `backbone.rms_norm_eps` from the loaded model configuration (Qwen3: `1e-6`);
+there is no separate local epsilon default or missing-field fallback.

@@ -36,7 +36,7 @@ _TOK = token_tokenizer("action", "repeat_episode_done")
 def _tiny_model(architecture: Literal['llama', 'qwen3']='qwen3', tokens: int=1, dtype: torch.dtype=torch.float32, **backbone_kwargs) -> Model:
     hidden_dim = 32
     backbone = Backbone(architecture=architecture, dtype=dtype, hidden_dim=hidden_dim, num_layers=2, num_heads=2, **backbone_kwargs)
-    head = MLP(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, propagate_gradient=1.0)
+    head = MLP(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, propagate_gradient=1.0, rms_norm_eps=1e-6)
     return simple_model(backbone=backbone, heads={'action_value': head}, reasoner=None).eval()
 
 def _steps(n: int, start: int=0) -> list[dict]:
@@ -139,7 +139,7 @@ def test_cuda_bf16_lora_compiled_train_matches_cached_decode() -> None:
     torch.manual_seed(5)
     hidden_dim = 64
     backbone = Backbone(architecture='qwen3', dtype=torch.bfloat16, hidden_dim=hidden_dim, num_layers=2, num_heads=4, lora=LoRAConfig(rank=4, alpha=8.0))
-    head = MLP(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, propagate_gradient=1.0)
+    head = MLP(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, propagate_gradient=1.0, rms_norm_eps=1e-6)
     model = simple_model(backbone=backbone, heads={'action_value': head}, reasoner=None).eval().to(torch.device('cuda'))
     steps = _steps(8)
     for step, episode in zip(steps, (0, 0, 1, 1, 0, 0, 2, 0)):

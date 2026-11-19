@@ -27,7 +27,7 @@ def _head(hidden_dim: int) -> MLP:
     return MLP(
         in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1,
         propagate_gradient=1.0,
-    )
+     rms_norm_eps=1e-6)
 
 
 def _tiny_model() -> Model:
@@ -112,7 +112,7 @@ def test_copy_rejects_a_model_with_nothing_trainable() -> None:
 
 def _two_head_model(hidden_dim: int=8) -> Model:
     q_head = _head(hidden_dim)
-    return simple_model(backbone=IdentityBackbone(hidden_dim=hidden_dim), heads={'action_value': q_head, 'behavior': MLP(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, propagate_gradient=1.0)}, reasoner=None)
+    return simple_model(backbone=IdentityBackbone(hidden_dim=hidden_dim), heads={'action_value': q_head, 'behavior': MLP(in_features=hidden_dim, out_features=4, hidden_dim=hidden_dim, num_layers=1, propagate_gradient=1.0, rms_norm_eps=1e-6)}, reasoner=None)
 
 
 @pytest.mark.parametrize('device', ['cuda'])

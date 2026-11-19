@@ -33,7 +33,7 @@ def head_class():
 
 
 def make_head(**settings):
-    settings = dict(latent_frequencies=4, latent_min=0., latent_max=20.,
+    settings = dict(rms_norm_eps=1e-6, latent_frequencies=4, latent_min=0., latent_max=20.,
                     time_min=0., time_max=1., noise_mean=0., noise_std=1.) | settings
     return head_class()(**settings)
 
@@ -711,7 +711,7 @@ def test_all_three_conditioning_branches_start_with_expected_unit_rms(latent_fre
         head = make_head(hidden_dim=128, num_actions=3, num_steps=10,
                          time_frequencies=64,
                          latent_frequencies=latent_frequencies, latent_min=latent_min, latent_max=latent_max)
-        assert head.norm.eps == 1e-5 and not head.norm.elementwise_affine
+        assert head.norm.eps == 1e-6 and not head.norm.elementwise_affine
         assert head.norm.normalized_shape == (128,)
         assert head.norm.weight is None
         hooks = [head.norm.register_forward_hook(capture('context')),

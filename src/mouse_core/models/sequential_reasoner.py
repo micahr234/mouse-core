@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Literal, cast
 
+import math
 import torch
 from tensordict import TensorDict
 from torch import nn
@@ -68,9 +69,10 @@ def _evaluating(*roots: nn.Module) -> Iterator[None]:
 class SequentialReasoner(nn.Module):
     """Generate repeated-token or residual reasoning with fixed or adaptive depth.
 
-    With residual connections, z[r+1] = z[r] + T(context, Norm(z[r].detach())).
-    Otherwise every reasoning position receives Norm(the initial token embedding)
-    and its representation is the transformer output at that position.
+    With residual connections, z[r+1] = z[r] + P(T(context, Norm(z[r].detach()))).
+    Otherwise every reasoning position receives Norm(the dedicated trainable start embedding)
+    and its representation is the projected transformer output at that position.
+    P is one shared, learned H-to-H linear map, initialized to identity.
 
     Adaptive depth selects among environment actions and one final think action.
     Before min_steps only think is available; at max_steps only environment
@@ -81,7 +83,7 @@ class SequentialReasoner(nn.Module):
     recomputation matches generation.
     """
 
-    def __init__(self, *, hidden_dim: int, min_steps: int, max_steps: int,
+    def __init__(self, *, hidden_dim: int, min_steps: int, max_steps: int, rms_norm_eps: float,
                  residual_connections: bool, adaptive_depth: bool) -> None:
         super().__init__()
         if type(hidden_dim) is not int or hidden_dim < 1:
@@ -92,13 +94,27 @@ class SequentialReasoner(nn.Module):
             raise ValueError("min_steps must be an integer in [1, max_steps]")
         if type(residual_connections) is not bool or type(adaptive_depth) is not bool:
             raise ValueError("residual_connections and adaptive_depth must be booleans")
+        if type(rms_norm_eps) not in (int, float) or not math.isfinite(rms_norm_eps) or rms_norm_eps <= 0:
+            raise ValueError("rms_norm_eps must be finite and positive")
+        self.rms_norm_eps = rms_norm_eps
         self.hidden_dim = hidden_dim
         self.max_steps = max_steps
         self.min_steps = min_steps
         self.residual_connections = residual_connections
         self.adaptive_depth = adaptive_depth
-        self.norm = nn.RMSNorm(hidden_dim, eps=1e-6, elementwise_affine=True, dtype=torch.float32)
+        self.start_embedding = nn.Embedding(1, hidden_dim, dtype=torch.float32)
+        nn.init.normal_(self.start_embedding.weight, std=0.02)
+        self.norm = nn.RMSNorm(hidden_dim, eps=rms_norm_eps, elementwise_affine=True, dtype=torch.float32)
         nn.init.constant_(self.norm.weight, 0.02)
+        self.update_norm = nn.RMSNorm(hidden_dim, eps=rms_norm_eps, elementwise_affine=False, dtype=torch.float32)
+        self.update_projection = nn.Linear(hidden_dim, hidden_dim, bias=True, dtype=torch.float32)
+        nn.init.zeros_(self.update_projection.weight)
+        nn.init.zeros_(self.update_projection.bias)
+
+    def project_updates(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Mix hidden coordinates identically in generation and differentiable replay."""
+        with torch.autocast(device_type=hidden.device.type, enabled=False):
+            return self.update_projection(self.update_norm(hidden.float())).float()
 
     @staticmethod
     def _embeds(tokens: TensorDict, embedding: MultiEmbedding) -> torch.Tensor:
@@ -151,7 +167,7 @@ class SequentialReasoner(nn.Module):
                                                    device=device), lengths)
         with _evaluating(embedding, backbone, self):
             embeds = self._embeds(tokens, embedding)
-            initial = embeds[list(heads)].float()
+            initial = self.start_embedding.weight.float().expand(len(heads), -1)
             states = initial[:, None, :].expand(-1, self.max_steps + 1, -1).clone()
             counts = [0] * len(heads)
             groups = tokens["sequence_ids"].to(embeds.device)
@@ -176,11 +192,12 @@ class SequentialReasoner(nn.Module):
                         for j, request in enumerate(requests) if cursors[request] < len(episode_heads[request])]
                 if not live:
                     return chunks
+                updates = self.project_updates(hidden)
                 for j, request, i in live:
                     counts[i] += 1
                     step = counts[i]
-                    states[i, step] = (states[i, step - 1] + hidden[j].float()
-                                       if self.residual_connections else hidden[j].float())
+                    states[i, step] = (states[i, step - 1] + updates[j]
+                                       if self.residual_connections else updates[j])
                 decisions = [i for _, _, i in live
                              if self.adaptive_depth or counts[i] == self.max_steps]
                 thinking = {i: True for _, _, i in live}
@@ -314,7 +331,7 @@ class SequentialReasoner(nn.Module):
 
         Context is embedded by this network. Residual feedback detaches before
         normalization and the additive path is rebuilt from this forward's updates.
-        Repeated-token inputs use this network's live initial-token embedding.
+        Repeated-token inputs use this network's live dedicated start embedding.
         No generation or sequence insertion happens here.
         """
         if generated.cached_prefix:
@@ -336,14 +353,14 @@ class SequentialReasoner(nn.Module):
         with _evaluating(embedding, backbone, self):
             tokens = generated.tokens.to(next(embedding.parameters()).device)
             embeds = self._embeds(tokens, embedding)
-            initial = embeds[generated.initial_positions.to(embeds.device)].float()
+            initial = self.start_embedding.weight.float().expand(count, -1)
             mask = tokens["latent_mask"]
             inputs = embeds.clone()
             latent_inputs = (tokens["latent_values"][mask].detach().float()
-                             if self.residual_connections else embeds[mask].float())
+                             if self.residual_connections else self.start_embedding.weight.float().expand_as(embeds[mask]))
             inputs[mask] = self.norm(latent_inputs).to(embeds.dtype)
             hidden = cast(torch.Tensor, backbone(inputs, sequence_ids=tokens["sequence_ids"]))
-            updates = hidden[generated.update_positions.to(hidden.device)].float()
+            updates = self.project_updates(hidden[generated.update_positions.to(hidden.device)])
             valid = torch.arange(self.max_steps, device=hidden.device)[None] < generated.lengths.to(hidden.device)[:, None]
             updates = updates.masked_fill(~valid[..., None], 0)
             if self.residual_connections:

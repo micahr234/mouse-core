@@ -91,9 +91,9 @@ def test_each_notebook_updates_components_with_independent_rates(path, rates):
             for param in dst.parameters(): param.fill_(-2.)
     opt.step(0)
     for name, settings in opt.groups.items():
-        expected = (rates[0] if name.endswith('embedding') else
+        expected = (rates[0] if name in ('embedding', 'encoder.embedding') else
                     rates[3] if name.endswith('token_head') else
-                    rates[2] if name.endswith('value_head') or name.startswith('q_head') else rates[1])
+                    rates[2] if name.endswith(('value_head', 'start_embedding', 'update_projection')) or name.startswith('q_head') else rates[1])
         dst = settings.get('target')
         if dst is not None:
             for param in dst.parameters():
@@ -113,12 +113,14 @@ class ReasoningModules(Model):
             self.reasoner.token_head = nn.Linear(2, 2)
         else:
             self.reasoner.norm = nn.Linear(2, 2)
+            self.reasoner.start_embedding = nn.Embedding(1, 2)
+            self.reasoner.update_projection = nn.Linear(2, 2)
 
     def forward(self, x):
         return x
 
 
-@pytest.mark.parametrize('kind', ['23', '25', '26', '27'])
+@pytest.mark.parametrize('kind', ['23', '25'])
 def test_reasoning_optimizers_cover_parameters_once_at_component_rates(kind):
     path = next(EXAMPLES.glob(kind + '_*.ipynb'))
     tree = ast.parse(source(path))

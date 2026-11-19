@@ -31,15 +31,15 @@ class BranchedModel(Model):
         self.backbones = nn.ModuleList([_backbone() for _ in range(2 if stacked else 1)])
         self.embedding = Embedding(hidden_dim=8, vocab_size=32)
         self.projection = (nn.Sequential(
-            MLP(in_features=8, out_features=8, hidden_dim=12),
-            MLP(in_features=8, hidden_dim=12, out_features=4),
+            MLP(in_features=8, out_features=8, hidden_dim=12, rms_norm_eps=1e-6),
+            MLP(in_features=8, hidden_dim=12, out_features=4, rms_norm_eps=1e-6),
         ) if projection else nn.Identity())
         width = 4 if projection else 8
         self.skip = nn.Linear(8, width)
         self.value = MLP(in_features=width, out_features=1, hidden_dim=8,
-                                    num_layers=2, propagate_gradient=1.)
+                                    num_layers=2, propagate_gradient=1., rms_norm_eps=1e-6)
         self.policy = MLP(in_features=width, out_features=4, hidden_dim=8,
-                                         num_layers=1, propagate_gradient=1.)
+                                         num_layers=1, propagate_gradient=1., rms_norm_eps=1e-6)
         self.to(torch.get_default_device())
 
     def get_action(self, *, out):
@@ -204,8 +204,8 @@ def test_custom_checkpoint_saves_only_online_state(tmp_path: Path):
 
 
 def test_mlp_instances_compose_as_projection_and_scalar_prediction():
-    projection = MLP(in_features=8, out_features=4, hidden_dim=12)
-    regression = MLP(in_features=4, out_features=1, hidden_dim=8, scale=0.1)
+    projection = MLP(in_features=8, out_features=4, hidden_dim=12, rms_norm_eps=1e-6)
+    regression = MLP(in_features=4, out_features=1, hidden_dim=8, scale=0.1, rms_norm_eps=1e-6)
     h = torch.randn(5, 8, requires_grad=True)
     values = regression(projection(h))
     assert values.shape == (5, 1)

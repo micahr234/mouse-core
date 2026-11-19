@@ -146,6 +146,11 @@ class BaseBackbone(nn.Module, ABC):
             return torch.float32
 
     @property
+    def rms_norm_eps(self) -> float:
+        """Explicit normalization epsilon supplied by this backbone's configuration."""
+        raise NotImplementedError("Backbone must expose its configured rms_norm_eps")
+
+    @property
     @abstractmethod
     def hidden_dim(self) -> int:
         """Width ``D`` of the hidden states this backbone returns."""

@@ -9,7 +9,7 @@ from mouse_core.data import Datastore
 from tests._reasoning_replay_fixture import recorded_stores, reasoning_loader
 
 
-@pytest.fixture(params=['autoregressive', '25', '26', '27'])
+@pytest.fixture(params=['autoregressive', '25'])
 def example(request):
     if request.param == 'autoregressive':
         return importlib.import_module('tests.test_autoregressive_reasoning').example_module()
