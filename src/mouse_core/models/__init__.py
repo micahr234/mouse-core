@@ -12,7 +12,7 @@ from mouse_core.models.lora import LoRAConfig
 from mouse_core.models.mlp import MLP
 from mouse_core.models.vocabulary_head import VocabularyHead
 from mouse_core.models.reasoner import LatentReasoner, sample_reasoning_splits
-from mouse_core.models.residual_reasoner import ResidualReasoner, ResidualBatch
+from mouse_core.models.sequential_reasoner import SequentialReasoner, ReasoningBatch
 
 __all__ = [
     "Model",
@@ -28,8 +28,8 @@ __all__ = [
     "AutoregressiveReasoner",
     "ReasoningTrace",
     "ReasoningReadout",
-    "ResidualReasoner",
-    "ResidualBatch",
+    "SequentialReasoner",
+    "ReasoningBatch",
     "VocabularyHead",
     "MLP",
     "Embedding",

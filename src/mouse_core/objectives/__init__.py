@@ -3,6 +3,7 @@ from mouse_core.objectives.replicate import ReplicateObjective
 from mouse_core.objectives.base import Objective
 from mouse_core.objectives.cosine import CosineObjective
 from mouse_core.objectives.dqn import DqnObjective
+from mouse_core.objectives.value_reasoning import value_reasoning_loss, final_reasoning_loss
 from mouse_core.objectives.diffusion_dqn import DiffusionDqnObjective
 from mouse_core.objectives.transforms import (
     Discount,
@@ -33,6 +34,8 @@ __all__ = [
     "Reward",
     "Value",
     "DqnObjective",
+    "value_reasoning_loss",
+    "final_reasoning_loss",
     "DiffusionDqnObjective",
     "affine_reward",
     "affine_value",

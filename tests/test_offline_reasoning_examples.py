@@ -15,7 +15,9 @@ EXAMPLES = Path(__file__).parents[1] / 'examples'
 
 
 @pytest.mark.parametrize('kind,filename,class_name', [
-    ('residual', '25_train_residual_reasoning_dqn.ipynb', 'ResidualDqn'),
+    ('sequential', '25_train_residual_reasoning_dqn.ipynb', 'ResidualDqn'),
+    ('sequential', '26_train_value_reasoning_dqn.ipynb', 'ValueReasoningDqn'),
+    ('sequential', '27_train_combined_reasoning_dqn.ipynb', 'ValueReasoningDqn'),
     ('autoregressive', '23_train_autoregressive_reasoning_dqn.ipynb', 'ReasoningDqn'),
 ])
 def test_offline_checkpoint_loads_and_evaluates_only_in_inference_notebook(tmp_path, monkeypatch, kind, filename, class_name):
@@ -40,7 +42,7 @@ def test_offline_checkpoint_loads_and_evaluates_only_in_inference_notebook(tmp_p
             exec(compile(code, filename, 'exec'), namespace)
             if index == 1:
                 namespace.update(PRETRAINED=str(source), load_stores_from_hub=lambda **_: recorded_stores(),
-                    SAMPLE_BUDGET=2, NUM_WORKERS=0, MAX_EPISODE_STEPS=2, NUM_CYCLES=0, MAX_REASONING_STEPS=2,
+                    SAMPLE_BUDGET=2, NUM_WORKERS=0, MAX_EPISODE_STEPS=2, NUM_CYCLES=0, MAX_REASONING_STEPS=4, MIN_REASONING_STEPS=3,
                     GENERATION_START_TOKEN='word2', MAX_NEW_TOKENS=64, MAX_ACTIVE_REQUESTS=2)
     assert len(uploads) == 1
     assert 'pytorch_model.bin' in uploads[0]['files']
@@ -69,13 +71,18 @@ def test_offline_checkpoint_loads_and_evaluates_only_in_inference_notebook(tmp_p
     for name, parameter in namespace['online'].named_parameters():
         torch.testing.assert_close(dict(policy.named_parameters())[name], parameter)
     _, spec, backend, settings = loaded
+    if kind == 'sequential':
+        assert settings['residual_connections'] is namespace['online'].reasoner.residual_connections
+        assert settings['adaptive_depth'] is namespace['online'].reasoner.adaptive_depth
+        assert settings['min_steps'] == namespace['online'].reasoner.min_steps
+        assert settings['objective'] == ('bellman' if settings['adaptive_depth'] else 'final')
     original_steps = namespace['train_transform'](recorded_stores(episodes=1)[0].to_dataset())
-    if kind == 'residual':
-        encoded = inference['encode_residual_observation'](observation=0, action=None, reward=0.,
+    if kind == 'sequential':
+        encoded = inference['encode_reasoning_observation'](observation=0, action=None, reward=0.,
             token_spec=spec, text_backend=backend, settings=settings)
         np.testing.assert_array_equal(encoded['token_ids'].cpu(), original_steps[0].token_ids)
-    names = (('residual_policy', 'residual_tokenizer', 'residual_backend', 'residual_settings')
-             if kind == 'residual' else ('autoregressive_policy', 'autoregressive_tokenizer', 'autoregressive_backend', 'autoregressive_settings'))
+    names = (('reasoning_policy', 'reasoning_tokenizer', 'reasoning_backend', 'reasoning_settings')
+             if kind == 'sequential' else ('autoregressive_policy', 'autoregressive_tokenizer', 'autoregressive_backend', 'autoregressive_settings'))
     inference.update(zip(names, loaded, strict=True))
     if kind == 'autoregressive':
         events = [inference['format_autoregressive_observation'](
@@ -89,7 +96,7 @@ def test_offline_checkpoint_loads_and_evaluates_only_in_inference_notebook(tmp_p
         lambda _module, args: readouts.append(int(args[0]['head_mask'].sum()))
     )
     try:
-        returns = inference[f'run_{kind}_eval'](num_episodes=1, seed=1000000)
+        returns = inference['run_reasoning_eval' if kind == 'sequential' else 'run_autoregressive_eval'](num_episodes=1, seed=1000000)
     finally:
         hook.remove()
     assert len(returns) == 1 and np.isfinite(returns).all()

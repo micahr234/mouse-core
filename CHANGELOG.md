@@ -11,6 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Require an explicit minimum reasoning depth in `SequentialReasoner` and
+  `value_reasoning_loss`. Value reasoning masks environment actions before the
+  minimum and think at the maximum in generation and Bellman targets. Save
+  the minimum in example checkpoints and restore it without fallback.
+
+- Make continuous paged KV generation mandatory in the FrozenLake examples;
+  remove their generation-backend option. Keep uncached generation only as a
+  generic library reference for tests. Group `GAMMA_THINK` with the other
+  objective discount factors in the value and combined reasoning examples.
+
 - Add `MouseOptimizer`: named groups explicitly contain online modules, learning
   rates, target modules and Polyak schedules. One selectable optimizer and its
   settings (including weight decay) apply globally. One step validates all groups, updates the
@@ -30,26 +40,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of complete samples independently of token length. Sample boundaries and
   eligibility remain caller-defined; epoch passes retain their final partial batch.
 
-- Initialize residual reasoning's learnable per-element input RMSNorm scale to
+- Initialize sequential reasoning's learnable per-element input RMSNorm scale to
   `0.02`, shared by generation and training forward calls.
 
 - Align all training examples with example 02's optimizer and target conventions.
-  Autoregressive and residual DQN now use MouseCore AdamW, separate embedding,
+  Autoregressive and sequential DQN now use MouseCore AdamW, separate embedding,
   backbone, and head learning rates, and component-specific Polyak rates, with
   an explicit rate for the extra generation head. Standardize loader controls,
   transform names, gradient clearing, work-count validation, and offline cleanup.
   Add CPU regression checks for independent target rates in every DQN example.
 
-- Residual generation now returns complete `ResidualBatch` token sequences for
-  ordinary online and target forward calls. Removed the public replay API;
-  post-stop training branches have isolated attention boundaries, and forward
-  rebuilds differentiable residual sums without generating or inserting tokens.
+- Sequential generation returns complete `ReasoningBatch` token sequences for
+  ordinary online and target forward calls. Only generated positions enter the
+  history, without post-stop branches. Forward reconstructs differentiable
+  residual sums or repeated-token representations without generating tokens.
 
-- Generate residual reasoning only with the online model. Replay its same latent
-  history through online and delayed transformers, using online stopping positions
-  for both value readouts before the DQN loss.
+- Generate sequential reasoning only with the online model. Replay that same
+  history through online and delayed transformers. Value reasoning backs up
+  environment transitions from the next observation's first reasoning state;
+  fixed-budget residual reasoning uses its final state.
 
-- Use the standard `DataLoader` in reasoning examples 23 and 25. Remove manual
+- Use the standard `DataLoader` in reasoning examples 23 and 25–27. Remove manual
   episode lists and batch packing; format sampled events through the tokenizer
   and let the loader supply objective mappings. Save and reload the same packing
   tokenizer for autoregressive evaluation in example 15.
@@ -66,26 +77,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   19 and 21–25, add the missing upload in 20, and load reasoning bundles from Hub
   repositories in example 15. Preserve tokenizers, action tables and inference settings.
 
-- Make reasoning examples 23 and 25 strictly offline: load recorded event stores,
+- Make reasoning examples 23 and 25–27 strictly offline: load recorded event stores,
   generate reasoning over sampled episodes, and train. Move their environment
   evaluation to standalone checkpoint-loading sections in example 15.
 
-- Add `Model.generate` as the common inference wrapper. Residual generation can
-  reuse caller-owned episode caches, retaining all reasoning states between actions
-  until episode reset. Training replays the same retained history, and the last
-  state supplies action values when generation reaches its hard cap.
+- Add `Model.generate` as the common inference wrapper. Sequential generation
+  can reuse caller-owned episode caches, retaining the generated reasoning
+  history between actions until episode reset. Training replays that same history.
+  Fixed-budget reasoning always executes the full budget; adaptive reasoning
+  chooses an environment action or `think` and masks `think` at the hard cap.
 
-- Share token and residual inference scheduling through `models.generate`, with
+- Share token and sequential inference scheduling through `models.generate`, with
   immediate admission into finished slots, stable request IDs, configurable
   concurrency and cache budgets, and cache cleanup on failure.
 
-- Add a residual-reasoning FrozenLake DQN example and `ResidualReasoner`:
-  detached state inputs, trainable context embeddings, differentiable residual accumulation, one packed
-  transformer training replay, and uncached/paged generation. A deterministic
-  stop head learns from task error plus a cost per extra update; generation stops
-  independently for each decision within a configurable cap. Token fields can
-  declare `autoregressive=True` to select the start embedding; preserve their
-  `autoregressive_mask` through streaming, batching, token caches and saved specs.
+- Add `SequentialReasoner` with explicit `residual_connections` and
+  `adaptive_depth`, and three separate FrozenLake DQN examples. Example 25 uses
+  residual accumulation, a fixed budget and `final_reasoning_loss` only on the
+  recorded environment action at the final state. Example 26 uses
+  `value_reasoning_loss` at every generated step and repeats the same initial
+  reasoning token at each position; transformer outputs are not fed back.
+  Example 27 combines value supervision with residual accumulation. Value
+  reasoning makes residual connections optional and uses one A+1 head whose
+  final action is `think`, with no separate stopping head. Think transitions use
+  a required `gamma_think` and cost per continuation; final-only supervision
+  subtracts the total cost `c * (K - 1)`. The first step is free and reported
+  environment rewards exclude internal costs. Residual feedback is detached
+  before trainable normalization; context embeddings and residual sums remain
+  differentiable. Both recurrences support one packed training replay and
+  uncached/paged generation. Token fields can declare `autoregressive=True` to
+  select the start embedding; preserve their `autoregressive_mask` through
+  streaming, batching, token caches and saved specs. Save explicit recurrence,
+  depth and objective settings and load all three variants in example 15.
 
 - Simplify batch names to `head_mask`, `sequence_ids`, and `step_ids`.
   Sequential objectives accept `sequence_ids=` and `step_ids=`; examples and

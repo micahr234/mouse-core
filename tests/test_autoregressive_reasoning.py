@@ -173,9 +173,8 @@ def test_reinforce_masks_nonparticipating_decisions_and_normalizes_weights():
     torch.testing.assert_close(log_probs.grad, torch.tensor([-1., 0.5, 0.]))
 
 
-@pytest.mark.parametrize("backend", ["uncached", "continuous"])
 @pytest.mark.flex_training
-def test_dqn_plus_reinforce_update_shared_backbone_head_and_delayed_target(backend):
+def test_dqn_plus_reinforce_update_shared_backbone_head_and_delayed_target():
     example = example_module()
     online = model()
     target = online.copy().eval()
@@ -188,7 +187,7 @@ def test_dqn_plus_reinforce_update_shared_backbone_head_and_delayed_target(backe
     example.run_train.__globals__.update(
         online=online, target=target, LR_EMBEDDING=1e-3, LR_BACKBONE=1e-3, LR_HEADS=1e-3,
         objective=objective, loader=loader, device=torch.get_default_device(),
-        GENERATION_BACKEND=backend, END_GENERATION_TOKEN_ID=0, MAX_NEW_TOKENS=64,
+        END_GENERATION_TOKEN_ID=0, MAX_NEW_TOKENS=64,
         MAX_ACTIVE_REQUESTS=2, REASONING_TEMPERATURE=0.8, REINFORCE_WEIGHT=1.,
         POLYAK_TAU_EMBEDDING=.1, POLYAK_TAU_BACKBONE=.2, POLYAK_TAU_VALUE=.3,
         POLYAK_TAU_REASONING_HEAD=.4, MAX_GRAD_NORM=1.)

@@ -9,9 +9,13 @@ from mouse_core.data import Datastore
 from tests._reasoning_replay_fixture import recorded_stores, reasoning_loader
 
 
-@pytest.fixture(params=['autoregressive', 'residual'])
+@pytest.fixture(params=['autoregressive', '25', '26', '27'])
 def example(request):
-    return importlib.import_module(f'tests.test_{request.param}_reasoning').example_module()
+    if request.param == 'autoregressive':
+        return importlib.import_module('tests.test_autoregressive_reasoning').example_module()
+    from tests.test_sequential_reasoning_examples import example_module
+    return example_module(request.param)
+
 
 
 def test_loader_skips_partial_prefixes_and_unfinished_tails(example):

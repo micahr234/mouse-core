@@ -105,7 +105,7 @@ settings such as betas, epsilon, and momentum cannot be overridden per group.
 Online and target modules are accepted only inside groups.
 
 Groups without a target omit both `target` and `polyak_tau`, as in supervised
-learning and GRPO. Extra components such as residual norms and stop heads each
+learning and GRPO. Extra components such as reasoning norms and vocabulary heads each
 have their own group. Trainability comes from the model's `requires_grad` flags;
 LoRA's frozen base stays frozen and its adapters remain trainable. Frozen source
 weights, shared tensors, and buffers are never interpolated. Independent target
@@ -260,94 +260,93 @@ save sections where applicable; environment evaluation lives in example 15.
 The [example layout guide](examples/README.md) defines the shared section order,
 tokenizer field formatting, and formatter commands.
 
-The [FrozenLake autoregressive reasoning notebook](examples/23_train_autoregressive_reasoning_dqn.ipynb) adds autoregressive vocabulary reasoning to the same Mouse model and uses negative DQN error as a REINFORCE reward. Both reasoning examples
-are offline: they load recorded event stores, sample episodes, generate fresh
-reasoning, and train. They never collect interactions or run evaluation. Set their
-`DATASET_ID` to an existing standalone 4x4 FrozenLake dataset and match its settings.
-Both use the standard `DataLoader`: a composed event-formatting and tokenizer
-transform supplies each complete episode, and the loader owns packing, sequence
-IDs, and prediction-to-step mappings. `run_train` consumes `loader.next_batch()`;
-`TOKEN_BUDGET` controls recorded context and the reasoner separately caps generation.
-[Example 15](examples/15_inference.ipynb) has separate checkpoint-loading and
-evaluation sections for ordinary DQN, autoregressive reasoning, and residual reasoning.
+The [FrozenLake autoregressive reasoning notebook](examples/23_train_autoregressive_reasoning_dqn.ipynb)
+uses vocabulary generation with a REINFORCE reward. Three separate sequential
+reasoning examples show the distinction between the recurrence and its loss:
 
-[Example 25](examples/25_train_residual_reasoning_dqn.ipynb) uses residual reasoning
-on the same fixed FrozenLake replay. A tokenizer field declares the starting token:
+| Example | Extra residual connection | Supervision | Stopping |
+| --- | --- | --- | --- |
+| [25 — Residual reasoning](examples/25_train_residual_reasoning_dqn.ipynb) | Yes | Final environment-action TD loss | Fixed budget |
+| [26 — Value reasoning](examples/26_train_value_reasoning_dqn.ipynb) | Optional; disabled in the example | Bellman loss at each reasoning state | Environment action or `think` |
+| [27 — Combined reasoning](examples/27_train_combined_reasoning_dqn.ipynb) | Enabled | Bellman loss at each reasoning state | Environment action or `think` |
+
+These notebooks load recorded standalone 4x4 FrozenLake episodes, generate fresh
+reasoning and train. They never collect interactions or run evaluation. Set
+`DATASET_ID` to an existing dataset and match its environment settings. The standard
+`DataLoader` owns complete-episode sampling, packing, sequence IDs and
+prediction-to-step mappings. [Example 15](examples/15_inference.ipynb) loads each
+checkpoint's explicit recurrence, depth and objective settings for evaluation.
+
+The tokenizer marks each requested decision with a single existing token:
 
 ```python
 {"type": "token", "provider": "environment", "input_field": "action_requested",
  "format": "\n", "head_output": True, "autoregressive": True}
 ```
 
-The format must encode to one token. `autoregressive_mask` preserves its location
-through streaming, packing and token caching; the tokenizer does not run the model.
-`ResidualReasoner` starts from that token's embedding and performs
-`z_next = z + transformer_update`, feeding `RMSNorm(z.detach())` at each successive
-causal position. The RMSNorm's learnable per-element scale starts at `0.02`.
-Existing backbone RoPE supplies positions; no explicit time
-embedding is added. A linear head projects the final residual to action values.
+`SequentialReasoner(hidden_dim=..., min_steps=..., max_steps=..., residual_connections=...,
+adaptive_depth=...)` separates the two mechanisms. With residual connections,
+`z_next = z + transformer_update`; each successive causal input is
+`RMSNorm(z.detach())`. The trainable RMSNorm scale starts at `0.02`. Without
+residual connections, every reasoning position receives the same initial token's
+normalized embedding. Its transformer output is the value representation; output
+states are never substituted for that repeated token. Causal attention and the
+backbone's ordinary internal residual connections remain in both variants.
 
-A separate stop head ends generation at its first nonnegative logit. `max_steps`
-is a per-action hard cap. When reached, the last state's action values are used
-even if the stop head has not fired. Training generates a hard-stopped episode
-trajectory, then evaluates candidate stopping points up to the cap against that
-same retained history. Candidates beyond the actual stop never become later
-context. `ResidualReasoner.generate` returns a `ResidualBatch` containing complete
-context/latent token sequences, update positions, and stopping/readout positions.
-Extra training continuations occupy independent causal rows. Both networks consume
-that same batch through ordinary `forward` calls; the delayed call has no gradients.
-Forward embeds context with each network's own weights, normalizes detached latent
-inputs, and reconstructs the residual sum from its own transformer outputs in one
-call. It does not generate, insert tokens, or choose new stopping positions.
-A differentiable first-stop distribution weights the DQN error at each possible stopping point,
-plus a configurable cost per extra update. One backward pass trains the stop head,
-residual updates, input norm, context and starting embeddings, and final projection. Only the residual-state
-feedback is detached before normalization. Cached inference uses the generated
-final state directly; chunks whose earlier context is in the cache cannot be used
-as standalone training batches.
-Uncached and paged cached generation support independent stopping lengths per
-decision; each finished request admits the next queued request. The example uploads the model, tokenizers and inference settings together to Hugging Face.
+With `adaptive_depth=True`, `generate` requires an A+1 `action_values(states)` head
+whose last action is `think`. Before `min_steps`, only think is available.
+After that, think continues and an environment action stops; think is masked at
+`max_steps`. The required minimum is between 1 and the maximum. Optional
+`select_actions(values, decision_indices, depths)` samples from the masked values.
+With `adaptive_depth=False`, generation always consumes the fixed budget and
+evaluates an A-action head only at its final depth. Fixed-budget residual reasoning
+has no learned stop head.
 
-`mouse_core.models.generate` is the shared inference scheduler used by both
-`AutoregressiveReasoner.generate` and `ResidualReasoner.generate`. It takes a
-backbone, a list of prompt embedding tensors, and an `advance(request_ids, hidden)`
-callback. The callback records generated outputs and returns the next embedding
-chunk for each active request, or `None` to stop it. Request IDs retain their
-original prompt order even when slots are reused. Token sampling, residual
-updates, stopping rules, and finite generation limits belong to the callback.
+The resulting `ReasoningBatch` contains only the generated history and records
+each decision's executed `lengths`. Both networks replay this same batch; the
+delayed network never generates a separate trajectory. `forward` reconstructs
+all generated value representations in one call. Residual feedback is detached
+before its trainable normalization; context embeddings and accumulated residual
+updates remain differentiable. Repeated-token reasoning trains its initial token
+embedding through each occurrence. Cached chunks cannot be used as standalone
+training batches.
 
-`backend="continuous"` prefills each prompt once and reuses its paged KV cache;
-`backend="uncached"` recomputes histories as a reference. `max_active_requests`
-limits concurrent requests, while `max_batch_tokens` and `cache_capacity_tokens`
-control decoder work and shared cache capacity. The scheduler resets finished
-cache rows before admitting replacements and closes the session on success or
-failure. Call it with dropout disabled and fixed weights; it runs without gradients.
+`value_reasoning_loss` supervises actual think choices and then the recorded
+environment action. Think's target is
+`-c + gamma_think * max Q_target(next reasoning state, available actions)`.
+The environment target is
+`reward + gamma * max Q_target(next observation's first reasoning state, available actions)`.
+Environment actions are unavailable before the minimum, and think is unavailable
+at the hard cap, in both policy and target calculations. The
+required `gamma_think` lies in [0, 1] and is explicitly 1.0 alongside the other
+objective discount factors in examples 26 and 27.
+The loss averages squared TD errors over weighted generated transitions, excluding
+padding and invalid decisions. No loss trains ungenerated depths.
 
-`model.generate(...)` is the common model inference wrapper: it selects evaluation
-mode and disables gradients, then runs the model's generation rules. Mouse-experiment
-uses this wrapper for online collection and evaluation, including GRPO, residual,
-and ordinary value policies. Policy sampling and exact behavior log probabilities
-remain with the collector; gradient-enabled training replay calls `forward`.
+`final_reasoning_loss` supervises only the recorded action at the final state. Its
+target is `reward - c * (K - 1) + gamma * max Q_target(next observation's final state)`.
+The residual sum propagates this final loss to every transformer update. The fixed
+budget is not a learned choice. In both objectives the first reasoning step is
+free, terminal discounts govern environment bootstrapping, and reported rewards
+exclude internal reasoning costs.
 
-Both GRPO and residual rollouts retain episode KV between actions. Residual
-generation keeps every normalized residual state, including the final stopping
-state, before the next environment event. Each new reasoning marker starts a new
-segment; its final state supplies the action values. Finished episodes release
-their cache rows immediately; inner repeats retain the outer episode's history.
-All cache sessions close before an optimizer update.
+`mouse_core.models.generate` is the shared inference scheduler used by
+`AutoregressiveReasoner.generate` and `SequentialReasoner.generate`. It takes a
+backbone, prompt embeddings and an `advance(request_ids, hidden)` callback, which
+returns the next embedding chunk or `None`. Original request IDs survive slot
+reuse. The FrozenLake examples always use continuous paged KV generation, with
+no backend option. The library's `backend="uncached"` remains available for independent
+reference tests. `max_active_requests`, `max_batch_tokens` and
+`cache_capacity_tokens` control concurrent work and cache capacity. Sessions reset
+finished rows and close on success or failure.
 
-The lower-level `generate` scheduler accepts a caller-owned `cache` and explicit
-`cache_rows`. It appends generated tokens and preserves them across calls; the
-caller resets rows only when their episodes end. Without a supplied cache, the
-scheduler owns a session for its requests and closes it on completion. The same
-residual implementation serves training histories, targets, and rollouts. Training
-explores additional candidate continuations for the stopping objective while
-preserving the hard-stopped history for subsequent decisions.
-
-This API is synchronous. Collection and optimizer updates still run in separate
-phases. Concurrent collection would need a separate inference model, explicit
-weight-version synchronization, and bounded experience queues. Training residual
-batches must still be generated with the learner's current weights before forward.
+`model.generate(...)` selects evaluation mode and disables gradients. Rollouts
+retain episode KV and generated reasoning history between environment actions;
+the collector owns action sampling and behavior log probabilities. Gradient-enabled
+training replay calls `forward`. The synchronous API separates collection and
+optimizer updates. Concurrent collection would need a separate inference model,
+explicit weight-version synchronization and bounded experience queues. Training
+reasoning batches must be generated with the learner's current weights.
 
 Mouse transformer backbones always use **FlexAttention**, with no kernel selection arguments, for packed training, rectangular forwards, and paged cached generation. Training requires CUDA; CPU supports inference under `torch.no_grad()`. The optional `kernels` extra can accelerate supported decoder modules when enabled with `backbone.enable_kernels()`; attention remains FlexAttention.
 
@@ -968,7 +967,8 @@ These are alternatives to the starting workflow, not a required sequence.
 | Policy optimization | [07 — PPO](examples/07_train_online_ppo.ipynb), [08 — GRPO](examples/08_train_online_grpo.ipynb) |
 | Supervised learning | [05 — Value labels](examples/05_train_offline_sv.ipynb), [09 — Action labels](examples/09_train_offline_sp.ipynb) |
 | Latent reasoning | [10 — Reasoning DQN](examples/10_train_offline_reasoning_dqn.ipynb) |
-| Autoregressive reasoning | [23 — Vocabulary reasoning](examples/23_train_autoregressive_reasoning_dqn.ipynb), [25 — Residual reasoning](examples/25_train_residual_reasoning_dqn.ipynb) |
+| Autoregressive reasoning | [23 — Vocabulary reasoning](examples/23_train_autoregressive_reasoning_dqn.ipynb) |
+| Sequential reasoning | [25 — Residual](examples/25_train_residual_reasoning_dqn.ipynb), [26 — Value](examples/26_train_value_reasoning_dqn.ipynb), [27 — Combined](examples/27_train_combined_reasoning_dqn.ipynb) |
 | Return horizons | [13 — N-step DQN](examples/13_train_offline_n_step_dqn.ipynb), [14 — Value-gap traces](examples/14_train_offline_value_gap_dqn.ipynb) |
 | Numeric observations | [17 — Collect CartPole](examples/17_collect_cartpole.ipynb), [18 — Train CartPole DQN](examples/18_train_offline_cartpole_dqn.ipynb) |
 | Continuous actions | [19 — Pendulum action tables](examples/19_train_online_pendulum_dqn.ipynb), [20 — Sequential Reacher actions](examples/20_train_sequential_actions_dqn.ipynb) |
