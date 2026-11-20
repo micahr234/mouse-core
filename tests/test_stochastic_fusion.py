@@ -6,7 +6,7 @@ from typing import Any
 import pytest
 import torch
 
-from mouse_core.stochastic_optim import StochasticOptimizer, _rmsprop_update_
+from mouse_core.precision_optim import PrecisionOptimizer, _rmsprop_update_
 from mouse_core.rounding import _polyak_bfloat16_, stochastic_round_bfloat16, scalar_tensor
 
 
@@ -17,7 +17,7 @@ def test_rmsprop_fast_path_matches_native_with_schedules_and_strides(centered, m
     p = torch.nn.Parameter(torch.linspace(-1, 1, 24).reshape(4, 6).t().to(dtype))
     q = torch.nn.Parameter(p.float().clone())
     options: dict[str, Any] = dict(alpha=.93, eps=.003, weight_decay=.12, momentum=momentum, centered=centered)
-    opt = StochasticOptimizer([p], name='rmsprop', options=options)
+    opt = PrecisionOptimizer([p], name='rmsprop', options=options)
     ref = torch.optim.RMSprop([q], **options, foreach=False)
     for step, rate in enumerate((.01, 0., .0001)):
         opt.param_groups[0]['lr'] = ref.param_groups[0]['lr'] = rate
@@ -38,7 +38,7 @@ def test_rmsprop_fast_path_matches_native_with_schedules_and_strides(centered, m
 def test_rmsprop_fast_path_skips_native_optimizer_and_missing_gradients(monkeypatch):
     p = torch.nn.Parameter(torch.ones(10, dtype=torch.bfloat16))
     unused = torch.nn.Parameter(torch.ones(10, dtype=torch.bfloat16))
-    opt = StochasticOptimizer([p, unused], name='rmsprop', options={})
+    opt = PrecisionOptimizer([p, unused], name='rmsprop', options={})
     p.grad = -torch.ones_like(p)
     def unexpected():
         pytest.fail('ordinary RMSprop should not construct temporary parameters or call the native optimizer')
@@ -50,7 +50,7 @@ def test_rmsprop_fast_path_skips_native_optimizer_and_missing_gradients(monkeypa
 
 def test_switching_transform_preserves_moments_and_resume():
     p = torch.nn.Parameter(torch.ones(100, dtype=torch.bfloat16))
-    opt = StochasticOptimizer([p], name='rmsprop', options=dict(momentum=.8, centered=True))
+    opt = PrecisionOptimizer([p], name='rmsprop', options=dict(momentum=.8, centered=True))
     p.grad = -torch.ones_like(p)
     opt.step()
     def transform(parameter, update):
@@ -58,7 +58,7 @@ def test_switching_transform_preserves_moments_and_resume():
     opt.update_transform = transform
     opt.step()
     q = torch.nn.Parameter(p.detach().clone())
-    restored = StochasticOptimizer([q], name='rmsprop', options=dict(momentum=.8, centered=True))
+    restored = PrecisionOptimizer([q], name='rmsprop', options=dict(momentum=.8, centered=True))
     restored.load_state_dict(copy.deepcopy(opt.state_dict()))
     opt.update_transform = None
     q.grad = p.grad.clone()

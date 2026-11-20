@@ -12,7 +12,7 @@ from torch import nn
 
 from mouse_core.optim import AdamW
 from mouse_core.rounding import polyak_parameter_
-from mouse_core.stochastic_optim import StochasticOptimizer
+from mouse_core.precision_optim import PrecisionOptimizer
 
 
 def _rate(value: Any, *, name: str, maximum: float = float("inf")) -> float:
@@ -21,7 +21,7 @@ def _rate(value: Any, *, name: str, maximum: float = float("inf")) -> float:
     return float(value)
 
 
-def _make_optimizer(params: list[dict[str, Any]], specification: Any, *, stochastic_rounding=False):
+def _make_optimizer(params: list[dict[str, Any]], specification: Any, *, dtype=torch.float32, stochastic_rounding=False):
     if not isinstance(specification, (str, Mapping)):
         raise TypeError("optimizer must be a name or an options dictionary.")
     options: dict[str, Any] = {"name": specification} if isinstance(specification, str) else dict(specification)
@@ -62,8 +62,9 @@ def _make_optimizer(params: list[dict[str, Any]], specification: Any, *, stochas
     if name in ("adam", "adamw"):
         options.setdefault("betas", (0.9, 0.95))
         options.setdefault("eps", 1e-8)
-    if stochastic_rounding:
-        return StochasticOptimizer(params, name=name, options=options)
+    if stochastic_rounding or dtype != torch.float32:
+        return PrecisionOptimizer(params, name=name, options=options, dtype=dtype,
+                                  stochastic_rounding=stochastic_rounding)
     if name == "adamw":
         return AdamW(params=params, **options)
     if name == "adam":
@@ -78,9 +79,9 @@ class MouseOptimizer:
 
     ``groups`` maps labels to settings: required ``online`` module and ``lr``,
     plus optional ``target`` module and ``polyak_tau`` (provided together).
-    ``stochastic_rounding`` enables BF16 online weights with FP32 update math
-    and moments, without master weights. ``polyak_stochastic_rounding`` enables
-    BF16 delayed targets; their source weights also need stochastic updates.
+    ``dtype`` selects both optimizer arithmetic and moment storage precision.
+    ``stochastic_rounding`` controls rounding when writing online weights and
+    delayed Polyak targets, without master weights.
     Online and target modules live in the groups; labels are not module paths.
     Online groups must be disjoint. Trainability follows ``requires_grad``.
 
@@ -97,12 +98,14 @@ class MouseOptimizer:
 
     def __init__(
         self, *, groups: Mapping[str, Mapping[str, Any]], optimizer: Any = "adamw",
-        stochastic_rounding: bool = False, polyak_stochastic_rounding: bool = False,
+        dtype: torch.dtype = torch.float32, stochastic_rounding: bool = False,
     ) -> None:
-        if type(stochastic_rounding) is not bool or type(polyak_stochastic_rounding) is not bool:
+        if type(stochastic_rounding) is not bool:
             raise TypeError("Stochastic rounding options must be booleans")
+        if dtype not in (torch.float64, torch.float32, torch.bfloat16):
+            raise ValueError("Optimizer dtype must be float64, float32 or bfloat16")
+        self.dtype = dtype
         self.stochastic_rounding = stochastic_rounding
-        self.polyak_stochastic_rounding = polyak_stochastic_rounding
         if not groups:
             raise ValueError("MouseOptimizer requires at least one named group.")
         self.groups: dict[str, dict[str, Any]] = {}
@@ -176,7 +179,7 @@ class MouseOptimizer:
 
     def _build_optimizer(self, params, optimizer):
         """Construct the single optimizer; subclasses may split packed readouts."""
-        return _make_optimizer(params, optimizer, stochastic_rounding=self.stochastic_rounding)
+        return _make_optimizer(params, optimizer, dtype=self.dtype, stochastic_rounding=self.stochastic_rounding)
 
     @property
     def param_groups(self) -> list[dict[str, Any]]:
@@ -215,12 +218,12 @@ class MouseOptimizer:
                         raise ValueError("Polyak rate tensor must be finite and in [0, 1], without gradients.")
                     if torch.broadcast_shapes(p.shape, value.shape) != p.shape:
                         raise ValueError("Polyak rate tensor must broadcast to its parameter shape.")
-                    value = value.to(device=p.device, dtype=torch.float32 if self.polyak_stochastic_rounding else p.dtype)
+                    value = value.to(device=p.device, dtype=self.dtype)
                 else:
                     value = _rate(value, name="Polyak rate", maximum=1.0)
                 if p.requires_grad and delayed is not p:
-                    if p.dtype == torch.bfloat16 and not self.polyak_stochastic_rounding:
-                        raise ValueError("BF16 delayed parameters require polyak_stochastic_rounding")
+                    if p.dtype == torch.bfloat16 and not self.stochastic_rounding:
+                        raise ValueError("BF16 delayed parameters require stochastic_rounding")
                     if delayed.requires_grad:
                         raise ValueError("Independent target parameters must be frozen.")
                     pairs.append((p, delayed, value))
@@ -257,14 +260,15 @@ class MouseOptimizer:
 
     def _step_targets(self, pairs) -> None:
         for source, target, tau in pairs:
-            polyak_parameter_(target, source, tau, stochastic_rounding=self.polyak_stochastic_rounding)
+            polyak_parameter_(target, source, tau, stochastic_rounding=self.stochastic_rounding,
+                              arithmetic_dtype=self.dtype)
 
     def state_dict(self) -> dict[str, Any]:
         native = isinstance(self.inner, torch.optim.Optimizer)
         state = ({"algorithm": type(self.inner).__name__.lower(), "inner": self.inner.state_dict()}
                  if native else self.inner.state_dict())
         return {**state, "groups": self._group_signature(),
-                "rounding": (self.stochastic_rounding, self.polyak_stochastic_rounding)}
+                "precision": (str(self.dtype), self.stochastic_rounding)}
 
     def _group_signature(self):
         return [(name, list(parameters), self.groups[name].get("target") is not None)
@@ -275,9 +279,9 @@ class MouseOptimizer:
         algorithm = type(self.inner).__name__.lower() if native else None
         if state.get("algorithm") != algorithm:
             raise ValueError("Different optimizer states are not interchangeable")
-        if state.get("rounding") != (self.stochastic_rounding, self.polyak_stochastic_rounding):
-            raise ValueError("Optimizer checkpoint rounding settings do not match")
-        expected = {"groups", "inner", "algorithm", "rounding"} if native else {"groups", "inner", "rounding"}
+        if state.get("precision") != (str(self.dtype), self.stochastic_rounding):
+            raise ValueError("Optimizer checkpoint precision settings do not match")
+        expected = {"groups", "inner", "algorithm", "precision"} if native else {"groups", "inner", "precision"}
         if state.keys() != expected:
             raise ValueError("Optimizer checkpoint fields do not match the current format.")
         if state["groups"] != self._group_signature():
@@ -290,4 +294,5 @@ class MouseOptimizer:
         for state in optimizer.state.values():
             for key, value in state.items():
                 if torch.is_tensor(value):
-                    state[key] = value.to(device)
+                    destination = "cpu" if isinstance(optimizer, PrecisionOptimizer) and key == "step" else device
+                    state[key] = value.to(destination)

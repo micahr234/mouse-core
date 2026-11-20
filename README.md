@@ -104,29 +104,40 @@ by name or supply a dictionary of global options. Weight decay and algorithm
 settings such as betas, epsilon, and momentum cannot be overridden per group.
 Online and target modules are accepted only inside groups.
 
-`MouseOptimizer(..., stochastic_rounding=True, polyak_stochastic_rounding=True)`
-allows BF16 trainable weights and BF16 delayed targets. `LoRAConfig(dtype="bfloat16")`
-selects BF16 adapter storage. The two rounding switches are independent; a BF16
-online/target pair requires both. Supported optimizers are Adam, AdamW, SGD and
-RMSprop, excluding fused variants. Ordinary FP32 parameters remain supported.
-Updates use FP32 arithmetic and moments with a single stochastic BF16 writeback.
-RMSprop without an update transform compiles the pointwise moment update, weight
-update, and rounding together on CUDA. BF16 Polyak interpolation and rounding
-are also compiled together. CUDA graphs are disabled; only compiled code and
-scalar rate metadata are cached, never weights or FP32 master parameters.
-CPU uses the same RMSprop expressions eagerly. Other optimizers and updates
-with custom transforms retain native PyTorch arithmetic. Initial CUDA calls
-compile; scheduled scalar rates do not specialize the graph on their values.
-Optimizer state loading preserves FP32 moments and rejects different algorithms
-or rounding modes. Compiled and eager RNG streams need not be bit-identical.
-Run `python bench/bench_stochastic_optimizer.py --device cuda` on an idle GPU to
-compare warmed optimizer-plus-target latency against the native reference.
+`MouseOptimizer(..., dtype=torch.float64, stochastic_rounding=True)` selects
+both optimizer arithmetic and state storage precision. Supported dtypes are
+`torch.float64`, `torch.float32` and `torch.bfloat16`. This does not change model parameter storage;
+for example, `LoRAConfig(dtype="bfloat16")` still selects adapter weight storage.
+Step counters retain FP32 precision regardless of optimizer dtype.
 
-`polyak_update(..., stochastic_rounding=True)` exposes the same rounding for
-standalone target updates. Interpolation happens in FP32; zero/unit rates are
-exact, and frozen sources/shared parameters/buffers are skipped. Finite values
-outside BF16 range saturate; NaNs/infinities are preserved. Stochastic rounding
-uses PyTorch's device RNG; restoring exact runs also requires restoring RNG state.
+One `stochastic_rounding` flag controls narrowing writes into online and target
+model weights. Optimizer arithmetic, moments, and update transforms use the selected
+dtype with native PyTorch rounding. Polyak arithmetic also uses that dtype.
+Stochastic rounding applies only when narrowing into model storage: FP64 to
+FP32 or BF16, and FP32 to BF16. FP64 results are rounded directly without an
+intermediate FP32 cast. BF16 arithmetic followed by a BF16 write has no
+additional rounding. Writes to the same or a wider dtype are exact. No intermediate
+arithmetic or moment update uses stochastic rounding. BF16 trainable model
+weights require the flag to be enabled.
+Supported algorithms are Adam, AdamW, SGD and RMSprop. Explicit `_fused` variants
+are unavailable with stochastic rounding or a non-FP32 optimizer dtype.
+
+RMSprop with FP32 or FP64 arithmetic and no custom update transform uses compiled CUDA
+pointwise operations. FP32 Polyak interpolation with BF16 target writeback is
+also compiled together with rounding. CUDA graphs
+are disabled; only compiled code and scalar metadata are cached. No master
+weights or converted-weight caches are retained. Initial CUDA calls compile;
+scheduled scalar rates do not specialize graphs on their values. Checkpoints
+record dtype and rounding mode and reject mismatches. Compiled and eager RNG
+streams need not be bit-identical. Run
+`python bench/bench_stochastic_optimizer.py --device cuda` on an idle GPU to
+compare warmed FP32-arithmetic RMSprop-plus-target latency with the reference.
+
+`polyak_update(..., stochastic_rounding=True)` exposes the same target rounding
+independently. This standalone helper uses FP32 arithmetic for stochastic target writeback;
+zero/unit rates are exact, and frozen/shared parameters and buffers are skipped.
+Finite values outside BF16 range saturate; NaNs/infinities are preserved.
+Restoring an exact stochastic run also requires restoring RNG state.
 
 Groups without a target omit both `target` and `polyak_tau`, as in supervised
 learning and GRPO. Extra components such as reasoning norms and vocabulary heads each

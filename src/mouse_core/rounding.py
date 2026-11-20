@@ -1,4 +1,4 @@
-"""Unbiased BF16 writeback from FP32 update arithmetic."""
+"""Stochastic model writeback from the selected update arithmetic precision."""
 
 from functools import lru_cache
 
@@ -27,13 +27,64 @@ def stochastic_round_bfloat16(value: torch.Tensor, *, generator=None) -> torch.T
 
 
 @torch.no_grad()
-def copy_update_(parameter: torch.Tensor, value: torch.Tensor) -> None:
-    """Write an update once, stochastically for BF16 and exactly for FP32."""
-    parameter.copy_(stochastic_round_bfloat16(value) if parameter.dtype == torch.bfloat16 else value)
+def stochastic_round_to(value: torch.Tensor, dtype: torch.dtype, *, generator=None) -> torch.Tensor:
+    """Round directly to model precision without an intermediate narrowing cast.
+
+    FP64 probabilities and adjacent target values are evaluated in FP64.
+    Finite overflow saturates; exact values and NaNs/infinities are preserved.
+    """
+    supported = (torch.bfloat16, torch.float32, torch.float64)
+    if value.dtype not in supported or dtype not in supported:
+        raise TypeError("Stochastic rounding supports float64, float32 and bfloat16")
+    if torch.finfo(value.dtype).bits <= torch.finfo(dtype).bits:
+        return value.to(dtype)
+    if value.dtype == torch.float32:
+        return stochastic_round_bfloat16(value, generator=generator)
+    limit = torch.finfo(dtype).max
+    finite = value.clamp(-limit, limit)
+    nearest = finite.to(dtype)
+    nearest_wide = nearest.to(torch.float64)
+    lower = torch.where(nearest_wide > finite,
+                        torch.nextafter(nearest, torch.full_like(nearest, -float('inf'))), nearest)
+    upper = torch.where(nearest_wide < finite,
+                        torch.nextafter(nearest, torch.full_like(nearest, float('inf'))), nearest)
+    lower_wide, upper_wide = lower.double(), upper.double()
+    span = upper_wide - lower_wide
+    probability = (finite - lower_wide) / torch.where(span == 0, torch.ones_like(span), span)
+    random = (torch.rand_like(value) if generator is None else
+              torch.rand(value.shape, dtype=value.dtype, device=value.device, generator=generator))
+    rounded = torch.where(random < probability, upper, lower)
+    return torch.where(torch.isfinite(value), rounded, value.to(dtype))
 
 
 @torch.no_grad()
-def polyak_parameter_(target, source, tau, *, stochastic_rounding=False):
+def copy_update_(parameter: torch.Tensor, value: torch.Tensor, *, stochastic_rounding=True) -> None:
+    """Round only narrowing model writes; otherwise copy exactly."""
+    parameter.copy_(stochastic_round_to(value, parameter.dtype) if stochastic_rounding else value)
+
+
+@torch.no_grad()
+def polyak_parameter_(target, source, tau, *, stochastic_rounding=False, arithmetic_dtype=None):
+    if arithmetic_dtype is not None:
+        if not isinstance(tau, torch.Tensor):
+            if tau == 0:
+                return
+            if tau == 1:
+                target.copy_(source)
+                return
+        if arithmetic_dtype == torch.float32 and stochastic_rounding and target.dtype == torch.bfloat16:
+            rate = tau.float() if isinstance(tau, torch.Tensor) else tau
+            if target.is_cuda and not isinstance(rate, torch.Tensor):
+                rate = scalar_tensor(rate)
+            _polyak_kernel(target.device)(target, source, rate)
+        else:
+            rate = tau.to(arithmetic_dtype) if isinstance(tau, torch.Tensor) else tau
+            if target.dtype == source.dtype == arithmetic_dtype:
+                target.lerp_(source, rate)
+            else:
+                value = target.to(arithmetic_dtype).lerp(source.to(arithmetic_dtype), rate)
+                copy_update_(target, value, stochastic_rounding=stochastic_rounding)
+        return
     if not stochastic_rounding:
         target.lerp_(source, tau)
         return
@@ -53,9 +104,9 @@ def polyak_parameter_(target, source, tau, *, stochastic_rounding=False):
 
 
 @lru_cache(maxsize=128)
-def scalar_tensor(value):
+def scalar_tensor(value, dtype=torch.float32):
     """Read-only CPU scalar metadata; values can change without recompiling CUDA."""
-    return torch.tensor(value, dtype=torch.float32, device="cpu")
+    return torch.tensor(value, dtype=dtype, device="cpu")
 
 
 def _polyak_bfloat16_(target, source, tau):

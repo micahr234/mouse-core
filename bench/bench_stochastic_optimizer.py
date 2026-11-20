@@ -10,7 +10,7 @@ import time
 import torch
 
 from mouse_core.rounding import copy_update_, polyak_parameter_
-from mouse_core.stochastic_optim import StochasticOptimizer
+from mouse_core.precision_optim import PrecisionOptimizer
 
 
 def main():
@@ -33,7 +33,7 @@ def main():
         parameters = [torch.nn.Parameter(torch.randn(64, 1024, device=device, dtype=torch.bfloat16))
                       for _ in range(args.tensors)]
         targets = [p.detach().clone() for p in parameters]
-        optimizer = StochasticOptimizer(parameters, name='rmsprop', options=dict(alpha=.95, eps=1e-8))
+        optimizer = PrecisionOptimizer(parameters, name='rmsprop', options=dict(alpha=.95, eps=1e-8))
         optimizer.param_groups[0]['lr'] = .0001
         if legacy:
             optimizer.update_transform = lambda parameter, update: None

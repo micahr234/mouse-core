@@ -7,7 +7,7 @@ from torch import nn
 
 from mouse_core import MouseOptimizer
 from mouse_core.polyak import polyak_update
-from mouse_core.rounding import stochastic_round_bfloat16
+from mouse_core.rounding import stochastic_round_bfloat16, stochastic_round_to
 
 
 @pytest.mark.parametrize('value', [1.001, -1.001, .02001, -.02001, 1e-40, -1e-40])
@@ -102,7 +102,7 @@ def test_tiny_optimizer_and_polyak_updates_survive():
     target.weight.data.fill_(1)
     opt = MouseOptimizer(groups={'m': {'online': model, 'lr': .001,
         'target': target, 'polyak_tau': .1}}, optimizer='sgd',
-        stochastic_rounding=True, polyak_stochastic_rounding=True)
+        stochastic_rounding=True)
     torch.manual_seed(15)
     model.weight.grad = -torch.ones_like(model.weight)
     opt.step(0)
@@ -129,7 +129,7 @@ def test_polyak_fp32_arithmetic_exact_endpoints_and_frozen_sharing(standalone):
             polyak_update(source=source, target=target, tau=tau, stochastic_rounding=True)
         else:
             opt = MouseOptimizer(groups={'m': {'online': source, 'lr': 0., 'target': target, 'polyak_tau': tau}},
-                                 optimizer='sgd', stochastic_rounding=True, polyak_stochastic_rounding=True)
+                                 optimizer='sgd', stochastic_rounding=True)
             opt.step(0)
         torch.testing.assert_close(target.weight, expected, rtol=0, atol=0)
         if tau in (0., 1.):
@@ -149,7 +149,7 @@ def test_tensor_polyak_rates_keep_fp32_precision():
     torch.random.set_rng_state(rng)
     opt = MouseOptimizer(groups={'m': {'online': source, 'lr': 0., 'target': target,
         'polyak_tau': {'weight': rate}}}, optimizer='sgd',
-        stochastic_rounding=True, polyak_stochastic_rounding=True)
+        stochastic_rounding=True)
     opt.step(0)
     torch.testing.assert_close(target.weight, expected, rtol=0, atol=0)
 
@@ -158,12 +158,40 @@ def test_invalid_options_fail_before_updates():
     model = nn.Linear(2, 1, dtype=torch.bfloat16)
     target = copy.deepcopy(model).requires_grad_(False)
     groups = {'m': {'online': model, 'lr': .1, 'target': target, 'polyak_tau': .1}}
-    with pytest.raises(ValueError, match='polyak_stochastic_rounding'):
-        MouseOptimizer(groups=groups, stochastic_rounding=True)
-    with pytest.raises(TypeError, match='fp32'):
+    with pytest.raises(ValueError, match='stochastic_rounding'):
+        MouseOptimizer(groups=groups)
+    with pytest.raises(TypeError, match='polyak_stochastic_rounding'):
         MouseOptimizer(groups=groups, polyak_stochastic_rounding=True)
     with pytest.raises(ValueError, match='fused'):
-        MouseOptimizer(groups=groups, optimizer='adamw_fused', stochastic_rounding=True,
-                       polyak_stochastic_rounding=True)
+        MouseOptimizer(groups=groups, optimizer='adamw_fused', stochastic_rounding=True)
     with pytest.raises(TypeError, match='booleans'):
         MouseOptimizer(groups=groups, stochastic_rounding=1)
+
+
+@pytest.mark.parametrize('dtype', [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize('sign', [-1., 1.])
+def test_fp64_rounding_statistics_and_special_values(dtype, sign):
+    torch.manual_seed(333)
+    quantum = torch.finfo(dtype).eps
+    x = torch.full((100_000,), sign * (1 + quantum * .125), dtype=torch.float64)
+    rounded = stochastic_round_to(x, dtype).double()
+    a, b = rounded.unique().sort().values.tolist()
+    probability = (x[0].item() - a) / (b - a)
+    observed = (rounded == b).double().mean().item()
+    assert abs(observed - probability) < 6 * (probability * (1-probability) / x.numel()) ** .5
+    special = torch.tensor([[0., -0., 1., float('inf')],
+                            [-float('inf'), float('nan'), 1e300, -1e300]], dtype=torch.float64).t()
+    expected = special.clamp(-torch.finfo(dtype).max, torch.finfo(dtype).max)
+    expected = torch.where(torch.isfinite(special), expected, special).to(dtype)
+    result = stochastic_round_to(special, dtype)
+    torch.testing.assert_close(result, expected, rtol=0, atol=0, equal_nan=True)
+    assert torch.signbit(result[1, 0])
+
+
+@pytest.mark.parametrize('dtype', [torch.float32, torch.bfloat16])
+def test_fp64_rounding_has_no_intermediate_fp32_cast(dtype, monkeypatch):
+    midpoint = 1. + torch.finfo(dtype).eps / 2
+    x = torch.tensor([midpoint + 2**-45], dtype=torch.float64)
+    monkeypatch.setattr(torch, 'rand_like', lambda value: torch.full_like(value, .5))
+    result = stochastic_round_to(x, dtype)
+    assert result.item() == 1. + torch.finfo(dtype).eps
