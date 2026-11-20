@@ -1,5 +1,7 @@
 """Unbiased BF16 writeback from FP32 update arithmetic."""
 
+from functools import lru_cache
+
 import torch
 
 
@@ -17,8 +19,9 @@ def stochastic_round_bfloat16(value: torch.Tensor, *, generator=None) -> torch.T
     limit = torch.finfo(torch.bfloat16).max
     finite = value.clamp(-limit, limit).contiguous()
     bits = finite.view(torch.int32)
-    random = torch.randint(0, 65536, bits.shape, dtype=torch.int32,
-                           device=bits.device, generator=generator)
+    random = (torch.randint_like(bits, 0, 65536) if generator is None else
+              torch.randint(0, 65536, bits.shape, dtype=torch.int32,
+                            device=bits.device, generator=generator))
     rounded = ((bits + random) & -65536).view(torch.float32).to(torch.bfloat16)
     return torch.where(torch.isfinite(value), rounded, value.to(torch.bfloat16))
 
@@ -42,6 +45,33 @@ def polyak_parameter_(target, source, tau, *, stochastic_rounding=False):
             return
     if stochastic_rounding and target.dtype == torch.bfloat16:
         rate = tau.float() if isinstance(tau, torch.Tensor) else tau
-        copy_update_(target, target.float().lerp(source.float(), rate))
+        if target.is_cuda and not isinstance(rate, torch.Tensor):
+            rate = scalar_tensor(rate)
+        _polyak_kernel(target.device)(target, source, rate)
     else:
         target.lerp_(source, tau)
+
+
+@lru_cache(maxsize=128)
+def scalar_tensor(value):
+    """Read-only CPU scalar metadata; values can change without recompiling CUDA."""
+    return torch.tensor(value, dtype=torch.float32, device="cpu")
+
+
+def _polyak_bfloat16_(target, source, tau):
+    copy_update_(target, target.float().lerp(source.float(), tau))
+
+
+_compiled_polyak_bfloat16 = None
+
+
+def _polyak_kernel(device):
+    global _compiled_polyak_bfloat16
+    if device.type != "cuda":
+        return _polyak_bfloat16_
+    if _compiled_polyak_bfloat16 is None:
+        _compiled_polyak_bfloat16 = torch.compile(
+            _polyak_bfloat16_, fullgraph=True, dynamic=True,
+            options={"triton.cudagraphs": False},
+        )
+    return _compiled_polyak_bfloat16

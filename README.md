@@ -109,11 +109,18 @@ allows BF16 trainable weights and BF16 delayed targets. `LoRAConfig(dtype="bfloa
 selects BF16 adapter storage. The two rounding switches are independent; a BF16
 online/target pair requires both. Supported optimizers are Adam, AdamW, SGD and
 RMSprop, excluding fused variants. Ordinary FP32 parameters remain supported.
-Updates use native PyTorch FP32 optimizer arithmetic one parameter tensor at a
-time, with FP32 moments and a single stochastic BF16 writeback. There are no
-persistent FP32 master weights or converted-weight caches. This implementation
-is not a fused optimizer kernel; speedups require measurement. Optimizer state
-loading preserves FP32 moments and rejects different algorithms/rounding modes.
+Updates use FP32 arithmetic and moments with a single stochastic BF16 writeback.
+RMSprop without an update transform compiles the pointwise moment update, weight
+update, and rounding together on CUDA. BF16 Polyak interpolation and rounding
+are also compiled together. CUDA graphs are disabled; only compiled code and
+scalar rate metadata are cached, never weights or FP32 master parameters.
+CPU uses the same RMSprop expressions eagerly. Other optimizers and updates
+with custom transforms retain native PyTorch arithmetic. Initial CUDA calls
+compile; scheduled scalar rates do not specialize the graph on their values.
+Optimizer state loading preserves FP32 moments and rejects different algorithms
+or rounding modes. Compiled and eager RNG streams need not be bit-identical.
+Run `python bench/bench_stochastic_optimizer.py --device cuda` on an idle GPU to
+compare warmed optimizer-plus-target latency against the native reference.
 
 `polyak_update(..., stochastic_rounding=True)` exposes the same rounding for
 standalone target updates. Interpolation happens in FP32; zero/unit rates are
