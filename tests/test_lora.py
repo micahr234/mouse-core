@@ -413,7 +413,7 @@ def test_delayed_backbone_shares_frozen_base_and_copies_adapters() -> None:
     assert all((p.requires_grad for n, p in online.items() if '.lora_' in n))
 
 
-@pytest.mark.parametrize("dtype", ["bfloat16", "float16", None, torch.float32])
+@pytest.mark.parametrize("dtype", ["float16", None, torch.float32])
 def test_lora_rejects_unsupported_stored_dtype(dtype):
     with pytest.raises(ValueError, match="dtype must be float32"):
         LoRAConfig(dtype=dtype)
@@ -425,3 +425,13 @@ def test_explicit_lora_dtype_constructs_fp32_adapters():
     assert config.dtype == "float32"
     assert layer.base.weight.dtype == torch.bfloat16
     assert layer.lora_A.weight.dtype == layer.lora_B.weight.dtype == torch.float32
+
+
+def test_bfloat16_lora_runs_without_autocast_and_preserves_input_gradients():
+    layer = LoRALinear(torch.nn.Linear(4, 3, dtype=torch.bfloat16), LoRAConfig(rank=2, dtype="bfloat16"))
+    assert layer.lora_A.weight.dtype == layer.lora_B.weight.dtype == torch.bfloat16
+    x = torch.randn(2, 4, dtype=torch.bfloat16, requires_grad=True)
+    layer(x).float().square().sum().backward()
+    assert x.grad is not None and x.grad.abs().sum() > 0
+    assert layer.base.weight.grad is None
+    assert layer.lora_B.weight.grad is not None and layer.lora_B.weight.grad.abs().sum() > 0

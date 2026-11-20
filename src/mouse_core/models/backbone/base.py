@@ -6,7 +6,8 @@ hidden states of the same shape. Pass flat ``[L, D]`` embeddings with explicit
 an attention mask. Incremental decoding passes a session created by
 ``decode_session`` as ``cache=`` together with per-row ``lengths``.
 
-Two ways to train a backbone, both with every trainable parameter in fp32:
+Trainable parameters normally use FP32. BF16 training requires stochastic
+optimizer updates (and stochastic updates for delayed targets). Common setups:
 
 - full fine-tuning — no ``lora``; build it with ``dtype=torch.float32`` and
   the base weights train directly;
@@ -119,7 +120,7 @@ class BaseBackbone(nn.Module, ABC):
         raise TypeError(f"{type(self).__name__}.float() is not supported; pass dtype= when building it.")
 
     def _attach_lora(self, model: nn.Module, lora: LoRAConfig | None) -> None:
-        """Freeze ``model`` and attach fp32 LoRA adapters when ``lora`` is set.
+        """Freeze ``model`` and attach LoRA adapters in their configured dtype.
 
         Without ``lora`` the backbone is left fully trainable. Call once the
         pretrained weights are loaded: wrapping renames every

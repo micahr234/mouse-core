@@ -1,11 +1,11 @@
-"""fp32 LoRA adapters on a frozen backbone.
+"""LoRA adapters with explicit storage precision on a frozen backbone.
 
 The alternative to fine-tuning the whole backbone in fp32: the base weights
 are frozen and, on CUDA, bf16, and the only trainable backbone parameters
-are the LoRA factors, which are always fp32. Their rank-``r`` matmuls use
+are the LoRA factors, stored in FP32 or BF16. Their rank-``r`` matmuls use
 backbone autocast when enabled, otherwise FP32.
-The delta is cast back onto the base output, so updates land
-in fp32 tensors and nothing needs fp32 master weights or polyak shadows.
+The delta is cast back onto the base output. BF16 trainable adapters require
+stochastic optimizer updates and, when delayed, stochastic Polyak updates.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ class LoRAConfig:
         rank: Adapter rank ``r``.
         alpha: Scaling numerator; the delta is scaled by ``alpha / rank``.
         dropout: Dropout on the adapter input (``0`` disables it).
-        dtype: Stored adapter weight dtype. Only ``"float32"`` is supported;
+        dtype: Stored adapter weight dtype. Use ``"float32"`` or ``"bfloat16"``;
             backbone autocast independently controls eligible computation.
     """
 
@@ -40,8 +40,8 @@ class LoRAConfig:
     dtype: str = "float32"
 
     def __post_init__(self) -> None:
-        if self.dtype != "float32":
-            raise ValueError("LoRA dtype must be float32: trainable adapter weights require FP32 updates.")
+        if self.dtype not in ("float32", "bfloat16"):
+            raise ValueError("LoRA dtype must be float32 or bfloat16; BF16 training requires stochastic optimizer updates.")
         if int(self.rank) < 1:
             raise ValueError(f"rank must be >= 1, got {self.rank}.")
         if float(self.alpha) <= 0.0:
@@ -63,7 +63,7 @@ def _lora_linear(
     dropout_p: float,
     training: bool,
 ) -> torch.Tensor:
-    """``y = W x + scale · B(A(x_fp32))`` with the casts inside one function.
+    """``y = W x + scale · B(A(x_adapter_dtype))`` with the casts inside one function.
 
     Packed train and cached decode both call this (via :class:`LoRALinear`),
     so the two paths cannot drift. On CUDA the function is ``torch.compile``d
@@ -72,7 +72,7 @@ def _lora_linear(
     """
     y = F.linear(x, weight, bias)
     xd = F.dropout(x, p=dropout_p, training=training) if dropout_p > 0.0 else x
-    a = F.linear(xd.to(dtype=torch.float32), lora_A)
+    a = F.linear(xd.to(dtype=lora_A.dtype), lora_A)
     delta = F.linear(a, lora_B) * scale
     return y + delta.to(dtype=y.dtype)
 
@@ -101,11 +101,11 @@ def _apply_lora(
 
 
 class LoRALinear(nn.Module):
-    """``base(x) + lora_B(lora_A(x)) * alpha / rank`` with fp32 adapters.
+    """``base(x) + lora_B(lora_A(x)) * alpha / rank`` with FP32 or BF16 adapters.
 
     ``base`` is the frozen wrapped ``nn.Linear`` and keeps its dtype (bf16 on
-    CUDA). ``lora_A`` / ``lora_B`` are fp32 and the only trainable
-    parameters; the adapter input is cast to fp32 and the delta is cast back
+    CUDA). ``lora_A`` / ``lora_B`` have the configured dtype and are the only trainable
+    parameters; the adapter input is cast to their dtype and the delta is cast back
     to the base output dtype. ``lora_B`` starts at zero so the wrapped
     module's output is unchanged at construction.
 

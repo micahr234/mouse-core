@@ -49,7 +49,7 @@ MOUSE is in early development; APIs may change.
 Frozen LoRA backbones can use `dtype=torch.bfloat16` together with
 `train_autocast_dtype=torch.bfloat16` and `decode_autocast_dtype=torch.bfloat16`.
 `LoRAConfig(dtype="float32")` explicitly declares stored adapter precision;
-FP32 is the supported trainable weight dtype. Base weights stay BF16;
+FP32 is the ordinary trainable weight dtype. Base weights stay BF16;
 trainable LoRA weights stay FP32, with eligible matrix
 operations running in BF16 under autocast. FP32 base weights also support BF16
 or FP16 autocast. Low-precision base weights must match the autocast dtype.
@@ -103,6 +103,23 @@ One optimizer applies to every group. Select `adamw`, `adam`, `sgd`, or `rmsprop
 by name or supply a dictionary of global options. Weight decay and algorithm
 settings such as betas, epsilon, and momentum cannot be overridden per group.
 Online and target modules are accepted only inside groups.
+
+`MouseOptimizer(..., stochastic_rounding=True, polyak_stochastic_rounding=True)`
+allows BF16 trainable weights and BF16 delayed targets. `LoRAConfig(dtype="bfloat16")`
+selects BF16 adapter storage. The two rounding switches are independent; a BF16
+online/target pair requires both. Supported optimizers are Adam, AdamW, SGD and
+RMSprop, excluding fused variants. Ordinary FP32 parameters remain supported.
+Updates use native PyTorch FP32 optimizer arithmetic one parameter tensor at a
+time, with FP32 moments and a single stochastic BF16 writeback. There are no
+persistent FP32 master weights or converted-weight caches. This implementation
+is not a fused optimizer kernel; speedups require measurement. Optimizer state
+loading preserves FP32 moments and rejects different algorithms/rounding modes.
+
+`polyak_update(..., stochastic_rounding=True)` exposes the same rounding for
+standalone target updates. Interpolation happens in FP32; zero/unit rates are
+exact, and frozen sources/shared parameters/buffers are skipped. Finite values
+outside BF16 range saturate; NaNs/infinities are preserved. Stochastic rounding
+uses PyTorch's device RNG; restoring exact runs also requires restoring RNG state.
 
 Groups without a target omit both `target` and `polyak_tau`, as in supervised
 learning and GRPO. Extra components such as reasoning norms and vocabulary heads each

@@ -2,10 +2,11 @@
 
 import torch
 from torch import nn
+from mouse_core.rounding import polyak_parameter_
 
 
 @torch.no_grad()
-def polyak_update(*, target: nn.Module, source: nn.Module, tau: float) -> None:
+def polyak_update(*, target: nn.Module, source: nn.Module, tau: float, stochastic_rounding: bool = False) -> None:
     """Interpolate trainable online parameters into their delayed counterparts.
 
     Parameters are matched by name. Names, shapes, devices, and dtypes must
@@ -13,6 +14,8 @@ def polyak_update(*, target: nn.Module, source: nn.Module, tau: float) -> None:
     Select by source.requires_grad: delayed parameters are normally frozen.
     Frozen source parameters, shared tensors, and buffers remain unchanged.
     """
+    if type(stochastic_rounding) is not bool:
+        raise TypeError("stochastic_rounding must be a boolean")
     if not 0 <= tau <= 1:
         raise ValueError("Polyak rate must be in [0, 1].")
     targets = dict(target.named_parameters())
@@ -31,4 +34,4 @@ def polyak_update(*, target: nn.Module, source: nn.Module, tau: float) -> None:
     for name, target_param in targets.items():
         source_param = sources[name]
         if source_param.requires_grad and target_param is not source_param:
-            target_param.lerp_(source_param, tau)
+            polyak_parameter_(target_param, source_param, tau, stochastic_rounding=stochastic_rounding)
