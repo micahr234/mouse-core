@@ -32,7 +32,7 @@ The FrozenLake examples use all four: generate a task, repeat it, collect experi
 Requires **Python 3.15+**. From this checkout:
 
 ```bash
-source scripts/install.sh
+source install.sh
 source .venv/bin/activate
 ```
 

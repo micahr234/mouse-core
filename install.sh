@@ -1,6 +1,6 @@
 #!/bin/bash
 # Install dependencies and set up the dev environment.
-# Run with: source scripts/install.sh
+# Run with: source install.sh
 #
 # Uses `return` throughout (never `exit`) because this script is sourced —
 # `exit` would terminate the user's shell.
@@ -88,7 +88,7 @@ setup_venv() {
 
 # Main installation process: uv, venv, project dependencies
 main() {
-    cd "$(dirname "${BASH_SOURCE[0]}")/.." || return 1
+    cd "$(dirname "${BASH_SOURCE[0]}")" || return 1
 
     echo "Starting Installation"
     echo "=================================="

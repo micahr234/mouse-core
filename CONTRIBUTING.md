@@ -16,7 +16,7 @@ MOUSE is actively developed and contributions are very welcome — whether that'
 # Clone and create a standard Python 3.15 virtual environment (via uv)
 git clone https://github.com/micahr234/mouse-core.git
 cd mouse-core
-source scripts/install.sh
+source install.sh
 ```
 
 This installs the package in editable mode with the `dev` and `all` extras (`all` bundles every feature extra — `examples` and `kernels`). Activate with `source .venv/bin/activate`. The install uses standard CPython (`3.15`). The stable PyTorch/Triton pair comes from the release index (`cu132` when `nvidia-smi` is present, CPU otherwise). See [Example dependencies](#example-dependencies) for notebook system packages.
@@ -61,23 +61,11 @@ The package lives at `src/mouse_core/` (standard src layout) and is imported as 
 
 Notebooks under [`examples/`](examples/) are committed **without** cell outputs. Clear outputs before committing, e.g. `jupyter nbconvert --clear-output --inplace examples/*.ipynb`.
 
-### Running all examples locally
+### Running examples locally
 
-Use an existing local Qwen3 tokenizer directory to run the notebooks without downloads or publishing:
-
-```bash
-.venv/bin/python scripts/run_examples.py \
-    --output-dir /tmp/mouse-examples \
-    --tokenizer-source /path/to/local/Qwen3-tokenizer \
-    --threads 2 --seed 7 --examples all
-```
-
-The runner uses explicit short CPU settings and a small randomly initialized Qwen3 model.
-It collects real datasets, trains each model, reloads checkpoints, and runs inference and
-rendering. It writes per-notebook logs, settings, and results to the output directory.
-Publication cells are skipped. This checks execution, not learning quality at full scale.
-Tokenizer conditions live in each notebook. Define the same named conditions in an
-inference notebook before loading its saved tokenizer.
+Open notebooks under `examples/` in Jupyter and configure their explicit model,
+tokenizer, and environment settings before running them. Keep publication cells
+unexecuted unless you intend to publish their outputs.
 
 Repeated-task examples save `repeat_episode_index` only on each inner episode's
 reset environment event. Use `RepeatTaskTracker.repeat_episode_start` and its
@@ -93,10 +81,9 @@ newline is a prediction readout.
 3. Before opening a PR, run:
    ```bash
    pyright src/ tests/
-   python scripts/check_example_types.py
    pytest
    ```
-   The notebook check extracts code cells and reports type errors by notebook and cell. CI runs source/test type checks, tests, and a wheel/sdist build on every pull request and on pushes to `main`.
+   CI runs source/test type checks, tests, and a wheel/sdist build on every pull request and on pushes to `main`.
 4. Open a pull request against `main` with a clear description of what changed and why.
 
 If you add a new feature, include a short usage example in the PR description or in `examples/`. Add tests for observable behavior and failure cases; prefer small regression cases over assertions about source spelling or private implementation details. Notebook regressions should exercise real notebook functions with local models and short environments, without downloads, training runs, or publishing.

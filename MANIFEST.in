@@ -1,2 +1,2 @@
-include scripts/install.sh
+include install.sh
 include CONTRIBUTING.md
