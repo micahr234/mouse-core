@@ -141,8 +141,14 @@ weights require the flag to be enabled.
 Supported algorithms are Adam, AdamW, SGD and RMSprop. Explicit `_fused` variants
 are unavailable with stochastic rounding or a non-FP32 optimizer dtype.
 
-RMSprop with FP32 or FP64 arithmetic and no custom update transform uses compiled CUDA
-pointwise operations. FP32 Polyak interpolation with BF16 target writeback is
+Set `compile=True` in a `MouseOptimizer` group to compile its CUDA update.
+This applies to Adam, AdamW, SGD and RMSprop. Enabled groups share compiled
+updates; disabled groups run eagerly. Python groups default to disabled, and CPU
+updates remain eager. This flag controls optimizer updates, not target averaging
+or model compilation. FP32/FP64 RMSprop uses its fused whole-step implementation;
+other algorithms compile their native PyTorch functional equations and writeback.
+BF16 compound-operation decomposition can change rounding relative to eager
+execution without changing arithmetic/state or model storage dtype. FP32 Polyak interpolation with BF16 target writeback is
 also compiled together with rounding. CUDA graphs
 are disabled; only compiled code and scalar metadata are cached. No master
 weights or converted-weight caches are retained. Initial CUDA calls compile;

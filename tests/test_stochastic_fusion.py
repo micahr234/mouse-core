@@ -138,7 +138,7 @@ def test_optimizer_dynamic_shapes_reuse_graph_and_preserve_live_parameters(monke
         assert parameter.data_ptr() in pointers
         return compiled(parameter, *args, **kwargs)
     monkeypatch.setattr(module, '_rmsprop_kernel', lambda device: update)
-    optimizer = PrecisionOptimizer(parameters, name='rmsprop', options={}, stochastic_rounding=False)
+    optimizer = PrecisionOptimizer([dict(params=parameters, compile=True)], name='rmsprop', options={}, stochastic_rounding=False)
     for p in parameters:
         p.grad = torch.ones_like(p)
     for _ in range(3):

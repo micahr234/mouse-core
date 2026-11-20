@@ -63,9 +63,15 @@ def _make_optimizer(params: list[dict[str, Any]], specification: Any, *, dtype=t
     if name in ("adam", "adamw"):
         options.setdefault("betas", (0.9, 0.95))
         options.setdefault("eps", 1e-8)
-    if stochastic_rounding or dtype != torch.float32:
+    compile_groups = any(group.get("compile", False) for group in params)
+    if compile_groups and not stochastic_rounding and dtype == torch.float32:
+        # The compiler supplies fusion for compiled groups; native fused aliases
+        # select the same algorithm without imposing a second kernel backend.
+        options.pop("fused", None)
+    if compile_groups or stochastic_rounding or dtype != torch.float32:
         return PrecisionOptimizer(params, name=name, options=options, dtype=dtype,
                                   stochastic_rounding=stochastic_rounding)
+    params = [{key: value for key, value in group.items() if key != "compile"} for group in params]
     if name == "adamw":
         return AdamW(params=params, **options)
     if name == "adam":
@@ -99,7 +105,11 @@ class MouseOptimizer:
     ``optimizer`` selects the single inner optimizer for all groups: AdamW,
     Adam, SGD or RMSprop. A dictionary supplies ``name`` and global options
     such as weight_decay, betas, eps or momentum. These settings cannot be
-    overridden per group; only learning rates and Polyak rates vary by group.
+    overridden per group; learning rates and Polyak rates vary by group.
+    ``compile`` is an optional per-group boolean (off unless enabled).
+    Enabled groups share compiled CUDA updates for the selected optimizer;
+    disabled groups run eagerly. CPU updates remain eager. RMSprop gradient transforms
+    use per-tensor compilation to limit temporary memory.
 
     Learning rates and taus may be numbers or zero-based training-batch schedules.
     A tau may map parameter names to scalar/broadcast tensor rates. All rates
@@ -132,9 +142,11 @@ class MouseOptimizer:
             if not isinstance(name, str) or not name:
                 raise ValueError("Optimizer group names must be nonempty strings.")
             if (not isinstance(settings, Mapping) or "online" not in settings
-                    or settings.keys() - {"online", "lr", "target", "polyak_tau", "parameters"}):
-                raise ValueError(f"{name}: groups require online; supported settings are lr, target, polyak_tau and parameters.")
+                    or settings.keys() - {"online", "lr", "target", "polyak_tau", "parameters", "compile"}):
+                raise ValueError(f"{name}: groups require online; supported settings are lr, target, polyak_tau, parameters and compile.")
             settings = dict(settings)
+            if type(settings.get("compile", False)) is not bool:
+                raise TypeError(f"{name}: compile must be a boolean")
             source = settings["online"]
             if not isinstance(source, nn.Module):
                 raise TypeError(f"{name}: online must be a module.")
@@ -182,7 +194,8 @@ class MouseOptimizer:
                         raise ValueError(f"{name}.{key}: independent target parameters must be frozen.")
                     targets_seen.add(id(p))
         rates, _ = self._prepare_step(0)
-        params = [dict(params=[p for p in self._parameters[name].values() if p.requires_grad], lr=rates[name])
+        params = [dict(params=[p for p in self._parameters[name].values() if p.requires_grad], lr=rates[name],
+                       compile=self.groups[name].get("compile", False))
                   for name in self.groups]
         allowed_dtypes = (torch.float32, torch.bfloat16) if stochastic_rounding else (torch.float32,)
         if any(p.dtype not in allowed_dtypes for group in params for p in group["params"]):
@@ -206,6 +219,7 @@ class MouseOptimizer:
                 if rates[name] == 0 and actual_lr != 0:
                     raise ValueError("An inner optimizer cannot override a zero group learning rate.")
                 group["name"] = name
+                group["compile"] = self.groups[name].get("compile", False)
                 self._inner_groups[name].append(index)
                 self._lr_factors[name].append(actual_lr / rates[name] if rates[name] else 1.0)
         for name, indices in self._inner_groups.items():
