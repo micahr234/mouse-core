@@ -45,6 +45,7 @@ class CausalBackbone(BaseBackbone):
     """Small differentiable causal reference for CPU gradient tests, not FlexAttention."""
     def __init__(self, hidden_dim=8):
         super().__init__()
+        self.residual_dtype = torch.float32
         self.linear = nn.Linear(hidden_dim, hidden_dim)
         self._hidden_dim = hidden_dim
 
@@ -448,12 +449,11 @@ def test_residual_retains_adaptive_reasoning_in_episode_cache_until_reset(monkey
     session = online.backbone.decode_session(2, max_batch_tokens=8, cache_capacity_tokens=1024)
     histories = [[], []]
     processed = []
-    original = online.backbone.forward
-    def record(embeds, **kwargs):
-        if kwargs.get('cache') is session:
-            processed.append(list(kwargs['lengths']))
-        return original(embeds, **kwargs)
-    monkeypatch.setattr(online.backbone, 'forward', record)
+    original = session._decode
+    def record(h, *args, **kwargs):
+        processed.append(len(h))
+        return original(h, *args, **kwargs)
+    monkeypatch.setattr(session, '_decode', record)
     def selector(tokens):
         heads = tokens['head_mask'].nonzero(as_tuple=True)[0]
         desired = tokens['token_ids'][heads - 1] % 3 + 1
@@ -474,6 +474,7 @@ def test_residual_retains_adaptive_reasoning_in_episode_cache_until_reset(monkey
             groups = full_tokens['sequence_ids'][full_tokens['head_mask']]
             latest = torch.stack([(groups == row).nonzero()[-1, 0] for row in range(2)])
             delta = batch(updates)
+            deferred_before = sum(len(v) for v in session._deferred.values())
             processed.clear()
             trace = online.reasoner.generate(delta, embedding=online.embedding, backbone=online.backbone, action_values=online.value_head,
                                              backend='continuous', max_active_requests=1, cache=session, select_actions=selector(delta))
@@ -485,9 +486,11 @@ def test_residual_retains_adaptive_reasoning_in_episode_cache_until_reset(monkey
                 histories[row].extend(update)
             assert session.lengths == tuple(len(h) + int(expected.lengths[groups == row].sum())
                                             for row, h in enumerate(histories))
-            # Only new events and new reasoning enter; previous tokens are cached.
-            assert [sum(call[row] for call in processed) for row in range(2)] == [
-                len(update) + int(length) for update, length in zip(updates, trace.lengths)]
+            # Count actual transformer queries, including deferred feedback.
+            # Old cached tokens must not be processed again.
+            deferred_after = sum(len(v) for v in session._deferred.values())
+            assert sum(processed) + deferred_after - deferred_before == sum(
+                len(update) + int(length) for update, length in zip(updates, trace.lengths))
             if before[1]:
                 assert session.lengths[1] > before[1]
     finally:

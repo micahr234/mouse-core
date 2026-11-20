@@ -43,7 +43,7 @@ def load_model[T: nn.Module](
     No default model or architecture reconstruction is provided. Extra keyword
     arguments (for example ``revision`` or ``token``) go to Hub downloads.
     """
-    obsolete = set(kwargs) & {"train_kernel", "decode_kernel", "dtype", "train_autocast_dtype", "decode_autocast_dtype"}
+    obsolete = set(kwargs) & {"train_kernel", "decode_kernel", "dtype", "autocast_dtype", "residual_dtype", "train_autocast_dtype", "decode_autocast_dtype"}
     if obsolete:
         raise TypeError(f"load_model does not accept execution arguments: {sorted(obsolete)}.")
     local = Path(repo_id_or_path)

@@ -21,12 +21,12 @@ PyTorch CPU implementation supports inference only; training requires CUDA.
 There is no SDPA or FlashAttention varlen fallback.
 
 Mixed precision is declared at construction, never inferred:
-``train_autocast_dtype=torch.bfloat16`` (or ``torch.float16``) on a fp32 backbone
+``autocast_dtype=torch.bfloat16`` (or ``torch.float16``) on a fp32 backbone
 wraps the decoder stack in :func:`torch.autocast` — matmuls run in the
-autocast dtype while weights, norms, RoPE, and the residual stream stay
-fp32. ``decode_autocast_dtype`` is the separate declaration for cached decode
-(``ContinuousDecodeSession`` runs its layers under it and allocates the KV pool
-in that dtype), so bf16 train can pair with exact fp32 eval decode.
+autocast dtype. ``residual_dtype`` independently controls the residual
+stream and its additions; weights and RoPE retain the base dtype.
+The same ``autocast_dtype`` applies to cached decoding and its KV pool;
+training and decoding cannot select different precision policies.
 ``packed_forward`` raises if it is called inside an ambient
 ``torch.autocast`` region, so the declared precision is always the actual
 precision.
@@ -161,6 +161,10 @@ def _flex_fn(device: torch.device) -> Callable[..., torch.Tensor]:
     return kern
 
 
+def _linear_dtype(module):
+    return getattr(module, "base", module).weight.dtype
+
+
 def _attention_inputs(
     layer: Any, h: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
     n_heads: int, n_kv_heads: int, head_dim: int,
@@ -168,7 +172,7 @@ def _attention_inputs(
     """Shared Q/K/V projections and RoPE for packed training and HF decoding."""
     L = h.shape[0]
     attn = layer.self_attn
-    hn = layer.input_layernorm(h)
+    hn = layer.input_layernorm(h).to(_linear_dtype(attn.q_proj))
     q = attn.q_proj(hn).view(L, n_heads, head_dim)
     k = attn.k_proj(hn).view(L, n_kv_heads, head_dim)
     v = attn.v_proj(hn).view(L, n_kv_heads, head_dim)
@@ -195,8 +199,9 @@ def _attention_output(
 ) -> torch.Tensor:
     """Shared attention residual and feed-forward block."""
     o = attention_output[0].transpose(0, 1).flatten(1)
-    h = h + layer.self_attn.o_proj(o)
-    return h + layer.mlp(layer.post_attention_layernorm(h))
+    h = h + layer.self_attn.o_proj(o).to(h.dtype)
+    normalized = layer.post_attention_layernorm(h).to(_linear_dtype(layer.mlp.gate_proj))
+    return h + layer.mlp(normalized).to(h.dtype)
 
 
 def _decoder_layer(
@@ -303,6 +308,7 @@ def packed_forward(
     embeds: torch.Tensor,
     sequence_ids: torch.Tensor,
     autocast_dtype: torch.dtype | None = None,
+    residual_dtype: torch.dtype | None = None,
     output_hidden_states: Literal[False] = False,
     checkpoint: bool = False,
     position_ids: torch.Tensor | None = None,
@@ -316,6 +322,7 @@ def packed_forward(
     embeds: torch.Tensor,
     sequence_ids: torch.Tensor,
     autocast_dtype: torch.dtype | None = None,
+    residual_dtype: torch.dtype | None = None,
     output_hidden_states: Literal[True],
     checkpoint: bool = False,
     position_ids: torch.Tensor | None = None,
@@ -329,6 +336,7 @@ def packed_forward(
     embeds: torch.Tensor,
     sequence_ids: torch.Tensor,
     autocast_dtype: torch.dtype | None = None,
+    residual_dtype: torch.dtype | None = None,
     output_hidden_states: bool,
     checkpoint: bool = False,
     position_ids: torch.Tensor | None = None,
@@ -341,6 +349,7 @@ def packed_forward(
     embeds: torch.Tensor,
     sequence_ids: torch.Tensor,
     autocast_dtype: torch.dtype | None = None,
+    residual_dtype: torch.dtype | None = None,
     output_hidden_states: bool = False,
     checkpoint: bool = False,
     position_ids: torch.Tensor | None = None,
@@ -354,14 +363,16 @@ def packed_forward(
         model: A ``transformers`` decoder stack (``Qwen3Model`` /
             ``LlamaModel``) with ``layers``, ``rotary_emb``, ``norm``.
         embeds: Token embeddings ``[L, D]`` in stream order; cast to the
-            model's base dtype.
+            selected residual dtype.
         sequence_ids: ``[L]`` group id per token. One group is one sample.
         position_ids: Optional explicit ``[L]`` rotary positions in stream order.
-        autocast_dtype: ``None`` runs everything in the model's base dtype.
+        residual_dtype: Residual storage and additions, independent of base weights.
+            When omitted by Core callers, uses the base dtype.
+        autocast_dtype: ``None`` runs projections in the model's base dtype.
             ``torch.bfloat16`` / ``torch.float16`` (fp32 or matching base weights)
             wraps the decoder stack in ``torch.autocast``: matmuls run in this
-            dtype, weights / norms / RoPE / residuals stay fp32. ``Model``
-            passes ``Backbone.train_autocast_dtype``. Calling ``packed_forward``
+            dtype while residual additions use residual_dtype. ``Model``
+            passes ``Backbone.autocast_dtype``. Calling ``packed_forward``
             inside an ambient ``torch.autocast`` region raises.
         output_hidden_states: Also return every layer's output (before the
             stack's output module, which is identity for MOUSE backbones).
@@ -385,12 +396,14 @@ def packed_forward(
         raise RuntimeError(
             "packed_forward was called inside an active torch.autocast region. "
             "Mixed precision is declared at backbone construction "
-            "(train_autocast_dtype= / decode_autocast_dtype=), never inferred from "
+            "(autocast_dtype=), never inferred from "
             "ambient state; remove the surrounding torch.autocast."
         )
     if position_ids is not None and position_ids.shape != (L,):
         raise ValueError("position_ids must have shape [L]")
-    x = embeds.to(device=device, dtype=dtype)
+    from mouse_core.models.backbone.flex_utils import check_residual_dtype
+    residual_dtype = check_residual_dtype(residual_dtype, dtype)
+    x = embeds.to(device=device, dtype=residual_dtype)
     n_layers = len(hf.layers)
 
     if L == 0:
@@ -409,10 +422,10 @@ def packed_forward(
     head_dim = int(head_dim) if head_dim is not None else int(cfg.hidden_size) // n_heads
 
     h = x[plan.order]
-    # RoPE cos/sin are computed outside autocast and stay fp32 alongside the
-    # residual stream; ``_decoder_layer`` casts q/k to the compute dtype.
+    # RoPE follows base precision independently of residual storage.
+    # Its values depend on positions, not on the supplied activation contents.
     positions = plan.position_ids if position_ids is None else position_ids.to(device)[plan.order]
-    cos, sin = hf.rotary_emb(h.unsqueeze(0), positions.unsqueeze(0))
+    cos, sin = hf.rotary_emb(h.new_empty((1, 0, h.shape[-1]), dtype=dtype), positions.unsqueeze(0))
     body = _compiled_layer if _compiled_layer is not None else _decoder_layer
     recompute = checkpoint and torch.is_grad_enabled()
     layer_hiddens: list[torch.Tensor] = []

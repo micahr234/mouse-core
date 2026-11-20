@@ -221,8 +221,8 @@ class Backbone(BaseBackbone):
         self,
         *,
         dtype: torch.dtype,
-        train_autocast_dtype: torch.dtype | None = None,
-        decode_autocast_dtype: torch.dtype | None = None,
+        residual_dtype: torch.dtype | None = None,
+        autocast_dtype: torch.dtype | None = None,
         hidden_dim: int | None = None,
         pretrained: str | Path | None = None,
         architecture: Architecture | None = None,
@@ -234,6 +234,9 @@ class Backbone(BaseBackbone):
         **config_kwargs: Any,
     ) -> None:
         super().__init__()
+        obsolete = {"train_autocast_dtype", "decode_autocast_dtype"} & config_kwargs.keys()
+        if obsolete:
+            raise TypeError("Use autocast_dtype for both training and decoding; separate precision settings are not supported")
         if type(rope_enabled) is not bool:
             raise TypeError("rope_enabled must be a boolean.")
         if "use_norm" in config_kwargs:
@@ -243,7 +246,9 @@ class Backbone(BaseBackbone):
             )
         if not isinstance(dtype, torch.dtype) or not dtype.is_floating_point:
             raise TypeError(f"dtype must be a floating point torch.dtype, got {dtype!r}.")
-        self._set_autocast(train_autocast_dtype, decode_autocast_dtype, dtype)
+        from mouse_core.models.backbone.flex_utils import check_residual_dtype
+        self.residual_dtype = check_residual_dtype(residual_dtype, dtype)
+        self._set_autocast(autocast_dtype, dtype)
         if pretrained is not None and architecture is not None:
             raise TypeError("Backbone accepts either pretrained= or architecture=, not both.")
         if pretrained is None and architecture is None:
@@ -530,7 +535,8 @@ class Backbone(BaseBackbone):
         out = packed_forward(
             model=self.model, embeds=embeds[valid], sequence_ids=groups[valid],
             position_ids=positions[valid],
-            autocast_dtype=self.train_autocast_dtype, checkpoint=self.gradient_checkpointing,
+            autocast_dtype=self.autocast_dtype, residual_dtype=self.residual_dtype,
+            checkpoint=self.gradient_checkpointing,
             output_hidden_states=output_hidden_states,
         )
         def restore(flat: torch.Tensor) -> torch.Tensor:

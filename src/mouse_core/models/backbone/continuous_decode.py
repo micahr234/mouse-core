@@ -117,6 +117,7 @@ class ContinuousDecodeSession:
         self, model: torch.nn.Module, *, batch_size: int,
         max_batch_tokens: int, cache_capacity_tokens: int,
         autocast_dtype: torch.dtype | None = None,
+        residual_dtype: torch.dtype | None = None,
     ) -> None:
         for name, value in (("batch_size", batch_size), ("max_batch_tokens", max_batch_tokens),
                             ("cache_capacity_tokens", cache_capacity_tokens)):
@@ -134,7 +135,11 @@ class ContinuousDecodeSession:
         self.max_batch_tokens = max_batch_tokens
         self.cache_capacity_tokens = cache_capacity_tokens
         self.device, self.dtype = module_device_dtype(model)
+        from mouse_core.models.backbone.flex_utils import check_residual_dtype
+        self.residual_dtype = check_residual_dtype(residual_dtype, self.dtype)
         self.autocast_dtype = check_autocast_dtype(autocast_dtype, self.dtype)
+        self._precision = (self.dtype, self.autocast_dtype, self.residual_dtype)
+        self._backbone_ref: Any = None
         try:
             self._cache: PagedAttentionCache | None = PagedAttentionCache(
                 cfg,
@@ -220,10 +225,15 @@ class ContinuousDecodeSession:
     def _check(self) -> tuple[PagedAttentionCache, FIFOScheduler]:
         if self._cache is None or self._scheduler is None:
             raise RuntimeError("Continuous decode session is closed.")
+        if (self.dtype, self.autocast_dtype, self.residual_dtype) != self._precision:
+            raise RuntimeError("Decode precision changed; create a new decode session")
+        backbone = self._backbone_ref() if self._backbone_ref is not None else None
+        if backbone is not None and (backbone.dtype, backbone.autocast_dtype, backbone.residual_dtype) != self._precision:
+            raise RuntimeError("Backbone precision changed; create a new decode session")
         if self.model.training:
             raise RuntimeError("Continuous decoding requires model.eval().")
         if torch.is_autocast_enabled(self.device.type):
-            raise RuntimeError("Declare decode_autocast_dtype on the backbone; remove ambient torch.autocast.")
+            raise RuntimeError("Declare autocast_dtype on the backbone; remove ambient torch.autocast.")
         if self._weight_versions() != self._versions:
             raise RuntimeError("Backbone weights changed; close the cache or reset all rows before decoding.")
         return self._cache, self._scheduler
@@ -271,14 +281,14 @@ class ContinuousDecodeSession:
         self._check()
         self._validate_submission(row, embeds)
         self._check_capacity({row: len(embeds)})
-        embeds = embeds.detach().to(device=self.device, dtype=self.dtype)
+        embeds = embeds.detach().to(device=self.device, dtype=self.residual_dtype)
         previous = self._deferred.get(row)
         self._deferred[row] = embeds.clone() if previous is None else torch.cat((previous, embeds))
 
     def _enqueue(self, row: int, embeds: torch.Tensor, *, output_hidden_states: bool) -> None:
         """Queue an input after the public entry point has validated the batch."""
         assert self._scheduler is not None
-        embeds = embeds.detach().to(device=self.device, dtype=self.dtype)
+        embeds = embeds.detach().to(device=self.device, dtype=self.residual_dtype)
         prefix = self._deferred.pop(row, None)
         prefix_length = 0 if prefix is None else len(prefix)
         if prefix is not None:
@@ -419,7 +429,7 @@ class ContinuousDecodeSession:
             head_dim = getattr(cfg, "head_dim", None) or cfg.hidden_size // cfg.num_attention_heads
             def run():
                 current = initial
-                cos, sin = self.model.rotary_emb(current.unsqueeze(0), qp.unsqueeze(0))
+                cos, sin = self.model.rotary_emb(current.new_empty((1, 0, current.shape[-1]), dtype=self.dtype), qp.unsqueeze(0))
                 hidden = []
                 context = nullcontext() if self.autocast_dtype is None else torch.autocast(self.device.type, dtype=self.autocast_dtype)
                 with context:
@@ -467,7 +477,7 @@ class ContinuousDecodeSession:
                 or any(type(n) is not int or not 0 <= n <= embeds.shape[1] for n in lengths)):
             raise ValueError("forward requires [batch_size, tokens, hidden_dim] and valid per-row lengths.")
         self._check_capacity(dict(enumerate(lengths)))
-        output = torch.zeros(embeds.shape, device=self.device, dtype=self.dtype)
+        output = torch.zeros(embeds.shape, device=self.device, dtype=self.residual_dtype)
         layers = tuple(torch.zeros_like(output) for _ in self.model.layers) if output_hidden_states else ()
         for row, count in enumerate(lengths):
             if count:

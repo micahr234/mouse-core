@@ -23,7 +23,7 @@ def backbone(architecture: Architecture="qwen3", device="cpu", autocast_dtype=No
     torch.manual_seed(81)
     model = Backbone(architecture=architecture, dtype=torch.float32, hidden_dim=32,
                      num_layers=2, num_heads=2, num_key_value_heads=1,
-                     train_autocast_dtype=autocast_dtype, decode_autocast_dtype=autocast_dtype).to(device).eval()
+                     autocast_dtype=autocast_dtype,).to(device).eval()
     with torch.no_grad():
         for name, param in model.named_parameters():
             if name.endswith(("q_proj.weight", "k_proj.weight")):

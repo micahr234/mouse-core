@@ -46,8 +46,20 @@ MOUSE is in early development; APIs may change.
 
 ## Backbone precision
 
+`Backbone(dtype=torch.bfloat16, residual_dtype=torch.float32, ...)` keeps frozen
+base weights in BF16 and transformer residual storage/additions in FP32.
+Packed training, dense forward, and continuous decode share this setting.
+The example notebooks explicitly select FP32 residuals for training and inference,
+independently of the backbone weight dtype.
+Projection computation follows base/autocast precision; the KV cache also
+follows decode compute precision. Residual dtype can be float16, bfloat16,
+float32, or float64. Core callers may omit it to use the base dtype; experiment
+TOMLs require an explicit `model.backbone_residual_dtype`. Configure execution
+precision when reconstructing a checkpoint, as with autocast settings.
+
+
 Frozen LoRA backbones can use `dtype=torch.bfloat16` together with
-`train_autocast_dtype=torch.bfloat16` and `decode_autocast_dtype=torch.bfloat16`.
+`autocast_dtype=torch.bfloat16` for both training and decoding.
 `LoRAConfig(dtype="float32")` explicitly declares stored adapter precision;
 FP32 is the ordinary trainable weight dtype. Base weights stay BF16;
 trainable LoRA weights stay FP32, with eligible matrix

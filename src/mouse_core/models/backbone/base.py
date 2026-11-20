@@ -68,39 +68,26 @@ class BaseBackbone(nn.Module, ABC):
     forwards and paged FlexAttention for cached decode. Training requires CUDA;
     CPU supports inference only.
 
-    - ``train_autocast_dtype`` / ``decode_autocast_dtype`` (default
-      ``None``) declare mixed precision per path for a fp32 backbone: the
-      packed training forward / cached decode run their matmuls in
-      bf16/fp16 under ``torch.autocast`` while weights, norms, RoPE, and
-      the residual stream stay fp32; decode also allocates its KV pool in
-      the autocast dtype (half the fp32 size). ``None`` runs that path in
-      the base dtype, so e.g. ``train_autocast_dtype=torch.bfloat16`` with
-      ``decode_autocast_dtype=None`` is mixed-precision training with
-      exact fp32 eval decode. Matching low-precision base weights also support
-      autocast: e.g. bf16 frozen weights with fp32 LoRA parameters and bf16
-      matmuls. Autocast does not change stored parameter dtypes. Both forwards
-      raise if called inside an
-      ambient ``torch.autocast`` region — precision is declared here,
-      never inferred.
-
-    Like ``gradient_checkpointing``, autocast settings are execution choices
-    for the current machine. Configure them on the model before loading weights.
+    ``autocast_dtype`` declares one precision policy for training, target
+    forwards, and cached decoding. None disables autocast everywhere; BF16/FP16
+    selects eligible matrix computations without changing stored weights.
+    Residual additions use ``residual_dtype`` in every path. The KV cache uses
+    the same attention dtype as training. Ambient autocast is rejected.
+    Configure precision before loading weights and opening decode sessions.
     """
 
     lora: LoRAConfig | None = None
     gradient_checkpointing: bool = False
     uses_packed: bool = False
-    train_autocast_dtype: torch.dtype | None = None
-    decode_autocast_dtype: torch.dtype | None = None
+    residual_dtype: torch.dtype
+    autocast_dtype: torch.dtype | None = None
 
     def _set_autocast(
         self,
-        train_autocast_dtype: torch.dtype | None,
-        decode_autocast_dtype: torch.dtype | None,
+        autocast_dtype: torch.dtype | None,
         dtype: torch.dtype,
     ) -> None:
-        self.train_autocast_dtype = check_autocast_dtype(train_autocast_dtype, dtype)
-        self.decode_autocast_dtype = check_autocast_dtype(decode_autocast_dtype, dtype)
+        self.autocast_dtype = check_autocast_dtype(autocast_dtype, dtype)
 
     def to(self, *args: Any, **kwargs: Any) -> Self:
         """Move the backbone; the base dtype is fixed at construction (``dtype=``)."""
@@ -175,10 +162,14 @@ class BaseBackbone(nn.Module, ABC):
         if cache is not None:
             if sequence_ids is not None or kwargs or lengths is None:
                 raise ValueError("cached forward requires lengths and cannot take sequence_ids or attention kwargs.")
+            if cache.model is not self.model:
+                raise ValueError("Decode cache must use this backbone's weights")
+            if (cache.dtype, cache.autocast_dtype, cache.residual_dtype) != (self.dtype, self.autocast_dtype, self.residual_dtype):
+                raise ValueError("Decode cache precision must match the backbone; create a new session")
             return cache.forward(embeds=embeds, lengths=lengths, output_hidden_states=output_hidden_states)
         if lengths is not None:
             raise ValueError("lengths requires a decode cache.")
-        embeds = embeds.to(dtype=self.dtype)
+        embeds = embeds.to(dtype=self.residual_dtype)
         if sequence_ids is None:
             if embeds.ndim != 3:
                 raise ValueError("flat embedding tensors require sequence_ids.")
@@ -198,7 +189,7 @@ class BaseBackbone(nn.Module, ABC):
         return packed_forward(
             model=cast(nn.Module, self.model), embeds=embeds, sequence_ids=sequence_ids,
             output_hidden_states=output_hidden_states, checkpoint=self.gradient_checkpointing,
-            autocast_dtype=self.train_autocast_dtype,
+            autocast_dtype=self.autocast_dtype, residual_dtype=self.residual_dtype,
         )
 
     @abstractmethod
@@ -226,10 +217,14 @@ class BaseBackbone(nn.Module, ABC):
             raise NotImplementedError(f"{type(self).__name__} does not support cached decoding.")
         if cache_capacity_tokens is None:
             cache_capacity_tokens = batch_size * ((16384 + _PAGE_SIZE - 1) // _PAGE_SIZE) * _PAGE_SIZE
-        return ContinuousDecodeSession(
+        session = ContinuousDecodeSession(
             model, batch_size=batch_size, max_batch_tokens=max_batch_tokens,
-            cache_capacity_tokens=cache_capacity_tokens, autocast_dtype=self.decode_autocast_dtype,
+            cache_capacity_tokens=cache_capacity_tokens, autocast_dtype=self.autocast_dtype,
+            residual_dtype=self.residual_dtype,
         )
+        from weakref import ref
+        session._backbone_ref = ref(self)
+        return session
 
 
 def _reject_dtype_cast(what: str, *args: Any, **kwargs: Any) -> None:

@@ -173,8 +173,7 @@ def test_cuda_autocast_train_matches_cached_decode(dtype, lora) -> None:
     """bf16 declared on both paths: FlexAttention packed train == Flex cached decode on a bf16 KV pool."""
     torch.manual_seed(6)
     model = _tiny_model('qwen3', dtype=dtype, lora=lora,
-                        train_autocast_dtype=torch.bfloat16,
-                        decode_autocast_dtype=torch.bfloat16).to(torch.device('cuda'))
+                        autocast_dtype=torch.bfloat16,).to(torch.device('cuda'))
     steps = _steps(8)
     for step, episode in zip(steps, (0, 0, 1, 1, 0, 0, 2, 0)):
         step['episode_index'] = episode
@@ -194,23 +193,6 @@ def test_cuda_autocast_train_matches_cached_decode(dtype, lora) -> None:
     assert full_q.dtype == torch.float32
     assert torch.allclose(incremental, full_q, atol=0.05), (incremental - full_q).abs().max().item()
 
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason='FlexAttention train is CUDA-only')
-def test_cuda_split_autocast_bf16_train_fp32_decode() -> None:
-    """train_autocast_dtype=bf16 with decode_autocast_dtype=None: fp32 KV pool, decode matches bf16 train."""
-    torch.manual_seed(7)
-    model = _tiny_model('qwen3', train_autocast_dtype=torch.bfloat16).to(torch.device('cuda'))
-    steps = _steps(6)
-    with torch.no_grad():
-        full, _ = _fwd(model, [steps])
-        preds_a, cache = _fwd(model, [steps[:4]], use_cache=True)
-        preds_b, cache = _fwd(model, [steps[4:]], cache=cache, use_cache=True)
-        incremental = torch.cat([preds_a['action_value'], preds_b['action_value']], dim=1)
-    session = cache.sessions[0]
-    assert session.autocast_dtype is None
-    assert session._cache.dtype == torch.float32
-    full_q = _as_rect(full['action_value'])
-    assert torch.allclose(incremental, full_q, atol=0.05), (incremental - full_q).abs().max().item()
 
 
 def test_decode_rejects_ambient_autocast() -> None:

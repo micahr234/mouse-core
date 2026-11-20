@@ -13,6 +13,14 @@ _FLEX_RECOMPILE_LIMIT = 64
 # The pinned torch runtime accepts recompile_limit, but its overload stubs omit it.
 _compiled_create_block_mask: Any | None = None
 
+def check_residual_dtype(residual_dtype: torch.dtype | None, dtype: torch.dtype) -> torch.dtype:
+    """Residual storage/addition precision is independent of weights and autocast."""
+    result = dtype if residual_dtype is None else residual_dtype
+    if result not in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
+        raise ValueError("residual_dtype must be float16, bfloat16, float32 or float64")
+    return result
+
+
 def check_autocast_dtype(autocast_dtype: object, dtype: torch.dtype) -> torch.dtype | None:
     """Validate a backbone autocast dtype (train or decode) against the base weight ``dtype``.
 
@@ -53,7 +61,7 @@ def module_device_dtype(module: torch.nn.Module) -> tuple[torch.device, torch.dt
     Skips fp32 LoRA adapters so a LoRA stack still reports the frozen
     base dtype. Raises if the module has no parameters. (The KV cache is
     allocated in the compute dtype: the base dtype, or the backbone's
-    ``decode_autocast_dtype`` when that is set.)
+    ``autocast_dtype`` when that is set.)
     """
     for name, param in module.named_parameters():
         if _is_lora_adapter(name):

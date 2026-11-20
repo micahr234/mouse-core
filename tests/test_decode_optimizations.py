@@ -97,8 +97,7 @@ def test_autocast_decode_keeps_training_parameters_and_lora_unchanged():
     model = Backbone(architecture='qwen3', dtype=torch.float32, hidden_dim=32,
                      num_layers=2, num_heads=2, num_key_value_heads=1,
                      lora=LoRAConfig(rank=4, alpha=8),
-                     train_autocast_dtype=torch.bfloat16,
-                     decode_autocast_dtype=torch.bfloat16).cuda().eval()
+                     autocast_dtype=torch.bfloat16,).cuda().eval()
     for name, p in model.named_parameters():
         if 'lora_B' in name:
             p.normal_(std=.02)

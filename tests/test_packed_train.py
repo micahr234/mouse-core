@@ -40,7 +40,7 @@ def no_compiled_decoder() -> Iterator[None]:
 
 
 def _backbone(architecture: str = "qwen3", *, hidden: int = 64, layers: int = 2, heads: int = 4, kv_heads: int = 4, head_dim: int | None = None, lora: LoRAConfig | None = None, dtype: torch.dtype = torch.float32, autocast_dtype: torch.dtype | None = None):
-    kwargs: dict[str, Any] = dict(architecture=architecture, dtype=dtype, train_autocast_dtype=autocast_dtype, hidden_dim=hidden, num_layers=layers, num_heads=heads, num_key_value_heads=kv_heads, lora=lora)
+    kwargs: dict[str, Any] = dict(architecture=architecture, dtype=dtype, autocast_dtype=autocast_dtype, hidden_dim=hidden, num_layers=layers, num_heads=heads, num_key_value_heads=kv_heads, lora=lora)
     if head_dim is not None:
         kwargs["head_dim"] = head_dim
     return Backbone(**kwargs)
@@ -319,7 +319,7 @@ def test_autocast_dtype_is_validated(no_compiled_decoder: None) -> None:
     """Autocast accepts fp32 or matching base weights, not mixed half formats."""
     for dtype in (torch.bfloat16, torch.float16):
         bb = _backbone("qwen3", dtype=dtype, autocast_dtype=dtype)
-        assert bb.train_autocast_dtype is dtype
+        assert bb.autocast_dtype is dtype
     with pytest.raises(ValueError, match="fp32 or matching"):
         _backbone("qwen3", dtype=torch.bfloat16, autocast_dtype=torch.float16)
     with pytest.raises(ValueError, match="autocast_dtype must be"):
@@ -327,7 +327,7 @@ def test_autocast_dtype_is_validated(no_compiled_decoder: None) -> None:
     with pytest.raises(ValueError, match="fp32 or matching"):
         Backbone(architecture="qwen3",
             dtype=torch.bfloat16,
-            decode_autocast_dtype=torch.float16, hidden_dim=64, num_layers=1, num_heads=4,
+            autocast_dtype=torch.float16, hidden_dim=64, num_layers=1, num_heads=4,
         )
     bb = _backbone("qwen3")
     ids = torch.zeros(4, dtype=torch.long)
@@ -745,10 +745,10 @@ def test_model_gradient_checkpointing_flag_reaches_backward(no_compiled_decoder:
 
 @_cuda
 def test_model_forwards_autocast_dtype_to_packed_forward(no_compiled_decoder: None) -> None:
-    """A fp32 Model built with train_autocast_dtype=bf16 trains through FlexAttention."""
+    """A fp32 Model built with autocast_dtype=bf16 trains through FlexAttention."""
     torch.manual_seed(13)
-    backbone = Backbone(architecture='qwen3', dtype=torch.float32, train_autocast_dtype=torch.bfloat16, hidden_dim=32, num_layers=2, num_heads=4)
-    assert backbone.train_autocast_dtype is torch.bfloat16 and backbone.decode_autocast_dtype is None
+    backbone = Backbone(architecture='qwen3', dtype=torch.float32, autocast_dtype=torch.bfloat16, hidden_dim=32, num_layers=2, num_heads=4)
+    assert backbone.autocast_dtype is torch.bfloat16
     head = MLP(in_features=32, out_features=4, hidden_dim=32, num_layers=1, propagate_gradient=1.0, rms_norm_eps=1e-6)
     model = simple_model(backbone=backbone, heads={'action_value': head}, reasoner=None).to('cuda')
     tb = batch_to_token_batch(token_tokenizer('action'), [[{'action': i % 4} for i in range(5)], [{'action': 1}]])
