@@ -66,7 +66,7 @@ def reference_states(parts, tokens, generated):
                 update = torch.nn.functional.linear(hidden * torch.rsqrt(hidden.square().mean(-1, keepdim=True) + 1e-6), reasoner.update_projection.weight, reasoner.update_projection.bias)
                 state = state + update if reasoner.residual_connections else update
                 per_depth.append(state)
-            if reasoner.residual_connections:
+            if reasoner.residual_connections and reasoner.max_steps > 1:
                 history.append(reasoner.norm(generated.states[decision, int(generated.lengths[decision])].detach()))
             per_depth.extend([per_depth[-1]] * (reasoner.max_steps - len(per_depth)))
             outputs.append(torch.stack(per_depth))
@@ -89,8 +89,8 @@ def test_variant_positions_and_outputs_match_literal_token_history(residual_conn
     assert trace.lengths.tolist() == lengths.tolist()
     assert sorted(calls) == sorted((i, k) for i, length in enumerate(lengths.tolist())
                                   for k in (range(1, length + 1) if adaptive_depth else [cap]))
-    assert len(trace.tokens['token_ids']) == len(tokens['token_ids']) + int((lengths - 1 + residual_connections).sum())
-    assert trace.readout_positions.tolist() == (trace.initial_positions + lengths - 1 + residual_connections).tolist()
+    assert len(trace.tokens['token_ids']) == len(tokens['token_ids']) + int((lengths - 1 + (residual_connections and cap > 1)).sum())
+    assert trace.readout_positions.tolist() == (trace.initial_positions + lengths - 1 + (residual_connections and cap > 1)).tolist()
     if not residual_connections:
         table = embedding.embeddings['text'].embed_tokens.weight
         torch.testing.assert_close(trace.tokens['latent_values'][trace.tokens['latent_mask']],
@@ -126,9 +126,9 @@ def test_real_cache_retains_exact_generated_token_count_and_replays(residual_con
     session = backbone.decode_session(2, max_batch_tokens=3, cache_capacity_tokens=1024)
     try:
         generated_first = generate(parts, first, backend='continuous', cache=session)
-        assert list(session.lengths) == [2 + cap - 1 + residual_connections, 3 + cap - 1 + residual_connections]
+        assert list(session.lengths) == [2 + cap - 1 + (residual_connections and cap > 1), 3 + cap - 1 + (residual_connections and cap > 1)]
         generated_second = generate(parts, second, backend='continuous', cache=session)
-        assert list(session.lengths) == [4 + 2 * (cap - 1 + residual_connections), 5 + 2 * (cap - 1 + residual_connections)]
+        assert list(session.lengths) == [4 + 2 * (cap - 1 + (residual_connections and cap > 1)), 5 + 2 * (cap - 1 + (residual_connections and cap > 1))]
         expected = generate(parts, full)
         torch.testing.assert_close(generated_first.states, expected.states[[0, 2]], atol=3e-5, rtol=3e-5)
         torch.testing.assert_close(generated_second.states, expected.states[[1, 3]], atol=3e-5, rtol=3e-5)
@@ -246,6 +246,29 @@ def test_rollout_defers_unused_feedback_without_extra_decoder_call(monkeypatch, 
             before = len(calls)
             generate(parts, batch(((2, 9), (4, 9))), backend='continuous', cache=session)
             assert len(calls) - before == cap
-            assert set(session._deferred) == ({0, 1} if residual_connections else set())
+            assert set(session._deferred) == ({0, 1} if residual_connections and cap > 1 else set())
     finally:
         session.close()
+
+
+@pytest.mark.parametrize('residual,adaptive', VARIANTS)
+@torch.no_grad()
+def test_one_step_uses_one_packed_forward_and_never_enters_generation(monkeypatch, residual, adaptive):
+    import importlib
+    module = importlib.import_module('mouse_core.models.sequential_reasoner')
+    parts = components(residual_connections=residual, adaptive_depth=adaptive, cap=1)
+    tokens = batch(((2, 9, 3, 9), (4, 9)))
+    tokens['head_mask'] = tokens['token_ids'] == 9
+    tokens['autoregressive_mask'] = tokens['head_mask'].clone()
+    tokens['step_readout_mask'] = tokens['head_mask'].clone()
+    def forbidden(*args, **kwargs):
+        raise AssertionError('One-step reasoning must not enter the sequential generator')
+    monkeypatch.setattr(module, 'generate', forbidden)
+    calls = []
+    hook = parts[1].register_forward_hook(lambda *args: calls.append(1))
+    trace = generate(parts, tokens, backend='continuous')
+    hook.remove()
+    assert calls == [1]
+    assert trace.tokens['token_ids'].tolist() == tokens['token_ids'].tolist()
+    assert trace.initial_positions.tolist() == trace.readout_positions.tolist() == [1, 3, 5]
+    torch.testing.assert_close(trace.states[:, 1:], reference_states(parts, tokens, trace))

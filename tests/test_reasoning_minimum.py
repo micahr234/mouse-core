@@ -54,7 +54,7 @@ def test_continuous_generation_masks_actions_and_preserves_replay(
     depth = maximum if prefer_think else minimum
     assert generated.lengths.tolist() == [depth] * 3
     assert sorted(calls) == [(row, step) for row in range(3) for step in range(1, depth + 1)]
-    assert len(generated.tokens['token_ids']) == len(tokens['token_ids']) + 3 * (depth - 1 + residual_connections)
+    assert len(generated.tokens['token_ids']) == len(tokens['token_ids']) + 3 * (depth - 1 + (residual_connections and maximum > 1))
     torch.testing.assert_close(reasoner(generated, embedding=embedding, backbone=backbone),
                                generated.states[:, 1:], atol=3e-5, rtol=3e-5)
     if minimum > 1:

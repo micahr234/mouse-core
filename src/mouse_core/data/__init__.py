@@ -21,6 +21,7 @@ from mouse_core.data.token_batch import make_token_batch, StepTokens, empty_toke
 
 from mouse_core.data.reasoning_dataset import (
     ReasoningDataset, ReasoningEpisode, split_reasoning_episodes, pack_reasoning_episodes,
+    start_only_reasoning_episodes,
 )
 from mouse_core.data.reasoning_loader import ReasoningDataLoader
 
@@ -33,6 +34,7 @@ __all__ = [
     "ReasoningEpisode",
     "split_reasoning_episodes",
     "pack_reasoning_episodes",
+    "start_only_reasoning_episodes",
     "EpochDataLoader",
     "Datastore",
     "DatasetSnapshot",

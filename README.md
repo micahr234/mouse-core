@@ -432,7 +432,7 @@ For scheduled reasoning replay, Core provides `ReasoningDataset` and
 ```python
 from mouse_core.data import ReasoningDataset, ReasoningDataLoader
 
-dataset = ReasoningDataset(capacity_tokens=262144)
+dataset = ReasoningDataset(capacity_episodes=512)
 loader = ReasoningDataLoader(
     dataset=dataset,
     sample_budget=8,
@@ -455,9 +455,18 @@ training_labels = training_labels.to(device)
 The dataset detaches and splits complete traces onto CPU, preserves original
 prediction-to-step alignment, and stores vectors only at reasoning positions.
 It retains no KV cache, Q values, weights, gradients, or model references.
-Capacity counts all sequence positions (context plus reasoning). New episodes
-append to the bank and evict oldest episodes; oversized individual episodes
-raise an error. `memory_bytes()` reports stored tensor payload size.
+Capacity counts complete episodes, regardless of their token lengths. New episodes
+append to the bank and evict the oldest episodes when the episode limit is exceeded. `memory_bytes()` reports stored tensor payload size.
+
+For a generation-free startup, `start_only_reasoning_episodes(inputs, objective_data,
+start_embedding=reasoner.start_embedding.weight[0], max_steps=reasoner.max_steps,
+generated_step=0)` prepares sparse CPU records to append with `dataset.append`.
+Each decision retains only its learned start input; there are no generated feedback
+positions. With `max_steps=1`, this is also the normal replay representation:
+collection needs no model forward. Full-episode inference evaluates all starts in
+one packed causal forward; cached inference consumes the start and adds no final
+feedback token. A larger maximum still needs generation to decide whether to THINK. Training computes the first update and supervises the recorded action.
+The caller must allow environment actions at depth one.
 
 The loader cycles sequentially or samples uniformly at random with replacement.
 It keeps episodes whole, so a token budget may be exceeded by its final episode.

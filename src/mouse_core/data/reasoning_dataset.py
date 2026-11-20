@@ -93,6 +93,69 @@ def split_reasoning_episodes(inputs: TensorDict, generated: ReasoningBatch, data
             len(source_rows), generated.lengths[decisions].clone(), generated_step)
 
 
+def start_only_reasoning_episodes(inputs: TensorDict, data: TensorDict, *,
+                                  start_embedding: torch.Tensor, max_steps: int,
+                                  generated_step: int) -> tuple[ReasoningEpisode, ...]:
+    """Prepare source episodes for replay without a model forward or generation.
+
+    Keep exactly one input state at each final head-output boundary. There are no
+    generated feedback positions, including in residual mode. Training computes
+    the first update and supervises the recorded environment action there. The
+    caller must allow environment actions at depth one. Only sparse start vectors
+    are stored; context tokens never allocate hidden-dimension vectors here.
+    """
+    from mouse_core.data.token_batch import head_output_segments
+
+    if type(max_steps) is not int or max_steps < 1:
+        raise ValueError('max_steps must be a positive integer')
+    if start_embedding.ndim != 1 or not len(start_embedding) or not start_embedding.is_floating_point():
+        raise ValueError('start_embedding must be a nonempty floating-point vector')
+    if 'latent_values' in inputs.keys() or 'latent_mask' in inputs.keys():
+        raise ValueError('Start-only replay requires clean source tokens')
+    inputs, data = inputs.detach().to('cpu'), data.detach().to('cpu')
+    start = start_embedding.detach().to(device='cpu', dtype=torch.float32)
+    original_heads = inputs['head_mask'].nonzero().flatten()
+    if len(original_heads) != len(data['step_ids']):
+        raise ValueError('Source head-output rows must align with objective step_ids')
+    episodes = []
+    for segment in head_output_segments(inputs):
+        group = segment.sequence_id
+        token_rows = (inputs['sequence_ids'] == group).nonzero().flatten()
+        step_rows = (data['sequence_ids'] == group).nonzero().flatten()
+        heads = torch.tensor(segment.head_token_ids, dtype=torch.long)
+        if not len(token_rows) or not len(step_rows) or not len(heads):
+            raise ValueError('Reasoning replay requires nonempty complete episodes with decisions')
+        if not bool(inputs['autoregressive_mask'][heads].all()):
+            raise ValueError('Reasoning starts must be autoregressive head-output tokens')
+        token_start, step_start = int(token_rows[0]), int(step_rows[0])
+        positions = heads - token_start
+        tokens = inputs.clone(recurse=False)
+        for key, value in inputs.items():
+            if isinstance(value, torch.Tensor):
+                tokens[key] = value[token_rows].clone()
+        tokens['sequence_ids'].zero_()
+        tokens.set_non_tensor('num_sequences', 1)
+        mask = torch.zeros(len(token_rows), dtype=torch.bool)
+        mask[positions] = True
+        tokens['latent_mask'] = mask
+        tokens['head_mask'] = mask.clone()
+        tokens['step_readout_mask'] = mask.clone()
+        tokens['autoregressive_mask'].zero_()
+        rows = torch.searchsorted(original_heads, heads)
+        objective = TensorDict({key: value[rows if key == 'step_ids' else step_rows].clone()
+                                for key, value in data.items()}, batch_size=[], device='cpu')
+        objective['step_ids'] -= step_start
+        objective['sequence_ids'].zero_()
+        updates = torch.zeros((len(heads), max_steps), dtype=torch.long)
+        updates[:, 0] = positions
+        episodes.append(ReasoningEpisode(tokens, start.expand(len(heads), -1).clone(), objective,
+            positions.clone(), updates, positions.clone(), tuple(positions.tolist()), len(token_rows),
+            torch.ones(len(heads), dtype=torch.long), generated_step))
+    if not episodes:
+        raise ValueError('Reasoning replay requires nonempty complete episodes with decisions')
+    return tuple(episodes)
+
+
 def pack_reasoning_episodes(episodes: Sequence[ReasoningEpisode]) -> tuple[ReasoningBatch, TensorDict]:
     """Rebase token, decision, and objective-step indices independently."""
     from mouse_core.models.sequential_reasoner import ReasoningBatch
@@ -143,20 +206,21 @@ def pack_reasoning_episodes(episodes: Sequence[ReasoningEpisode]) -> tuple[Reaso
 
 
 class ReasoningDataset:
-    """A token-capacity FIFO bank of complete episodes in CPU RAM.
+    """An episode-capacity FIFO bank of complete episodes in CPU RAM.
 
     Append never waits for a full bank. Sampling does not remove entries; only
-    new arrivals evict oldest episodes. Capacity counts context and reasoning
-    positions, while only reasoning positions store embedding vectors.
+    new arrivals evict oldest episodes. Capacity counts complete episodes, regardless
+    of their lengths. Only reasoning positions store embedding vectors. Token
+    counts are metrics.
     Entries have monotonically increasing IDs so independent loaders can retain
     cursors across eviction or clear(). Tensor payloads are read-only by contract.
     This is synchronous storage; concurrent writes and reads are unsupported.
     """
 
-    def __init__(self, *, capacity_tokens: int) -> None:
-        if type(capacity_tokens) is not int or capacity_tokens < 1:
-            raise ValueError('capacity_tokens must be a positive integer')
-        self.capacity_tokens = capacity_tokens
+    def __init__(self, *, capacity_episodes: int) -> None:
+        if type(capacity_episodes) is not int or capacity_episodes < 1:
+            raise ValueError('capacity_episodes must be a positive integer')
+        self.capacity_episodes = capacity_episodes
         self._episodes: deque[ReasoningEpisode] = deque()
         self.token_count = 0
         self.first_id = self.next_id = 0
@@ -174,8 +238,6 @@ class ReasoningDataset:
     def _check(self, episode: ReasoningEpisode):
         if not isinstance(episode, ReasoningEpisode):
             raise TypeError('ReasoningDataset accepts ReasoningEpisode entries')
-        if episode.token_count > self.capacity_tokens:
-            raise ValueError(f'Reasoning episode has {episode.token_count} tokens, exceeding capacity_tokens={self.capacity_tokens}')
         schema = (episode.tokens['tokenizer_names'], episode.tokens['numeric_field_names'],
                   episode.latent_values.shape[1:], episode.latent_values.dtype,
                   episode.update_positions.shape[1:],
@@ -192,7 +254,7 @@ class ReasoningDataset:
         self._episodes.append(episode)
         self.next_id += 1
         self.token_count += episode.token_count
-        while self.token_count > self.capacity_tokens:
+        while len(self._episodes) > self.capacity_episodes:
             self.token_count -= self._episodes.popleft().token_count
             self.first_id += 1
 

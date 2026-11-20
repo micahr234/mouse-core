@@ -40,8 +40,9 @@ class ReasoningBatch:
     readout_positions mark the final reasoning tokens in the episode rows.
     ``states`` includes an initial-embedding slot, followed by generated outputs,
     for incremental inference/diagnostics only. Forward recomputes the outputs.
-    Residual mode emits a final feedback token after the last update; repeated-token
-    mode has exactly one input marker per update and no unused final token.
+    Residual mode with a multi-step budget emits a final feedback token after the
+    last update. A one-step budget and repeated-token mode have no final feedback
+    token; a one-step trace retains only its existing start input.
     """
 
     tokens: TensorDict
@@ -153,6 +154,23 @@ class SequentialReasoner(nn.Module):
             position_values=tensors["position_values"], position_mask=tensors["position_mask"],
         )
 
+    def _select_actions(self, states, indices, depths, action_values, select_actions):
+        values = action_values(states)
+        minimum = 2 if self.adaptive_depth else 1
+        if values.ndim != 2 or values.shape[0] != len(indices) or values.shape[1] < minimum:
+            raise ValueError("action_values must return environment actions, followed by think only for adaptive depth")
+        values = values.clone()
+        if self.adaptive_depth:
+            values[depths < self.min_steps, :-1] = -torch.inf
+            values[depths == self.max_steps, -1] = -torch.inf
+        actions = (values.argmax(-1) if select_actions is None
+                   else select_actions(values, indices, depths))
+        if (actions.shape != depths.shape or actions.dtype != torch.long
+                or bool(((actions < 0) | (actions >= values.shape[1])).any())
+                or not bool(torch.isfinite(values.gather(1, actions[:, None])).all())):
+            raise ValueError("select_actions must select one available action per reasoning state")
+        return actions, values.shape[1]
+
     @torch.no_grad()
     def _generate_trace(
         self, tokens: TensorDict, *, embedding: MultiEmbedding, backbone: BaseBackbone,
@@ -192,6 +210,19 @@ class SequentialReasoner(nn.Module):
             embeds = self._embeds(tokens, embedding)
             initial = self.start_embedding.weight.float().expand(len(heads), -1)
             states = initial[:, None, :].expand(-1, self.max_steps + 1, -1).clone()
+            if self.max_steps == 1 and cache is None:
+                # All inputs already exist: evaluate every decision in one packed
+                # causal forward. There is no generated feedback or decode session.
+                positions = torch.tensor(heads, device=embeds.device, dtype=torch.long)
+                inputs = embeds.clone()
+                inputs[positions] = self.norm(initial).to(inputs.dtype)
+                hidden = cast(torch.Tensor, backbone(inputs, sequence_ids=tokens['sequence_ids'].to(inputs.device)))
+                updates = self.project_updates(hidden[positions])
+                states[:, 1] = initial + updates if self.residual_connections else updates
+                lengths = torch.ones(len(heads), device=embeds.device, dtype=torch.long)
+                self._select_actions(states[:, 1], torch.arange(len(heads), device=embeds.device),
+                                     lengths, action_values, select_actions)
+                return _ReasoningTrace(heads, states, lengths)
             counts = [0] * len(heads)
             episode_heads: list[list[int]] = []
             contexts: list[tuple[slice, ...]] = []
@@ -227,22 +258,10 @@ class SequentialReasoner(nn.Module):
                 if decisions:
                     indices = torch.tensor(decisions, device=states.device)
                     depths = torch.tensor([counts[i] for i in decisions], device=states.device)
-                    values = action_values(states[indices, depths])
-                    minimum = 2 if self.adaptive_depth else 1
-                    if values.ndim != 2 or values.shape[0] != len(decisions) or values.shape[1] < minimum:
-                        raise ValueError("action_values must return environment actions, followed by think only for adaptive depth")
-                    values = values.clone()
-                    if self.adaptive_depth:
-                        values[depths < self.min_steps, :-1] = -torch.inf
-                        values[depths == self.max_steps, -1] = -torch.inf
-                    actions = (values.argmax(-1) if select_actions is None
-                               else select_actions(values, indices, depths))
-                    if (actions.shape != depths.shape or actions.dtype != torch.long
-                            or bool(((actions < 0) | (actions >= values.shape[1])).any())
-                            or not bool(torch.isfinite(values.gather(1, actions[:, None])).all())):
-                        raise ValueError("select_actions must select one available action per reasoning state")
+                    actions, action_count = self._select_actions(
+                        states[indices, depths], indices, depths, action_values, select_actions)
                     for i, action in zip(decisions, actions.tolist(), strict=True):
-                        thinking[i] = self.adaptive_depth and action == values.shape[1] - 1
+                        thinking[i] = self.adaptive_depth and action == action_count - 1
                 for j, request, i in live:
                     step = counts[i]
                     state = states[i, step:step + 1]
@@ -252,7 +271,7 @@ class SequentialReasoner(nn.Module):
                     states[i, step + 1:] = state
                     cursors[request] += 1
                     next_index = cursors[request]
-                    prefix = self.norm(state) if self.residual_connections else state[:0]
+                    prefix = self.norm(state) if self.residual_connections and self.max_steps > 1 else state[:0]
                     if next_index < len(episode_heads[request]):
                         following = episode_heads[request][next_index]
                         chunks[j] = torch.cat((prefix, embeds[contexts[request][next_index]],
@@ -283,6 +302,9 @@ class SequentialReasoner(nn.Module):
     ) -> ReasoningBatch:
         """Generate once and return complete context/latent inputs for forward.
 
+        With max_steps=1, complete episodes need one packed forward, with no
+        sequential generation or inserted feedback. Replay collection can skip
+        this forward entirely using start_only_reasoning_episodes.
         A cached call returns the new chunk for inference. Its earlier context
         lives in the KV cache, so it cannot be used as a standalone training batch.
         """
@@ -317,9 +339,10 @@ class SequentialReasoner(nn.Module):
                     start = offset + len(row)
                     initial[i] = start
                     length = int(trace.lengths[i])
-                    readouts[i] = start + length - (not self.residual_connections)
+                    feedback = self.residual_connections and self.max_steps > 1
+                    readouts[i] = start + length - 1 + int(feedback)
                     positions[i, :length] = torch.arange(start, start + length, device=device)
-                    token_count = length + int(self.residual_connections)
+                    token_count = length + int(feedback)
                     row.extend((cursor, i, step) for step in range(token_count))
                 else:
                     row.append((cursor, -1, -1))

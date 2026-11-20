@@ -105,6 +105,8 @@ def test_notebook_training_uses_its_selected_recurrence_and_target_depth(reasoni
     monkeypatch.setattr(target.reasoner, 'generate', forbidden_generation)
     original_generation = online.reasoner.generate
     def cpu_generation(*args, **kwargs):
+        if max_steps == 1:
+            raise AssertionError('One-step notebook training must skip generation')
         assert kwargs.pop('backend') == 'continuous'
         return original_generation(*args, backend='uncached', **kwargs)
     monkeypatch.setattr(online.reasoner, 'generate', cpu_generation)
