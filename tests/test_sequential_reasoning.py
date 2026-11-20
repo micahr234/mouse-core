@@ -225,3 +225,25 @@ def test_update_norm_zero_initialization_and_gradient_startup():
     torch.testing.assert_close(updates, expected)
     (updates - target).square().mean().backward()
     assert hidden.grad.abs().sum() > 0
+
+
+@pytest.mark.parametrize('residual_connections', [False, True])
+@pytest.mark.parametrize('cap', [1, 3, 5])
+@torch.no_grad()
+def test_rollout_defers_unused_feedback_without_extra_decoder_call(monkeypatch, residual_connections, cap):
+    parts = components(residual_connections=residual_connections, adaptive_depth=True, cap=cap, real=True)
+    session = parts[1].decode_session(2, max_batch_tokens=64, cache_capacity_tokens=1024)
+    calls = []
+    step = session.step
+    def counted():
+        calls.append(None)
+        return step()
+    monkeypatch.setattr(session, 'step', counted)
+    try:
+        for _ in range(2):
+            before = len(calls)
+            generate(parts, batch(((2, 9), (4, 9))), backend='continuous', cache=session)
+            assert len(calls) - before == cap
+            assert set(session._deferred) == ({0, 1} if residual_connections else set())
+    finally:
+        session.close()

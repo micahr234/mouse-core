@@ -7,6 +7,7 @@ No vocabulary head, token sampling, or second model is involved.
 """
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -31,6 +32,9 @@ Readout = torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, ...]]
 _PAGE_SIZE = ContinuousBatchingConfig().page_size
 _compiled_layer: Any = None
 _compiled_inputs: Any = None
+_GRAPH_REUSE_THRESHOLD = 8
+_MAX_DECODE_GRAPHS = 16
+_MAX_TRACKED_SHAPES = 256
 
 
 def _decode_layer(layer, h, q, n_heads, n_kv_heads, head_dim,
@@ -68,6 +72,7 @@ def _physical_indices(allocator, request_id, positions):
 class _Submission:
     embeds: torch.Tensor
     output_hidden_states: bool
+    prefix_length: int = 0
     outputs: list[torch.Tensor] = field(default_factory=list)
     layers: list[tuple[torch.Tensor, ...]] = field(default_factory=list)
 
@@ -163,7 +168,12 @@ class ContinuousDecodeSession:
         )
         self._lengths = [0] * batch_size
         self._pending: dict[int, _Submission] = {}
+        self._deferred: dict[int, torch.Tensor] = {}
+        self._module_layout = tuple((module, module._modules.copy()) for module in self.model.modules())
         self._versions = self._weight_versions()
+        self._graphs = OrderedDict()
+        self._graph_pool = torch.cuda.graph_pool_handle() if self.device.type == "cuda" else None
+        self._graph_counts = OrderedDict()
         global _compiled_layer, _compiled_inputs
         if _use_flex_compile(self.device):
             if _compiled_layer is None:
@@ -186,15 +196,26 @@ class ContinuousDecodeSession:
 
     @property
     def lengths(self) -> tuple[int, ...]:
-        """Number of processed tokens in each outer episode (no device sync)."""
-        return tuple(self._lengths)
+        """History length, including deferred feedback (no device sync)."""
+        lengths = [n + len(self._deferred.get(row, ())) for row, n in enumerate(self._lengths)]
+        for row, pending in self._pending.items():
+            processed = sum(len(output) for output in pending.outputs)
+            lengths[row] += max(0, pending.prefix_length - processed)
+        return tuple(lengths)
 
     @property
     def has_pending(self) -> bool:
         return bool(self._pending)
 
     def _weight_versions(self):
-        return tuple((id(p), p._version, p.device, p.dtype) for p in self.model.parameters())
+        # Avoid recursively rebuilding parameter names for every decode chunk.
+        # Still inspect the live parameter dictionaries, and rebuild the flat
+        # module list if a child is added, removed, or replaced.
+        if any(module._modules != children for module, children in self._module_layout):
+            self._module_layout = tuple((module, module._modules.copy()) for module in self.model.modules())
+        return tuple((id(p), p._version, p.device, p.dtype)
+                     for module, _ in self._module_layout
+                     for p in module._parameters.values() if p is not None)
 
     def _check(self) -> tuple[PagedAttentionCache, FIFOScheduler]:
         if self._cache is None or self._scheduler is None:
@@ -220,7 +241,7 @@ class ContinuousDecodeSession:
 
     def _check_capacity(self, additions: dict[int, int]) -> None:
         # Reserve all pending tokens, including chunks the scheduler has not run.
-        lengths = list(self._lengths)
+        lengths = [n + len(self._deferred.get(row, ())) for row, n in enumerate(self._lengths)]
         for row, pending in self._pending.items():
             processed = sum(x.shape[0] for x in pending.outputs)
             lengths[row] += pending.embeds.shape[0] - processed
@@ -241,10 +262,28 @@ class ContinuousDecodeSession:
         self._check_capacity({row: embeds.shape[0]})
         self._enqueue(row, embeds, output_hidden_states=output_hidden_states)
 
+    def defer(self, row: int, embeds: torch.Tensor) -> None:
+        """Retain output-free history and process it with the row's next input.
+
+        No token is dropped: deferred embeddings precede the next submission at
+        their original rotary positions. Resetting the episode discards them.
+        """
+        self._check()
+        self._validate_submission(row, embeds)
+        self._check_capacity({row: len(embeds)})
+        embeds = embeds.detach().to(device=self.device, dtype=self.dtype)
+        previous = self._deferred.get(row)
+        self._deferred[row] = embeds.clone() if previous is None else torch.cat((previous, embeds))
+
     def _enqueue(self, row: int, embeds: torch.Tensor, *, output_hidden_states: bool) -> None:
         """Queue an input after the public entry point has validated the batch."""
         assert self._scheduler is not None
-        self._pending[row] = _Submission(embeds.detach().to(device=self.device, dtype=self.dtype), output_hidden_states)
+        embeds = embeds.detach().to(device=self.device, dtype=self.dtype)
+        prefix = self._deferred.pop(row, None)
+        prefix_length = 0 if prefix is None else len(prefix)
+        if prefix is not None:
+            embeds = torch.cat((prefix, embeds))
+        self._pending[row] = _Submission(embeds, output_hidden_states, prefix_length)
         # HF schedules lists of IDs. These are local embedding indices, never
         # vocabulary IDs; prefix sharing MUST remain disabled for numeric inputs.
         state = RequestState(request_id=str(row), initial_tokens=list(range(embeds.shape[0])))
@@ -284,7 +323,10 @@ class ContinuousDecodeSession:
             owners = np.full(num_blocks, -1, dtype=np.int64)
             logical_pages = np.zeros(num_blocks, dtype=np.int64)
             q_blocks = (query_width + _BLOCK_SIZE - 1) // _BLOCK_SIZE
-            max_pages = max(len(allocator.block_table[state.request_id]) for state in states)
+            # Page-index tables cover the fixed pool. Actual block counts still
+            # bound every attention read; history growth only updates indices,
+            # rather than invalidating a captured decoder graph's tensor shapes.
+            max_pages = self.cache_capacity_tokens // page_size
             indices = np.zeros((len(rows), 1, q_blocks, max_pages), dtype=np.int32)
             block_counts = np.zeros((len(rows), 1, q_blocks), dtype=np.int32)
             full_indices = np.zeros_like(indices)
@@ -309,41 +351,17 @@ class ContinuousDecodeSession:
                     column.append(value)
             metadata = [past_lengths, query_lengths, owners, logical_pages,
                         *(np.concatenate(column) for column in columns)]
-            past, counts, owners_gpu, logical_gpu, qp, wi, qi = torch.from_numpy(np.concatenate(metadata)).to(self.device).split(
-                [len(column) for column in metadata])
+            metadata_gpu = torch.from_numpy(np.concatenate(metadata)).to(self.device)
             block_arrays = [block_counts, indices, full_counts, full_indices]
             blocks_gpu = torch.from_numpy(np.concatenate([array.ravel() for array in block_arrays])).to(self.device)
-            count_gpu, index_gpu, full_count_gpu, full_index_gpu = blocks_gpu.split([array.size for array in block_arrays])
-            mask = BlockMask.from_kv_blocks(
-                count_gpu.view(block_counts.shape), index_gpu.view(indices.shape),
-                full_count_gpu.view(full_counts.shape), full_index_gpu.view(full_indices.shape),
-                BLOCK_SIZE=(_BLOCK_SIZE, page_size),
-                mask_mod=_paged_mask(past, counts, owners_gpu, logical_gpu, stride, page_size),
-                seq_lengths=(query_width, cache_rows), compute_q_blocks=False,
-            )
-            write_only = wi[:0]
-            cos, sin = self.model.rotary_emb(h.unsqueeze(0), qp.unsqueeze(0))
-            cfg = self.model.config
-            head_dim = getattr(cfg, "head_dim", None) or cfg.hidden_size // cfg.num_attention_heads
-            layer_outputs = []
             need_layers = any(self._pending[row].output_hidden_states for row in rows)
-            context = nullcontext() if self.autocast_dtype is None else torch.autocast(self.device.type, dtype=self.autocast_dtype)
-            with context:
-                for layer_index, layer in enumerate(self.model.layers):
-                    # HF owns these strided views, including page/trash storage.
-                    key_cache, value_cache = allocator._kv_token_views[layer_index]
-                    q, k, v = self._inputs(
-                        layer, h, cos, sin, cfg.num_attention_heads, cfg.num_key_value_heads, head_dim,
-                    )
-                    # New full-attention pages never overwrite live episode history.
-                    allocator.update(k[0].transpose(0, 1), v[0].transpose(0, 1), layer_index, write_only, wi)
-                    h = self._layer(
-                        layer, h, q, cfg.num_attention_heads, cfg.num_key_value_heads, head_dim,
-                        key_cache[:cache_rows], value_cache[:cache_rows], qi, query_width, mask,
-                    )
-                    if need_layers:
-                        layer_outputs.append(h.split(chunks))
-                outputs = self.model.norm(h).split(chunks)
+            output, hidden = self._decode(
+                h, metadata_gpu, blocks_gpu,
+                tuple(len(column) for column in metadata), tuple(array.shape for array in block_arrays),
+                query_width, cache_rows, stride, page_size, allocator, need_layers,
+            )
+            outputs = output.split(chunks)
+            layer_outputs = [layer.split(chunks) for layer in hidden]
             completed = {}
             for index, (row, state, count, output) in enumerate(zip(rows, states, chunks, outputs, strict=True)):
                 pending = self._pending[row]
@@ -353,8 +371,8 @@ class ContinuousDecodeSession:
                 state.position_offset += count
                 self._lengths[row] += count
                 if not state.remaining_prefill_tokens:
-                    out = torch.cat(pending.outputs)
-                    completed[row] = (out, tuple(torch.cat(parts) for parts in zip(*pending.layers, strict=True))) if pending.output_hidden_states else out
+                    out = torch.cat(pending.outputs)[pending.prefix_length:]
+                    completed[row] = (out, tuple(torch.cat(parts)[pending.prefix_length:] for parts in zip(*pending.layers, strict=True))) if pending.output_hidden_states else out
                     # finish_request would free KV: an RL environment pauses here,
                     # it has not finished its outer episode.
                     scheduler.active_requests.pop(state.request_id)
@@ -364,6 +382,79 @@ class ContinuousDecodeSession:
             # A failed layer may have written only part of the cache. Never reuse it.
             self.close()
             raise
+
+    def _decode(self, h, metadata, blocks, sizes, shapes, query_width, cache_rows,
+                stride, page_size, allocator, need_layers):
+        # Capture only shapes that recur. Ragged scheduler batches and all KV
+        # mappings remain unchanged; no projection/MLP padding is introduced.
+        signature = (h.shape, h.dtype, sizes, shapes, query_width, need_layers)
+        use_graph = False
+        if _use_flex_compile(self.device):
+            uses = self._graph_counts.pop(signature, 0) + 1
+            if len(self._graph_counts) >= _MAX_TRACKED_SHAPES:
+                self._graph_counts.popitem(last=False)
+            self._graph_counts[signature] = uses
+            use_graph = signature in self._graphs or uses >= _GRAPH_REUSE_THRESHOLD
+        entry = self._graphs.pop(signature, None) if use_graph else None
+        if entry is not None:
+            graph, static, result = entry
+            for dest, source in zip(static, (h, metadata, blocks), strict=True):
+                dest.copy_(source)
+            graph.replay()
+            self._graphs[signature] = entry
+        else:
+            static = tuple(t.clone() for t in (h, metadata, blocks)) if use_graph else (h, metadata, blocks)
+            initial, meta, block_data = static
+            past, counts, owners, logical, qp, wi, qi = meta.split(sizes)
+            count, index, full_count, full_index = [
+                t.view(shape) for t, shape in zip(
+                    block_data.split([int(np.prod(shape)) for shape in shapes]), shapes, strict=True)]
+            mask = BlockMask.from_kv_blocks(
+                count, index, full_count, full_index,
+                BLOCK_SIZE=(_BLOCK_SIZE, page_size),
+                mask_mod=_paged_mask(past, counts, owners, logical, stride, page_size),
+                seq_lengths=(query_width, cache_rows), compute_q_blocks=False,
+            )
+            cfg = self.model.config
+            head_dim = getattr(cfg, "head_dim", None) or cfg.hidden_size // cfg.num_attention_heads
+            def run():
+                current = initial
+                cos, sin = self.model.rotary_emb(current.unsqueeze(0), qp.unsqueeze(0))
+                hidden = []
+                context = nullcontext() if self.autocast_dtype is None else torch.autocast(self.device.type, dtype=self.autocast_dtype)
+                with context:
+                    for layer_index, layer in enumerate(self.model.layers):
+                        key_cache, value_cache = allocator._kv_token_views[layer_index]
+                        q, k, v = self._inputs(layer, current, cos, sin, cfg.num_attention_heads, cfg.num_key_value_heads, head_dim)
+                        allocator.update(k[0].transpose(0, 1), v[0].transpose(0, 1), layer_index, wi[:0], wi)
+                        current = self._layer(layer, current, q, cfg.num_attention_heads, cfg.num_key_value_heads,
+                                              head_dim, key_cache[:cache_rows], value_cache[:cache_rows], qi, query_width, mask)
+                        if need_layers:
+                            hidden.append(current)
+                    return self.model.norm(current), tuple(hidden)
+            if use_graph:
+                if len(self._graphs) >= _MAX_DECODE_GRAPHS:
+                    self._graphs.popitem(last=False)
+                # Warm up compilation and library work outside capture. Writes
+                # target the same new KV positions, so repeating them is safe.
+                stream = torch.cuda.Stream(device=self.device)
+                stream.wait_stream(torch.cuda.current_stream(self.device))
+                with torch.cuda.stream(stream):
+                    run()
+                torch.cuda.current_stream(self.device).wait_stream(stream)
+                graph = torch.cuda.CUDAGraph()
+                # Graphs run serially and outputs are copied before any replay:
+                # their intermediate storage can share one bounded pool.
+                with torch.cuda.graph(graph, stream=stream, pool=self._graph_pool):
+                    result = run()
+                graph.replay()
+                self._graphs[signature] = (graph, static, result)
+            else:
+                result = run()
+        if use_graph:
+            # Pending chunks and callers must not alias the next replay output.
+            return result[0].clone(), tuple(t.clone() for t in result[1])
+        return result
 
     @torch.no_grad()
     def forward(self, *, embeds: torch.Tensor, lengths: list[int], output_hidden_states: bool = False) -> Readout:
@@ -400,9 +491,12 @@ class ContinuousDecodeSession:
         for row in selected:
             self._row(row)
         if set(selected) == set(range(self.B)):
+            self._graphs.clear()
+            self._graph_counts.clear()
             self._cache.reset()
             self._scheduler.reset()
             self._pending.clear()
+            self._deferred.clear()
             self._lengths = [0] * self.B
             # A changed layout requires allocating a new pool, even after reset.
             if module_device_dtype(self.model) != (self.device, self.dtype):
@@ -414,11 +508,15 @@ class ContinuousDecodeSession:
             for row in selected:
                 self._scheduler.set_request_cancellation(str(row))
                 self._pending.pop(row, None)
+                self._deferred.pop(row, None)
                 self._lengths[row] = 0
             self._scheduler.clear_cancelled_requests()
 
     def close(self) -> None:
         """Release the HF scheduler, KV pool, and pending embeddings. Idempotent."""
+        self._graphs.clear()
+        self._graph_counts.clear()
         self._pending.clear()
+        self._deferred.clear()
         self._scheduler = None
         self._cache = None

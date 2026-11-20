@@ -236,7 +236,12 @@ class SequentialReasoner(nn.Module):
                                                self.norm(initial[following:following + 1])))
                     else:
                         tail = torch.cat((prefix, embeds[heads[i] + 1:episode_ends[request]]))
-                        chunks[j] = tail if len(tail) else None
+                        if cache is not None and len(tail):
+                            cache.defer(rows[request], tail)
+                        # No readout consumes this suffix. A persistent episode
+                        # processes it with the next observation; an owned cache
+                        # is about to be discarded.
+                        chunks[j] = None
                 return chunks
             generate(backbone=backbone, prompts=prompts, advance=advance, backend=backend,
                      max_active_requests=max_active_requests, max_batch_tokens=max_batch_tokens,
