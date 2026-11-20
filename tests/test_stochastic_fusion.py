@@ -121,3 +121,33 @@ def test_compiled_update_and_polyak_numerics(device, centered, momentum):
     torch.manual_seed(456)
     target_update(repeated, p, scalar_tensor(.1))
     torch.testing.assert_close(repeated, target, rtol=0, atol=0)
+
+
+def test_optimizer_dynamic_shapes_reuse_graph_and_preserve_live_parameters(monkeypatch):
+    import mouse_core.precision_optim as module
+    graphs = []
+    def backend(graph, inputs):
+        graphs.append(graph)
+        return graph.forward
+    compiled = torch.compile(_rmsprop_update_, backend=backend, fullgraph=True,
+                             dynamic=True, isolate_recompiles=True)
+    parameters = [torch.nn.Parameter(torch.ones(n, 3)) for n in range(4, 24)]
+    pointers = [p.data_ptr() for p in parameters]
+    def update(parameter, *args, **kwargs):
+        assert type(parameter) is torch.Tensor and not parameter.requires_grad
+        assert parameter.data_ptr() in pointers
+        return compiled(parameter, *args, **kwargs)
+    monkeypatch.setattr(module, '_rmsprop_kernel', lambda device: update)
+    optimizer = PrecisionOptimizer(parameters, name='rmsprop', options={}, stochastic_rounding=False)
+    for p in parameters:
+        p.grad = torch.ones_like(p)
+    for _ in range(3):
+        optimizer.step()
+    assert len(graphs) == 1
+    assert set(optimizer.state) == set(parameters)
+    for p, pointer in zip(parameters, pointers, strict=True):
+        assert p.requires_grad and p.is_leaf and p.data_ptr() == pointer
+        assert bool((p < 1).all())
+        p.grad = None
+        p.square().sum().backward()
+        torch.testing.assert_close(p.grad, 2 * p.detach())

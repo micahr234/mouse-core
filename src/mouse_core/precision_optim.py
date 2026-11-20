@@ -115,8 +115,11 @@ class PrecisionOptimizer(torch.optim.Optimizer):
                         if group["centered"]:
                             state["grad_avg"] = torch.zeros_like(p, dtype=self.dtype)
                     state["step"].add_(1)
+                    # A detached alias keeps the original storage but avoids
+                    # Dynamo's static-shape policy for nn.Parameter arguments.
+                    # State remains keyed by p; backward still uses the live parameter.
                     _rmsprop_kernel(p.device)(
-                        p, gradient, state["square_avg"], state.get("grad_avg"),
+                        p.detach(), gradient, state["square_avg"], state.get("grad_avg"),
                         state.get("momentum_buffer"),
                         lr=scalar_tensor(group["lr"], self.dtype) if p.is_cuda else group["lr"],
                         alpha=group["alpha"], eps=group["eps"],
