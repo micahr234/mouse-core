@@ -131,7 +131,7 @@ def test_final_token_representation_and_token_scores_match_manual_shared_forward
     loss.backward()
     assert online.reasoner.token_head.weight.grad[0].abs().sum() > 0  # EOS is rewarded too
     assert online.embedding.embeddings["text"].embed_tokens.weight.grad[5].abs().sum() > 0
-    assert dict(online.backbone.named_parameters())["model.layers.0.mlp.down_proj.weight"].grad.abs().sum() > 0
+    assert dict(online.backbone.named_parameters())["model.layers.0.mlp.down_proj.lora_B.weight"].grad.abs().sum() > 0
 
 
 @torch.no_grad()
@@ -177,23 +177,25 @@ def test_reinforce_masks_nonparticipating_decisions_and_normalizes_weights():
 def test_dqn_plus_reinforce_update_shared_backbone_head_and_delayed_target():
     example = example_module()
     online = model()
+    from mouse_core.models.lora import apply_lora, LoRAConfig
+    apply_lora(model=online.backbone, config=LoRAConfig(rank=2))
     target = online.copy().eval()
     head_before = online.reasoner.token_head.weight.detach().clone()
-    decoder = dict(online.backbone.named_parameters())["model.layers.0.mlp.down_proj.weight"]
+    decoder = dict(online.backbone.named_parameters())["model.layers.0.mlp.down_proj.lora_B.weight"]
     decoder_before = decoder.detach().clone()
     loader = reasoning_loader(example)
     objective = DqnObjective(reward=None, value=None, gate=None, temperature=0.,
                             discount=boundary_discount(gamma_step=0.9, gamma_terminated=0., gamma_truncated=0.))
     example.run_train.__globals__.update(
-        online=online, target=target, LR_EMBEDDING=1e-3, LR_BACKBONE=1e-3, LR_HEADS=1e-3,
+        online=online, target=target, LR_EMBEDDING=1e-3, LR_BACKBONE_LORA=1e-3, LR_HEADS=1e-3,
         objective=objective, loader=loader, device=torch.get_default_device(),
         END_GENERATION_TOKEN_ID=0, MAX_NEW_TOKENS=64,
         MAX_ACTIVE_REQUESTS=2, REASONING_TEMPERATURE=0.8, REINFORCE_WEIGHT=1.,
-        POLYAK_TAU_EMBEDDING=.1, POLYAK_TAU_BACKBONE=.2, POLYAK_TAU_VALUE=.3,
+        POLYAK_TAU_EMBEDDING=.1, POLYAK_TAU_BACKBONE_LORA=.2, POLYAK_TAU_VALUE=.3,
         POLYAK_TAU_REASONING_HEAD=.4, MAX_GRAD_NORM=1.)
     configure_notebook_optimizer(example, Path(__file__).parents[1] / "examples/23_train_autoregressive_reasoning_dqn.ipynb")
     try:
-        loss, metrics = example.run_train(num_steps=1)
+        loss, metrics, next_step = example.run_train(training_step=0, num_steps=1)
     finally:
         loader.close()
     assert torch.isfinite(loss) and not loss.requires_grad

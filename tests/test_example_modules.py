@@ -34,6 +34,7 @@ from mouse_core.models import (
     DiscretizedActionHead, prepare_decode, select_discrete_action, action_readouts,
     load_model, save_model, sample_reasoning_splits,
 )
+from mouse_core.models import LoRAConfig, named_backbone_parameters
 from mouse_core.objectives import (
     DqnObjective, SupervisedObjective, PpoObjective, GrpoObjective,
     CosineObjective, best_action, boundary_discount, nstep_gate,
@@ -86,7 +87,7 @@ def _example(path, **overrides):
     def backbone_factory(**kwargs):
         construction.append(("backbone", kwargs))
         return Backbone(architecture="qwen3", hidden_dim=8, num_layers=1, num_heads=2, head_dim=16,
-                        dtype=torch.float32)
+                        dtype=torch.float32, lora=kwargs["lora"])
 
     namespace.update(Embedding=embedding_factory, Backbone=backbone_factory)
     source = next("".join(cell["source"]) for cell in notebook["cells"]
@@ -102,6 +103,9 @@ def _example(path, **overrides):
     exec(compile(ast.Module(body=body, type_ignores=[]), str(path), "exec"), namespace)
     table_count = 1 if path.stem.startswith(("19_", "20_")) else len(namespace["TOKENIZER_SOURCES"])
     assert [name for name, _ in construction] == ["embedding"] * table_count + ["backbone"]
+    assert all(not p.requires_grad for _, p in named_backbone_parameters(namespace["encoder"].backbone, adapters=False))
+    adapters = list(named_backbone_parameters(namespace["encoder"].backbone, adapters=True))
+    assert adapters and all(p.requires_grad for _, p in adapters)
     if "modules" not in namespace:  # cosine example saves separate tracker dicts
         namespace["modules"] = nn.ModuleDict({
             name: namespace[name] for name in ("encoder", "q_head", "transition")
@@ -240,7 +244,11 @@ def test_notebook_training_uses_all_online_modules_and_updates_targets(path):
             return supervised_objective(**kwargs)
 
         ns["objective"] = check_active_observations
+    kwargs["training_step"] = 11
+    if "grpo" in path.stem:
+        kwargs.update(stores=ns["stores"], branch_advantages=ns["branch_advantages"])
     result = ns["run_train"](**kwargs)
+    assert result[2] == 12
     assert isinstance(result[0], torch.Tensor)
     assert torch.isfinite(result[0]) and not result[0].requires_grad
     for name, module in ns["modules"].items():
@@ -385,7 +393,7 @@ def test_ppo_collection_restarts_replay_and_preserves_behavior_prefixes():
               sample_discrete_action=sample_discrete_action, json=json)
     _notebook_functions(notebook, {'frozenlake_fields', 'behavior_fields', 'run_rollout'}, ns)
     for initial_step in (0, 5):
-        assert ns['run_rollout'](env_steps=initial_step, num_episodes=1, max_cache=6) == initial_step + 5
+        assert ns['run_rollout'](stores=ns['stores'], contexts=ns['contexts'], env_steps=initial_step, num_episodes=1, max_cache=6) == initial_step + 5
         store = ns['stores'][0]
         rows = list(environment_decisions(store.to_dataset()))
         assert len(rows) == 5
@@ -430,10 +438,9 @@ def test_ppo_collection_restarts_replay_and_preserves_behavior_prefixes():
                           value_predictions=ns['value_head'](out['z'][:2]))
         finally:
             loader.close()
-    assert created[0].closed
-    created[-1].close()
+    assert all(env.closed for env in created)
     with pytest.raises(ValueError, match='fit a complete outer task'):
-        ns['run_rollout'](env_steps=10, num_episodes=1, max_cache=5)
+        ns['run_rollout'](stores=ns['stores'], contexts=ns['contexts'], env_steps=10, num_episodes=1, max_cache=5)
 
 
 def test_grpo_behavior_probability_uses_the_complete_training_prefix():

@@ -90,7 +90,7 @@ to recompute layer activations during backward and reduce training memory.
 Each named group specifies its online module, learning rate, and optional target
 module and Polyak rate. Group names are labels, not module lookup paths. Groups
 must not overlap. For example, with `online` and a frozen `target` containing
-`embedding`, `backbone`, and `value_head` modules:
+`embedding`, a LoRA-enabled `backbone`, and `value_head` modules:
 
 ```python
 from mouse_core import MouseOptimizer
@@ -100,8 +100,8 @@ optimizer = MouseOptimizer(
     groups={
         "embedding": {"online": online.embedding, "lr": 1e-5,
                       "target": target.embedding, "polyak_tau": 0.01},
-        "backbone": {"online": online.backbone, "lr": 1e-4,
-                     "target": target.backbone, "polyak_tau": 0.01},
+        "backbone_lora": {"online": online.backbone, "parameters": "lora", "lr": 1e-4,
+                          "target": target.backbone, "polyak_tau": 0.01},
         "value_head": {"online": online.value_head, "lr": 1e-3,
                        "target": target.value_head, "polyak_tau": 0.001},
     },
@@ -110,6 +110,13 @@ optimizer.zero_grad()
 loss.backward()
 optimizer.step(step=0)  # Batch index; AdamW first, then each target's Polyak update
 ```
+
+The group dictionary needs no filtering loop. `parameters="lora"` selects adapter
+weights in both online and target modules; `parameters="base"` selects base
+weights, and omitting it selects all parameters. Empty or fully frozen groups
+are discarded during construction and need no learning rate or Polyak rate.
+Omit known frozen components entirely: gradients still propagate through their
+computation to trainable inputs. At least one group must be trainable.
 
 One optimizer applies to every group. Select `adamw`, `adam`, `sgd`, or `rmsprop`
 by name or supply a dictionary of global options. Weight decay and algorithm
@@ -151,6 +158,40 @@ zero/unit rates are exact, and frozen/shared parameters and buffers are skipped.
 Finite values outside BF16 range saturate; NaNs/infinities are preserved.
 Restoring an exact stochastic run also requires restoring RNG state.
 
+`langevin_noise_beta` accepts a nonnegative scalar or callable batch schedule.
+When enabled, call `optimizer.step(step, online_transition_count=N)` with a
+positive replay transition count. Core adds independent Gaussian noise to each
+active raw gradient before optimizer moments or weight updates, with standard
+deviation `beta * sqrt(2 / (lr * N))`. Noise arithmetic uses `optimizer.dtype`.
+Frozen, unused and zero-rate parameters receive no noise. Zero beta draws no
+random numbers. The temporary noisy gradients do not overwrite accumulated
+gradients, and targets follow the final updated weights.
+
+For plain SGD without momentum this yields parameter-noise standard deviation
+`beta * sqrt(2 * lr / N)`. With RMSprop/Adam the noisy gradients also change the
+moments; this option is raw-gradient noise, not the preconditioned SGLD algorithm.
+See [Welling & Teh](https://icml.cc/2011/papers/398_icmlpaper.pdf) for basic SGLD and
+[Li et al.](https://arxiv.org/abs/1512.07666) for the distinct preconditioned update.
+The caller owns clipping and accumulation; inject noise only on optimizer steps,
+after those operations. The Core optimizer contains no packed per-head scaling
+policy; an experiment can specialize the gradient-noise and update transforms.
+
+For separate base and LoRA groups, use
+`mouse_core.models.backbone_parameter_view(backbone, adapters=False)` and
+`backbone_parameter_view(backbone, adapters=True)`. These non-owning views preserve
+parameter identities and names for optimizer/target pairing. Adapter membership
+comes from actual `LoRALinear` factors, independent of names or trainability.
+Do not register the views on the model. Freezing either view freezes only its
+parameters; gradients still propagate through its computation to earlier layers.
+`named_backbone_parameters` exposes the same partition as a named iterator and
+also supplies base-weight precision detection. Mouse Core training notebooks
+always enable LoRA and keep the pretrained backbone frozen. Their optimizer
+contains only backbone adapters (`parameters="lora"`), embeddings, and heads or
+reasoning components, each with its own learning rate and applicable Polyak rate.
+There is no full-backbone training switch in the examples. The general optimizer
+API supports both base and adapter selections and omits frozen or empty groups
+internally; callers need no filtering loop or explicit parameter views.
+
 Groups without a target omit both `target` and `polyak_tau`, as in supervised
 learning and GRPO. Extra components such as reasoning norms and vocabulary heads each
 have their own group. Trainability comes from the model's `requires_grad` flags;
@@ -167,7 +208,11 @@ Call the optimizer only when applying the accumulated gradient, passing that fin
 batch's index; learning-rate and Polyak schedules resolve at that index. Evaluation
 intervals and training budgets count batches independently of optimizer updates.
 Optimizer state stores moments and group identity; the training loop owns its batch
-position. Target/model weights are saved separately. Advanced packed heads can provide a per-parameter mapping of scalar or broadcast
+position. Notebook training functions require `training_step` explicitly and
+return `(loss, metrics, next_training_step)`. The calling loop passes that value
+into the next call; functions do not mutate a global counter. GRPO collections
+return replay stores, advantages, and the next episode index. PPO rollout
+environments and trackers are local to the collection, with guaranteed cleanup. Target/model weights are saved separately. Advanced packed heads can provide a per-parameter mapping of scalar or broadcast
 Tensor taus. All training notebooks use this wrapper. The standalone
 `polyak_update(target=..., source=..., tau=...)` remains available for explicit
 interpolation outside the coupled training path.
@@ -335,6 +380,22 @@ The tokenizer marks each requested decision with a single existing token:
  "format": "\n", "head_output": True, "autoregressive": True}
 ```
 
+A text head-output field can emit multiple tokens, and multiple fields may mark
+outputs within one step. Packing preserves every ordinary prediction in
+`head_mask` and separately marks the last one per step in `step_readout_mask`.
+Sequential reasoning uses only these final markers; earlier marked tokens remain
+context. `head_output_segments(inputs)` returns each episode's marker positions
+and context slices (prefix, inter-step segments, tail), preserving passive steps
+and trailing fields. The generator replaces each final marker with the learned
+start, reasons until stopping, then appends the next recorded segment. Choosing
+an environment action ends reasoning; it never replaces the recorded action.
+Low-level `make_token_batch` callers must supply `step_readout_mask` explicitly
+when using sequential reasoning; tokenizers and loaders calculate it automatically.
+
+After generation, use `generated.align_objective_data(inputs, objective_data)`
+to select prediction-to-step mappings for those final markers. Per-step labels
+remain unchanged. Both networks then train on the same aligned generated history.
+
 `SequentialReasoner(rms_norm_eps=backbone.rms_norm_eps, hidden_dim=..., min_steps=..., max_steps=..., residual_connections=...,
 adaptive_depth=...)` separates the two mechanisms. With residual connections,
 `z_next = z + update_projection(update_norm(transformer_output))`; each successive causal input is
@@ -364,6 +425,50 @@ embedding through each occurrence. The start vector is independent of the
 newline marker and pretrained token tables. A shared learned H-to-H linear map
 projects transformer outputs in both modes (non-affine RMSNorm, epsilon from the backbone configuration, then zero-initialized weights and bias). Cached chunks cannot be used as standalone
 training batches.
+
+For scheduled reasoning replay, Core provides `ReasoningDataset` and
+`ReasoningDataLoader` independently of any experiment configuration:
+
+```python
+from mouse_core.data import ReasoningDataset, ReasoningDataLoader
+
+dataset = ReasoningDataset(capacity_tokens=262144)
+loader = ReasoningDataLoader(
+    dataset=dataset,
+    sample_budget=8,
+    token_budget=None,
+    sampling="sequential",
+    seed=0,
+)
+
+# Collection: inputs and objective_data are the original complete source episodes.
+# generate_reasoning is the caller's model/policy callback, returning ReasoningBatch.
+generated = generate_reasoning(inputs)
+dataset.add(inputs, generated, objective_data, generated_step=step)
+
+# Training: no generation or environment interaction occurs in next_batch().
+training_trace, training_labels = loader.next_batch()
+training_trace = training_trace.to(device)
+training_labels = training_labels.to(device)
+```
+
+The dataset detaches and splits complete traces onto CPU, preserves original
+prediction-to-step alignment, and stores vectors only at reasoning positions.
+It retains no KV cache, Q values, weights, gradients, or model references.
+Capacity counts all sequence positions (context plus reasoning). New episodes
+append to the bank and evict oldest episodes; oversized individual episodes
+raise an error. `memory_bytes()` reports stored tensor payload size.
+
+The loader cycles sequentially or samples uniformly at random with replacement.
+It keeps episodes whole, so a token budget may be exceeded by its final episode.
+A small initial bank can serve larger batches by repetition. Sampling never
+expires entries; collection cadence belongs to the caller. Multiple loaders
+have independent cursors/RNGs and observe new entries without refresh. Storage
+and sampling are synchronous and intended for RAM, without background workers.
+`loader.sampled_steps` reports generation steps for trace-age metrics.
+`loader.close()` resets its cursor without clearing the caller-owned dataset;
+`dataset.clear()` releases the bank. `split_reasoning_episodes` and
+`pack_reasoning_episodes` also expose the packing operations independently.
 
 `value_reasoning_loss` supervises actual think choices and then the recorded
 environment action. Think's target is
@@ -1249,3 +1354,46 @@ applicable), plus `off`.
 Custom MLP and reasoning norms require an explicit `rms_norm_eps`. Example factories
 read `backbone.rms_norm_eps` from the loaded model configuration (Qwen3: `1e-6`);
 there is no separate local epsilon default or missing-field fallback.
+
+
+### Recorded actions and local checkpoint storage
+
+`mouse_core.objectives.replay_action_indices(data, sequence_ids, step_ids=...,
+readout_shape=...)` maps prediction rows to recorded outgoing actions. In arrival
+rows, `data["action"][t+1]` is the action taken from state `t`, so the supervised
+prediction is `Q_t[action[t+1]]`. This does not choose a greedy action. `step_ids`
+handles missing or repeated head readouts. NaN actions and cross-episode pairs
+are omitted; malformed action IDs and readout mappings fail validation.
+
+For ordinary DQN, pass full online action vectors to `DqnObjective`; it selects
+recorded actions through this same helper. Callers do not need to gather actions
+before invoking the objective when they already have full Q vectors. Selected
+values remain supported for heads that evaluate only the executed action.
+Reasoning losses can obtain explicit action indices from the shared helper.
+Targets, discounts, boundary masks, and loss weights remain the objective's job.
+
+`CheckpointStore` owns local model snapshot storage independently of a training
+runner. It stores frozen parameters once per directory, then changing parameters
+and all persistent buffers at each saved step. This includes buffers inside frozen
+modules. Tokenizer schemas and their named backend files are also shared once.
+
+```python
+from mouse_core import CheckpointStore, load_checkpoint, load_checkpoint_tokenizer
+
+store = CheckpointStore("runs/my-run/checkpoint")
+path = store.save(step=100, model=online, tokenizer=tokenizer,
+                  metadata={"run_name": "my-run"})
+load_checkpoint(path, model=rebuilt_model)
+restored_tokenizer = load_checkpoint_tokenizer(store.directory)
+```
+
+Construct the matching model before restoring. Load a step directory or the store
+root to select its latest completed snapshot. The current format is
+`mouse-core-checkpoint-v1`; superseded Experiment formats are not accepted.
+These are model snapshots, without optimizer state, target-network state or RNG
+state. The caller owns those separately when exact training resume is required.
+A store refuses to reuse an existing directory and rejects changes in trainability
+or model schema. Completed steps and the latest pointer are committed by rename;
+a failed write leaves the previous latest snapshot available. Repeating a completed
+step returns its existing snapshot for publication retries. Scheduling, run naming,
+metrics, extra text attachments and Hub publication belong to the caller.

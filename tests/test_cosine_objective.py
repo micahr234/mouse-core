@@ -336,7 +336,7 @@ def test_offline_dqn_cosine_example(monkeypatch):
 
     before = [p.detach().clone() for p in transition.parameters()]
     namespace["loader"] = Loader()
-    total, metrics = namespace["run_train"](num_steps=1)
+    total, metrics, next_step = namespace["run_train"](training_step=0, num_steps=1)
     assert torch.isfinite(total) and "cosine" in metrics
     assert any(not torch.equal(old, new) for old, new in zip(before, transition.parameters()))
     # No valid adjacent pairs contributes a differentiable zero.
@@ -572,7 +572,7 @@ def test_example_zero_weight_omits_transition_and_auxiliary_loss():
                 terminated=torch.tensor([False, True]), truncated=torch.tensor([False, False]))
     from types import SimpleNamespace
     ns["loader"] = SimpleNamespace(next_batch=lambda: (_tokens(0, 1), TensorDict(dict(data, step_ids=torch.arange(2), sequence_ids=torch.zeros(2, dtype=torch.long)), batch_size=[])))
-    loss, metrics = ns["run_train"](num_steps=1)
+    loss, metrics, next_step = ns["run_train"](training_step=0, num_steps=1)
     assert torch.isfinite(loss) and "cosine" not in metrics
     optimized = {id(p) for g in ns["optimizer"].param_groups for p in g["params"]}
     expected = {id(p) for module in (ns["encoder"], ns["q_head"]) for p in module.parameters()}

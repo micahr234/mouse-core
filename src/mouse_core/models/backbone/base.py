@@ -79,7 +79,7 @@ class BaseBackbone(nn.Module, ABC):
     lora: LoRAConfig | None = None
     gradient_checkpointing: bool = False
     uses_packed: bool = False
-    residual_dtype: torch.dtype
+    residual_dtype: torch.dtype | None
     autocast_dtype: torch.dtype | None = None
 
     def _set_autocast(

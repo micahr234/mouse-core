@@ -141,11 +141,14 @@ def test_example_collection_starts_new_groups_without_prior_history():
         stamp_advantages_with_prefix_len=lambda **kw: [
             [{**row, 'advantage': 0.} for row in branch] for branch in kw['branches']])
     _functions({'run_rollout'}, namespace)
-    assert namespace['run_rollout'](num_envs=2) == (2, 4)
-    assert namespace['run_rollout'](num_envs=2) == (2, 4)
+    first, first_advantages, next_episode = namespace['run_rollout'](num_envs=2, next_episode_index=0)
+    stores, advantages, next_episode = namespace['run_rollout'](num_envs=2, next_episode_index=next_episode)
+    assert next_episode == 4
+    assert len(first) == len(first_advantages) == len(stores) == len(advantages) == 4
+    assert stores is not first and advantages is not first_advantages
+    assert namespace['stores'] == [] and namespace['next_episode_index'] == 0
     assert seen == [(10, 0), (11, 0), (12, 0), (13, 0)]
-    assert len(namespace['stores']) == 4
-    for store in namespace['stores']:
+    for store in stores:
         persisted = EventLog.from_dataset(store.to_dataset())
         assert all(event['payload']['repeat_episode_index'] == 0
                    for event in persisted if event['provider'] == 'environment')

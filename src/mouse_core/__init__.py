@@ -1,5 +1,6 @@
 from importlib.metadata import version
 
+from mouse_core.checkpoint import CheckpointStore, load_checkpoint, load_checkpoint_tokenizer
 from mouse_core.models import Model, load_model
 from mouse_core.data import load_tokenizer
 from mouse_core.objectives import Objective
@@ -11,6 +12,9 @@ from mouse_core.schedule import ExponentialDecay, Piecewise
 __version__ = version("mouse-core")
 
 __all__ = [
+    "CheckpointStore",
+    "load_checkpoint",
+    "load_checkpoint_tokenizer",
     "__version__",
     "Model",
     "load_model",

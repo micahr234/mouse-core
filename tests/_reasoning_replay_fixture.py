@@ -79,4 +79,3 @@ def configure_notebook_optimizer(example, notebook):
              and any(isinstance(target, ast.Name) and target.id == 'optimizer' for target in node.targets)]
     assert len(nodes) == 1
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(notebook), 'exec'), namespace)
-    namespace['training_step'] = 0

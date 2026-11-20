@@ -60,7 +60,8 @@ class PrecisionOptimizer(torch.optim.Optimizer):
     Other algorithms and transformed updates delegate to native PyTorch math.
     Moment storage follows dtype; compiled kernels cache code, never weights.
     ``update_transform`` optionally modifies the result in optimizer dtype before its single
-    writeback (for packed-head rate multipliers and Langevin noise).
+    writeback (for packed-head rate multipliers). ``gradient_transform`` modifies
+    a temporary gradient in arithmetic dtype before optimizer moments and updates.
     """
 
     def __init__(self, params, *, name, options, dtype=torch.float32, stochastic_rounding=True):
@@ -78,6 +79,7 @@ class PrecisionOptimizer(torch.optim.Optimizer):
         self._kernel = classes[name]([{"params": [], "lr": 0.}], **options, foreach=False)
         super().__init__(params, self._kernel.defaults)
         self._kernel.param_groups = []
+        self.gradient_transform: Callable[[torch.Tensor, torch.Tensor], None] | None = None
         self.update_transform: Callable[[torch.Tensor, torch.Tensor], None] | None = None
         for group in self.param_groups:
             for p in group["params"]:
@@ -99,6 +101,10 @@ class PrecisionOptimizer(torch.optim.Optimizer):
             for p in group["params"]:
                 if not p.requires_grad or p.grad is None:
                     continue
+                gradient = p.grad
+                if self.gradient_transform is not None:
+                    gradient = gradient.detach().to(self.dtype, copy=True)
+                    self.gradient_transform(p, gradient)
                 if self.dtype in (torch.float32, torch.float64) and self.algorithm == "rmsprop" and self.update_transform is None:
                     state = self.state[p]
                     if not state:
@@ -110,7 +116,7 @@ class PrecisionOptimizer(torch.optim.Optimizer):
                             state["grad_avg"] = torch.zeros_like(p, dtype=self.dtype)
                     state["step"].add_(1)
                     _rmsprop_kernel(p.device)(
-                        p, p.grad, state["square_avg"], state.get("grad_avg"),
+                        p, gradient, state["square_avg"], state.get("grad_avg"),
                         state.get("momentum_buffer"),
                         lr=scalar_tensor(group["lr"], self.dtype) if p.is_cuda else group["lr"],
                         alpha=group["alpha"], eps=group["eps"],
@@ -119,7 +125,7 @@ class PrecisionOptimizer(torch.optim.Optimizer):
                     )
                     continue
                 update = torch.nn.Parameter(p.detach().to(self.dtype, copy=True))
-                update.grad = p.grad.detach().to(self.dtype)
+                update.grad = gradient.detach().to(self.dtype)
                 kernel_group = {**group, "params": [update]}
                 self._kernel.param_groups = [kernel_group]
                 self._kernel.state[update] = {

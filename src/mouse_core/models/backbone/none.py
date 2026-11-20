@@ -17,6 +17,7 @@ class IdentityBackbone(BaseBackbone):
         if hidden_dim <= 0:
             raise ValueError(f"hidden_dim must be > 0, got {hidden_dim}")
         self._hidden_dim = int(hidden_dim)
+        self.residual_dtype = None
 
     @property
     def hidden_dim(self) -> int:

@@ -188,7 +188,7 @@ def test_single_selected_optimizer_matches_torch_for_all_explicit_groups(name):
 @pytest.mark.parametrize("key,value", [("optimizer", "rmsprop"), ("weight_decay", .1),
                                        ("momentum", .9), ("betas", (.8, .9)), ("eps", 1e-6)])
 def test_groups_reject_optimizer_overrides(key, value):
-    with pytest.raises(ValueError, match="only target and polyak_tau"):
+    with pytest.raises(ValueError, match="supported settings"):
         MouseOptimizer(groups={"weights": {"online": nn.Linear(2, 1), "lr": .1, key: value}})
 
 

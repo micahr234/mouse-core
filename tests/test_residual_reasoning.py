@@ -95,7 +95,7 @@ def batch(rows=((2, 3, 9), (4, 9), (9,))):
     ids = np.concatenate(rows)
     heads = np.isin(np.arange(len(ids)), np.cumsum(lengths) - 1)
     return make_token_batch(token_ids=ids, numeric_values=np.zeros(len(ids)), numeric_mask=np.zeros(len(ids), bool),
-                            head_mask=heads, autoregressive_mask=heads.copy(),
+                            head_mask=heads, autoregressive_mask=heads.copy(), step_readout_mask=heads.copy(),
                             sequence_ids=np.repeat(np.arange(len(rows)), lengths),
                             num_sequences=len(rows), tokenizer_names=('text',))
 
@@ -272,6 +272,7 @@ def test_passive_batch_skips_generation_and_replay():
     online = model()
     tokens = batch()
     tokens['head_mask'].zero_()
+    tokens['step_readout_mask'].zero_()
     tokens['autoregressive_mask'].zero_()
     calls = []
     hook = online.backbone.register_forward_hook(lambda *_: calls.append(True))
@@ -346,9 +347,11 @@ def test_autoregressive_field_requires_one_token_and_a_readout(spec):
 def test_notebook_dqn_update_replays_online_trajectory_through_both_models(tmp_path, monkeypatch):
     example = example_module()
     online = model()
+    from mouse_core.models.lora import apply_lora, LoRAConfig
+    apply_lora(model=online.backbone, config=LoRAConfig(rank=2))
     target = online.copy().eval()
     with torch.no_grad():
-        target.backbone.linear.bias.add_(.3)
+        target.backbone.linear.base.bias.add_(.3)
     original = {n: p.detach().clone() for n, p in online.named_parameters()}
     target_before = {n: p.detach().clone() for n, p in target.named_parameters()}
     loader = reasoning_loader(example)
@@ -388,14 +391,14 @@ def test_notebook_dqn_update_replays_online_trajectory_through_both_models(tmp_p
         seen_backups.append(kwargs['backup_value_predictions'].clone())
         return objective(**kwargs)
     example.run_train.__globals__.update(
-        online=online, target=target, LR_EMBEDDING=1e-3, LR_BACKBONE=1e-3, LR_HEADS=1e-3,
+        online=online, target=target, LR_EMBEDDING=1e-3, LR_BACKBONE_LORA=1e-3, LR_REASONING_NORM=1e-3, LR_HEADS=1e-3,
         objective=check_objective, loader=loader, device=torch.device('cpu'),
         MAX_ACTIVE_REQUESTS=2,
-        POLYAK_TAU_EMBEDDING=.1, POLYAK_TAU_BACKBONE=.2, POLYAK_TAU_VALUE=.3,
+        POLYAK_TAU_EMBEDDING=.1, POLYAK_TAU_BACKBONE_LORA=.2, POLYAK_TAU_REASONING_NORM=.2, POLYAK_TAU_VALUE=.3,
         MAX_GRAD_NORM=1., REASONING_STEP_COST=.01, GAMMA_THINK=1.)
     configure_notebook_optimizer(example, NOTEBOOK)
     try:
-        loss, metrics = example.run_train(num_steps=1)
+        loss, metrics, next_step = example.run_train(training_step=0, num_steps=1)
     finally:
         loader.close()
     assert torch.isfinite(loss) and not loss.requires_grad
@@ -403,16 +406,19 @@ def test_notebook_dqn_update_replays_online_trajectory_through_both_models(tmp_p
     assert all(np.isfinite(value) for value in metrics.values()) and calls.count(True) == 1
     assert len(replays) == 2 and replays[0] is replays[1]
     torch.testing.assert_close(seen_backups[0], expected_target)
-    assert not torch.equal(original['backbone.linear.weight'], online.backbone.linear.weight)
+    assert not torch.equal(original['backbone.linear.lora_B.weight'], online.backbone.linear.lora_B.weight)
     assert not torch.equal(original['reasoner.norm.weight'], online.reasoner.norm.weight)
     assert all(p.grad is None for p in target.parameters())
     for name, parameter in target.named_parameters():
         rate = (.1 if name.startswith('embedding.') else .3 if name.startswith(('value_head.', 'reasoner.start_embedding.', 'reasoner.update_projection.'))
                 else .2)
+        if not dict(online.named_parameters())[name].requires_grad:
+            rate = 0.
         torch.testing.assert_close(parameter, target_before[name].lerp(dict(online.named_parameters())[name], rate))
     monkeypatch.setattr(online.reasoner, 'generate', original_generation)
     save_model(model=online, path=tmp_path / 'saved')
     restored = model()
+    apply_lora(model=restored.backbone, config=LoRAConfig(rank=2))
     load_model(model=restored, repo_id_or_path=tmp_path / 'saved')
     torch.testing.assert_close(restored(generate(restored, tokens))['q'],
                                online(generate(online, tokens))['q'])
@@ -469,6 +475,7 @@ def test_residual_retains_adaptive_reasoning_in_episode_cache_until_reset(monkey
             full_tokens = batch(tuple(tuple(h) + u for h, u in zip(histories, updates)))
             full_tokens['head_mask'] = full_tokens['token_ids'] == 9
             full_tokens['autoregressive_mask'] = full_tokens['head_mask'].clone()
+            full_tokens['step_readout_mask'] = full_tokens['head_mask'].clone()
             expected = online.reasoner.generate(full_tokens, embedding=online.embedding, backbone=online.backbone,
                 action_values=online.value_head, select_actions=selector(full_tokens), backend='uncached', max_active_requests=2)
             groups = full_tokens['sequence_ids'][full_tokens['head_mask']]
@@ -519,6 +526,7 @@ def test_pending_episode_uses_finished_slot_while_longer_episode_continues(monke
     tokens = batch(((2, 9, 3, 9), (4, 9), (1, 9)))
     tokens['head_mask'] = tokens['token_ids'] == 9
     tokens['autoregressive_mask'] = tokens['head_mask'].clone()
+    tokens['step_readout_mask'] = tokens['head_mask'].clone()
     expected = online.reasoner.generate(tokens, embedding=online.embedding, backbone=online.backbone,
         action_values=online.value_head, backend='uncached', max_active_requests=1)
     resets = []
@@ -544,6 +552,7 @@ def test_multiple_actions_retain_every_depth_with_detached_feedback():
     tokens = batch(((2, 9, 3, 9), (4, 9, 5, 9)))
     tokens['head_mask'] = tokens['token_ids'] == 9
     tokens['autoregressive_mask'] = tokens['head_mask'].clone()
+    tokens['step_readout_mask'] = tokens['head_mask'].clone()
     generated = generate(online, tokens)
     assert generated.lengths.tolist() == [4] * 4
     assert generated.tokens['num_sequences'] == 2
@@ -587,6 +596,7 @@ def test_adaptive_depths_retain_only_executed_states_and_replay_exactly(backend)
     tokens = batch(((2, 9, 3, 9), (4, 9), (1, 9)))
     tokens['head_mask'] = tokens['token_ids'] == 9
     tokens['autoregressive_mask'] = tokens['head_mask'].clone()
+    tokens['step_readout_mask'] = tokens['head_mask'].clone()
     lengths = torch.tensor([1, 3, 2, 4])
     calls = []
     def select(values, indices, depths):
@@ -636,6 +646,7 @@ def test_explicit_positions_and_target_weights_replay_the_same_latent_history(ma
     tokens = batch(((2, 9, 3, 4, 9, 5), (6, 7), (8, 9)))
     tokens['head_mask'] = tokens['token_ids'] == 9
     tokens['autoregressive_mask'] = tokens['head_mask'].clone()
+    tokens['step_readout_mask'] = tokens['head_mask'].clone()
     # Logical rows 1 and 3 are empty; row 2 has context but no decision.
     tokens['sequence_ids'] *= 2
     tokens.set_non_tensor('num_sequences', 5)
@@ -715,6 +726,7 @@ def test_sparse_cached_rows_preserve_passive_context_and_reset_positions():
         tokens = batch(rows)
         tokens['head_mask'] = tokens['token_ids'] == 9
         tokens['autoregressive_mask'] = tokens['head_mask'].clone()
+        tokens['step_readout_mask'] = tokens['head_mask'].clone()
         return tokens
 
     def selector(tokens):

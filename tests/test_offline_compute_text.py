@@ -110,7 +110,7 @@ def test_offline_dqn_update_backpropagates_into_compute_positions():
 
     hook = ns["encoder"].embedding.register_forward_hook(capture)
     try:
-        loss, _ = ns["run_train"](num_steps=1)
+        loss, _, next_step = ns["run_train"](training_step=0, num_steps=1)
     finally:
         hook.remove()
     assert torch.isfinite(loss)

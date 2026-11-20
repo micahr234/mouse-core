@@ -189,3 +189,35 @@ def apply_lora(*, model: nn.Module, config: LoRAConfig) -> int:
             replacements[id(child)] = LoRALinear(child, config)
         setattr(parent, name, replacements[id(child)])
     return len(replacements)
+
+
+def named_backbone_parameters(backbone: nn.Module, *, adapters: bool) -> Iterator[tuple[str, nn.Parameter]]:
+    """Select LoRA factors or base parameters by identity, independent of freezing.
+
+    Names stay relative to the supplied backbone. Tied parameters appear once.
+    Only factors owned by LoRALinear are adapters; names alone do not identify one.
+    """
+    adapter_ids = {id(p) for layer in lora_modules(backbone)
+                   for factor in (layer.lora_A, layer.lora_B) for p in factor.parameters()}
+    for name, parameter in backbone.named_parameters():
+        if (id(parameter) in adapter_ids) == adapters:
+            yield name, parameter
+
+
+def backbone_parameter_view(backbone: nn.Module, *, adapters: bool) -> nn.Module:
+    """Non-owning optimizer/target group with original parameter names.
+
+    Do not register this view as a child of the original model. Changing
+    requires_grad on its parameters freezes weights without detaching forward
+    computation, so gradients can still reach earlier trainable embeddings.
+    """
+    view = nn.Module()
+    for name, parameter in named_backbone_parameters(backbone, adapters=adapters):
+        parent = view
+        *parts, leaf = name.split(".")
+        for part in parts:
+            if part not in parent._modules:
+                parent.add_module(part, nn.Module())
+            parent = parent.get_submodule(part)
+        parent.register_parameter(leaf, parameter)
+    return view

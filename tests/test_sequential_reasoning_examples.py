@@ -12,6 +12,7 @@ import torch
 from torch import nn
 
 from mouse_core.models import Embedding, MultiEmbedding
+from mouse_core.models.lora import apply_lora, LoRAConfig
 from mouse_core.objectives import DqnObjective, boundary_discount
 from tests._reasoning_replay_fixture import configure_notebook_optimizer, reasoning_loader
 from tests.test_residual_reasoning import CausalBackbone
@@ -59,12 +60,13 @@ def test_notebook_training_uses_its_selected_recurrence_and_target_depth(reasoni
                   backbone=CausalBackbone(), value_head=head, max_steps=max_steps)
     online = example.ReasoningDqn(**kwargs, min_steps=min_steps,
         residual_connections=residual, reasoning_loss=reasoning_loss)
+    apply_lora(model=online.backbone, config=LoRAConfig(rank=2))
     with torch.no_grad():
         online.reasoner.update_projection.weight.copy_(torch.eye(8).roll(1, 0) * .7)
         online.reasoner.update_projection.bias.fill_(.03)
     target = deepcopy(online).requires_grad_(False).eval()
     with torch.no_grad():
-        target.backbone.linear.bias.add_(.35)
+        target.backbone.linear.base.bias.add_(.35)
         target.value_head.bias.add_(.5)
         if adaptive and min_steps > 1:
             target.value_head.bias[:-1].add_(100.)
@@ -117,14 +119,14 @@ def test_notebook_training_uses_its_selected_recurrence_and_target_depth(reasoni
     handle = online.reasoner.register_forward_hook(record_states)
     with reasoning_loader(example) as loader:
         example.run_train.__globals__.update(
-            online=online, target=target, LR_EMBEDDING=.001, LR_BACKBONE=.001, LR_HEADS=.001,
+            online=online, target=target, LR_EMBEDDING=.001, LR_BACKBONE_LORA=.001, LR_REASONING_NORM=.001, LR_HEADS=.001,
             objective=checked_objective, loader=loader, device=torch.device('cpu'),
             MAX_ACTIVE_REQUESTS=2,
-            POLYAK_TAU_EMBEDDING=.1, POLYAK_TAU_BACKBONE=.2, POLYAK_TAU_VALUE=.3,
+            POLYAK_TAU_EMBEDDING=.1, POLYAK_TAU_BACKBONE_LORA=.2, POLYAK_TAU_REASONING_NORM=.2, POLYAK_TAU_VALUE=.3,
             MAX_GRAD_NORM=1., REASONING_STEP_COST=.2, GAMMA_THINK=.4)
         configure_notebook_optimizer(example, EXAMPLES / "25_train_reasoning_dqn.ipynb")
         try:
-            loss, metrics = example.run_train(num_steps=1)
+            loss, metrics, next_step = example.run_train(training_step=0, num_steps=1)
         finally:
             handle.remove()
     weighted_errors, transition_weights = [], []
@@ -156,6 +158,10 @@ def test_notebook_training_uses_its_selected_recurrence_and_target_depth(reasoni
         assert gradient[:, :-1].count_nonzero() == 0
     assert gradient[:, -1].abs().sum() > 0
     assert all(parameter.grad is None for parameter in target.parameters())
+    for name, param in online.named_parameters():
+        if not param.requires_grad:
+            assert param.grad is None
+            torch.testing.assert_close(param, original_weights[name], rtol=0, atol=0)
     for component in ('embedding.', 'backbone.', 'reasoner.norm.', 'reasoner.start_embedding.', 'reasoner.update_projection.', 'value_head.'):
         assert any(not torch.equal(original_weights[name], param)
                    for name, param in online.named_parameters() if name.startswith(component))

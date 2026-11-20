@@ -128,7 +128,7 @@ def make_token_batch(
     tokenizer_ids=None, tokenizer_names=("default",),
     numeric_field_ids=None, numeric_field_names=(),
     position_values=None, position_mask=None,
-    autoregressive_mask=None,
+    autoregressive_mask=None, step_readout_mask=None,
 ) -> TensorDict:
     """Build CPU tensor inputs without scanning or validating batch contents.
 
@@ -145,8 +145,10 @@ def make_token_batch(
     head_mask [L] selects tokens passed to prediction heads.
     autoregressive_mask [L] identifies tokenizer-defined generation starts and
     defaults to false. Generation implementations decide how to consume them.
-    Step mappings belong to objective_data, not model inputs. Names and num_sequences are
-    non-tensor metadata; the count includes empty decode sequences.
+    step_readout_mask [L] marks the LAST head-output token of each step, for
+    reasoning insertion. Low-level producers must supply it for reasoning;
+    omitted masks are false. Full prediction-to-step mappings belong to objective_data.
+    Names and num_sequences are non-tensor metadata; the count includes empty decode sequences.
     """
     ids = torch.as_tensor(token_ids, dtype=torch.int64, device="cpu")
     shape = ids.shape
@@ -156,6 +158,8 @@ def make_token_batch(
         "numeric_mask": torch.as_tensor(numeric_mask, dtype=torch.bool, device="cpu"),
         "sequence_ids": torch.as_tensor(sequence_ids, dtype=torch.int64, device="cpu"),
         "head_mask": torch.as_tensor(head_mask, dtype=torch.bool, device="cpu"),
+        "step_readout_mask": (torch.zeros(shape, dtype=torch.bool, device="cpu") if step_readout_mask is None
+                              else torch.as_tensor(step_readout_mask, dtype=torch.bool, device="cpu")),
         "autoregressive_mask": (torch.zeros(shape, dtype=torch.bool, device="cpu") if autoregressive_mask is None
                                 else torch.as_tensor(autoregressive_mask, dtype=torch.bool, device="cpu")),
         "tokenizer_ids": (torch.zeros(shape, dtype=torch.int64, device="cpu") if tokenizer_ids is None
@@ -395,6 +399,10 @@ def pack_token_batch(
     head_mask = np.concatenate(head_masks)
     head_token_ids = np.flatnonzero(head_mask)
     step_ids = np.searchsorted(np.cumsum(lengths), head_token_ids, side="right")
+    step_readout_mask = np.zeros(head_mask.shape, dtype=bool)
+    if len(head_token_ids):
+        last_rows = np.r_[step_ids[1:] != step_ids[:-1], True]
+        step_readout_mask[head_token_ids[last_rows]] = True
     fields = _stack_objective_fields(steps)
     inputs = make_token_batch(
         position_values=np.concatenate(position_values),
@@ -406,6 +414,7 @@ def pack_token_batch(
         numeric_values=np.concatenate(numeric_values),
         sequence_ids=np.repeat(seq_per_step, lengths),
         head_mask=head_mask,
+        step_readout_mask=step_readout_mask,
         autoregressive_mask=np.concatenate(autoregressive_masks),
         tokenizer_ids=np.concatenate(tokenizer_ids),
         tokenizer_names=tokenizer_names,
@@ -415,3 +424,51 @@ def pack_token_batch(
     objective_data["step_ids"] = torch.from_numpy(step_ids)
     objective_data["sequence_ids"] = torch.tensor(seq_per_step, dtype=torch.int64, device="cpu")
     return inputs, TensorDict(objective_data, batch_size=[], device="cpu")
+
+
+@dataclass(frozen=True)
+class HeadOutputSegments:
+    """One episode's context slices separated by final step readout markers.
+
+    For N markers there are N+1 context slices: prefix, inter-step history,
+    and tail. The markers themselves are excluded because reasoning replaces
+    them with its learned start. Concatenating slices and intervening markers
+    reproduces every original token, including passive steps and trailing fields.
+    """
+
+    sequence_id: int
+    head_token_ids: tuple[int, ...]
+    context_slices: tuple[slice, ...]
+
+
+def head_output_segments(tokens: TensorDict) -> tuple[HeadOutputSegments, ...]:
+    """Split packed episodes at their explicitly saved final head-output markers.
+
+    This never infers steps from adjacent head tokens: fields in the same step
+    may be separated by ordinary tokens. ``pack_token_batch`` saves the mask
+    before discarding the StepTokens boundaries.
+    """
+    groups = tokens["sequence_ids"].detach().cpu()
+    mask = tokens["step_readout_mask"].detach().cpu()
+    heads = tokens["head_mask"].detach().cpu()
+    if mask.shape != groups.shape or mask.dtype != torch.bool or bool((mask & ~heads).any()):
+        raise ValueError("step_readout_mask must be boolean and select head-output tokens")
+    if len(groups) and (bool((groups[1:] < groups[:-1]).any()) or int(groups[0]) < 0
+                        or int(groups[-1]) >= tokens["num_sequences"]):
+        raise ValueError("Segment sequences must be packed in increasing sequence order")
+    positions = mask.nonzero().flatten().tolist()
+    result = []
+    cursor = 0
+    for group in range(tokens["num_sequences"]):
+        start = int(torch.searchsorted(groups, group))
+        end = int(torch.searchsorted(groups, group, right=True))
+        first = cursor
+        while cursor < len(positions) and positions[cursor] < end:
+            cursor += 1
+        selected = tuple(positions[first:cursor])
+        if bool(heads[start:end].any()) and not selected:
+            raise ValueError("Head-output steps require explicit step_readout_mask boundaries")
+        starts = (start, *(head + 1 for head in selected))
+        stops = (*selected, end)
+        result.append(HeadOutputSegments(group, selected, tuple(slice(a, b) for a, b in zip(starts, stops))))
+    return tuple(result)

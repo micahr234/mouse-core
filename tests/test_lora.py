@@ -237,22 +237,11 @@ def test_module_device_dtype_skips_lora_adapters() -> None:
     """Flex train/decode must not take dtype from an fp32 adapter that happens to be first."""
     from mouse_core.models.backbone.flex_utils import module_device_dtype
 
-    class _Adapter(nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.weight = nn.Parameter(torch.ones(2, dtype=torch.float32))
-
-    class _Stack(nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            # Register adapters first so next(parameters()) is fp32.
-            self.q_proj = nn.Module()
-            self.q_proj.lora_A = _Adapter()
-            self.q_proj.lora_B = _Adapter()
-            self.base = nn.Module()
-            self.base.weight = nn.Parameter(torch.ones(3, dtype=torch.bfloat16))
-
-    stack = _Stack()
+    stack = LoRALinear(nn.Linear(2, 3, dtype=torch.bfloat16), LoRAConfig(rank=1))
+    # Register real LoRA factors before their base to exercise traversal order.
+    base = stack.base
+    del stack.base
+    stack.base = base
     first = next(stack.parameters())
     assert first.dtype == torch.float32
     device, dtype = module_device_dtype(stack)

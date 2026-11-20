@@ -17,12 +17,22 @@ from mouse_core.data.augmenter import (
 from mouse_core.data.compose import compose
 from mouse_core.data.modality import TokenizerModalitySpec
 from mouse_core.data.tokenizer import Tokenizer, EventTokenStream, load_tokenizer, save_tokenizer
-from mouse_core.data.token_batch import make_token_batch, StepTokens, empty_token_batch, pack_token_batch
+from mouse_core.data.token_batch import make_token_batch, StepTokens, empty_token_batch, pack_token_batch, HeadOutputSegments, head_output_segments
+
+from mouse_core.data.reasoning_dataset import (
+    ReasoningDataset, ReasoningEpisode, split_reasoning_episodes, pack_reasoning_episodes,
+)
+from mouse_core.data.reasoning_loader import ReasoningDataLoader
 
 __all__ = [
     "Augmenter",
     "compose",
     "DataLoader",
+    "ReasoningDataset",
+    "ReasoningDataLoader",
+    "ReasoningEpisode",
+    "split_reasoning_episodes",
+    "pack_reasoning_episodes",
     "EpochDataLoader",
     "Datastore",
     "DatasetSnapshot",
@@ -44,6 +54,8 @@ __all__ = [
     "StepTokens",
     "make_token_batch",
     "pack_token_batch",
+    "HeadOutputSegments",
+    "head_output_segments",
     "empty_token_batch",
     "load_stores_from_hub",
     "push_stores_to_hub",

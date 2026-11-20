@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal, cast
 
 import math
@@ -11,6 +11,7 @@ import torch
 from tensordict import TensorDict
 from torch import nn
 
+from mouse_core.data.token_batch import head_output_segments
 from mouse_core.models.backbone.base import BaseBackbone
 from mouse_core.models.backbone.continuous_decode import ContinuousDecodeSession
 from mouse_core.models.embedding import MultiEmbedding
@@ -52,6 +53,31 @@ class ReasoningBatch:
     lengths: torch.Tensor
     cached_prefix: bool = False
 
+    def to(self, device: torch.device | str) -> ReasoningBatch:
+        """Move the complete trace without changing precision or detaching gradients."""
+        return replace(self, tokens=self.tokens.to(device), **{
+            key: getattr(self, key).to(device) for key in
+            ('initial_positions', 'update_positions', 'readout_positions', 'states', 'lengths')})
+
+    def align_objective_data(self, source_tokens: TensorDict, objective_data: TensorDict) -> TensorDict:
+        """Select each decision's original final head row without shifting step labels.
+
+        Ordinary DQN may predict at many tokens per step. Reasoning predicts at
+        only the last one, while actions/rewards still retain all environment steps.
+        Call this once on the original source data, before splitting replay episodes.
+        """
+        original_heads = source_tokens["head_mask"].nonzero().flatten()
+        if len(original_heads) != len(objective_data["step_ids"]):
+            raise ValueError("Source head-output rows must align with objective step_ids")
+        selected = torch.tensor(self.head_token_ids, device=original_heads.device, dtype=torch.long)
+        rows = torch.searchsorted(original_heads, selected)
+        if (bool((rows >= len(original_heads)).any())
+                or not torch.equal(original_heads[rows], selected)):
+            raise ValueError("Reasoning starts must identify original head-output tokens")
+        data = objective_data.clone(recurse=False)
+        data["step_ids"] = data["step_ids"][rows.to(data["step_ids"].device)]
+        return data
+
 
 @contextmanager
 def _evaluating(*roots: nn.Module) -> Iterator[None]:
@@ -72,7 +98,7 @@ class SequentialReasoner(nn.Module):
     With residual connections, z[r+1] = z[r] + P(T(context, Norm(z[r].detach()))).
     Otherwise every reasoning position receives Norm(the dedicated trainable start embedding)
     and its representation is the projected transformer output at that position.
-    P is one shared, learned H-to-H linear map, initialized to identity.
+    P is a shared RMSNorm followed by a learned H-to-H linear map, initialized to zero.
 
     Adaptive depth selects among environment actions and one final think action.
     Before min_steps only think is available; at max_steps only environment
@@ -126,12 +152,6 @@ class SequentialReasoner(nn.Module):
             numeric_field_ids=tensors["numeric_field_ids"], numeric_field_names=tokens["numeric_field_names"],
             position_values=tensors["position_values"], position_mask=tensors["position_mask"],
         )
-    @staticmethod
-    def _heads(tokens: TensorDict) -> tuple[int, ...]:
-        mask = tokens.get("autoregressive_mask", None)
-        if mask is None or not torch.equal(mask, tokens["head_mask"]):
-            raise ValueError("Sequential reasoning requires autoregressive=True on every head-output token")
-        return tuple(mask.nonzero(as_tuple=True)[0].tolist())
 
     @torch.no_grad()
     def _generate_trace(
@@ -159,7 +179,10 @@ class SequentialReasoner(nn.Module):
             raise ValueError("max_active_requests must be a positive integer")
         if cache is not None and backend != "continuous":
             raise ValueError("Persistent episode generation requires the continuous backend")
-        heads = self._heads(tokens)
+        segments = head_output_segments(tokens)
+        heads = tuple(head for episode in segments for head in episode.head_token_ids)
+        if heads and not bool(tokens["autoregressive_mask"][list(heads)].all()):
+            raise ValueError("Sequential reasoning requires autoregressive=True on each final head-output token")
         if not heads and cache is None:
             device = next(embedding.parameters()).device
             lengths = torch.empty(0, device=device, dtype=torch.long)
@@ -170,21 +193,21 @@ class SequentialReasoner(nn.Module):
             initial = self.start_embedding.weight.float().expand(len(heads), -1)
             states = initial[:, None, :].expand(-1, self.max_steps + 1, -1).clone()
             counts = [0] * len(heads)
-            groups = tokens["sequence_ids"].to(embeds.device)
             episode_heads: list[list[int]] = []
-            episode_ends: list[int] = []
+            contexts: list[tuple[slice, ...]] = []
             rows, prompts = [], []
-            for group in range(tokens["num_sequences"]):
-                start = int(torch.searchsorted(groups, group))
-                end = int(torch.searchsorted(groups, group, right=True))
-                if start == end:
+            head_index = 0
+            for episode in segments:
+                if not episode.head_token_ids and episode.context_slices[0].start == episode.context_slices[0].stop:
                     continue
-                indices = [i for i, head in enumerate(heads) if int(groups[head]) == group]
-                rows.append(group)
+                indices = list(range(head_index, head_index + len(episode.head_token_ids)))
+                head_index += len(indices)
+                rows.append(episode.sequence_id)
                 episode_heads.append(indices)
-                episode_ends.append(end)
-                prompts.append(torch.cat((embeds[start:heads[indices[0]]], self.norm(initial[indices[0]:indices[0] + 1])))
-                               if indices else embeds[start:end])
+                contexts.append(episode.context_slices)
+                prefix = embeds[episode.context_slices[0]]
+                prompts.append(torch.cat((prefix, self.norm(initial[indices[0]:indices[0] + 1])))
+                               if indices else prefix)
             cursors = [0] * len(rows)
             def advance(requests: list[int], hidden: torch.Tensor) -> list[torch.Tensor | None]:
                 chunks: list[torch.Tensor | None] = [None] * len(requests)
@@ -232,10 +255,10 @@ class SequentialReasoner(nn.Module):
                     prefix = self.norm(state) if self.residual_connections else state[:0]
                     if next_index < len(episode_heads[request]):
                         following = episode_heads[request][next_index]
-                        chunks[j] = torch.cat((prefix, embeds[heads[i] + 1:heads[following]],
+                        chunks[j] = torch.cat((prefix, embeds[contexts[request][next_index]],
                                                self.norm(initial[following:following + 1])))
                     else:
-                        tail = torch.cat((prefix, embeds[heads[i] + 1:episode_ends[request]]))
+                        tail = torch.cat((prefix, embeds[contexts[request][-1]]))
                         if cache is not None and len(tail):
                             cache.defer(rows[request], tail)
                         # No readout consumes this suffix. A persistent episode
@@ -325,6 +348,7 @@ class SequentialReasoner(nn.Module):
         starts = torch.tensor(initial, device=device, dtype=torch.long)
         ends = torch.tensor(readouts, device=device, dtype=torch.long)
         packed["head_mask"][ends] = True
+        packed["step_readout_mask"] = packed["head_mask"].clone()
         # Generation is complete: starts are metadata, not pending markers.
         return ReasoningBatch(packed, starts, positions, ends, trace.head_token_ids,
                              trace.states, trace.lengths, cached_prefix)

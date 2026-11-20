@@ -8,7 +8,7 @@ from mouse_core.models.embedding import Embedding, MultiEmbedding
 from mouse_core.models.autoregressive_reasoner import AutoregressiveReasoner, ReasoningReadout, ReasoningTrace
 from mouse_core.models.heads import DiscretizedActionHead, DiscretizedLinear
 from mouse_core.models.io import load_model, push_model_to_hub, save_model
-from mouse_core.models.lora import LoRAConfig
+from mouse_core.models.lora import LoRAConfig, backbone_parameter_view, named_backbone_parameters
 from mouse_core.models.mlp import MLP
 from mouse_core.models.vocabulary_head import VocabularyHead
 from mouse_core.models.reasoner import LatentReasoner, sample_reasoning_splits
@@ -24,6 +24,8 @@ __all__ = [
     "BaseBackbone",
     "IdentityBackbone",
     "LoRAConfig",
+    "backbone_parameter_view",
+    "named_backbone_parameters",
     "LatentReasoner",
     "AutoregressiveReasoner",
     "ReasoningTrace",

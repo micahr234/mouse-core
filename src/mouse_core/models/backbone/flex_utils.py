@@ -1,6 +1,7 @@
 """Shared FlexAttention mask, precision and position utilities."""
 from __future__ import annotations
 from typing import Any, Callable, cast
+from mouse_core.models.lora import named_backbone_parameters
 import torch
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
@@ -51,10 +52,6 @@ def _use_flex_compile(device: torch.device) -> bool:
     return device.type == "cuda"
 
 
-def _is_lora_adapter(name: str) -> bool:
-    return ".lora_A." in name or ".lora_B." in name
-
-
 def module_device_dtype(module: torch.nn.Module) -> tuple[torch.device, torch.dtype]:
     """Device and dtype of a module's base weights.
 
@@ -63,9 +60,7 @@ def module_device_dtype(module: torch.nn.Module) -> tuple[torch.device, torch.dt
     allocated in the compute dtype: the base dtype, or the backbone's
     ``autocast_dtype`` when that is set.)
     """
-    for name, param in module.named_parameters():
-        if _is_lora_adapter(name):
-            continue
+    for _, param in named_backbone_parameters(module, adapters=False):
         return param.device, param.dtype
     try:
         param = next(module.parameters())

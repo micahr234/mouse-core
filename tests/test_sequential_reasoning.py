@@ -82,6 +82,7 @@ def test_variant_positions_and_outputs_match_literal_token_history(residual_conn
     tokens = batch(((2, 9, 3, 9, 4), (5, 9)))
     tokens['head_mask'] = tokens['token_ids'] == 9
     tokens['autoregressive_mask'] = tokens['head_mask'].clone()
+    tokens['step_readout_mask'] = tokens['head_mask'].clone()
     lengths = torch.tensor([1, cap, min(2, cap)] if adaptive_depth else [cap] * 3)
     calls = []
     trace = generate(parts, tokens, lengths=lengths, calls=calls)
@@ -121,6 +122,7 @@ def test_real_cache_retains_exact_generated_token_count_and_replays(residual_con
     full = batch(((2, 9, 3, 9), (4, 5, 9, 6, 9)))
     full['head_mask'] = full['token_ids'] == 9
     full['autoregressive_mask'] = full['head_mask'].clone()
+    full['step_readout_mask'] = full['head_mask'].clone()
     session = backbone.decode_session(2, max_batch_tokens=3, cache_capacity_tokens=1024)
     try:
         generated_first = generate(parts, first, backend='continuous', cache=session)

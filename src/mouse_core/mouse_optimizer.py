@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from math import isfinite
-from numbers import Real
+from math import isfinite, sqrt
+from numbers import Integral, Real
 from typing import Any
 
 import torch
 from torch import nn
 
+from mouse_core.models.lora import backbone_parameter_view
 from mouse_core.optim import AdamW
 from mouse_core.rounding import polyak_parameter_
 from mouse_core.precision_optim import PrecisionOptimizer
@@ -77,11 +78,21 @@ def _make_optimizer(params: list[dict[str, Any]], specification: Any, *, dtype=t
 class MouseOptimizer:
     """One selectable optimizer and explicit online/target groups.
 
-    ``groups`` maps labels to settings: required ``online`` module and ``lr``,
-    plus optional ``target`` module and ``polyak_tau`` (provided together).
+    ``groups`` maps labels to settings: an ``online`` module, ``lr`` for trainable
+    groups, and optional ``target`` plus ``polyak_tau`` (provided together).
+    ``parameters="base"`` selects non-LoRA weights; ``parameters="lora"`` selects
+    LoRA factors on both online and target modules. Omit it to select all weights.
+    Empty and fully frozen groups are discarded during construction, so callers
+    need no filtering loop. Known frozen groups can simply be omitted.
     ``dtype`` selects both optimizer arithmetic and moment storage precision.
     ``stochastic_rounding`` controls rounding when writing online weights and
     delayed Polyak targets, without master weights.
+    ``langevin_noise_beta`` is a nonnegative number or batch-index schedule.
+    When positive, ``step`` requires ``online_transition_count`` and adds noise
+    to raw gradients with standard deviation ``beta * sqrt(2 / (lr * count))``
+    before moment updates. Noise uses optimizer arithmetic precision. Zero-rate
+    groups receive no noise. With SGD without momentum this has SGLD scaling;
+    with adaptive optimizers it is gradient noise, not preconditioned SGLD.
     Online and target modules live in the groups; labels are not module paths.
     Online groups must be disjoint. Trainability follows ``requires_grad``.
 
@@ -99,11 +110,15 @@ class MouseOptimizer:
     def __init__(
         self, *, groups: Mapping[str, Mapping[str, Any]], optimizer: Any = "adamw",
         dtype: torch.dtype = torch.float32, stochastic_rounding: bool = False,
+        langevin_noise_beta: Any = 0.0,
     ) -> None:
         if type(stochastic_rounding) is not bool:
             raise TypeError("Stochastic rounding options must be booleans")
         if dtype not in (torch.float64, torch.float32, torch.bfloat16):
             raise ValueError("Optimizer dtype must be float64, float32 or bfloat16")
+        if not callable(langevin_noise_beta):
+            _rate(langevin_noise_beta, name="langevin_noise_beta")
+        self.langevin_noise_beta = langevin_noise_beta
         self.dtype = dtype
         self.stochastic_rounding = stochastic_rounding
         if not groups:
@@ -111,23 +126,43 @@ class MouseOptimizer:
         self.groups: dict[str, dict[str, Any]] = {}
         self._sources: dict[str, nn.Module] = {}
         self._parameters: dict[str, dict[str, nn.Parameter]] = {}
+        self._ignored_sources: list[nn.Module] = []
         online_ids: set[int] = set()
         for name, settings in groups.items():
             if not isinstance(name, str) or not name:
                 raise ValueError("Optimizer group names must be nonempty strings.")
-            if (not isinstance(settings, Mapping) or {"online", "lr"} - settings.keys()
-                    or settings.keys() - {"online", "lr", "target", "polyak_tau"}):
-                raise ValueError(f"{name}: groups require online and lr; only target and polyak_tau are optional.")
+            if (not isinstance(settings, Mapping) or "online" not in settings
+                    or settings.keys() - {"online", "lr", "target", "polyak_tau", "parameters"}):
+                raise ValueError(f"{name}: groups require online; supported settings are lr, target, polyak_tau and parameters.")
+            settings = dict(settings)
             source = settings["online"]
             if not isinstance(source, nn.Module):
                 raise TypeError(f"{name}: online must be a module.")
+            selection = settings.pop("parameters", "all")
+            if selection not in ("all", "base", "lora"):
+                raise ValueError(f"{name}: parameters must be all, base or lora.")
+            if selection != "all":
+                source = backbone_parameter_view(source, adapters=selection == "lora")
+                settings["online"] = source
             parameters = dict(source.named_parameters())
+            if not any(p.requires_grad for p in parameters.values()):
+                self._ignored_sources.append(source)
+                continue
+            if "lr" not in settings or settings["lr"] is None:
+                raise ValueError(f"{name}: a learning rate is required for a trainable group.")
+            target = settings.get("target")
+            if target is not None and selection != "all":
+                if not isinstance(target, nn.Module):
+                    raise TypeError(f"{name}: target must be a module.")
+                settings["target"] = backbone_parameter_view(target, adapters=selection == "lora")
             ids = {id(p) for p in parameters.values()}
-            if not ids or ids & online_ids:
-                raise ValueError("Online groups must contain parameters and must not overlap or share them.")
+            if ids & online_ids:
+                raise ValueError("Online groups must not overlap or share parameters.")
             online_ids.update(ids)
             self._sources[name], self._parameters[name] = source, parameters
-            self.groups[name] = dict(settings)
+            self.groups[name] = settings
+        if not self.groups:
+            raise ValueError("MouseOptimizer requires at least one trainable parameter.")
         self._trainable = {id(p) for parameters in self._parameters.values() for p in parameters.values() if p.requires_grad}
         targets_seen: set[int] = set()
         for name, settings in self.groups.items():
@@ -232,10 +267,76 @@ class MouseOptimizer:
     def zero_grad(self, set_to_none: bool = True) -> None:
         self.inner.zero_grad(set_to_none=set_to_none)
 
-    def _step_online(self, step: int, **kwargs: Any) -> None:
+    def _needs_update_transform(self):
+        """Whether the subclass needs a pre-rounding update transform."""
+        return False
+
+    def _transform_update(self, parameter, update):
+        """Hook for a subclass to transform an update before precision rounding."""
+
+    def _transform_noise(self, parameter, noise):
+        """Hook for subclass-specific effective learning rates; mutate noise."""
+
+    def _step_parameters(self):
+        """Apply the native optimizer update using the prepared gradients."""
+        self.inner.step()
+
+    def _step_online(self, step: int, *, online_transition_count: int | None = None, **kwargs: Any) -> None:
         if kwargs:
             raise TypeError(f"Unsupported optimizer step arguments: {sorted(kwargs)}")
-        self.inner.step()
+        beta = self.langevin_noise_beta
+        beta = _rate(beta(step) if callable(beta) else beta, name="langevin_noise_beta")
+        scales = {}
+        if beta:
+            if (isinstance(online_transition_count, bool)
+                    or not isinstance(online_transition_count, Integral)
+                    or online_transition_count <= 0):
+                raise ValueError("Langevin noise requires a positive online_transition_count")
+            for group in self.param_groups:
+                lr = group["lr"]
+                scale = beta * sqrt((2 / lr) / online_transition_count) if lr else 0.
+                if not isfinite(scale):
+                    raise ValueError("Langevin gradient noise standard deviation must be finite")
+                scales.update((id(p), scale) for p in group["params"])
+        noisy = any(scales.values())
+        if noisy and any(p.grad is not None and p.grad.is_sparse
+                         for group in self.param_groups for p in group["params"]):
+            raise RuntimeError("Langevin noise requires dense gradients")
+
+        def add_noise(parameter, gradient):
+            scale = scales.get(id(parameter), 0.)
+            if scale:
+                noise = torch.randn_like(gradient)
+                self._transform_noise(parameter, noise)
+                gradient.add_(noise, alpha=scale)
+
+        if isinstance(self.inner, PrecisionOptimizer):
+            # Inject after casting to arithmetic dtype, before moments or updates.
+            # The final model write remains the only stochastic rounding boundary.
+            self.inner.gradient_transform = add_noise if noisy else None
+            self.inner.update_transform = self._transform_update if self._needs_update_transform() else None
+            try:
+                self.inner.step()
+            finally:
+                self.inner.gradient_transform = None
+                self.inner.update_transform = None
+        else:
+            previous = []
+            try:
+                if noisy:
+                    for group in self.param_groups:
+                        for parameter in group["params"]:
+                            if (parameter.requires_grad and parameter.grad is not None
+                                    and scales.get(id(parameter), 0.)):
+                                gradient = parameter.grad.clone()
+                                add_noise(parameter, gradient)
+                                previous.append((parameter, parameter.grad))
+                                parameter.grad = gradient
+                self._step_parameters()
+            finally:
+                # Do not accumulate random noise into retained batch gradients.
+                for parameter, gradient in previous:
+                    parameter.grad = gradient
 
     @torch.no_grad()
     def step(self, step: int, **kwargs: Any) -> None:
@@ -247,7 +348,8 @@ class MouseOptimizer:
         """
         if type(step) is not int or step < 0:
             raise ValueError("training step must be a nonnegative integer")
-        if {id(p) for module in self._sources.values() for p in module.parameters() if p.requires_grad} != self._trainable:
+        if ({id(p) for module in self._sources.values() for p in module.parameters() if p.requires_grad} != self._trainable
+                or any(p.requires_grad for module in self._ignored_sources for p in module.parameters())):
             raise ValueError("Trainability changed; rebuild the optimizer after changing requires_grad.")
         rates, pairs = self._prepare_step(step)
         resolved = [(index, _rate(rates[name] * factor, name=f"{name} effective lr"))

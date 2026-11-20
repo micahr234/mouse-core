@@ -1,3 +1,4 @@
+from mouse_core.models.lora import LoRALinear, LoRAConfig
 """Analytic flow targets, replay alignment, and the actual example head/loop."""
 from typing import Any
 import ast
@@ -961,7 +962,9 @@ def notebook_training_namespace(*, action_samples=1, noise_mean=0., noise_std=1.
         def __init__(self):
             super().__init__()
             self.embedding = nn.Linear(4, 8)
-            self.backbone = nn.Linear(8, 8)
+            self.backbone = LoRALinear(nn.Linear(8, 8), LoRAConfig(rank=2))
+            with torch.no_grad():
+                self.backbone.lora_B.weight.fill_(.01)
         def forward(self, inputs):
             return {'z': self.backbone(self.embedding(inputs))}
         def parameter_groups(self, *, lr):
@@ -983,9 +986,9 @@ def notebook_training_namespace(*, action_samples=1, noise_mean=0., noise_std=1.
         device=torch.device('cpu'), encoder=encoder, q_head=head, modules=modules,
         delayed_encoder=target_encoder, backup_value_head=target_head,
         loader=SimpleNamespace(next_batch=lambda: (inputs, data)),
-        LR_EMBEDDING=1e-3, LR_BACKBONE=1e-3, LR_HEADS=1e-3,
+        LR_EMBEDDING=1e-3, LR_BACKBONE_LORA=1e-3, LR_HEADS=1e-3,
         DIFFUSION_NOISE_MEAN=noise_mean, DIFFUSION_NOISE_STD=noise_std,
-        POLYAK_TAU_EMBEDDING=.1, POLYAK_TAU_BACKBONE=.1, POLYAK_TAU_VALUE=head_tau)
+        POLYAK_TAU_EMBEDDING=.1, POLYAK_TAU_BACKBONE_LORA=.1, POLYAK_TAU_VALUE=head_tau)
     source = next(s for s in notebook_sources() if 'def run_train(' in s)
     exec(compile(source, str(NOTEBOOK), 'exec'), ns)
     return ns
@@ -1034,7 +1037,7 @@ def test_actual_notebook_training_loop_uses_configurable_selector_and_single_bac
     expected_backup_noise = noise_mean + noise_std * torch.randn(2, 2, generator=expected_rng)
     expected_correction_noise = torch.randn(2, generator=expected_rng)
     before = {k: p.detach().clone() for k, p in modules.named_parameters()}
-    loss, metrics = ns['run_train'](num_steps=1)
+    loss, metrics, next_step = ns['run_train'](training_step=0, num_steps=1)
     assert torch.isfinite(loss) and metrics['per_diffusion_step'].shape == (4,)
     # K batched selector trajectories and one fresh backup; no tau-level reselection.
     assert len(trajectory_calls) == 2
@@ -1068,6 +1071,10 @@ def test_actual_notebook_training_loop_uses_configurable_selector_and_single_bac
         assert selected.item() == 1 and backup[4][1].argmax().item() == 0
         assert backup[2][1].argmax(-1).tolist() == [0, 1, 0, 1]
     for name, p in modules.named_parameters():
+        if not p.requires_grad:
+            assert p.grad is None
+            torch.testing.assert_close(p, before[name], rtol=0, atol=0)
+            continue
         assert p.grad is not None and p.grad.abs().sum() > 0, name
         assert not torch.equal(p, before[name]), name
     for source, target, prefix, tau in [(encoder.embedding, target_encoder.embedding, 'encoder.embedding', .1),
@@ -1089,7 +1096,7 @@ def test_velocity_target_can_freeze_or_copy_the_entire_head(num_blocks, head_tau
     source, target = ns['q_head'], ns['backup_value_head']
     before = {name: value.detach().clone() for name, value in target.named_parameters()}
     buffers_before = {name: value.detach().clone() for name, value in target.named_buffers()}
-    ns['run_train'](num_steps=1)
+    ns['run_train'](training_step=0, num_steps=1)
     for name, parameter in target.named_parameters():
         online = dict(source.named_parameters())[name]
         assert not torch.equal(online, before[name]), name

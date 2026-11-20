@@ -7,7 +7,7 @@ from typing import overload
 import torch
 import torch.nn.functional as F
 
-from mouse_core.objectives._actions import canonical_actions, executed_actions
+from mouse_core.objectives._actions import canonical_actions, executed_actions, replay_action_indices
 
 from mouse_core.objectives.base import Objective, _reject_predictions, _require_prediction
 from mouse_core.objectives.transforms import (
@@ -915,14 +915,6 @@ class DqnObjective(Objective[...]):
             dtype=value_dtype,
         )
 
-        # Each token at position i encodes (obs_i, action_{i-1}, reward_{i-1},
-        # terminated_{i-1}, truncated_{i-1}), i.e. the action, reward, and
-        # flags stored at i are the ones that *produced* obs_i, not the
-        # ones taken *from* obs_i.  The transition out of state i is therefore
-        # described by the fields stored at i+1.
-        step_next = (step_of + 1).clamp(max=N - 1)  # [P] (final step clamped, weight 0)
-        next_actions = action[step_next]            # [P]  a_i (stored at i+1)
-
         discount_all = _apply_transform(
             transform=self.discount,
             name="discount",
@@ -944,9 +936,19 @@ class DqnObjective(Objective[...]):
         q = q.masked_fill(online_mask, 0)
         q_target = q_target.masked_fill(backup_mask, 0)
         q_actions = q_actions.masked_fill(backup_mask, 0)
-        gather_action = next_actions.reshape((P,) + (1,) * (q_target.ndim - 1))
-        gather_action = gather_action.expand(*q_target.shape[:-1], 1)
-        q_values = q if selected else q.gather(dim=-1, index=gather_action).squeeze(-1)
+        if selected:
+            q_values = q
+        else:
+            # Use the same replay alignment as action-conditioned heads and
+            # reasoning losses. The next event reports this readout's action.
+            rows, actions = replay_action_indices(
+                {"action": objective_data[self.action_key]}, sequence_ids,
+                step_ids=step_of, readout_shape=(P,),
+            )
+            gather_action = actions.reshape((len(rows),) + (1,) * (q.ndim - 1))
+            gather_action = gather_action.expand(len(rows), *q.shape[1:-1], 1)
+            taken = q[rows].gather(dim=-1, index=gather_action).squeeze(-1)
+            q_values = q.new_zeros(q.shape[:-1]).index_copy(0, rows, taken)
         v_step = _backup_state_value(
             q_actions=_step_predictions(q_actions, last_rows), q_backup=_step_predictions(q_target, last_rows),
             temperature=self.temperature,

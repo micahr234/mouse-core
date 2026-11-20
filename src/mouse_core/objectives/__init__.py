@@ -1,3 +1,4 @@
+from mouse_core.objectives._actions import replay_action_indices
 from mouse_core.objectives.reinforce import reinforce_loss
 from mouse_core.objectives.replicate import ReplicateObjective
 from mouse_core.objectives.base import Objective
@@ -25,6 +26,7 @@ from mouse_core.objectives.ppo import PpoObjective, sample_discrete_action
 from mouse_core.objectives.supervised import SupervisedObjective, best_action
 
 __all__ = [
+    "replay_action_indices",
     "Objective",
     "reinforce_loss",
     "ReplicateObjective",
