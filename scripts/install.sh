@@ -70,20 +70,18 @@ setup_venv() {
 
     # Install project dependencies (core + all optional extras).
     log "Installing project dependencies..."
-    # Install the pinned Python 3.15 PyTorch/Triton nightly pair.
+    # Install the pinned Python 3.15 stable PyTorch/Triton pair.
     if command -v nvidia-smi >/dev/null 2>&1; then
-        TORCH_INDEX="https://download.pytorch.org/whl/nightly/cu130"
+        TORCH_INDEX="https://download.pytorch.org/whl/cu132"
     else
-        TORCH_INDEX="https://download.pytorch.org/whl/nightly/cpu"
+        TORCH_INDEX="https://download.pytorch.org/whl/cpu"
     fi
     # --refresh bypasses uv's cache so branch-pinned git extras (mouse-gym@main,
     # procedural-frozenlake@main) re-resolve to the current head.
-    if ! uv pip install -e ".[dev,all]" --python .venv/bin/python --index-strategy unsafe-best-match --extra-index-url "$TORCH_INDEX" --refresh; then
+    if ! uv pip install --upgrade -e ".[dev,all]" --python .venv/bin/python --index-strategy unsafe-best-match --extra-index-url "$TORCH_INDEX" --refresh; then
         error "Failed to install project dependencies"
         return 1
     fi
-
-    .venv/bin/python scripts/patch_triton.py || return 1
 
     success "Project dependencies installed"
 }

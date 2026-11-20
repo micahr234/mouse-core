@@ -36,9 +36,9 @@ source scripts/install.sh
 source .venv/bin/activate
 ```
 
-The installer pins PyTorch `2.15.0.dev20261005` and Triton `3.8.0+gitc01b6774`
-from the CUDA 13 nightly index (CPU when no GPU is detected), and applies the
-upstream Triton Python 3.15 fix. See the [dependency notes](CONTRIBUTING.md#pinned-pytorch-and-triton).
+The installer uses stable PyTorch `2.15.0` and Triton `3.9.0`
+from the CUDA 13.2 release index (CPU when no GPU is detected), with native
+Python 3.15 support and no source patch. See the [dependency notes](CONTRIBUTING.md#pinned-pytorch-and-triton).
 
 To run the notebooks, follow the [development setup](CONTRIBUTING.md#development-setup), which installs the example dependencies and standard Python 3.15. Multi-worker loading uses persistent spawned processes with shared-memory batch transfer. See [example dependencies](CONTRIBUTING.md#example-dependencies) for system packages.
 

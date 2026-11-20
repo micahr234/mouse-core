@@ -1,3 +1,2 @@
 include scripts/install.sh
-include scripts/patch_triton.py
 include CONTRIBUTING.md

@@ -19,7 +19,7 @@ cd mouse-core
 source scripts/install.sh
 ```
 
-This installs the package in editable mode with the `dev` and `all` extras (`all` bundles every feature extra — `examples` and `kernels`). Activate with `source .venv/bin/activate`. The install uses standard CPython (`3.15`). The pinned PyTorch/Triton pair comes from the nightly index (`cu130` when `nvidia-smi` is present, CPU otherwise), with the Python 3.15 source fix described below. See [Example dependencies](#example-dependencies) for notebook system packages.
+This installs the package in editable mode with the `dev` and `all` extras (`all` bundles every feature extra — `examples` and `kernels`). Activate with `source .venv/bin/activate`. The install uses standard CPython (`3.15`). The stable PyTorch/Triton pair comes from the release index (`cu132` when `nvidia-smi` is present, CPU otherwise). See [Example dependencies](#example-dependencies) for notebook system packages.
 
 ### Example dependencies
 
@@ -130,17 +130,10 @@ Open a GitHub Discussion or issue.
 
 ## Pinned PyTorch and Triton
 
-The development environment pins PyTorch `2.15.0.dev20261005` and Triton
-`3.8.0+gitc01b6774` from the official PyTorch nightly index, using standard
-Python 3.15. This pair avoids the nanobind shutdown warning reproduced with
-Triton 3.9. The installer and CI apply `scripts/patch_triton.py`, which backports
-[Triton PR #10986](https://github.com/triton-lang/triton/pull/10986): the
-`AnnAssign.simple` argument required by Python 3.15. Reapply this script after
-manually reinstalling Triton. It checks the version and expected source before
-editing the installed package.
-
-The official `cp315` wheel still declares Python `<3.15`, so `uv pip check`
-reports that upstream metadata mismatch. The metadata is left intact. This
-setup depends on the explicit source fix; it was verified in V2B with compiled
-CUDA FlexAttention forward/backward and the test suites. Use the nightly CPU
-index `https://download.pytorch.org/whl/nightly/cpu` for CPU installations.
+The development environment uses stable PyTorch `2.15.0` and Triton `3.9.0`
+with standard Python 3.15. Use the official CUDA 13.2 release index
+`https://download.pytorch.org/whl/cu132`, or `https://download.pytorch.org/whl/cpu`
+for CPU installations. Triton 3.9 includes the Python 3.15 `AnnAssign.simple`
+fix and declares Python 3.15 support; no installed-package patch is needed.
+The installer upgrades dependencies to the newest releases allowed by the
+package requirements. Run `uv pip check` and the test suite after installation.

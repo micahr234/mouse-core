@@ -17,9 +17,9 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
 
-      - uses: astral-sh/setup-uv@v10.3.0
+      - uses: astral-sh/setup-uv@v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: "pyproject.toml"
@@ -28,11 +28,10 @@ jobs:
         run: |
           uv python install 3.15
           uv venv --python 3.15
-          # Resolve the pinned nightly pair with CPU wheels for CI.
+          # Resolve the stable PyTorch/Triton pair with CPU wheels for CI.
           uv pip install -e ".[dev]" --python .venv/bin/python \
-            --extra-index-url https://download.pytorch.org/whl/nightly/cpu \
+            --extra-index-url https://download.pytorch.org/whl/cpu \
             --index-strategy unsafe-best-match
-          .venv/bin/python scripts/patch_triton.py
 
       - name: Type check
         run: .venv/bin/pyright src/ tests/
@@ -43,9 +42,9 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
 
-      - uses: astral-sh/setup-uv@v10.3.0
+      - uses: astral-sh/setup-uv@v10.3.3
         with:
           enable-cache: true
 
