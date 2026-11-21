@@ -135,8 +135,6 @@ class SequentialReasoner(nn.Module):
         nn.init.constant_(self.norm.weight, 0.02)
         self.update_norm = nn.RMSNorm(hidden_dim, eps=rms_norm_eps, elementwise_affine=False, dtype=torch.float32)
         self.update_projection = nn.Linear(hidden_dim, hidden_dim, bias=True, dtype=torch.float32)
-        nn.init.zeros_(self.update_projection.weight)
-        nn.init.zeros_(self.update_projection.bias)
 
     def project_updates(self, hidden: torch.Tensor) -> torch.Tensor:
         """Mix hidden coordinates identically in generation and differentiable replay."""

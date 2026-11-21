@@ -83,7 +83,7 @@ def model(*, real=False, max_steps=3):
         embedding=embedding, backbone=backbone, value_head=value_head, min_steps=1, max_steps=max_steps,
         residual_connections=True, reasoning_loss="all_tokens",
     ).to(torch.get_default_device())
-    # Exercise learned, nonzero updates rather than a zero-initialized recurrence.
+    # Use fixed nonzero updates for reproducible recurrence checks.
     with torch.no_grad():
         result.reasoner.update_projection.weight.copy_(torch.eye(8).roll(1, 0) * .7)
         result.reasoner.update_projection.bias.fill_(.03)

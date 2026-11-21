@@ -203,30 +203,43 @@ def test_reasoner_requires_boolean_mechanism_settings(residual_connections, adap
                            adaptive_depth=adaptive_depth, rms_norm_eps=1e-6)
 
 
-def test_update_norm_zero_initialization_and_gradient_startup():
-    reasoner = SequentialReasoner(hidden_dim=8, min_steps=1, max_steps=3,
-                                  residual_connections=True, adaptive_depth=True, rms_norm_eps=1e-6)
+@pytest.mark.parametrize('residual_connections', [False, True])
+def test_update_norm_standard_initialization_and_zero_head_gradient_startup(residual_connections):
+    torch.manual_seed(19)
+    reasoner = SequentialReasoner(hidden_dim=8, min_steps=1, max_steps=1,
+                                  residual_connections=residual_connections, adaptive_depth=True, rms_norm_eps=1e-6)
     assert not list(reasoner.update_norm.parameters())
-    assert torch.count_nonzero(reasoner.update_projection.weight) == 0
-    assert torch.count_nonzero(reasoner.update_projection.bias) == 0
+    for parameter in reasoner.update_projection.parameters():
+        assert parameter.count_nonzero() > 0
+        assert parameter.abs().max() <= 8 ** -.5
     hidden = torch.randn(3, 8, requires_grad=True)
-    target = torch.randn(3, 8)
-    optimizer = torch.optim.SGD(reasoner.update_projection.parameters(), lr=.01)
-    updates = reasoner.project_updates(hidden)
-    torch.testing.assert_close(updates, torch.zeros_like(hidden), rtol=0, atol=0)
-    (updates - target).square().mean().backward()
-    assert reasoner.update_projection.weight.grad.abs().sum() > 0
-    assert hidden.grad.count_nonzero() == 0
-    optimizer.step()
-    optimizer.zero_grad()
-    hidden.grad = None
-    updates = reasoner.project_updates(hidden)
-    expected_norm = hidden * torch.rsqrt(hidden.square().mean(-1, keepdim=True) + 1e-6)
-    expected = torch.nn.functional.linear(expected_norm, reasoner.update_projection.weight,
-                                          reasoner.update_projection.bias)
-    torch.testing.assert_close(updates, expected)
-    (updates - target).square().mean().backward()
-    assert hidden.grad.abs().sum() > 0
+    head = nn.Linear(8, 5)
+    nn.init.zeros_(head.weight)
+    nn.init.zeros_(head.bias)
+    optimizer = torch.optim.SGD([*reasoner.parameters(), *head.parameters()], lr=.01)
+    before = reasoner.update_projection.weight.detach().clone()
+    for step in range(2):
+        optimizer.zero_grad()
+        hidden.grad = None
+        updates = reasoner.project_updates(hidden)
+        expected_norm = hidden * torch.rsqrt(hidden.square().mean(-1, keepdim=True) + 1e-6)
+        expected = torch.nn.functional.linear(expected_norm, reasoner.update_projection.weight,
+                                              reasoner.update_projection.bias)
+        torch.testing.assert_close(updates, expected)
+        states = updates + reasoner.start_embedding.weight if residual_connections else updates
+        values = head(states)
+        loss, _ = value_reasoning_loss(
+            q_values=values[:, None], target_q_values=values.detach()[:, None],
+            lengths=torch.ones(3, dtype=torch.long), environment_actions=torch.tensor([0, 1, 2]),
+            environment_targets=torch.tensor([1., -2., 3.]), weights=torch.ones(3),
+            reasoning_step_cost=0., gamma_think=1., min_steps=1)
+        loss.backward()
+        assert head.weight.grad.abs().sum() > 0
+        if step == 1:
+            assert reasoner.update_projection.weight.grad.abs().sum() > 0
+            assert hidden.grad.abs().sum() > 0
+        optimizer.step()
+    assert not torch.equal(reasoner.update_projection.weight, before)
 
 
 @pytest.mark.parametrize('residual_connections', [False, True])

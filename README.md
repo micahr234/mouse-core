@@ -429,7 +429,7 @@ before its trainable normalization; context embeddings and accumulated residual
 updates remain differentiable. Repeated-token reasoning trains its dedicated start
 embedding through each occurrence. The start vector is independent of the
 newline marker and pretrained token tables. A shared learned H-to-H linear map
-projects transformer outputs in both modes (non-affine RMSNorm, epsilon from the backbone configuration, then zero-initialized weights and bias). Cached chunks cannot be used as standalone
+projects transformer outputs in both modes (non-affine RMSNorm, epsilon from the backbone configuration, then standard PyTorch `nn.Linear` initialization for weights and bias). Cached chunks cannot be used as standalone
 training batches.
 
 For scheduled reasoning replay, Core provides `ReasoningDataset` and
