@@ -368,9 +368,11 @@ reasoning model with independent loss and recurrence choices:
 | `all_tokens` | Bellman loss at each generated reasoning state | Environment action or `think`, within minimum/maximum depths | A+1 actions |
 | `last_token` | TD loss only at the final reasoning state | Fixed budget; minimum must equal maximum | A environment actions |
 
-`RESIDUAL_CONNECTIONS` can be true or false with either loss. When true, updates
-accumulate through an extra residual path. When false, each position repeats the
-same initial reasoning token, and the transformer outputs are not fed back.
+`RESIDUAL_CONNECTIONS` adds the input latent to the raw transformer output.
+`WRAP_LATENT` feeds that resulting state into the next reasoning position through
+input RMSNorm and the shared H-to-H linear input projection. With wrapping disabled, each position receives the learned start
+embedding; residual addition then produces `start + update` independently at each
+depth. With both enabled, states accumulate. Both flags apply with either loss.
 
 The notebooks load recorded standalone 4x4 FrozenLake episodes, generate fresh
 reasoning and train. They never collect interactions or run evaluation. Set
@@ -402,15 +404,15 @@ After generation, use `generated.align_objective_data(inputs, objective_data)`
 to select prediction-to-step mappings for those final markers. Per-step labels
 remain unchanged. Both networks then train on the same aligned generated history.
 
-`SequentialReasoner(rms_norm_eps=backbone.rms_norm_eps, hidden_dim=..., min_steps=..., max_steps=..., residual_connections=...,
-adaptive_depth=...)` separates the two mechanisms. With residual connections,
-`z_next = z + update_projection(update_norm(transformer_output))`; each successive causal input is
-`RMSNorm(z.detach())`. The trainable RMSNorm scale starts at `0.02`. Without
-residual connections, every reasoning position receives the same dedicated
-learnable start embedding after normalization. Its projected transformer output
-is the value representation; output
-states are never substituted for that repeated token. Causal attention and the
-backbone's ordinary internal residual connections remain in both variants.
+`SequentialReasoner(rms_norm_eps=backbone.rms_norm_eps, hidden_dim=..., min_steps=...,
+max_steps=..., residual_connections=..., wrap_latent=..., adaptive_depth=...)`
+requires both mechanism flags explicitly. For each input latent `x`, the update
+is the raw backbone output: `u = transformer(context, input_projection(norm(x)))`. The state
+is `x + u` with residual addition, or `u` without it. Wrapping chooses the previous
+state as the next input; otherwise the input is the learned start embedding again.
+The first input is always the learned start. Each input passes through RMSNorm
+(trainable scale starts at `0.02`) and then the H-to-H linear input projection. Causal attention and the backbone's ordinary
+internal residual connections remain in every combination.
 
 With `adaptive_depth=True`, `generate` requires an A+1 `action_values(states)` head
 whose last action is `think`. Before `min_steps`, only think is available.
@@ -424,13 +426,18 @@ has no learned stop head, regardless of the residual setting.
 The resulting `ReasoningBatch` contains only the generated history and records
 each decision's executed `lengths`. Both networks replay this same batch; the
 delayed network never generates a separate trajectory. `forward` reconstructs
-all generated value representations in one call. Residual feedback is detached
-before its trainable normalization; context embeddings and accumulated residual
-updates remain differentiable. Repeated-token reasoning trains its dedicated start
-embedding through each occurrence. The start vector is independent of the
+all generated value representations in one call. Wrapped feedback is detached
+before its trainable normalization. The first reasoning input uses the live start
+embedding, which remains learnable even with wrapping but no addition. Both flags
+enabled rebuild the differentiable accumulated residual path; without wrapping,
+addition uses the live start independently at each depth. Repeated-token reasoning
+trains its dedicated start embedding through each occurrence. The start vector is independent of the
 newline marker and pretrained token tables. A shared learned H-to-H linear map
-projects transformer outputs in both modes (non-affine RMSNorm, epsilon from the backbone configuration, then standard PyTorch `nn.Linear` initialization for weights and bias). Cached chunks cannot be used as standalone
-training batches.
+projects normalized reasoning inputs in every mode. Both input operations run in
+FP32; RMSNorm epsilon comes from the backbone configuration and the linear layer
+uses standard PyTorch initialization for weights and bias. There is no update
+RMSNorm or output-side H-to-H projection. Cached chunks cannot be used as
+standalone training batches.
 
 For scheduled reasoning replay, Core provides `ReasoningDataset` and
 `ReasoningDataLoader` independently of any experiment configuration:

@@ -3,6 +3,7 @@ from dataclasses import replace
 
 import pytest
 import torch
+from tests._reasoning_input_reference import input_reference
 
 from mouse_core.data import (
     ReasoningDataset, ReasoningDataLoader, split_reasoning_episodes, pack_reasoning_episodes,
@@ -18,7 +19,7 @@ def prepared(residual=True):
     inputs['sequence_ids'][inputs['sequence_ids'] == 2] = 1
     inputs.set_non_tensor('num_sequences', 2)
     data['sequence_ids'][data['sequence_ids'] == 2] = 1
-    parts = components(residual_connections=residual, adaptive_depth=True)
+    parts = components(residual_connections=residual, wrap_latent=residual, adaptive_depth=True)
     trace = generate(parts, inputs, lengths=torch.tensor([2, 3, 1]))
     return parts, inputs, data, trace
 
@@ -56,10 +57,10 @@ def test_sparse_split_pack_roundtrip_reorders_duplicates_and_replays_live_weight
     torch.testing.assert_close(evaluate(reordered), expected)
     frozen_vectors = records[0].latent_values.clone()
     with torch.no_grad():
-        reasoner.update_projection.weight.mul_(1.2)
+        reasoner.input_projection.weight.mul_(1.2)
     output = evaluate(rebuilt)
     output.square().sum().backward()
-    assert reasoner.update_projection.weight.grad.abs().sum() > 0
+    assert reasoner.input_projection.weight.grad.abs().sum() > 0
     assert reasoner.start_embedding.weight.grad.abs().sum() > 0
     torch.testing.assert_close(records[0].latent_values, frozen_vectors)
 
@@ -228,17 +229,17 @@ def test_start_only_replay_preserves_boundaries_labels_and_matches_literal_forwa
         history = []
         for row in (inputs['sequence_ids'] == group).nonzero().flatten().tolist():
             is_start = bool(inputs['step_readout_mask'][row])
-            history.append(reasoner.norm(reasoner.start_embedding.weight[0]) if is_start
+            history.append(input_reference(reasoner, reasoner.start_embedding.weight[0]) if is_start
                            else table[inputs['token_ids'][row]])
             if is_start:
                 hidden = backbone(torch.stack(history), sequence_ids=torch.zeros(len(history), dtype=torch.long))[-1]
-                update = reasoner.project_updates(hidden)
+                update = hidden.float()
                 expected.append(update + reasoner.start_embedding.weight[0] if residual else update)
     actual = reasoner(batch, embedding=embedding, backbone=backbone)
     torch.testing.assert_close(actual[:, 0], torch.stack(expected))
     actual[:, 0].square().sum().backward()
     assert reasoner.start_embedding.weight.grad.abs().sum() > 0
-    assert reasoner.update_projection.weight.grad.abs().sum() > 0
+    assert reasoner.input_projection.weight.grad.abs().sum() > 0
     for key, value in original.items():
         if isinstance(value, torch.Tensor):
             torch.testing.assert_close(inputs[key], value)

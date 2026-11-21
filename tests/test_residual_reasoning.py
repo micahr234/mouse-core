@@ -14,6 +14,7 @@ from tests._reasoning_replay_fixture import configure_notebook_optimizer, record
 import numpy as np
 import pytest
 import torch
+from tests._reasoning_input_reference import input_reference
 from torch import nn
 
 from mouse_core.data import (
@@ -81,12 +82,12 @@ def model(*, real=False, max_steps=3):
         value_head.bias[-1] = 100.
     result = example_module().ReasoningDqn(
         embedding=embedding, backbone=backbone, value_head=value_head, min_steps=1, max_steps=max_steps,
-        residual_connections=True, reasoning_loss="all_tokens",
+        residual_connections=True, wrap_latent=True, reasoning_loss="all_tokens",
     ).to(torch.get_default_device())
     # Use fixed nonzero updates for reproducible recurrence checks.
     with torch.no_grad():
-        result.reasoner.update_projection.weight.copy_(torch.eye(8).roll(1, 0) * .7)
-        result.reasoner.update_projection.bias.fill_(.03)
+        result.reasoner.input_projection.weight.copy_(torch.eye(8).roll(1, 0) * .7)
+        result.reasoner.input_projection.bias.fill_(.03)
     return result
 
 
@@ -165,11 +166,11 @@ def test_single_replay_gradient_matches_explicit_detached_recurrence():
         embeds = reference.embedding(ids, tokenizer_ids=torch.zeros_like(ids), tokenizer_names=('text',))
         context, state = embeds[:-1], reference.reasoner.start_embedding.weight[0]
         inputs = []
-        for _ in range(3):
-            inputs.append(reference.reasoner.norm(state.detach()))
+        for depth in range(3):
+            inputs.append(input_reference(reference.reasoner, state if depth == 0 else state.detach()))
             row = torch.cat((context, torch.stack(inputs)))
             hidden = reference.backbone(row, sequence_ids=torch.zeros(len(row), dtype=torch.long))
-            state = state + torch.nn.functional.linear(hidden[-1].float() * torch.rsqrt(hidden[-1].float().square().mean(-1, keepdim=True) + 1e-6), reference.reasoner.update_projection.weight, reference.reasoner.update_projection.bias)
+            state = state + hidden[-1].float()
         reference_values.append(reference.value_head(state))
         offset += length
     expected = torch.stack(reference_values)
@@ -285,7 +286,7 @@ def test_passive_batch_skips_generation_and_replay():
 @pytest.mark.parametrize('max_steps', [0, -1, True, 1.5])
 def test_invalid_reasoning_budget(max_steps):
     with pytest.raises(ValueError, match='positive integer'):
-        SequentialReasoner(min_steps=1, hidden_dim=8, max_steps=max_steps, residual_connections=True, adaptive_depth=True, rms_norm_eps=1e-6)
+        SequentialReasoner(min_steps=1, hidden_dim=8, max_steps=max_steps, residual_connections=True, wrap_latent=True, adaptive_depth=True, rms_norm_eps=1e-6)
 
 
 class TextBackend:
@@ -410,7 +411,7 @@ def test_notebook_dqn_update_replays_online_trajectory_through_both_models(tmp_p
     assert not torch.equal(original['reasoner.norm.weight'], online.reasoner.norm.weight)
     assert all(p.grad is None for p in target.parameters())
     for name, parameter in target.named_parameters():
-        rate = (.1 if name.startswith('embedding.') else .3 if name.startswith(('value_head.', 'reasoner.start_embedding.', 'reasoner.update_projection.'))
+        rate = (.1 if name.startswith('embedding.') else .3 if name.startswith(('value_head.', 'reasoner.start_embedding.', 'reasoner.input_projection.'))
                 else .2)
         if not dict(online.named_parameters())[name].requires_grad:
             rate = 0.
@@ -574,13 +575,13 @@ def test_multiple_actions_retain_every_depth_with_detached_feedback():
                     prefix.append(embed)
                     continue
                 z = online.reasoner.start_embedding.weight
-                prefix.append(online.reasoner.norm(z))
+                prefix.append(input_reference(online.reasoner, z))
                 updates = []
                 for _ in range(4):
                     inputs = torch.cat(prefix)
                     raw = online.backbone(inputs, sequence_ids=torch.zeros(len(inputs), dtype=torch.long))[-1:]
-                    z = z + torch.nn.functional.linear(raw * torch.rsqrt(raw.square().mean(-1, keepdim=True) + 1e-6), online.reasoner.update_projection.weight, online.reasoner.update_projection.bias)
-                    prefix.append(online.reasoner.norm(z))
+                    z = z + raw.float()
+                    prefix.append(input_reference(online.reasoner, z))
                     updates.append(z[0])
                 reference.append(torch.stack(updates))
         torch.testing.assert_close(states, torch.stack(reference))
@@ -689,7 +690,7 @@ def test_explicit_positions_and_target_weights_replay_the_same_latent_history(ma
         for episode in episode_items:
             inputs = torch.stack([
                 token_table[item] if isinstance(item, int)
-                else network.reasoner.norm(trace.states[item[0], item[1]].detach())
+                else input_reference(network.reasoner, network.reasoner.start_embedding.weight[0] if item[1] == 0 else trace.states[item[0], item[1]].detach())
                 for item in episode
             ])
             # Compute each selected update directly from its causal prefix.
@@ -703,7 +704,7 @@ def test_explicit_positions_and_target_weights_replay_the_same_latent_history(ma
                     update_position = position + depth
                     raw_update = ((update_position + 1) * network.backbone.position_gain
                                   + inputs[:update_position + 1].sum(0) * network.backbone.context_gain)
-                    state = state + torch.nn.functional.linear(raw_update * torch.rsqrt(raw_update.square().mean(-1, keepdim=True) + 1e-6), network.reasoner.update_projection.weight, network.reasoner.update_projection.bias)
+                    state = state + raw_update.float()
                     outputs.append(state)
                 outputs.extend([outputs[-1]] * (3 - len(outputs)))
                 expected.append(torch.stack(outputs))

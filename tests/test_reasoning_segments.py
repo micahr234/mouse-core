@@ -46,7 +46,7 @@ def test_step_segments_preserve_separated_heads_passive_steps_tails_and_empty_ro
 @torch.no_grad()
 def test_multiple_head_tokens_reason_once_per_step_with_literal_history_reference(residual_connections, backend):
     tokens, data = segmented_batch()
-    parts = components(residual_connections=residual_connections, adaptive_depth=True, cap=3, real=True)
+    parts = components(residual_connections=residual_connections, wrap_latent=residual_connections, adaptive_depth=True, cap=3, real=True)
     depths = torch.tensor([2, 3, 1])
     trace = generate(parts, tokens, lengths=depths, backend=backend)
     assert trace.head_token_ids == (3, 9, 14)

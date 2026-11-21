@@ -108,7 +108,7 @@ def test_each_notebook_updates_components_with_independent_rates(path, rates):
     for name, settings in opt.groups.items():
         expected = (.37 if name.endswith('backbone_lora') else rates[0] if name in ('embedding', 'encoder.embedding') else
                     rates[3] if name.endswith('token_head') else
-                    rates[2] if name.endswith(('value_head', 'start_embedding', 'update_projection')) or name.startswith('q_head') else rates[1])
+                    rates[2] if name.endswith(('value_head', 'start_embedding', 'input_projection')) or name.startswith('q_head') else rates[1])
         dst = settings.get('target')
         if dst is not None:
             for param in dst.parameters():
@@ -129,7 +129,7 @@ class ReasoningModules(Model):
         else:
             self.reasoner.norm = nn.Linear(2, 2)
             self.reasoner.start_embedding = nn.Embedding(1, 2)
-            self.reasoner.update_projection = nn.Linear(2, 2)
+            self.reasoner.input_projection = nn.Linear(2, 2)
 
     def forward(self, x):
         return x

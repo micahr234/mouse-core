@@ -59,11 +59,11 @@ def test_notebook_training_uses_its_selected_recurrence_and_target_depth(reasoni
     kwargs = dict(embedding=MultiEmbedding(embeddings={'text': Embedding(vocab_size=16, hidden_dim=8)}),
                   backbone=CausalBackbone(), value_head=head, max_steps=max_steps)
     online = example.ReasoningDqn(**kwargs, min_steps=min_steps,
-        residual_connections=residual, reasoning_loss=reasoning_loss)
+        residual_connections=residual, wrap_latent=residual, reasoning_loss=reasoning_loss)
     apply_lora(model=online.backbone, config=LoRAConfig(rank=2))
     with torch.no_grad():
-        online.reasoner.update_projection.weight.copy_(torch.eye(8).roll(1, 0) * .7)
-        online.reasoner.update_projection.bias.fill_(.03)
+        online.reasoner.input_projection.weight.copy_(torch.eye(8).roll(1, 0) * .7)
+        online.reasoner.input_projection.bias.fill_(.03)
     target = deepcopy(online).requires_grad_(False).eval()
     with torch.no_grad():
         target.backbone.linear.base.bias.add_(.35)
@@ -164,7 +164,7 @@ def test_notebook_training_uses_its_selected_recurrence_and_target_depth(reasoni
         if not param.requires_grad:
             assert param.grad is None
             torch.testing.assert_close(param, original_weights[name], rtol=0, atol=0)
-    for component in ('embedding.', 'backbone.', 'reasoner.norm.', 'reasoner.start_embedding.', 'reasoner.update_projection.', 'value_head.'):
+    for component in ('embedding.', 'backbone.', 'reasoner.norm.', 'reasoner.start_embedding.', 'reasoner.input_projection.', 'value_head.'):
         assert any(not torch.equal(original_weights[name], param)
                    for name, param in online.named_parameters() if name.startswith(component))
 
@@ -181,5 +181,5 @@ def test_notebook_rejects_invalid_loss_and_adaptive_last_token_budget(reasoning_
             embedding=MultiEmbedding(embeddings={'text': Embedding(vocab_size=16, hidden_dim=8)}),
             backbone=CausalBackbone(), value_head=nn.Linear(8, 4),
             min_steps=min_steps, max_steps=max_steps,
-            residual_connections=False, reasoning_loss=reasoning_loss,
+            residual_connections=False, wrap_latent=False, reasoning_loss=reasoning_loss,
         )
