@@ -223,6 +223,7 @@ class SequentialReasoner(nn.Module):
                 self._select_actions(states[:, 1], torch.arange(len(heads), device=embeds.device),
                                      lengths, action_values, select_actions)
                 return _ReasoningTrace(heads, states, lengths)
+            start_input = self.project_inputs(self.start_embedding.weight.float())
             counts = [0] * len(heads)
             episode_heads: list[list[int]] = []
             contexts: list[tuple[slice, ...]] = []
@@ -237,7 +238,7 @@ class SequentialReasoner(nn.Module):
                 episode_heads.append(indices)
                 contexts.append(episode.context_slices)
                 prefix = embeds[episode.context_slices[0]]
-                prompts.append(torch.cat((prefix, self.project_inputs(initial[indices[0]:indices[0] + 1])))
+                prompts.append(torch.cat((prefix, start_input))
                                if indices else prefix)
             cursors = [0] * len(rows)
             def advance(requests: list[int], hidden: torch.Tensor) -> list[torch.Tensor | None]:
@@ -246,12 +247,14 @@ class SequentialReasoner(nn.Module):
                         for j, request in enumerate(requests) if cursors[request] < len(episode_heads[request])]
                 if not live:
                     return chunks
-                updates = hidden.float()
-                for j, request, i in live:
+                live_indices = torch.tensor([i for _, _, i in live], device=states.device)
+                for _, _, i in live:
                     counts[i] += 1
-                    step = counts[i]
-                    states[i, step] = ((states[i, step - 1] if self.wrap_latent else initial[i]) + updates[j]
-                                       if self.residual_connections else updates[j])
+                live_depths = torch.tensor([counts[i] for _, _, i in live], device=states.device)
+                updates = hidden[[j for j, _, _ in live]].float()
+                base = (states[live_indices, live_depths - 1] if self.wrap_latent else initial[live_indices])
+                current = base + updates if self.residual_connections else updates
+                states[live_indices, live_depths] = current
                 decisions = [i for _, _, i in live
                              if self.adaptive_depth or counts[i] == self.max_steps]
                 thinking = {i: True for _, _, i in live}
@@ -266,16 +269,15 @@ class SequentialReasoner(nn.Module):
                     step = counts[i]
                     state = states[i, step:step + 1]
                     if thinking[i]:
-                        chunks[j] = self.project_inputs(state if self.wrap_latent else initial[i:i + 1])
+                        chunks[j] = self.project_inputs(state) if self.wrap_latent else start_input
                         continue
                     states[i, step + 1:] = state
                     cursors[request] += 1
                     next_index = cursors[request]
                     prefix = self.project_inputs(state) if self.wrap_latent and self.max_steps > 1 else state[:0]
                     if next_index < len(episode_heads[request]):
-                        following = episode_heads[request][next_index]
                         chunks[j] = torch.cat((prefix, embeds[contexts[request][next_index]],
-                                               self.project_inputs(initial[following:following + 1])))
+                                               start_input))
                     else:
                         tail = torch.cat((prefix, embeds[contexts[request][-1]]))
                         if cache is not None and len(tail):
@@ -328,7 +330,8 @@ class SequentialReasoner(nn.Module):
         rows: list[list[tuple[int, int, int]]] = []
         initial = [0] * len(by_head)
         readouts = [0] * len(by_head)
-        positions = torch.zeros((len(by_head), self.max_steps), device=device, dtype=torch.long)
+        positions = [[0] * self.max_steps for _ in by_head]
+        lengths = trace.lengths.tolist()
         offset = 0
         cursor = 0
         for group in range(tokens["num_sequences"]):
@@ -338,10 +341,10 @@ class SequentialReasoner(nn.Module):
                     i = by_head[cursor]
                     start = offset + len(row)
                     initial[i] = start
-                    length = int(trace.lengths[i])
+                    length = lengths[i]
                     feedback = self.wrap_latent and self.max_steps > 1
                     readouts[i] = start + length - 1 + int(feedback)
-                    positions[i, :length] = torch.arange(start, start + length, device=device)
+                    positions[i][:length] = range(start, start + length)
                     token_count = length + int(feedback)
                     row.extend((cursor, i, step) for step in range(token_count))
                 else:
@@ -351,7 +354,7 @@ class SequentialReasoner(nn.Module):
             offset += len(row)
         entries = [entry for row in rows for entry in row]
         indices = torch.tensor([entry[0] for entry in entries], device=device, dtype=torch.long)
-        packed = source.clone()
+        packed = source.clone(recurse=False)
         for key, value in source.items():
             if isinstance(value, torch.Tensor):
                 packed[key] = value[indices].detach().clone()
@@ -360,10 +363,11 @@ class SequentialReasoner(nn.Module):
         packed.set_non_tensor("num_sequences", len(rows))
         latent_mask = torch.tensor([entry[1] >= 0 for entry in entries], device=device, dtype=torch.bool)
         latents = trace.states.new_zeros((len(entries), self.hidden_dim))
-        if latent_mask.any():
+        latent_rows = [row for row, (_, i, _) in enumerate(entries) if i >= 0]
+        if latent_rows:
             decision = torch.tensor([i for _, i, _ in entries if i >= 0], device=device)
             step = torch.tensor([step for _, i, step in entries if i >= 0], device=device)
-            latents[latent_mask] = trace.states[decision, step if self.wrap_latent else 0].detach()
+            latents[torch.tensor(latent_rows, device=device)] = trace.states[decision, step if self.wrap_latent else 0].detach()
         packed["latent_mask"] = latent_mask
         packed["latent_values"] = latents.detach()
         packed["head_mask"] = torch.zeros(len(entries), device=device, dtype=torch.bool)
@@ -373,7 +377,8 @@ class SequentialReasoner(nn.Module):
         packed["head_mask"][ends] = True
         packed["step_readout_mask"] = packed["head_mask"].clone()
         # Generation is complete: starts are metadata, not pending markers.
-        return ReasoningBatch(packed, starts, positions, ends, trace.head_token_ids,
+        update_positions = torch.tensor(positions, device=device, dtype=torch.long).reshape(-1, self.max_steps)
+        return ReasoningBatch(packed, starts, update_positions, ends, trace.head_token_ids,
                              trace.states, trace.lengths, cached_prefix)
 
     def forward(

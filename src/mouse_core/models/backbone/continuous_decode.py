@@ -228,7 +228,7 @@ class ContinuousDecodeSession:
         if (self.dtype, self.autocast_dtype, self.residual_dtype) != self._precision:
             raise RuntimeError("Decode precision changed; create a new decode session")
         backbone = self._backbone_ref() if self._backbone_ref is not None else None
-        if backbone is not None and (backbone.dtype, backbone.autocast_dtype, backbone.residual_dtype) != self._precision:
+        if backbone is not None and (backbone.autocast_dtype, backbone.residual_dtype) != self._precision[1:]:
             raise RuntimeError("Backbone precision changed; create a new decode session")
         if self.model.training:
             raise RuntimeError("Continuous decoding requires model.eval().")
@@ -308,7 +308,10 @@ class ContinuousDecodeSession:
         action. Submit the next input on that row, or reset it at the outer reset.
         Other rows may arrive or reset between calls, including during a prefill.
         """
-        cache, scheduler = self._check()
+        return self._step(*self._check())
+
+    def _step(self, cache, scheduler) -> dict[int, Readout]:
+        """Run one scheduler chunk after the public operation validated weights."""
         if not self._pending:
             return {}
         try:
@@ -469,7 +472,7 @@ class ContinuousDecodeSession:
     @torch.no_grad()
     def forward(self, *, embeds: torch.Tensor, lengths: list[int], output_hidden_states: bool = False) -> Readout:
         """Process a left-padded batch; zero-length rows do not enter the decoder."""
-        self._check()
+        cache, scheduler = self._check()
         if self._pending:
             raise RuntimeError("Drain pending submit/step inputs before calling forward.")
         if (embeds.ndim != 3 or embeds.shape[0] != self.B
@@ -483,7 +486,9 @@ class ContinuousDecodeSession:
             if count:
                 self._enqueue(row, embeds[row, -count:], output_hidden_states=output_hidden_states)
         while self._pending:
-            for row, result in self.step().items():
+            # forward is one serialized operation with fixed weights. Public
+            # step still validates every independently submitted operation.
+            for row, result in self._step(cache, scheduler).items():
                 if isinstance(result, tuple):
                     out, layer_hiddens = result
                     for target, hidden in zip(layers, layer_hiddens, strict=True):

@@ -164,7 +164,9 @@ class BaseBackbone(nn.Module, ABC):
                 raise ValueError("cached forward requires lengths and cannot take sequence_ids or attention kwargs.")
             if cache.model is not self.model:
                 raise ValueError("Decode cache must use this backbone's weights")
-            if (cache.dtype, cache.autocast_dtype, cache.residual_dtype) != (self.dtype, self.autocast_dtype, self.residual_dtype):
+            # The session verifies every parameter's identity, version, device
+            # and dtype. Avoid another full LoRA/base-parameter scan here.
+            if (cache.autocast_dtype, cache.residual_dtype) != (self.autocast_dtype, self.residual_dtype):
                 raise ValueError("Decode cache precision must match the backbone; create a new session")
             return cache.forward(embeds=embeds, lengths=lengths, output_hidden_states=output_hidden_states)
         if lengths is not None:

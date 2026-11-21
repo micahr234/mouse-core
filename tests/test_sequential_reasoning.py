@@ -253,11 +253,11 @@ def test_rollout_defers_unused_feedback_without_extra_decoder_call(monkeypatch, 
     parts = components(residual_connections=residual_connections, wrap_latent=residual_connections, adaptive_depth=True, cap=cap, real=True)
     session = parts[1].decode_session(2, max_batch_tokens=64, cache_capacity_tokens=1024)
     calls = []
-    step = session.step
-    def counted():
+    decode = session._decode
+    def counted(*args, **kwargs):
         calls.append(None)
-        return step()
-    monkeypatch.setattr(session, 'step', counted)
+        return decode(*args, **kwargs)
+    monkeypatch.setattr(session, '_decode', counted)
     try:
         for _ in range(2):
             before = len(calls)

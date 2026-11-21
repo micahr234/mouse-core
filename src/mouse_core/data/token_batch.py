@@ -426,6 +426,52 @@ def pack_token_batch(
     return inputs, TensorDict(objective_data, batch_size=[], device="cpu")
 
 
+def concatenate_token_batches(
+    batches: Sequence[tuple[TensorDict, TensorDict]],
+) -> tuple[TensorDict, TensorDict]:
+    """Join packed batches while preserving episode and objective alignment.
+
+    Tokenizer and objective schemas must match. Sequence IDs and objective
+    step IDs are rebased; source batches are never mutated. As with packing
+    StepTokens, ragged floating-point objective vectors are padded with -inf.
+    """
+    if not batches:
+        raise ValueError("At least one token batch is required")
+    if len(batches) == 1:
+        return batches[0]
+    inputs, data = (value.clone(recurse=False) for value in batches[0])
+    sequence_offset = step_offset = 0
+    input_columns = {key: [] for key, value in inputs.items() if isinstance(value, torch.Tensor)}
+    data_columns = {key: [] for key in data.keys()}
+    for tokens, objective in batches:
+        if (set(tokens.keys()) != set(inputs.keys()) or set(objective.keys()) != set(data.keys())
+                or tokens['tokenizer_names'] != inputs['tokenizer_names']
+                or tokens['numeric_field_names'] != inputs['numeric_field_names']):
+            raise ValueError('Token batches must share token and objective schemas')
+        for key in input_columns:
+            value = tokens[key]
+            input_columns[key].append(value + sequence_offset if key == 'sequence_ids' else value)
+        for key in data_columns:
+            value = objective[key]
+            offset = sequence_offset if key == 'sequence_ids' else step_offset if key == 'step_ids' else 0
+            data_columns[key].append(value + offset if offset else value)
+        sequence_offset += tokens['num_sequences']
+        step_offset += len(objective['sequence_ids'])
+    for key, values in input_columns.items():
+        inputs[key] = torch.cat(values)
+    for key, values in data_columns.items():
+        # Objective vectors may contain different numbers of legal actions.
+        if values[0].ndim == 2 and len({value.shape[1] for value in values}) > 1:
+            if not values[0].is_floating_point():
+                raise ValueError('Ragged objective vectors must be floating point')
+            width = max(value.shape[1] for value in values)
+            values = [torch.nn.functional.pad(value, (0, width - value.shape[1]), value=-torch.inf)
+                      for value in values]
+        data[key] = torch.cat(values)
+    inputs.set_non_tensor('num_sequences', sequence_offset)
+    return inputs, data
+
+
 @dataclass(frozen=True)
 class HeadOutputSegments:
     """One episode's context slices separated by final step readout markers.
