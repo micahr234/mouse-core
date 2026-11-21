@@ -152,7 +152,7 @@ def test_notebook_training_uses_its_selected_recurrence_and_target_depth(reasoni
             weighted_errors.append(weight * (prediction - target_value) ** 2)
             transition_weights.append(weight)
     assert float(loss) == pytest.approx(sum(weighted_errors) / sum(transition_weights), rel=2e-5)
-    assert metrics['reasoning_reward'] == pytest.approx(.2 * (max_steps - 1))
+    assert metrics['reasoning_reward'] == pytest.approx(-.2 * (max_steps - 1))
     assert len(head_states) == 1
     gradient = head_states[0].grad
     assert gradient is not None
