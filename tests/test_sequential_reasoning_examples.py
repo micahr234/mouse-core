@@ -125,7 +125,7 @@ def test_notebook_training_uses_its_selected_recurrence_and_target_depth(reasoni
             objective=checked_objective, loader=loader, device=torch.device('cpu'),
             MAX_ACTIVE_REQUESTS=2,
             POLYAK_TAU_EMBEDDING=.1, POLYAK_TAU_BACKBONE_LORA=.2, POLYAK_TAU_REASONING_NORM=.2, POLYAK_TAU_VALUE=.3,
-            MAX_GRAD_NORM=1., REASONING_STEP_COST=.2, GAMMA_THINK=.4)
+            MAX_GRAD_NORM=1., REASONING_REWARD=-.2, GAMMA_THINK=.4)
         configure_notebook_optimizer(example, EXAMPLES / "25_train_reasoning_dqn.ipynb")
         try:
             loss, metrics, next_step = example.run_train(training_step=0, num_steps=1)
@@ -152,7 +152,7 @@ def test_notebook_training_uses_its_selected_recurrence_and_target_depth(reasoni
             weighted_errors.append(weight * (prediction - target_value) ** 2)
             transition_weights.append(weight)
     assert float(loss) == pytest.approx(sum(weighted_errors) / sum(transition_weights), rel=2e-5)
-    assert metrics['reasoning_cost'] == pytest.approx(.2 * (max_steps - 1))
+    assert metrics['reasoning_reward'] == pytest.approx(.2 * (max_steps - 1))
     assert len(head_states) == 1
     gradient = head_states[0].grad
     assert gradient is not None

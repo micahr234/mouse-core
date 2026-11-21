@@ -8,7 +8,7 @@ def value_reasoning_loss(
     *, q_values: torch.Tensor, target_q_values: torch.Tensor,
     lengths: torch.Tensor, environment_actions: torch.Tensor,
     environment_targets: torch.Tensor, weights: torch.Tensor,
-    reasoning_step_cost: float, gamma_think: float, min_steps: int,
+    reasoning_reward: float, gamma_think: float, min_steps: int,
     value_scale: float = 1., value_shift: float = 0.,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Train actual think transitions, then the recorded outgoing environment action.
@@ -18,8 +18,9 @@ def value_reasoning_loss(
     Environment targets/weights come from the environment's one-step TD backup,
     using next-observation *first-state* values. The caller must restrict that
     bootstrap to think when min_steps exceeds one. They are in transformed value
-    units, as is the per-continuation cost. Internal transitions use gamma_think;
+    units, as is the per-continuation reward. Internal transitions use gamma_think;
     environment targets retain their independently configured discount.
+    Positive reasoning rewards encourage thinking; negative rewards penalize it.
     Invalid/padded transitions receive no loss. Target values always detach.
     """
     if q_values.ndim != 3 or q_values.shape[-1] < 2 or q_values.shape[1] < 1:
@@ -36,9 +37,9 @@ def value_reasoning_loss(
     if (environment_actions.dtype != torch.long
             or bool(((environment_actions < 0) | (environment_actions >= choices - 1)).any())):
         raise ValueError("Environment actions must be int64 indices excluding think")
-    if (not math.isfinite(reasoning_step_cost) or reasoning_step_cost < 0
+    if (type(reasoning_reward) not in (int, float) or not math.isfinite(reasoning_reward)
             or not math.isfinite(value_scale) or value_scale <= 0 or not math.isfinite(value_shift)):
-        raise ValueError("Cost must be nonnegative and value transform finite with positive scale")
+        raise ValueError("reasoning_reward must be finite and value transform finite with positive scale")
     if type(gamma_think) not in (int, float) or not math.isfinite(gamma_think) or not 0 <= gamma_think <= 1:
         raise ValueError("gamma_think must be a finite number in [0, 1]")
     if not bool(torch.isfinite(weights).all()) or bool((weights < 0).any()):
@@ -58,7 +59,7 @@ def value_reasoning_loss(
         delayed[:, -1, -1] = -torch.inf
         next_values = delayed.amax(-1)
         next_values = torch.cat((next_values[:, 1:], next_values.new_zeros((count, 1))), dim=1)
-        targets = torch.where(continuing, gamma_think * next_values - reasoning_step_cost,
+        targets = torch.where(continuing, reasoning_reward + gamma_think * next_values,
                               environment_targets.detach()[:, None])
         td_weights = weights.detach()[:, None] * valid
     errors = (predictions - targets).masked_fill(td_weights <= 0, 0).square()
@@ -68,30 +69,30 @@ def value_reasoning_loss(
 
 def final_reasoning_loss(
     *, q_values: torch.Tensor, environment_targets: torch.Tensor,
-    lengths: torch.Tensor, weights: torch.Tensor, reasoning_step_cost: float,
+    lengths: torch.Tensor, weights: torch.Tensor, reasoning_reward: float,
     value_scale: float = 1., value_shift: float = 0.,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Train only the final selected action, charging this decision's total cost.
+    """Train only the final selected action, adding this decision's total reasoning reward.
 
     The caller gathers the recorded environment action at the final generated depth.
     Environment targets use next-observation final-state values, already transformed
     into value units. The first reasoning update is free. Raw replay rewards are
-    not changed, and targets, costs, and weights never receive gradients.
+    not changed, and targets, rewards, and weights never receive gradients.
     """
     if q_values.ndim != 1 or any(x.shape != q_values.shape
                                 for x in (environment_targets, lengths, weights)):
         raise ValueError("Final values, targets, lengths and weights must be one-dimensional with matching shapes")
     if lengths.dtype != torch.long or bool((lengths < 1).any()):
         raise ValueError("Lengths must be positive int64 counts")
-    if (type(reasoning_step_cost) not in (int, float)
-            or not math.isfinite(reasoning_step_cost) or reasoning_step_cost < 0
+    if (type(reasoning_reward) not in (int, float)
+            or not math.isfinite(reasoning_reward)
             or not math.isfinite(value_scale) or value_scale <= 0 or not math.isfinite(value_shift)):
-        raise ValueError("Cost must be nonnegative and value transform finite with positive scale")
+        raise ValueError("reasoning_reward must be finite and value transform finite with positive scale")
     if not bool(torch.isfinite(weights).all()) or bool((weights < 0).any()):
         raise ValueError("Weights must be finite and nonnegative")
     predictions = value_scale * q_values + value_shift
     with torch.no_grad():
-        targets = environment_targets.detach() - reasoning_step_cost * (lengths - 1)
+        targets = environment_targets.detach() + reasoning_reward * (lengths - 1)
         td_weights = weights.detach()
     errors = (predictions - targets).masked_fill(td_weights <= 0, 0).square()
     loss = (errors * td_weights).sum() / td_weights.sum().clamp_min(1)

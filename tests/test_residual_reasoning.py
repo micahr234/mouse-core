@@ -396,7 +396,7 @@ def test_notebook_dqn_update_replays_online_trajectory_through_both_models(tmp_p
         objective=check_objective, loader=loader, device=torch.device('cpu'),
         MAX_ACTIVE_REQUESTS=2,
         POLYAK_TAU_EMBEDDING=.1, POLYAK_TAU_BACKBONE_LORA=.2, POLYAK_TAU_REASONING_NORM=.2, POLYAK_TAU_VALUE=.3,
-        MAX_GRAD_NORM=1., REASONING_STEP_COST=.01, GAMMA_THINK=1.)
+        MAX_GRAD_NORM=1., REASONING_REWARD=-.01, GAMMA_THINK=1.)
     configure_notebook_optimizer(example, NOTEBOOK)
     try:
         loss, metrics, next_step = example.run_train(training_step=0, num_steps=1)

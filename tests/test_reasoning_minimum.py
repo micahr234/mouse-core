@@ -78,7 +78,7 @@ def test_bellman_backups_use_only_next_states_available_actions(gamma, minimum, 
     loss, details = value_reasoning_loss(
         q_values=q, target_q_values=target_q, lengths=torch.tensor(lengths),
         environment_actions=torch.tensor(selected_actions), environment_targets=environment_targets,
-        weights=weights, reasoning_step_cost=cost, gamma_think=gamma, min_steps=minimum,
+        weights=weights, reasoning_reward=-cost, gamma_think=gamma, min_steps=minimum,
         value_scale=scale, value_shift=shift,
     )
     total_weight = sum(w * k for w, k in zip(weights.tolist(), lengths, strict=True))
@@ -117,7 +117,7 @@ def test_minimum_must_be_an_integer_within_cap(minimum):
         value_reasoning_loss(q_values=torch.zeros(1, 4, 5), target_q_values=torch.zeros(1, 4, 5),
                              lengths=torch.tensor([4]), environment_actions=torch.tensor([0]),
                              environment_targets=torch.ones(1), weights=torch.ones(1),
-                             reasoning_step_cost=.1, gamma_think=1., min_steps=minimum)
+                             reasoning_reward=-.1, gamma_think=1., min_steps=minimum)
 
 
 def test_loss_rejects_a_trajectory_stopping_before_minimum():
@@ -125,4 +125,4 @@ def test_loss_rejects_a_trajectory_stopping_before_minimum():
         value_reasoning_loss(q_values=torch.zeros(1, 4, 5), target_q_values=torch.zeros(1, 4, 5),
                              lengths=torch.tensor([2]), environment_actions=torch.tensor([0]),
                              environment_targets=torch.ones(1), weights=torch.ones(1),
-                             reasoning_step_cost=.1, gamma_think=1., min_steps=3)
+                             reasoning_reward=-.1, gamma_think=1., min_steps=3)

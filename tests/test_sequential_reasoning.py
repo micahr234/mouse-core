@@ -173,7 +173,7 @@ def test_final_only_head_loss_reaches_all_residual_updates_and_no_intermediate_h
     values.retain_grad()
     selected = values[:, -1, 2]
     loss, details = final_reasoning_loss(q_values=selected, environment_targets=torch.tensor([3.]),
-                                       lengths=trace.lengths, weights=torch.ones(1), reasoning_step_cost=.2)
+                                       lengths=trace.lengths, weights=torch.ones(1), reasoning_reward=-.2)
     loss.backward()
     assert values.grad[:, :-1].count_nonzero() == 0
     assert values.grad[0, -1, 2] != 0
@@ -191,7 +191,7 @@ def test_value_reasoning_trains_each_generated_output_and_repeated_initial_embed
     loss, _ = value_reasoning_loss(min_steps=1, q_values=values, target_q_values=values.detach(),
                                   lengths=trace.lengths, environment_actions=torch.tensor([2]),
                                   environment_targets=torch.tensor([3.]), weights=torch.ones(1),
-                                  reasoning_step_cost=.2, gamma_think=1.)
+                                  reasoning_reward=-.2, gamma_think=1.)
     loss.backward()
     nonzero = values.grad != 0
     assert nonzero[0].nonzero().tolist() == [[0, 4], [1, 4], [2, 2]]
@@ -236,7 +236,7 @@ def test_input_projection_standard_initialization_and_zero_head_gradient_startup
             q_values=values[:, None], target_q_values=values.detach()[:, None],
             lengths=torch.ones(3, dtype=torch.long), environment_actions=torch.tensor([0, 1, 2]),
             environment_targets=torch.tensor([1., -2., 3.]), weights=torch.ones(3),
-            reasoning_step_cost=0., gamma_think=1., min_steps=1)
+            reasoning_reward=-0., gamma_think=1., min_steps=1)
         loss.backward()
         assert head.weight.grad.abs().sum() > 0
         if step == 1:

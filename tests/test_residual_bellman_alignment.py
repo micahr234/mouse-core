@@ -37,7 +37,7 @@ def test_ragged_residual_loss_matches_scalar_transition_graph(cap, gamma_think, 
     loss, details = value_reasoning_loss(min_steps=1, 
         q_values=q, target_q_values=target, lengths=lengths,
         environment_actions=actions, environment_targets=rewards_and_environment_backups,
-        weights=weights, reasoning_step_cost=cost, gamma_think=gamma_think,
+        weights=weights, reasoning_reward=-cost, gamma_think=gamma_think,
         value_scale=value_scale, value_shift=value_shift,
     )
 

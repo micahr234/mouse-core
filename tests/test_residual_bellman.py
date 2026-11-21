@@ -15,7 +15,7 @@ def test_internal_backups_cap_recorded_action_padding_and_detached_targets():
     loss, details = value_reasoning_loss(min_steps=1, 
         q_values=q, target_q_values=target, lengths=torch.tensor([3, 2, 1]),
         environment_actions=torch.tensor([1, 0, 1]), environment_targets=environment,
-        weights=torch.tensor([1., 2., 0.]), reasoning_step_cost=.5, gamma_think=1.,
+        weights=torch.tensor([1., 2., 0.]), reasoning_reward=-.5, gamma_think=1.,
     )
     # A target may still choose think at an online stopping depth below the cap.
     torch.testing.assert_close(details['td_target'][:2], torch.tensor([[8.5, 6.5, 11.], [11.5, -2., -2.]]))
@@ -37,7 +37,7 @@ def test_first_state_is_free_and_affine_units_apply_to_internal_targets():
     target = torch.tensor([[[0., 0., 0.], [7., 9., 100.]]])
     args = dict(q_values=q, target_q_values=target, environment_actions=torch.tensor([0]),
                 environment_targets=torch.tensor([10.]), weights=torch.ones(1),
-                reasoning_step_cost=2., gamma_think=1., value_scale=3., value_shift=-1.)
+                reasoning_reward=-2., gamma_think=1., value_scale=3., value_shift=-1.)
     loss, details = value_reasoning_loss(min_steps=1, **args, lengths=torch.tensor([2]))
     torch.testing.assert_close(details['td_target'], torch.tensor([[24., 10.]]))
     torch.testing.assert_close(loss, torch.tensor(((14-24)**2+(5-10)**2)/2))
@@ -50,7 +50,7 @@ def test_zero_weight_and_empty_batches_are_finite():
         q = torch.zeros(n, 3, 5, requires_grad=True)
         loss, _ = value_reasoning_loss(min_steps=1, q_values=q, target_q_values=q.detach(),
             lengths=torch.ones(n, dtype=torch.long), environment_actions=torch.zeros(n, dtype=torch.long),
-            environment_targets=torch.full((n,), float('nan')), weights=torch.zeros(n), reasoning_step_cost=.1, gamma_think=1.)
+            environment_targets=torch.full((n,), float('nan')), weights=torch.zeros(n), reasoning_reward=-.1, gamma_think=1.)
         assert loss.item() == 0
         loss.backward()
         assert torch.isfinite(q.grad).all() and q.grad.count_nonzero() == 0
@@ -63,7 +63,7 @@ def test_think_discount_only_scales_the_internal_bootstrap(gamma_think):
     loss, details = value_reasoning_loss(min_steps=1, 
         q_values=q, target_q_values=delayed, lengths=torch.tensor([2]),
         environment_actions=torch.tensor([1]), environment_targets=torch.tensor([7.]),
-        weights=torch.ones(1), reasoning_step_cost=2., gamma_think=gamma_think,
+        weights=torch.ones(1), reasoning_reward=-2., gamma_think=gamma_think,
     )
     expected = torch.tensor([[gamma_think * 10 - 2, 7.]])
     torch.testing.assert_close(details['td_target'], expected)
@@ -79,11 +79,11 @@ def test_invalid_think_discount_is_rejected(gamma_think):
             q_values=torch.zeros(1, 1, 2), target_q_values=torch.zeros(1, 1, 2),
             lengths=torch.ones(1, dtype=torch.long), environment_actions=torch.zeros(1, dtype=torch.long),
             environment_targets=torch.zeros(1), weights=torch.ones(1),
-            reasoning_step_cost=0., gamma_think=gamma_think,
+            reasoning_reward=-0., gamma_think=gamma_think,
         )
 
 
-@pytest.mark.parametrize('cost', [0., .7])
+@pytest.mark.parametrize('cost', [-.7, 0., .7])
 def test_final_reasoning_loss_uses_selected_values_and_current_cost_only(cost):
     from mouse_core.objectives import final_reasoning_loss
     q = torch.tensor([2., 3., float('nan')], requires_grad=True)
@@ -91,7 +91,7 @@ def test_final_reasoning_loss_uses_selected_values_and_current_cost_only(cost):
     weights = torch.tensor([1., 2., 0.], requires_grad=True)
     lengths = torch.tensor([1, 4, 3])
     loss, details = final_reasoning_loss(q_values=q, environment_targets=target,
-        lengths=lengths, weights=weights, reasoning_step_cost=cost, value_scale=2., value_shift=-1.)
+        lengths=lengths, weights=weights, reasoning_reward=-cost, value_scale=2., value_shift=-1.)
     expected_predictions = torch.tensor([3., 5.])
     expected_targets = torch.tensor([8., 9. - 3 * cost])
     expected = ((expected_predictions - expected_targets).square() * weights[:2].detach()).sum() / 3
@@ -108,7 +108,41 @@ def test_final_reasoning_loss_empty_or_masked_batches_are_finite(count):
     from mouse_core.objectives import final_reasoning_loss
     values = torch.full((count,), float('nan'), requires_grad=True)
     loss, _ = final_reasoning_loss(q_values=values, environment_targets=values.detach(),
-        lengths=torch.ones(count, dtype=torch.long), weights=torch.zeros(count), reasoning_step_cost=.3)
+        lengths=torch.ones(count, dtype=torch.long), weights=torch.zeros(count), reasoning_reward=-.3)
     assert loss == 0
     loss.backward()
     assert values.grad.count_nonzero() == 0
+
+
+@pytest.mark.parametrize("reward", [-.5, 0., .5])
+@pytest.mark.parametrize("gamma", [0., .4, 1.])
+def test_signed_think_reward_only_affects_continuations(reward, gamma):
+    q = torch.zeros(2, 2, 3, requires_grad=True)
+    target = torch.tensor([[[0., 0., 0.], [2., 4., 100.]]] * 2, requires_grad=True)
+    environment = torch.tensor([7., 9.], requires_grad=True)
+    loss, details = value_reasoning_loss(
+        q_values=q, target_q_values=target, lengths=torch.tensor([2, 1]),
+        environment_actions=torch.tensor([0, 1]), environment_targets=environment,
+        weights=torch.ones(2), reasoning_reward=reward, gamma_think=gamma, min_steps=1)
+    expected = torch.tensor([[reward + gamma * 4, 7.], [9., 9.]])
+    torch.testing.assert_close(details["td_target"], expected)
+    torch.testing.assert_close(loss, (expected[0].square().sum() + 81) / 3)
+    loss.backward()
+    assert target.grad is None and environment.grad is None
+    assert q.grad[1, 1].count_nonzero() == 0
+
+
+@pytest.mark.parametrize("reward", [True, float("nan"), float("inf"), -float("inf")])
+@pytest.mark.parametrize("final", [False, True])
+def test_reasoning_reward_requires_finite_number(reward, final):
+    from mouse_core.objectives import final_reasoning_loss
+    common = dict(lengths=torch.ones(1, dtype=torch.long),
+                  environment_targets=torch.zeros(1), weights=torch.ones(1),
+                  reasoning_reward=reward)
+    with pytest.raises(ValueError, match="reasoning_reward"):
+        if final:
+            final_reasoning_loss(q_values=torch.zeros(1), **common)
+        else:
+            value_reasoning_loss(q_values=torch.zeros(1, 1, 2),
+                target_q_values=torch.zeros(1, 1, 2), environment_actions=torch.zeros(1, dtype=torch.long),
+                gamma_think=1., min_steps=1, **common)

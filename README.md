@@ -510,7 +510,8 @@ When residual connections are enabled, the residual sum propagates this final
 loss to every accumulated transformer update. Without them, training follows the
 ordinary causal transformer computation. The fixed budget is not a learned choice.
 In both objectives the first reasoning step is free, terminal discounts govern environment bootstrapping, and reported rewards
-exclude internal reasoning costs.
+exclude internal reasoning rewards. `reasoning_reward` may be positive or negative;
+it applies only to additional thinking steps after the first.
 
 `mouse_core.models.generate` is the shared inference scheduler used by
 `AutoregressiveReasoner.generate` and `SequentialReasoner.generate`. It takes a
