@@ -1,3 +1,5 @@
+from mouse_core.data.vocabulary import VocabularyTokenizer
+from mouse_core.data.token_batch import decision_positions, align_decision_objectives
 from mouse_core.data.event_transform import (
     EnvironmentProtocol, EventTransform, environment_decisions,
     latest_environment_decision, latest_environment_packet,
@@ -26,6 +28,7 @@ from mouse_core.data.reasoning_dataset import (
 from mouse_core.data.reasoning_loader import ReasoningDataLoader
 
 __all__ = [
+    "VocabularyTokenizer", "decision_positions", "align_decision_objectives",
     "Augmenter",
     "compose",
     "DataLoader",

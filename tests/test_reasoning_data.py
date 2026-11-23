@@ -62,7 +62,7 @@ def test_sparse_split_pack_roundtrip_reorders_duplicates_and_replays_live_weight
     output = evaluate(rebuilt)
     output.square().sum().backward()
     assert bool(reasoner.input_projection.down_proj.weight.grad.abs().sum() > 0) is (wrap != "none")
-    assert reasoner.start_embedding.weight.grad.abs().sum() > 0
+    assert embedding.embeddings["text"].embed_tokens.weight.grad[9:10].abs().sum() > 0
     torch.testing.assert_close(records[0].latent_values, frozen_vectors)
 
 
@@ -230,7 +230,7 @@ def test_start_only_replay_preserves_boundaries_labels_and_matches_literal_forwa
         history = []
         for row in (inputs['sequence_ids'] == group).nonzero().flatten().tolist():
             is_start = bool(inputs['step_readout_mask'][row])
-            history.append(input_reference(reasoner, torch.zeros_like(reasoner.start_embedding.weight[0])) if is_start
+            history.append(input_reference(reasoner, torch.zeros_like(embedding.embeddings["text"].embed_tokens.weight[9:10][0]), embedding.embeddings["text"].embed_tokens.weight[9]) if is_start
                            else table[inputs['token_ids'][row]])
             if is_start:
                 hidden = backbone(torch.stack(history), sequence_ids=torch.zeros(len(history), dtype=torch.long))[-1]
@@ -239,7 +239,7 @@ def test_start_only_replay_preserves_boundaries_labels_and_matches_literal_forwa
     actual = reasoner(batch, embedding=embedding, backbone=backbone)
     torch.testing.assert_close(actual[:, 0], torch.stack(expected))
     actual[:, 0].square().sum().backward()
-    assert reasoner.start_embedding.weight.grad.abs().sum() > 0
+    assert embedding.embeddings["text"].embed_tokens.weight.grad[9:10].abs().sum() > 0
     assert all(p.grad is not None and p.grad.count_nonzero() == 0 for p in reasoner.input_projection.parameters())
     for key, value in original.items():
         if isinstance(value, torch.Tensor):

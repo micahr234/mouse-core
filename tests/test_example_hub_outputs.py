@@ -26,7 +26,7 @@ def test_upload_cell_preserves_model_tokenizer_and_custom_artifacts(tmp_path, mo
     text = PreTrainedTokenizerFast(tokenizer_object=TextTokenizer(WordLevel({'?': 0, 'x': 1}, unk_token='?')),
                                   unk_token='?')
     tokenizer = Tokenizer(tokenizers={'text': text}, input_fields=[
-        dict(type='token', provider='environment', input_field='action_requested', format='x', head_output=True)])
+        dict(type='token', provider='environment', input_field='action_requested', format='x', head_output="all")])
     modules = nn.ModuleDict({'encoder': nn.Linear(2, 2), 'q_head': nn.Linear(2, 4)})
     output = tmp_path / 'uploaded'
     uploads = capture_upload(monkeypatch, output)

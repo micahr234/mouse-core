@@ -79,7 +79,7 @@ def _head_output_tokenizer(
         }
     )
     fields.append(
-        {"provider": "sensor", "type": "text", "format": value, "head_output": True}
+        {"provider": "sensor", "type": "text", "format": value, "head_output": "all"}
     )
     if tail is not None:
         fields.append({"provider": "sensor", "type": "text", "input_field": tail, "format": "{" + tail + "}"})
@@ -129,14 +129,14 @@ def _packed(model: Model):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize('head', [False, True])
+@pytest.mark.parametrize('head', ['none', 'last', 'all'])
 def test_tokenizer_supports_zero_or_multiple_head_fields(head) -> None:
     tok = Tokenizer(tokenizers={"default": _FakeTokenizer()}, input_fields=[
         dict(provider="sensor", type='text', input_field=name, format="{" + name + "}", head_output=head)
         for name in ('action', 'obs')
     ])
     step = encode_measurement(tok, {'action': 1, 'obs': 2})
-    assert step.head_mask.tolist() == [head, head]
+    assert step.head_mask.tolist() == [head != "none", head != "none"]
 
 
 def test_step_without_head_output_token_is_retained() -> None:
@@ -147,7 +147,7 @@ def test_step_without_head_output_token_is_retained() -> None:
                 "type": "text",
                 "input_field": "reward",
                 "format": '{reward}',
-                "head_output": True,
+                "head_output": "all",
             },
             {"provider": "sensor",
                 "type": "text",

@@ -164,7 +164,7 @@ def test_qwen_compute_text_has_exact_configured_token_counts():
     for count in (0, 1, 3, 10):
         tok = Tokenizer(tokenizers={"text": backend}, input_fields=[
             dict(type="text", provider="environment", input_field="action_requested", format=" ." * count),
-            dict(type="token", provider="environment", input_field="action_requested", format="\n", head_output=True),
+            dict(type="token", provider="environment", input_field="action_requested", format="\n", head_output="all"),
         ])
         piece = tok(dict(provider="environment", payload={"action_requested": True}))
         assert piece["token_ids"].tolist() == [token] * count + backend.encode("\n", add_special_tokens=False)

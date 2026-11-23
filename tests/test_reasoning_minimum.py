@@ -43,7 +43,6 @@ def test_continuous_generation_masks_actions_and_preserves_replay(
 
     tokens = batch(((2, 9, 3, 9), (4, 9)))
     tokens['head_mask'] = tokens['token_ids'] == 9
-    tokens['autoregressive_mask'] = tokens['head_mask'].clone()
     tokens['step_readout_mask'] = tokens['head_mask'].clone()
     generated = reasoner.generate(
         tokens, embedding=embedding, backbone=backbone,

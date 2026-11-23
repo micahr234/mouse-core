@@ -17,7 +17,7 @@ def segmented_batch():
     ]):
         mask = np.isin(np.arange(len(ids)), heads)
         steps.append(StepTokens(np.array(ids), np.zeros(len(ids)), np.zeros(len(ids), bool), mask,
-            objective_fields=dict(action=i, reward=i * .5), autoregressive_mask=mask.copy(),
+            objective_fields=dict(action=i, reward=i * .5),
             tokenizer_names=('text',)))
     return pack_token_batch(steps=steps, sequence_ids=[0, 0, 0, 0, 2], batch_size=3)
 
@@ -67,7 +67,7 @@ def test_multiple_head_tokens_reason_once_per_step_with_literal_history_referenc
     torch.testing.assert_close(aligned['reward'], data['reward'])
     with pytest.raises(ValueError, match='Source head-output rows'):
         trace.align_objective_data(tokens, aligned)
-    with pytest.raises(ValueError, match='original head-output'):
+    with pytest.raises(ValueError, match='source decision'):
         replace(trace, head_token_ids=(0,)).align_objective_data(tokens, data)
 
 

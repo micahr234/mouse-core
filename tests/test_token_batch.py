@@ -17,7 +17,7 @@ from tests._token_batch_helpers import IntIdTokenizer
 def _tok(**kwargs) -> Tokenizer:
     return Tokenizer(
         input_fields=[
-            {"provider": "sensor", "type": "text", "input_field": "action", "format": '{action}', "head_output": True},
+            {"provider": "sensor", "type": "text", "input_field": "action", "format": '{action}', "head_output": "all"},
             {"provider": "sensor",
                 "type": "text",
                 "input_field": "repeat_episode_index",
@@ -63,7 +63,7 @@ def test_tokenizer_pack_rows_all_empty_keeps_batch_slots() -> None:
 def test_sparse_inference_inputs_and_strict_training_labels():
     tok = Tokenizer(input_fields=[
         dict(type='text', provider='environment', input_field='observation', format='{observation}'),
-        dict(type='token', provider='environment', format='4', head_output=True),
+        dict(type='token', provider='environment', format='4', head_output="all"),
     ], objective_fields=[dict(input_field='advantage')], tokenizers={"default": IntIdTokenizer()})
     log = EventLog()
     log.event(provider='coordinator', episode_index=0, step_index=0, payload={
@@ -103,7 +103,7 @@ def test_sparse_inference_inputs_and_strict_training_labels():
 @pytest.mark.parametrize('provider', ['environment', 'agent'])
 def test_event_tokenizer_groups_repeated_providers_by_marker(provider):
     tok = Tokenizer(input_fields=[dict(type='text', provider=provider, input_field='value', format='{value}'),
-                                          dict(type='token', provider=provider, format='4', head_output=True)], tokenizers={"default": IntIdTokenizer()})
+                                          dict(type='token', provider=provider, format='4', head_output="all")], tokenizers={"default": IntIdTokenizer()})
     log = EventLog()
     for step, value in [(0, 1), (0, 2), (1, 3)]:
         log.event(provider=provider, episode_index=0, step_index=step, payload={'value': value})
@@ -137,7 +137,7 @@ def test_objective_column_stays_int_when_all_steps_are_int() -> None:
 def test_objective_vector_column_promotes_dtype() -> None:
     tok = Tokenizer(
         input_fields=[
-            {"provider": "sensor", "type": "text", "input_field": "action", "format": '{action}', "head_output": True},
+            {"provider": "sensor", "type": "text", "input_field": "action", "format": '{action}', "head_output": "all"},
             {"provider": "sensor",
                 "type": "text",
                 "input_field": "repeat_episode_index",
@@ -160,7 +160,7 @@ def test_objective_ragged_float_vectors_pad_with_neg_inf() -> None:
     """Shorter rows are padded with -inf (the nonexistent-action sentinel), not 0."""
     tok = Tokenizer(
         input_fields=[
-            {"provider": "sensor", "type": "text", "input_field": "action", "format": '{action}', "head_output": True},
+            {"provider": "sensor", "type": "text", "input_field": "action", "format": '{action}', "head_output": "all"},
             {"provider": "sensor",
                 "type": "text",
                 "input_field": "repeat_episode_index",
@@ -185,7 +185,7 @@ def test_objective_ragged_int_vectors_raise() -> None:
     """Integer columns have no padding sentinel, so ragged shapes are an error."""
     tok = Tokenizer(
         input_fields=[
-            {"provider": "sensor", "type": "text", "input_field": "action", "format": '{action}', "head_output": True},
+            {"provider": "sensor", "type": "text", "input_field": "action", "format": '{action}', "head_output": "all"},
             {"provider": "sensor",
                 "type": "text",
                 "input_field": "repeat_episode_index",
@@ -206,7 +206,7 @@ def test_objective_ragged_int_vectors_raise() -> None:
 def test_objective_mixed_rank_raises() -> None:
     tok = Tokenizer(
         input_fields=[
-            {"provider": "sensor", "type": "text", "input_field": "action", "format": '{action}', "head_output": True},
+            {"provider": "sensor", "type": "text", "input_field": "action", "format": '{action}', "head_output": "all"},
             {"provider": "sensor",
                 "type": "text",
                 "input_field": "repeat_episode_index",

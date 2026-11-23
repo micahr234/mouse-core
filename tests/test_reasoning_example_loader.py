@@ -33,7 +33,7 @@ def test_loader_skips_partial_prefixes_and_unfinished_tails(example):
     assert data['step_ids'].tolist() == [0, 1, 3, 4]
     assert data['truncated'].tolist() == [False, False, True] * 2
     assert tokens['sequence_ids'][tokens['head_mask']].tolist() == [0, 0, 1, 1]
-    assert tokens['autoregressive_mask'].equal(tokens['head_mask'])
+    assert tokens['step_readout_mask'].equal(tokens['head_mask'])
     with reasoning_loader(example, stores=[partial, unfinished]) as loader:
         with pytest.raises(ValueError, match='no eligible samples'):
             loader.next_batch()

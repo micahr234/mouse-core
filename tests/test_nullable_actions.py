@@ -37,7 +37,7 @@ from tests._token_batch_helpers import IntIdTokenizer
 def tokenizer(*fields):
     return Tokenizer(
         tokenizers={"default": IntIdTokenizer()},
-        input_fields=[{"provider": "sensor", "type": "text", "format": "1", "head_output": True}],
+        input_fields=[{"provider": "sensor", "type": "text", "format": "1", "head_output": "all"}],
         objective_fields=[{"input_field": key} for key in fields],
     )
 
@@ -159,7 +159,7 @@ def test_dataloader_derives_masks_without_mutating_replay(workers):
     loader = DataLoader(
         stores=store, sample_ranges=environment_episode_ranges, events_budget=10,
          transform=EventTransform(encode=partial(encode_measurement, Tokenizer(
-            tokenizers={"default": IntIdTokenizer()}, input_fields=[{"provider": "sensor", "type": "text", "format": "1", "head_output": True}],
+            tokenizers={"default": IntIdTokenizer()}, input_fields=[{"provider": "sensor", "type": "text", "format": "1", "head_output": "all"}],
             objective_fields=[{"input_field": "action", "missing_value": None}]))), num_workers=workers, seed=4,
     )
     try:

@@ -56,7 +56,7 @@ def test_named_multifield_expression_and_indexing_preserve_payload():
 
 def test_constant_compute_and_readout_share_filter_and_stream_matches_encode():
     tok = tokenizer(dict(type='text', input_field='action_requested', format=' . .'),
-                    dict(type='token', input_field='action_requested', format='\n', head_output=True))
+                    dict(type='token', input_field='action_requested', format='\n', head_output="all"))
     events = [dict(provider='environment', step_index=i, payload=payload)
               for i, payload in enumerate([{'action_requested': True}, {}, {'action_requested': True}])]
     steps = tok.encode(events)
@@ -209,7 +209,7 @@ def test_format_functions_survive_loader_worker_serialization(workers):
                        payload={'action': i, 'reward': 2.5}) for i in range(4)])
     tok = tokenizer(dict(type='text', input_field=['action', 'reward'],
                          format="{''.join(transition(action, reward, prefix='') for _ in range(1))}",
-                         format_functions={'transition': transition_text}, head_output=True))
+                         format_functions={'transition': transition_text}, head_output="all"))
     with DataLoader(stores=store, events_budget=4, sample_field='episode_index',
                     transform=tok.encode, num_workers=workers, prefetch=1, seed=7) as loader:
         inputs, _ = loader.next_batch()

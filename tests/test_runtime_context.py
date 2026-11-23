@@ -37,7 +37,7 @@ def make_tokenizer(format=compute_text):
                 provider="sensor",
                 input_field="request",
                 format="V",
-                head_output=True,
+                head_output="all",
             ),
         ],
         objective_fields=[dict(input_field="stored", missing_value=99)],

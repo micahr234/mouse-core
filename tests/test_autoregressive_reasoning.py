@@ -141,12 +141,14 @@ def test_baseline_and_early_readout_cannot_see_samples_future_events_or_other_se
                         numeric_mask=np.zeros(6, dtype=bool), sequence_ids=np.array([0, 0, 0, 0, 1, 1]),
                         head_positions=np.array([1, 3, 5]),  num_sequences=2,
                         tokenizer_names=("text",))
+    tokens["step_readout_mask"] = tokens["head_mask"].clone()
     traces = [ReasoningTrace(i, (8, 0), 0) for i in [1, 3, 5]]
     kwargs = dict(embedding=online.embedding, backbone=online.backbone, tokenizer_name="text", temperature=1., score_tokens=False)
     before = online.reasoner(tokens, traces, **kwargs)
     changed = [ReasoningTrace(i, (9, 10, 0), 0) for i in [1, 3, 5]]
     after = online.reasoner(tokens, changed, **kwargs)
-    torch.testing.assert_close(before.value_hidden, after.value_hidden)
+    torch.testing.assert_close(before.value_hidden[[0, 2]], after.value_hidden[[0, 2]])
+    assert not torch.allclose(before.value_hidden[1], after.value_hidden[1])
     assert not torch.allclose(before.final_hidden, after.final_hidden)
     tokens['token_ids'][2:] = torch.tensor([12, 13, 14, 15])
     future = online.reasoner(tokens, traces, **kwargs)
@@ -206,17 +208,23 @@ def test_dqn_plus_reinforce_update_shared_backbone_head_and_delayed_target():
     torch.testing.assert_close(target.reasoner.token_head.weight, head_before.lerp(online.reasoner.token_head.weight, 0.4))
 
 
-def local_checkpoint(path, *, tied=False):
+def local_checkpoint(path, *, tied=False, newline=False):
     from transformers import PreTrainedTokenizerFast, Qwen3Config, Qwen3ForCausalLM
     from tokenizers import Tokenizer
     from tokenizers.models import WordLevel
     from tokenizers.pre_tokenizers import Whitespace
     vocabulary = {"<eos>": 0, "<unk>": 1, "<pad>": 15}
     vocabulary.update({f"word{i}": i for i in range(2, 15)})
+    if newline:
+        vocabulary.pop("word14")
+        vocabulary["\n"] = 14
     backend = Tokenizer(WordLevel(vocabulary, unk_token="<unk>"))
     backend.pre_tokenizer = Whitespace()
     tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, eos_token="<eos>", unk_token="<unk>", pad_token="<pad>",
         chat_template='{% for m in messages %}{{ m["content"] }}{% endfor %} assistant:')
+    if newline:
+        from tokenizers import AddedToken
+        tokenizer.add_tokens([AddedToken("\n", normalized=False)])
     tokenizer.save_pretrained(path)
     lm = Qwen3ForCausalLM(Qwen3Config(vocab_size=16, hidden_size=16, intermediate_size=32, num_hidden_layers=1,
         num_attention_heads=2, num_key_value_heads=2, head_dim=8, max_position_embeddings=1024,

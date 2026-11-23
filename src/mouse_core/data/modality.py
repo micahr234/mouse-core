@@ -40,10 +40,10 @@ class TokenizerModalitySpec:
     ``input_index`` selects a scalar for a single named input. Images encode
     each present selected input in selection order (payload order if omitted).
     Token fields emit exactly one token unless their formatted text is empty.
-    ``special=True`` registers a literal token. ``head_output`` marks outputs.
-    ``autoregressive=True`` marks a single token as a generation start and
-    requires ``type="token", head_output=True``. Its format defines the start
-    token; the model owns generation after tokenization.
+    ``special=True`` registers a literal token. ``head_output`` selects "none",
+    "last", or "all" positions in this emitted field. A multi-token readout field
+    is one span, not multiple generation requests. The final selected readout in
+    a step is its decision boundary; the model owns continuation behavior.
 
     Numeric and position additions use independent payload fields and explicit
     finite Fourier bounds (min < max), scaled to [-1,1] without clipping.
@@ -70,8 +70,7 @@ class TokenizerModalitySpec:
     _format_code: CodeType | None = field(default=None, init=False, repr=False, compare=False)
     _format_context: bool = field(default=False, init=False, repr=False, compare=False)
     max_tokens: int | None = None
-    head_output: bool = False
-    autoregressive: bool = False
+    head_output: str = "none"
 
     _VALID_TYPES: ClassVar[tuple[str, ...]] = (
         "text",
@@ -80,10 +79,8 @@ class TokenizerModalitySpec:
     )
 
     def __post_init__(self) -> None:
-        if type(self.autoregressive) is not bool:
-            raise TypeError("autoregressive must be boolean")
-        if self.autoregressive and ((self.type or "").lower() != "token" or not self.head_output):
-            raise ValueError("autoregressive=True requires a token field with head_output=True")
+        if self.head_output not in ("none", "last", "all"):
+            raise ValueError("head_output must be none, last, or all")
         if self.numeric_field is None:
             if self.fourier_min is not None or self.fourier_max is not None or self.numeric_index is not None:
                 raise ValueError("Numeric bounds and numeric_index require numeric_field")

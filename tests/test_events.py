@@ -31,7 +31,7 @@ def tokenizer():
     return Tokenizer(tokenizers={"default": IntIdTokenizer()}, input_fields=[
         dict(type="token", provider='environment', input_field='position', numeric_field='position', format='1', fourier_min=-10., fourier_max=10.),
         dict(type="token", provider='environment', input_field='temperature', numeric_field='temperature', format='2', fourier_min=-40., fourier_max=40.),
-        dict(type='token', provider='environment', format='4', head_output=True),
+        dict(type='token', provider='environment', format='4', head_output="all"),
         dict(type="token", provider='agent', input_field='action', numeric_field='action', format='3', fourier_min=0., fourier_max=2.),
     ],
         objective_fields=[dict(input_field=name, missing_value=value) for name, value in

@@ -15,13 +15,13 @@ def test_pointwise_recurrence_and_detached_feedback_gradients(monkeypatch, resid
     # No attention: any gradient across updates must come from our additive path.
     monkeypatch.setattr(backbone, 'forward', lambda embeds, **kw: backbone.linear(embeds))
     trace = generate(parts, batch(((2, 9),)))
-    initial = torch.zeros_like(reasoner.start_embedding.weight[0])
+    initial = torch.zeros_like(embedding.embeddings["text"].embed_tokens.weight[9:10][0])
     state = initial
     expected, expected_inputs = [], []
     for depth in range(3):
         latent = state if wrap != "none" else initial
         expected_inputs.append(latent)
-        update = backbone.linear(input_reference(reasoner, latent)).float()
+        update = backbone.linear(input_reference(reasoner, latent, embedding.embeddings["text"].embed_tokens.weight[9])).float()
         state = latent + update if residual else update
         expected.append(state)
     torch.testing.assert_close(trace.states[0, 1:], torch.stack(expected))
@@ -42,11 +42,11 @@ def test_pointwise_recurrence_and_detached_feedback_gradients(monkeypatch, resid
     assert bool((gradients[:-1] > 0).all()) is (residual and wrap != "none")
     assert gradients[-1] > 0
     # Even final-only loss without a residual reaches the injected offset.
-    assert reasoner.start_embedding.weight.grad.abs().sum() > 0
+    assert embedding.embeddings["text"].embed_tokens.weight.grad[9:10].abs().sum() > 0
     reasoner.zero_grad(set_to_none=True)
     # Initial embeddings remain learnable even with wrapping and no addition.
     reasoner(trace, embedding=embedding, backbone=backbone).sum().backward()
-    assert reasoner.start_embedding.weight.grad.abs().sum() > 0
+    assert embedding.embeddings["text"].embed_tokens.weight.grad[9:10].abs().sum() > 0
 
 
 @pytest.mark.parametrize('value', [None, False, True, 0, 1, 'true', 'invalid'])
@@ -70,7 +70,6 @@ def test_sequence_carries_only_reasoning_states_and_rebuilds_gradient_path(monke
     monkeypatch.setattr(backbone, 'forward', lambda embeds, **kw: backbone.linear(embeds))
     tokens = batch(((2, 9, 3, 4, 9), (5, 9)))
     tokens['head_mask'] = tokens['token_ids'] == 9
-    tokens['autoregressive_mask'] = tokens['head_mask'].clone()
     tokens['step_readout_mask'] = tokens['head_mask'].clone()
     trace = generate(parts, tokens)
     torch.testing.assert_close(trace.states[1, 0], trace.states[0, cap])
@@ -99,7 +98,6 @@ def test_replay_injects_current_offset_at_all_positions_without_changing_saved_f
     embedding, backbone, reasoner, _ = parts
     tokens = batch(((2, 9, 3, 9), (5, 9)))
     tokens['head_mask'] = tokens['token_ids'] == 9
-    tokens['autoregressive_mask'] = tokens['head_mask'].clone()
     tokens['step_readout_mask'] = tokens['head_mask'].clone()
     trace = generate(parts, tokens)
     saved = trace.tokens['latent_values'].clone()
@@ -110,7 +108,7 @@ def test_replay_injects_current_offset_at_all_positions_without_changing_saved_f
     monkeypatch.setattr(backbone, 'forward', capture)
     reasoner(trace, embedding=embedding, backbone=backbone)
     with torch.no_grad():
-        reasoner.start_embedding.weight.add_(.125)
+        embedding.embeddings["text"].embed_tokens.weight[9:10].add_(.125)
     reasoner(trace, embedding=embedding, backbone=backbone)
     mask = trace.tokens['latent_mask']
     torch.testing.assert_close(received[1][mask] - received[0][mask], torch.full_like(received[0][mask], .125))

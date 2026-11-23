@@ -25,7 +25,7 @@ def tokenizer():
         dict(type='text', provider='sensor', input_field='reading', format='a {reading} b', **position),
         dict(type="token", provider='sensor', input_field='position', numeric_field='position', format='n', fourier_min=0., fourier_max=2., **position),
         dict(type="token", provider='sensor', input_field='angle', numeric_field='angle', format='n', fourier_min=0., fourier_max=2., **position),
-        dict(type='token', provider='sensor', input_field='request', format='head', head_output=True),
+        dict(type='token', provider='sensor', input_field='request', format='head', head_output="all"),
     ])
 
 

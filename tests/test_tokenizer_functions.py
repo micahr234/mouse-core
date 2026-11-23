@@ -25,7 +25,7 @@ def make_tokenizer(**field_options):
     return Tokenizer(tokenizers={'default': CharacterTokenizer()}, input_fields=[
         dict(provider='agent', type='text', input_field='action',
              format='[{action_name(action)}]', format_functions={'action_name': action_name}, **field_options),
-        dict(provider='agent', type='token', input_field='action_requested', format='\n', head_output=True),
+        dict(provider='agent', type='token', input_field='action_requested', format='\n', head_output="all"),
     ], objective_fields=[dict(input_field='action', missing_value=None)])
 
 

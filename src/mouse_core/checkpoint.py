@@ -66,7 +66,7 @@ def load_checkpoint_tokenizer(path: str | Path) -> Tokenizer:
     spec = json.loads((path / "tokenizer" / "tokenizer.json").read_text())
     backends = {
         name: AutoTokenizer.from_pretrained(path / "tokenizer_backends" / quote(name, safe=""), local_files_only=True)
-        for name in spec.get("tokenizers", {})
+        for name, source in spec["tokenizers"].items() if not isinstance(source, dict)
     }
     return load_tokenizer(repo_id_or_path=str(path / "tokenizer"), tokenizers=backends)
 
@@ -119,6 +119,9 @@ class CheckpointStore:
                 if tokenizer is not None:
                     save_tokenizer(tokenizer=tokenizer, path=self.directory / "tokenizer")
                     for name, backend in tokenizer.tokenizers.items():
+                        from mouse_core.data.vocabulary import VocabularyTokenizer
+                        if isinstance(backend, VocabularyTokenizer):
+                            continue
                         save_backend = getattr(backend, "save_pretrained", None)
                         if not callable(save_backend):
                             raise TypeError(f"Checkpoint tokenizer backend {name!r} must support save_pretrained")

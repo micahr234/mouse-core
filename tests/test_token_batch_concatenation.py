@@ -9,7 +9,7 @@ from tests._token_batch_helpers import IntIdTokenizer
 def test_concatenation_matches_pack_with_empty_episodes_and_ragged_action_vectors():
     tokenizer = Tokenizer(
         input_fields=[dict(provider='sensor', type='text', input_field='action',
-                           format='{action}', head_output=True)],
+                           format='{action}', head_output="all")],
         objective_fields=[dict(input_field='reward'), dict(input_field='action'), dict(input_field='q')],
         tokenizers={'default': IntIdTokenizer()},
     )

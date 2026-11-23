@@ -562,7 +562,7 @@ class DqnObjective(Objective[...]):
 
     Q rows are **per head-output token** (``[P, A]``), not per step: a step may
     own several head-output tokens (tokenizer input field flagged
-    ``head_output=True`` emitting more than one token). The
+    ``head_output="all"`` emitting more than one token). The
     ``step_ids`` mapping already carried by ``TensorDict`` maps rows to
     steps, so the loss can align predictions with per-step labels. Every
     head-output row of step ``i`` trains toward the *same* TD target; the

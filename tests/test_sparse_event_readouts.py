@@ -26,7 +26,7 @@ def tokenizer():
         dict(type='token', provider='environment', input_field='observation', format='obs'),
         dict(type='token', provider='environment', input_field='reward', format='reward'),
         dict(type='token', provider='environment', input_field='action_requested',
-             format='<|action_requested|>', special=True, head_output=True),
+             format='<|action_requested|>', special=True, head_output="all"),
     ], objective_fields=[dict(input_field=name, missing_value=value) for name, value in
                         [('action', None), ('reward', 0.), ('terminated', False), ('truncated', False),
                          ('advantage', 1.), ('old_log_prob', 0.)]])
@@ -134,7 +134,7 @@ def test_explicit_provider_fields_keep_order_and_episode_prompt_once():
     tok = Tokenizer(tokenizers={"default": backend()}, input_fields=[
         dict(type='token', provider='coordinator', input_field='_episode_start', format='prefix'),
         dict(type='token', provider='sensor', input_field='value', format='obs'),
-        dict(type='token', provider='agent', input_field='value', format='action', head_output=True),
+        dict(type='token', provider='agent', input_field='value', format='action', head_output="all"),
     ])
     log = EventLog()
     log.event(provider='coordinator', episode_index=0, step_index=0, payload={'_episode_start': True})
@@ -236,7 +236,7 @@ def test_missing_inputs_skip_all_modalities(payload):
 
     tok = Tokenizer(tokenizers={'default': backend(), 'image': unexpected_image}, input_fields=[
         dict(provider="environment", type='text', input_field='text', format='{text}'),
-        dict(provider="environment", type='token', input_field='marker', format='action', head_output=True),
+        dict(provider="environment", type='token', input_field='marker', format='action', head_output="all"),
         dict(provider="environment", type="token", input_field='number', numeric_field='number', format='reward', fourier_min=0., fourier_max=1.),
         dict(provider="environment", type='image', tokenizer='image', input_field='image'),
     ])
@@ -249,7 +249,7 @@ def test_existing_action_marker_does_not_extend_vocabulary():
     hf = backend()
     size = len(hf)
     tok = Tokenizer(tokenizers={"default": hf}, input_fields=[
-        dict(provider="environment", type='token', input_field='action_requested', format='action', head_output=True),
+        dict(provider="environment", type='token', input_field='action_requested', format='action', head_output="all"),
     ])
     assert len(hf) == size and tok.special_token_ids == {}
     event = {'provider': 'environment', 'payload': {'action_requested': True}}

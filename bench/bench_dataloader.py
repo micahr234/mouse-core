@@ -157,7 +157,7 @@ def _train_transform(*, tokenizer_source: str = "Qwen/Qwen3-0.6B", local_files_o
                 "provider": "environment",
                 "input_field": "action_requested",
                 "format": "\n",
-                "head_output": True,
+                "head_output": "all",
             },
             {
                 "type": "text",

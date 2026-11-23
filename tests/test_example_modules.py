@@ -128,7 +128,7 @@ def test_example_encoder_builds_and_trains_each_named_tokenizer_table():
     assert set(encoder.embedding.embeddings) == {'text', 'actions'}
     tokenizer = Tokenizer(tokenizers={'text': IntIdTokenizer(), 'actions': IntIdTokenizer()}, input_fields=[
         dict(provider="sensor", type='text', tokenizer='actions', input_field='action', format='{action}'),
-        dict(provider="sensor", type='text', tokenizer='text', input_field='observation', format='{observation}', head_output=True),
+        dict(provider="sensor", type='text', tokenizer='text', input_field='observation', format='{observation}', head_output="all"),
     ])
     inputs, inputs_objective_data = tokenizer.pack_rows(rows=[measurement_events([{'action': 2, 'observation': 3}])])
     ns['q_head'](encoder(inputs)['z']).square().sum().backward()
@@ -380,7 +380,7 @@ def test_ppo_collection_restarts_replay_and_preserves_behavior_prefixes():
     from tests._token_batch_helpers import IntIdTokenizer
     tokenizer = Tokenizer(tokenizers={"text": IntIdTokenizer()}, input_fields=[
             dict(type='text', provider='environment', input_field='observation', format='{observation}'),
-            dict(type='token', provider='environment', format='1', head_output=True)],
+            dict(type='token', provider='environment', format='1', head_output="all")],
         objective_fields=[
             {'input_field': 'action', 'missing_value': None},
             {'input_field': 'reward', 'missing_value': 0.},
@@ -491,7 +491,7 @@ def test_cartpole_encoder_uses_configured_fourier_features_for_observations():
         if isinstance(kind, ast.Constant) and any(isinstance(key, ast.Constant) and key.value == 'numeric_field' for key in field.keys):
             input_fields.append({**ast.literal_eval(field), "provider": "sensor"})
     assert [(field["input_field"], field["format"]) for field in input_fields] == [("cart_position", "x"), ("pole_angle", "t")]
-    input_fields.append({"provider": "sensor", 'type': 'token', 'format': '\n', 'head_output': True})
+    input_fields.append({"provider": "sensor", 'type': 'token', 'format': '\n', 'head_output': "all"})
 
     class FieldTokenizer:
         def __call__(self, text, **kwargs):
@@ -638,7 +638,7 @@ def test_inference_notebook_keeps_outer_prefix_and_resets_rows(monkeypatch):
         input_fields=[
             dict(type="text", provider="coordinator", input_field="_episode_start", format="15"),
             dict(type="text", provider="environment", input_field="observation", format='{observation}'),
-            dict(type="token", provider="environment", input_field="action_requested", format="1", head_output=True),
+            dict(type="token", provider="environment", input_field="action_requested", format="1", head_output="all"),
         ],
     )
     env = Env()

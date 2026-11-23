@@ -29,7 +29,7 @@ def _tokenizer():
         dict(provider="environment", type='text', tokenizer='text', input_field='_episode_start', format='prefix'),
         dict(provider="agent", type='text', tokenizer='actions', input_field='action', format="{(['a', 'b'])[action]}"),
         dict(provider="environment", type='text', tokenizer='text', input_field='observation', format='{observation}'),
-        dict(provider="environment", type='token', tokenizer='text', input_field='action_requested', format='\n', head_output=True),
+        dict(provider="environment", type='token', tokenizer='text', input_field='action_requested', format='\n', head_output="all"),
     ], objective_fields=[dict(input_field='action', missing_value=None)])
 
 

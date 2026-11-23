@@ -37,19 +37,19 @@ def token_tokenizer(
 
     ``IntIdTokenizer`` turns that rendered integer into one vocab id, so an
     action value of ``1`` is still token id ``1``. The last listed field is
-    ``head_output=True``. Reward floats stay on ``objective_fields`` only.
+    ``head_output="all"``. Reward floats stay on ``objective_fields`` only.
     """
     input_fields: list[dict[str, Any]] = [
         {"provider": "sensor", "type": "text", "input_field": name, "format": "{" + name + "}"} for name in fields
     ]
     if input_fields:
-        input_fields[-1]["head_output"] = True
+        input_fields[-1]["head_output"] = "all"
     if input_fields and not any(
         field.get("input_field") == "episode_index"
         for field in input_fields
     ):
         head_at = next(
-            i for i, field in enumerate(input_fields) if field.get("head_output")
+            i for i, field in enumerate(input_fields) if field.get("head_output", "none") != "none"
         )
         input_fields.insert(
             head_at,

@@ -126,8 +126,6 @@ def start_only_reasoning_episodes(inputs: TensorDict, data: TensorDict, *,
         heads = torch.tensor(segment.head_token_ids, dtype=torch.long)
         if not len(token_rows) or not len(step_rows) or not len(heads):
             raise ValueError('Reasoning replay requires nonempty complete episodes with decisions')
-        if not bool(inputs['autoregressive_mask'][heads].all()):
-            raise ValueError('Reasoning starts must be autoregressive head-output tokens')
         token_start, step_start = int(token_rows[0]), int(step_rows[0])
         positions = heads - token_start
         tokens = inputs.clone(recurse=False)
@@ -141,7 +139,6 @@ def start_only_reasoning_episodes(inputs: TensorDict, data: TensorDict, *,
         tokens['latent_mask'] = mask
         tokens['head_mask'] = mask.clone()
         tokens['step_readout_mask'] = mask.clone()
-        tokens['autoregressive_mask'].zero_()
         rows = torch.searchsorted(original_heads, heads)
         objective = TensorDict({key: value[rows if key == 'step_ids' else step_rows].clone()
                                 for key, value in data.items()}, batch_size=[], device='cpu')

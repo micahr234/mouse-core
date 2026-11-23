@@ -53,7 +53,7 @@ def _tokenizer(*, objective_fields: list[dict[str, str]] | None = None) -> Token
     )
     return Tokenizer(
         input_fields=[
-            {"provider": "sensor", "type": "text", "input_field": "action", "format": '{action}', "head_output": True},
+            {"provider": "sensor", "type": "text", "input_field": "action", "format": '{action}', "head_output": "all"},
             {"provider": "sensor",
                 "type": "text",
                 "input_field": "repeat_episode_index",
@@ -708,7 +708,7 @@ def test_dataloader_first_sample_over_budget_raises() -> None:
 
 def _episode_transform(*, episode_prompt: bool):
     fields: list[dict] = [
-        {"provider": "sensor", "type": "text", "input_field": "action", "format": '{action}', "head_output": True},
+        {"provider": "sensor", "type": "text", "input_field": "action", "format": '{action}', "head_output": "all"},
     ]
     if episode_prompt:
         fields.append(

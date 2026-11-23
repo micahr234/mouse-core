@@ -32,7 +32,7 @@ def make_tokenizer(format=compute_text, **options):
                 type="token",
                 provider="environment",
                 format="V",
-                head_output=True,
+                head_output="all",
                 input_field="action_requested",
             ),
         ],
@@ -189,7 +189,7 @@ def test_empty_format_never_calls_backend_or_emits_readouts(kind, format):
     tok = Tokenizer(
         tokenizers={"text": unexpected_backend},
         input_fields=[
-            dict(type=kind, provider="environment", format=format, head_output=True),
+            dict(type=kind, provider="environment", format=format, head_output="all"),
         ],
     )
     (step,) = tok.encode(events([1]))
@@ -204,7 +204,7 @@ def test_token_format_callback_skips_or_emits_one_token():
                 type="token",
                 provider="environment",
                 format=lambda ctx: ctx["text"],
-                head_output=True,
+                head_output="all",
             ),
         ],
     )

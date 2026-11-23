@@ -84,11 +84,11 @@ def test_each_notebook_updates_components_with_independent_rates(path, rates):
               online=online, target=deepcopy(online).requires_grad_(False), modules=modules,
               q_head=q_head, backup_value_head=deepcopy(q_head).requires_grad_(False), q_heads=q_heads,
               backup_value_heads=deepcopy(q_heads).requires_grad_(False), transition=None,
-              MouseOptimizer=MouseOptimizer,
-              LR_EMBEDDING=0., LR_REASONING=0., LR_REASONING_NORM=0., LR_BACKBONE_LORA=0., LR_HEADS=0., POLYAK_TAU_BACKBONE_LORA=.37)
+              MouseOptimizer=MouseOptimizer, nn=nn,
+              LR_EMBEDDING=0., LR_REASONING=0., LR_REASONING_INPUT=0., LR_BACKBONE_LORA=0., LR_HEADS=0., POLYAK_TAU_BACKBONE_LORA=.37)
     ns.update(zip(('POLYAK_TAU_EMBEDDING', 'POLYAK_TAU_REASONING', 'POLYAK_TAU_VALUE',
                    'POLYAK_TAU_REASONING_HEAD'), rates, strict=True))
-    ns.update(POLYAK_TAU_REASONING=rates[1], POLYAK_TAU_REASONING_NORM=rates[1])
+    ns.update(POLYAK_TAU_REASONING=rates[1], POLYAK_TAU_REASONING_INPUT=rates[1])
     exec(compile(ast.Module(body=[optimizer], type_ignores=[]), str(path), 'exec'), ns)
     opt = ns['optimizer']
     assert any(name.endswith("backbone_lora") for name in opt.groups)
@@ -108,7 +108,7 @@ def test_each_notebook_updates_components_with_independent_rates(path, rates):
     for name, settings in opt.groups.items():
         expected = (.37 if name.endswith('backbone_lora') else rates[0] if name in ('embedding', 'encoder.embedding') else
                     rates[3] if name.endswith('token_head') else
-                    rates[2] if name.endswith(('value_head', 'start_embedding', 'input_projection')) or name.startswith('q_head') else rates[1])
+                    rates[2] if name.endswith(('value_head', 'trainable_embeddings')) or name.startswith('q_head') else rates[1])
         dst = settings.get('target')
         if dst is not None:
             for param in dst.parameters():
@@ -128,7 +128,8 @@ class ReasoningModules(Model):
             self.reasoner.token_head = nn.Linear(2, 2)
         else:
             self.reasoner.norm = nn.Linear(2, 2)
-            self.reasoner.start_embedding = nn.Embedding(1, 2)
+            self.embedding = nn.Module()
+            self.embedding.embeddings = nn.ModuleDict({'text': nn.Linear(2, 2), 'reasoning': nn.Embedding(1, 2)})
             self.reasoner.input_projection = nn.Linear(2, 2)
 
     def forward(self, x):
@@ -142,10 +143,10 @@ def test_reasoning_optimizers_cover_parameters_once_at_component_rates(kind):
     optimizer = next(n for n in tree.body if isinstance(n, ast.Assign)
                      and any(isinstance(t, ast.Name) and t.id == 'optimizer' for t in n.targets))
     model = ReasoningModules(kind)
-    ns: dict[str, Any] = dict(online=model, target=deepcopy(model).requires_grad_(False), MouseOptimizer=MouseOptimizer,
+    ns: dict[str, Any] = dict(online=model, target=deepcopy(model).requires_grad_(False), MouseOptimizer=MouseOptimizer, nn=nn,
         LR_BACKBONE_LORA=.004, POLYAK_TAU_BACKBONE_LORA=.5,
-        LR_EMBEDDING=.001, LR_REASONING_NORM=.002, LR_HEADS=.003, POLYAK_TAU_EMBEDDING=.1,
-        POLYAK_TAU_REASONING_NORM=.2, POLYAK_TAU_VALUE=.3, POLYAK_TAU_REASONING_HEAD=.4)
+        LR_EMBEDDING=.001, LR_REASONING_INPUT=.002, LR_HEADS=.003, POLYAK_TAU_EMBEDDING=.1,
+        POLYAK_TAU_REASONING_INPUT=.2, POLYAK_TAU_VALUE=.3, POLYAK_TAU_REASONING_HEAD=.4)
     exec(compile(ast.Module(body=[optimizer], type_ignores=[]), str(path), 'exec'), ns)
     actual = {}
     for group in ns['optimizer'].param_groups:
@@ -156,6 +157,8 @@ def test_reasoning_optimizers_cover_parameters_once_at_component_rates(kind):
         if not param.requires_grad:
             assert id(param) not in actual
             continue
-        expected = .001 if name.startswith('embedding.') else .004 if name.startswith('backbone.') else .002 if name.startswith('reasoner.norm.') else .003
+        expected = .001 if name.startswith('embedding.') else .004 if name.startswith('backbone.') else .002 if name.startswith(('reasoner.norm.', 'reasoner.input_projection.')) else .003
+        if name.startswith('embedding.embeddings.reasoning.'):
+            expected = .003
         assert actual.pop(id(param)) == expected
     assert not actual

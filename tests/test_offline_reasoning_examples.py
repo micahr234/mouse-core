@@ -1,5 +1,7 @@
 """Offline reasoning notebooks load saved events; evaluation lives in example 15."""
 import json
+import sys
+from types import ModuleType
 from pathlib import Path
 
 import gymnasium as gym
@@ -21,8 +23,10 @@ EXAMPLES = Path(__file__).parents[1] / 'examples'
 def test_offline_checkpoint_loads_and_evaluates_only_in_inference_notebook(tmp_path, monkeypatch, kind, filename, reasoning_loss, residual):
     source, output = tmp_path / 'base', tmp_path / 'saved'
     uploads = capture_upload(monkeypatch, output)
-    local_checkpoint(source)
-    namespace = {}
+    local_checkpoint(source, newline=kind == "sequential")
+    training_module = ModuleType("__main__")
+    monkeypatch.setitem(sys.modules, "__main__", training_module)
+    namespace = vars(training_module)
     def forbidden_environment(*args, **kwargs):
         raise AssertionError('Offline training notebooks must never create an environment')
     # Real model construction, tokenization, offline loading and checkpoint saving
@@ -40,7 +44,7 @@ def test_offline_checkpoint_loads_and_evaluates_only_in_inference_notebook(tmp_p
             exec(compile(code, filename, 'exec'), namespace)
             if index == 1:
                 namespace.update(PRETRAINED=str(source), load_stores_from_hub=lambda **_: recorded_stores(),
-                    SAMPLE_BUDGET=2, NUM_WORKERS=0, MAX_EPISODE_STEPS=2, NUM_CYCLES=0, MAX_REASONING_STEPS=4, MIN_REASONING_STEPS=4 if reasoning_loss == "last_token" else 3,
+                    SAMPLE_BUDGET=2, NUM_WORKERS=0, MAX_EPISODE_STEPS=2, MAX_STEPS_PER_EPISODE=2, REPEAT_COUNT=2, NUM_CYCLES=0, MAX_REASONING_STEPS=4, MIN_REASONING_STEPS=4 if reasoning_loss == "last_token" else 3,
                     REASONING_LOSS=reasoning_loss, RESIDUAL_CONNECTIONS=residual, WRAP_LATENT="step" if residual else "none",
                     GENERATION_START_TOKEN='word2', MAX_NEW_TOKENS=64, MAX_ACTIVE_REQUESTS=2)
     assert len(uploads) == 1
@@ -52,7 +56,9 @@ def test_offline_checkpoint_loads_and_evaluates_only_in_inference_notebook(tmp_p
         assert repo_type == 'model'
         return str(output)
     monkeypatch.setattr(huggingface_hub, 'snapshot_download', snapshot_download)
-    inference = {}
+    inference_module = ModuleType("__main__")
+    monkeypatch.setitem(sys.modules, "__main__", inference_module)
+    inference = vars(inference_module)
     cells = json.loads((EXAMPLES / '15_inference.ipynb').read_text())['cells']
     start = next(i for i, cell in enumerate(cells)
                  if cell['cell_type'] == 'markdown'
@@ -69,7 +75,10 @@ def test_offline_checkpoint_loads_and_evaluates_only_in_inference_notebook(tmp_p
     policy = loaded[0]
     for name, parameter in namespace['online'].named_parameters():
         torch.testing.assert_close(dict(policy.named_parameters())[name], parameter)
-    _, spec, backend, settings = loaded
+    if kind == "sequential":
+        _, spec, settings = loaded
+    else:
+        _, spec, backend, settings = loaded
     if kind == 'sequential':
         assert settings['residual_connections'] is namespace['online'].reasoner.residual_connections
         assert settings['wrap_latent'] == namespace['online'].reasoner.wrap_latent
@@ -77,12 +86,13 @@ def test_offline_checkpoint_loads_and_evaluates_only_in_inference_notebook(tmp_p
         assert settings['reasoning_loss'] == reasoning_loss
         assert policy.reasoning_loss == reasoning_loss
         assert policy.reasoner.adaptive_depth is (reasoning_loss == 'all_tokens')
-    original_steps = namespace['train_transform'](recorded_stores(episodes=1)[0].to_dataset())
+    events = recorded_stores(episodes=1)[0].to_dataset()
+    original_steps = (namespace['tokenizer'].encode(events) if kind == 'sequential'
+                      else namespace['train_transform'](events))
     if kind == 'sequential':
-        encoded = inference['encode_reasoning_observation'](observation=0, action=None, reward=0.,
-            token_spec=spec, text_backend=backend, settings=settings)
+        encoded = inference['encode_reasoning_events'](events=list(events)[:2], token_spec=spec)
         np.testing.assert_array_equal(encoded['token_ids'].cpu(), original_steps[0].token_ids)
-    names = (('reasoning_policy', 'reasoning_tokenizer', 'reasoning_backend', 'reasoning_settings')
+    names = (('reasoning_policy', 'reasoning_tokenizer', 'reasoning_settings')
              if kind == 'sequential' else ('autoregressive_policy', 'autoregressive_tokenizer', 'autoregressive_backend', 'autoregressive_settings'))
     inference.update(zip(names, loaded, strict=True))
     if kind == 'autoregressive':
@@ -92,6 +102,13 @@ def test_offline_checkpoint_loads_and_evaluates_only_in_inference_notebook(tmp_p
         for actual, expected in zip(spec.encode(events), original_steps[:2], strict=True):
             np.testing.assert_array_equal(actual.token_ids, expected.token_ids)
             np.testing.assert_array_equal(actual.head_mask, expected.head_mask)
+    received_events = []
+    if kind == 'sequential':
+        original_encode = inference['encode_reasoning_events']
+        def record_events(*, events, token_spec):
+            received_events.extend(events)
+            return original_encode(events=events, token_spec=token_spec)
+        inference['encode_reasoning_events'] = record_events
     readouts = []
     hook = policy.register_forward_pre_hook(
         lambda _module, args: readouts.append(int(args[0]['head_mask'].sum()))
@@ -103,3 +120,10 @@ def test_offline_checkpoint_loads_and_evaluates_only_in_inference_notebook(tmp_p
     assert len(returns) == 1 and np.isfinite(returns).all()
     assert readouts and all(count == 1 for count in readouts)
     assert all(parameter.grad is None for parameter in policy.parameters())
+    if kind == 'sequential':
+        resets = [event['payload']['repeat_episode_index'] for event in received_events
+                  if 'repeat_episode_index' in event['payload']]
+        assert resets == [0, 1]
+        assert sum('_episode_start' in event['payload'] for event in received_events) == 1
+        assert any(event['payload'].get('inner_terminated') or event['payload'].get('inner_truncated')
+                   for event in received_events)

@@ -112,3 +112,25 @@ def test_strict_load_validation_happens_before_parameter_mutation(tmp_path):
     for name, value in before.items():
         torch.testing.assert_close(target.state_dict()[name], value)
     assert json.loads((path / "config.json").read_text())["format"] == CHECKPOINT_FORMAT
+
+
+def test_learned_vocabulary_and_weights_reload_without_external_tokenizer(tmp_path):
+    from mouse_core.data import Tokenizer, VocabularyTokenizer
+    from mouse_core.checkpoint import load_checkpoint_tokenizer
+    from mouse_core.models import Embedding, MultiEmbedding
+
+    tokenizer = Tokenizer(
+        tokenizers={'reasoning': VocabularyTokenizer(['reason', 'other'])},
+        input_fields=[dict(type='token', tokenizer='reasoning', input_field='query',
+                           format='{query}', head_output='last')],
+    )
+    model = MultiEmbedding(embeddings={'reasoning': Embedding(vocab_size=2, hidden_dim=8)})
+    store = CheckpointStore(tmp_path / 'run')
+    snapshot = store.save(step=0, model=model, tokenizer=tokenizer)
+    restored_tokenizer = load_checkpoint_tokenizer(snapshot)
+    assert restored_tokenizer({'provider': 'environment', 'payload': {'query': 'other'}})['token_ids'].tolist() == [1]
+    restored = MultiEmbedding(embeddings={'reasoning': Embedding(vocab_size=2, hidden_dim=8)})
+    load_checkpoint(snapshot, model=restored)
+    torch.testing.assert_close(restored.embeddings['reasoning'].embed_tokens.weight,
+                               model.embeddings['reasoning'].embed_tokens.weight)
+    assert not (store.directory / 'tokenizer_backends' / 'reasoning').exists()

@@ -26,7 +26,7 @@ def store_of(count=6):
 
 def tokenizer():
     return Tokenizer(tokenizers={"text": IntIdTokenizer()}, input_fields=[
-        dict(type="text", provider="sensor", input_field="value", format="{value}", head_output=True)],
+        dict(type="text", provider="sensor", input_field="value", format="{value}", head_output="all")],
         objective_fields=[dict(input_field="value")])
 
 
@@ -153,7 +153,7 @@ def test_incomplete_tail_is_reconsidered_after_append_and_malformed_tail_raises(
     log.event(provider="environment", episode_index=0, step_index=0, payload={"observation": 1})
     store = log.to_store()
     tok = Tokenizer(tokenizers={"text": IntIdTokenizer()}, input_fields=[
-        dict(type="text", provider="environment", input_field="observation", format="{observation}", head_output=True)])
+        dict(type="text", provider="environment", input_field="observation", format="{observation}", head_output="all")])
     data = DataLoader(stores=store, transform=tok.encode, sample_ranges=episode_sample_ranges,
                       sample_eligible=environment_episode_is_complete,
                       num_workers=0, token_budget=4, seed=5)

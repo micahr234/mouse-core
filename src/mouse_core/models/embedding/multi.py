@@ -53,20 +53,21 @@ class MultiEmbedding(nn.Module):
         position_values: torch.Tensor | None = None, position_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Route prepared tensors without transferring them between devices."""
-        if tuple(tokenizer_names) != self.tokenizer_names:
-            raise ValueError("Input tokenizer_names must match the embedding tables in order")
+        if (tuple(tokenizer_names) != tuple(sorted(set(tokenizer_names)))
+                or any(name not in self.embeddings for name in tokenizer_names)):
+            raise ValueError("Input tokenizer_names must identify distinct configured embedding tables in sorted order")
         if token_ids.ndim != 1 or token_ids.dtype != torch.long:
             raise ValueError("token_ids must be int64 [L]")
         if (tokenizer_ids.shape != token_ids.shape or tokenizer_ids.dtype != torch.long
                 or tokenizer_ids.device != token_ids.device):
             raise ValueError("tokenizer_ids must be int64 [L] on the token_ids device")
-        if bool(((tokenizer_ids < 0) | (tokenizer_ids >= len(self.tokenizer_names))).any()):
+        if bool(((tokenizer_ids < 0) | (tokenizer_ids >= len(tokenizer_names))).any()):
             raise ValueError("tokenizer_ids must identify an embedding table")
         first = next(self.parameters())
         if any(parameter.device != token_ids.device for parameter in self.parameters()):
             raise ValueError("Input tensors and all embedding tables must be on the same device")
         output = first.new_zeros((token_ids.numel(), self.hidden_dim))
-        for index, name in enumerate(self.tokenizer_names):
+        for index, name in enumerate(tokenizer_names):
             selected = tokenizer_ids == index
             if not bool(selected.any()):
                 continue

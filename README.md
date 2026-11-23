@@ -387,28 +387,44 @@ reasoning and train. They never collect interactions or run evaluation. Set
 prediction-to-step mappings. [Example 15](examples/15_inference.ipynb) loads each
 checkpoint's explicit loss, recurrence and depth settings for evaluation.
 
-The tokenizer marks each requested decision with a single existing token:
+Ordinary DQN and both reasoners use the same tokenizer and packed decision
+boundaries. A field selects readouts with `head_output="none"`, `"last"`, or
+`"all"`. Multi-token fields keep their complete token span; `last` selects only
+its final token. `head_mask` records all requested predictions, and
+`step_readout_mask` selects the final prediction in each environment step.
+`decision_positions` and `align_decision_objectives` provide the common mapping
+from those decisions to recorded actions and rewards.
+
+Learned reasoning inputs use a named vocabulary alongside the text tokenizer:
 
 ```python
-{"type": "token", "provider": "environment", "input_field": "action_requested",
- "format": "\n", "head_output": True, "autoregressive": True}
+tokenizers = {"text": text_tokenizer,
+              "reasoning": VocabularyTokenizer(["reasoning"])}
+field = {"type": "token", "tokenizer": "reasoning", "provider": "environment",
+         "input_field": "action_requested", "format": "reasoning",
+         "head_output": "last"}
 ```
 
-A text head-output field can emit multiple tokens, and multiple fields may mark
-outputs within one step. Packing preserves every ordinary prediction in
-`head_mask` and separately marks the last one per step in `step_readout_mask`.
-Sequential reasoning uses only these final markers; earlier marked tokens remain
-context. `head_output_segments(inputs)` returns each episode's marker positions
-and context slices (prefix, inter-step segments, tail), preserving passive steps
-and trailing fields. The generator replaces each final marker with the learned
-start, reasons until stopping, then appends the next recorded segment. Choosing
-an environment action ends reasoning; it never replaces the recorded action.
-Low-level `make_token_batch` callers must supply `step_readout_mask` explicitly
-when using sequential reasoning; tokenizers and loaders calculate it automatically.
+`MultiEmbedding` owns a matching `reasoning` embedding table. Its embedding is
+added after the latent input MLP at every reasoning depth. There is no hidden
+placeholder replacement or tokenizer `autoregressive` option. The model controls
+continuation and stopping. Text reasoning generates vocabulary tokens; latent
+reasoning inserts feedback embeddings at the same decision boundaries.
 
-After generation, use `generated.align_objective_data(inputs, objective_data)`
-to select prediction-to-step mappings for those final markers. Per-step labels
-remain unchanged. Both networks then train on the same aligned generated history.
+`head_output_segments(inputs)` splits each sequence into recorded context and
+boundary inputs, preserving passive steps and trailing fields. Both generators
+retain earlier generated reasoning before appending the next recorded segment.
+An environment action ends reasoning without replacing the action in replay.
+Low-level `make_token_batch` callers supply `step_readout_mask` explicitly;
+tokenizers and loaders calculate it automatically. Field boundary masks preserve
+multi-token spans. `ReasoningBatch.readouts` describes each valid Q-producing
+position, its decision, depth, and whether it is final; trailing feedback is
+context, not a prediction.
+
+After generation, `generated.align_objective_data(inputs, objective_data)`
+uses the common decision alignment. Per-step labels remain unchanged. Both
+networks then train on the same aligned generated history with their own live
+input embeddings.
 
 `SequentialReasoner(rms_norm_eps=backbone.rms_norm_eps, hidden_dim=...,
 input_mlp_intermediate_dim=backbone.mlp_intermediate_dim, input_mlp_output_scale=..., min_steps=...,
@@ -441,8 +457,8 @@ feedback. Both flags enabled rebuild the differentiable accumulated residual
 path starting from zero; without wrapping, the residual is zero at every depth.
 The offset remains learnable through every occurrence, even with a final-only
 loss and no residual connection. A zero-feedback-only batch gives zero data
-gradients to the norm/MLP, because the bias-free MLP maps zero to zero. The start vector is independent of the
-newline marker and pretrained token tables. A shared learned gated MLP
+gradients to the norm/MLP, because the bias-free MLP maps zero to zero. The start vector belongs to its named vocabulary table and is independent of
+the pretrained text table. A shared learned gated MLP
 projects normalized reasoning inputs in every mode:
 `input_mlp_output_scale * down(SiLU(gate(norm(x))) * up(norm(x)))`.
 All three linear layers are bias-free and use standard PyTorch initialization.

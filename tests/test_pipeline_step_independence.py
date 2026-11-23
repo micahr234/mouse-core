@@ -34,7 +34,7 @@ def _tok_in(
             "type": "text",
             "input_field": name,
             "format": "{" + name + "}",
-            **({"head_output": True} if name == head_output else {}),
+            **({"head_output": "all"} if name == head_output else {}),
         }
         for name in names
     ]
@@ -91,7 +91,7 @@ def test_tokenizer_renames_objective_fields() -> None:
                 "type": "text",
                 "input_field": "act",
                 "format": '{act}',
-                "head_output": True,
+                "head_output": "all",
             },
             {"provider": "sensor",
                 "type": "text",

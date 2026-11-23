@@ -39,7 +39,7 @@ def configured(*, wrapper=False):
         dict(provider="sensor", type="token", tokenizer='text', input_field='number', numeric_field='number', format='reward',
              fourier_min=0., fourier_max=2.),
         dict(provider="sensor", type='token', tokenizer='text', input_field='request', format='<readout>',
-             special=True, head_output=True),
+             special=True, head_output="all"),
         dict(provider="sensor", type='image', tokenizer='image', input_field='image'),
     ], objective_fields=[dict(input_field='action', missing_value=None)])
 

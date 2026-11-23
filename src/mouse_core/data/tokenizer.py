@@ -87,7 +87,7 @@ class Tokenizer:
     ``tokenizer(event)`` returns an event's token arrays, possibly empty. It does
     not interpret provider roles. An omitted ``provider`` matches every provider;
     a name filters events to that provider. ``input_field`` optionally filters
-    payload names (one name or a list); formats use those names directly. ``head_output=True`` marks
+    payload names (one name or a list); formats use those names directly. ``head_output="all"`` marks
     exactly the tokens that field emits, including optional special tokens.
     Matching fields emit in ``input_fields`` order, regardless of payload key
     order. Each field is tokenized separately; text never merges across fields
@@ -152,7 +152,12 @@ class Tokenizer:
             if name not in sources:
                 raise ValueError(f"Input field {_field_label(spec)!r} must select a configured tokenizer; got {name!r}")
             field_tokenizers.append(name)
-        self.tokenizer_sources = {name: str(value) if isinstance(value, (str, Path)) else None
+        from mouse_core.data.vocabulary import VocabularyTokenizer
+        sources = {name: VocabularyTokenizer(value["tokens"])
+                   if isinstance(value, dict) and set(value) == {"type", "tokens"} and value["type"] == "vocabulary"
+                   else value for name, value in sources.items()}
+        self.tokenizer_sources = {name: value.config() if isinstance(value, VocabularyTokenizer)
+                                  else str(value) if isinstance(value, (str, Path)) else None
                                   for name, value in sources.items()}
         self.tokenizers: dict[str, Any] = {}
         for name, source in sources.items():
@@ -283,7 +288,7 @@ class EventTokenStream:
     def _finish(self) -> StepTokens:
         pieces = self._pieces
         values = {name: np.concatenate([piece[name] for piece in pieces]) for name in
-                  ("token_ids", "numeric_values", "numeric_mask", "head_mask", "autoregressive_mask", "tokenizer_ids", "position_values", "position_mask", "numeric_field_ids")}
+                  ("token_ids", "numeric_values", "numeric_mask", "head_mask", "field_start_mask", "field_end_mask", "tokenizer_ids", "position_values", "position_mask", "numeric_field_ids")}
         objective = copy_keep_fields(self._labels,
                                     self.tokenizer.objective_fields if self.include_objectives else (),
                                     missing_values=self.tokenizer.objective_missing_values)
@@ -528,14 +533,15 @@ def _tokenize_fields(*, row, meta, tokenizers, tokenizer_routes, numeric_routes,
     numeric_values: list[float] = []
     numeric_mask: list[bool] = []
     head_mask: list[bool] = []
-    autoregressive_mask: list[bool] = []
+    field_start_mask: list[bool] = []
+    field_end_mask: list[bool] = []
     numeric_field_ids: list[int] = []
     position_values: list[float] = []
     position_mask: list[bool] = []
 
     def _emit(
         emitted_ids: list[int], *, spec: TokenizerModalitySpec, field_id: int,
-        head_output: bool = False,
+        head_output: str = "none",
     ) -> None:
         _require_max_tokens(spec, emitted_ids)
         position = row.get(spec.position_field) if spec.position_field is not None else None
@@ -558,8 +564,12 @@ def _tokenize_fields(*, row, meta, tokenizers, tokenizer_routes, numeric_routes,
         numeric_field_ids.extend([numeric_routes[field_id] if is_numeric else -1] * len(emitted_ids))
         position_values.extend([0.0 if position is None else position] * len(emitted_ids))
         position_mask.extend([position is not None] * len(emitted_ids))
-        head_mask.extend([head_output] * len(emitted_ids))
-        autoregressive_mask.extend([spec.autoregressive] * len(emitted_ids))
+        selected = [head_output == "all"] * len(emitted_ids)
+        if selected and head_output == "last":
+            selected[-1] = True
+        head_mask.extend(selected)
+        field_start_mask.extend([i == 0 for i in range(len(emitted_ids))])
+        field_end_mask.extend([i == len(emitted_ids) - 1 for i in range(len(emitted_ids))])
 
     for field_id, m in meta:
         spec = m.spec
@@ -599,11 +609,12 @@ def _tokenize_fields(*, row, meta, tokenizers, tokenizer_routes, numeric_routes,
         position_values=np.asarray(position_values, dtype=np.float64),
         position_mask=np.asarray(position_mask, dtype=bool),
         head_mask=np.asarray(head_mask, dtype=bool),
-        autoregressive_mask=np.asarray(autoregressive_mask, dtype=bool),
+        field_start_mask=np.asarray(field_start_mask, dtype=bool),
+        field_end_mask=np.asarray(field_end_mask, dtype=bool),
     )
 
 
-TOKENIZER_FORMAT = "mouse-core-tokenizer-v5"
+TOKENIZER_FORMAT = "mouse-core-tokenizer-v6"
 TOKENIZER_FILENAME = "tokenizer.json"
 
 
@@ -637,7 +648,7 @@ def _input_fields_config(specs):
         for key, value in data.items():
             if key.startswith("_") or value is None:
                 continue
-            if key in ("head_output", "special", "autoregressive") and value is False:
+            if key in ("special",) and value is False:
                 continue
             if key == "format_functions":
                 if value:

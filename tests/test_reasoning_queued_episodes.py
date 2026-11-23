@@ -16,7 +16,6 @@ def test_queued_episode_refills_match_uncached_histories(residual, wrap):
     tokens = batch(((2, 9, 3, 9), (4, 9), (5, 9, 6, 9, 7, 9),
                     (2, 3, 4, 9), (6, 9, 8, 9)))
     tokens['head_mask'] = tokens['token_ids'] == 9
-    tokens['autoregressive_mask'] = tokens['head_mask'].clone()
     tokens['step_readout_mask'] = tokens['head_mask'].clone()
     lengths = torch.tensor([1, 3, 2, 1, 2, 3, 3, 2, 1])
     cached = generate(parts, tokens, lengths=lengths, backend='continuous')

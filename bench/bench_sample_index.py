@@ -99,7 +99,7 @@ def main():
             dict(type="text", provider="agent", input_field="action", format="{action}"),
             dict(type="text", provider="environment", input_field="observation", format=",{observation}"),
             dict(type="text", provider="environment", input_field="reward", format=",r={reward}"),
-            dict(type="token", provider="environment", input_field="action_requested", format="\n", head_output=True),
+            dict(type="token", provider="environment", input_field="action_requested", format="\n", head_output="all"),
         ], objective_fields=[
             dict(input_field="action", missing_value=None),
             dict(input_field="reward", missing_value=0.),

@@ -12,6 +12,7 @@ def pack_prefixes(prompts):
         token_ids=ids, numeric_values=np.zeros(len(ids)), numeric_mask=np.zeros(len(ids), bool),
         sequence_ids=np.repeat(np.arange(len(prompts)), lengths),
         head_mask=np.isin(np.arange(len(ids)), lengths.cumsum() - 1),
+        step_readout_mask=np.isin(np.arange(len(ids)), lengths.cumsum() - 1),
         num_sequences=len(prompts), tokenizer_names=("text",),
     )
 
@@ -30,22 +31,29 @@ class DigitsBackend:
 def reasoning_loader(example, *, stores=None, events_budget=12, seed=7, num_workers=0):
     """Use the notebook's real transform/sampling with a tiny test-owned tokenizer."""
     from mouse_core.data import DataLoader, Tokenizer, compose
+    if hasattr(example, "format_events"):
+        fields = [dict(type="text", provider="environment", input_field="prompt", format="{prompt}")]
+        objective_fields = [dict(input_field=key, missing_value=value) for key, value in
+                            [("action", None), ("reward", 0.), ("terminated", False), ("truncated", False)]]
+        example.format_events.__globals__["format_observation"] = (
+            lambda *, observation, action, reward, requested: "2 3" if action is None else str(observation + 4)
+        )
+        stages = (example.format_events,)
+    else:
+        fields = [dict(type="text", provider="environment", input_field="observation", format="{observation+4}")]
+        objective_fields = [dict(input_field=source, output_field=key, missing_value=value)
+                            for source, key, value in [("action", "action", None), ("reward", "reward", 0.),
+                                                       ("_terminated", "terminated", False), ("_truncated", "truncated", False)]]
+        stages = ()
     tokenizer = Tokenizer(
         tokenizers={"text": DigitsBackend()},
-        input_fields=[
-            dict(type="text", provider="environment", input_field="prompt", format="{prompt}"),
-            dict(type="token", provider="environment", input_field="action_requested",
-                 format="9", head_output=True, autoregressive=True),
-        ],
-        objective_fields=[dict(input_field=key, missing_value=value) for key, value in
-                          [("action", None), ("reward", 0.), ("terminated", False), ("truncated", False)]],
-    )
-    example.format_events.__globals__["format_observation"] = (
-        lambda *, observation, action, reward, requested: "2 3" if action is None else str(observation + 4)
+        input_fields=fields + [dict(type="token", provider="environment", input_field="action_requested",
+                                   format="9", head_output="all")],
+        objective_fields=objective_fields,
     )
     return DataLoader(
         stores=recorded_stores() if stores is None else stores,
-        transform=compose(stages=(example.format_events, tokenizer.encode)),
+        transform=compose(stages=(*stages, tokenizer.encode)),
         events_budget=events_budget, sample_ranges=example.sample_ranges,
         sample_eligible=example.sample_eligible, num_workers=num_workers, seed=seed,
     )

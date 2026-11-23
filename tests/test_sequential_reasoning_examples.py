@@ -57,7 +57,7 @@ def test_notebook_training_uses_its_selected_recurrence_and_target_depth(reasoni
         with torch.no_grad():
             head.weight[-1].zero_()
             head.bias[-1] = 12.
-    kwargs = dict(embedding=MultiEmbedding(embeddings={'text': Embedding(vocab_size=16, hidden_dim=8)}),
+    kwargs = dict(embedding=MultiEmbedding(embeddings={'text': Embedding(vocab_size=16, hidden_dim=8), 'reasoning': Embedding(vocab_size=1, hidden_dim=8)}),
                   backbone=CausalBackbone(), value_head=head, max_steps=max_steps)
     online = example.ReasoningDqn(input_mlp_output_scale=100., **kwargs, min_steps=min_steps,
         residual_connections=residual, wrap_latent=wrap, reasoning_loss=reasoning_loss)
@@ -119,10 +119,10 @@ def test_notebook_training_uses_its_selected_recurrence_and_target_depth(reasoni
     handle = online.reasoner.register_forward_hook(record_states)
     with reasoning_loader(example) as loader:
         example.run_train.__globals__.update(
-            online=online, target=target, LR_EMBEDDING=.001, LR_BACKBONE_LORA=.001, LR_REASONING_NORM=.001, LR_HEADS=.001,
+            online=online, target=target, LR_EMBEDDING=.001, LR_BACKBONE_LORA=.001, LR_REASONING_INPUT=.001, LR_HEADS=.001,
             objective=checked_objective, loader=loader, device=torch.device('cpu'),
             MAX_ACTIVE_REQUESTS=2,
-            POLYAK_TAU_EMBEDDING=.1, POLYAK_TAU_BACKBONE_LORA=.2, POLYAK_TAU_REASONING_NORM=.2, POLYAK_TAU_VALUE=.3,
+            POLYAK_TAU_EMBEDDING=.1, POLYAK_TAU_BACKBONE_LORA=.2, POLYAK_TAU_REASONING_INPUT=.2, POLYAK_TAU_VALUE=.3,
             MAX_GRAD_NORM=1., REASONING_REWARD=-.2, GAMMA_THINK=.4)
         configure_notebook_optimizer(example, EXAMPLES / "25_train_reasoning_dqn.ipynb")
         try:
@@ -162,7 +162,7 @@ def test_notebook_training_uses_its_selected_recurrence_and_target_depth(reasoni
         if not param.requires_grad:
             assert param.grad is None
             torch.testing.assert_close(param, original_weights[name], rtol=0, atol=0)
-    for component in ('embedding.', 'backbone.', 'reasoner.norm.', 'reasoner.start_embedding.', 'reasoner.input_projection.', 'value_head.'):
+    for component in ('embedding.', 'backbone.', 'reasoner.norm.', 'reasoner.input_projection.', 'value_head.'):
         changed = any(not torch.equal(original_weights[name], param)
                       for name, param in online.named_parameters() if name.startswith(component))
         feedback_is_zero = wrap == "none" or (wrap == "step" and max_steps == 1)
@@ -179,7 +179,7 @@ def test_notebook_rejects_invalid_loss_and_adaptive_last_token_budget(reasoning_
     example = example_module('25')
     with pytest.raises(ValueError, match=message):
         example.ReasoningDqn(input_mlp_output_scale=100.,
-            embedding=MultiEmbedding(embeddings={'text': Embedding(vocab_size=16, hidden_dim=8)}),
+            embedding=MultiEmbedding(embeddings={'text': Embedding(vocab_size=16, hidden_dim=8), 'reasoning': Embedding(vocab_size=1, hidden_dim=8)}),
             backbone=CausalBackbone(), value_head=nn.Linear(8, 4),
             min_steps=min_steps, max_steps=max_steps,
             residual_connections=False, wrap_latent="none", reasoning_loss=reasoning_loss,

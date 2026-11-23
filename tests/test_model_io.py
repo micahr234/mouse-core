@@ -24,7 +24,7 @@ def test_inline_formats_reload_in_a_fresh_notebook(tmp_path, monkeypatch):
     tokenizer = Tokenizer(
         input_fields=[
             {"provider": "sensor", 'type': 'text', 'format': training.episode_prompt},
-            {"provider": "sensor", 'type': 'token', 'format': '1', 'head_output': True},
+            {"provider": "sensor", 'type': 'token', 'format': '1', 'head_output': "all"},
         ],
         tokenizers={"default": IntIdTokenizer()},
     )
@@ -45,7 +45,7 @@ def test_inline_formats_reload_in_a_fresh_notebook(tmp_path, monkeypatch):
 @pytest.mark.parametrize('module', ['__main__', 'missing_notebook_predicate_module'])
 def test_unsavable_callback_does_not_overwrite_a_saved_tokenizer(tmp_path, module):
     good = Tokenizer(
-        input_fields=[{"provider": "sensor", 'type': 'token', 'format': '1', 'head_output': True}],
+        input_fields=[{"provider": "sensor", 'type': 'token', 'format': '1', 'head_output': "all"}],
         tokenizers={"default": IntIdTokenizer()},
     )
     save_tokenizer(tokenizer=good, path=tmp_path)
@@ -55,7 +55,7 @@ def test_unsavable_callback_does_not_overwrite_a_saved_tokenizer(tmp_path, modul
     bad = Tokenizer(
         input_fields=[
             {"provider": "sensor", 'type': 'text', 'format': namespace['episode_prompt']},
-            {"provider": "sensor", 'type': 'token', 'format': '1', 'head_output': True},
+            {"provider": "sensor", 'type': 'token', 'format': '1', 'head_output': "all"},
         ],
         tokenizers={"default": IntIdTokenizer()},
     )
@@ -305,7 +305,7 @@ def test_tokenizer_roundtrip(tmp_path) -> None:
         input_fields=[
             {"provider": "sensor", "type": "text", "input_field": "action", "format": '{action}'},
             {"provider": "sensor", "type": "text", "input_field": "repeat_episode_done", "format": '{repeat_episode_done}'},
-            {"provider": "sensor", "type": "text", "input_field": "done_code", "format": '{done_code}', "head_output": True},
+            {"provider": "sensor", "type": "text", "input_field": "done_code", "format": '{done_code}', "head_output": "all"},
             {"provider": "sensor",
                 "type": "text",
                 "input_field": "repeat_episode_index",
@@ -338,9 +338,9 @@ def test_tokenizer_roundtrip(tmp_path) -> None:
         "repeat_episode_index",
     ]
     assert "required" not in (tmp_path / "tokenizer.json").read_text()
-    assert loaded.input_fields[2].head_output is True
+    assert loaded.input_fields[2].head_output == "all"
     assert loaded.input_fields[3].format is format_episode_index
-    assert sum(1 for s in loaded.input_fields if s.head_output) == 1
+    assert sum(1 for s in loaded.input_fields if s.head_output != "none") == 1
 
 
 def test_load_tokenizer_missing_file_raises(tmp_path) -> None:
@@ -350,7 +350,7 @@ def test_load_tokenizer_missing_file_raises(tmp_path) -> None:
 
 def test_push_model_and_tokenizer_share_repository(monkeypatch) -> None:
     model = simple_model(backbone=IdentityBackbone(hidden_dim=8), heads=({'action_value': (head := MLP(in_features=8, out_features=4, hidden_dim=8, num_layers=1, propagate_gradient=1.0, rms_norm_eps=1e-6))}), reasoner=None)
-    tokenizer = Tokenizer(input_fields=[{"provider": "sensor", 'type': 'text', 'input_field': 'action', 'format': '{action}', 'head_output': True}, {"provider": "sensor", 'type': 'text', 'input_field': 'repeat_episode_index', 'format': format_episode_index}], objective_fields=[], tokenizers={"default": IntIdTokenizer()})
+    tokenizer = Tokenizer(input_fields=[{"provider": "sensor", 'type': 'text', 'input_field': 'action', 'format': '{action}', 'head_output': "all"}, {"provider": "sensor", 'type': 'text', 'input_field': 'repeat_episode_index', 'format': format_episode_index}], objective_fields=[], tokenizers={"default": IntIdTokenizer()})
     import mouse_core.models.io as io
     import huggingface_hub
     from pathlib import Path
@@ -380,7 +380,7 @@ def test_explicit_missing_labels_roundtrip_without_inserting_input_tokens(tmp_pa
     tokenizer = Tokenizer(tokenizers={"default": IntIdTokenizer()}, input_fields=[
         {"provider": "sensor", 'type': "token", 'input_field': 'reward', "numeric_field": 'reward',
          'format': '2', 'fourier_min': 0., 'fourier_max': 10.},
-        {"provider": "sensor", 'type': 'token', 'format': '1', 'head_output': True},
+        {"provider": "sensor", 'type': 'token', 'format': '1', 'head_output': "all"},
     ], objective_fields=[
         {'input_field': 'reward', 'output_field': 'return_reward', 'missing_value': 0.},
         {'input_field': 'action', 'missing_value': None},
@@ -401,7 +401,7 @@ def test_explicit_missing_labels_roundtrip_without_inserting_input_tokens(tmp_pa
 
 def test_missing_vector_targets_roundtrip_and_do_not_train_unlabelled_rows(tmp_path):
     tokenizer = Tokenizer(tokenizers={"default": IntIdTokenizer()}, input_fields=[
-        {"provider": "sensor", 'type': 'token', 'format': '1', 'head_output': True},
+        {"provider": "sensor", 'type': 'token', 'format': '1', 'head_output': "all"},
     ], objective_fields=[{'input_field': 'q_star', 'missing_value': []}])
     save_tokenizer(tokenizer=tokenizer, path=tmp_path)
     restored = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizers={"default": IntIdTokenizer()})

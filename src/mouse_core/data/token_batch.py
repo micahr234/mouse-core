@@ -74,7 +74,6 @@ class StepTokens:
     ``tokenizer_ids`` selects a name in ``tokenizer_names`` for each token;
     IDs remain local to that tokenizer's vocabulary and embedding table.
     ``numeric_mask`` marks numeric tokens even when their scaled value is zero.
-    ``autoregressive_mask`` marks generation starts (a subset of head tokens).
     Optional ``position_values`` / ``position_mask`` carry numeric context per token.
     Omitted arrays become zeros and a false mask; zero can be present.
     A passive step can contain no head tokens, or even no input tokens, while
@@ -92,19 +91,19 @@ class StepTokens:
     tokenizer_names: tuple[str, ...] = ("default",)
     position_values: np.ndarray | None = None
     position_mask: np.ndarray | None = None
-    autoregressive_mask: np.ndarray | None = None
+    field_start_mask: np.ndarray | None = None
+    field_end_mask: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         token_ids = np.asarray(self.token_ids, dtype=np.int64)
         if token_ids.ndim != 1:
             raise ValueError("StepTokens requires a 1-D token_ids array")
-        if self.autoregressive_mask is None:
-            self.autoregressive_mask = np.zeros(token_ids.shape, dtype=bool)
-        self.autoregressive_mask = np.asarray(self.autoregressive_mask)
-        if self.autoregressive_mask.shape != token_ids.shape or self.autoregressive_mask.dtype != np.bool_:
-            raise ValueError("autoregressive_mask must be boolean and match token_ids")
-        if np.any(self.autoregressive_mask & ~np.asarray(self.head_mask, dtype=bool)):
-            raise ValueError("Autoregressive starts must also be head-output tokens")
+        for name in ("field_start_mask", "field_end_mask"):
+            value = getattr(self, name)
+            value = np.zeros(token_ids.shape, dtype=bool) if value is None else np.asarray(value)
+            if value.shape != token_ids.shape or value.dtype != np.bool_:
+                raise ValueError(f"{name} must be boolean and match token_ids")
+            setattr(self, name, value)
         self.position_values, self.position_mask = _position_arrays(self.position_values, self.position_mask, token_ids.shape)
         self.numeric_field_names = tuple(self.numeric_field_names)
         self.numeric_field_ids = _numeric_field_ids(self.numeric_field_ids, self.numeric_mask, self.numeric_field_names)
@@ -128,7 +127,7 @@ def make_token_batch(
     tokenizer_ids=None, tokenizer_names=("default",),
     numeric_field_ids=None, numeric_field_names=(),
     position_values=None, position_mask=None,
-    autoregressive_mask=None, step_readout_mask=None,
+    step_readout_mask=None, field_start_mask=None, field_end_mask=None,
 ) -> TensorDict:
     """Build CPU tensor inputs without scanning or validating batch contents.
 
@@ -143,8 +142,6 @@ def make_token_batch(
     position_values stays float64 until the position features are formed.
 
     head_mask [L] selects tokens passed to prediction heads.
-    autoregressive_mask [L] identifies tokenizer-defined generation starts and
-    defaults to false. Generation implementations decide how to consume them.
     step_readout_mask [L] marks the LAST head-output token of each step, for
     reasoning insertion. Low-level producers must supply it for reasoning;
     omitted masks are false. Full prediction-to-step mappings belong to objective_data.
@@ -158,10 +155,10 @@ def make_token_batch(
         "numeric_mask": torch.as_tensor(numeric_mask, dtype=torch.bool, device="cpu"),
         "sequence_ids": torch.as_tensor(sequence_ids, dtype=torch.int64, device="cpu"),
         "head_mask": torch.as_tensor(head_mask, dtype=torch.bool, device="cpu"),
+        "field_start_mask": torch.zeros(shape, dtype=torch.bool, device="cpu") if field_start_mask is None else torch.as_tensor(field_start_mask, dtype=torch.bool, device="cpu"),
+        "field_end_mask": torch.zeros(shape, dtype=torch.bool, device="cpu") if field_end_mask is None else torch.as_tensor(field_end_mask, dtype=torch.bool, device="cpu"),
         "step_readout_mask": (torch.zeros(shape, dtype=torch.bool, device="cpu") if step_readout_mask is None
                               else torch.as_tensor(step_readout_mask, dtype=torch.bool, device="cpu")),
-        "autoregressive_mask": (torch.zeros(shape, dtype=torch.bool, device="cpu") if autoregressive_mask is None
-                                else torch.as_tensor(autoregressive_mask, dtype=torch.bool, device="cpu")),
         "tokenizer_ids": (torch.zeros(shape, dtype=torch.int64, device="cpu") if tokenizer_ids is None
                           else torch.as_tensor(tokenizer_ids, dtype=torch.int64, device="cpu")),
         "numeric_field_ids": (torch.full(shape, -1, dtype=torch.int64, device="cpu") if numeric_field_ids is None
@@ -357,7 +354,7 @@ def pack_token_batch(
     numeric_values: list[np.ndarray] = []
     tokenizer_ids: list[np.ndarray] = []
     head_masks: list[np.ndarray] = []
-    autoregressive_masks: list[np.ndarray] = []
+    field_starts, field_ends = [], []
     step_lengths: list[int] = []
 
     inferred_B = (max(seq_per_step) + 1) if seq_per_step else 0
@@ -390,8 +387,8 @@ def pack_token_batch(
         assert st.tokenizer_ids is not None
         tokenizer_ids.append(st.tokenizer_ids)
         head_masks.append(st.head_mask)
-        assert st.autoregressive_mask is not None
-        autoregressive_masks.append(st.autoregressive_mask)
+        field_starts.append(st.field_start_mask)
+        field_ends.append(st.field_end_mask)
         step_lengths.append(t)
 
     # Compute packed metadata in bulk, including zero-token/passive steps.
@@ -415,7 +412,7 @@ def pack_token_batch(
         sequence_ids=np.repeat(seq_per_step, lengths),
         head_mask=head_mask,
         step_readout_mask=step_readout_mask,
-        autoregressive_mask=np.concatenate(autoregressive_masks),
+        field_start_mask=np.concatenate(field_starts), field_end_mask=np.concatenate(field_ends),
         tokenizer_ids=np.concatenate(tokenizer_ids),
         tokenizer_names=tokenizer_names,
         num_sequences=B,
@@ -477,8 +474,8 @@ class HeadOutputSegments:
     """One episode's context slices separated by final step readout markers.
 
     For N markers there are N+1 context slices: prefix, inter-step history,
-    and tail. The markers themselves are excluded because reasoning replaces
-    them with its learned start. Concatenating slices and intervening markers
+    and tail. The boundary input is separate from its context so the reasoner can
+    transform its embedding and insert continuations after it. Concatenating slices and intervening markers
     reproduces every original token, including passive steps and trailing fields.
     """
 
@@ -518,3 +515,21 @@ def head_output_segments(tokens: TensorDict) -> tuple[HeadOutputSegments, ...]:
         stops = (*selected, end)
         result.append(HeadOutputSegments(group, selected, tuple(slice(a, b) for a, b in zip(starts, stops))))
     return tuple(result)
+
+
+def decision_positions(tokens: TensorDict) -> torch.Tensor:
+    """Validate and select one final readout per decision in packed order."""
+    head_output_segments(tokens)
+    return tokens["step_readout_mask"].nonzero().flatten()
+
+
+def align_decision_objectives(tokens: TensorDict, data: TensorDict) -> TensorDict:
+    """Map decision readouts to original environment labels without shifting actions."""
+    heads = tokens["head_mask"].nonzero().flatten()
+    if len(heads) != len(data["step_ids"]):
+        raise ValueError("Source head-output rows must align with objective step_ids")
+    positions = decision_positions(tokens)
+    rows = torch.searchsorted(heads, positions)
+    result = data.clone(recurse=False)
+    result["step_ids"] = data["step_ids"][rows.to(data["step_ids"].device)]
+    return result

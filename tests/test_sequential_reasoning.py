@@ -49,29 +49,29 @@ def reference_states(parts, tokens, generated):
     for group in range(tokens['num_sequences']):
         history = []
         group_start = decision
-        state = torch.zeros_like(reasoner.start_embedding.weight[0])
+        state = torch.zeros_like(embedding.embeddings["text"].embed_tokens.weight[9:10][0])
         selected = tokens['sequence_ids'] == group
         for token, is_head in zip(tokens['token_ids'][selected].tolist(), tokens['head_mask'][selected].tolist(), strict=True):
             if not is_head:
                 history.append(table[token])
                 continue
             if reasoner.wrap_latent != "sequence":
-                state = torch.zeros_like(reasoner.start_embedding.weight[0])
+                state = torch.zeros_like(embedding.embeddings["text"].embed_tokens.weight[9:10][0])
             per_depth = []
             for depth in range(int(generated.lengths[decision])):
                 latent = (generated.states[decision, depth].detach()
                           if reasoner.wrap_latent != "none" and (depth > 0 or
                               (reasoner.wrap_latent == "sequence" and decision > group_start))
-                          else torch.zeros_like(reasoner.start_embedding.weight[0]))
-                history.append(input_reference(reasoner, latent))
+                          else torch.zeros_like(embedding.embeddings["text"].embed_tokens.weight[9:10][0]))
+                history.append(input_reference(reasoner, latent, embedding.embeddings["text"].embed_tokens.weight[9]))
                 packed = torch.stack(history)
                 hidden = backbone(packed, sequence_ids=torch.zeros(len(packed), dtype=torch.long))[-1]
                 update = hidden.float()
-                base = state if reasoner.wrap_latent != "none" else torch.zeros_like(reasoner.start_embedding.weight[0])
+                base = state if reasoner.wrap_latent != "none" else torch.zeros_like(embedding.embeddings["text"].embed_tokens.weight[9:10][0])
                 state = base + update if reasoner.residual_connections else update
                 per_depth.append(state)
             if reasoner.wrap_latent != "none" and reasoner.max_steps > 1:
-                history.append(input_reference(reasoner, generated.states[decision, int(generated.lengths[decision])].detach()))
+                history.append(input_reference(reasoner, generated.states[decision, int(generated.lengths[decision])].detach(), embedding.embeddings["text"].embed_tokens.weight[9]))
             per_depth.extend([per_depth[-1]] * (reasoner.max_steps - len(per_depth)))
             outputs.append(torch.stack(per_depth))
             decision += 1
@@ -86,7 +86,6 @@ def test_variant_positions_and_outputs_match_literal_token_history(residual_conn
     embedding, backbone, reasoner, _ = parts
     tokens = batch(((2, 9, 3, 9, 4), (5, 9)))
     tokens['head_mask'] = tokens['token_ids'] == 9
-    tokens['autoregressive_mask'] = tokens['head_mask'].clone()
     tokens['step_readout_mask'] = tokens['head_mask'].clone()
     lengths = torch.tensor([1, cap, min(2, cap)] if adaptive_depth else [cap] * 3)
     calls = []
@@ -95,7 +94,7 @@ def test_variant_positions_and_outputs_match_literal_token_history(residual_conn
     assert sorted(calls) == sorted((i, k) for i, length in enumerate(lengths.tolist())
                                   for k in (range(1, length + 1) if adaptive_depth else [cap]))
     assert len(trace.tokens['token_ids']) == len(tokens['token_ids']) + int((lengths - 1 + (wrap_latent != "none" and cap > 1)).sum())
-    assert trace.readout_positions.tolist() == (trace.initial_positions + lengths - 1 + (wrap_latent != "none" and cap > 1)).tolist()
+    assert trace.readout_positions.tolist() == (trace.initial_positions + lengths - 1).tolist()
     if wrap_latent == "none":
         table = embedding.embeddings['text'].embed_tokens.weight
         torch.testing.assert_close(trace.tokens['latent_values'][trace.tokens['latent_mask']],
@@ -109,7 +108,7 @@ def test_variant_positions_and_outputs_match_literal_token_history(residual_conn
         target[0].embeddings['text'].embed_tokens.weight.add_(.4)
         target[1].linear.weight.mul_(.7)
         target[2].norm.weight.mul_(1.5)
-        target[2].start_embedding.weight.add_(.1)
+        target[0].embeddings["text"].embed_tokens.weight[9:10].add_(.1)
         target[2].input_projection.down_proj.weight.mul_(.8)
     delayed = target[2](trace, embedding=target[0], backbone=target[1])
     torch.testing.assert_close(delayed, reference_states(target, tokens, trace))
@@ -127,7 +126,6 @@ def test_real_cache_retains_exact_generated_token_count_and_replays(residual_con
     second = batch(((3, 9), (6, 9)))
     full = batch(((2, 9, 3, 9), (4, 5, 9, 6, 9)))
     full['head_mask'] = full['token_ids'] == 9
-    full['autoregressive_mask'] = full['head_mask'].clone()
     full['step_readout_mask'] = full['head_mask'].clone()
     session = backbone.decode_session(2, max_batch_tokens=3, cache_capacity_tokens=1024)
     try:
@@ -188,7 +186,9 @@ def test_final_only_head_loss_reaches_all_residual_updates_and_no_intermediate_h
     assert values.grad[:, :-1].count_nonzero() == 0
     assert values.grad[0, -1, 2] != 0
     assert (outputs[0].grad[trace.update_positions].abs().sum(-1) > 0).all()
-    assert outputs[0].grad[trace.readout_positions].count_nonzero() == 0
+    assert outputs[0].grad[trace.readout_positions].count_nonzero() > 0
+    # The extra feedback input is context only, never a Q-producing readout.
+    assert outputs[0].grad[trace.readout_positions + 1].count_nonzero() == 0
     assert details['td_target'].item() == pytest.approx(2.6)
 
 
@@ -205,8 +205,8 @@ def test_value_reasoning_trains_each_generated_output_and_repeated_initial_embed
     loss.backward()
     nonzero = values.grad != 0
     assert nonzero[0].nonzero().tolist() == [[0, 4], [1, 4], [2, 2]]
-    assert reasoner.start_embedding.weight.grad.abs().sum() > 0
-    assert embedding.embeddings['text'].embed_tokens.weight.grad[9].count_nonzero() == 0
+    assert embedding.embeddings["text"].embed_tokens.weight.grad[9:10].abs().sum() > 0
+    assert embedding.embeddings['text'].embed_tokens.weight.grad[9].count_nonzero() > 0
     assert reasoner.norm.weight.grad.count_nonzero() == 0
 
 
@@ -226,6 +226,7 @@ def test_input_projection_standard_initialization_and_zero_head_gradient_startup
     for parameter in reasoner.input_projection.parameters():
         assert parameter.count_nonzero() > 0
         assert parameter.abs().max() <= 8 ** -.5
+    embedding = MultiEmbedding(embeddings={"text": Embedding(vocab_size=16, hidden_dim=8)})
     hidden = torch.randn(3, 8, requires_grad=True)
     head = nn.Linear(8, 5)
     nn.init.zeros_(head.weight)
@@ -235,10 +236,10 @@ def test_input_projection_standard_initialization_and_zero_head_gradient_startup
     for step in range(2):
         optimizer.zero_grad()
         hidden.grad = None
-        updates = reasoner.project_inputs(hidden)
-        expected = input_reference(reasoner, hidden)
+        updates = reasoner.project_inputs(hidden, embedding.embeddings["text"].embed_tokens.weight[9])
+        expected = input_reference(reasoner, hidden, embedding.embeddings["text"].embed_tokens.weight[9])
         torch.testing.assert_close(updates, expected)
-        states = updates + reasoner.start_embedding.weight if residual_connections else updates
+        states = updates + embedding.embeddings["text"].embed_tokens.weight[9:10] if residual_connections else updates
         values = head(states)
         loss, _ = value_reasoning_loss(
             q_values=values[:, None], target_q_values=values.detach()[:, None],
@@ -284,7 +285,6 @@ def test_one_step_uses_one_packed_forward_and_never_enters_generation(monkeypatc
     parts = components(residual_connections=residual, wrap_latent="step" if residual else "none", adaptive_depth=adaptive, cap=1)
     tokens = batch(((2, 9, 3, 9), (4, 9)))
     tokens['head_mask'] = tokens['token_ids'] == 9
-    tokens['autoregressive_mask'] = tokens['head_mask'].clone()
     tokens['step_readout_mask'] = tokens['head_mask'].clone()
     def forbidden(*args, **kwargs):
         raise AssertionError('One-step reasoning must not enter the sequential generator')

@@ -43,7 +43,7 @@ def _tokenizer_fields(fields: list[dict[str, Any]], head_output: str = "action")
         if data.get("type") == "text" and "format" not in data:
             data["format"] = "{" + data["input_field"] + "}"
         if data.get("input_field") == head_output:
-            data["head_output"] = True
+            data["head_output"] = "all"
         out.append(data)
     return out
 
@@ -71,7 +71,7 @@ def _text_pair(hidden_dim: int = 8, **kwargs):
         for field in fields
     ):
         head_at = next(
-            (i for i, field in enumerate(fields) if field.get("head_output")),
+            (i for i, field in enumerate(fields) if field.get("head_output", "none") != "none"),
             len(fields),
         )
         fields.insert(
@@ -155,7 +155,7 @@ def test_text_tokenizer_when_not_equals_omits_value() -> None:
 def test_text_tokenizer_field_format_uses_str() -> None:
     tokenizer = Tokenizer(
         input_fields=[
-            {"provider": "sensor", "type": "text", "input_field": "reward", "format": '{reward}', "head_output": True},
+            {"provider": "sensor", "type": "text", "input_field": "reward", "format": '{reward}', "head_output": "all"},
             {"provider": "sensor",
                 "type": "text",
                 "input_field": "repeat_episode_index",
@@ -175,7 +175,7 @@ def test_text_tokenizer_field_format_spec() -> None:
                 "type": "text",
                 "input_field": "reward",
                 "format": '{reward:.0f}',
-                "head_output": True,
+                "head_output": "all",
             },
             {"provider": "sensor",
                 "type": "text",
@@ -196,7 +196,7 @@ def test_text_tokenizer_omitted_input_field_is_const() -> None:
             {"provider": "sensor",
                 "type": "text",
                 "format": ",value",
-                "head_output": True,
+                "head_output": "all",
             },
             {"provider": "sensor",
                 "type": "text",
@@ -223,7 +223,7 @@ def test_text_tokenizer_const_format_keeps_the_word_field() -> None:
             {"provider": "sensor",
                 "type": "text",
                 "format": "field",
-                "head_output": True,
+                "head_output": "all",
             },
         ],
         tokenizers={"default": _FakeTokenizer()},
@@ -233,7 +233,7 @@ def test_text_tokenizer_const_format_keeps_the_word_field() -> None:
 
 
 def test_text_tokenizer_unfiltered_format_uses_payload_names() -> None:
-    tokenizer = Tokenizer(input_fields=[dict(type="text", format=",{value}", head_output=True)],
+    tokenizer = Tokenizer(input_fields=[dict(type="text", format=",{value}", head_output="all")],
                           tokenizers={"default": _FakeTokenizer()})
     assert encode_measurement(tokenizer, {"value": 3}).token_ids.tolist() == _enc(",3")
 
@@ -245,7 +245,7 @@ def test_text_tokenizer_max_tokens_allows_at_limit() -> None:
                 "type": "text",
                 "format": "x",
                 "max_tokens": 1,
-                "head_output": True,
+                "head_output": "all",
             },
             {"provider": "sensor",
                 "type": "text",
@@ -268,7 +268,7 @@ def test_text_tokenizer_max_tokens_raises_when_exceeded() -> None:
                 "type": "text",
                 "format": "xy",
                 "max_tokens": 1,
-                "head_output": True,
+                "head_output": "all",
             },
             {"provider": "sensor",
                 "type": "text",
@@ -292,7 +292,7 @@ def test_text_tokenizer_max_tokens_must_be_positive() -> None:
                     "type": "text",
                     "format": "x",
                     "max_tokens": 0,
-                    "head_output": True,
+                    "head_output": "all",
                 },
                 {"provider": "sensor",
                     "type": "text",
@@ -319,7 +319,7 @@ def test_text_tokenizer_when_gates_cover_skip_literal_pattern() -> None:
 
     tokenizer = Tokenizer(
         input_fields=[
-            {"provider": "sensor", "type": "text", "input_field": "action", "format": '{action}', "head_output": True},
+            {"provider": "sensor", "type": "text", "input_field": "action", "format": '{action}', "head_output": "all"},
             {"provider": "sensor",
                 "type": "text",
                 "input_field": "reward",
@@ -357,7 +357,7 @@ def test_text_tokenizer_when_or_in_callable() -> None:
                 "input_field": "reward",
                 "format": lambda ctx: f"{ctx['reward']}" if when_any_reward(ctx) else "",
             },
-            {"provider": "sensor", "type": "text", "input_field": "action", "format": '{action}', "head_output": True},
+            {"provider": "sensor", "type": "text", "input_field": "action", "format": '{action}', "head_output": "all"},
         ],
         tokenizers={"default": _FakeTokenizer()},
     )
@@ -377,7 +377,7 @@ def test_text_tokenizer_requires_field_format() -> None:
     with pytest.raises(ValueError, match="requires format="):
         Tokenizer(
             input_fields=[
-                {"provider": "sensor", "type": "text", "input_field": "observation", "head_output": True},
+                {"provider": "sensor", "type": "text", "input_field": "observation", "head_output": "all"},
                 {"provider": "sensor",
                     "type": "text",
                     "input_field": "repeat_episode_index",
@@ -395,7 +395,7 @@ def test_text_format_evaluates_expression_on_field() -> None:
                 "type": "text",
                 "input_field": "repeat_episode_index",
                 "format": ',episode {repeat_episode_index+1}',
-                "head_output": True,
+                "head_output": "all",
             },
         ],
         tokenizers={"default": _FakeTokenizer()},
@@ -420,7 +420,7 @@ def test_optional_literal_text_uses_field_presence_and_roundtrips(tmp_path) -> N
 
     tok = Tokenizer(tokenizers={"default": _FakeTokenizer()}, input_fields=[
         {"provider": "sensor", "type": "text", "input_field": "inner_terminated", "format": ",terminated"},
-        {"provider": "sensor", "type": "token", "format": "\n", "head_output": True},
+        {"provider": "sensor", "type": "token", "format": "\n", "head_output": "all"},
     ])
     save_tokenizer(tokenizer=tok, path=tmp_path)
     loaded = load_tokenizer(repo_id_or_path=str(tmp_path), tokenizers={"default": _FakeTokenizer()})
@@ -441,7 +441,7 @@ def test_text_tokenizer_const_and_when_gated_unescape_braces() -> None:
                 "type": "text",
                 "format": lambda ctx: f'{{-}}' if ('r' in ctx and ctx['r'] == 0) else "",
             },
-            {"provider": "sensor", "type": "text", "format": "{{c}}", "head_output": True},
+            {"provider": "sensor", "type": "text", "format": "{{c}}", "head_output": "all"},
             {"provider": "sensor",
                 "type": "text",
                 "input_field": "repeat_episode_index",
@@ -467,7 +467,7 @@ def test_text_tokenizer_optional_missing_value_emits_nothing() -> None:
                 "type": "text",
                 "format": lambda ctx: f',' if ('r' in ctx and ctx['r'] == 0.0) else "",
             },
-            {"provider": "sensor", "type": "text", "format": "\n", "head_output": True},
+            {"provider": "sensor", "type": "text", "format": "\n", "head_output": "all"},
             {"provider": "sensor",
                 "type": "text",
                 "input_field": "repeat_episode_index",
@@ -485,7 +485,7 @@ def test_missing_inputs_leave_constant_readout() -> None:
     tokenizer = Tokenizer(
         input_fields=[
             {"provider": "sensor", "type": "text", "input_field": "a", "format": '{a}'},
-            {"provider": "sensor", "type": "token", "format": "x", "head_output": True},
+            {"provider": "sensor", "type": "token", "format": "x", "head_output": "all"},
         ],
         tokenizers={"default": _FakeTokenizer()},
     )
@@ -530,7 +530,7 @@ def test_text_tokenizer_max_tokens_only_on_variable_length_types() -> None:
 def test_text_tokenizer_repeated_filters_emit_in_order() -> None:
     tokenizer = Tokenizer(input_fields=[
         dict(type="text", input_field="value", format="{value}"),
-        dict(type="token", input_field="value", format="x", head_output=True),
+        dict(type="token", input_field="value", format="x", head_output="all"),
     ], tokenizers={"default": _FakeTokenizer()})
     step = encode_measurement(tokenizer, {"value": 12})
     assert step.token_ids.tolist() == _enc("12x")
@@ -575,7 +575,7 @@ def test_text_input_index_emits_each_element_in_field_order() -> None:
             {"provider": "sensor",
                 "type": "text",
                 "format": "]",
-                "head_output": True,
+                "head_output": "all",
             },
         ],
         tokenizers={"default": _capture_tokenizer(seen)},
@@ -592,7 +592,7 @@ def test_text_input_index_emits_each_element_in_field_order() -> None:
                 "type": "text",
                 "input_field": "observation",
                 "format": '{observation:.2f}',
-                "head_output": True,
+                "head_output": "all",
             }
         ],
         tokenizers={"default": _FakeTokenizer()},
@@ -603,7 +603,7 @@ def test_text_input_index_emits_each_element_in_field_order() -> None:
                 "type": "text",
                 "input_field": "observation",
                 "format": ',{observation:.2f}',
-                "head_output": True,
+                "head_output": "all",
             }
         ],
         tokenizers={"default": _FakeTokenizer()},
@@ -625,7 +625,7 @@ def test_text_input_index_emits_each_element_in_field_order() -> None:
                 "input_field": "observation",
                 "input_index": 0,
                 "format": ',{observation:.2f}',
-                "head_output": True,
+                "head_output": "all",
             },
         ],
         tokenizers={"default": _capture_tokenizer(seen)},
@@ -650,7 +650,7 @@ def test_text_scalar_without_input_index_renders_once() -> None:
                 "type": "text",
                 "input_field": "observation",
                 "format": '{observation:.2f}',
-                "head_output": True,
+                "head_output": "all",
             }
         ],
         tokenizers={"default": _capture_tokenizer(seen)},
@@ -671,7 +671,7 @@ def test_text_input_index_rejects_bad_shapes() -> None:
                 "type": "text",
                 "input_field": "observation",
                 "format": '{observation}',
-                "head_output": True,
+                "head_output": "all",
             }
         ],
         tokenizers={"default": _FakeTokenizer()},
@@ -685,7 +685,7 @@ def test_text_input_index_rejects_bad_shapes() -> None:
                 "input_field": "observation",
                 "input_index": 1,
                 "format": '{observation:.2f}',
-                "head_output": True,
+                "head_output": "all",
             }
         ],
         tokenizers={"default": _FakeTokenizer()},
@@ -721,7 +721,7 @@ def test_text_input_index_repeated_filters_and_rejected_types() -> None:
                 "input_field": "observation",
                 "input_index": 1,
                 "format": '{observation}',
-                "head_output": True,
+                "head_output": "all",
             },
         ],
         tokenizers={"default": _FakeTokenizer()},
@@ -739,7 +739,7 @@ def test_text_input_index_repeated_filters_and_rejected_types() -> None:
                 "input_field": "observation",
                 "input_index": 0,
                 "format": '{observation}',
-                "head_output": True,
+                "head_output": "all",
             },
         ],
         tokenizers={"default": _FakeTokenizer()},
@@ -769,7 +769,7 @@ def test_text_input_index_roundtrip(tmp_path) -> None:
                 "input_field": "observation",
                 "input_index": 1,
                 "format": ',{observation:.2f}',
-                "head_output": True,
+                "head_output": "all",
             },
         ],
         tokenizers={"default": _FakeTokenizer()},
@@ -928,7 +928,7 @@ def test_repeat_episode_index_emits_only_on_step_zero() -> None:
                 "type": "text",
                 "format": "\n",
                 "max_tokens": 1,
-                "head_output": True,
+                "head_output": "all",
             },
         ],
         tokenizers={"default": _CaptureTok()},
@@ -961,7 +961,7 @@ def test_repeat_episode_index_emits_only_on_step_zero() -> None:
 def test_token_repeat_episode_index_emits_only_on_step_zero() -> None:
     tok = Tokenizer(
         input_fields=[
-            {"provider": "sensor", "type": "text", "input_field": "action", "format": '{action}', "head_output": True},
+            {"provider": "sensor", "type": "text", "input_field": "action", "format": '{action}', "head_output": "all"},
             {"provider": "sensor",
                 "type": "text",
                 "input_field": "repeat_episode_index",
@@ -991,7 +991,7 @@ def test_removed_when_keyword_is_rejected() -> None:
                     "input_field": "repeat_episode_index",
                     "format": '{repeat_episode_index}',
                     "when": 0,
-                    "head_output": True,
+                    "head_output": "all",
                 }
             ],
         )
@@ -1004,7 +1004,7 @@ def test_constant_format_callback_controls_emission() -> None:
                 "type": "text",
                 "format": lambda ctx: f'x' if ('step_index' in ctx and ctx['step_index'] == 0) else "",
             },
-            {"provider": "sensor", "type": "text", "input_field": "action", "format": '{action}', "head_output": True},
+            {"provider": "sensor", "type": "text", "input_field": "action", "format": '{action}', "head_output": "all"},
         ],
         tokenizers={"default": _FakeTokenizer()},
     )
@@ -1034,7 +1034,7 @@ def test_numeric_field_tokenizes_star_and_stores_scaled_value() -> None:
                 "type": "text",
                 "input_field": "action",
                 "format": '{action}',
-                "head_output": True,
+                "head_output": "all",
             },
             {"provider": "sensor",
                 "type": "token",
@@ -1077,7 +1077,7 @@ def test_zero_numeric_values_keep_their_mask_through_prefix_packing_and_embeddin
         input_fields=[
             {"provider": "sensor", "type": "token", "input_field": "prefix", "numeric_field": "prefix", "format": "*",
              "fourier_min": -1., "fourier_max": 1.},
-            {"provider": "sensor", "type": "token", "format": "*", "head_output": True},
+            {"provider": "sensor", "type": "token", "format": "*", "head_output": "all"},
             {"provider": "sensor", "type": "token", "input_field": "observation", "numeric_field": "observation", "format": "*",
              "fourier_min": -1., "fourier_max": 1.},
         ],
@@ -1149,7 +1149,7 @@ def test_token_with_numeric_addition_allows_formatted_text() -> None:
                 "format": "field",
                 "fourier_min": 0.0,
                 "fourier_max": 2.0,
-                "head_output": True,
+                "head_output": "all",
             }
         ],
         tokenizers={"default": _FakeTokenizer()},
@@ -1190,7 +1190,7 @@ def test_numeric_requires_distinct_finite_bounds() -> None:
                     "format": "*",
                     "fourier_min": 0.0,
                     "fourier_max": 1.0,
-                    "head_output": True,
+                    "head_output": "all",
                 }
             ]
         )
@@ -1201,7 +1201,7 @@ def test_numeric_config_roundtrip(tmp_path) -> None:
 
     tokenizer = Tokenizer(
         input_fields=[
-            {"provider": "sensor", "type": "text", "input_field": "action", "format": '{action}', "head_output": True},
+            {"provider": "sensor", "type": "text", "input_field": "action", "format": '{action}', "head_output": "all"},
             {"provider": "sensor",
                 "type": "token",
                 "input_field": "observation", "numeric_field": "observation", "numeric_index": 0,
@@ -1238,7 +1238,7 @@ def test_numeric_embed_adds_fourier_of_the_scaled_value() -> None:
                 "type": "text",
                 "input_field": "action",
                 "format": '{action}',
-                "head_output": True,
+                "head_output": "all",
             },
             {"provider": "sensor",
                 "type": "token",
@@ -1299,7 +1299,7 @@ def test_token_field_emits_one_text_token() -> None:
     tokenizer = Tokenizer(
         input_fields=[
             {"provider": "sensor", "type": "text", "input_field": "action", "format": '{action}'},
-            {"provider": "sensor", "type": "token", "format": "\n", "head_output": True},
+            {"provider": "sensor", "type": "token", "format": "\n", "head_output": "all"},
         ],
         tokenizers={"default": _FakeTokenizer()},
     )
@@ -1307,7 +1307,7 @@ def test_token_field_emits_one_text_token() -> None:
     assert step.token_ids.tolist() == _encoded("0") + _encoded("\n")
     assert step.head_mask.tolist() == [False, True]
     wide = Tokenizer(
-        input_fields=[{"provider": "sensor", "type": "token", "format": "ab", "head_output": True}],
+        input_fields=[{"provider": "sensor", "type": "token", "format": "ab", "head_output": "all"}],
         tokenizers={"default": _FakeTokenizer()},
     )
     with pytest.raises(ValueError, match="expected 1"):
