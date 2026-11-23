@@ -24,7 +24,6 @@ def save_model(*, model: nn.Module, path: str | Path) -> None:
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
     config = {
-        "format": "mouse-core-model-v3",
         "class": f"{type(model).__module__}.{type(model).__qualname__}",
     }
     (path / "config.json").write_text(json.dumps(config, indent=2) + "\n")
@@ -59,8 +58,8 @@ def load_model[T: nn.Module](
         config_path = Path(hf_hub_download(repo_id=repo_id, filename="config.json", **download_kwargs))
         weights_path = Path(hf_hub_download(repo_id=repo_id, filename="pytorch_model.bin", **download_kwargs))
     config = json.loads(config_path.read_text())
-    if config.get("format") != "mouse-core-model-v3":
-        raise ValueError("Unsupported model config format; expected mouse-core-model-v3.")
+    if not isinstance(config, dict) or config.keys() != {"class"}:
+        raise ValueError("Model metadata must contain exactly the model class")
     expected_class = f"{type(model).__module__}.{type(model).__qualname__}"
     if config.get("class") != expected_class:
         raise ValueError(f"Model class mismatch: saved {config.get('class')!r}, supplied {expected_class!r}")

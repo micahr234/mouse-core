@@ -5,7 +5,6 @@ import pytest
 import torch
 from torch import nn
 from mouse_core import CheckpointStore, load_checkpoint
-from mouse_core.checkpoint import CHECKPOINT_FORMAT
 
 
 class TinyModel(nn.Module):
@@ -111,7 +110,7 @@ def test_strict_load_validation_happens_before_parameter_mutation(tmp_path):
         load_checkpoint(path, model=target)
     for name, value in before.items():
         torch.testing.assert_close(target.state_dict()[name], value)
-    assert json.loads((path / "config.json").read_text())["format"] == CHECKPOINT_FORMAT
+    assert json.loads((path / "config.json").read_text()) == {"class": f"{TinyModel.__module__}.TinyModel"}
 
 
 def test_learned_vocabulary_and_weights_reload_without_external_tokenizer(tmp_path):
@@ -134,3 +133,10 @@ def test_learned_vocabulary_and_weights_reload_without_external_tokenizer(tmp_pa
     torch.testing.assert_close(restored.embeddings['reasoning'].embed_tokens.weight,
                                model.embeddings['reasoning'].embed_tokens.weight)
     assert not (store.directory / 'tokenizer_backends' / 'reasoning').exists()
+
+
+@pytest.mark.parametrize("metadata", [{}, [], {"class": "x", "unknown": True}])
+def test_checkpoint_metadata_requires_current_structure(tmp_path, metadata):
+    (tmp_path / "config.json").write_text(json.dumps(metadata))
+    with pytest.raises(ValueError, match="metadata must contain exactly the model class"):
+        load_checkpoint(tmp_path, model=TinyModel())

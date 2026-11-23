@@ -98,7 +98,7 @@ def test_composed_model_roundtrip(tmp_path) -> None:
         assert torch.equal(orig_sd[key], loaded_sd[key]), f'param {key!r} differs after save/load roundtrip'
     with (tmp_path / 'config.json').open() as fh:
         config = json.load(fh)
-    assert config['format'] == 'mouse-core-model-v3'
+    assert set(config) == {'class'}
     assert config['class'].endswith('ExampleModel')
 
 
@@ -181,15 +181,12 @@ def test_explicit_model_checkpoints_roundtrip_without_backbone_output_norm(tmp_p
     torch.testing.assert_close(loaded.head(h=h)['action_value'], model.head(h=h)['action_value'])
 
 
-@pytest.mark.parametrize("version", ["mouse-core-model-v1", "mouse-core-model-v2"])
-def test_legacy_checkpoint_formats_are_rejected(tmp_path, version: str) -> None:
+@pytest.mark.parametrize("metadata", [{}, [], {"class": "x", "unknown": True}])
+def test_model_metadata_requires_current_structure(tmp_path, metadata) -> None:
     model = _lora_model(torch.float32)
     save_model(model=model, path=tmp_path)
-    path = tmp_path / "config.json"
-    config = json.loads(path.read_text())
-    config["format"] = version
-    path.write_text(json.dumps(config))
-    with pytest.raises(ValueError, match="Unsupported model config format"):
+    (tmp_path / "config.json").write_text(json.dumps(metadata))
+    with pytest.raises(ValueError, match="metadata must contain exactly the model class"):
         load_model(model=fresh_model(model), repo_id_or_path=tmp_path)
 
 

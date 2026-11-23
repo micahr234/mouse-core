@@ -1447,8 +1447,9 @@ restored_tokenizer = load_checkpoint_tokenizer(store.directory)
 ```
 
 Construct the matching model before restoring. Load a step directory or the store
-root to select its latest completed snapshot. The current format is
-`mouse-core-checkpoint-v1`; superseded Experiment formats are not accepted.
+root to select its latest completed snapshot. Storage has one current structure;
+loaders validate metadata, model class, parameter names and shapes directly.
+There are no numbered model/checkpoint versions or migration branches.
 These are model snapshots, without optimizer state, target-network state or RNG
 state. The caller owns those separately when exact training resume is required.
 A store refuses to reuse an existing directory and rejects changes in trainability

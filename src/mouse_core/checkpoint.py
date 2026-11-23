@@ -14,9 +14,6 @@ from urllib.parse import quote
 import torch
 from mouse_core.data import Tokenizer, load_tokenizer, save_tokenizer
 
-CHECKPOINT_FORMAT = "mouse-core-checkpoint-v1"
-
-
 def _snapshot_path(path: str | Path) -> Path:
     path = Path(path)
     if (path / "latest.json").is_file():
@@ -35,8 +32,8 @@ def load_checkpoint(path: str | Path, *, model: torch.nn.Module) -> torch.nn.Mod
     """
     path = _snapshot_path(path)
     config = json.loads((path / "config.json").read_text())
-    if config.get("format") != CHECKPOINT_FORMAT:
-        raise ValueError(f"Unsupported model config format; expected {CHECKPOINT_FORMAT}")
+    if not isinstance(config, dict) or config.keys() != {"class"}:
+        raise ValueError("Checkpoint metadata must contain exactly the model class")
     expected = f"{type(model).__module__}.{type(model).__qualname__}"
     if config.get("class") != expected:
         raise ValueError(f"Model class mismatch: saved {config.get('class')!r}, supplied {expected!r}")
@@ -142,7 +139,7 @@ class CheckpointStore:
                 torch.save({name: value for name, value in state.items() if name not in frozen_names},
                            temporary / "pytorch_model.bin")
                 (temporary / "config.json").write_text(json.dumps({
-                    "format": CHECKPOINT_FORMAT, "class": model_class,
+                    "class": model_class,
                 }, indent=2) + "\n")
                 (temporary / "metadata.json").write_text(metadata_text)
                 for name, contents in files.items():
