@@ -61,7 +61,11 @@ def test_sparse_split_pack_roundtrip_reorders_duplicates_and_replays_live_weight
         reasoner.input_projection.down_proj.weight.mul_(1.2)
     output = evaluate(rebuilt)
     output.square().sum().backward()
-    assert bool(reasoner.input_projection.down_proj.weight.grad.abs().sum() > 0) is (wrap != "none")
+    gradient = reasoner.input_projection.down_proj.weight.grad
+    if wrap == "none":
+        assert gradient is None
+    else:
+        assert gradient is not None and gradient.abs().sum() > 0
     assert embedding.embeddings["text"].embed_tokens.weight.grad[9:10].abs().sum() > 0
     torch.testing.assert_close(records[0].latent_values, frozen_vectors)
 
@@ -223,15 +227,14 @@ def test_start_only_replay_preserves_boundaries_labels_and_matches_literal_forwa
     assert all(e.token_count == e.source_token_count for e in episodes)
     assert all('latent_values' not in e.tokens.keys() and not e.latent_values.requires_grad for e in episodes)
     # An independent literal history has exactly the original tokens, with only
-    # each final head replaced by the live learned input offset. No fabricated final feedback state.
+    # each final head using its original embedding directly. No fabricated final feedback state.
     expected = []
     table = embedding.embeddings['text'].embed_tokens.weight
     for group in range(inputs['num_sequences']):
         history = []
         for row in (inputs['sequence_ids'] == group).nonzero().flatten().tolist():
             is_start = bool(inputs['step_readout_mask'][row])
-            history.append(input_reference(reasoner, torch.zeros_like(embedding.embeddings["text"].embed_tokens.weight[9:10][0]), embedding.embeddings["text"].embed_tokens.weight[9]) if is_start
-                           else table[inputs['token_ids'][row]])
+            history.append(table[inputs['token_ids'][row]])
             if is_start:
                 hidden = backbone(torch.stack(history), sequence_ids=torch.zeros(len(history), dtype=torch.long))[-1]
                 update = hidden.float()
@@ -240,7 +243,7 @@ def test_start_only_replay_preserves_boundaries_labels_and_matches_literal_forwa
     torch.testing.assert_close(actual[:, 0], torch.stack(expected))
     actual[:, 0].square().sum().backward()
     assert embedding.embeddings["text"].embed_tokens.weight.grad[9:10].abs().sum() > 0
-    assert all(p.grad is not None and p.grad.count_nonzero() == 0 for p in reasoner.input_projection.parameters())
+    assert all(p.grad is None for p in reasoner.input_projection.parameters())
     for key, value in original.items():
         if isinstance(value, torch.Tensor):
             torch.testing.assert_close(inputs[key], value)

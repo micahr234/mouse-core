@@ -168,7 +168,7 @@ def test_single_replay_gradient_matches_explicit_detached_recurrence():
         context, state = embeds[:-1], torch.zeros_like(reference.embedding.embeddings["text"].embed_tokens.weight[9:10][0])
         inputs = []
         for depth in range(3):
-            inputs.append(input_reference(reference.reasoner, state if depth == 0 else state.detach(), reference.embedding.embeddings["text"].embed_tokens.weight[9]))
+            inputs.append(embeds[-1] if depth == 0 else input_reference(reference.reasoner, state.detach()))
             row = torch.cat((context, torch.stack(inputs)))
             hidden = reference.backbone(row, sequence_ids=torch.zeros(len(row), dtype=torch.long))
             state = state + hidden[-1].float()
@@ -575,13 +575,13 @@ def test_multiple_actions_retain_every_depth_with_detached_feedback():
                     prefix.append(embed)
                     continue
                 z = torch.zeros_like(online.embedding.embeddings["text"].embed_tokens.weight[9:10])
-                prefix.append(input_reference(online.reasoner, z, online.embedding.embeddings["text"].embed_tokens.weight[9]))
+                prefix.append(embed)
                 updates = []
                 for _ in range(4):
                     inputs = torch.cat(prefix)
                     raw = online.backbone(inputs, sequence_ids=torch.zeros(len(inputs), dtype=torch.long))[-1:]
                     z = z + raw.float()
-                    prefix.append(input_reference(online.reasoner, z, online.embedding.embeddings["text"].embed_tokens.weight[9]))
+                    prefix.append(input_reference(online.reasoner, z))
                     updates.append(z[0])
                 reference.append(torch.stack(updates))
         torch.testing.assert_close(states, torch.stack(reference))
@@ -691,7 +691,7 @@ def test_explicit_positions_and_target_weights_replay_the_same_latent_history(ma
         for episode in episode_items:
             inputs = torch.stack([
                 token_table[item] if isinstance(item, int)
-                else input_reference(network.reasoner, torch.zeros_like(network.embedding.embeddings["text"].embed_tokens.weight[9:10][0]) if item[1] == 0 else trace.states[item[0], item[1]].detach(), network.embedding.embeddings["text"].embed_tokens.weight[9])
+                else (token_table[9] if item[1] == 0 else input_reference(network.reasoner, trace.states[item[0], item[1]].detach()))
                 for item in episode
             ])
             # Compute each selected update directly from its causal prefix.

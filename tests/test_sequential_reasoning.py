@@ -63,7 +63,9 @@ def reference_states(parts, tokens, generated):
                           if reasoner.wrap_latent != "none" and (depth > 0 or
                               (reasoner.wrap_latent == "sequence" and decision > group_start))
                           else torch.zeros_like(embedding.embeddings["text"].embed_tokens.weight[9:10][0]))
-                history.append(input_reference(reasoner, latent, embedding.embeddings["text"].embed_tokens.weight[9]))
+                continued = reasoner.wrap_latent != "none" and (depth > 0 or
+                    (reasoner.wrap_latent == "sequence" and decision > group_start))
+                history.append(input_reference(reasoner, latent) if continued else table[token])
                 packed = torch.stack(history)
                 hidden = backbone(packed, sequence_ids=torch.zeros(len(packed), dtype=torch.long))[-1]
                 update = hidden.float()
@@ -71,7 +73,7 @@ def reference_states(parts, tokens, generated):
                 state = base + update if reasoner.residual_connections else update
                 per_depth.append(state)
             if reasoner.wrap_latent != "none" and reasoner.max_steps > 1:
-                history.append(input_reference(reasoner, generated.states[decision, int(generated.lengths[decision])].detach(), embedding.embeddings["text"].embed_tokens.weight[9]))
+                history.append(input_reference(reasoner, generated.states[decision, int(generated.lengths[decision])].detach()))
             per_depth.extend([per_depth[-1]] * (reasoner.max_steps - len(per_depth)))
             outputs.append(torch.stack(per_depth))
             decision += 1
@@ -207,7 +209,7 @@ def test_value_reasoning_trains_each_generated_output_and_repeated_initial_embed
     assert nonzero[0].nonzero().tolist() == [[0, 4], [1, 4], [2, 2]]
     assert embedding.embeddings["text"].embed_tokens.weight.grad[9:10].abs().sum() > 0
     assert embedding.embeddings['text'].embed_tokens.weight.grad[9].count_nonzero() > 0
-    assert reasoner.norm.weight.grad.count_nonzero() == 0
+    assert reasoner.norm.weight.grad is None
 
 
 @pytest.mark.parametrize('residual_connections,adaptive_depth', [(0, True), (True, 1), (None, False)])
@@ -236,8 +238,8 @@ def test_input_projection_standard_initialization_and_zero_head_gradient_startup
     for step in range(2):
         optimizer.zero_grad()
         hidden.grad = None
-        updates = reasoner.project_inputs(hidden, embedding.embeddings["text"].embed_tokens.weight[9])
-        expected = input_reference(reasoner, hidden, embedding.embeddings["text"].embed_tokens.weight[9])
+        updates = reasoner.project_inputs(hidden)
+        expected = input_reference(reasoner, hidden)
         torch.testing.assert_close(updates, expected)
         states = updates + embedding.embeddings["text"].embed_tokens.weight[9:10] if residual_connections else updates
         values = head(states)

@@ -17,12 +17,11 @@ def make_reasoner(**overrides):
 def test_input_matches_qwen_mlp_without_a_residual_and_preserves_gradients():
     torch.manual_seed(113)
     reasoner = make_reasoner()
-    token_embedding = torch.randn(1, 8, requires_grad=True)
     reference = Qwen3MLP(Qwen3Config(hidden_size=8, intermediate_size=24, hidden_act="silu"))
     reference.load_state_dict(reasoner.input_projection.state_dict(), strict=True)
     x = torch.randn(5, 8, requires_grad=True)
-    expected = reference(reasoner.norm(x)) * reasoner.input_mlp_output_scale + token_embedding
-    actual = reasoner.project_inputs(x, token_embedding)
+    expected = reference(reasoner.norm(x)) * reasoner.input_mlp_output_scale
+    actual = reasoner.project_inputs(x)
     torch.testing.assert_close(actual, expected)
     expected_gradient, = torch.autograd.grad(expected.square().sum(), x, retain_graph=True)
     actual.square().sum().backward()
@@ -31,16 +30,15 @@ def test_input_matches_qwen_mlp_without_a_residual_and_preserves_gradients():
     assert reasoner.norm.weight.grad.abs().sum() > 0
     with torch.no_grad():
         reasoner.input_projection.down_proj.weight.zero_()
-    torch.testing.assert_close(reasoner.project_inputs(x, token_embedding), token_embedding.expand_as(x))
+    torch.testing.assert_close(reasoner.project_inputs(x), torch.zeros_like(x))
 
 
 def test_scale_is_static_and_applied_in_generation_input_function():
     reasoner = make_reasoner(input_mlp_output_scale=1.)
-    token_embedding = torch.randn(1, 8, requires_grad=True)
     x = torch.randn(2, 8)
-    before = reasoner.project_inputs(x, token_embedding)
+    before = reasoner.project_inputs(x)
     reasoner.input_mlp_output_scale = 17.
-    torch.testing.assert_close(reasoner.project_inputs(x, token_embedding), (before - token_embedding) * 17. + token_embedding)
+    torch.testing.assert_close(reasoner.project_inputs(x), before * 17.)
 
 
 @pytest.mark.parametrize('scale', [None, True, 0., -1., float('inf'), float('nan')])
@@ -61,14 +59,12 @@ def test_required_mlp_settings():
                            residual_connections=False, wrap_latent="none", adaptive_depth=True)
 
 
-def test_zero_feedback_injects_exact_live_embedding_at_every_token():
+def test_zero_feedback_has_no_embedding_offset():
     reasoner = make_reasoner()
-    token_embedding = torch.randn(1, 8, requires_grad=True)
     zeros = torch.zeros(4, 8, requires_grad=True)
-    output = reasoner.project_inputs(zeros, token_embedding)
-    torch.testing.assert_close(output, token_embedding.expand(4, -1))
+    output = reasoner.project_inputs(zeros)
+    torch.testing.assert_close(output, torch.zeros_like(zeros))
     output.sum().backward()
-    torch.testing.assert_close(token_embedding.grad, torch.full((1, 8), 4.))
     assert reasoner.norm.weight.grad.count_nonzero() == 0
     assert all(p.grad.count_nonzero() == 0 for p in reasoner.input_projection.parameters())
     assert zeros.grad.count_nonzero() == 0

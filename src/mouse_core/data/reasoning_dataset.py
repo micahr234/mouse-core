@@ -102,7 +102,7 @@ def start_only_reasoning_episodes(inputs: TensorDict, data: TensorDict, *,
     generated feedback positions, including in residual mode. Training computes
     the first update and supervises the recorded environment action there. The
     caller must allow environment actions at depth one. Only sparse zero feedback
-    vectors are stored. Forward adds the live learned embedding after the MLP;
+    vectors are stored. Forward uses the live token embedding directly;
     no model parameters are snapshotted into these records.
     """
     from mouse_core.data.token_batch import head_output_segments

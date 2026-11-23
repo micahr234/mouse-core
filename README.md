@@ -373,8 +373,9 @@ reasoning model with independent loss and recurrence choices:
 reasoning state through input RMSNorm and the shared gated input MLP within each
 environment decision. `"sequence"` also carries the final state into the next
 decision, across intervening context tokens; only the first reasoning position of
-an independent sequence uses zero feedback. Every input adds the learned offset after the MLP. Cache resets clear the
-carried state. With `"none"`, each position has zero feedback and receives only the learned start embedding.
+an independent sequence uses its configured token embedding directly. Later
+inputs use only projected feedback, without an embedding offset. Cache resets
+clear the carried state. With `"none"`, each position has zero feedback and receives only the learned start embedding.
 Residual addition accumulates across the selected wrapping scope, with gradients
 through the live additive path; stored projection inputs remain detached.
 Sequence wrapping requires generation even with a one-step reasoning budget;
@@ -406,7 +407,7 @@ field = {"type": "token", "tokenizer": "reasoning", "provider": "environment",
 ```
 
 `MultiEmbedding` owns a matching `reasoning` embedding table. Its embedding is
-added after the latent input MLP at every reasoning depth. There is no hidden
+used directly at each wrapping boundary; later inputs are projected latents only. There is no hidden
 placeholder replacement or tokenizer `autoregressive` option. The model controls
 continuation and stopping. Text reasoning generates vocabulary tokens; latent
 reasoning inserts feedback embeddings at the same decision boundaries.
@@ -429,13 +430,15 @@ input embeddings.
 `SequentialReasoner(rms_norm_eps=backbone.rms_norm_eps, hidden_dim=...,
 input_mlp_intermediate_dim=backbone.mlp_intermediate_dim, input_mlp_output_scale=..., min_steps=...,
 max_steps=..., residual_connections=..., wrap_latent=..., adaptive_depth=...)`
-requires both mechanism flags explicitly. For each input latent `x`, the update
-is the raw backbone output: `u = transformer(context, z_start + s * input_projection(norm(x)))`. The state
-is `x + u` with residual addition, or `u` without it. Wrapping chooses the previous
-state as feedback; without wrapping feedback is always zero. At each scope
-boundary feedback resets to zero. The learned embedding `z_start` is added AFTER
-the input MLP at every reasoning position. Feedback passes through RMSNorm
-(trainable scale starts at `0.02`) and then a Qwen3-style gated MLP with no residual bypass. Causal attention and the backbone's ordinary
+requires both mechanism flags explicitly. A scope starts with `e = E[token]`,
+bypassing the input block. Each continuation uses
+`e = s * input_projection(norm(stop_gradient(previous_state)))`, with no added
+embedding. The backbone produces `u = transformer(context, e)`.
+The state is `feedback + u` with residual addition, or `u` without it. Residual
+feedback starts at zero at each scope boundary. Without wrapping, every input
+uses the configured embedding directly and the residual feedback is always zero.
+Input RMSNorm (trainable scale starts at `0.02`) precedes the Qwen3-style gated
+MLP with no residual bypass. Causal attention and the backbone's ordinary
 internal residual connections remain in every combination.
 
 With `adaptive_depth=True`, `generate` requires an A+1 `action_values(states)` head
@@ -451,22 +454,22 @@ The resulting `ReasoningBatch` contains only the generated history and records
 each decision's executed `lengths`. Both networks replay this same batch; the
 delayed network never generates a separate trajectory. `forward` reconstructs
 all generated value representations in one call. Wrapped feedback is detached
-before its trainable normalization. Every reasoning input adds the network's
-live learned embedding after the MLP, including positions with detached saved
-feedback. Both flags enabled rebuild the differentiable accumulated residual
-path starting from zero; without wrapping, the residual is zero at every depth.
-The offset remains learnable through every occurrence, even with a final-only
-loss and no residual connection. A zero-feedback-only batch gives zero data
-gradients to the norm/MLP, because the bias-free MLP maps zero to zero. The start vector belongs to its named vocabulary table and is independent of
-the pretrained text table. A shared learned gated MLP
-projects normalized reasoning inputs in every mode:
+before its trainable normalization. Scope-start embeddings remain live and
+trainable; continuation inputs use only the projected saved feedback. Both flags
+enabled rebuild the differentiable accumulated residual path starting from zero;
+without wrapping, the residual is zero at every depth. The first embedding can
+receive gradients through causal attention or the live residual path, but not
+through detached feedback. One-step batches without sequence wrapping bypass
+the norm/MLP entirely, so those parameters receive no gradients.
+The start vector belongs to its named vocabulary table, independently of the
+pretrained text table. The input block for continuations is:
 `input_mlp_output_scale * down(SiLU(gate(norm(x))) * up(norm(x)))`.
 All three linear layers are bias-free and use standard PyTorch initialization.
 The intermediate width and positive static output scale are required constructor
 arguments. Use the backbone's configured MLP width. The Qwen3-0.6B example uses
 `711.24`, calibrated against mean text embedding norms with the retained `0.02`
-RMSNorm gain. The calibration is for the MLP branch alone, before adding the
-learned offset; reset-token input is exactly the learned offset. Calibrate a new scale when changing the backbone or initialization;
+RMSNorm gain. The calibration is for projected continuation inputs; the first input is
+exactly its configured embedding. Calibrate a new scale when changing the backbone or initialization;
 no runtime norm matching is performed. These input operations run in FP32;
 RMSNorm epsilon comes from the backbone configuration. There is no update
 RMSNorm or output-side H-to-H projection. Cached chunks cannot be used as
@@ -507,7 +510,7 @@ append to the bank and evict the oldest episodes when the episode limit is excee
 For a generation-free startup, `start_only_reasoning_episodes(inputs, objective_data,
 hidden_dim=reasoner.hidden_dim, max_steps=reasoner.max_steps,
 generated_step=0)` prepares sparse CPU records to append with `dataset.append`.
-Each decision stores zero feedback; training injects the live learned offset; there are no generated feedback
+Each decision stores zero feedback; training uses the live token embedding directly; there are no generated feedback
 positions. With `max_steps=1`, this is also the normal replay representation:
 collection needs no model forward. Full-episode inference evaluates all starts in
 one packed causal forward; cached inference consumes the start and adds no final

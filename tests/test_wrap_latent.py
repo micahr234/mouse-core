@@ -21,7 +21,9 @@ def test_pointwise_recurrence_and_detached_feedback_gradients(monkeypatch, resid
     for depth in range(3):
         latent = state if wrap != "none" else initial
         expected_inputs.append(latent)
-        update = backbone.linear(input_reference(reasoner, latent, embedding.embeddings["text"].embed_tokens.weight[9])).float()
+        first_input = embedding.embeddings["text"].embed_tokens.weight[9]
+        inputs = first_input if depth == 0 or wrap == "none" else input_reference(reasoner, latent)
+        update = backbone.linear(inputs).float()
         state = latent + update if residual else update
         expected.append(state)
     torch.testing.assert_close(trace.states[0, 1:], torch.stack(expected))
@@ -41,8 +43,9 @@ def test_pointwise_recurrence_and_detached_feedback_gradients(monkeypatch, resid
     gradients = outputs[0].grad[trace.update_positions[0]].abs().sum(-1)
     assert bool((gradients[:-1] > 0).all()) is (residual and wrap != "none")
     assert gradients[-1] > 0
-    # Even final-only loss without a residual reaches the injected offset.
-    assert embedding.embeddings["text"].embed_tokens.weight.grad[9:10].abs().sum() > 0
+    # With no attention, detached feedback cannot connect the final loss to
+    # the first input unless the additive residual path remains live.
+    assert bool(embedding.embeddings["text"].embed_tokens.weight.grad[9:10].abs().sum() > 0) is (residual or wrap == "none")
     reasoner.zero_grad(set_to_none=True)
     # Initial embeddings remain learnable even with wrapping and no addition.
     reasoner(trace, embedding=embedding, backbone=backbone).sum().backward()
@@ -93,7 +96,7 @@ def test_sequence_carries_only_reasoning_states_and_rebuilds_gradient_path(monke
 
 
 @pytest.mark.parametrize('wrap', ['none', 'step', 'sequence'])
-def test_replay_injects_current_offset_at_all_positions_without_changing_saved_feedback(monkeypatch, wrap):
+def test_replay_uses_current_embedding_only_at_scope_starts_without_changing_saved_feedback(monkeypatch, wrap):
     parts = components(residual_connections=False, wrap_latent=wrap, adaptive_depth=False, cap=3)
     embedding, backbone, reasoner, _ = parts
     tokens = batch(((2, 9, 3, 9), (5, 9)))
@@ -111,6 +114,11 @@ def test_replay_injects_current_offset_at_all_positions_without_changing_saved_f
         embedding.embeddings["text"].embed_tokens.weight[9:10].add_(.125)
     reasoner(trace, embedding=embedding, backbone=backbone)
     mask = trace.tokens['latent_mask']
-    torch.testing.assert_close(received[1][mask] - received[0][mask], torch.full_like(received[0][mask], .125))
+    changed = mask.clone() if wrap == "none" else torch.zeros_like(mask)
+    if wrap != "none":
+        starts = trace.initial_positions if wrap == "step" else trace.initial_positions[[0, 2]]
+        changed[starts] = True
+    torch.testing.assert_close(received[1][changed] - received[0][changed], torch.full_like(received[0][changed], .125))
+    torch.testing.assert_close(received[1][~changed], received[0][~changed])
     torch.testing.assert_close(received[1][~mask], received[0][~mask])
     torch.testing.assert_close(trace.tokens['latent_values'], saved)
