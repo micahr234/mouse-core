@@ -51,6 +51,10 @@ class CausalBackbone(BaseBackbone):
         self._hidden_dim = hidden_dim
 
     @property
+    def mlp_intermediate_dim(self):
+        return 24
+
+    @property
     def rms_norm_eps(self):
         return 1e-6
 
@@ -80,14 +84,10 @@ def model(*, real=False, max_steps=3):
     with torch.no_grad():
         value_head.weight[-1].zero_()
         value_head.bias[-1] = 100.
-    result = example_module().ReasoningDqn(
+    result = example_module().ReasoningDqn(input_mlp_output_scale=100.,
         embedding=embedding, backbone=backbone, value_head=value_head, min_steps=1, max_steps=max_steps,
-        residual_connections=True, wrap_latent=True, reasoning_loss="all_tokens",
+        residual_connections=True, wrap_latent="step", reasoning_loss="all_tokens",
     ).to(torch.get_default_device())
-    # Use fixed nonzero updates for reproducible recurrence checks.
-    with torch.no_grad():
-        result.reasoner.input_projection.weight.copy_(torch.eye(8).roll(1, 0) * .7)
-        result.reasoner.input_projection.bias.fill_(.03)
     return result
 
 
@@ -120,7 +120,7 @@ def test_real_transformer_rollout_replay_parity_and_request_batches(backend):
     assert online.training and online.backbone.training and online.reasoner.training
     assert all(p.grad is None for p in online.parameters())
     # The start token is consumed as z0, not also copied into the context.
-    initial = online.reasoner.start_embedding.weight
+    initial = torch.zeros_like(online.reasoner.start_embedding.weight)
     torch.testing.assert_close(trace.states[:, 0], initial.expand(4, -1))
     changed = tokens.clone()
     changed['token_ids'][-2] = 6
@@ -164,7 +164,7 @@ def test_single_replay_gradient_matches_explicit_detached_recurrence():
     for length in [3, 2, 1]:
         ids = tokens['token_ids'][offset:offset + length]
         embeds = reference.embedding(ids, tokenizer_ids=torch.zeros_like(ids), tokenizer_names=('text',))
-        context, state = embeds[:-1], reference.reasoner.start_embedding.weight[0]
+        context, state = embeds[:-1], torch.zeros_like(reference.reasoner.start_embedding.weight[0])
         inputs = []
         for depth in range(3):
             inputs.append(input_reference(reference.reasoner, state if depth == 0 else state.detach()))
@@ -286,7 +286,7 @@ def test_passive_batch_skips_generation_and_replay():
 @pytest.mark.parametrize('max_steps', [0, -1, True, 1.5])
 def test_invalid_reasoning_budget(max_steps):
     with pytest.raises(ValueError, match='positive integer'):
-        SequentialReasoner(min_steps=1, hidden_dim=8, max_steps=max_steps, residual_connections=True, wrap_latent=True, adaptive_depth=True, rms_norm_eps=1e-6)
+        SequentialReasoner(input_mlp_intermediate_dim=24, input_mlp_output_scale=100., min_steps=1, hidden_dim=8, max_steps=max_steps, residual_connections=True, wrap_latent="step", adaptive_depth=True, rms_norm_eps=1e-6)
 
 
 class TextBackend:
@@ -574,7 +574,7 @@ def test_multiple_actions_retain_every_depth_with_detached_feedback():
                 if token != 9:
                     prefix.append(embed)
                     continue
-                z = online.reasoner.start_embedding.weight
+                z = torch.zeros_like(online.reasoner.start_embedding.weight)
                 prefix.append(input_reference(online.reasoner, z))
                 updates = []
                 for _ in range(4):
@@ -690,7 +690,7 @@ def test_explicit_positions_and_target_weights_replay_the_same_latent_history(ma
         for episode in episode_items:
             inputs = torch.stack([
                 token_table[item] if isinstance(item, int)
-                else input_reference(network.reasoner, network.reasoner.start_embedding.weight[0] if item[1] == 0 else trace.states[item[0], item[1]].detach())
+                else input_reference(network.reasoner, torch.zeros_like(network.reasoner.start_embedding.weight[0]) if item[1] == 0 else trace.states[item[0], item[1]].detach())
                 for item in episode
             ])
             # Compute each selected update directly from its causal prefix.
@@ -698,7 +698,7 @@ def test_explicit_positions_and_target_weights_replay_the_same_latent_history(ma
                 if not isinstance(item, tuple) or item[1] != 0:
                     continue
                 decision = item[0]
-                state = network.reasoner.start_embedding.weight[0]
+                state = torch.zeros_like(network.reasoner.start_embedding.weight[0])
                 outputs = []
                 for depth in range(int(lengths[decision])):
                     update_position = position + depth

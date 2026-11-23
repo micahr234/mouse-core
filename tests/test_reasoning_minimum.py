@@ -21,8 +21,8 @@ def test_continuous_generation_masks_actions_and_preserves_replay(
     embedding = MultiEmbedding(embeddings={'text': Embedding(vocab_size=16, hidden_dim=8)})
     backbone = Backbone(architecture='qwen3', hidden_dim=8, num_layers=1, num_heads=2,
                         head_dim=4, max_position_embeddings=128, dtype=torch.float32)
-    reasoner = SequentialReasoner(hidden_dim=8, min_steps=minimum, max_steps=maximum,
-                                 residual_connections=residual_connections, wrap_latent=residual_connections, adaptive_depth=True, rms_norm_eps=1e-6)
+    reasoner = SequentialReasoner(input_mlp_intermediate_dim=24, input_mlp_output_scale=100., hidden_dim=8, min_steps=minimum, max_steps=maximum,
+                                 residual_connections=residual_connections, wrap_latent="step" if residual_connections else "none", adaptive_depth=True, rms_norm_eps=1e-6)
     values = torch.tensor([3., 1., 2., 0., 10. if prefer_think else -1.])
     calls = []
 
@@ -111,8 +111,8 @@ def test_bellman_backups_use_only_next_states_available_actions(gamma, minimum, 
 @pytest.mark.parametrize('minimum', [0, True, 1.5, 5])
 def test_minimum_must_be_an_integer_within_cap(minimum):
     with pytest.raises(ValueError, match='min_steps'):
-        SequentialReasoner(hidden_dim=8, min_steps=minimum, max_steps=4,
-                           residual_connections=False, wrap_latent=False, adaptive_depth=True, rms_norm_eps=1e-6)
+        SequentialReasoner(input_mlp_intermediate_dim=24, input_mlp_output_scale=100., hidden_dim=8, min_steps=minimum, max_steps=4,
+                           residual_connections=False, wrap_latent="none", adaptive_depth=True, rms_norm_eps=1e-6)
     with pytest.raises(ValueError, match='min_steps'):
         value_reasoning_loss(q_values=torch.zeros(1, 4, 5), target_q_values=torch.zeros(1, 4, 5),
                              lengths=torch.tensor([4]), environment_actions=torch.tensor([0]),

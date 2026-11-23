@@ -41,7 +41,7 @@ def test_offline_checkpoint_loads_and_evaluates_only_in_inference_notebook(tmp_p
             if index == 1:
                 namespace.update(PRETRAINED=str(source), load_stores_from_hub=lambda **_: recorded_stores(),
                     SAMPLE_BUDGET=2, NUM_WORKERS=0, MAX_EPISODE_STEPS=2, NUM_CYCLES=0, MAX_REASONING_STEPS=4, MIN_REASONING_STEPS=4 if reasoning_loss == "last_token" else 3,
-                    REASONING_LOSS=reasoning_loss, RESIDUAL_CONNECTIONS=residual, WRAP_LATENT=residual,
+                    REASONING_LOSS=reasoning_loss, RESIDUAL_CONNECTIONS=residual, WRAP_LATENT="step" if residual else "none",
                     GENERATION_START_TOKEN='word2', MAX_NEW_TOKENS=64, MAX_ACTIVE_REQUESTS=2)
     assert len(uploads) == 1
     assert 'pytorch_model.bin' in uploads[0]['files']
@@ -72,7 +72,7 @@ def test_offline_checkpoint_loads_and_evaluates_only_in_inference_notebook(tmp_p
     _, spec, backend, settings = loaded
     if kind == 'sequential':
         assert settings['residual_connections'] is namespace['online'].reasoner.residual_connections
-        assert settings['wrap_latent'] is namespace['online'].reasoner.wrap_latent
+        assert settings['wrap_latent'] == namespace['online'].reasoner.wrap_latent
         assert settings['min_steps'] == namespace['online'].reasoner.min_steps
         assert settings['reasoning_loss'] == reasoning_loss
         assert policy.reasoning_loss == reasoning_loss

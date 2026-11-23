@@ -13,13 +13,13 @@ from tests.test_reasoning_segments import segmented_batch
 from tests.test_sequential_reasoning import components, generate
 
 
-def prepared(residual=True):
+def prepared(residual=True, wrap="step"):
     inputs, data = segmented_batch()
     # The dataset receives whole nonempty episode samples, not empty decode slots.
     inputs['sequence_ids'][inputs['sequence_ids'] == 2] = 1
     inputs.set_non_tensor('num_sequences', 2)
     data['sequence_ids'][data['sequence_ids'] == 2] = 1
-    parts = components(residual_connections=residual, wrap_latent=residual, adaptive_depth=True)
+    parts = components(residual_connections=residual, wrap_latent=wrap, adaptive_depth=True)
     trace = generate(parts, inputs, lengths=torch.tensor([2, 3, 1]))
     return parts, inputs, data, trace
 
@@ -34,8 +34,9 @@ def bank_and_loader(episode, *, sampling='sequential', sample_budget=2, token_bu
 
 
 @pytest.mark.parametrize('residual', [False, True])
-def test_sparse_split_pack_roundtrip_reorders_duplicates_and_replays_live_weights(residual):
-    parts, inputs, data, trace = prepared(residual)
+@pytest.mark.parametrize('wrap', ['none', 'step', 'sequence'])
+def test_sparse_split_pack_roundtrip_reorders_duplicates_and_replays_live_weights(residual, wrap):
+    parts, inputs, data, trace = prepared(residual, wrap)
     records = list(split_reasoning_episodes(inputs, trace, data, 7))
     assert all(e.latent_values.device.type == 'cpu' and not e.latent_values.requires_grad for e in records)
     assert all('latent_values' not in e.tokens.keys() for e in records)
@@ -57,10 +58,10 @@ def test_sparse_split_pack_roundtrip_reorders_duplicates_and_replays_live_weight
     torch.testing.assert_close(evaluate(reordered), expected)
     frozen_vectors = records[0].latent_values.clone()
     with torch.no_grad():
-        reasoner.input_projection.weight.mul_(1.2)
+        reasoner.input_projection.down_proj.weight.mul_(1.2)
     output = evaluate(rebuilt)
     output.square().sum().backward()
-    assert reasoner.input_projection.weight.grad.abs().sum() > 0
+    assert bool(reasoner.input_projection.down_proj.weight.grad.abs().sum() > 0) is (wrap != "none")
     assert reasoner.start_embedding.weight.grad.abs().sum() > 0
     torch.testing.assert_close(records[0].latent_values, frozen_vectors)
 
@@ -207,7 +208,7 @@ def test_start_only_replay_preserves_boundaries_labels_and_matches_literal_forwa
     embedding, backbone, reasoner, _ = parts
     original = inputs.clone()
     episodes = start_only_reasoning_episodes(inputs, data,
-        start_embedding=reasoner.start_embedding.weight[0], max_steps=reasoner.max_steps, generated_step=0)
+        hidden_dim=reasoner.hidden_dim, max_steps=reasoner.max_steps, generated_step=0)
     batch, labels = pack_reasoning_episodes(episodes)
     assert batch.head_token_ids == (3, 9, 14)
     assert batch.lengths.tolist() == [1, 1, 1]
@@ -222,24 +223,24 @@ def test_start_only_replay_preserves_boundaries_labels_and_matches_literal_forwa
     assert all(e.token_count == e.source_token_count for e in episodes)
     assert all('latent_values' not in e.tokens.keys() and not e.latent_values.requires_grad for e in episodes)
     # An independent literal history has exactly the original tokens, with only
-    # each final head replaced by Norm(start). No fabricated final feedback state.
+    # each final head replaced by the live learned input offset. No fabricated final feedback state.
     expected = []
     table = embedding.embeddings['text'].embed_tokens.weight
     for group in range(inputs['num_sequences']):
         history = []
         for row in (inputs['sequence_ids'] == group).nonzero().flatten().tolist():
             is_start = bool(inputs['step_readout_mask'][row])
-            history.append(input_reference(reasoner, reasoner.start_embedding.weight[0]) if is_start
+            history.append(input_reference(reasoner, torch.zeros_like(reasoner.start_embedding.weight[0])) if is_start
                            else table[inputs['token_ids'][row]])
             if is_start:
                 hidden = backbone(torch.stack(history), sequence_ids=torch.zeros(len(history), dtype=torch.long))[-1]
                 update = hidden.float()
-                expected.append(update + reasoner.start_embedding.weight[0] if residual else update)
+                expected.append(update)
     actual = reasoner(batch, embedding=embedding, backbone=backbone)
     torch.testing.assert_close(actual[:, 0], torch.stack(expected))
     actual[:, 0].square().sum().backward()
     assert reasoner.start_embedding.weight.grad.abs().sum() > 0
-    assert reasoner.input_projection.weight.grad.abs().sum() > 0
+    assert all(p.grad is not None and p.grad.count_nonzero() == 0 for p in reasoner.input_projection.parameters())
     for key, value in original.items():
         if isinstance(value, torch.Tensor):
             torch.testing.assert_close(inputs[key], value)
@@ -264,11 +265,10 @@ def test_episode_capacity_ignores_token_length_and_updates_token_metrics():
 
 
 @pytest.mark.parametrize('invalid', [dict(max_steps=0), dict(max_steps=True),
-    dict(start_embedding=torch.zeros(2, 3)), dict(start_embedding=torch.zeros(0)),
-    dict(start_embedding=torch.ones(3, dtype=torch.long))])
+    dict(hidden_dim=0), dict(hidden_dim=True), dict(hidden_dim=2.5)])
 def test_start_only_replay_rejects_invalid_dimensions(invalid):
     _, inputs, data, _ = prepared()
-    kwargs = dict(start_embedding=torch.zeros(8), max_steps=3, generated_step=0)
+    kwargs = dict(hidden_dim=8, max_steps=3, generated_step=0)
     kwargs.update(invalid)
     with pytest.raises(ValueError):
         start_only_reasoning_episodes(inputs, data, **kwargs)

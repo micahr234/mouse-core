@@ -107,6 +107,9 @@ class ContinuousDecodeSession:
     never discards keys the model's training mask would allow, or recomputes a
     truncated history.
 
+    ``generation_state`` holds caller-owned tensors per row and is cleared on
+    row reset and close, together with the corresponding KV history.
+
     Close after rollout, before updating model/embedding weights. A backbone
     weight change while cache entries exist raises; resetting ALL rows explicitly
     starts a new weight version. The caller must also reset after embedding or
@@ -172,6 +175,7 @@ class ContinuousDecodeSession:
             self._cache, safety_margin=0.0, max_requests_per_batch=batch_size,
         )
         self._lengths = [0] * batch_size
+        self.generation_state: list[dict[str, torch.Tensor]] = [{} for _ in range(batch_size)]
         self._pending: dict[int, _Submission] = {}
         self._deferred: dict[int, torch.Tensor] = {}
         self._module_layout = tuple((module, module._modules.copy()) for module in self.model.modules())
@@ -506,6 +510,8 @@ class ContinuousDecodeSession:
         for row in selected:
             self._row(row)
         if set(selected) == set(range(self.B)):
+            for state in self.generation_state:
+                state.clear()
             self._graphs.clear()
             self._graph_counts.clear()
             self._cache.reset()
@@ -521,6 +527,7 @@ class ContinuousDecodeSession:
         else:
             self._check()
             for row in selected:
+                self.generation_state[row].clear()
                 self._scheduler.set_request_cancellation(str(row))
                 self._pending.pop(row, None)
                 self._deferred.pop(row, None)
@@ -533,5 +540,7 @@ class ContinuousDecodeSession:
         self._graph_counts.clear()
         self._pending.clear()
         self._deferred.clear()
+        for state in self.generation_state:
+            state.clear()
         self._scheduler = None
         self._cache = None

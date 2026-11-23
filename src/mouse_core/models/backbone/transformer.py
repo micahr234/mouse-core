@@ -499,6 +499,13 @@ class Backbone(BaseBackbone):
         self._attach_lora(_as_module(self.model), lora)
 
     @property
+    def mlp_intermediate_dim(self) -> int:
+        value = vars(self.model.config)["intermediate_size"]
+        if type(value) is not int or value < 1:
+            raise ValueError("Backbone config intermediate_size must be a positive integer")
+        return value
+
+    @property
     def rms_norm_eps(self) -> float:
         value = vars(self.model.config)["rms_norm_eps"]
         if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:

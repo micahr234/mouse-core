@@ -45,7 +45,8 @@ def example_module(number):
 @pytest.mark.parametrize('reasoning_loss', ['all_tokens', 'last_token'])
 @pytest.mark.parametrize('residual', [False, True])
 @pytest.mark.parametrize('min_steps,max_steps', [(1, 1), (1, 3), (3, 4)])
-def test_notebook_training_uses_its_selected_recurrence_and_target_depth(reasoning_loss, residual, min_steps, max_steps, monkeypatch):
+@pytest.mark.parametrize('wrap', ['none', 'step', 'sequence'])
+def test_notebook_training_uses_its_selected_recurrence_and_target_depth(reasoning_loss, residual, min_steps, max_steps, wrap, monkeypatch):
     torch.manual_seed(37)
     example = example_module("25")
     adaptive = reasoning_loss == "all_tokens"
@@ -58,12 +59,9 @@ def test_notebook_training_uses_its_selected_recurrence_and_target_depth(reasoni
             head.bias[-1] = 12.
     kwargs = dict(embedding=MultiEmbedding(embeddings={'text': Embedding(vocab_size=16, hidden_dim=8)}),
                   backbone=CausalBackbone(), value_head=head, max_steps=max_steps)
-    online = example.ReasoningDqn(**kwargs, min_steps=min_steps,
-        residual_connections=residual, wrap_latent=residual, reasoning_loss=reasoning_loss)
+    online = example.ReasoningDqn(input_mlp_output_scale=100., **kwargs, min_steps=min_steps,
+        residual_connections=residual, wrap_latent=wrap, reasoning_loss=reasoning_loss)
     apply_lora(model=online.backbone, config=LoRAConfig(rank=2))
-    with torch.no_grad():
-        online.reasoner.input_projection.weight.copy_(torch.eye(8).roll(1, 0) * .7)
-        online.reasoner.input_projection.bias.fill_(.03)
     target = deepcopy(online).requires_grad_(False).eval()
     with torch.no_grad():
         target.backbone.linear.base.bias.add_(.35)
@@ -105,7 +103,7 @@ def test_notebook_training_uses_its_selected_recurrence_and_target_depth(reasoni
     monkeypatch.setattr(target.reasoner, 'generate', forbidden_generation)
     original_generation = online.reasoner.generate
     def cpu_generation(*args, **kwargs):
-        if max_steps == 1:
+        if max_steps == 1 and wrap != "sequence":
             raise AssertionError('One-step notebook training must skip generation')
         assert kwargs.pop('backend') == 'continuous'
         return original_generation(*args, backend='uncached', **kwargs)
@@ -165,8 +163,11 @@ def test_notebook_training_uses_its_selected_recurrence_and_target_depth(reasoni
             assert param.grad is None
             torch.testing.assert_close(param, original_weights[name], rtol=0, atol=0)
     for component in ('embedding.', 'backbone.', 'reasoner.norm.', 'reasoner.start_embedding.', 'reasoner.input_projection.', 'value_head.'):
-        assert any(not torch.equal(original_weights[name], param)
-                   for name, param in online.named_parameters() if name.startswith(component))
+        changed = any(not torch.equal(original_weights[name], param)
+                      for name, param in online.named_parameters() if name.startswith(component))
+        feedback_is_zero = wrap == "none" or (wrap == "step" and max_steps == 1)
+        expect_change = not (feedback_is_zero and component in ('reasoner.norm.', 'reasoner.input_projection.'))
+        assert changed is expect_change, component
 
 
 @pytest.mark.parametrize('reasoning_loss,min_steps,max_steps,message', [
@@ -177,9 +178,9 @@ def test_notebook_training_uses_its_selected_recurrence_and_target_depth(reasoni
 def test_notebook_rejects_invalid_loss_and_adaptive_last_token_budget(reasoning_loss, min_steps, max_steps, message):
     example = example_module('25')
     with pytest.raises(ValueError, match=message):
-        example.ReasoningDqn(
+        example.ReasoningDqn(input_mlp_output_scale=100.,
             embedding=MultiEmbedding(embeddings={'text': Embedding(vocab_size=16, hidden_dim=8)}),
             backbone=CausalBackbone(), value_head=nn.Linear(8, 4),
             min_steps=min_steps, max_steps=max_steps,
-            residual_connections=False, wrap_latent=False, reasoning_loss=reasoning_loss,
+            residual_connections=False, wrap_latent="none", reasoning_loss=reasoning_loss,
         )

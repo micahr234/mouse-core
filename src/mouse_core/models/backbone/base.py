@@ -134,6 +134,11 @@ class BaseBackbone(nn.Module, ABC):
             return torch.float32
 
     @property
+    def mlp_intermediate_dim(self) -> int:
+        """Intermediate width explicitly configured for the transformer's MLP."""
+        raise NotImplementedError("Backbone must expose its configured mlp_intermediate_dim")
+
+    @property
     def rms_norm_eps(self) -> float:
         """Explicit normalization epsilon supplied by this backbone's configuration."""
         raise NotImplementedError("Backbone must expose its configured rms_norm_eps")

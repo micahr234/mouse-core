@@ -38,7 +38,7 @@ class ReasoningBatch:
     ``latent_mask``. Episode rows retain only the reasoning states actually generated.
     Positions identify transformer updates and their tokenizer-defined starts;
     readout_positions mark the final reasoning tokens in the episode rows.
-    ``states`` includes an initial-embedding slot, followed by generated outputs,
+    ``states`` includes an initial-latent slot, followed by generated outputs,
     for incremental inference/diagnostics only. Forward recomputes the outputs.
     Wrapped-latent mode with a multi-step budget emits a final feedback token after the
     last update. A one-step budget and repeated-token mode have no final feedback
@@ -93,14 +93,34 @@ def _evaluating(*roots: nn.Module) -> Iterator[None]:
             module.training = training
 
 
+class _ReasoningInputMLP(nn.Module):
+    """Qwen3's bias-free SiLU-gated MLP, without a residual bypass.
+
+    Fresh projections use standard nn.Linear initialization. The surrounding
+    reasoner owns input RMS normalization and the explicit static output scale.
+    """
+
+    def __init__(self, hidden_dim: int, intermediate_dim: int) -> None:
+        super().__init__()
+        self.gate_proj = nn.Linear(hidden_dim, intermediate_dim, bias=False, dtype=torch.float32)
+        self.up_proj = nn.Linear(hidden_dim, intermediate_dim, bias=False, dtype=torch.float32)
+        self.down_proj = nn.Linear(intermediate_dim, hidden_dim, bias=False, dtype=torch.float32)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(torch.nn.functional.silu(self.gate_proj(inputs)) * self.up_proj(inputs))
+
+
 class SequentialReasoner(nn.Module):
     """Generate repeated-token or residual reasoning with fixed or adaptive depth.
 
-    With wrap_latent, each input after the first is the detached preceding latent;
-    otherwise every input is the dedicated trainable start embedding. Residual
-    connections add that input latent (before normalization) to the raw transformer
-    output. Input RMSNorm precedes a shared learned H-to-H linear map with standard
-    nn.Linear initialization; there is no output-side norm or projection. Only
+    wrap_latent="step" feeds back within each environment decision; "sequence"
+    also carries the final latent into the next decision, resetting only for a new
+    sequence. "none" supplies zero feedback at every token. Every projected input adds the
+    dedicated trainable start embedding after the MLP. At each scope boundary
+    the feedback latent is zero. Residual connections add the feedback latent
+    (before normalization) to the raw transformer
+    output. Input RMSNorm precedes a shared SiLU-gated MLP with standard
+    nn.Linear initialization and an explicit static output scale; there is no output-side norm or projection. Only
     wrapping plus residual addition accumulates updates.
 
     Adaptive depth selects among environment actions and one final think action.
@@ -112,8 +132,9 @@ class SequentialReasoner(nn.Module):
     recomputation matches generation.
     """
 
-    def __init__(self, *, hidden_dim: int, min_steps: int, max_steps: int, rms_norm_eps: float,
-                 residual_connections: bool, wrap_latent: bool, adaptive_depth: bool) -> None:
+    def __init__(self, *, hidden_dim: int, input_mlp_intermediate_dim: int, input_mlp_output_scale: float,
+                 min_steps: int, max_steps: int, rms_norm_eps: float,
+                 residual_connections: bool, wrap_latent: Literal["none", "step", "sequence"], adaptive_depth: bool) -> None:
         super().__init__()
         if type(hidden_dim) is not int or hidden_dim < 1:
             raise ValueError("hidden_dim must be a positive integer")
@@ -121,10 +142,18 @@ class SequentialReasoner(nn.Module):
             raise ValueError("max_steps must be a positive integer")
         if type(min_steps) is not int or not 1 <= min_steps <= max_steps:
             raise ValueError("min_steps must be an integer in [1, max_steps]")
-        if any(type(value) is not bool for value in (residual_connections, wrap_latent, adaptive_depth)):
-            raise ValueError("residual_connections, wrap_latent and adaptive_depth must be booleans")
+        if any(type(value) is not bool for value in (residual_connections, adaptive_depth)):
+            raise ValueError("residual_connections and adaptive_depth must be booleans")
         if type(rms_norm_eps) not in (int, float) or not math.isfinite(rms_norm_eps) or rms_norm_eps <= 0:
             raise ValueError("rms_norm_eps must be finite and positive")
+        if wrap_latent not in ("none", "step", "sequence"):
+            raise ValueError("wrap_latent must be none, step or sequence")
+        if type(input_mlp_intermediate_dim) is not int or input_mlp_intermediate_dim < 1:
+            raise ValueError("input_mlp_intermediate_dim must be a positive integer")
+        if type(input_mlp_output_scale) not in (int, float) or not math.isfinite(input_mlp_output_scale) or input_mlp_output_scale <= 0:
+            raise ValueError("input_mlp_output_scale must be finite and positive")
+        self.input_mlp_intermediate_dim = input_mlp_intermediate_dim
+        self.input_mlp_output_scale = float(input_mlp_output_scale)
         self.rms_norm_eps = rms_norm_eps
         self.hidden_dim = hidden_dim
         self.max_steps = max_steps
@@ -136,12 +165,13 @@ class SequentialReasoner(nn.Module):
         nn.init.normal_(self.start_embedding.weight, std=0.02)
         self.norm = nn.RMSNorm(hidden_dim, eps=rms_norm_eps, elementwise_affine=True, dtype=torch.float32)
         nn.init.constant_(self.norm.weight, 0.02)
-        self.input_projection = nn.Linear(hidden_dim, hidden_dim, bias=True, dtype=torch.float32)
+        self.input_projection = _ReasoningInputMLP(hidden_dim, input_mlp_intermediate_dim)
 
     def project_inputs(self, latent: torch.Tensor) -> torch.Tensor:
-        """Normalize and project reasoning inputs identically in generation and replay."""
+        """Project feedback, then inject the live learned offset at every input token."""
         with torch.autocast(device_type=latent.device.type, enabled=False):
-            return self.input_projection(self.norm(latent.float())).float()
+            return (self.input_projection(self.norm(latent.float())).float() * self.input_mlp_output_scale
+                    + self.start_embedding.weight.float())
 
     @staticmethod
     def _embeds(tokens: TensorDict, embedding: MultiEmbedding) -> torch.Tensor:
@@ -208,9 +238,9 @@ class SequentialReasoner(nn.Module):
                                                    device=device), lengths)
         with _evaluating(embedding, backbone, self):
             embeds = self._embeds(tokens, embedding)
-            initial = self.start_embedding.weight.float().expand(len(heads), -1)
+            initial = self.start_embedding.weight.new_zeros((len(heads), self.hidden_dim))
             states = initial[:, None, :].expand(-1, self.max_steps + 1, -1).clone()
-            if self.max_steps == 1 and cache is None:
+            if self.max_steps == 1 and cache is None and self.wrap_latent != "sequence":
                 # All inputs already exist: evaluate every decision in one packed
                 # causal forward. There is no generated feedback or decode session.
                 positions = torch.tensor(heads, device=embeds.device, dtype=torch.long)
@@ -223,7 +253,7 @@ class SequentialReasoner(nn.Module):
                 self._select_actions(states[:, 1], torch.arange(len(heads), device=embeds.device),
                                      lengths, action_values, select_actions)
                 return _ReasoningTrace(heads, states, lengths)
-            start_input = self.project_inputs(self.start_embedding.weight.float())
+            start_input = self.project_inputs(initial.new_zeros((1, self.hidden_dim)))
             counts = [0] * len(heads)
             episode_heads: list[list[int]] = []
             contexts: list[tuple[slice, ...]] = []
@@ -238,8 +268,13 @@ class SequentialReasoner(nn.Module):
                 episode_heads.append(indices)
                 contexts.append(episode.context_slices)
                 prefix = embeds[episode.context_slices[0]]
-                prompts.append(torch.cat((prefix, start_input))
-                               if indices else prefix)
+                first_input = start_input
+                if indices and self.wrap_latent == "sequence" and cache is not None:
+                    carried = cache.generation_state[episode.sequence_id].get("reasoning_latent")
+                    if carried is not None:
+                        states[indices[0], 0] = carried
+                        first_input = self.project_inputs(carried[None])
+                prompts.append(torch.cat((prefix, first_input)) if indices else prefix)
             cursors = [0] * len(rows)
             def advance(requests: list[int], hidden: torch.Tensor) -> list[torch.Tensor | None]:
                 chunks: list[torch.Tensor | None] = [None] * len(requests)
@@ -252,7 +287,7 @@ class SequentialReasoner(nn.Module):
                     counts[i] += 1
                 live_depths = torch.tensor([counts[i] for _, _, i in live], device=states.device)
                 updates = hidden[[j for j, _, _ in live]].float()
-                base = (states[live_indices, live_depths - 1] if self.wrap_latent else initial[live_indices])
+                base = (states[live_indices, live_depths - 1] if self.wrap_latent != "none" else initial[live_indices])
                 current = base + updates if self.residual_connections else updates
                 states[live_indices, live_depths] = current
                 decisions = [i for _, _, i in live
@@ -269,15 +304,21 @@ class SequentialReasoner(nn.Module):
                     step = counts[i]
                     state = states[i, step:step + 1]
                     if thinking[i]:
-                        chunks[j] = self.project_inputs(state) if self.wrap_latent else start_input
+                        chunks[j] = self.project_inputs(state) if self.wrap_latent != "none" else start_input
                         continue
                     states[i, step + 1:] = state
                     cursors[request] += 1
                     next_index = cursors[request]
-                    prefix = self.project_inputs(state) if self.wrap_latent and self.max_steps > 1 else state[:0]
+                    prefix = self.project_inputs(state) if self.wrap_latent != "none" and self.max_steps > 1 else state[:0]
+                    if self.wrap_latent == "sequence" and cache is not None:
+                        cache.generation_state[rows[request]]["reasoning_latent"] = state[0].detach().clone()
                     if next_index < len(episode_heads[request]):
+                        next_input = start_input
+                        if self.wrap_latent == "sequence":
+                            states[episode_heads[request][next_index], 0] = state[0]
+                            next_input = self.project_inputs(state)
                         chunks[j] = torch.cat((prefix, embeds[contexts[request][next_index]],
-                                               start_input))
+                                               next_input))
                     else:
                         tail = torch.cat((prefix, embeds[contexts[request][-1]]))
                         if cache is not None and len(tail):
@@ -304,7 +345,7 @@ class SequentialReasoner(nn.Module):
     ) -> ReasoningBatch:
         """Generate once and return complete context/latent inputs for forward.
 
-        With max_steps=1, complete episodes need one packed forward, with no
+        With max_steps=1 and no sequence wrapping, episodes need one packed forward, with no
         sequential generation or inserted feedback. Replay collection can skip
         this forward entirely using start_only_reasoning_episodes.
         A cached call returns the new chunk for inference. Its earlier context
@@ -342,7 +383,7 @@ class SequentialReasoner(nn.Module):
                     start = offset + len(row)
                     initial[i] = start
                     length = lengths[i]
-                    feedback = self.wrap_latent and self.max_steps > 1
+                    feedback = self.wrap_latent != "none" and self.max_steps > 1
                     readouts[i] = start + length - 1 + int(feedback)
                     positions[i][:length] = range(start, start + length)
                     token_count = length + int(feedback)
@@ -367,7 +408,7 @@ class SequentialReasoner(nn.Module):
         if latent_rows:
             decision = torch.tensor([i for _, i, _ in entries if i >= 0], device=device)
             step = torch.tensor([step for _, i, step in entries if i >= 0], device=device)
-            latents[torch.tensor(latent_rows, device=device)] = trace.states[decision, step if self.wrap_latent else 0].detach()
+            latents[torch.tensor(latent_rows, device=device)] = trace.states[decision, step if self.wrap_latent != "none" else 0].detach()
         packed["latent_mask"] = latent_mask
         packed["latent_values"] = latents.detach()
         packed["head_mask"] = torch.zeros(len(entries), device=device, dtype=torch.bool)
@@ -386,10 +427,10 @@ class SequentialReasoner(nn.Module):
     ) -> torch.Tensor:
         """Evaluate a generated batch once, returning all depth representations.
 
-        Context and initial reasoning inputs are embedded by this network. Wrapped
-        feedback detaches before normalization. With both flags enabled, the
-        additive path is rebuilt from this forward's updates. Without wrapping,
-        residual addition adds the live start separately at each depth.
+        Context is embedded by this network. Wrapped inputs retain detached saved
+        feedback; scope starts use zero feedback. The live learned start embedding
+        is added after the input MLP at every latent position. With residuals and
+        wrapping, the additive path is rebuilt from this forward's updates.
         No generation or sequence insertion happens here.
         """
         if generated.cached_prefix:
@@ -411,19 +452,34 @@ class SequentialReasoner(nn.Module):
         with _evaluating(embedding, backbone, self):
             tokens = generated.tokens.to(next(embedding.parameters()).device)
             embeds = self._embeds(tokens, embedding)
-            initial = self.start_embedding.weight.float().expand(count, -1)
+            initial = self.start_embedding.weight.new_zeros((count, self.hidden_dim))
             mask = tokens["latent_mask"]
             inputs = embeds.clone()
             latent_inputs = (tokens["latent_values"][mask].detach().float()
-                             if self.wrap_latent else self.start_embedding.weight.float().expand_as(embeds[mask]))
+                             if self.wrap_latent != "none" else torch.zeros_like(embeds[mask], dtype=torch.float32))
             inputs[mask] = self.project_inputs(latent_inputs).to(embeds.dtype)
-            # The first input is a live learned parameter, not generated feedback.
-            inputs[generated.initial_positions] = self.project_inputs(initial).to(embeds.dtype)
+            # Reset feedback at scope boundaries. project_inputs injects the live
+            # learned embedding at EVERY latent position, including saved feedback.
+            starts = generated.initial_positions.to(embeds.device)
+            first = torch.ones(count, device=embeds.device, dtype=torch.bool)
+            if self.wrap_latent == "sequence":
+                groups = tokens["sequence_ids"][starts]
+                first[1:] = groups[1:] != groups[:-1]
+            inputs[starts[first]] = self.project_inputs(initial[first]).to(embeds.dtype)
             hidden = cast(torch.Tensor, backbone(inputs, sequence_ids=tokens["sequence_ids"]))
             updates = hidden[generated.update_positions.to(hidden.device)].float()
             valid = torch.arange(self.max_steps, device=hidden.device)[None] < generated.lengths.to(hidden.device)[:, None]
             updates = updates.masked_fill(~valid[..., None], 0)
-            if self.residual_connections and self.wrap_latent:
+            if self.residual_connections and self.wrap_latent != "none":
+                if self.wrap_latent == "sequence":
+                    # Rebuild the live additive path across all decisions in each
+                    # sequence; generated projection inputs remain detached.
+                    first_indices = first.nonzero().flatten()
+                    counts = torch.diff(torch.cat((first_indices, first_indices.new_tensor([count]))))
+                    return torch.cat([
+                        piece.flatten(0, 1).cumsum(0).view_as(piece)
+                        for piece in updates.split(counts.tolist())
+                    ])
                 return initial[:, None] + updates.cumsum(1)
             states = initial[:, None] + updates if self.residual_connections else updates
             final = states[torch.arange(count, device=hidden.device), generated.lengths.to(hidden.device) - 1]

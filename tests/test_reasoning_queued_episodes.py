@@ -6,7 +6,7 @@ from tests.test_sequential_reasoning import components, generate
 
 
 @pytest.mark.parametrize('residual', [False, True])
-@pytest.mark.parametrize('wrap', [False, True])
+@pytest.mark.parametrize('wrap', ['none', 'step', 'sequence'])
 @torch.no_grad()
 def test_queued_episode_refills_match_uncached_histories(residual, wrap):
     parts = components(residual_connections=residual, wrap_latent=wrap,

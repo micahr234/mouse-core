@@ -94,26 +94,27 @@ def split_reasoning_episodes(inputs: TensorDict, generated: ReasoningBatch, data
 
 
 def start_only_reasoning_episodes(inputs: TensorDict, data: TensorDict, *,
-                                  start_embedding: torch.Tensor, max_steps: int,
+                                  hidden_dim: int, max_steps: int,
                                   generated_step: int) -> tuple[ReasoningEpisode, ...]:
     """Prepare source episodes for replay without a model forward or generation.
 
     Keep exactly one input state at each final head-output boundary. There are no
     generated feedback positions, including in residual mode. Training computes
     the first update and supervises the recorded environment action there. The
-    caller must allow environment actions at depth one. Only sparse start vectors
-    are stored; context tokens never allocate hidden-dimension vectors here.
+    caller must allow environment actions at depth one. Only sparse zero feedback
+    vectors are stored. Forward adds the live learned embedding after the MLP;
+    no model parameters are snapshotted into these records.
     """
     from mouse_core.data.token_batch import head_output_segments
 
     if type(max_steps) is not int or max_steps < 1:
         raise ValueError('max_steps must be a positive integer')
-    if start_embedding.ndim != 1 or not len(start_embedding) or not start_embedding.is_floating_point():
-        raise ValueError('start_embedding must be a nonempty floating-point vector')
+    if type(hidden_dim) is not int or hidden_dim < 1:
+        raise ValueError('hidden_dim must be a positive integer')
     if 'latent_values' in inputs.keys() or 'latent_mask' in inputs.keys():
         raise ValueError('Start-only replay requires clean source tokens')
     inputs, data = inputs.detach().to('cpu'), data.detach().to('cpu')
-    start = start_embedding.detach().to(device='cpu', dtype=torch.float32)
+    start = torch.zeros(hidden_dim, dtype=torch.float32)
     original_heads = inputs['head_mask'].nonzero().flatten()
     if len(original_heads) != len(data['step_ids']):
         raise ValueError('Source head-output rows must align with objective step_ids')
