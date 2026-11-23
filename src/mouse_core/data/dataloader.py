@@ -14,8 +14,9 @@ capturing source stores or unbounded decoded caches. Returned arrays are owned b
 the consumer and survive refresh/close.
 
 Batch k uses SeedSequence(seed, spawn_key=(k,)); each sampled segment is reseeded
-with k * (budget + 1) + attempt. Worker count changes throughput, not the stream.
-Refresh restarts workers against new store snapshots at the next unseen batch.
+with k * (budget + 1) + attempt. In-order delivery preserves that stream across
+worker counts. Unordered delivery depends on worker timing. Refresh rebuilds
+store snapshots and discards pending work; unordered mode skips submitted IDs.
 """
 
 from __future__ import annotations
@@ -467,6 +468,12 @@ class DataLoader:
     weights / weight_mode / prefetch / num_workers :
         Sampling and worker controls. ``num_workers`` is required: ``0`` is
         in-process; ``> 0`` uses spawned processes with shared-memory batch transfer.
+    in_order :
+        True returns batches in submission order, preserving the seeded stream
+        across worker counts. False returns ready batches without waiting for
+        slower earlier jobs; delivery order then depends on worker timing.
+        Unordered refresh discards pending IDs and resumes after all submitted
+        IDs, so no previously delivered ID is regenerated. Unused with no workers.
     context_for_batch :
         Optional ``fn(batch_index) -> mapping``, evaluated once in the parent
         process as each zero-based batch is scheduled. A snapshot travels with
@@ -475,7 +482,7 @@ class DataLoader:
         read-only: the top-level mapping is immutable, nested values are owned
         by that batch. Keep it small; result tensors still use shared memory.
         Prefetched jobs keep their scheduled context. ``refresh()`` drops them
-        and reevaluates the schedule from the next unconsumed batch index.
+        and reevaluates contexts for the new jobs.
     seed :
         Entropy of the batch stream. Batch ``k`` is a pure function of
         ``(seed, k, snapshot, context)`` for any ``num_workers`` (see module
@@ -499,6 +506,7 @@ class DataLoader:
         weights: list[float] | None = None,
         weight_mode: str = "per_store",
         prefetch: int = 4,
+        in_order: bool = True,
         num_workers: int,
         seed: int | None = None,
         context_for_batch: Callable[[int], Mapping[str, Any]] | None = None,
@@ -576,6 +584,9 @@ class DataLoader:
         self.transform = transform
         self.index_field = index_field
         self._num_workers = num_workers
+        if not isinstance(in_order, bool):
+            raise TypeError("in_order must be a bool")
+        self._in_order = in_order
         self._prefetch = prefetch
         self._weights: np.ndarray = (
             np.ones(len(stores)) if weights is None else np.asarray(weights, dtype=float)
@@ -601,7 +612,9 @@ class DataLoader:
 
         Numbering resumes at the next batch the consumer has not received,
         so batches after the refresh are rebuilt against the new snapshot
-        with their original indices. Unchanged source snapshots reuse their files;
+        with their original indices. With in_order=False, numbering resumes
+        after all submitted IDs instead, discarding unfinished jobs.
+        Unchanged source snapshots reuse their files;
         changed in-memory sources are persisted again. A failed refresh closes
         the loader and releases its snapshots.
         """
@@ -694,10 +707,14 @@ class DataLoader:
                         transform=self.transform)
         self._pool = ProcessBatches(build, workers=self._num_workers,
                                     prefetch=self._prefetch, start=self._next_k,
-                                    context_for_batch=self.context_for_batch)
+                                    context_for_batch=self.context_for_batch, in_order=self._in_order)
 
     def _stop_workers(self) -> None:
         if self._pool is not None:
+            if not self._in_order:
+                # Delivered IDs need not be contiguous. Never reuse an already
+                # submitted ID when discarding pending work during refresh.
+                self._next_k = self._pool.next_submit_index
             self._last_worker_diagnostics = {
                 "worker_payload_bytes": self._pool.worker_payload_bytes,
                 "worker_startup_seconds": self._pool.worker_startup_seconds,

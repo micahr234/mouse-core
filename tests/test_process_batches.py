@@ -41,8 +41,8 @@ def test_shared_slots_grow_and_returned_batches_survive_reuse_and_close():
             assert inputs["token_ids"].shape[0] == sizes[index]
             assert bool((inputs['token_ids'] == index).all())
             torch.testing.assert_close(data["vector"][0], torch.arange(sizes[index], dtype=torch.float32))
-            assert len(pool._active) + len(pool._ready) <= 2
-        with_names = [slot.name for slot in pool._slots if slot is not None]
+            assert len(pool._pending) == 2
+        with_names = list(pool._names)
         assert pool._payload is not None
         with_names.append(pool._payload.name)
     finally:
@@ -118,8 +118,6 @@ def test_worker_diagnostics_include_idle_workers_and_exclude_consumer_delay():
     pool = ProcessBatches(_batch, workers=2, prefetch=1, start=7)
     try:
         assert pool.worker_payload_bytes == len(cloudpickle.dumps(_batch))
-        assert pool.worker_startup_seconds is None
-        # Observe notifications waiting in the pipes without consuming them.
         for connection in pool._connections:
             assert connection.poll(30), "worker did not report startup"
         time.sleep(0.2)
@@ -146,12 +144,9 @@ def test_worker_mapping_survives_deserialized_views_and_closes_after_callable_cy
 
     class Connection:
         def __init__(self):
-            self.jobs = iter([(3, output.name, output.size, None), None])
+
             self.messages = []
             self.closed = False
-
-        def recv(self):
-            return next(self.jobs)
 
         def send(self, message):
             self.messages.append(message)
@@ -177,21 +172,30 @@ def test_worker_mapping_survives_deserialized_views_and_closes_after_callable_cy
         references.append(weakref.ref(build))
         return build
 
+    class Jobs:
+        def __init__(self): self.jobs = iter([(3, 0, None), None])
+        def get(self): return next(self.jobs)
+
+    class Signal:
+        def __init__(self): self.value = False
+        def set(self): self.value = True
+        def release(self): self.value = True
+
+    ready, completed = Signal(), Signal()
     connection = Connection()
     monkeypatch.setattr(process_batches.cloudpickle, "loads", loads)
     monkeypatch.setattr(process_batches.torch, "set_num_threads", lambda _: None)
     try:
-        process_batches._worker(connection, payload.name)
+        process_batches._worker(connection, payload.name, Jobs(), [output.name], [ready], completed)
         assert connection.closed
-        assert [message[0] for message in connection.messages] == ["started", "error" if fail else "ready"]
+        assert [message[0] for message in connection.messages] == (["started", "error"] if fail else ["started"])
         assert references[0]() is None
         if fail:
             assert "retained view still readable: 7" in connection.messages[1][1]
         else:
-            descriptors = connection.messages[1][2]
-            _, _, shape, dtype, offset = next(item for item in descriptors if item[1] == "token_ids")
-            actual = np.ndarray(shape, dtype=dtype, buffer=output.buf, offset=offset).copy()
-            assert actual.tolist() == [10, 10, 10]
+            assert ready.value and completed.value
+            inputs, _ = process_batches._read_slot(output.name)
+            assert inputs["token_ids"].tolist() == [10, 10, 10]
         # The worker closes its mapping but never unlinks the parent's payload.
         assert payload.buf is not None
         assert bytes(payload.buf) == bytes(range(16))
@@ -223,5 +227,107 @@ def test_startup_deserialization_failure_reports_traceback_and_releases_payload(
         assert pool.worker_payload_bytes > 0
         with pytest.raises(FileNotFoundError):
             SharedMemory(name=payload_name)
+    finally:
+        pool.close()
+
+
+@pytest.mark.parametrize("prefetch", [1, 16])
+def test_background_prefetch_fills_and_refills_while_consumer_is_idle(prefetch):
+    def build(index):
+        # Different completion order must not change the consumer's batch order.
+        if index % 2 == 0:
+            time.sleep(.02)
+        return _batch(index)
+
+    threads = {thread.ident for thread in threading.enumerate()}
+    pool = ProcessBatches(build, workers=2, prefetch=prefetch)
+    names = []
+    try:
+        for first_index in (0, 3):
+            for event in pool._ready:
+                assert event.wait(30), "worker did not fill its slot while consumer was idle"
+            assert pool._next_submit == first_index + prefetch
+            assert {thread.ident for thread in threading.enumerate()} == threads
+            for index in range(first_index, first_index + 3):
+                inputs, _ = pool.next_batch()
+                assert inputs['token_ids'].tolist() == [index] * 3
+        names = list(pool._names)
+    finally:
+        pool.close()
+    for name in names:
+        with pytest.raises(FileNotFoundError):
+            SharedMemory(name=name)
+
+
+@pytest.mark.parametrize("in_order", [True, False])
+def test_order_option_handles_a_slow_first_batch_without_duplicates(tmp_path, in_order):
+    gate = tmp_path / "release-first"
+    def build(index):
+        if index == 0:
+            deadline = time.monotonic() + 30
+            while not gate.exists():
+                if time.monotonic() > deadline:
+                    raise TimeoutError("first batch was not released")
+                time.sleep(.005)
+        return _batch(index)
+
+    pool = ProcessBatches(build, workers=2, prefetch=3, in_order=in_order)
+    names = list(pool._names)
+    try:
+        assert pool._ready[1].wait(30)
+        assert pool._ready[2].wait(30)
+        assert not pool._ready[0].is_set()
+        if in_order:
+            gate.touch()
+            received = [int(pool.next_batch()[0]['token_ids'][0]) for _ in range(3)]
+            assert received == [0, 1, 2]
+        else:
+            assert int(pool.next_batch()[0]['token_ids'][0]) == 1
+            gate.touch()
+            assert pool._ready[0].wait(30)
+            received = [1] + [int(pool.next_batch()[0]['token_ids'][0]) for _ in range(2)]
+            assert sorted(received) == [0, 1, 2]
+    finally:
+        gate.touch()
+        pool.close()
+    for name in names:
+        with pytest.raises(FileNotFoundError):
+            SharedMemory(name=name)
+
+
+def test_close_discards_unread_grown_slots_without_leaking():
+    pool = ProcessBatches(lambda index: _batch(index, 100_000), workers=2, prefetch=4)
+    names = list(pool._names)
+    try:
+        for event in pool._ready:
+            assert event.wait(30)
+    finally:
+        pool.close()
+    for name in names:
+        with pytest.raises(FileNotFoundError):
+            SharedMemory(name=name)
+
+
+@pytest.mark.parametrize("in_order", [True, False])
+def test_recycled_slots_keep_batch_data_and_context_aligned(in_order):
+    def build(index, *, context):
+        assert context["index"] == index
+        if index % 7 == 0:
+            time.sleep(.005)
+        return _batch(index, length=3 + index % 5)
+
+    pool = ProcessBatches(build, workers=3, prefetch=8, in_order=in_order,
+                          context_for_batch=lambda index: {"index": index})
+    seen = []
+    try:
+        for _ in range(100):
+            inputs, objective = pool.next_batch()
+            index = int(inputs['token_ids'][0])
+            assert inputs['token_ids'].tolist() == [index] * (3 + index % 5)
+            assert objective['vector'].tolist() == [list(range(3 + index % 5))]
+            seen.append(index)
+        assert len(set(seen)) == 100
+        if in_order:
+            assert seen == list(range(100))
     finally:
         pool.close()

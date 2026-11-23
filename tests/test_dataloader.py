@@ -902,3 +902,22 @@ def test_disk_backed_store_matches_live_seeded_batches(tmp_path, workers):
     finally:
         a.close()
         b.close()
+
+
+def test_unordered_refresh_does_not_reuse_submitted_batch_ids():
+    loader = _loader(events_budget=6, num_workers=2, prefetch=4, seed=3, in_order=False)
+    try:
+        loader.next_batch()
+        first_unused = loader._pool.next_submit_index
+        loader.refresh()
+        assert loader._next_k == first_unused
+        assert min(loader._pool._pending.values()) == first_unused
+        loader.next_batch()
+    finally:
+        loader.close()
+
+
+@pytest.mark.parametrize("value", [0, 1, "false", None])
+def test_in_order_requires_bool(value):
+    with pytest.raises(TypeError, match="in_order"):
+        _loader(events_budget=3, num_workers=0, in_order=value)
