@@ -1477,3 +1477,15 @@ or model schema. Completed steps and the latest pointer are committed by rename;
 a failed write leaves the previous latest snapshot available. Repeating a completed
 step returns its existing snapshot for publication retries. Scheduling, run naming,
 metrics, extra text attachments and Hub publication belong to the caller.
+
+
+For recorded episodes whose reasoning depths are selected independently of Q-values,
+`SequentialReasoner.prepare_replay(tokens, lengths=..., ...)` builds training inputs
+without generating unused readouts. Step wrapping prefills consecutive known
+context through the next decision needing a continuation, generates the required
+latent input, and resumes prefill. Entire one-token sequences and repeated-embedding
+inputs require no model forward. Sequence-wide wrapping retains its sequential
+carry dependency. This method returns a training `ReasoningBatch`: its `states`
+are zero diagnostic placeholders, while `latent_values` contains the required
+feedback. Use ordinary `generate` for policy-selected stopping or inference outputs.
+Training and target networks recompute all outputs from the prepared inputs.

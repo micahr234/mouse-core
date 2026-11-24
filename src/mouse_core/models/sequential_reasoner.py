@@ -220,9 +220,8 @@ class SequentialReasoner(nn.Module):
         Adaptive depth treats the final action-value column as think, masked at
         the cap, and selects after every update. Fixed depth evaluates environment
         values and selects only at the final update. The optional selector receives
-        available values, decision indices and depths. Wrapped feedback retains
-        the stopping state in history; repeated-token reasoning has no extra final
-        input. Only episode completion clears a caller-owned cache.
+        available values, decision indices and depths. Only THINK inserts a
+        continuation input. Only episode completion clears a caller-owned cache.
         """
         if backbone.hidden_dim != self.hidden_dim:
             raise ValueError("hidden_dim must match the backbone")
@@ -384,6 +383,108 @@ class SequentialReasoner(nn.Module):
             # these latents/indices while training the input block and embeddings.
             trace = replace(trace, states=trace.states.clone(), lengths=trace.lengths.clone())
         return self._materialize(tokens, trace, cached_prefix=cached_prefix)
+
+    @torch.no_grad()
+    def prepare_replay(
+        self, tokens: TensorDict, *, lengths: torch.Tensor,
+        embedding: MultiEmbedding, backbone: BaseBackbone,
+        backend: Literal["uncached", "continuous"], max_active_requests: int,
+        max_batch_tokens: int = 1024, cache_capacity_tokens: int | None = None,
+    ) -> ReasoningBatch:
+        """Prepare recorded episodes with policy-independent, already selected depths.
+
+        With step wrapping, combine all known inputs through the next decision
+        needing a continuation. Only outputs needed to construct latent inputs
+        are evaluated; the final input joins the next context chunk. Entire
+        one-token episodes and repeated-embedding reasoning need no forward.
+        Sequence wrapping still needs each output to construct the next input.
+        Replay recomputes all readouts during training. Returned ``states`` are
+        zero placeholders, as with replay loaded from ReasoningDataset; use
+        ``generate`` when inference outputs or policy-selected depths are needed.
+        """
+        segments = head_output_segments(tokens)
+        heads = tuple(head for segment in segments for head in segment.head_token_ids)
+        if (lengths.dtype != torch.long or lengths.shape != (len(heads),)
+                or bool(((lengths < self.min_steps) | (lengths > self.max_steps)).any())):
+            raise ValueError("Replay lengths must be one int64 depth per decision within min/max steps")
+        if not self.adaptive_depth and bool((lengths != self.max_steps).any()):
+            raise ValueError("Fixed-depth replay requires max_steps at every decision")
+        if backbone.hidden_dim != self.hidden_dim:
+            raise ValueError("hidden_dim must match the backbone")
+        if backend not in ("uncached", "continuous"):
+            raise ValueError("backend must be uncached or continuous")
+        if type(max_active_requests) is not int or max_active_requests < 1:
+            raise ValueError("max_active_requests must be a positive integer")
+        if 'latent_values' in tokens.keys() or 'latent_mask' in tokens.keys():
+            raise ValueError("Replay preparation requires clean source tokens")
+        desired = lengths.tolist()
+        if self.wrap_latent == "sequence":
+            # Every decision depends on the preceding output in this mode.
+            def select(values, indices, depths):
+                target = lengths.to(depths.device)[indices]
+                return torch.where(depths < target, values.shape[-1] - 1, 0)
+            trace = self.generate(
+                tokens, embedding=embedding, backbone=backbone,
+                action_values=lambda states: states.new_zeros((len(states), 2 if self.adaptive_depth else 1)),
+                select_actions=select, backend=backend, max_active_requests=max_active_requests,
+                max_batch_tokens=max_batch_tokens, cache_capacity_tokens=cache_capacity_tokens)
+            trace.states.zero_()
+            return trace
+        needs_generation = self.wrap_latent == "step" and any(depth > 1 for depth in desired)
+        device = next(embedding.parameters()).device if needs_generation else tokens['token_ids'].device
+        states = torch.zeros((len(heads), self.max_steps + 1, self.hidden_dim), device=device)
+        if needs_generation:
+            with _evaluating(embedding, backbone, self), torch.inference_mode():
+                embeds = self._embeds(tokens, embedding)
+                prompts, requests = [], []
+                offset = 0
+                for segment in segments:
+                    indices = [offset + i for i in range(len(segment.head_token_ids))
+                               if desired[offset + i] > 1]
+                    offset += len(segment.head_token_ids)
+                    if not indices:
+                        continue
+                    prompts.append(embeds[segment.context_slices[0].start:heads[indices[0]] + 1])
+                    requests.append(indices)
+                cursors = [0] * len(requests)
+                depths = [0] * len(heads)
+
+                def advance(active: list[int], hidden: torch.Tensor) -> list[torch.Tensor | None]:
+                    decisions = [requests[request][cursors[request]] for request in active]
+                    previous = [depths[i] for i in decisions]
+                    updates = hidden.float()
+                    current = states[decisions, previous] + updates if self.residual_connections else updates
+                    projected = self.project_inputs(current).to(embeds.dtype)
+                    chunks: list[torch.Tensor | None] = []
+                    for row, (request, decision) in enumerate(zip(active, decisions, strict=True)):
+                        depths[decision] += 1
+                        depth = depths[decision]
+                        states[decision, depth] = current[row]
+                        continuation = projected[row:row + 1]
+                        if depth < desired[decision] - 1:
+                            chunks.append(continuation)
+                        else:
+                            cursors[request] += 1
+                            if cursors[request] < len(requests[request]):
+                                next_decision = requests[request][cursors[request]]
+                                # Final reasoning input, recorded environment steps,
+                                # and all one-token decisions are one prefill span.
+                                context = embeds[heads[decision] + 1:heads[next_decision] + 1]
+                                chunks.append(torch.cat((continuation, context)))
+                            else:
+                                # Remaining recorded context needs no generated latents.
+                                chunks.append(None)
+                    return chunks
+
+                generate(backbone=backbone, prompts=prompts, advance=advance, backend=backend,
+                         max_active_requests=max_active_requests, max_batch_tokens=max_batch_tokens,
+                         cache_capacity_tokens=cache_capacity_tokens)
+        trace = _ReasoningTrace(heads, states, lengths.to(device).clone())
+        prepared = self._materialize(tokens, trace, cached_prefix=False)
+        # Materialization copied the needed feedback into latent_values. Reuse
+        # this allocation for replay's unused diagnostic output slots.
+        states.zero_()
+        return prepared
 
     def _materialize(self, tokens: TensorDict, trace: _ReasoningTrace, *,
                      cached_prefix: bool) -> ReasoningBatch:
