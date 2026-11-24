@@ -541,6 +541,7 @@ class Backbone(BaseBackbone):
         groups = torch.arange(batch, device=embeds.device)[:, None].expand(-1, length)
         out = packed_forward(
             model=self.model, embeds=embeds[valid], sequence_ids=groups[valid],
+            attention_tiles=self.training_attention_tiles,
             position_ids=positions[valid],
             autocast_dtype=self.autocast_dtype, residual_dtype=self.residual_dtype,
             checkpoint=self.gradient_checkpointing,

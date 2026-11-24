@@ -1313,13 +1313,29 @@ including noncontiguous pages, without gathering a padded per-request cache.
 This follows the page-table/physical-block-mask approach described in
 [PyTorch’s FlexAttention inference guide](https://pytorch.org/blog/flexattention-for-inference/).
 
-Short CUDA queries explicitly use FlexDecoding. Attention kernels use
-`max_autotune` with the standard Flex search space; library GEMMs retain their
-existing backend. Long prefills use general FlexAttention. Mouse views the HF allocation as layer-major pages, without copying or allocating
+Continuous decoding uses general Triton FlexAttention with dynamic batch sizes.
+Decoding uses 16-query by 128-KV kernel tiles unless explicitly configured.
+Configure a backbone before running forwards or opening sessions:
+
+```python
+backbone.configure_attention_tiles(
+    training_query=None, training_kv=None,
+    decoding_query=16, decoding_kv=128,
+)
+```
+
+Each dimension accepts 16, 32, 64, 128, or `None` for the backend heuristic.
+Training tiles apply to packed and dense uncached forwards, including target
+networks; decoding tiles apply to all cached queries, including prefill.
+Backward attention retains its own tile selection. Sessions capture their tile
+configuration when opened. These runtime options are not model weights; the
+Experiment resolved TOML preserves them alongside checkpoints.
+Max-autotune is disabled for decoding, including GEMMs. New graph specializations
+can still compile, but do not run the max-autotune candidate search. This avoids
+the static-batch specializations required by explicit FlexDecoding.
+Mouse views the HF allocation as layer-major pages, without copying or allocating
 a second pool. The scheduler and page table remain HF-owned; Mouse writes and reads
-the KV contents. Autotuning therefore samples only the current layer
-instead of spanning every layer in the pool. First-use tuning can be expensive
-and needs temporary GPU memory; warm calls reuse the chosen kernels.
+the KV contents.
 
 The session captures repeated whole-transformer decode shapes with CUDA graphs.
 Compiler-managed CUDA graphs are disabled to avoid nesting graph managers.

@@ -214,13 +214,20 @@ def _decoder_layer(
     n_heads: int,
     n_kv_heads: int,
     head_dim: int,
+    attention_tiles: tuple[int | None, int | None] = (None, None),
 ) -> torch.Tensor:
     """One packed-compatible decoder layer, shared with cached inference."""
     q, k, v = _attention_inputs(layer, h, cos, sin, n_heads, n_kv_heads, head_dim)
+    from torch.nn.attention.flex_attention import FlexKernelOptions
+    options: FlexKernelOptions = {"FORCE_USE_FLEX_ATTENTION": True}
+    if attention_tiles[0] is not None:
+        options["BLOCK_M"] = attention_tiles[0]
+    if attention_tiles[1] is not None:
+        options["BLOCK_N"] = attention_tiles[1]
     output = flex_fn(
         q, k, v, block_mask=block_mask, scale=layer.self_attn.scaling,
         enable_gqa=n_heads != n_kv_heads,
-        kernel_options={"FORCE_USE_FLEX_ATTENTION": True},
+        kernel_options=options,
     )
     return _attention_output(layer, h, output)
 
@@ -312,6 +319,7 @@ def packed_forward(
     output_hidden_states: Literal[False] = False,
     checkpoint: bool = False,
     position_ids: torch.Tensor | None = None,
+    attention_tiles: tuple[int | None, int | None] = (None, None),
 ) -> torch.Tensor: ...
 
 
@@ -326,6 +334,7 @@ def packed_forward(
     output_hidden_states: Literal[True],
     checkpoint: bool = False,
     position_ids: torch.Tensor | None = None,
+    attention_tiles: tuple[int | None, int | None] = (None, None),
 ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]: ...
 
 
@@ -340,6 +349,7 @@ def packed_forward(
     output_hidden_states: bool,
     checkpoint: bool = False,
     position_ids: torch.Tensor | None = None,
+    attention_tiles: tuple[int | None, int | None] = (None, None),
 ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, ...]]: ...
 
 
@@ -353,6 +363,7 @@ def packed_forward(
     output_hidden_states: bool = False,
     checkpoint: bool = False,
     position_ids: torch.Tensor | None = None,
+    attention_tiles: tuple[int | None, int | None] = (None, None),
 ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
     """Full uncached forward over a flat packed stream ``embeds [L, D]``.
 
@@ -383,6 +394,8 @@ def packed_forward(
         Final hidden states ``[L, D]`` in the original stream
         order, plus the per-layer tuple when ``output_hidden_states``.
     """
+    from mouse_core.models.backbone.flex_utils import validate_attention_tiles
+    attention_tiles = validate_attention_tiles(*attention_tiles)
     if embeds.ndim != 2:
         raise ValueError(f"embeds must be [L, D], got shape {tuple(embeds.shape)}")
     L, _D = embeds.shape
@@ -435,7 +448,7 @@ def packed_forward(
     with run_ctx:
         for layer in hf.layers:
             args = (
-                layer, h, cos, sin, block_mask, flex_fn, n_heads, n_kv_heads, head_dim,
+                layer, h, cos, sin, block_mask, flex_fn, n_heads, n_kv_heads, head_dim, attention_tiles,
             )
             h = (
                 _checkpoint(_run_layer_rebound, body, flex_segment, *args, use_reentrant=False)

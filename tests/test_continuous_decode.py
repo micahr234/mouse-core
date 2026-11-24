@@ -514,3 +514,70 @@ def test_cuda_non_power_of_two_gqa_uses_general_flex():
                                            atol=3e-5, rtol=3e-5)
     finally:
         cache.close()
+
+
+def test_decode_compilation_disables_autotuning_and_keeps_dynamic_batches(monkeypatch):
+    from mouse_core.models.backbone import continuous_decode as decode
+
+    calls = []
+
+    def compile_function(function, **kwargs):
+        calls.append((function, kwargs))
+        return function
+
+    monkeypatch.setattr(decode, '_compiled_layer', None)
+    monkeypatch.setattr(decode, '_compiled_inputs', None)
+    monkeypatch.setattr(decode, '_use_flex_compile', lambda device: True)
+    monkeypatch.setattr(torch, 'compile', compile_function)
+    model = backbone()
+    session = model.decode_session(3, max_batch_tokens=32, cache_capacity_tokens=3 * PAGE_SIZE)
+    try:
+        options = next(kwargs for function, kwargs in calls if function is decode._decode_layer)
+        assert options['dynamic'] is True
+        assert options['options']['max_autotune'] is False
+        assert options['options']['max_autotune_gemm'] is False
+        assert options['options']['triton.cudagraphs'] is False
+    finally:
+        session.close()
+
+
+@pytest.mark.parametrize('query,kv', [(16, 128), (32, 64), (None, None)])
+@torch.no_grad()
+def test_attention_tiles_reach_packed_dense_and_decode_kernels(monkeypatch, query, kv):
+    from mouse_core.models.backbone import packed_train, continuous_decode
+    from torch.nn.attention.flex_attention import flex_attention
+
+    model = backbone()
+    model.configure_attention_tiles(training_query=query, training_kv=kv,
+                                    decoding_query=kv, decoding_kv=query)
+    seen = []
+    def attention(*args, **kwargs):
+        seen.append(kwargs['kernel_options'].copy())
+        return flex_attention(*args, **kwargs)
+    monkeypatch.setattr(packed_train, '_flex_fn', lambda device: attention)
+    monkeypatch.setattr(packed_train, '_compiled_layer', None)
+    monkeypatch.setattr(continuous_decode, 'flex_attention', attention)
+    x = torch.randn(7, 32)
+    packed = model(x, sequence_ids=torch.zeros(7, dtype=torch.long))
+    dense = model(x.unsqueeze(0))[0]
+    torch.testing.assert_close(packed, dense)
+    assert len(seen) == 4
+    assert all(row.get('BLOCK_M') == query and row.get('BLOCK_N') == kv for row in seen)
+    seen.clear()
+    session = model.decode_session(1, cache_capacity_tokens=PAGE_SIZE)
+    try:
+        actual = model(x.unsqueeze(0), cache=session, lengths=[7])[0]
+        torch.testing.assert_close(actual, packed, atol=2e-5, rtol=2e-5)
+        assert seen and all(row.get('BLOCK_M') == kv and row.get('BLOCK_N') == query for row in seen)
+    finally:
+        session.close()
+
+
+@pytest.mark.parametrize('bad', [True, 0, -1, 8, 24, 256, 16.0])
+def test_attention_tiles_validate_before_changing_configuration(bad):
+    model = backbone()
+    before = (model.training_attention_tiles, model.decoding_attention_tiles)
+    with pytest.raises(ValueError, match='tile_size'):
+        model.configure_attention_tiles(training_query=32, training_kv=64,
+                                        decoding_query=bad, decoding_kv=128)
+    assert (model.training_attention_tiles, model.decoding_attention_tiles) == before

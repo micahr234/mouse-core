@@ -150,3 +150,11 @@ class _FlexKernel:
                 self._active = self._eager
                 return self._eager(*args, **kwargs)
             raise
+
+
+def validate_attention_tiles(query: int | None, kv: int | None) -> tuple[int | None, int | None]:
+    """Supported kernel tiles divide the 128-token sparse mask blocks."""
+    for name, value in (("attention_query_tile_size", query), ("attention_kv_tile_size", kv)):
+        if value is not None and (type(value) is not int or value not in (16, 32, 64, 128)):
+            raise ValueError(f"{name} must be None or one of 16, 32, 64, 128")
+    return query, kv

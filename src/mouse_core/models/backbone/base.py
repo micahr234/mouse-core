@@ -82,6 +82,23 @@ class BaseBackbone(nn.Module, ABC):
     residual_dtype: torch.dtype | None
     autocast_dtype: torch.dtype | None = None
 
+    training_attention_tiles: tuple[int | None, int | None] = (None, None)
+    decoding_attention_tiles: tuple[int | None, int | None] = (16, 128)
+
+    def configure_attention_tiles(
+        self, *, training_query: int | None, training_kv: int | None,
+        decoding_query: int | None, decoding_kv: int | None,
+    ) -> None:
+        """Set execution tiles before forwards or opening decode sessions.
+
+        None delegates that dimension to the backend heuristic. These runtime
+        settings do not change weights and are not saved in model checkpoints.
+        """
+        from mouse_core.models.backbone.flex_utils import validate_attention_tiles
+        training = validate_attention_tiles(training_query, training_kv)
+        decoding = validate_attention_tiles(decoding_query, decoding_kv)
+        self.training_attention_tiles, self.decoding_attention_tiles = training, decoding
+
     def _set_autocast(
         self,
         autocast_dtype: torch.dtype | None,
@@ -195,6 +212,7 @@ class BaseBackbone(nn.Module, ABC):
         from mouse_core.models.backbone.packed_train import packed_forward
         return packed_forward(
             model=cast(nn.Module, self.model), embeds=embeds, sequence_ids=sequence_ids,
+            attention_tiles=self.training_attention_tiles,
             output_hidden_states=output_hidden_states, checkpoint=self.gradient_checkpointing,
             autocast_dtype=self.autocast_dtype, residual_dtype=self.residual_dtype,
         )
@@ -227,7 +245,7 @@ class BaseBackbone(nn.Module, ABC):
         session = ContinuousDecodeSession(
             model, batch_size=batch_size, max_batch_tokens=max_batch_tokens,
             cache_capacity_tokens=cache_capacity_tokens, autocast_dtype=self.autocast_dtype,
-            residual_dtype=self.residual_dtype,
+            residual_dtype=self.residual_dtype, attention_tiles=self.decoding_attention_tiles,
         )
         from weakref import ref
         session._backbone_ref = ref(self)

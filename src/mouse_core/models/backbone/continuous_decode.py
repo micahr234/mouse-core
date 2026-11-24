@@ -38,29 +38,21 @@ _MAX_TRACKED_SHAPES = 256
 
 
 def _decode_layer(layer, h, q, n_heads, n_kv_heads, head_dim,
-                  key_cache, value_cache, query_index, query_width, block_mask):
+                  key_cache, value_cache, query_index, query_width, block_mask, attention_tiles=(16, 128)):
     """Attend directly to HF-owned KV pages; pad only the new query tokens."""
     batch = block_mask.kv_num_blocks.shape[0]
     queries = q.new_zeros((batch * query_width, n_heads, head_dim))
     queries.index_copy_(0, query_index, q[0].transpose(0, 1))
-    kernel_options: FlexKernelOptions | None = (
-        {"BLOCK_M": _BLOCK_SIZE}
-        if query_width < 128 and query_width * (n_heads // n_kv_heads) > _BLOCK_SIZE
-        else None
-    )
     queries = queries.view(batch, query_width, n_heads, head_dim).transpose(1, 2)
     keys = key_cache.transpose(0, 1).unsqueeze(0)
     values = value_cache.transpose(0, 1).unsqueeze(0)
-    gqa_heads = n_heads // n_kv_heads
-    if queries.device.type == "cuda" and 0 < query_width < 128 and gqa_heads & (gqa_heads - 1) == 0:
-        # FlexDecoding requires static batch/head dimensions. Query length and
-        # cache contents can still change; long prefills and unsupported GQA
-        # ratios retain general Flex.
-        torch._dynamo.mark_static(queries, 0)
-        torch._dynamo.mark_static(queries, 1)
-        torch._dynamo.mark_static(keys, 1)
-        torch._dynamo.mark_static(values, 1)
-        kernel_options = {**(kernel_options or {}), "BACKEND": "TRITON_DECODE"}
+    # Explicit tiles avoid an autotuning search.
+    # General Flex keeps the batch dimension dynamic, unlike FlexDecoding.
+    kernel_options: FlexKernelOptions = {"BACKEND": "TRITON"}
+    if attention_tiles[0] is not None:
+        kernel_options["BLOCK_M"] = attention_tiles[0]
+    if attention_tiles[1] is not None:
+        kernel_options["BLOCK_N"] = attention_tiles[1]
     attention_output = flex_attention(
         queries, keys, values,
         block_mask=block_mask, scale=layer.self_attn.scaling,
@@ -133,6 +125,7 @@ class ContinuousDecodeSession:
         max_batch_tokens: int, cache_capacity_tokens: int,
         autocast_dtype: torch.dtype | None = None,
         residual_dtype: torch.dtype | None = None,
+        attention_tiles: tuple[int | None, int | None] = (16, 128),
     ) -> None:
         for name, value in (("batch_size", batch_size), ("max_batch_tokens", max_batch_tokens),
                             ("cache_capacity_tokens", cache_capacity_tokens)):
@@ -140,6 +133,8 @@ class ContinuousDecodeSession:
                 raise ValueError(f"{name} must be a positive integer.")
         if cache_capacity_tokens % _PAGE_SIZE:
             raise ValueError(f"cache_capacity_tokens must be a multiple of {_PAGE_SIZE} (HF's default KV page size).")
+        from mouse_core.models.backbone.flex_utils import validate_attention_tiles
+        self.attention_tiles = validate_attention_tiles(*attention_tiles)
         self.model: Any = model
         cfg = self.model.config
         if getattr(cfg, "use_sliding_window", False) or any(
@@ -213,11 +208,9 @@ class ContinuousDecodeSession:
                     _decode_layer, dynamic=True, fullgraph=True,
                     recompile_limit=_FLEX_RECOMPILE_LIMIT,
                     options={
-                        "max_autotune": True,
-                        "max_autotune_flex_search_space": "DEFAULT",
-                        # Tune attention; retain existing library GEMMs and the
-                        # session's whole-transformer CUDA graph management.
-                        "max_autotune_gemm_backends": "ATEN",
+                        "max_autotune": False,
+                        "max_autotune_gemm": False,
+                        # The session owns whole-transformer CUDA graphs.
                         "triton.cudagraphs": False,
                     },
                 )
@@ -495,7 +488,7 @@ class ContinuousDecodeSession:
                         key_cache.index_copy_(0, wi, k[0].transpose(0, 1))
                         value_cache.index_copy_(0, wi, v[0].transpose(0, 1))
                         current = self._layer(layer, current, q, cfg.num_attention_heads, cfg.num_key_value_heads,
-                                              head_dim, key_cache, value_cache, qi, query_width, mask)
+                                              head_dim, key_cache, value_cache, qi, query_width, mask, self.attention_tiles)
                         if need_layers:
                             hidden.append(current)
                     return self.model.norm(current), tuple(hidden)
