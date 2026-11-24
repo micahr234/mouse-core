@@ -72,8 +72,6 @@ def reference_states(parts, tokens, generated):
                 base = state if reasoner.wrap_latent != "none" else torch.zeros_like(embedding.embeddings["text"].embed_tokens.weight[9:10][0])
                 state = base + update if reasoner.residual_connections else update
                 per_depth.append(state)
-            if reasoner.wrap_latent != "none" and reasoner.max_steps > 1:
-                history.append(input_reference(reasoner, generated.states[decision, int(generated.lengths[decision])].detach()))
             per_depth.extend([per_depth[-1]] * (reasoner.max_steps - len(per_depth)))
             outputs.append(torch.stack(per_depth))
             decision += 1
@@ -95,7 +93,7 @@ def test_variant_positions_and_outputs_match_literal_token_history(residual_conn
     assert trace.lengths.tolist() == lengths.tolist()
     assert sorted(calls) == sorted((i, k) for i, length in enumerate(lengths.tolist())
                                   for k in (range(1, length + 1) if adaptive_depth else [cap]))
-    assert len(trace.tokens['token_ids']) == len(tokens['token_ids']) + int((lengths - 1 + (wrap_latent != "none" and cap > 1)).sum())
+    assert len(trace.tokens['token_ids']) == len(tokens['token_ids']) + int((lengths - 1).sum())
     assert trace.readout_positions.tolist() == (trace.initial_positions + lengths - 1).tolist()
     if wrap_latent == "none":
         table = embedding.embeddings['text'].embed_tokens.weight
@@ -132,9 +130,9 @@ def test_real_cache_retains_exact_generated_token_count_and_replays(residual_con
     session = backbone.decode_session(2, max_batch_tokens=3, cache_capacity_tokens=1024)
     try:
         generated_first = generate(parts, first, backend='continuous', cache=session)
-        assert list(session.lengths) == [2 + cap - 1 + (wrap_latent != "none" and cap > 1), 3 + cap - 1 + (wrap_latent != "none" and cap > 1)]
+        assert list(session.lengths) == [2 + cap - 1, 3 + cap - 1]
         generated_second = generate(parts, second, backend='continuous', cache=session)
-        assert list(session.lengths) == [4 + 2 * (cap - 1 + (wrap_latent != "none" and cap > 1)), 5 + 2 * (cap - 1 + (wrap_latent != "none" and cap > 1))]
+        assert list(session.lengths) == [4 + 2 * (cap - 1), 5 + 2 * (cap - 1)]
         expected = generate(parts, full)
         torch.testing.assert_close(generated_first.states, expected.states[[0, 2]], atol=3e-5, rtol=3e-5)
         torch.testing.assert_close(generated_second.states, expected.states[[1, 3]], atol=3e-5, rtol=3e-5)
@@ -189,8 +187,7 @@ def test_final_only_head_loss_reaches_all_residual_updates_and_no_intermediate_h
     assert values.grad[0, -1, 2] != 0
     assert (outputs[0].grad[trace.update_positions].abs().sum(-1) > 0).all()
     assert outputs[0].grad[trace.readout_positions].count_nonzero() > 0
-    # The extra feedback input is context only, never a Q-producing readout.
-    assert outputs[0].grad[trace.readout_positions + 1].count_nonzero() == 0
+    assert trace.readout_positions[-1] == len(trace.tokens['token_ids']) - 1
     assert details['td_target'].item() == pytest.approx(2.6)
 
 
@@ -260,7 +257,7 @@ def test_input_projection_standard_initialization_and_zero_head_gradient_startup
 @pytest.mark.parametrize('residual_connections', [False, True])
 @pytest.mark.parametrize('cap', [1, 3, 5])
 @torch.no_grad()
-def test_rollout_defers_unused_feedback_without_extra_decoder_call(monkeypatch, residual_connections, cap):
+def test_rollout_stops_without_trailing_feedback_or_extra_decoder_call(monkeypatch, residual_connections, cap):
     parts = components(residual_connections=residual_connections, wrap_latent="step" if residual_connections else "none", adaptive_depth=True, cap=cap, real=True)
     session = parts[1].decode_session(2, max_batch_tokens=64, cache_capacity_tokens=1024)
     calls = []
@@ -274,7 +271,7 @@ def test_rollout_defers_unused_feedback_without_extra_decoder_call(monkeypatch, 
             before = len(calls)
             generate(parts, batch(((2, 9), (4, 9))), backend='continuous', cache=session)
             assert len(calls) - before == cap
-            assert set(session._deferred) == ({0, 1} if residual_connections and cap > 1 else set())
+            assert not session._deferred
     finally:
         session.close()
 
@@ -363,7 +360,7 @@ def test_live_projection_batch_matches_independent_ragged_histories(wrap_latent)
     hook = reasoner.input_projection.register_forward_pre_hook(
         lambda module, inputs: sizes.append(len(inputs[0])))
     try:
-        trace = generate(parts, tokens, lengths=torch.tensor([1, 3, 2]))
+        trace = generate(parts, tokens, lengths=torch.tensor([2, 3, 2]))
     finally:
         hook.remove()
     torch.testing.assert_close(trace.states[:, 1:], reference_states(parts, tokens, trace))
@@ -371,3 +368,51 @@ def test_live_projection_batch_matches_independent_ragged_histories(wrap_latent)
         assert sizes == []
     else:
         assert max(sizes) > 1
+
+
+@pytest.mark.parametrize('wrap_latent', ['none', 'step', 'sequence'])
+@pytest.mark.parametrize('residual_connections', [False, True])
+@torch.no_grad()
+def test_one_token_decisions_are_independent_of_maximum_budget(wrap_latent, residual_connections):
+    parts = components(residual_connections=residual_connections, adaptive_depth=True,
+                       wrap_latent=wrap_latent, cap=1, real=True)
+    tokens = batch(((2, 9, 3, 9, 4), (5, 9, 6, 9)))
+    tokens['head_mask'] = tokens['token_ids'] == 9
+    tokens['step_readout_mask'] = tokens['head_mask'].clone()
+    lengths = torch.ones(4, dtype=torch.long)
+    original = generate(parts, tokens, lengths=lengths, backend='continuous')
+    parts[2].max_steps = 5
+    expanded = generate(parts, tokens, lengths=lengths, backend='continuous')
+    for key in ('token_ids', 'sequence_ids', 'head_mask', 'step_readout_mask'):
+        torch.testing.assert_close(expanded.tokens[key], tokens[key])
+    torch.testing.assert_close(expanded.states[:, 1], original.states[:, 1], atol=3e-5, rtol=3e-5)
+    torch.testing.assert_close(parts[2](expanded, embedding=parts[0], backbone=parts[1])[:, 0],
+                               original.states[:, 1], atol=3e-5, rtol=3e-5)
+    assert expanded.initial_positions.tolist() == expanded.readout_positions.tolist()
+
+
+@pytest.mark.parametrize('cap', [1, 5])
+def test_stopping_at_first_token_never_uses_input_mlp(monkeypatch, cap):
+    parts = components(residual_connections=False, adaptive_depth=True, wrap_latent='step', cap=cap)
+    def forbidden(*args, **kwargs):
+        pytest.fail('An environment action must not project another latent input')
+    monkeypatch.setattr(parts[2], 'project_inputs', forbidden)
+    trace = generate(parts, batch(), lengths=torch.ones(3, dtype=torch.long))
+    parts[2](trace, embedding=parts[0], backbone=parts[1])
+
+
+@pytest.mark.parametrize('wrap_latent', ['none', 'step', 'sequence'])
+@torch.no_grad()
+def test_cached_first_token_stop_adds_no_feedback_at_large_cap(wrap_latent):
+    parts = components(residual_connections=False, adaptive_depth=True,
+                       wrap_latent=wrap_latent, cap=5, real=True)
+    session = parts[1].decode_session(2, max_batch_tokens=64, cache_capacity_tokens=1024)
+    try:
+        for step in range(3):
+            trace = generate(parts, batch(((2, 9), (4, 9))), lengths=torch.ones(2, dtype=torch.long),
+                             backend='continuous', cache=session)
+            assert trace.lengths.tolist() == [1, 1]
+            assert session.lengths == (2 * (step + 1),) * 2
+            assert not session._deferred
+    finally:
+        session.close()

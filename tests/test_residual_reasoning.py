@@ -155,9 +155,9 @@ def test_single_replay_gradient_matches_explicit_detached_recurrence():
     assert len(outputs) == 1
     positions = trace.update_positions
     assert (outputs[0].grad[positions].abs().sum(-1) > 0).all()
-    # z_N is the readout; running T on the appended z_N would be update N+1.
+    # Each final reasoning output is the readout; no extra input follows it.
     assert outputs[0].grad[trace.readout_positions].abs().sum() > 0
-    assert outputs[0].grad[trace.readout_positions + 1].count_nonzero() == 0
+    assert trace.readout_positions[-1] == len(trace.tokens['token_ids']) - 1
 
     # Independent sequential construction, preserving every solid residual edge.
     reference_values = []
@@ -230,9 +230,9 @@ def test_cache_closed_and_modes_restored_on_generation_failure(monkeypatch):
     def broken(**kwargs):
         session = create(**kwargs)
         sessions.append(session)
-        def fail(**kwargs):
+        def fail(*args, **kwargs):
             raise RuntimeError('deliberate forward failure')
-        session.forward = fail
+        session._decode = fail
         return session
     monkeypatch.setattr(online.backbone, 'decode_session', broken)
     with pytest.raises(RuntimeError, match='deliberate'):
@@ -494,13 +494,13 @@ def test_residual_retains_adaptive_reasoning_in_episode_cache_until_reset(monkey
                     online(trace)
             for row, update in enumerate(updates):
                 histories[row].extend(update)
-            assert session.lengths == tuple(len(h) + int(expected.lengths[groups == row].sum())
+            assert session.lengths == tuple(len(h) + int((expected.lengths[groups == row] - 1).sum())
                                             for row, h in enumerate(histories))
-            # Count actual transformer queries, including deferred feedback.
+            # Count actual transformer queries, including deferred ordinary context.
             # Old cached tokens must not be processed again.
             deferred_after = sum(len(v) for v in session._deferred.values())
             assert sum(processed) + deferred_after - deferred_before == sum(
-                len(update) + int(length) for update, length in zip(updates, trace.lengths))
+                len(update) + int(length) - 1 for update, length in zip(updates, trace.lengths))
             if before[1]:
                 assert session.lengths[1] > before[1]
     finally:
@@ -577,11 +577,12 @@ def test_multiple_actions_retain_every_depth_with_detached_feedback():
                 z = torch.zeros_like(online.embedding.embeddings["text"].embed_tokens.weight[9:10])
                 prefix.append(embed)
                 updates = []
-                for _ in range(4):
+                for depth in range(4):
                     inputs = torch.cat(prefix)
                     raw = online.backbone(inputs, sequence_ids=torch.zeros(len(inputs), dtype=torch.long))[-1:]
                     z = z + raw.float()
-                    prefix.append(input_reference(online.reasoner, z))
+                    if depth < 3:
+                        prefix.append(input_reference(online.reasoner, z))
                     updates.append(z[0])
                 reference.append(torch.stack(updates))
         torch.testing.assert_close(states, torch.stack(reference))
@@ -606,7 +607,7 @@ def test_adaptive_depths_retain_only_executed_states_and_replay_exactly(backend)
         action_values=online.value_head, select_actions=select, backend=backend, max_active_requests=2)
     assert trace.lengths.tolist() == lengths.tolist()
     assert sorted(calls) == [(i, k) for i, n in enumerate(lengths.tolist()) for k in range(1, n + 1)]
-    assert len(trace.tokens['token_ids']) == len(tokens['token_ids']) + int(lengths.sum())
+    assert len(trace.tokens['token_ids']) == len(tokens['token_ids']) + int((lengths - 1).sum())
     torch.testing.assert_close(online(trace)['states'], trace.states[:, 1:], atol=3e-5, rtol=3e-5)
     assert not hasattr(online.reasoner, 'stop_head')
 
@@ -656,17 +657,16 @@ def test_explicit_positions_and_target_weights_replay_the_same_latent_history(ma
         max_active_requests=max_active_requests,
         select_actions=lambda values, indices, depths: torch.where(depths < lengths[indices], 4, 1),
     )
-    # Explicit positions distinguish the update that produces z_k from the
-    # appended z_k token whose transformer output would produce z_(k+1).
-    assert trace.initial_positions.tolist() == [1, 6, 12]
-    assert trace.update_positions.tolist() == [[1, 2, 0], [6, 0, 0], [12, 13, 14]]
-    assert trace.readouts['token_positions'].tolist() == [1, 2, 6, 12, 13, 14]
+    # Each THINK adds exactly one token, with no token after the final readout.
+    assert trace.initial_positions.tolist() == [1, 5, 10]
+    assert trace.update_positions.tolist() == [[1, 2, 0], [5, 0, 0], [10, 11, 12]]
+    assert trace.readouts['token_positions'].tolist() == [1, 2, 5, 10, 11, 12]
     assert trace.readouts['depths'].tolist() == [1, 2, 1, 1, 2, 3]
     assert trace.readouts['is_final'].tolist() == [False, True, True, False, False, True]
-    assert trace.readout_positions.tolist() == [2, 6, 14]
-    assert trace.tokens['head_mask'].nonzero(as_tuple=True)[0].tolist() == [2, 6, 14]
-    assert trace.tokens['sequence_ids'].tolist() == [0] * 9 + [2] * 2 + [4] * 5
-    assert trace.tokens['token_ids'].tolist() == [2, 9, 9, 9, 3, 4, 9, 9, 5, 6, 7, 8, 9, 9, 9, 9]
+    assert trace.readout_positions.tolist() == [2, 5, 12]
+    assert trace.tokens['head_mask'].nonzero(as_tuple=True)[0].tolist() == [2, 5, 12]
+    assert trace.tokens['sequence_ids'].tolist() == [0] * 7 + [2] * 2 + [4] * 4
+    assert trace.tokens['token_ids'].tolist() == [2, 9, 9, 3, 4, 9, 5, 6, 7, 8, 9, 9, 9]
 
     target = deepcopy(online)
     with torch.no_grad():
@@ -681,9 +681,9 @@ def test_explicit_positions_and_target_weights_replay_the_same_latent_history(ma
     # metadata. The target consumes ONLINE latents, with its own context
     # embeddings, normalization, transformer weights and value head.
     episode_items = [
-        [2, (0, 0), (0, 1), (0, 2), 3, 4, (1, 0), (1, 1), 5],
+        [2, (0, 0), (0, 1), 3, 4, (1, 0), 5],
         [6, 7],
-        [8, (2, 0), (2, 1), (2, 2), (2, 3)],
+        [8, (2, 0), (2, 1), (2, 2)],
     ]
     for network in (online, target):
         token_table = network.embedding.embeddings['text'].embed_tokens.weight
@@ -765,7 +765,7 @@ def test_sparse_cached_rows_preserve_passive_context_and_reset_positions():
             expected_states = expected.states[torch.stack(latest)] if latest else expected.states[:0]
             torch.testing.assert_close(actual.states, expected_states, atol=3e-5, rtol=3e-5)
             for group, chunk in enumerate(chunks):
-                extra_reasoning = sum((chunk[i - 1] % 3 + 1) for i, token in enumerate(chunk) if token == 9)
+                extra_reasoning = sum((chunk[i - 1] % 3) for i, token in enumerate(chunk) if token == 9)
                 assert session.lengths[group] == before[group] + len(chunk) + extra_reasoning
             if iteration == 2:
                 assert not len(actual.lengths)

@@ -40,9 +40,8 @@ class ReasoningBatch:
     readout_positions mark the final reasoning tokens in the episode rows.
     ``states`` includes an initial-latent slot, followed by generated outputs,
     for incremental inference/diagnostics only. Forward recomputes the outputs.
-    Wrapped-latent mode with a multi-step budget emits a final feedback token after the
-    last update. A one-step budget and repeated-token mode have no final feedback
-    token; a one-step trace retains only its existing start input.
+    Each decision retains its existing first input and inserts one continuation
+    input per THINK transition. An environment action inserts no trailing token.
     """
 
     tokens: TensorDict
@@ -56,7 +55,7 @@ class ReasoningBatch:
 
     @property
     def readouts(self) -> TensorDict:
-        """Actual transformer outputs by decision/depth, excluding trailing feedback."""
+        """Actual transformer outputs by decision/depth."""
         depths = torch.arange(self.update_positions.shape[1], device=self.lengths.device)
         valid = depths[None] < self.lengths[:, None]
         decisions = torch.arange(len(self.lengths), device=self.lengths.device)[:, None].expand_as(valid)
@@ -305,12 +304,18 @@ class SequentialReasoner(nn.Module):
                         states[indices, depths], indices, depths, action_values, select_actions)
                     for i, action in zip(decisions, actions.tolist(), strict=True):
                         thinking[i] = self.adaptive_depth and action == action_count - 1
-                # Each live request contributes one latent. Project the batch
-                # once, then reuse each row for thinking, feedback and carry.
-                projected = (self.project_inputs(current).to(embeds.dtype)
-                             if self.wrap_latent != "none" else None)
+                # Only THINK inserts a continuation. Sequence wrapping also
+                # projects a carry into the next decision's existing first slot.
+                projection_rows = [position for position, (_, request, i) in enumerate(live)
+                                   if self.wrap_latent != "none" and (thinking[i] or
+                                       (self.wrap_latent == "sequence" and
+                                        cursors[request] + 1 < len(episode_heads[request])))]
+                projected = (self.project_inputs(current[projection_rows]).to(embeds.dtype)
+                             if projection_rows else embeds[:0])
+                projected_inputs = {position: projected[row:row + 1]
+                                    for row, position in enumerate(projection_rows)}
                 for position, (j, request, i) in enumerate(live):
-                    projected_input = projected[position:position + 1] if projected is not None else embeds[:0]
+                    projected_input = projected_inputs.get(position, embeds[:0])
                     step = counts[i]
                     state = states[i, step:step + 1]
                     if thinking[i]:
@@ -319,7 +324,6 @@ class SequentialReasoner(nn.Module):
                     states[i, step + 1:] = state
                     cursors[request] += 1
                     next_index = cursors[request]
-                    prefix = projected_input if self.wrap_latent != "none" and self.max_steps > 1 else embeds[:0]
                     if self.wrap_latent == "sequence" and cache is not None:
                         cache.generation_state[rows[request]]["reasoning_latent"] = state[0].detach().clone()
                     if next_index < len(episode_heads[request]):
@@ -328,10 +332,10 @@ class SequentialReasoner(nn.Module):
                         if self.wrap_latent == "sequence":
                             states[episode_heads[request][next_index], 0] = state[0]
                             next_input = projected_input
-                        chunks[j] = torch.cat((prefix, embeds[contexts[request][next_index]],
+                        chunks[j] = torch.cat((embeds[contexts[request][next_index]],
                                                next_input))
                     else:
-                        tail = torch.cat((prefix, embeds[contexts[request][-1]]))
+                        tail = embeds[contexts[request][-1]]
                         if cache is not None and len(tail):
                             deferred[rows[request]] = tail
                         # No readout consumes this suffix. A persistent episode
@@ -404,11 +408,9 @@ class SequentialReasoner(nn.Module):
                     start = offset + len(row)
                     initial[i] = start
                     length = lengths[i]
-                    feedback = self.wrap_latent != "none" and self.max_steps > 1
                     readouts[i] = start + length - 1
                     positions[i][:length] = range(start, start + length)
-                    token_count = length + int(feedback)
-                    row.extend((cursor, i, step) for step in range(token_count))
+                    row.extend((cursor, i, step) for step in range(length))
                 else:
                     row.append((cursor, -1, -1))
                 cursor += 1

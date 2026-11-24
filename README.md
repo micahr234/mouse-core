@@ -419,8 +419,10 @@ An environment action ends reasoning without replacing the action in replay.
 Low-level `make_token_batch` callers supply `step_readout_mask` explicitly;
 tokenizers and loaders calculate it automatically. Field boundary masks preserve
 multi-token spans. `ReasoningBatch.readouts` describes each valid Q-producing
-position, its decision, depth, and whether it is final; trailing feedback is
-context, not a prediction.
+position, its decision, depth, and whether it is final. Only THINK inserts a
+continuation token; an environment action adds no trailing feedback token,
+regardless of the configured maximum depth. Sequence wrapping carries the latent
+into the next decision's existing first-token slot.
 
 After generation, `generated.align_objective_data(inputs, objective_data)`
 uses the common decision alignment. Per-step labels remain unchanged. Both
