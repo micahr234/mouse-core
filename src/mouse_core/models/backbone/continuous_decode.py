@@ -48,10 +48,21 @@ def _decode_layer(layer, h, q, n_heads, n_kv_heads, head_dim,
         if query_width < 128 and query_width * (n_heads // n_kv_heads) > _BLOCK_SIZE
         else None
     )
+    queries = queries.view(batch, query_width, n_heads, head_dim).transpose(1, 2)
+    keys = key_cache.transpose(0, 1).unsqueeze(0)
+    values = value_cache.transpose(0, 1).unsqueeze(0)
+    gqa_heads = n_heads // n_kv_heads
+    if queries.device.type == "cuda" and 0 < query_width < 128 and gqa_heads & (gqa_heads - 1) == 0:
+        # FlexDecoding requires static batch/head dimensions. Query length and
+        # cache contents can still change; long prefills and unsupported GQA
+        # ratios retain general Flex.
+        torch._dynamo.mark_static(queries, 0)
+        torch._dynamo.mark_static(queries, 1)
+        torch._dynamo.mark_static(keys, 1)
+        torch._dynamo.mark_static(values, 1)
+        kernel_options = {**(kernel_options or {}), "BACKEND": "TRITON_DECODE"}
     attention_output = flex_attention(
-        queries.view(batch, query_width, n_heads, head_dim).transpose(1, 2),
-        key_cache.transpose(0, 1).unsqueeze(0),
-        value_cache.transpose(0, 1).unsqueeze(0),
+        queries, keys, values,
         block_mask=block_mask, scale=layer.self_attn.scaling,
         enable_gqa=n_heads != n_kv_heads, kernel_options=kernel_options,
     )
@@ -64,7 +75,7 @@ def _physical_indices(allocator, request_id, positions):
     """Vectorized lookup into HF's per-request pages (no allocation policy)."""
     slots = positions
     pages = np.asarray(allocator.block_table[request_id], dtype=np.int64)
-    return (pages[slots // allocator.tokens_per_page] * allocator.block_physical_stride
+    return (pages[slots // allocator.tokens_per_page] * allocator.tokens_per_page
             + slots % allocator.tokens_per_page)
 
 
@@ -172,6 +183,14 @@ class ContinuousDecodeSession:
                 "retaining enough space for all live outer episodes, or reduce "
                 f"concurrent episodes and the pool together. Original error: {exc}"
             ) from exc
+        # HF owns page allocation and request scheduling. Mouse owns the contents:
+        # reinterpret the same allocation as layer-major pages (no copy/pool).
+        # Full attention and disabled prefix sharing are required above; HF's
+        # interleaved update/copy APIs must not be used with this content layout.
+        allocator = cast(FullAttentionCacheAllocator, self._cache.layer_to_allocator[0])
+        self._kv_cache = allocator.cache_tensor.view(
+            len(self.model.layers), 2, -1, allocator.num_key_value_heads, allocator.head_dim,
+        )
         self._scheduler: FIFOScheduler | None = FIFOScheduler(
             self._cache, safety_margin=0.0, max_requests_per_batch=batch_size,
         )
@@ -193,6 +212,14 @@ class ContinuousDecodeSession:
                 _compiled_layer = cast(Any, torch.compile)(
                     _decode_layer, dynamic=True, fullgraph=True,
                     recompile_limit=_FLEX_RECOMPILE_LIMIT,
+                    options={
+                        "max_autotune": True,
+                        "max_autotune_flex_search_space": "DEFAULT",
+                        # Tune attention; retain existing library GEMMs and the
+                        # session's whole-transformer CUDA graph management.
+                        "max_autotune_gemm_backends": "ATEN",
+                        "triton.cudagraphs": False,
+                    },
                 )
             if _compiled_inputs is None:
                 _compiled_inputs = cast(Any, torch.compile)(
@@ -343,13 +370,13 @@ class ContinuousDecodeSession:
             h = torch.cat([self._pending[row].embeds[state.tokens_to_process[0]:state.tokens_to_process[-1] + 1]
                            for row, state in zip(rows, states, strict=True)])
             allocator = cast(FullAttentionCacheAllocator, cache.layer_to_allocator[0])
-            # HF blocks interleave layers and K/V pages. Translate page indices,
-            # not their contents; the same block map applies to each shifted layer view.
+            # The HF page table addresses layer-major KV pages directly.
             past_lengths = np.asarray([state.position_offset for state in states], dtype=np.int64)
             query_lengths = np.asarray(chunks, dtype=np.int64)
             query_width = max(chunks)
-            page_size, stride = allocator.tokens_per_page, allocator.block_physical_stride
-            cache_rows = allocator._kv_token_views[allocator.layer_indices[-1]][1].shape[0]
+            page_size = stride = allocator.tokens_per_page
+            assert self._kv_cache is not None
+            cache_rows = self._kv_cache.shape[2]
             num_blocks = (cache_rows + stride - 1) // stride
             owners = np.full(num_blocks, -1, dtype=np.int64)
             logical_pages = np.zeros(num_blocks, dtype=np.int64)
@@ -421,6 +448,8 @@ class ContinuousDecodeSession:
 
     def _decode(self, h, metadata, blocks, sizes, shapes, query_width, cache_rows,
                 stride, page_size, allocator, need_layers):
+        kv_cache = self._kv_cache
+        assert kv_cache is not None
         # Capture only shapes that recur. Ragged scheduler batches and all KV
         # mappings remain unchanged; no projection/MLP padding is introduced.
         signature = (h.shape, h.dtype, sizes, shapes, query_width, need_layers)
@@ -461,11 +490,12 @@ class ContinuousDecodeSession:
                 context = nullcontext() if self.autocast_dtype is None else torch.autocast(self.device.type, dtype=self.autocast_dtype)
                 with context:
                     for layer_index, layer in enumerate(self.model.layers):
-                        key_cache, value_cache = allocator._kv_token_views[layer_index]
+                        key_cache, value_cache = kv_cache[layer_index].unbind(0)
                         q, k, v = self._inputs(layer, current, cos, sin, cfg.num_attention_heads, cfg.num_key_value_heads, head_dim)
-                        allocator.update(k[0].transpose(0, 1), v[0].transpose(0, 1), layer_index, wi[:0], wi)
+                        key_cache.index_copy_(0, wi, k[0].transpose(0, 1))
+                        value_cache.index_copy_(0, wi, v[0].transpose(0, 1))
                         current = self._layer(layer, current, q, cfg.num_attention_heads, cfg.num_key_value_heads,
-                                              head_dim, key_cache[:cache_rows], value_cache[:cache_rows], qi, query_width, mask)
+                                              head_dim, key_cache, value_cache, qi, query_width, mask)
                         if need_layers:
                             hidden.append(current)
                     return self.model.norm(current), tuple(hidden)
@@ -592,5 +622,6 @@ class ContinuousDecodeSession:
         for state in self.generation_state:
             state.clear()
         self._scheduler = None
+        self._kv_cache = None
         self._cache = None
         self._capture_stream = None

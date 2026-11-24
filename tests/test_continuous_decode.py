@@ -293,14 +293,15 @@ def test_cuda_bf16_base_with_fp32_lora():
 
 
 @pytest.mark.parametrize("tokens", [1, PAGE_SIZE + 1, 2 * PAGE_SIZE + 1])
-def test_physical_addresses_match_hf_allocator(tokens):
-    """Match HF's address oracle across interleaved full-episode pages."""
+def test_physical_addresses_map_hf_pages_to_layer_major_storage(tokens):
+    """Preserve HF page identity and token offsets in compact per-layer storage."""
     import numpy as np
     from mouse_core.models.backbone.continuous_decode import _physical_indices
     session = backbone().decode_session(2, cache_capacity_tokens=4 * PAGE_SIZE)
     assert session._cache is not None
     allocator = session._cache.layer_to_allocator[0]
     try:
+        assert session._kv_cache.untyped_storage().data_ptr() == allocator.cache_tensor.untyped_storage().data_ptr()
         # Use the scheduler to reserve sectors and interleave each row's pages.
         first = min(tokens, allocator.tokens_per_page)
         session.forward(embeds=torch.randn(2, first, 32), lengths=[first, first])
@@ -309,9 +310,13 @@ def test_physical_addresses_match_hf_allocator(tokens):
         for past in sorted({0, min(1, tokens - 1), tokens - 1}):
             for count in sorted({1, tokens - past}):
                 read = _physical_indices(allocator, '0', np.arange(past + count, dtype=np.int64))
-                assert read.tolist() == allocator.get_read_indices('0', past, count)
+                expected = np.asarray(allocator.get_read_indices('0', past, count))
+                expected = expected // allocator.block_physical_stride * PAGE_SIZE + expected % allocator.block_physical_stride
+                assert read.tolist() == expected.tolist()
                 write = _physical_indices(allocator, '0', np.arange(past, past + count, dtype=np.int64))
-                assert write.tolist() == allocator.get_write_indices('0', past, count)
+                expected = np.asarray(allocator.get_write_indices('0', past, count))
+                expected = expected // allocator.block_physical_stride * PAGE_SIZE + expected % allocator.block_physical_stride
+                assert write.tolist() == expected.tolist()
     finally:
         session.close()
 
@@ -455,5 +460,57 @@ def test_deferred_batch_is_atomic_owns_inputs_and_preserves_history():
         cache.reset_rows()
         cache.defer_chunks(query)
         assert cache.lengths == (1, 1)
+    finally:
+        cache.close()
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@torch.no_grad()
+def test_fragmented_page_table_and_reused_pages_preserve_request_history(device):
+    model = backbone(device=device)
+    cache = model.decode_session(2, max_batch_tokens=2 * PAGE_SIZE,
+                                 cache_capacity_tokens=6 * PAGE_SIZE)
+    history = [torch.empty(0, 32, device=device) for _ in range(2)]
+
+    def append(row, count):
+        chunk = torch.randn(count, 32, device=device)
+        result = cache.forward_chunks({row: chunk})[row]
+        history[row] = torch.cat((history[row], chunk))
+        torch.testing.assert_close(result, reference(model, history[row])[-count:], atol=2e-5, rtol=2e-5)
+
+    try:
+        append(0, 1)
+        append(1, 1)
+        append(0, PAGE_SIZE + 7)
+        allocator = cache._cache.layer_to_allocator[0]
+        pages = allocator.block_table['0']
+        # The second request occupies a physical page between this request's pages.
+        assert len(pages) == 2 and abs(pages[1] - pages[0]) > 1
+        freed = set(allocator.block_table['1'])
+        cache.reset_rows([1])
+        history[1] = history[1][:0]
+        append(1, PAGE_SIZE + 3)
+        assert freed.intersection(allocator.block_table['1'])
+        append(0, 3)
+        append(1, 1)
+    finally:
+        cache.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.no_grad()
+def test_cuda_non_power_of_two_gqa_uses_general_flex():
+    model = Backbone(architecture="qwen3", dtype=torch.float32, hidden_dim=96,
+                     num_layers=2, num_heads=3, num_key_value_heads=1).cuda().eval()
+    cache = model.decode_session(2, max_batch_tokens=8, cache_capacity_tokens=2 * PAGE_SIZE)
+    history = torch.empty(2, 0, 96, device="cuda")
+    try:
+        for _ in range(3):
+            chunk = torch.randn(2, 1, 96, device="cuda")
+            history = torch.cat((history, chunk), dim=1)
+            output = cache.forward(embeds=chunk, lengths=[1, 1])
+            for row in range(2):
+                torch.testing.assert_close(output[row], reference(model, history[row])[-1:],
+                                           atol=3e-5, rtol=3e-5)
     finally:
         cache.close()

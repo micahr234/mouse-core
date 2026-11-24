@@ -1304,7 +1304,25 @@ query budget and shared pool capacity for uniform/ragged rows. Explicitly
 undersized capacity fails before allocating the model. `bench_inference.py`
 reports resident session allocation separately from transient peak allocation.
 The HF pool is allocated up front; requests acquire pages as they grow and
-release them at outer-episode boundaries. This path does not use CUDA graphs.
+release them at outer-episode boundaries. The HF page table is translated into
+physical FlexAttention block indices; causal masking maps physical pages back to
+logical request positions. Attention reads the shared KV allocation directly,
+including noncontiguous pages, without gathering a padded per-request cache.
+This follows the page-table/physical-block-mask approach described in
+[PyTorch’s FlexAttention inference guide](https://pytorch.org/blog/flexattention-for-inference/).
+
+Short CUDA queries explicitly use FlexDecoding. Attention kernels use
+`max_autotune` with the standard Flex search space; library GEMMs retain their
+existing backend. Long prefills use general FlexAttention. Mouse views the HF allocation as layer-major pages, without copying or allocating
+a second pool. The scheduler and page table remain HF-owned; Mouse writes and reads
+the KV contents. Autotuning therefore samples only the current layer
+instead of spanning every layer in the pool. First-use tuning can be expensive
+and needs temporary GPU memory; warm calls reuse the chosen kernels.
+
+The session captures repeated whole-transformer decode shapes with CUDA graphs.
+Compiler-managed CUDA graphs are disabled to avoid nesting graph managers.
+Reasoning input projections batch the currently ready requests in each callback;
+ragged episode boundaries and per-request latent histories remain separate.
 
 First calls are reported separately, but warmup does not guarantee that later
 shapes avoid compilation. Run each comparison in a fresh process; the compiled

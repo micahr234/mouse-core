@@ -305,16 +305,21 @@ class SequentialReasoner(nn.Module):
                         states[indices, depths], indices, depths, action_values, select_actions)
                     for i, action in zip(decisions, actions.tolist(), strict=True):
                         thinking[i] = self.adaptive_depth and action == action_count - 1
-                for j, request, i in live:
+                # Each live request contributes one latent. Project the batch
+                # once, then reuse each row for thinking, feedback and carry.
+                projected = (self.project_inputs(current).to(embeds.dtype)
+                             if self.wrap_latent != "none" else None)
+                for position, (j, request, i) in enumerate(live):
+                    projected_input = projected[position:position + 1] if projected is not None else embeds[:0]
                     step = counts[i]
                     state = states[i, step:step + 1]
                     if thinking[i]:
-                        chunks[j] = self.project_inputs(state).to(embeds.dtype) if self.wrap_latent != "none" else start_inputs[i:i + 1]
+                        chunks[j] = projected_input if self.wrap_latent != "none" else start_inputs[i:i + 1]
                         continue
                     states[i, step + 1:] = state
                     cursors[request] += 1
                     next_index = cursors[request]
-                    prefix = self.project_inputs(state).to(embeds.dtype) if self.wrap_latent != "none" and self.max_steps > 1 else embeds[:0]
+                    prefix = projected_input if self.wrap_latent != "none" and self.max_steps > 1 else embeds[:0]
                     if self.wrap_latent == "sequence" and cache is not None:
                         cache.generation_state[rows[request]]["reasoning_latent"] = state[0].detach().clone()
                     if next_index < len(episode_heads[request]):
@@ -322,7 +327,7 @@ class SequentialReasoner(nn.Module):
                         next_input = start_inputs[next_decision:next_decision + 1]
                         if self.wrap_latent == "sequence":
                             states[episode_heads[request][next_index], 0] = state[0]
-                            next_input = self.project_inputs(state).to(embeds.dtype)
+                            next_input = projected_input
                         chunks[j] = torch.cat((prefix, embeds[contexts[request][next_index]],
                                                next_input))
                     else:

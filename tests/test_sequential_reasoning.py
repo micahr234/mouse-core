@@ -349,3 +349,25 @@ def test_evaluation_scope_restores_mixed_modes_after_callback_failure(initial_tr
     with _evaluating(module):
         module.train()
     assert not any(part.training for part in module.modules())
+
+
+@pytest.mark.parametrize('wrap_latent', ['none', 'step', 'sequence'])
+def test_live_projection_batch_matches_independent_ragged_histories(wrap_latent):
+    parts = components(residual_connections=True, adaptive_depth=True,
+                       wrap_latent=wrap_latent, cap=3)
+    reasoner = parts[2]
+    tokens = batch(((2, 9, 3, 9, 4), (5, 9)))
+    tokens['head_mask'] = tokens['token_ids'] == 9
+    tokens['step_readout_mask'] = tokens['head_mask'].clone()
+    sizes = []
+    hook = reasoner.input_projection.register_forward_pre_hook(
+        lambda module, inputs: sizes.append(len(inputs[0])))
+    try:
+        trace = generate(parts, tokens, lengths=torch.tensor([1, 3, 2]))
+    finally:
+        hook.remove()
+    torch.testing.assert_close(trace.states[:, 1:], reference_states(parts, tokens, trace))
+    if wrap_latent == 'none':
+        assert sizes == []
+    else:
+        assert max(sizes) > 1
