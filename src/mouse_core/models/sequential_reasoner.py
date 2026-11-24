@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from typing import Literal, cast
 
@@ -92,12 +92,14 @@ def _evaluating(*roots: nn.Module) -> Iterator[None]:
     # Disable dropout in both rollout and replay without disabling replay gradients.
     modes = {module: module.training for root in roots for module in root.modules()}
     try:
-        for root in roots:
-            root.eval()
+        if any(modes.values()):
+            for root in roots:
+                root.eval()
         yield
     finally:
         for module, training in modes.items():
-            module.training = training
+            if module.training != training:
+                module.training = training
 
 
 class _ReasoningInputMLP(nn.Module):
@@ -280,6 +282,7 @@ class SequentialReasoner(nn.Module):
             cursors = [0] * len(rows)
             def advance(requests: list[int], hidden: torch.Tensor) -> list[torch.Tensor | None]:
                 chunks: list[torch.Tensor | None] = [None] * len(requests)
+                deferred: dict[int, torch.Tensor] = {}
                 live = [(j, request, episode_heads[request][cursors[request]])
                         for j, request in enumerate(requests) if cursors[request] < len(episode_heads[request])]
                 if not live:
@@ -325,11 +328,13 @@ class SequentialReasoner(nn.Module):
                     else:
                         tail = torch.cat((prefix, embeds[contexts[request][-1]]))
                         if cache is not None and len(tail):
-                            cache.defer(rows[request], tail)
+                            deferred[rows[request]] = tail
                         # No readout consumes this suffix. A persistent episode
                         # processes it with the next observation; an owned cache
                         # is about to be discarded.
                         chunks[j] = None
+                if cache is not None and deferred:
+                    cache.defer_chunks(deferred)
                 return chunks
             generate(backbone=backbone, prompts=prompts, advance=advance, backend=backend,
                      max_active_requests=max_active_requests, max_batch_tokens=max_batch_tokens,
@@ -355,12 +360,20 @@ class SequentialReasoner(nn.Module):
         lives in the KV cache, so it cannot be used as a standalone training batch.
         """
         cached_prefix = cache is not None and any(cache.lengths)
-        trace = self._generate_trace(
-            tokens, embedding=embedding, backbone=backbone, action_values=action_values,
-            select_actions=select_actions, backend=backend,
-            max_active_requests=max_active_requests, max_batch_tokens=max_batch_tokens,
-            cache_capacity_tokens=cache_capacity_tokens, cache=cache,
-        )
+        # Owned sessions never escape generation, so their temporary tensors need
+        # no autograd view/version tracking. A caller-owned session may also be
+        # used outside inference mode; keep its tensor lifetime contract intact.
+        with torch.inference_mode() if cache is None else nullcontext():
+            trace = self._generate_trace(
+                tokens, embedding=embedding, backbone=backbone, action_values=action_values,
+                select_actions=select_actions, backend=backend,
+                max_active_requests=max_active_requests, max_batch_tokens=max_batch_tokens,
+                cache_capacity_tokens=cache_capacity_tokens, cache=cache,
+            )
+        if cache is None and not torch.is_inference_mode_enabled():
+            # Replay must contain ordinary detached tensors: backward may save
+            # these latents/indices while training the input block and embeddings.
+            trace = replace(trace, states=trace.states.clone(), lengths=trace.lengths.clone())
         return self._materialize(tokens, trace, cached_prefix=cached_prefix)
 
     def _materialize(self, tokens: TensorDict, trace: _ReasoningTrace, *,

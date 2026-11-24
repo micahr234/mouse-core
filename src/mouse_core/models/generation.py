@@ -72,13 +72,13 @@ def generate(
             if cache is not None:
                 physical = [slot if owned_cache else cast(Sequence[int], cache_rows)[request]
                             for slot, request in zip(live, requests, strict=True)]
-                lengths = [0] * cache.B
-                for slot, row in zip(live, physical, strict=True):
-                    lengths[row] = len(chunks[slot])
-                padded = prompts[0].new_zeros((cache.B, max(lengths), backbone.hidden_dim))
-                for slot, row in zip(live, physical, strict=True):
-                    padded[row, -lengths[row]:] = chunks[slot]
-                hidden = cast(torch.Tensor, backbone(padded, cache=cache, lengths=lengths))[physical, -1]
+                if cache.model is not backbone.model:
+                    raise ValueError("Decode cache must use this backbone's weights")
+                if (cache.autocast_dtype, cache.residual_dtype) != (backbone.autocast_dtype, backbone.residual_dtype):
+                    raise ValueError("Decode cache precision must match the backbone; create a new session")
+                outputs = cache.forward_chunks({row: chunks[slot]
+                                                for slot, row in zip(live, physical, strict=True)})
+                hidden = torch.stack([cast(torch.Tensor, outputs[row])[-1] for row in physical])
             else:
                 rows = [histories[slot] for slot in live]
                 lengths = torch.tensor([len(row) for row in rows], device=rows[0].device)

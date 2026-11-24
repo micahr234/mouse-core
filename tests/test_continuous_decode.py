@@ -333,3 +333,127 @@ def test_cuda_batched_gqa_decode_matches_full_episodes(tokens_per_row):
             expected = reference(model, history[row])[-tokens_per_row:]
             torch.testing.assert_close(got[row], expected, atol=4e-3, rtol=4e-3)
     cache.close()
+
+
+@torch.no_grad()
+def test_unpadded_chunks_match_padded_forward_with_deferred_history():
+    model = backbone()
+    sessions = [model.decode_session(3, max_batch_tokens=4, cache_capacity_tokens=3 * PAGE_SIZE)
+                for _ in range(2)]
+    padded, ragged = sessions
+    try:
+        for lengths, reset in [([7, 2, 1], []), ([1, 0, 5], []), ([3, 1, 2], [1])]:
+            for session in sessions:
+                if reset:
+                    session.reset_rows(reset)
+            x = torch.randn(3, max(lengths), 32)
+            # Deliberately reverse insertion order: scheduling must remain by row.
+            chunks = {row: x[row, -lengths[row]:] for row in (2, 1, 0) if lengths[row]}
+            actual = ragged.forward_chunks(chunks, output_hidden_states=True)
+            expected, expected_layers = padded.forward(embeds=x, lengths=lengths, output_hidden_states=True)
+            for row, (out, layers) in actual.items():
+                torch.testing.assert_close(out, expected[row, -lengths[row]:], atol=0, rtol=0)
+                for got, want in zip(layers, expected_layers, strict=True):
+                    torch.testing.assert_close(got, want[row, -lengths[row]:], atol=0, rtol=0)
+            assert padded.lengths == ragged.lengths
+            suffix = torch.randn(2, 32)
+            for session in sessions:
+                session.defer(0, suffix)
+        assert ragged.forward_chunks({}) == {}
+    finally:
+        for session in sessions:
+            session.close()
+
+
+@torch.no_grad()
+def test_unpadded_invalid_batch_is_rejected_before_any_submission():
+    model = backbone()
+    cache = model.decode_session(2, max_batch_tokens=4, cache_capacity_tokens=2 * PAGE_SIZE)
+    try:
+        with pytest.raises(ValueError, match='nonempty'):
+            cache.forward_chunks({0: torch.randn(1, 32), 1: torch.empty(0, 32)})
+        with pytest.raises(ValueError, match='KV capacity'):
+            cache.forward_chunks({0: torch.randn(PAGE_SIZE, 32), 1: torch.randn(PAGE_SIZE + 1, 32)})
+        assert not cache.has_pending and cache.lengths == (0, 0)
+        cache.submit(0, torch.randn(1, 32))
+        with pytest.raises(RuntimeError, match='Drain pending'):
+            cache.forward_chunks({1: torch.randn(1, 32)})
+    finally:
+        cache.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
+@torch.no_grad()
+def test_capture_stream_reuses_library_warmup_and_preserves_cache(monkeypatch):
+    import mouse_core.models.backbone.continuous_decode as decode
+    monkeypatch.setattr(decode, '_GRAPH_REUSE_THRESHOLD', 2)
+    monkeypatch.setattr(decode, '_MAX_DECODE_GRAPHS', 2)
+    model = Backbone(architecture='qwen3', dtype=torch.float32, hidden_dim=128,
+                     num_layers=2, num_heads=4, num_key_value_heads=2).cuda().eval()
+    cache = model.decode_session(2, max_batch_tokens=32, cache_capacity_tokens=2 * PAGE_SIZE)
+    original = cache._inputs
+    calls = 0
+    def counted(*args):
+        nonlocal calls
+        calls += 1
+        return original(*args)
+    cache._inputs = counted
+    history = [torch.empty(0, 128, device='cuda') for _ in range(2)]
+    captures = []
+    saved_outputs = []
+    try:
+        for width, expected_calls in zip((1, 1, 1, 3, 3, 3, 2, 2, 2, 1),
+                                          (2, 4, 0, 2, 2, 0, 2, 2, 0, 2), strict=True):
+            inputs = torch.randn(2, width, 128, device='cuda')
+            before = calls
+            outputs = cache.forward_chunks({i: inputs[i] for i in range(2)})
+            assert calls - before == expected_calls
+            for row in range(2):
+                history[row] = torch.cat((history[row], inputs[row]))
+                torch.testing.assert_close(outputs[row], reference(model, history[row])[-width:],
+                                           atol=4e-5, rtol=4e-5)
+            saved_outputs.append((outputs[0], outputs[0].clone()))
+            if cache._capture_stream is not None:
+                captures.append(cache._capture_stream)
+        assert len(cache._graphs) == 2
+        assert all(stream is captures[0] for stream in captures)
+        for output, snapshot in saved_outputs:
+            torch.testing.assert_close(output, snapshot, atol=0, rtol=0)
+        cache.reset_rows()
+        assert not cache._graphs
+        assert cache._capture_stream is captures[0]
+    finally:
+        cache.close()
+    assert cache._capture_stream is None
+
+
+@torch.no_grad()
+def test_deferred_batch_is_atomic_owns_inputs_and_preserves_history():
+    model = backbone()
+    cache = model.decode_session(2, max_batch_tokens=4, cache_capacity_tokens=2 * PAGE_SIZE)
+    prefix = {0: torch.randn(2, 32), 1: torch.randn(3, 32)}
+    snapshots = {row: value.clone() for row, value in prefix.items()}
+    try:
+        cache.defer_chunks(dict(reversed(list(prefix.items()))))
+        for value in prefix.values():
+            value.zero_()
+        for invalid, message in (({0: torch.randn(1, 32), 1: torch.empty(0, 32)}, 'nonempty'),
+                                 ({0: torch.randn(PAGE_SIZE, 32), 1: torch.randn(1, 32)}, 'KV capacity')):
+            with pytest.raises(ValueError, match=message):
+                cache.defer_chunks(invalid)
+            assert cache.lengths == (2, 3)
+            for row in prefix:
+                torch.testing.assert_close(cache._deferred[row], snapshots[row], atol=0, rtol=0)
+        query = {row: torch.randn(1, 32) for row in prefix}
+        result = cache.forward_chunks(query)
+        for row in prefix:
+            expected = reference(model, torch.cat((snapshots[row], query[row])))[-1:]
+            torch.testing.assert_close(result[row], expected)
+        next(model.parameters()).add_(.1)
+        with pytest.raises(RuntimeError, match='weights changed'):
+            cache.defer_chunks(query)
+        cache.reset_rows()
+        cache.defer_chunks(query)
+        assert cache.lengths == (1, 1)
+    finally:
+        cache.close()

@@ -93,8 +93,9 @@ class ContinuousDecodeSession:
 
     Create with ``backbone.decode_session``. ``forward`` accepts the
     left-padded embedding layout; projections and MLPs process only real
-    tokens, while attention pads the scheduled environment rows. Alternatively,
-    call ``submit(row, embeds)`` as environments become ready and ``step()`` to run
+    tokens, while attention pads the scheduled environment rows. ``forward_chunks``
+    accepts a mapping of rows to unpadded chunks and validates the batch once.
+    Alternatively, call ``submit(row, embeds)`` as environments become ready and ``step()`` to run
     one scheduled batch and retrieve completed inputs.
     Calls must be serialized by the caller; there is no background worker.
 
@@ -183,6 +184,7 @@ class ContinuousDecodeSession:
         self._graphs = OrderedDict()
         self._graph_pool = torch.cuda.graph_pool_handle() if self.device.type == "cuda" else None
         self._graph_counts = OrderedDict()
+        self._capture_stream = None
         global _compiled_layer, _compiled_inputs
         if _use_flex_compile(self.device):
             if _compiled_layer is None:
@@ -282,12 +284,24 @@ class ContinuousDecodeSession:
         No token is dropped: deferred embeddings precede the next submission at
         their original rotary positions. Resetting the episode discards them.
         """
+        self.defer_chunks({row: embeds})
+
+    def defer_chunks(self, chunks: dict[int, torch.Tensor]) -> None:
+        """Retain a batch of output-free suffixes after one weight/capacity check.
+
+        Validate every row before changing deferred history. Each suffix is copied
+        so caller mutation cannot change a later observation's cached context.
+        """
         self._check()
-        self._validate_submission(row, embeds)
-        self._check_capacity({row: len(embeds)})
-        embeds = embeds.detach().to(device=self.device, dtype=self.residual_dtype)
-        previous = self._deferred.get(row)
-        self._deferred[row] = embeds.clone() if previous is None else torch.cat((previous, embeds))
+        for row, embeds in chunks.items():
+            self._validate_submission(row, embeds)
+        self._check_capacity({row: len(embeds) for row, embeds in chunks.items()})
+        prepared = {}
+        for row, embeds in chunks.items():
+            embeds = embeds.detach().to(device=self.device, dtype=self.residual_dtype)
+            previous = self._deferred.get(row)
+            prepared[row] = embeds.clone() if previous is None else torch.cat((previous, embeds))
+        self._deferred.update(prepared)
 
     def _enqueue(self, row: int, embeds: torch.Tensor, *, output_hidden_states: bool) -> None:
         """Queue an input after the public entry point has validated the batch."""
@@ -388,8 +402,13 @@ class ContinuousDecodeSession:
                 state.position_offset += count
                 self._lengths[row] += count
                 if not state.remaining_prefill_tokens:
-                    out = torch.cat(pending.outputs)[pending.prefix_length:]
-                    completed[row] = (out, tuple(torch.cat(parts)[pending.prefix_length:] for parts in zip(*pending.layers, strict=True))) if pending.output_hidden_states else out
+                    # A single chunk already owns stable decoder output storage.
+                    # Only split prefills need a concatenation; copying every row
+                    # adds a GPU launch per request at every generation step.
+                    def join(parts):
+                        return (parts[0] if len(parts) == 1 else torch.cat(parts))[pending.prefix_length:]
+                    out = join(pending.outputs)
+                    completed[row] = (out, tuple(join(parts) for parts in zip(*pending.layers, strict=True))) if pending.output_hidden_states else out
                     # finish_request would free KV: an RL environment pauses here,
                     # it has not finished its outer episode.
                     scheduler.active_requests.pop(state.request_id)
@@ -406,6 +425,7 @@ class ContinuousDecodeSession:
         # mappings remain unchanged; no projection/MLP padding is introduced.
         signature = (h.shape, h.dtype, sizes, shapes, query_width, need_layers)
         use_graph = False
+        uses = 0
         if _use_flex_compile(self.device):
             uses = self._graph_counts.pop(signature, 0) + 1
             if len(self._graph_counts) >= _MAX_TRACKED_SHAPES:
@@ -454,10 +474,17 @@ class ContinuousDecodeSession:
                     self._graphs.popitem(last=False)
                 # Warm up compilation and library work outside capture. Writes
                 # target the same new KV positions, so repeating them is safe.
-                stream = torch.cuda.Stream(device=self.device)
+                stream = self._capture_stream
+                first_capture = stream is None
+                if stream is None:
+                    stream = self._capture_stream = torch.cuda.Stream(device=self.device)
                 stream.wait_stream(torch.cuda.current_stream(self.device))
-                with torch.cuda.stream(stream):
-                    run()
+                # This exact shape has already run before capture. Initialize
+                # stream-local library state only on the first use of the shared
+                # capture stream, rather than rerunning every captured shape.
+                if first_capture or uses < 2:
+                    with torch.cuda.stream(stream):
+                        run()
                 torch.cuda.current_stream(self.device).wait_stream(stream)
                 graph = torch.cuda.CUDAGraph()
                 # Graphs run serially and outputs are copied before any replay:
@@ -471,6 +498,28 @@ class ContinuousDecodeSession:
         if use_graph:
             # Pending chunks and callers must not alias the next replay output.
             return result[0].clone(), tuple(t.clone() for t in result[1])
+        return result
+
+    @torch.no_grad()
+    def forward_chunks(self, chunks: dict[int, torch.Tensor], *,
+                       output_hidden_states: bool = False) -> dict[int, Readout]:
+        """Process unpadded row inputs, retaining each row's complete KV history.
+
+        Validate the entire batch before submitting any row. Ascending row order
+        matches ``forward`` scheduling even if the mapping was built out of order.
+        Results contain only submitted rows and exclude deferred prefix outputs.
+        """
+        cache, scheduler = self._check()
+        if self._pending:
+            raise RuntimeError("Drain pending submit/step inputs before calling forward_chunks.")
+        for row, embeds in chunks.items():
+            self._validate_submission(row, embeds)
+        self._check_capacity({row: len(embeds) for row, embeds in chunks.items()})
+        for row in sorted(chunks):
+            self._enqueue(row, chunks[row], output_hidden_states=output_hidden_states)
+        result: dict[int, Readout] = {}
+        while self._pending:
+            result.update(self._step(cache, scheduler))
         return result
 
     @torch.no_grad()
@@ -544,3 +593,4 @@ class ContinuousDecodeSession:
             state.clear()
         self._scheduler = None
         self._cache = None
+        self._capture_stream = None

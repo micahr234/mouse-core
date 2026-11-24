@@ -299,3 +299,53 @@ def test_one_step_uses_one_packed_forward_and_never_enters_generation(monkeypatc
     assert trace.tokens['token_ids'].tolist() == tokens['token_ids'].tolist()
     assert trace.initial_positions.tolist() == trace.readout_positions.tolist() == [1, 3, 5]
     torch.testing.assert_close(trace.states[:, 1:], reference_states(parts, tokens, trace))
+
+
+@pytest.mark.parametrize('backend,device', [('uncached', 'cpu'),
+    pytest.param('continuous', 'cuda', marks=pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')),
+    pytest.param('uncached', 'cuda', marks=pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required'))])
+def test_generated_trace_remains_trainable_through_frozen_backbone(backend, device):
+    parts = components(residual_connections=True, wrap_latent='sequence',
+                       adaptive_depth=True, cap=3, real=device == 'cuda')
+    if device == 'cuda':
+        # Compiled FlexAttention requires head dimensions of at least 16.
+        parts = (parts[0], Backbone(architecture='qwen3', hidden_dim=8, num_layers=1,
+                 num_heads=2, head_dim=16, dtype=torch.float32), *parts[2:])
+    parts = tuple(root.to(device) for root in parts)
+    embedding, backbone, reasoner, head = parts
+    backbone.requires_grad_(False)
+    tokens = batch(((2, 9, 3, 9), (4, 9)))
+    tokens['head_mask'] = tokens['token_ids'] == 9
+    tokens['step_readout_mask'] = tokens['head_mask'].clone()
+    trace = generate(parts, tokens, lengths=torch.tensor([2, 3, 1], device=device), backend=backend)
+    for tensor in (trace.states, trace.lengths, trace.initial_positions,
+                   trace.update_positions, trace.readout_positions,
+                   *(value for value in trace.tokens.values() if isinstance(value, torch.Tensor))):
+        assert not tensor.is_inference()
+        assert not tensor.requires_grad
+    predictions = head(reasoner(trace, embedding=embedding, backbone=backbone))
+    predictions.square().mean().backward()
+    for root in (embedding, reasoner, head):
+        gradients = [parameter.grad for parameter in root.parameters() if parameter.requires_grad]
+        assert gradients and all(gradient is not None and torch.isfinite(gradient).all()
+                                 for gradient in gradients)
+        assert sum(gradient.abs().sum() for gradient in gradients) > 0
+    assert all(parameter.grad is None for parameter in backbone.parameters())
+
+
+@pytest.mark.parametrize('initial_training', [False, True])
+def test_evaluation_scope_restores_mixed_modes_after_callback_failure(initial_training):
+    from mouse_core.models.sequential_reasoner import _evaluating
+    module = nn.Sequential(nn.Dropout(.5), nn.Linear(3, 3)).train(initial_training)
+    module[0].training = not initial_training
+    before = [part.training for part in module.modules()]
+    with pytest.raises(RuntimeError, match='callback failed'):
+        with _evaluating(module, module[0]):
+            assert not any(part.training for part in module.modules())
+            module[1].train()
+            raise RuntimeError('callback failed')
+    assert [part.training for part in module.modules()] == before
+    module.eval()
+    with _evaluating(module):
+        module.train()
+    assert not any(part.training for part in module.modules())
