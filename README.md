@@ -771,8 +771,12 @@ into scoped memory-mapped snapshots before spawning. Workers reopen files instea
 of deserializing a full copy of replay history. Fully mapped sources borrow their
 existing files, and unchanged source objects reuse their snapshot across refreshes.
 Use the loader as a context manager or call `close()`: workers stop before owned
-snapshot files are deleted. Returned batches remain valid. A failed constructor or
-refresh cleans up its snapshots; a failed refresh leaves the loader closed.
+snapshot files are deleted. Returned batches remain valid. Refresh retains old
+snapshots until their queued batches are consumed. Failed construction or refresh
+cleans up all owned snapshots and leaves the loader closed. Workers and the
+transform stay alive across refreshes. New jobs use the refreshed index; queued
+jobs keep their original data. Pass `loader.refresh(stores=stores, weights=weights)`
+to replace the source mixture using the same workers.
 
 This removes worker amplification of source payloads, but does not bound the
 parent's datastore, sampled events, or arbitrary state captured by a transform.
@@ -783,9 +787,10 @@ Temporary snapshots use the system temporary directory (select its filesystem wi
 snapshots during replacement. `DatasetSnapshot(dataset, directory=...)` is also
 available for explicit ownership outside DataLoader.
 
-`loader.diagnostics` reports `snapshot_bytes` for currently owned files,
+`loader.diagnostics` reports `snapshot_bytes` for the current source snapshot
+(excluding old snapshots retained for pending jobs),
 `snapshot_seconds` for the latest source/index snapshot operation,
-`worker_payload_bytes` for the serialized worker callable and configuration, and
+`worker_payload_bytes` for the serialized worker callable, and
 `worker_startup_seconds` from process-pool construction through the last worker's
 deserialization. Startup is `None` until `next_batch()` consumes all readiness
 notifications. Payload bytes are not reconstructed Python memory. A large payload
@@ -1025,9 +1030,10 @@ All tokenizer entry points (`__call__`, `encode`, `stream`, `pack_rows`) also ac
 The finite `EpochDataLoader` pretokenizes samples and does not provide a per-batch
 schedule; use `DataLoader` for this curriculum.
 
-Already-prefetched batches keep their assigned settings. `loader.refresh()` discards
-those batches, refreshes the stores, and reevaluates the schedule from the next
-unconsumed batch index. Recreating a loader starts at index zero. With gradient
+Already-prefetched batches keep their assigned settings across `loader.refresh()`.
+It refreshes the stores without restarting workers or discarding queued batches.
+New jobs evaluate the current schedule; batch IDs continue from the next
+unused submission index. Recreating a loader starts at index zero. With gradient
 accumulation, each batch still counts as one training step; keep schedules indexed
 by batches. Keep inference
 compute counts fixed during cached episodes. Notebook 02 uses a constant count through the same context API and validates that

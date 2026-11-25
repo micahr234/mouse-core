@@ -173,7 +173,7 @@ def test_worker_mapping_survives_deserialized_views_and_closes_after_callable_cy
         return build
 
     class Jobs:
-        def __init__(self): self.jobs = iter([(3, 0, None), None])
+        def __init__(self): self.jobs = iter([(3, 0, None, None), None])
         def get(self): return next(self.jobs)
 
     class Signal:
@@ -331,3 +331,163 @@ def test_recycled_slots_keep_batch_data_and_context_aligned(in_order):
             assert seen == list(range(100))
     finally:
         pool.close()
+
+
+@pytest.mark.parametrize("in_order", [True, False])
+def test_refresh_keeps_inflight_jobs_worker_state_and_unique_ids(tmp_path, in_order):
+    # Block one job explicitly so refresh occurs while its worker is preparing it.
+    entered, release = tmp_path / "entered", tmp_path / "release"
+    counts = [0]
+    def build(index, *, snapshot):
+        counts[0] += 1
+        if index == 0:
+            entered.touch()
+            deadline = time.monotonic() + 45
+            while not release.exists():
+                if time.monotonic() > deadline:
+                    raise TimeoutError("test did not release the blocked job")
+                time.sleep(0.01)
+        time.sleep(0.002 * (index % 3))
+        inputs, data = _batch(index)
+        inputs['token_ids'] = torch.tensor([index, snapshot['generation'], os.getpid(), counts[0]])
+        return inputs, data
+
+    pool = ProcessBatches(build, workers=4, prefetch=6, in_order=in_order,
+                          snapshot={'generation': 0})
+    processes = list(pool._processes)
+    pids = [process.pid for process in processes]
+    expected = {index: 0 for index in pool._pending.values()}
+    seen, counters, names = set(), {}, set(pool._snapshot_payloads)
+    try:
+        deadline = time.monotonic() + 45
+        while not entered.exists():
+            pool._check_workers()
+            assert time.monotonic() < deadline, "worker never reached the blocked job"
+            time.sleep(0.01)
+        for generation in (1, 2, 3):
+            pool.update_snapshot({'generation': generation})
+            names.update(pool._snapshot_payloads)
+        # Intermediate refreshes without submissions have no readers to retain.
+        assert len(pool._snapshot_payloads) == 2
+        release.touch()
+        for iteration in range(60):
+            if iteration % 3 == 0:
+                generation += 1
+                pool.update_snapshot({'generation': generation})
+                names.update(pool._snapshot_payloads)
+            next_index = pool.next_submit_index
+            inputs, _ = pool.next_batch()
+            index, actual_generation, pid, count = inputs['token_ids'].tolist()
+            assert index not in seen
+            assert actual_generation == expected[index]
+            assert count == counters.get(pid, 0) + 1
+            counters[pid] = count
+            seen.add(index)
+            expected[next_index] = generation
+            assert len(pool._snapshot_payloads) <= 7
+            assert [process.pid for process in pool._processes] == pids
+        assert seen | set(pool._pending.values()) == set(range(pool.next_submit_index))
+        assert not seen & set(pool._pending.values())
+        if in_order:
+            assert seen == set(range(60))
+    finally:
+        pool.close()
+    for name in names:
+        with pytest.raises(FileNotFoundError):
+            SharedMemory(name=name)
+    assert all(process._closed for process in processes)
+
+
+def test_failed_snapshot_serialization_leaves_existing_jobs_intact():
+    def build(index, *, snapshot):
+        return _batch(index + snapshot)
+    pool = ProcessBatches(build, workers=1, prefetch=2, snapshot=10)
+    try:
+        pending, name = dict(pool._pending), pool._snapshot_name
+        with pytest.raises(TypeError):
+            pool.update_snapshot(threading.Lock())
+        assert pool._pending == pending and pool._snapshot_name == name
+        assert pool.next_batch()[0]['token_ids'].tolist() == [10] * 3
+    finally:
+        pool.close()
+
+
+def _fail_snapshot_load():
+    raise ValueError('snapshot cannot load')
+
+
+class _BadSnapshot:
+    def __reduce__(self):
+        return (_fail_snapshot_load, ())
+
+
+def test_worker_snapshot_error_closes_pool_and_releases_shared_memory():
+    def build(index, *, snapshot):
+        return _batch(index)
+    pool = ProcessBatches(build, workers=2, prefetch=3, snapshot={'valid': True})
+    names = set(pool._names) | set(pool._snapshot_payloads) | {pool._payload.name}
+    pool.update_snapshot(_BadSnapshot())
+    names.update(pool._snapshot_payloads)
+    try:
+        with pytest.raises(RuntimeError, match='snapshot cannot load'):
+            for _ in range(8):
+                pool.next_batch()
+        assert pool._closed
+    finally:
+        pool.close()
+    for name in names:
+        with pytest.raises(FileNotFoundError):
+            SharedMemory(name=name)
+
+
+
+def test_snapshot_views_are_released_before_switching_jobs(monkeypatch):
+    import warnings
+    payloads = [SharedMemory(create=True, size=16) for _ in range(2)]
+    output = SharedMemory(create=True, size=65536)
+    references = []
+    for generation, memory in enumerate(payloads):
+        memory.buf[:] = bytes([generation + 1]) * 16
+
+    class Snapshot:
+        def __init__(self, buffer):
+            self.values = np.frombuffer(buffer, dtype=np.uint8)
+            self.cycle = self
+
+    def loads(buffer):
+        value = Snapshot(buffer)
+        references.append(weakref.ref(value))
+        return value
+
+    def build(index, *, snapshot):
+        inputs, data = _batch(index)
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', UserWarning)
+            inputs['token_ids'] = torch.from_numpy(snapshot.values)
+        return inputs, data
+
+    class Jobs:
+        def __init__(self):
+            self.items = iter([(0, 0, None, payloads[0].name),
+                               (1, 0, None, payloads[1].name), None])
+        def get(self):
+            return next(self.items)
+
+    class Signal:
+        def set(self): pass
+        def release(self): pass
+
+    cache = process_batches._WorkerSnapshot()
+    monkeypatch.setattr(process_batches.cloudpickle, 'loads', loads)
+    try:
+        process_batches._prepare_batches(build, Jobs(), [output.name], [Signal()], Signal(), cache)
+        assert references[0]() is None
+        cache.close()
+        assert references[1]() is None
+        inputs, _ = process_batches._read_slot(output.name)
+        assert inputs['token_ids'].tolist() == [2] * 16
+    finally:
+        cache.close()
+        for memory in [*payloads, output]:
+            memory.close()
+            memory.unlink()

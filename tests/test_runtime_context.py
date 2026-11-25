@@ -232,7 +232,7 @@ def test_worker_count_does_not_change_scheduled_batches():
 
 
 @pytest.mark.parametrize("workers", [0, 4])
-def test_prefetched_context_is_fixed_and_refresh_resumes_at_next_unconsumed_index(
+def test_prefetched_context_is_preserved_across_refresh(
     workers,
 ):
     calls = []
@@ -257,8 +257,17 @@ def test_prefetched_context_is_fixed_and_refresh_resumes_at_next_unconsumed_inde
         assert_count(loader.next_batch(), 1 if workers else 11)
         old_calls = len(calls)
         loader.refresh()
-        assert_count(loader.next_batch(), 12)
-        assert calls[old_calls] == 2
+        assert len(calls) == old_calls
+        if workers:
+            assert_count(loader.next_batch(), 2)
+            assert_count(loader.next_batch(), 3)
+            assert_count(loader.next_batch(), 4)
+            assert_count(loader.next_batch(), 15)
+            assert_count(loader.next_batch(), 16)
+            assert calls == list(range(len(calls)))
+        else:
+            assert_count(loader.next_batch(), 12)
+            assert calls[old_calls] == 2
 
 
 @pytest.mark.parametrize("workers", [0, 4])

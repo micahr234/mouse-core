@@ -368,7 +368,7 @@ def test_dataloader_refresh_resumes_numbering_at_next_unseen_batch() -> None:
     )
     try:
         got = _signatures(loader, 3)
-        loader.refresh()  # drops prefetched 3.. and rebuilds them with the same indices
+        loader.refresh()  # preserves prefetched batches 3.. and their indices
         got += _signatures(loader, 5)
         assert got == expected
         assert loader._next_k == 8
@@ -425,7 +425,7 @@ def test_dataloader_refresh_picks_up_appended_rows() -> None:
     assert 4 in seen
 
 
-def test_dataloader_refresh_drains_prefetch_queue_and_updates_store_sizes() -> None:
+def test_dataloader_refresh_updates_store_sizes() -> None:
     store = measurement_store()
     for action in range(3):
         append_measurement(store, fields={"action": action, "reward": 0.0, "repeat_episode_done": 0, "episode_done": 0})
@@ -908,10 +908,15 @@ def test_unordered_refresh_does_not_reuse_submitted_batch_ids():
     loader = _loader(events_budget=6, num_workers=2, prefetch=4, seed=3, in_order=False)
     try:
         loader.next_batch()
-        first_unused = loader._pool.next_submit_index
+        pool = loader._pool
+        first_unused = pool.next_submit_index
+        pending = dict(pool._pending)
+        consumed = loader._next_k
         loader.refresh()
-        assert loader._next_k == first_unused
-        assert min(loader._pool._pending.values()) == first_unused
+        assert loader._pool is pool
+        assert loader._next_k == consumed
+        assert pool.next_submit_index == first_unused
+        assert pool._pending == pending
         loader.next_batch()
     finally:
         loader.close()

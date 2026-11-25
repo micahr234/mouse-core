@@ -111,6 +111,8 @@ def test_growing_replay_refresh_preserves_batches_and_releases_snapshots(workers
     actual, expected = loader(store, workers), loader(store, 0)
     paths, retained = [], []
     payloads = []
+    pool = actual._pool
+    pids = [worker.pid for worker in pool._processes]
     try:
         for generation in range(3):
             paths.extend(snapshot.path for snapshot in actual._snapshots if snapshot.path is not None)
@@ -130,10 +132,17 @@ def test_growing_replay_refresh_preserves_batches_and_releases_snapshots(workers
             actual.refresh()
             expected.refresh()
             assert tuple(actual._snapshots) == before
+            del before
+            assert actual._pool is pool
+            assert [worker.pid for worker in pool._processes] == pids
             if generation != 2:
                 store.append(data={'episode_index': 4 + generation, 'provider': 'sensor',
                                    'payload': {'value': 4 + generation, 'padding': 'y' * (2 * 1024 * 1024)}})
                 actual.refresh()
+                assert paths[-1].exists()
+                # Already submitted jobs still use the previous source snapshot.
+                for _ in range(actual._prefetch):
+                    equal_batches(actual.next_batch(), expected.next_batch())
                 expected.refresh()
                 assert all(not path.exists() for path in paths)
         assert max(payloads) < 128 * 1024
@@ -186,7 +195,7 @@ def test_worker_loader_accepts_empty_and_nonempty_stores():
         assert inputs['head_mask'].sum() == 2
 
 
-def test_refresh_startup_failure_closes_loader_and_removes_snapshots(monkeypatch):
+def test_refresh_update_failure_closes_loader_and_removes_snapshots(monkeypatch):
     import mouse_core.data.dataloader as module
     store = Datastore()
     store.from_dataset(ds=source())
@@ -201,10 +210,10 @@ def test_refresh_startup_failure_closes_loader_and_removes_snapshots(monkeypatch
         paths.append(snapshot.path)
         return snapshot
     def fail(*args, **kwargs):
-        raise RuntimeError('refresh worker startup failed')
+        raise RuntimeError('snapshot update failed')
     monkeypatch.setattr(module, 'DatasetSnapshot', capture)
-    monkeypatch.setattr(module, 'ProcessBatches', fail)
-    with pytest.raises(RuntimeError, match='refresh worker startup failed'):
+    monkeypatch.setattr(actual._pool, 'update_snapshot', fail)
+    with pytest.raises(RuntimeError, match='snapshot update failed'):
         actual.refresh()
     assert all(path is not None and not path.exists() for path in paths)
     with pytest.raises(RuntimeError, match='closed'):
@@ -220,7 +229,58 @@ def test_clearing_store_releases_previous_snapshot():
         paths = [snapshot.path for snapshot in actual._snapshots]
         store.clear()
         actual.refresh()
-        assert all(path is not None and not path.exists() for path in paths)
+        assert all(path is not None and path.exists() for path in paths)
         assert actual.diagnostics['snapshot_bytes'] == 0
         with pytest.raises(RuntimeError, match='no eligible samples'):
-            actual.next_batch()
+            for _ in range(actual._prefetch + 1):
+                actual.next_batch()
+    assert all(not path.exists() for path in paths)
+
+
+@pytest.mark.parametrize('workers', [0, 4])
+def test_refresh_replaces_mixture_without_restarting_or_reusing_batch_ids(workers):
+    first, second = Datastore(), Datastore()
+    first.from_dataset(ds=source())
+    second.from_dataset(ds=source().map(lambda row: {'payload': json.dumps({'value': 100})}))
+    with loader(first, workers) as actual:
+        pool = actual._pool
+        actual.next_batch()
+        paths = [snapshot.path for snapshot in actual._snapshots]
+        old_pending = dict(pool._pending) if pool else {}
+        actual.refresh(stores=second, weights=[1.0])
+        assert actual._pool is pool
+        if pool:
+            assert pool._pending == old_pending
+            assert all(path.exists() for path in paths)
+            for _ in old_pending:
+                assert (actual.next_batch()[0]['token_ids'] < 100).all()
+            assert all(not path.exists() for path in paths)
+        assert (actual.next_batch()[0]['token_ids'] == 100).all()
+        # Restore a two-source mixture using the same processes and batch stream.
+        actual.refresh(stores=[first, second], weights=[1.0, 1.0])
+        assert actual._pool is pool
+        for _ in range(2 if pool else 0):
+            assert (actual.next_batch()[0]['token_ids'] == 100).all()
+        values = set()
+        for _ in range(20):
+            values.update(actual.next_batch()[0]['token_ids'].tolist())
+        assert 100 in values and any(value < 100 for value in values)
+
+
+@pytest.mark.parametrize('replacement', [
+    {'stores': []}, {'weights': [1]}, {'stores': [], 'weights': []},
+    {'stores': ['bad'], 'weights': [1]}, {'weights': [0]},
+    {'weights': [float('nan')]}, {'weights': [float('inf')]}, {'weights': [1, 2]},
+])
+def test_invalid_source_replacement_leaves_loader_usable(replacement):
+    store = Datastore()
+    store.from_dataset(ds=source())
+    with loader(store, 0) as actual:
+        arguments = dict(replacement)
+        if 'stores' not in arguments and arguments.get('weights') != [1]:
+            arguments['stores'] = store
+        with pytest.raises((ValueError, TypeError)):
+            actual.refresh(**arguments)
+        assert actual.stores == [store]
+        assert not actual._closed
+        actual.next_batch()

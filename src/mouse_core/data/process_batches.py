@@ -44,40 +44,74 @@ def _arrays(batch):
     return metadata, arrays, descriptors, max(1, offset)
 
 
-def _prepare_batches(build, jobs, names, ready, completed):
+class _WorkerSnapshot:
+    """Map only the snapshot required by the worker's current job."""
+
+    def __init__(self):
+        self.name = self.memory = self.view = self.value = None
+
+    def get(self, name):
+        if name != self.name:
+            self.close()
+            self.memory = SharedMemory(name=name, track=False)
+            self.view = self.memory.buf.toreadonly()
+            self.value = cloudpickle.loads(self.view)
+            self.name = name
+        return self.value
+
+    def close(self):
+        self.value = None
+        gc.collect()
+        if self.view is not None:
+            self.view.release()
+            self.view = None
+        if self.memory is not None:
+            self.memory.close()
+            self.memory = None
+        self.name = None
+
+
+def _prepare_batches(build, jobs, names, ready, completed, snapshot):
     while True:
         job = jobs.get()
         if job is None:
             return
-        index, slot, context_payload = job
-        if context_payload is None:
-            batch = build(index)
-        else:
-            context = MappingProxyType(cloudpickle.loads(context_payload))
-            batch = build(index, context=context)
-        metadata, arrays, descriptors, required = _arrays(batch)
-        header = pickle.dumps((metadata, descriptors), protocol=pickle.HIGHEST_PROTOCOL)
-        base = (8 + len(header) + 63) // 64 * 64
-        memory = SharedMemory(name=names[slot], track=False)
-        try:
-            if base + required > memory.size:
-                # Only this worker owns the slot until ready is set. The parent
-                # has no open mapping while work is scheduled for this slot.
-                memory.unlink()
-                memory.close()
-                capacity = max(65536, 1 << (base + required - 1).bit_length())
-                memory = SharedMemory(name=names[slot], create=True, size=capacity, track=False)
-            assert memory.buf is not None
-            memory.buf[:8] = len(header).to_bytes(8, "little")
-            memory.buf[8:8 + len(header)] = header
-            for (_, _, array), (_, _, shape, dtype, offset) in zip(arrays, descriptors):
-                view = np.ndarray(shape, dtype=dtype, buffer=memory.buf, offset=base + offset)
-                np.copyto(view, array)
-                del view
-        finally:
-            memory.close()
+        index, slot, context_payload, snapshot_name = job
+        kwargs = {}
+        if context_payload is not None:
+            kwargs['context'] = MappingProxyType(cloudpickle.loads(context_payload))
+        if snapshot_name is not None:
+            kwargs['snapshot'] = snapshot.get(snapshot_name)
+        batch = build(index, **kwargs)
+        del kwargs
+        _write_slot(names[slot], batch)
+        del batch
         ready[slot].set()
         completed.release()
+
+
+def _write_slot(name, batch):
+    metadata, arrays, descriptors, required = _arrays(batch)
+    header = pickle.dumps((metadata, descriptors), protocol=pickle.HIGHEST_PROTOCOL)
+    base = (8 + len(header) + 63) // 64 * 64
+    memory = SharedMemory(name=name, track=False)
+    try:
+        if base + required > memory.size:
+            # Only this worker owns the slot until ready is set. The parent
+            # has no open mapping while work is scheduled for this slot.
+            memory.unlink()
+            memory.close()
+            capacity = max(65536, 1 << (base + required - 1).bit_length())
+            memory = SharedMemory(name=name, create=True, size=capacity, track=False)
+        assert memory.buf is not None
+        memory.buf[:8] = len(header).to_bytes(8, "little")
+        memory.buf[8:8 + len(header)] = header
+        for (_, _, array), (_, _, shape, dtype, offset) in zip(arrays, descriptors):
+            view = np.ndarray(shape, dtype=dtype, buffer=memory.buf, offset=base + offset)
+            np.copyto(view, array)
+            del view
+    finally:
+        memory.close()
 
 
 def _read_slot(name):
@@ -104,6 +138,7 @@ def _worker(connection, build_name, jobs, names, ready, completed):
     # Spawn never inherits the training process's CUDA context. This worker
     # executes CPU data preparation only; do not initialize CUDA here.
     payload = payload_view = build = None
+    snapshot = _WorkerSnapshot()
     try:
         torch.set_num_threads(1)
         payload = SharedMemory(name=build_name, track=False)
@@ -114,7 +149,7 @@ def _worker(connection, build_name, jobs, names, ready, completed):
         payload_view = payload.buf.toreadonly()
         build = cloudpickle.loads(payload_view)
         connection.send(("started", perf_counter()))
-        _prepare_batches(build, jobs, names, ready, completed)
+        _prepare_batches(build, jobs, names, ready, completed, snapshot)
     except EOFError:
         pass
     except BaseException:
@@ -126,6 +161,7 @@ def _worker(connection, build_name, jobs, names, ready, completed):
         # The batch-loop frame is gone before releasing the startup mapping.
         # Collect callable cycles as well, since they can own buffer views.
         build = None
+        snapshot.close()
         gc.collect()
         try:
             if payload_view is not None:
@@ -139,7 +175,8 @@ def _worker(connection, build_name, jobs, names, ready, completed):
 class ProcessBatches:
     """Spawned workers fill bounded slots, with optional ordered delivery."""
 
-    def __init__(self, build, *, workers, prefetch, start=0, context_for_batch=None, in_order=True):
+    def __init__(self, build, *, workers, prefetch, start=0, context_for_batch=None, in_order=True,
+                 snapshot=None, keep_alive=()):
         self._closed = False
         self._payload: SharedMemory | None = None
         self._jobs = None
@@ -149,6 +186,9 @@ class ProcessBatches:
         self._names: list[str] = []
         self._ready = []
         self._pending = {}
+        self._snapshot_name = None
+        self._snapshot_payloads = {}
+        self._slot_snapshots = {}
         self._in_order = in_order
         self._startup_started = perf_counter()
         self._startup_ready_at = self._startup_started
@@ -174,6 +214,8 @@ class ProcessBatches:
             assert self._payload.buf is not None
             self._payload.buf[:] = payload
             del payload
+            if snapshot is not None:
+                self.update_snapshot(snapshot, keep_alive=keep_alive)
             for _ in range(prefetch):
                 memory = SharedMemory(create=True, size=65536)
                 self._names.append(memory.name)
@@ -217,14 +259,45 @@ class ProcessBatches:
         """First unused batch ID, including jobs not yet consumed."""
         return self._next_submit
 
+    def update_snapshot(self, snapshot, *, keep_alive=()):
+        """Use this immutable snapshot for future jobs, retaining queued work.
+
+        The callable and worker processes stay unchanged. Keep parent-side
+        resource owners alive until every job using their snapshot is consumed.
+        Workers switch snapshots at job boundaries, never during preparation.
+        """
+        if self._closed:
+            raise RuntimeError("DataLoader is closed")
+        keep_alive = tuple(keep_alive)
+        payload = cloudpickle.dumps(snapshot)
+        memory = SharedMemory(create=True, size=len(payload))
+        try:
+            memory.buf[:] = payload
+        except BaseException:
+            memory.close()
+            memory.unlink()
+            raise
+        self._snapshot_payloads[memory.name] = (memory, snapshot, keep_alive)
+        self._snapshot_name = memory.name
+        self._release_snapshots()
+
+    def _release_snapshots(self):
+        needed = {*self._slot_snapshots.values(), self._snapshot_name}
+        for name in list(self._snapshot_payloads):
+            if name not in needed:
+                memory, _, _ = self._snapshot_payloads.pop(name)
+                memory.close()
+                memory.unlink()
+
     def _schedule(self, slot):
         index = self._next_submit
         self._ready[slot].clear()
         context_payload = None if self._context_for_batch is None else cloudpickle.dumps(
             dict(self._context_for_batch(index)))
         assert self._jobs is not None
-        self._jobs.put((index, slot, context_payload))
+        self._jobs.put((index, slot, context_payload, self._snapshot_name))
         self._pending[slot] = index
+        self._slot_snapshots[slot] = self._snapshot_name
         self._next_submit += 1
 
     def _check_workers(self):
@@ -262,6 +335,7 @@ class ProcessBatches:
             self._check_workers()
             batch = _read_slot(self._names[slot])
             self._schedule(slot)
+            self._release_snapshots()
             return batch
         except BaseException:
             self.close()
@@ -297,6 +371,9 @@ class ProcessBatches:
             self._payload.close()
             self._payload.unlink()
             self._payload = None
+        self._slot_snapshots.clear()
+        self._snapshot_name = None
+        self._release_snapshots()
         self._starting.clear()
 
     def __del__(self):

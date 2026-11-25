@@ -18,15 +18,16 @@ def _memory_mapped(table) -> bool:
 
 
 class DatasetSnapshot:
-    """Keep an immutable Dataset cheaply serializable for a worker generation.
+    """Keep an immutable Dataset cheaply serializable for worker jobs.
 
     Fully memory-mapped data and selection indices borrow their existing files.
     In-memory or mixed storage is written once, preserving selected row order,
     duplicates, sparse columns and dataset features. Only filenames and small
     metadata then travel to spawned workers, rather than the Arrow payload.
 
-    Keep this owner alive until all readers/workers stop. ``close()`` removes
-    only files owned by this snapshot; borrowed source files are never removed.
+    Keep this owner alive until all jobs using it finish and no reader needs to
+    reopen its files. Idle workers may retain mappings until their next job.
+    ``close()`` removes only owned files; borrowed source files are never removed.
     Returned *batches* own their arrays and can outlive the snapshot. A returned
     Dataset must not be reopened or serialized after its owner is closed.
     ``directory`` selects the parent for the owned temporary directory.

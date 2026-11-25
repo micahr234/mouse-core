@@ -7,7 +7,7 @@ The loader returns
 
 ``num_workers=0`` prepares synchronously. Positive worker counts use persistent
 spawned processes and bounded, reusable shared-memory result slots. Transforms
-(including notebook-local functions) are serialized once per worker generation.
+(including notebook-local functions) are serialized once at worker startup.
 In-memory source datasets are persisted to scoped, memory-mapped snapshots before
 spawning; unchanged sources reuse their files on refresh. Transforms should avoid
 capturing source stores or unbounded decoded caches. Returned arrays are owned by
@@ -15,8 +15,8 @@ the consumer and survive refresh/close.
 
 Batch k uses SeedSequence(seed, spawn_key=(k,)); each sampled segment is reseeded
 with k * (budget + 1) + attempt. In-order delivery preserves that stream across
-worker counts. Unordered delivery depends on worker timing. Refresh rebuilds
-store snapshots and discards pending work; unordered mode skips submitted IDs.
+worker counts. Unordered delivery depends on worker timing. Refresh updates
+source snapshots for future jobs while keeping workers and prefetched batches.
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ EventSequenceTransform = Callable[..., list[StepTokens]]
 
 @dataclass(frozen=True)
 class _SnapshotConfig:
-    """Immutable sampling snapshot sent once to each worker process."""
+    """Immutable sampling snapshot selected when each job is submitted."""
 
     datasets: tuple[Any, ...]
     ns: tuple[int, ...]
@@ -63,6 +63,10 @@ class _SnapshotConfig:
     sample_field: str | None
     runs: tuple[np.ndarray, ...]
     checks: tuple[SampleChecks, ...]
+
+
+def _fetch_snapshot_batch(index, *, snapshot, entropy, transform, context=None):
+    return _fetch_one_batch(snapshot, entropy, index, transform, context=context)
 
 
 class _ColumnView(Mapping[str, Any]):
@@ -472,8 +476,8 @@ class DataLoader:
         True returns batches in submission order, preserving the seeded stream
         across worker counts. False returns ready batches without waiting for
         slower earlier jobs; delivery order then depends on worker timing.
-        Unordered refresh discards pending IDs and resumes after all submitted
-        IDs, so no previously delivered ID is regenerated. Unused with no workers.
+        Refresh preserves queued jobs and their IDs in both modes. Unused with
+        no workers.
     context_for_batch :
         Optional ``fn(batch_index) -> mapping``, evaluated once in the parent
         process as each zero-based batch is scheduled. A snapshot travels with
@@ -481,8 +485,8 @@ class DataLoader:
         to forward it only to stages declaring ``*, context``. Treat context as
         read-only: the top-level mapping is immutable, nested values are owned
         by that batch. Keep it small; result tensors still use shared memory.
-        Prefetched jobs keep their scheduled context. ``refresh()`` drops them
-        and reevaluates contexts for the new jobs.
+        Prefetched jobs keep their scheduled context across ``refresh()``.
+        Only newly submitted jobs evaluate the current context schedule.
     seed :
         Entropy of the batch stream. Batch ``k`` is a pure function of
         ``(seed, k, snapshot, context)`` for any ``num_workers`` (see module
@@ -607,24 +611,43 @@ class DataLoader:
             self.close()
             raise
 
-    def refresh(self) -> None:
-        """Drop prefetched batches and re-snapshot all stores.
+    def refresh(
+        self, *, stores: Datastore | list[Datastore] | None = None,
+        weights: list[float] | None = None,
+    ) -> None:
+        """Refresh source indexes without restarting workers or dropping batches.
 
-        Numbering resumes at the next batch the consumer has not received,
-        so batches after the refresh are rebuilt against the new snapshot
-        with their original indices. With in_order=False, numbering resumes
-        after all submitted IDs instead, discarding unfinished jobs.
-        Unchanged source snapshots reuse their files;
-        changed in-memory sources are persisted again. A failed refresh closes
-        the loader and releases its snapshots.
+        Already submitted jobs keep their source snapshot and sampled context.
+        Future jobs use the new snapshot; numbering continues in both delivery
+        modes. Unchanged sources reuse their indexes and files. Old snapshots
+        remain alive until their pending batches are consumed. Invalid replacement
+        arguments leave the loader unchanged; a failure rebuilding or publishing
+        the snapshot closes the loader and releases its snapshots.
+
+        To replace the source mixture, provide both ``stores`` and positive
+        ``weights``. Omit both to retain the mixture. Jobs already submitted
+        keep their original source mixture as well as their original context.
+        Call refresh and next_batch from the same consumer process, serially.
         """
         if self._closed:
             raise RuntimeError("DataLoader is closed")
-        self._stop_workers()
+        if (stores is None) != (weights is None):
+            raise ValueError("Provide both stores and weights to replace the source mixture")
+        if stores is not None:
+            from mouse_core.data.datastore import Datastore as _DS
+            stores = [stores] if isinstance(stores, _DS) else list(stores)
+            if not stores or not all(isinstance(store, _DS) for store in stores):
+                raise TypeError("stores must contain Datastore instances")
+            new_weights = np.asarray(weights, dtype=float)
+            if new_weights.shape != (len(stores),):
+                raise ValueError("weights must match the number of stores")
+            if not np.isfinite(new_weights).all() or (new_weights <= 0).any():
+                raise ValueError("weights must be finite and positive")
+            self.stores, self._weights = stores, new_weights.copy()
         try:
             self._resnapshot_stores()
-            if self._num_workers > 0:
-                self._start_workers()
+            if self._pool is not None:
+                self._pool.update_snapshot(self._snapshot_config(), keep_alive=self._snapshots)
         except BaseException:
             self.close()
             raise
@@ -703,18 +726,14 @@ class DataLoader:
         )
 
     def _start_workers(self) -> None:
-        build = partial(_fetch_one_batch, self._snapshot_config(), self._entropy,
-                        transform=self.transform)
+        build = partial(_fetch_snapshot_batch, entropy=self._entropy, transform=self.transform)
         self._pool = ProcessBatches(build, workers=self._num_workers,
                                     prefetch=self._prefetch, start=self._next_k,
-                                    context_for_batch=self.context_for_batch, in_order=self._in_order)
+                                    context_for_batch=self.context_for_batch, in_order=self._in_order,
+                                    snapshot=self._snapshot_config(), keep_alive=self._snapshots)
 
     def _stop_workers(self) -> None:
         if self._pool is not None:
-            if not self._in_order:
-                # Delivered IDs need not be contiguous. Never reuse an already
-                # submitted ID when discarding pending work during refresh.
-                self._next_k = self._pool.next_submit_index
             self._last_worker_diagnostics = {
                 "worker_payload_bytes": self._pool.worker_payload_bytes,
                 "worker_startup_seconds": self._pool.worker_startup_seconds,
@@ -746,8 +765,11 @@ class DataLoader:
             raise
         previous, self._snapshots = self._snapshots, snapshots
         self._datasets = datasets
+        # With workers, the pool owns each old snapshot until all jobs that can
+        # reopen its files have been consumed. Unchanged owners may be shared
+        # by multiple generations, so do not explicitly close them here.
         for snapshot in previous:
-            if snapshot not in snapshots:
+            if snapshot not in snapshots and self._pool is None:
                 snapshot.close()
         self._snapshot_seconds = perf_counter() - started
         self._runs = tuple(item[1] for item in indexes)
