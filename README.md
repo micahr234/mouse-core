@@ -363,13 +363,13 @@ uses vocabulary generation with a REINFORCE reward.
 [Example 25 — Reasoning DQN](examples/25_train_reasoning_dqn.ipynb) exposes one
 reasoning model with independent loss and recurrence choices:
 
-| `REASONING_LOSS` | Supervision | Stopping | Head |
+| `REASONING_LOSS_MODE` | Supervision | Stopping | Head |
 | --- | --- | --- | --- |
-| `all_tokens` | Bellman loss at each generated reasoning state | Binary EXECUTE/THINK, then environment action, within depth limits | Separate A-action and 2-choice heads |
-| `last_token` | TD loss only at the final reasoning state | Fixed budget; minimum must equal maximum | A environment actions |
+| `transition_bellman` | Bellman loss at each generated reasoning state | Binary EXECUTE/THINK, then environment action, within depth limits | Separate A-action and 2-choice heads |
+| `final_action` | TD loss only at the final reasoning state | Fixed budget; minimum must equal maximum | A environment actions |
 
-`RESIDUAL_CONNECTIONS` adds the input latent to the raw transformer output.
-`WRAP_LATENT` is `"none"`, `"step"`, or `"sequence"`. `"step"` feeds the previous
+`LATENT_RESIDUAL_ENABLED` adds the input latent to the raw transformer output.
+`LATENT_FEEDBACK_SCOPE` is `"none"`, `"decision"`, or `"sequence"`. `"decision"` feeds the previous
 reasoning state through input RMSNorm and the shared gated input MLP within each
 environment decision. `"sequence"` also carries the final state into the next
 decision, across intervening context tokens; only the first reasoning position of
@@ -430,8 +430,8 @@ networks then train on the same aligned generated history with their own live
 input embeddings.
 
 `SequentialReasoner(rms_norm_eps=backbone.rms_norm_eps, hidden_dim=...,
-input_mlp_intermediate_dim=backbone.mlp_intermediate_dim, input_mlp_output_scale=..., min_steps=...,
-max_steps=..., residual_connections=..., wrap_latent=..., adaptive_depth=...)`
+input_mlp_intermediate_dim=backbone.mlp_intermediate_dim, input_mlp_output_scale=..., min_depth=...,
+max_depth=..., latent_residual_enabled=..., latent_feedback_scope=..., adaptive_depth=...)`
 requires both mechanism flags explicitly. A scope starts with `e = E[token]`,
 bypassing the input block. Each continuation uses
 `e = s * input_projection(norm(stop_gradient(previous_state)))`, with no added
@@ -443,12 +443,12 @@ Input RMSNorm (trainable scale starts at `0.02`) precedes the Qwen3-style gated
 MLP with no residual bypass. Causal attention and the backbone's ordinary
 internal residual connections remain in every combination.
 
-With `adaptive_depth=True`, `action_values(states)` returns `ThinkExecuteValues`:
-`actions` holds A environment values and `decisions` holds two values ordered
-EXECUTE, THINK. `ThinkExecuteHead(action_head=..., reasoning_control_head=...)` composes independent
+With `adaptive_depth=True`, `action_values(states)` returns `ReasoningActionValues`:
+`action_values` holds A environment values and `control_values` holds two values ordered
+EXECUTE, THINK. `ReasoningActionHeads(action_head=..., reasoning_control_head=...)` composes independent
 environment-action and reasoning-control heads on the same state. Generation chooses the binary decision first, then
 an environment action on EXECUTE. The binary softmax is independent of action count.
-Before `min_steps`, only THINK is available; at `max_steps`, only EXECUTE is available.
+Before `min_depth`, only THINK is available; at `max_depth`, only EXECUTE is available.
 The required minimum is between 1 and the maximum. Optional
 `select_actions(values, decision_indices, depths)` receives the masked structured
 values and returns an environment index in [0, A), or A for THINK.
@@ -516,10 +516,10 @@ Capacity counts complete episodes, regardless of their token lengths. New episod
 append to the bank and evict the oldest episodes when the episode limit is exceeded. `memory_bytes()` reports stored tensor payload size.
 
 For a generation-free startup, `start_only_reasoning_episodes(inputs, objective_data,
-hidden_dim=reasoner.hidden_dim, max_steps=reasoner.max_steps,
+hidden_dim=reasoner.hidden_dim, max_depth=reasoner.max_depth,
 generated_step=0)` prepares sparse CPU records to append with `dataset.append`.
 Each decision stores zero feedback; training uses the live token embedding directly; there are no generated feedback
-positions. With `max_steps=1`, this is also the normal replay representation:
+positions. With `max_depth=1`, this is also the normal replay representation:
 collection needs no model forward. Full-episode inference evaluates all starts in
 one packed causal forward; cached inference consumes the start and adds no final
 feedback token. A larger maximum still needs generation to decide whether to THINK. Training computes the first update and supervises the recorded action.
@@ -536,11 +536,11 @@ and sampling are synchronous and intended for RAM, without background workers.
 `dataset.clear()` releases the bank. `split_reasoning_episodes` and
 `pack_reasoning_episodes` also expose the packing operations independently.
 
-`value_reasoning_loss` accepts online and target `ThinkExecuteValues` with action
+`value_reasoning_loss` accepts online and target `ReasoningActionValues` with action
 shape [decisions, depth cap, A] and binary shape [decisions, depth cap, 2].
 It trains three Bellman edges:
 
-- THINK: `reasoning_reward + gamma_think * max legal B_target(next reasoning state)`.
+- THINK: `think_reward + gamma_think * max legal B_target(next reasoning state)`.
 - EXECUTE: `max_a Q_target(current reasoning state, a)`, without reward or discount.
 - Recorded environment action: the caller's environment target,
   `reward + gamma * max legal B_target(next observation's first reasoning state)`.
@@ -559,7 +559,7 @@ When residual connections are enabled, the residual sum propagates this final
 loss to every accumulated transformer update. Without them, training follows the
 ordinary causal transformer computation. The fixed budget is not a learned choice.
 In both objectives the first reasoning step is free, terminal discounts govern environment bootstrapping, and reported rewards
-exclude internal reasoning rewards. `reasoning_reward` may be positive or negative;
+exclude internal reasoning rewards. `think_reward` may be positive or negative;
 it applies only to additional thinking steps after the first.
 
 `mouse_core.models.generate` is the shared inference scheduler used by

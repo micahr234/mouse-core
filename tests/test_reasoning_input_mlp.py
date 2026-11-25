@@ -9,8 +9,8 @@ from mouse_core.models import SequentialReasoner
 
 def make_reasoner(**overrides):
     settings = dict(hidden_dim=8, input_mlp_intermediate_dim=24, input_mlp_output_scale=100.,
-                    min_steps=1, max_steps=3, rms_norm_eps=1e-6,
-                    residual_connections=True, wrap_latent="sequence", adaptive_depth=True)
+                    min_depth=1, max_depth=3, rms_norm_eps=1e-6,
+                    latent_residual_enabled=True, latent_feedback_scope="sequence", adaptive_depth=True)
     return SequentialReasoner(**(settings | overrides))
 
 
@@ -55,8 +55,8 @@ def test_invalid_intermediate_width(width):
 
 def test_required_mlp_settings():
     with pytest.raises(TypeError, match='input_mlp_intermediate_dim.*input_mlp_output_scale'):
-        SequentialReasoner(hidden_dim=8, min_steps=1, max_steps=1, rms_norm_eps=1e-6,
-                           residual_connections=False, wrap_latent="none", adaptive_depth=True)
+        SequentialReasoner(hidden_dim=8, min_depth=1, max_depth=1, rms_norm_eps=1e-6,
+                           latent_residual_enabled=False, latent_feedback_scope="none", adaptive_depth=True)
 
 
 def test_zero_feedback_has_no_embedding_offset():

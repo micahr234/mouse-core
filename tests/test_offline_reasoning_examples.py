@@ -16,11 +16,11 @@ from tests.test_autoregressive_reasoning import local_checkpoint
 EXAMPLES = Path(__file__).parents[1] / 'examples'
 
 
-@pytest.mark.parametrize('kind,filename,reasoning_loss,residual', [
+@pytest.mark.parametrize('kind,filename,reasoning_loss_mode,residual', [
     ('sequential', '25_train_reasoning_dqn.ipynb', loss, residual)
-    for loss in ('all_tokens', 'last_token') for residual in (False, True)
+    for loss in ('transition_bellman', 'final_action') for residual in (False, True)
 ] + [('autoregressive', '23_train_autoregressive_reasoning_dqn.ipynb', None, None)])
-def test_offline_checkpoint_loads_and_evaluates_only_in_inference_notebook(tmp_path, monkeypatch, kind, filename, reasoning_loss, residual):
+def test_offline_checkpoint_loads_and_evaluates_only_in_inference_notebook(tmp_path, monkeypatch, kind, filename, reasoning_loss_mode, residual):
     source, output = tmp_path / 'base', tmp_path / 'saved'
     uploads = capture_upload(monkeypatch, output)
     local_checkpoint(source, newline=kind == "sequential")
@@ -44,8 +44,8 @@ def test_offline_checkpoint_loads_and_evaluates_only_in_inference_notebook(tmp_p
             exec(compile(code, filename, 'exec'), namespace)
             if index == 1:
                 namespace.update(PRETRAINED=str(source), load_stores_from_hub=lambda **_: recorded_stores(),
-                    SAMPLE_BUDGET=2, NUM_WORKERS=0, MAX_EPISODE_STEPS=2, MAX_STEPS_PER_EPISODE=2, REPEAT_COUNT=2, NUM_CYCLES=0, MAX_REASONING_STEPS=4, MIN_REASONING_STEPS=4 if reasoning_loss == "last_token" else 3,
-                    REASONING_LOSS=reasoning_loss, RESIDUAL_CONNECTIONS=residual, WRAP_LATENT="step" if residual else "none",
+                    SAMPLE_BUDGET=2, NUM_WORKERS=0, MAX_EPISODE_STEPS=2, MAX_STEPS_PER_EPISODE=2, REPEAT_COUNT=2, NUM_CYCLES=0, MAX_REASONING_DEPTH=4, MIN_REASONING_DEPTH=4 if reasoning_loss_mode == "final_action" else 3,
+                    REASONING_LOSS_MODE=reasoning_loss_mode, LATENT_RESIDUAL_ENABLED=residual, LATENT_FEEDBACK_SCOPE="decision" if residual else "none",
                     GENERATION_START_TOKEN='word2', MAX_NEW_TOKENS=64, MAX_ACTIVE_REQUESTS=2)
     assert len(uploads) == 1
     assert 'pytorch_model.bin' in uploads[0]['files']
@@ -80,12 +80,12 @@ def test_offline_checkpoint_loads_and_evaluates_only_in_inference_notebook(tmp_p
     else:
         _, spec, backend, settings = loaded
     if kind == 'sequential':
-        assert settings['residual_connections'] is namespace['online'].reasoner.residual_connections
-        assert settings['wrap_latent'] == namespace['online'].reasoner.wrap_latent
-        assert settings['min_steps'] == namespace['online'].reasoner.min_steps
-        assert settings['reasoning_loss'] == reasoning_loss
-        assert policy.reasoning_loss == reasoning_loss
-        assert policy.reasoner.adaptive_depth is (reasoning_loss == 'all_tokens')
+        assert settings['latent_residual_enabled'] is namespace['online'].reasoner.latent_residual_enabled
+        assert settings['latent_feedback_scope'] == namespace['online'].reasoner.latent_feedback_scope
+        assert settings['min_depth'] == namespace['online'].reasoner.min_depth
+        assert settings['reasoning_loss_mode'] == reasoning_loss_mode
+        assert policy.reasoning_loss_mode == reasoning_loss_mode
+        assert policy.reasoner.adaptive_depth is (reasoning_loss_mode == 'transition_bellman')
     events = recorded_stores(episodes=1)[0].to_dataset()
     original_steps = (namespace['tokenizer'].encode(events) if kind == 'sequential'
                       else namespace['train_transform'](events))

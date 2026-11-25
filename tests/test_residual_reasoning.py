@@ -16,7 +16,7 @@ import pytest
 import torch
 from tests._reasoning_input_reference import input_reference
 from torch import nn
-from mouse_core.models import ThinkExecuteValues, ThinkExecuteHead
+from mouse_core.models import ReasoningActionValues, ReasoningActionHeads
 
 from mouse_core.data import (
     Tokenizer, TokenizerModalitySpec, TokenCache, load_tokenizer, make_token_batch,
@@ -75,19 +75,19 @@ class CausalBackbone(BaseBackbone):
         return torch.cat(rows)
 
 
-def model(*, real=False, max_steps=3):
+def model(*, real=False, max_depth=3):
     torch.manual_seed(17)
     embedding = MultiEmbedding(embeddings={'text': Embedding(vocab_size=16, hidden_dim=8), 'reasoning': Embedding(vocab_size=1, hidden_dim=8)})
     backbone = (Backbone(architecture='qwen3', hidden_dim=8, num_layers=1, num_heads=2,
                          head_dim=4, max_position_embeddings=128, dtype=torch.float32)
                 if real else CausalBackbone())
-    value_head = ThinkExecuteHead(action_head=nn.Linear(8, 4), reasoning_control_head=nn.Linear(8, 2))
+    value_head = ReasoningActionHeads(action_head=nn.Linear(8, 4), reasoning_control_head=nn.Linear(8, 2))
     with torch.no_grad():
         value_head.reasoning_control_head.weight[1].zero_()
         value_head.reasoning_control_head.bias[1] = 100.
     result = example_module().ReasoningDqn(input_mlp_output_scale=100.,
-        embedding=embedding, backbone=backbone, value_head=value_head, min_steps=1, max_steps=max_steps,
-        residual_connections=True, wrap_latent="step", reasoning_loss="all_tokens",
+        embedding=embedding, backbone=backbone, value_head=value_head, min_depth=1, max_depth=max_depth,
+        latent_residual_enabled=True, latent_feedback_scope="decision", reasoning_loss_mode="transition_bellman",
     ).to(torch.get_default_device())
     return result
 
@@ -116,7 +116,7 @@ def test_real_transformer_rollout_replay_parity_and_request_batches(backend):
     trace = generate(online, tokens, backend)
     torch.testing.assert_close(trace.states, expected.states, atol=3e-5, rtol=3e-5)
     actual = online(trace)["q"]
-    torch.testing.assert_close(actual, online.value_head(trace.states[:, -1]).actions, atol=3e-5, rtol=3e-5)
+    torch.testing.assert_close(actual, online.value_head(trace.states[:, -1]).action_values, atol=3e-5, rtol=3e-5)
     assert trace.states.shape == (4, 4, 8) and not trace.states.requires_grad
     assert online.training and online.backbone.training and online.reasoner.training
     assert all(p.grad is None for p in online.parameters())
@@ -147,7 +147,7 @@ def test_single_replay_gradient_matches_explicit_detached_recurrence():
     # Artificial requires_grad makes accidental feedback through sampled states observable.
     states = trace.tokens["latent_values"].clone().requires_grad_()
     trace.tokens["latent_values"] = states
-    actual = online(trace)["q_steps"].actions[:, -1]
+    actual = online(trace)["q_steps"].action_values[:, -1]
     loss = actual.square().sum()
     loss.backward()
     hook.remove()
@@ -173,7 +173,7 @@ def test_single_replay_gradient_matches_explicit_detached_recurrence():
             row = torch.cat((context, torch.stack(inputs)))
             hidden = reference.backbone(row, sequence_ids=torch.zeros(len(row), dtype=torch.long))
             state = state + hidden[-1].float()
-        reference_values.append(reference.value_head(state).actions)
+        reference_values.append(reference.value_head(state).action_values)
         offset += length
     expected = torch.stack(reference_values)
     expected.square().sum().backward()
@@ -193,7 +193,7 @@ def test_real_transformer_backward_reaches_all_residual_updates():
     online = model(real=True)
     tokens = batch()
     trace = generate(online, tokens, 'continuous')
-    q = online(trace)["q_steps"].actions[:, -1]
+    q = online(trace)["q_steps"].action_values[:, -1]
     q.square().sum().backward()
     assert online.reasoner.norm.weight.grad.abs().sum() > 0
     assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in online.backbone.parameters())
@@ -284,10 +284,10 @@ def test_passive_batch_skips_generation_and_replay():
     assert trace.states.shape == (0, 4, 8) and not calls
 
 
-@pytest.mark.parametrize('max_steps', [0, -1, True, 1.5])
-def test_invalid_reasoning_budget(max_steps):
+@pytest.mark.parametrize('max_depth', [0, -1, True, 1.5])
+def test_invalid_reasoning_budget(max_depth):
     with pytest.raises(ValueError, match='positive integer'):
-        SequentialReasoner(input_mlp_intermediate_dim=24, input_mlp_output_scale=100., min_steps=1, hidden_dim=8, max_steps=max_steps, residual_connections=True, wrap_latent="step", adaptive_depth=True, rms_norm_eps=1e-6)
+        SequentialReasoner(input_mlp_intermediate_dim=24, input_mlp_output_scale=100., min_depth=1, hidden_dim=8, max_depth=max_depth, latent_residual_enabled=True, latent_feedback_scope="decision", adaptive_depth=True, rms_norm_eps=1e-6)
 
 
 class TextBackend:
@@ -367,11 +367,11 @@ def test_notebook_dqn_update_replays_online_trajectory_through_both_models(tmp_p
                             discount=boundary_discount(gamma_step=.9, gamma_terminated=0., gamma_truncated=0.))
     trace = online.reasoner.generate(tokens, embedding=online.embedding, backbone=online.backbone, action_values=online.value_head,
         backend='uncached', max_active_requests=2)
-    assert (trace.lengths == online.reasoner.max_steps).all()
+    assert (trace.lengths == online.reasoner.max_depth).all()
     with torch.no_grad():
         target_states = target.reasoner(trace,
             embedding=target.embedding, backbone=target.backbone)
-        expected_target = target.value_head(target_states[:, 0]).decisions.amax(-1, keepdim=True).expand(-1, 4)
+        expected_target = target.value_head(target_states[:, 0]).control_values.amax(-1, keepdim=True).expand(-1, 4)
     def forbidden_generation(*args, **kwargs):
         raise AssertionError('The target must replay the online trajectory, never generate')
     monkeypatch.setattr(target.reasoner, 'generate', forbidden_generation)
@@ -396,7 +396,7 @@ def test_notebook_dqn_update_replays_online_trajectory_through_both_models(tmp_p
         objective=check_objective, loader=loader, device=torch.device('cpu'),
         MAX_ACTIVE_REQUESTS=2,
         POLYAK_TAU_EMBEDDING=.1, POLYAK_TAU_BACKBONE_LORA=.2, POLYAK_TAU_REASONING_INPUT=.2, POLYAK_TAU_VALUE=.3,
-        MAX_GRAD_NORM=1., REASONING_REWARD=-.01, GAMMA_THINK=1.)
+        MAX_GRAD_NORM=1., THINK_REWARD=-.01, GAMMA_THINK=1.)
     configure_notebook_optimizer(example, NOTEBOOK)
     try:
         loss, metrics, next_step = example.run_train(training_step=0, num_steps=1)
@@ -456,7 +456,7 @@ def test_complete_residual_notebook_trains_and_uploads_checkpoint(tmp_path, monk
 
 @torch.no_grad()
 def test_residual_retains_adaptive_reasoning_in_episode_cache_until_reset(monkeypatch):
-    online = model(real=True, max_steps=3).eval()
+    online = model(real=True, max_depth=3).eval()
     session = online.backbone.decode_session(2, max_batch_tokens=8, cache_capacity_tokens=1024)
     histories = [[], []]
     processed = []
@@ -512,13 +512,13 @@ def test_residual_retains_adaptive_reasoning_in_episode_cache_until_reset(monkey
 @pytest.mark.parametrize('backend', ['uncached', 'continuous'])
 @torch.no_grad()
 def test_think_wins_until_cap_and_final_values_match_replay(backend):
-    online = model(real=True, max_steps=5)
+    online = model(real=True, max_depth=5)
     trace = generate(online, batch(), backend)
     assert trace.lengths.tolist() == [5, 5, 5]
     assert not hasattr(online.reasoner, 'stop_head')
     replay = online(trace)
     torch.testing.assert_close(replay['states'], trace.states[:, 1:], atol=3e-5, rtol=3e-5)
-    torch.testing.assert_close(replay['q'], online.value_head(trace.states[:, -1]).actions,
+    torch.testing.assert_close(replay['q'], online.value_head(trace.states[:, -1]).action_values,
                                atol=3e-5, rtol=3e-5)
     assert trace.tokens['num_sequences'] == 3
 
@@ -526,7 +526,7 @@ def test_think_wins_until_cap_and_final_values_match_replay(backend):
 @pytest.mark.parametrize('backend', ['uncached', 'continuous'])
 @torch.no_grad()
 def test_pending_episode_uses_finished_slot_while_longer_episode_continues(monkeypatch, backend):
-    online = model(real=True, max_steps=3)
+    online = model(real=True, max_depth=3)
     tokens = batch(((2, 9, 3, 9), (4, 9), (1, 9)))
     tokens['head_mask'] = tokens['token_ids'] == 9
     tokens['step_readout_mask'] = tokens['head_mask'].clone()
@@ -551,7 +551,7 @@ def test_pending_episode_uses_finished_slot_while_longer_episode_continues(monke
 
 
 def test_multiple_actions_retain_every_depth_with_detached_feedback():
-    online = model(max_steps=4).eval()
+    online = model(max_depth=4).eval()
     tokens = batch(((2, 9, 3, 9), (4, 9, 5, 9)))
     tokens['head_mask'] = tokens['token_ids'] == 9
     tokens['step_readout_mask'] = tokens['head_mask'].clone()
@@ -587,7 +587,7 @@ def test_multiple_actions_retain_every_depth_with_detached_feedback():
                     updates.append(z[0])
                 reference.append(torch.stack(updates))
         torch.testing.assert_close(states, torch.stack(reference))
-    online.value_head(states).actions.square().sum().backward()
+    online.value_head(states).action_values.square().sum().backward()
     assert sampled.grad is None
     assert online.embedding.embeddings['text'].embed_tokens.weight.grad[[2, 3, 4, 5]].abs().sum() > 0
 
@@ -595,7 +595,7 @@ def test_multiple_actions_retain_every_depth_with_detached_feedback():
 @pytest.mark.parametrize('backend', ['uncached', 'continuous'])
 @torch.no_grad()
 def test_adaptive_depths_retain_only_executed_states_and_replay_exactly(backend):
-    online = model(real=True, max_steps=4).eval()
+    online = model(real=True, max_depth=4).eval()
     tokens = batch(((2, 9, 3, 9), (4, 9), (1, 9)))
     tokens['head_mask'] = tokens['token_ids'] == 9
     tokens['step_readout_mask'] = tokens['head_mask'].clone()
@@ -616,13 +616,13 @@ def test_adaptive_depths_retain_only_executed_states_and_replay_exactly(backend)
 @pytest.mark.parametrize('backend', ['uncached', 'continuous'])
 @torch.no_grad()
 def test_greedy_think_or_environment_action_stops_without_looking_ahead(backend):
-    online = model(real=True, max_steps=4).eval()
+    online = model(real=True, max_depth=4).eval()
     seen = []
     def values(states):
         seen.append(states.clone())
         actions = [0., 1., 2., 3.] if len(seen) == 1 else [0., 5., 2., 3.]
         gate = [3., 4.] if len(seen) == 1 else [5., 4.]
-        return ThinkExecuteValues(states.new_tensor(actions).expand(len(states), -1),
+        return ReasoningActionValues(states.new_tensor(actions).expand(len(states), -1),
                               states.new_tensor(gate).expand(len(states), -1))
     trace = online.reasoner.generate(batch(), embedding=online.embedding, backbone=online.backbone,
         action_values=values, backend=backend, max_active_requests=3)
@@ -645,7 +645,7 @@ def test_explicit_positions_and_target_weights_replay_the_same_latent_history(ma
                 rows.append(positions * self.position_gain + row.cumsum(0) * self.context_gain)
             return torch.cat(rows)
 
-    online = model(max_steps=3).eval()
+    online = model(max_depth=3).eval()
     online.backbone = PositionBackbone()
     tokens = batch(((2, 9, 3, 4, 9, 5), (6, 7), (8, 9)))
     tokens['head_mask'] = tokens['token_ids'] == 9
@@ -716,16 +716,16 @@ def test_explicit_positions_and_target_weights_replay_the_same_latent_history(ma
         actual = network(trace)
         expected_states = torch.stack(expected)
         torch.testing.assert_close(actual['states'], expected_states)
-        torch.testing.assert_close(actual['q_steps'].actions, network.value_head(expected_states).actions)
-        torch.testing.assert_close(actual['q_steps'].decisions, network.value_head(expected_states).decisions)
-        torch.testing.assert_close(actual['q'], network.value_head(expected_states).actions[torch.arange(3), lengths - 1])
+        torch.testing.assert_close(actual['q_steps'].action_values, network.value_head(expected_states).action_values)
+        torch.testing.assert_close(actual['q_steps'].control_values, network.value_head(expected_states).control_values)
+        torch.testing.assert_close(actual['q'], network.value_head(expected_states).action_values[torch.arange(3), lengths - 1])
     torch.testing.assert_close(online(trace)['states'], trace.states[:, 1:])
     assert not torch.allclose(target(trace)['states'], trace.states[:, 1:])
 
 
 @torch.no_grad()
 def test_sparse_cached_rows_preserve_passive_context_and_reset_positions():
-    online = model(real=True, max_steps=3).eval()
+    online = model(real=True, max_depth=3).eval()
     session = online.backbone.decode_session(5, max_batch_tokens=3, cache_capacity_tokens=1024)
     histories = [[] for _ in range(5)]
 

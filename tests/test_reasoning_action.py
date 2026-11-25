@@ -1,14 +1,14 @@
 """Independent two-stage probabilities and Bellman targets, including gradients."""
 import pytest
 import torch
-from mouse_core.models import ThinkExecuteValues, ThinkExecuteHead
+from mouse_core.models import ReasoningActionValues, ReasoningActionHeads
 from mouse_core.objectives import value_reasoning_loss
 
 
 @pytest.mark.parametrize('num_actions', [1, 4, 100, 1000])
 @pytest.mark.parametrize('temperature', [0., .5, 1., 2.])
 def test_binary_think_probability_does_not_dilute_with_action_count(num_actions, temperature):
-    values = ThinkExecuteValues(torch.linspace(-100, 100, num_actions)[None], torch.tensor([[1., 2.]]))
+    values = ReasoningActionValues(torch.linspace(-100, 100, num_actions)[None], torch.tensor([[1., 2.]]))
     probs = values.policy_logits(torch.tensor([temperature])).exp()
     expected = 1. if temperature == 0 else torch.sigmoid(torch.tensor(1. / temperature)).item()
     assert probs[0, -1].item() == pytest.approx(expected)
@@ -17,14 +17,14 @@ def test_binary_think_probability_does_not_dilute_with_action_count(num_actions,
 
 
 def test_masks_apply_to_binary_gate_and_do_not_permute_environment_actions():
-    values = ThinkExecuteValues(torch.tensor([[3., 7., 2.]] * 4), torch.tensor([[5., 10.]] * 4))
-    masked = values.masked(torch.arange(1, 5), min_steps=2, max_steps=4)
+    values = ReasoningActionValues(torch.tensor([[3., 7., 2.]] * 4), torch.tensor([[5., 10.]] * 4))
+    masked = values.masked(torch.arange(1, 5), min_depth=2, max_depth=4)
     assert masked.greedy().tolist() == [3, 3, 3, 1]
-    probs = masked.policy_logits(torch.ones(4), allow_policy_think=False).exp()
+    probs = masked.policy_logits(torch.ones(4), policy_think_enabled=False).exp()
     assert probs[0, -1] == 1
     assert probs[1:, -1].count_nonzero() == 0
-    assert torch.isfinite(values.decisions).all()
-    swapped = ThinkExecuteValues(values.actions[:, [2, 0, 1]], values.decisions)
+    assert torch.isfinite(values.control_values).all()
+    swapped = ReasoningActionValues(values.action_values[:, [2, 0, 1]], values.control_values)
     torch.testing.assert_close(values.policy_logits(torch.ones(4))[:, -1], swapped.policy_logits(torch.ones(4))[:, -1])
 
 
@@ -43,10 +43,10 @@ def test_three_bellman_edges_and_exact_gradient(gamma, minimum, cap, lengths, re
     weights = torch.tensor([1., 2.], requires_grad=True)
     recorded = [2, 1]
     scale, shift = 2.5, -.2
-    loss, details = value_reasoning_loss(q_values=ThinkExecuteValues(actions, gate),
-        target_q_values=ThinkExecuteValues(target_actions, target_gate), lengths=torch.tensor(lengths),
+    loss, details = value_reasoning_loss(q_values=ReasoningActionValues(actions, gate),
+        target_q_values=ReasoningActionValues(target_actions, target_gate), lengths=torch.tensor(lengths),
         environment_actions=torch.tensor(recorded), environment_targets=targets, weights=weights,
-        reasoning_reward=reward, gamma_think=gamma, min_steps=minimum, value_scale=scale, value_shift=shift)
+        think_reward=reward, gamma_think=gamma, min_depth=minimum, value_scale=scale, value_shift=shift)
     denominator = sum(w * (length + 1) for w, length in zip(weights.tolist(), lengths))
     expected = 0.
     action_grad = torch.zeros_like(actions)
@@ -78,11 +78,11 @@ def test_three_bellman_edges_and_exact_gradient(gamma, minimum, cap, lengths, re
 
 
 def test_both_heads_receive_gradients_and_frozen_head_passes_gradients_to_state():
-    head = ThinkExecuteHead(action_head=torch.nn.Linear(8, 4), reasoning_control_head=torch.nn.Linear(8, 2))
+    head = ReasoningActionHeads(action_head=torch.nn.Linear(8, 4), reasoning_control_head=torch.nn.Linear(8, 2))
     states = torch.randn(2, 3, 8, requires_grad=True)
     head.action_head.requires_grad_(False)
     values = head(states)
-    (values.actions.square().mean() + values.decisions.square().mean()).backward()
+    (values.action_values.square().mean() + values.control_values.square().mean()).backward()
     assert states.grad.abs().sum() > 0
     assert all(p.grad is None for p in head.action_head.parameters())
     assert all(p.grad is not None for p in head.reasoning_control_head.parameters())
@@ -91,7 +91,7 @@ def test_both_heads_receive_gradients_and_frozen_head_passes_gradients_to_state(
 def test_fixed_budget_sequence_replay_matches_generation():
     from tests.test_sequential_reasoning import components, generate
     from tests.test_residual_reasoning import batch
-    parts = components(residual_connections=True, adaptive_depth=False, wrap_latent='sequence', cap=3)
+    parts = components(latent_residual_enabled=True, adaptive_depth=False, latent_feedback_scope='sequence', cap=3)
     embedding, backbone, reasoner, _ = parts
     tokens = batch(((2, 9, 3, 9), (4, 9)))
     tokens['head_mask'] = tokens['token_ids'] == 9
@@ -126,11 +126,11 @@ def test_execute_changes_heads_at_same_token_while_think_changes_tokens(perturba
         tensor.requires_grad_()
     environment_target = torch.tensor([-5.], requires_grad=True)
     loss, details = value_reasoning_loss(
-        q_values=ThinkExecuteValues(actions, gate),
-        target_q_values=ThinkExecuteValues(target_actions, target_gate),
+        q_values=ReasoningActionValues(actions, gate),
+        target_q_values=ReasoningActionValues(target_actions, target_gate),
         lengths=torch.tensor([2]), environment_actions=torch.tensor([0]),
         environment_targets=environment_target, weights=torch.ones(1),
-        reasoning_reward=-.5, gamma_think=.25, min_steps=1,
+        think_reward=-.5, gamma_think=.25, min_depth=1,
     )
     torch.testing.assert_close(details["td_target"][0, :2], torch.tensor([expected_think, expected_execute]))
     torch.testing.assert_close(details["action_target"], torch.tensor([-5.]))

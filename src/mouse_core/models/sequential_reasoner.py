@@ -7,7 +7,7 @@ from dataclasses import dataclass, replace
 from typing import Literal, cast
 
 import math
-from mouse_core.models.think_execute import ThinkExecuteValues
+from mouse_core.models.reasoning_action import ReasoningActionValues
 
 import torch
 from tensordict import TensorDict
@@ -123,7 +123,7 @@ class _ReasoningInputMLP(nn.Module):
 class SequentialReasoner(nn.Module):
     """Generate repeated-token or residual reasoning with fixed or adaptive depth.
 
-    wrap_latent="step" feeds back within each environment decision; "sequence"
+    latent_feedback_scope="decision" feeds back within each environment decision; "sequence"
     also carries the final latent into the next decision, resetting only for a new
     sequence. "none" repeats the tokenizer-selected embedding at every token.
     The first input at each wrapping boundary is its embedding directly.
@@ -134,30 +134,30 @@ class SequentialReasoner(nn.Module):
     wrapping plus residual addition accumulates updates.
 
     Adaptive depth first selects EXECUTE or THINK using a separate binary head.
-    EXECUTE selects an environment action using the action head. Before min_steps
-    only THINK is available; at max_steps only EXECUTE is available.
-    Fixed depth evaluates only environment actions after exactly max_steps updates.
+    EXECUTE selects an environment action using the action head. Before min_depth
+    only THINK is available; at max_depth only EXECUTE is available.
+    Fixed depth evaluates only environment actions after exactly max_depth updates.
     Backbone RoPE supplies positions. The trainable input RMSNorm scale starts at
     0.02. Keep the backbone in eval mode through checkpointed backward so stochastic
     recomputation matches generation.
     """
 
     def __init__(self, *, hidden_dim: int, input_mlp_intermediate_dim: int, input_mlp_output_scale: float,
-                 min_steps: int, max_steps: int, rms_norm_eps: float,
-                 residual_connections: bool, wrap_latent: Literal["none", "step", "sequence"], adaptive_depth: bool) -> None:
+                 min_depth: int, max_depth: int, rms_norm_eps: float,
+                 latent_residual_enabled: bool, latent_feedback_scope: Literal["none", "decision", "sequence"], adaptive_depth: bool) -> None:
         super().__init__()
         if type(hidden_dim) is not int or hidden_dim < 1:
             raise ValueError("hidden_dim must be a positive integer")
-        if type(max_steps) is not int or max_steps < 1:
-            raise ValueError("max_steps must be a positive integer")
-        if type(min_steps) is not int or not 1 <= min_steps <= max_steps:
-            raise ValueError("min_steps must be an integer in [1, max_steps]")
-        if any(type(value) is not bool for value in (residual_connections, adaptive_depth)):
-            raise ValueError("residual_connections and adaptive_depth must be booleans")
+        if type(max_depth) is not int or max_depth < 1:
+            raise ValueError("max_depth must be a positive integer")
+        if type(min_depth) is not int or not 1 <= min_depth <= max_depth:
+            raise ValueError("min_depth must be an integer in [1, max_depth]")
+        if any(type(value) is not bool for value in (latent_residual_enabled, adaptive_depth)):
+            raise ValueError("latent_residual_enabled and adaptive_depth must be booleans")
         if type(rms_norm_eps) not in (int, float) or not math.isfinite(rms_norm_eps) or rms_norm_eps <= 0:
             raise ValueError("rms_norm_eps must be finite and positive")
-        if wrap_latent not in ("none", "step", "sequence"):
-            raise ValueError("wrap_latent must be none, step or sequence")
+        if latent_feedback_scope not in ("none", "decision", "sequence"):
+            raise ValueError("latent_feedback_scope must be none, decision or sequence")
         if type(input_mlp_intermediate_dim) is not int or input_mlp_intermediate_dim < 1:
             raise ValueError("input_mlp_intermediate_dim must be a positive integer")
         if type(input_mlp_output_scale) not in (int, float) or not math.isfinite(input_mlp_output_scale) or input_mlp_output_scale <= 0:
@@ -166,10 +166,10 @@ class SequentialReasoner(nn.Module):
         self.input_mlp_output_scale = float(input_mlp_output_scale)
         self.rms_norm_eps = rms_norm_eps
         self.hidden_dim = hidden_dim
-        self.max_steps = max_steps
-        self.min_steps = min_steps
-        self.residual_connections = residual_connections
-        self.wrap_latent = wrap_latent
+        self.max_depth = max_depth
+        self.min_depth = min_depth
+        self.latent_residual_enabled = latent_residual_enabled
+        self.latent_feedback_scope = latent_feedback_scope
         self.adaptive_depth = adaptive_depth
         self.norm = nn.RMSNorm(hidden_dim, eps=rms_norm_eps, elementwise_affine=True, dtype=torch.float32)
         nn.init.constant_(self.norm.weight, 0.02)
@@ -194,9 +194,9 @@ class SequentialReasoner(nn.Module):
     def _select_actions(self, states, indices, depths, action_values, select_actions):
         values = action_values(states)
         if self.adaptive_depth:
-            if not isinstance(values, ThinkExecuteValues) or values.actions.ndim != 2 or len(values) != len(indices):
-                raise ValueError('Adaptive action_values must return ThinkExecuteValues with separate action and EXECUTE/THINK heads')
-            values = values.masked(depths, min_steps=self.min_steps, max_steps=self.max_steps)
+            if not isinstance(values, ReasoningActionValues) or values.action_values.ndim != 2 or len(values) != len(indices):
+                raise ValueError('Adaptive action_values must return ReasoningActionValues with separate action and EXECUTE/THINK heads')
+            values = values.masked(depths, min_depth=self.min_depth, max_depth=self.max_depth)
             actions = values.greedy() if select_actions is None else select_actions(values, indices, depths)
             available = values.available()
         else:
@@ -213,9 +213,9 @@ class SequentialReasoner(nn.Module):
     @torch.no_grad()
     def _generate_trace(
         self, tokens: TensorDict, *, embedding: MultiEmbedding, backbone: BaseBackbone,
-        action_values: Callable[[torch.Tensor], torch.Tensor | ThinkExecuteValues],
+        action_values: Callable[[torch.Tensor], torch.Tensor | ReasoningActionValues],
         backend: Literal["uncached", "continuous"], max_active_requests: int,
-        select_actions: Callable[[torch.Tensor | ThinkExecuteValues, torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
+        select_actions: Callable[[torch.Tensor | ReasoningActionValues, torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
         max_batch_tokens: int = 1024, cache_capacity_tokens: int | None = None,
         cache: ContinuousDecodeSession | None = None,
     ) -> _ReasoningTrace:
@@ -240,21 +240,21 @@ class SequentialReasoner(nn.Module):
         if not heads and cache is None:
             device = next(embedding.parameters()).device
             lengths = torch.empty(0, device=device, dtype=torch.long)
-            return _ReasoningTrace(heads, torch.empty((0, self.max_steps + 1, self.hidden_dim),
+            return _ReasoningTrace(heads, torch.empty((0, self.max_depth + 1, self.hidden_dim),
                                                    device=device), lengths)
         with _evaluating(embedding, backbone, self):
             embeds = self._embeds(tokens, embedding)
             initial = embeds.new_zeros((len(heads), self.hidden_dim), dtype=torch.float32)
             query_embeddings = embeds[list(heads)]
-            states = initial[:, None, :].expand(-1, self.max_steps + 1, -1).clone()
-            if self.max_steps == 1 and cache is None and self.wrap_latent != "sequence":
+            states = initial[:, None, :].expand(-1, self.max_depth + 1, -1).clone()
+            if self.max_depth == 1 and cache is None and self.latent_feedback_scope != "sequence":
                 # All inputs already exist: evaluate every decision in one packed
                 # causal forward. There is no generated feedback or decode session.
                 positions = torch.tensor(heads, device=embeds.device, dtype=torch.long)
                 inputs = embeds
                 hidden = cast(torch.Tensor, backbone(inputs, sequence_ids=tokens['sequence_ids'].to(inputs.device)))
                 updates = hidden[positions].float()
-                states[:, 1] = initial + updates if self.residual_connections else updates
+                states[:, 1] = initial + updates if self.latent_residual_enabled else updates
                 lengths = torch.ones(len(heads), device=embeds.device, dtype=torch.long)
                 self._select_actions(states[:, 1], torch.arange(len(heads), device=embeds.device),
                                      lengths, action_values, select_actions)
@@ -275,7 +275,7 @@ class SequentialReasoner(nn.Module):
                 contexts.append(episode.context_slices)
                 prefix = embeds[episode.context_slices[0]]
                 first_input = start_inputs[indices[:1]]
-                if indices and self.wrap_latent == "sequence" and cache is not None:
+                if indices and self.latent_feedback_scope == "sequence" and cache is not None:
                     carried = cache.generation_state[episode.sequence_id].get("reasoning_latent")
                     if carried is not None:
                         states[indices[0], 0] = carried
@@ -294,11 +294,11 @@ class SequentialReasoner(nn.Module):
                     counts[i] += 1
                 live_depths = torch.tensor([counts[i] for _, _, i in live], device=states.device)
                 updates = hidden[[j for j, _, _ in live]].float()
-                base = (states[live_indices, live_depths - 1] if self.wrap_latent != "none" else initial[live_indices])
-                current = base + updates if self.residual_connections else updates
+                base = (states[live_indices, live_depths - 1] if self.latent_feedback_scope != "none" else initial[live_indices])
+                current = base + updates if self.latent_residual_enabled else updates
                 states[live_indices, live_depths] = current
                 decisions = [i for _, _, i in live
-                             if self.adaptive_depth or counts[i] == self.max_steps]
+                             if self.adaptive_depth or counts[i] == self.max_depth]
                 thinking = {i: True for _, _, i in live}
                 if decisions:
                     indices = torch.tensor(decisions, device=states.device)
@@ -310,8 +310,8 @@ class SequentialReasoner(nn.Module):
                 # Only THINK inserts a continuation. Sequence wrapping also
                 # projects a carry into the next decision's existing first slot.
                 projection_rows = [position for position, (_, request, i) in enumerate(live)
-                                   if self.wrap_latent != "none" and (thinking[i] or
-                                       (self.wrap_latent == "sequence" and
+                                   if self.latent_feedback_scope != "none" and (thinking[i] or
+                                       (self.latent_feedback_scope == "sequence" and
                                         cursors[request] + 1 < len(episode_heads[request])))]
                 projected = (self.project_inputs(current[projection_rows]).to(embeds.dtype)
                              if projection_rows else embeds[:0])
@@ -322,17 +322,17 @@ class SequentialReasoner(nn.Module):
                     step = counts[i]
                     state = states[i, step:step + 1]
                     if thinking[i]:
-                        chunks[j] = projected_input if self.wrap_latent != "none" else start_inputs[i:i + 1]
+                        chunks[j] = projected_input if self.latent_feedback_scope != "none" else start_inputs[i:i + 1]
                         continue
                     states[i, step + 1:] = state
                     cursors[request] += 1
                     next_index = cursors[request]
-                    if self.wrap_latent == "sequence" and cache is not None:
+                    if self.latent_feedback_scope == "sequence" and cache is not None:
                         cache.generation_state[rows[request]]["reasoning_latent"] = state[0].detach().clone()
                     if next_index < len(episode_heads[request]):
                         next_decision = episode_heads[request][next_index]
                         next_input = start_inputs[next_decision:next_decision + 1]
-                        if self.wrap_latent == "sequence":
+                        if self.latent_feedback_scope == "sequence":
                             states[episode_heads[request][next_index], 0] = state[0]
                             next_input = projected_input
                         chunks[j] = torch.cat((embeds[contexts[request][next_index]],
@@ -357,15 +357,15 @@ class SequentialReasoner(nn.Module):
 
     def generate(
         self, tokens: TensorDict, *, embedding: MultiEmbedding, backbone: BaseBackbone,
-        action_values: Callable[[torch.Tensor], torch.Tensor | ThinkExecuteValues],
+        action_values: Callable[[torch.Tensor], torch.Tensor | ReasoningActionValues],
         backend: Literal["uncached", "continuous"], max_active_requests: int,
-        select_actions: Callable[[torch.Tensor | ThinkExecuteValues, torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
+        select_actions: Callable[[torch.Tensor | ReasoningActionValues, torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
         max_batch_tokens: int = 1024, cache_capacity_tokens: int | None = None,
         cache: ContinuousDecodeSession | None = None,
     ) -> ReasoningBatch:
         """Generate once and return complete context/latent inputs for forward.
 
-        With max_steps=1 and no sequence wrapping, episodes need one packed forward, with no
+        With max_depth=1 and no sequence wrapping, episodes need one packed forward, with no
         sequential generation or inserted feedback. Replay collection can skip
         this forward entirely using start_only_reasoning_episodes.
         A cached call returns the new chunk for inference. Its earlier context
@@ -409,10 +409,10 @@ class SequentialReasoner(nn.Module):
         segments = head_output_segments(tokens)
         heads = tuple(head for segment in segments for head in segment.head_token_ids)
         if (lengths.dtype != torch.long or lengths.shape != (len(heads),)
-                or bool(((lengths < self.min_steps) | (lengths > self.max_steps)).any())):
+                or bool(((lengths < self.min_depth) | (lengths > self.max_depth)).any())):
             raise ValueError("Replay lengths must be one int64 depth per decision within min/max steps")
-        if not self.adaptive_depth and bool((lengths != self.max_steps).any()):
-            raise ValueError("Fixed-depth replay requires max_steps at every decision")
+        if not self.adaptive_depth and bool((lengths != self.max_depth).any()):
+            raise ValueError("Fixed-depth replay requires max_depth at every decision")
         if backbone.hidden_dim != self.hidden_dim:
             raise ValueError("hidden_dim must match the backbone")
         if backend not in ("uncached", "continuous"):
@@ -422,22 +422,22 @@ class SequentialReasoner(nn.Module):
         if 'latent_values' in tokens.keys() or 'latent_mask' in tokens.keys():
             raise ValueError("Replay preparation requires clean source tokens")
         desired = lengths.tolist()
-        if self.wrap_latent == "sequence":
+        if self.latent_feedback_scope == "sequence":
             # Every decision depends on the preceding output in this mode.
             def select(values, indices, depths):
                 target = lengths.to(depths.device)[indices]
                 return torch.where(depths < target, 1, 0)  # Synthetic one-action head: index 1 is THINK.
             trace = self.generate(
                 tokens, embedding=embedding, backbone=backbone,
-                action_values=lambda states: (ThinkExecuteValues(states.new_zeros((len(states), 1)), states.new_zeros((len(states), 2)))
+                action_values=lambda states: (ReasoningActionValues(states.new_zeros((len(states), 1)), states.new_zeros((len(states), 2)))
                                              if self.adaptive_depth else states.new_zeros((len(states), 1))),
                 select_actions=select, backend=backend, max_active_requests=max_active_requests,
                 max_batch_tokens=max_batch_tokens, cache_capacity_tokens=cache_capacity_tokens)
             trace.states.zero_()
             return trace
-        needs_generation = self.wrap_latent == "step" and any(depth > 1 for depth in desired)
+        needs_generation = self.latent_feedback_scope == "decision" and any(depth > 1 for depth in desired)
         device = next(embedding.parameters()).device if needs_generation else tokens['token_ids'].device
-        states = torch.zeros((len(heads), self.max_steps + 1, self.hidden_dim), device=device)
+        states = torch.zeros((len(heads), self.max_depth + 1, self.hidden_dim), device=device)
         if needs_generation:
             with _evaluating(embedding, backbone, self), torch.inference_mode():
                 embeds = self._embeds(tokens, embedding)
@@ -458,7 +458,7 @@ class SequentialReasoner(nn.Module):
                     decisions = [requests[request][cursors[request]] for request in active]
                     previous = [depths[i] for i in decisions]
                     updates = hidden.float()
-                    current = states[decisions, previous] + updates if self.residual_connections else updates
+                    current = states[decisions, previous] + updates if self.latent_residual_enabled else updates
                     projected = self.project_inputs(current).to(embeds.dtype)
                     chunks: list[torch.Tensor | None] = []
                     for row, (request, decision) in enumerate(zip(active, decisions, strict=True)):
@@ -502,7 +502,7 @@ class SequentialReasoner(nn.Module):
         rows: list[list[tuple[int, int, int]]] = []
         initial = [0] * len(by_head)
         readouts = [0] * len(by_head)
-        positions = [[0] * self.max_steps for _ in by_head]
+        positions = [[0] * self.max_depth for _ in by_head]
         lengths = trace.lengths.tolist()
         offset = 0
         cursor = 0
@@ -537,7 +537,7 @@ class SequentialReasoner(nn.Module):
         if latent_rows:
             decision = torch.tensor([i for _, i, _ in entries if i >= 0], device=device)
             step = torch.tensor([step for _, i, step in entries if i >= 0], device=device)
-            latents[torch.tensor(latent_rows, device=device)] = trace.states[decision, step if self.wrap_latent != "none" else 0].detach()
+            latents[torch.tensor(latent_rows, device=device)] = trace.states[decision, step if self.latent_feedback_scope != "none" else 0].detach()
         inserted = torch.tensor([step > 0 for _, _, step in entries], device=device)
         packed["field_start_mask"][inserted] = True
         packed["field_end_mask"][latent_mask] = True
@@ -549,7 +549,7 @@ class SequentialReasoner(nn.Module):
         packed["head_mask"][ends] = True
         packed["step_readout_mask"] = packed["head_mask"].clone()
         # Generation is complete: starts are metadata, not pending markers.
-        update_positions = torch.tensor(positions, device=device, dtype=torch.long).reshape(-1, self.max_steps)
+        update_positions = torch.tensor(positions, device=device, dtype=torch.long).reshape(-1, self.max_depth)
         return ReasoningBatch(packed, starts, update_positions, ends, trace.head_token_ids,
                              trace.states, trace.lengths, cached_prefix)
 
@@ -567,13 +567,13 @@ class SequentialReasoner(nn.Module):
         if generated.cached_prefix:
             raise ValueError("Forward requires complete episodes, not a chunk with a cached prefix")
         count = len(generated.head_token_ids)
-        if (generated.update_positions.shape != (count, self.max_steps)
+        if (generated.update_positions.shape != (count, self.max_depth)
                 or generated.initial_positions.shape != (count,)
                 or generated.readout_positions.shape != (count,)):
             raise ValueError("Generated positions must match readouts and reasoning budget")
         if (generated.lengths.shape != (count,) or generated.lengths.dtype != torch.long
-                or bool(((generated.lengths < (self.min_steps if self.adaptive_depth else 1))
-                         | (generated.lengths > self.max_steps)).any())):
+                or bool(((generated.lengths < (self.min_depth if self.adaptive_depth else 1))
+                         | (generated.lengths > self.max_depth)).any())):
             raise ValueError("Generated lengths must be int64 counts within the reasoning budget")
         if backbone.hidden_dim != self.hidden_dim:
             raise ValueError("hidden_dim must match the backbone")
@@ -587,10 +587,10 @@ class SequentialReasoner(nn.Module):
             inputs = embeds.clone()
             starts = generated.initial_positions.to(embeds.device)
             first = torch.ones(count, device=embeds.device, dtype=torch.bool)
-            if self.wrap_latent == "sequence":
+            if self.latent_feedback_scope == "sequence":
                 groups = tokens["sequence_ids"][starts]
                 first[1:] = groups[1:] != groups[:-1]
-            if self.wrap_latent != "none":
+            if self.latent_feedback_scope != "none":
                 # Scope starts use their configured embedding directly. All
                 # continuation inputs are projected detached feedback only.
                 continuation = tokens["latent_mask"].clone()
@@ -600,10 +600,10 @@ class SequentialReasoner(nn.Module):
                     inputs[continuation] = self.project_inputs(feedback).to(embeds.dtype)
             hidden = cast(torch.Tensor, backbone(inputs, sequence_ids=tokens["sequence_ids"]))
             updates = hidden[generated.update_positions.to(hidden.device)].float()
-            valid = torch.arange(self.max_steps, device=hidden.device)[None] < generated.lengths.to(hidden.device)[:, None]
+            valid = torch.arange(self.max_depth, device=hidden.device)[None] < generated.lengths.to(hidden.device)[:, None]
             updates = updates.masked_fill(~valid[..., None], 0)
-            if self.residual_connections and self.wrap_latent != "none":
-                if self.wrap_latent == "sequence":
+            if self.latent_residual_enabled and self.latent_feedback_scope != "none":
+                if self.latent_feedback_scope == "sequence":
                     # Rebuild the live additive path across all decisions in each
                     # sequence; generated projection inputs remain detached.
                     first_indices = first.nonzero().flatten()
@@ -613,6 +613,6 @@ class SequentialReasoner(nn.Module):
                         for piece in updates.split(counts.tolist())
                     ])
                 return initial[:, None] + updates.cumsum(1)
-            states = initial[:, None] + updates if self.residual_connections else updates
+            states = initial[:, None] + updates if self.latent_residual_enabled else updates
             final = states[torch.arange(count, device=hidden.device), generated.lengths.to(hidden.device) - 1]
             return torch.where(valid[..., None], states, final[:, None])

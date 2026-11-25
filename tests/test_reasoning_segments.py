@@ -41,12 +41,12 @@ def test_step_segments_preserve_separated_heads_passive_steps_tails_and_empty_ro
     assert len(head_output_segments(empty_token_batch(num_sequences=2))) == 2
 
 
-@pytest.mark.parametrize('residual_connections', [False, True])
+@pytest.mark.parametrize('latent_residual_enabled', [False, True])
 @pytest.mark.parametrize('backend', ['uncached', 'continuous'])
 @torch.no_grad()
-def test_multiple_head_tokens_reason_once_per_step_with_literal_history_reference(residual_connections, backend):
+def test_multiple_head_tokens_reason_once_per_step_with_literal_history_reference(latent_residual_enabled, backend):
     tokens, data = segmented_batch()
-    parts = components(residual_connections=residual_connections, wrap_latent="step" if residual_connections else "none", adaptive_depth=True, cap=3, real=True)
+    parts = components(latent_residual_enabled=latent_residual_enabled, latent_feedback_scope="decision" if latent_residual_enabled else "none", adaptive_depth=True, cap=3, real=True)
     depths = torch.tensor([2, 3, 1])
     trace = generate(parts, tokens, lengths=depths, backend=backend)
     assert trace.head_token_ids == (3, 9, 14)

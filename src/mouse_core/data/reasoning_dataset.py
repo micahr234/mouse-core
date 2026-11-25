@@ -94,7 +94,7 @@ def split_reasoning_episodes(inputs: TensorDict, generated: ReasoningBatch, data
 
 
 def start_only_reasoning_episodes(inputs: TensorDict, data: TensorDict, *,
-                                  hidden_dim: int, max_steps: int,
+                                  hidden_dim: int, max_depth: int,
                                   generated_step: int) -> tuple[ReasoningEpisode, ...]:
     """Prepare source episodes for replay without a model forward or generation.
 
@@ -107,8 +107,8 @@ def start_only_reasoning_episodes(inputs: TensorDict, data: TensorDict, *,
     """
     from mouse_core.data.token_batch import head_output_segments
 
-    if type(max_steps) is not int or max_steps < 1:
-        raise ValueError('max_steps must be a positive integer')
+    if type(max_depth) is not int or max_depth < 1:
+        raise ValueError('max_depth must be a positive integer')
     if type(hidden_dim) is not int or hidden_dim < 1:
         raise ValueError('hidden_dim must be a positive integer')
     if 'latent_values' in inputs.keys() or 'latent_mask' in inputs.keys():
@@ -144,7 +144,7 @@ def start_only_reasoning_episodes(inputs: TensorDict, data: TensorDict, *,
                                 for key, value in data.items()}, batch_size=[], device='cpu')
         objective['step_ids'] -= step_start
         objective['sequence_ids'].zero_()
-        updates = torch.zeros((len(heads), max_steps), dtype=torch.long)
+        updates = torch.zeros((len(heads), max_depth), dtype=torch.long)
         updates[:, 0] = positions
         episodes.append(ReasoningEpisode(tokens, start.expand(len(heads), -1).clone(), objective,
             positions.clone(), updates, positions.clone(), tuple(positions.tolist()), len(token_rows),

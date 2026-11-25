@@ -5,10 +5,10 @@ from tests.test_residual_reasoning import batch
 from tests.test_sequential_reasoning import components, generate
 
 
-@pytest.mark.parametrize('wrap', ['none', 'step', 'sequence'])
+@pytest.mark.parametrize('wrap', ['none', 'decision', 'sequence'])
 @pytest.mark.parametrize('residual', [False, True])
 def test_zero_continuation_never_reinjects_embedding(monkeypatch, wrap, residual):
-    parts = components(residual_connections=residual, wrap_latent=wrap,
+    parts = components(latent_residual_enabled=residual, latent_feedback_scope=wrap,
                        adaptive_depth=False, cap=3)
     embedding, backbone, reasoner, _ = parts
     monkeypatch.setattr(backbone, 'forward', lambda inputs, **kwargs: inputs * 0)
@@ -39,16 +39,16 @@ def test_zero_continuation_never_reinjects_embedding(monkeypatch, wrap, residual
     assert learned.abs().sum() > 0
     positions = trace.tokens['latent_mask'].nonzero().flatten()
     starts = (positions if wrap == 'none' else trace.initial_positions
-              if wrap == 'step' else trace.initial_positions[[0, 2]])
+              if wrap == 'decision' else trace.initial_positions[[0, 2]])
     for position in positions.tolist():
         expected = learned if position in starts.tolist() else torch.zeros_like(learned)
         torch.testing.assert_close(inputs[position], expected)
     torch.testing.assert_close(reasoner(trace, embedding=embedding, backbone=backbone), trace.states[:, 1:])
 
 
-@pytest.mark.parametrize('wrap', ['none', 'step'])
+@pytest.mark.parametrize('wrap', ['none', 'decision'])
 def test_one_step_bypasses_input_block_in_generation_and_replay(monkeypatch, wrap):
-    parts = components(residual_connections=True, wrap_latent=wrap,
+    parts = components(latent_residual_enabled=True, latent_feedback_scope=wrap,
                        adaptive_depth=False, cap=1)
     embedding, backbone, reasoner, _ = parts
     def forbidden(*args, **kwargs):
@@ -62,11 +62,11 @@ def test_one_step_bypasses_input_block_in_generation_and_replay(monkeypatch, wra
     assert all(parameter.grad is None for parameter in reasoner.parameters())
 
 
-@pytest.mark.parametrize('wrap', ['step', 'sequence'])
+@pytest.mark.parametrize('wrap', ['decision', 'sequence'])
 @pytest.mark.parametrize('cap', [1, 3])
 @torch.no_grad()
 def test_bfloat16_embeddings_match_across_generation_and_replay(wrap, cap):
-    parts = components(residual_connections=True, wrap_latent=wrap,
+    parts = components(latent_residual_enabled=True, latent_feedback_scope=wrap,
                        adaptive_depth=False, cap=cap, real=True)
     embedding, backbone, reasoner, head = parts
     embedding.to(dtype=torch.bfloat16)

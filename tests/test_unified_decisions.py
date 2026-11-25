@@ -91,7 +91,7 @@ def test_distinct_learned_inputs_are_live_in_online_and_target_replay():
                                        'reasoning':Embedding(vocab_size=2,hidden_dim=8)})
     backbone=CausalBackbone()
     reasoner=SequentialReasoner(hidden_dim=8,input_mlp_intermediate_dim=24,input_mlp_output_scale=3.,
-        min_steps=2,max_steps=2,rms_norm_eps=1e-6,residual_connections=False,wrap_latent='none',adaptive_depth=False)
+        min_depth=2,max_depth=2,rms_norm_eps=1e-6,latent_residual_enabled=False,latent_feedback_scope='none',adaptive_depth=False)
     trace=reasoner.generate(inputs,embedding=embedding,backbone=backbone,action_values=nn.Linear(8,4),backend='uncached',max_active_requests=1)
     recorded=[]
     hook=backbone.register_forward_pre_hook(lambda _,args:recorded.append(args[0].detach().clone()))

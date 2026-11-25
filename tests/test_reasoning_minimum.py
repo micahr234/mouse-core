@@ -4,26 +4,26 @@ from dataclasses import replace
 
 import pytest
 import torch
-from mouse_core.models import ThinkExecuteValues
+from mouse_core.models import ReasoningActionValues
 
 from mouse_core.models import Backbone, Embedding, MultiEmbedding, SequentialReasoner
 from mouse_core.objectives import value_reasoning_loss
 from tests.test_residual_reasoning import batch
 
 
-@pytest.mark.parametrize('residual_connections', [False, True])
+@pytest.mark.parametrize('latent_residual_enabled', [False, True])
 @pytest.mark.parametrize('minimum,maximum', [(1, 1), (1, 4), (3, 4), (3, 3)])
 @pytest.mark.parametrize('prefer_think', [False, True])
 @torch.no_grad()
 def test_continuous_generation_masks_actions_and_preserves_replay(
-    residual_connections, minimum, maximum, prefer_think,
+    latent_residual_enabled, minimum, maximum, prefer_think,
 ):
     torch.manual_seed(91)
     embedding = MultiEmbedding(embeddings={'text': Embedding(vocab_size=16, hidden_dim=8)})
     backbone = Backbone(architecture='qwen3', hidden_dim=8, num_layers=1, num_heads=2,
                         head_dim=4, max_position_embeddings=128, dtype=torch.float32)
-    reasoner = SequentialReasoner(input_mlp_intermediate_dim=24, input_mlp_output_scale=100., hidden_dim=8, min_steps=minimum, max_steps=maximum,
-                                 residual_connections=residual_connections, wrap_latent="step" if residual_connections else "none", adaptive_depth=True, rms_norm_eps=1e-6)
+    reasoner = SequentialReasoner(input_mlp_intermediate_dim=24, input_mlp_output_scale=100., hidden_dim=8, min_depth=minimum, max_depth=maximum,
+                                 latent_residual_enabled=latent_residual_enabled, latent_feedback_scope="decision" if latent_residual_enabled else "none", adaptive_depth=True, rms_norm_eps=1e-6)
     actions = torch.tensor([3., 1., 2., 0.])
     gate = torch.tensor([3., 10. if prefer_think else -1.])
     calls = []
@@ -48,7 +48,7 @@ def test_continuous_generation_masks_actions_and_preserves_replay(
     tokens['step_readout_mask'] = tokens['head_mask'].clone()
     generated = reasoner.generate(
         tokens, embedding=embedding, backbone=backbone,
-        action_values=lambda z: ThinkExecuteValues(actions.expand(len(z), -1), gate.expand(len(z), -1)), select_actions=select,
+        action_values=lambda z: ReasoningActionValues(actions.expand(len(z), -1), gate.expand(len(z), -1)), select_actions=select,
         backend='continuous', max_active_requests=2, max_batch_tokens=3,
         cache_capacity_tokens=1024,
     )
@@ -66,19 +66,19 @@ def test_continuous_generation_masks_actions_and_preserves_replay(
 
 @pytest.mark.parametrize('minimum', [0, True, 1.5, 5])
 def test_minimum_must_be_an_integer_within_cap(minimum):
-    with pytest.raises(ValueError, match='min_steps'):
-        SequentialReasoner(input_mlp_intermediate_dim=24, input_mlp_output_scale=100., hidden_dim=8, min_steps=minimum, max_steps=4,
-                           residual_connections=False, wrap_latent="none", adaptive_depth=True, rms_norm_eps=1e-6)
-    with pytest.raises(ValueError, match='min_steps'):
-        value_reasoning_loss(q_values=ThinkExecuteValues(torch.zeros(1, 4, 4), torch.zeros(1, 4, 2)), target_q_values=ThinkExecuteValues(torch.zeros(1, 4, 4), torch.zeros(1, 4, 2)),
+    with pytest.raises(ValueError, match='min_depth'):
+        SequentialReasoner(input_mlp_intermediate_dim=24, input_mlp_output_scale=100., hidden_dim=8, min_depth=minimum, max_depth=4,
+                           latent_residual_enabled=False, latent_feedback_scope="none", adaptive_depth=True, rms_norm_eps=1e-6)
+    with pytest.raises(ValueError, match='min_depth'):
+        value_reasoning_loss(q_values=ReasoningActionValues(torch.zeros(1, 4, 4), torch.zeros(1, 4, 2)), target_q_values=ReasoningActionValues(torch.zeros(1, 4, 4), torch.zeros(1, 4, 2)),
                              lengths=torch.tensor([4]), environment_actions=torch.tensor([0]),
                              environment_targets=torch.ones(1), weights=torch.ones(1),
-                             reasoning_reward=-.1, gamma_think=1., min_steps=minimum)
+                             think_reward=-.1, gamma_think=1., min_depth=minimum)
 
 
 def test_loss_rejects_a_trajectory_stopping_before_minimum():
     with pytest.raises(ValueError, match='minimum'):
-        value_reasoning_loss(q_values=ThinkExecuteValues(torch.zeros(1, 4, 4), torch.zeros(1, 4, 2)), target_q_values=ThinkExecuteValues(torch.zeros(1, 4, 4), torch.zeros(1, 4, 2)),
+        value_reasoning_loss(q_values=ReasoningActionValues(torch.zeros(1, 4, 4), torch.zeros(1, 4, 2)), target_q_values=ReasoningActionValues(torch.zeros(1, 4, 4), torch.zeros(1, 4, 2)),
                              lengths=torch.tensor([2]), environment_actions=torch.tensor([0]),
                              environment_targets=torch.ones(1), weights=torch.ones(1),
-                             reasoning_reward=-.1, gamma_think=1., min_steps=3)
+                             think_reward=-.1, gamma_think=1., min_depth=3)

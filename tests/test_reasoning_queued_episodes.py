@@ -6,10 +6,10 @@ from tests.test_sequential_reasoning import components, generate
 
 
 @pytest.mark.parametrize('residual', [False, True])
-@pytest.mark.parametrize('wrap', ['none', 'step', 'sequence'])
+@pytest.mark.parametrize('wrap', ['none', 'decision', 'sequence'])
 @torch.no_grad()
 def test_queued_episode_refills_match_uncached_histories(residual, wrap):
-    parts = components(residual_connections=residual, wrap_latent=wrap,
+    parts = components(latent_residual_enabled=residual, latent_feedback_scope=wrap,
                        adaptive_depth=True, cap=3, real=True)
     # Five episodes share two active slots. They finish at different depths
     # and have different numbers of environment decisions and context tokens.

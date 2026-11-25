@@ -16,11 +16,11 @@ def source():
     return tokens
 
 
-@pytest.mark.parametrize('wrap', ['none', 'step', 'sequence'])
+@pytest.mark.parametrize('wrap', ['none', 'decision', 'sequence'])
 @pytest.mark.parametrize('residual', [False, True])
 @pytest.mark.parametrize('backend', ['uncached', 'continuous'])
 def test_planned_replay_matches_sequential_latents_and_training(wrap, residual, backend):
-    parts = components(residual_connections=residual, adaptive_depth=True, wrap_latent=wrap,
+    parts = components(latent_residual_enabled=residual, adaptive_depth=True, latent_feedback_scope=wrap,
                        cap=3, real=backend == 'continuous')
     embedding, backbone, reasoner, _ = parts
     tokens = source()
@@ -51,10 +51,10 @@ def test_planned_replay_matches_sequential_latents_and_training(wrap, residual, 
                 assert current_reasoner.input_projection.down_proj.weight.grad.abs().sum() > 0
 
 
-@pytest.mark.parametrize('wrap,lengths', [('step', [1] * 8), ('none', [1, 2, 3, 1, 2, 1, 1, 3])])
+@pytest.mark.parametrize('wrap,lengths', [('decision', [1] * 8), ('none', [1, 2, 3, 1, 2, 1, 1, 3])])
 def test_known_embedding_inputs_need_no_model_or_decode(monkeypatch, wrap, lengths):
-    embedding, backbone, reasoner, _ = components(residual_connections=True, adaptive_depth=True,
-                                                 wrap_latent=wrap, cap=3)
+    embedding, backbone, reasoner, _ = components(latent_residual_enabled=True, adaptive_depth=True,
+                                                 latent_feedback_scope=wrap, cap=3)
     def forbidden(*args, **kwargs):
         pytest.fail('Known replay inputs must not run the model')
     monkeypatch.setattr(backbone, 'forward', forbidden)
@@ -81,8 +81,8 @@ def test_single_token_spans_and_final_inputs_are_batched(monkeypatch):
             return result
         return original(**{**kwargs, 'advance': record_advance})
     monkeypatch.setattr(module, 'generate', record)
-    embedding, backbone, reasoner, _ = components(residual_connections=True, adaptive_depth=True,
-                                                 wrap_latent='step', cap=3)
+    embedding, backbone, reasoner, _ = components(latent_residual_enabled=True, adaptive_depth=True,
+                                                 latent_feedback_scope='decision', cap=3)
     trace = reasoner.prepare_replay(source(), lengths=torch.tensor([1, 1, 3, 1, 2, 1, 1, 1]),
         embedding=embedding, backbone=backbone, backend='uncached', max_active_requests=2)
     # Second sequence is all one-token; third has no decisions. Neither decodes.
@@ -94,8 +94,8 @@ def test_single_token_spans_and_final_inputs_are_batched(monkeypatch):
 @pytest.mark.parametrize('lengths', [torch.ones(7, dtype=torch.long), torch.ones(8),
                                     torch.zeros(8, dtype=torch.long), torch.full((8,), 4)])
 def test_planned_depths_are_validated(lengths):
-    embedding, backbone, reasoner, _ = components(residual_connections=False, adaptive_depth=True,
-                                                 wrap_latent='step', cap=3)
+    embedding, backbone, reasoner, _ = components(latent_residual_enabled=False, adaptive_depth=True,
+                                                 latent_feedback_scope='decision', cap=3)
     with pytest.raises(ValueError, match='Replay lengths'):
         reasoner.prepare_replay(source(), lengths=lengths, embedding=embedding, backbone=backbone,
                                backend='uncached', max_active_requests=2)
@@ -104,8 +104,8 @@ def test_planned_depths_are_validated(lengths):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
 def test_planned_continuous_gpu_replay_and_backward():
     from mouse_core.models import Backbone
-    embedding, _, reasoner, head = components(residual_connections=True, adaptive_depth=True,
-                                               wrap_latent='step', cap=3)
+    embedding, _, reasoner, head = components(latent_residual_enabled=True, adaptive_depth=True,
+                                               latent_feedback_scope='decision', cap=3)
     backbone = Backbone(architecture='qwen3', hidden_dim=8, num_layers=1, num_heads=2,
                         head_dim=16, dtype=torch.float32).cuda()
     parts = embedding.cuda(), backbone, reasoner.cuda(), head.cuda()
@@ -124,8 +124,8 @@ def test_planned_continuous_gpu_replay_and_backward():
 
 
 def test_fixed_depth_planning_matches_generation():
-    embedding, backbone, reasoner, head = parts = components(residual_connections=True,
-        adaptive_depth=False, wrap_latent='step', cap=3)
+    embedding, backbone, reasoner, head = parts = components(latent_residual_enabled=True,
+        adaptive_depth=False, latent_feedback_scope='decision', cap=3)
     tokens = source()
     lengths = torch.full((8,), 3, dtype=torch.long)
     expected = generate(parts, tokens)

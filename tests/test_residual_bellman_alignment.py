@@ -2,7 +2,7 @@
 
 import pytest
 import torch
-from mouse_core.models import ThinkExecuteValues
+from mouse_core.models import ReasoningActionValues
 
 from mouse_core.objectives import value_reasoning_loss
 
@@ -35,11 +35,11 @@ def test_ragged_residual_loss_matches_scalar_transition_graph(cap, gamma_think, 
     rewards_and_environment_backups.requires_grad_()
     weights.requires_grad_()
 
-    loss, details = value_reasoning_loss(min_steps=1, 
-        q_values=ThinkExecuteValues(q[..., :environment_choices], q[..., environment_choices:]),
-        target_q_values=ThinkExecuteValues(target[..., :environment_choices], target[..., environment_choices:]), lengths=lengths,
+    loss, details = value_reasoning_loss(min_depth=1,
+        q_values=ReasoningActionValues(q[..., :environment_choices], q[..., environment_choices:]),
+        target_q_values=ReasoningActionValues(target[..., :environment_choices], target[..., environment_choices:]), lengths=lengths,
         environment_actions=actions, environment_targets=rewards_and_environment_backups,
-        weights=weights, reasoning_reward=-cost, gamma_think=gamma_think,
+        weights=weights, think_reward=-cost, gamma_think=gamma_think,
         value_scale=value_scale, value_shift=value_shift,
     )
 

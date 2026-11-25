@@ -14,10 +14,10 @@ from mouse_core.models.vocabulary_head import VocabularyHead
 from mouse_core.models.reasoner import LatentReasoner, sample_reasoning_splits
 from mouse_core.models.sequential_reasoner import SequentialReasoner, ReasoningBatch
 
-from mouse_core.models.think_execute import ThinkExecuteValues, ThinkExecuteHead
+from mouse_core.models.reasoning_action import ReasoningActionValues, ReasoningActionHeads
 
 __all__ = [
-    "ThinkExecuteValues", "ThinkExecuteHead",
+    "ReasoningActionValues", "ReasoningActionHeads",
     "Model",
     "generate",
     "select_discrete_action",

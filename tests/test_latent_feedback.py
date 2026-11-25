@@ -8,9 +8,9 @@ from tests.test_sequential_reasoning import components, generate
 
 
 @pytest.mark.parametrize('residual', [False, True])
-@pytest.mark.parametrize('wrap', ['none', 'step'])
+@pytest.mark.parametrize('wrap', ['none', 'decision'])
 def test_pointwise_recurrence_and_detached_feedback_gradients(monkeypatch, residual, wrap):
-    parts = components(residual_connections=residual, wrap_latent=wrap, adaptive_depth=False, cap=3)
+    parts = components(latent_residual_enabled=residual, latent_feedback_scope=wrap, adaptive_depth=False, cap=3)
     embedding, backbone, reasoner, _ = parts
     # No attention: any gradient across updates must come from our additive path.
     monkeypatch.setattr(backbone, 'forward', lambda embeds, **kw: backbone.linear(embeds))
@@ -54,21 +54,21 @@ def test_pointwise_recurrence_and_detached_feedback_gradients(monkeypatch, resid
 
 @pytest.mark.parametrize('value', [None, False, True, 0, 1, 'true', 'invalid'])
 def test_wrap_mode_requires_supported_string(value):
-    with pytest.raises(ValueError, match='wrap_latent'):
-        SequentialReasoner(input_mlp_intermediate_dim=24, input_mlp_output_scale=100., hidden_dim=8, min_steps=1, max_steps=3, rms_norm_eps=1e-6,
-                          residual_connections=False, wrap_latent=value, adaptive_depth=True)
+    with pytest.raises(ValueError, match='latent_feedback_scope'):
+        SequentialReasoner(input_mlp_intermediate_dim=24, input_mlp_output_scale=100., hidden_dim=8, min_depth=1, max_depth=3, rms_norm_eps=1e-6,
+                          latent_residual_enabled=False, latent_feedback_scope=value, adaptive_depth=True)
 
 
 def test_wrap_flag_is_required():
-    with pytest.raises(TypeError, match='wrap_latent'):
-        SequentialReasoner(input_mlp_intermediate_dim=24, input_mlp_output_scale=100., hidden_dim=8, min_steps=1, max_steps=3, rms_norm_eps=1e-6,
-                          residual_connections=False, adaptive_depth=True)
+    with pytest.raises(TypeError, match='latent_feedback_scope'):
+        SequentialReasoner(input_mlp_intermediate_dim=24, input_mlp_output_scale=100., hidden_dim=8, min_depth=1, max_depth=3, rms_norm_eps=1e-6,
+                          latent_residual_enabled=False, adaptive_depth=True)
 
 
 @pytest.mark.parametrize('residual', [False, True])
 @pytest.mark.parametrize('cap', [1, 3])
 def test_sequence_carries_only_reasoning_states_and_rebuilds_gradient_path(monkeypatch, residual, cap):
-    parts = components(residual_connections=residual, wrap_latent="sequence", adaptive_depth=False, cap=cap)
+    parts = components(latent_residual_enabled=residual, latent_feedback_scope="sequence", adaptive_depth=False, cap=cap)
     embedding, backbone, reasoner, _ = parts
     monkeypatch.setattr(backbone, 'forward', lambda embeds, **kw: backbone.linear(embeds))
     tokens = batch(((2, 9, 3, 4, 9), (5, 9)))
@@ -95,9 +95,9 @@ def test_sequence_carries_only_reasoning_states_and_rebuilds_gradient_path(monke
     assert gradients[2].count_nonzero() == 0
 
 
-@pytest.mark.parametrize('wrap', ['none', 'step', 'sequence'])
+@pytest.mark.parametrize('wrap', ['none', 'decision', 'sequence'])
 def test_replay_uses_current_embedding_only_at_scope_starts_without_changing_saved_feedback(monkeypatch, wrap):
-    parts = components(residual_connections=False, wrap_latent=wrap, adaptive_depth=False, cap=3)
+    parts = components(latent_residual_enabled=False, latent_feedback_scope=wrap, adaptive_depth=False, cap=3)
     embedding, backbone, reasoner, _ = parts
     tokens = batch(((2, 9, 3, 9), (5, 9)))
     tokens['head_mask'] = tokens['token_ids'] == 9
@@ -116,7 +116,7 @@ def test_replay_uses_current_embedding_only_at_scope_starts_without_changing_sav
     mask = trace.tokens['latent_mask']
     changed = mask.clone() if wrap == "none" else torch.zeros_like(mask)
     if wrap != "none":
-        starts = trace.initial_positions if wrap == "step" else trace.initial_positions[[0, 2]]
+        starts = trace.initial_positions if wrap == "decision" else trace.initial_positions[[0, 2]]
         changed[starts] = True
     torch.testing.assert_close(received[1][changed] - received[0][changed], torch.full_like(received[0][changed], .125))
     torch.testing.assert_close(received[1][~changed], received[0][~changed])

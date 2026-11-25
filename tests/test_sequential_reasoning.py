@@ -5,7 +5,7 @@ import pytest
 import torch
 from tests._reasoning_input_reference import input_reference
 from torch import nn
-from mouse_core.models import ThinkExecuteValues, ThinkExecuteHead
+from mouse_core.models import ReasoningActionValues, ReasoningActionHeads
 
 from mouse_core.models import Backbone, Embedding, MultiEmbedding, SequentialReasoner
 from mouse_core.objectives import final_reasoning_loss, value_reasoning_loss
@@ -15,15 +15,15 @@ from tests.test_residual_reasoning import CausalBackbone, batch
 VARIANTS = [(True, False), (False, True), (True, True)]
 
 
-def components(*, residual_connections, adaptive_depth, wrap_latent, cap=3, real=False):
+def components(*, latent_residual_enabled, adaptive_depth, latent_feedback_scope, cap=3, real=False):
     torch.manual_seed(73)
     embedding = MultiEmbedding(embeddings={'text': Embedding(vocab_size=16, hidden_dim=8)})
     backbone = (Backbone(architecture='qwen3', hidden_dim=8, num_layers=1, num_heads=2,
                          head_dim=4, max_position_embeddings=128, dtype=torch.float32)
                 if real else CausalBackbone())
-    reasoner = SequentialReasoner(input_mlp_intermediate_dim=24, input_mlp_output_scale=100., min_steps=1, hidden_dim=8, max_steps=cap,
-                                 residual_connections=residual_connections, wrap_latent=wrap_latent, adaptive_depth=adaptive_depth, rms_norm_eps=1e-6)
-    head = ThinkExecuteHead(action_head=nn.Linear(8, 4), reasoning_control_head=nn.Linear(8, 2)) if adaptive_depth else nn.Linear(8, 4)
+    reasoner = SequentialReasoner(input_mlp_intermediate_dim=24, input_mlp_output_scale=100., min_depth=1, hidden_dim=8, max_depth=cap,
+                                 latent_residual_enabled=latent_residual_enabled, latent_feedback_scope=latent_feedback_scope, adaptive_depth=adaptive_depth, rms_norm_eps=1e-6)
+    head = ReasoningActionHeads(action_head=nn.Linear(8, 4), reasoning_control_head=nn.Linear(8, 2)) if adaptive_depth else nn.Linear(8, 4)
     return embedding, backbone, reasoner, head
 
 
@@ -35,7 +35,7 @@ def generate(parts, tokens, *, lengths=None, backend='uncached', cache=None, cal
         if not reasoner.adaptive_depth:
             assert torch.isfinite(values[:, -1]).all()
             return torch.full_like(depths, 3)
-        desired = (torch.full_like(depths, reasoner.max_steps) if lengths is None else lengths[indices])
+        desired = (torch.full_like(depths, reasoner.max_depth) if lengths is None else lengths[indices])
         return torch.where(depths < desired, 4, 2)
     return reasoner.generate(tokens, embedding=embedding, backbone=backbone, action_values=head,
                              select_actions=select, backend=backend, max_active_requests=2, cache=cache)
@@ -56,34 +56,34 @@ def reference_states(parts, tokens, generated):
             if not is_head:
                 history.append(table[token])
                 continue
-            if reasoner.wrap_latent != "sequence":
+            if reasoner.latent_feedback_scope != "sequence":
                 state = torch.zeros_like(embedding.embeddings["text"].embed_tokens.weight[9:10][0])
             per_depth = []
             for depth in range(int(generated.lengths[decision])):
                 latent = (generated.states[decision, depth].detach()
-                          if reasoner.wrap_latent != "none" and (depth > 0 or
-                              (reasoner.wrap_latent == "sequence" and decision > group_start))
+                          if reasoner.latent_feedback_scope != "none" and (depth > 0 or
+                              (reasoner.latent_feedback_scope == "sequence" and decision > group_start))
                           else torch.zeros_like(embedding.embeddings["text"].embed_tokens.weight[9:10][0]))
-                continued = reasoner.wrap_latent != "none" and (depth > 0 or
-                    (reasoner.wrap_latent == "sequence" and decision > group_start))
+                continued = reasoner.latent_feedback_scope != "none" and (depth > 0 or
+                    (reasoner.latent_feedback_scope == "sequence" and decision > group_start))
                 history.append(input_reference(reasoner, latent) if continued else table[token])
                 packed = torch.stack(history)
                 hidden = backbone(packed, sequence_ids=torch.zeros(len(packed), dtype=torch.long))[-1]
                 update = hidden.float()
-                base = state if reasoner.wrap_latent != "none" else torch.zeros_like(embedding.embeddings["text"].embed_tokens.weight[9:10][0])
-                state = base + update if reasoner.residual_connections else update
+                base = state if reasoner.latent_feedback_scope != "none" else torch.zeros_like(embedding.embeddings["text"].embed_tokens.weight[9:10][0])
+                state = base + update if reasoner.latent_residual_enabled else update
                 per_depth.append(state)
-            per_depth.extend([per_depth[-1]] * (reasoner.max_steps - len(per_depth)))
+            per_depth.extend([per_depth[-1]] * (reasoner.max_depth - len(per_depth)))
             outputs.append(torch.stack(per_depth))
             decision += 1
     return torch.stack(outputs)
 
 
-@pytest.mark.parametrize('residual_connections,adaptive_depth', [(r, a) for r in (False, True) for a in (False, True)])
-@pytest.mark.parametrize('wrap_latent', ['none', 'step', 'sequence'])
+@pytest.mark.parametrize('latent_residual_enabled,adaptive_depth', [(r, a) for r in (False, True) for a in (False, True)])
+@pytest.mark.parametrize('latent_feedback_scope', ['none', 'decision', 'sequence'])
 @pytest.mark.parametrize('cap', [1, 3])
-def test_variant_positions_and_outputs_match_literal_token_history(residual_connections, adaptive_depth, cap, wrap_latent):
-    parts = components(residual_connections=residual_connections, wrap_latent=wrap_latent, adaptive_depth=adaptive_depth, cap=cap)
+def test_variant_positions_and_outputs_match_literal_token_history(latent_residual_enabled, adaptive_depth, cap, latent_feedback_scope):
+    parts = components(latent_residual_enabled=latent_residual_enabled, latent_feedback_scope=latent_feedback_scope, adaptive_depth=adaptive_depth, cap=cap)
     embedding, backbone, reasoner, _ = parts
     tokens = batch(((2, 9, 3, 9, 4), (5, 9)))
     tokens['head_mask'] = tokens['token_ids'] == 9
@@ -96,7 +96,7 @@ def test_variant_positions_and_outputs_match_literal_token_history(residual_conn
                                   for k in (range(1, length + 1) if adaptive_depth else [cap]))
     assert len(trace.tokens['token_ids']) == len(tokens['token_ids']) + int((lengths - 1).sum())
     assert trace.readout_positions.tolist() == (trace.initial_positions + lengths - 1).tolist()
-    if wrap_latent == "none":
+    if latent_feedback_scope == "none":
         table = embedding.embeddings['text'].embed_tokens.weight
         torch.testing.assert_close(trace.tokens['latent_values'][trace.tokens['latent_mask']],
                                    torch.zeros(int(lengths.sum()), reasoner.hidden_dim))
@@ -116,12 +116,12 @@ def test_variant_positions_and_outputs_match_literal_token_history(residual_conn
     assert not torch.allclose(delayed, actual)
 
 
-@pytest.mark.parametrize('residual_connections,adaptive_depth', [(r, a) for r in (False, True) for a in (False, True)])
-@pytest.mark.parametrize('wrap_latent', ['none', 'step', 'sequence'])
+@pytest.mark.parametrize('latent_residual_enabled,adaptive_depth', [(r, a) for r in (False, True) for a in (False, True)])
+@pytest.mark.parametrize('latent_feedback_scope', ['none', 'decision', 'sequence'])
 @pytest.mark.parametrize('cap', [1, 3])
 @torch.no_grad()
-def test_real_cache_retains_exact_generated_token_count_and_replays(residual_connections, adaptive_depth, cap, wrap_latent):
-    parts = components(residual_connections=residual_connections, wrap_latent=wrap_latent, adaptive_depth=adaptive_depth, cap=cap, real=True)
+def test_real_cache_retains_exact_generated_token_count_and_replays(latent_residual_enabled, adaptive_depth, cap, latent_feedback_scope):
+    parts = components(latent_residual_enabled=latent_residual_enabled, latent_feedback_scope=latent_feedback_scope, adaptive_depth=adaptive_depth, cap=cap, real=True)
     embedding, backbone, reasoner, _ = parts
     first = batch(((2, 9), (4, 5, 9)))
     second = batch(((3, 9), (6, 9)))
@@ -142,7 +142,7 @@ def test_real_cache_retains_exact_generated_token_count_and_replays(residual_con
         backbone.eval()
         session.reset_rows([0])
         assert not session.generation_state[0]
-        if wrap_latent == "sequence":
+        if latent_feedback_scope == "sequence":
             assert "reasoning_latent" in session.generation_state[1]
         partial_reset = generate(parts, second, backend='continuous', cache=session)
         torch.testing.assert_close(partial_reset.states[0], generate(parts, second).states[0], atol=3e-5, rtol=3e-5)
@@ -155,7 +155,7 @@ def test_real_cache_retains_exact_generated_token_count_and_replays(residual_con
 
 
 def test_fixed_depth_evaluates_environment_head_and_selector_only_at_final_update():
-    parts = components(residual_connections=True, wrap_latent="step", adaptive_depth=False, cap=4)
+    parts = components(latent_residual_enabled=True, latent_feedback_scope="decision", adaptive_depth=False, cap=4)
     embedding, backbone, reasoner, head = parts
     evaluations, choices = [], []
     hook = head.register_forward_pre_hook(lambda _, args: evaluations.append(args[0].clone()))
@@ -169,7 +169,7 @@ def test_fixed_depth_evaluates_environment_head_and_selector_only_at_final_updat
 
 
 def test_final_only_head_loss_reaches_all_residual_updates_and_no_intermediate_head_outputs():
-    embedding, backbone, reasoner, head = parts = components(residual_connections=True, wrap_latent="step", adaptive_depth=False)
+    embedding, backbone, reasoner, head = parts = components(latent_residual_enabled=True, latent_feedback_scope="decision", adaptive_depth=False)
     trace = generate(parts, batch(((2, 9),)))
     outputs = []
     def capture(_, args, output):
@@ -182,7 +182,7 @@ def test_final_only_head_loss_reaches_all_residual_updates_and_no_intermediate_h
     values.retain_grad()
     selected = values[:, -1, 2]
     loss, details = final_reasoning_loss(q_values=selected, environment_targets=torch.tensor([3.]),
-                                       lengths=trace.lengths, weights=torch.ones(1), reasoning_reward=-.2)
+                                       lengths=trace.lengths, weights=torch.ones(1), think_reward=-.2)
     loss.backward()
     assert values.grad[:, :-1].count_nonzero() == 0
     assert values.grad[0, -1, 2] != 0
@@ -193,43 +193,43 @@ def test_final_only_head_loss_reaches_all_residual_updates_and_no_intermediate_h
 
 
 def test_value_reasoning_trains_each_generated_output_and_repeated_initial_embedding():
-    embedding, backbone, reasoner, head = parts = components(residual_connections=False, wrap_latent="none", adaptive_depth=True)
+    embedding, backbone, reasoner, head = parts = components(latent_residual_enabled=False, latent_feedback_scope="none", adaptive_depth=True)
     trace = generate(parts, batch(((2, 9),)))
     states = reasoner(trace, embedding=embedding, backbone=backbone)
     values = head(states)
-    values.actions.retain_grad()
-    values.decisions.retain_grad()
-    loss, _ = value_reasoning_loss(min_steps=1, q_values=values, target_q_values=ThinkExecuteValues(values.actions.detach(), values.decisions.detach()),
+    values.action_values.retain_grad()
+    values.control_values.retain_grad()
+    loss, _ = value_reasoning_loss(min_depth=1, q_values=values, target_q_values=ReasoningActionValues(values.action_values.detach(), values.control_values.detach()),
                                   lengths=trace.lengths, environment_actions=torch.tensor([2]),
                                   environment_targets=torch.tensor([3.]), weights=torch.ones(1),
-                                  reasoning_reward=-.2, gamma_think=1.)
+                                  think_reward=-.2, gamma_think=1.)
     loss.backward()
-    assert (values.decisions.grad[0] != 0).nonzero().tolist() == [[0, 1], [1, 1], [2, 0]]
-    assert (values.actions.grad[0] != 0).nonzero().tolist() == [[2, 2]]
+    assert (values.control_values.grad[0] != 0).nonzero().tolist() == [[0, 1], [1, 1], [2, 0]]
+    assert (values.action_values.grad[0] != 0).nonzero().tolist() == [[2, 2]]
     assert embedding.embeddings["text"].embed_tokens.weight.grad[9:10].abs().sum() > 0
     assert embedding.embeddings['text'].embed_tokens.weight.grad[9].count_nonzero() > 0
     assert reasoner.norm.weight.grad is None
 
 
-@pytest.mark.parametrize('residual_connections,adaptive_depth', [(0, True), (True, 1), (None, False)])
-def test_reasoner_requires_boolean_mechanism_settings(residual_connections, adaptive_depth):
+@pytest.mark.parametrize('latent_residual_enabled,adaptive_depth', [(0, True), (True, 1), (None, False)])
+def test_reasoner_requires_boolean_mechanism_settings(latent_residual_enabled, adaptive_depth):
     with pytest.raises(ValueError, match='booleans'):
-        SequentialReasoner(input_mlp_intermediate_dim=24, input_mlp_output_scale=100., min_steps=1, hidden_dim=8, max_steps=2, residual_connections=residual_connections, wrap_latent="step" if residual_connections else "none",
+        SequentialReasoner(input_mlp_intermediate_dim=24, input_mlp_output_scale=100., min_depth=1, hidden_dim=8, max_depth=2, latent_residual_enabled=latent_residual_enabled, latent_feedback_scope="decision" if latent_residual_enabled else "none",
                            adaptive_depth=adaptive_depth, rms_norm_eps=1e-6)
 
 
-@pytest.mark.parametrize('residual_connections', [False, True])
-def test_input_projection_standard_initialization_and_zero_head_gradient_startup(residual_connections):
+@pytest.mark.parametrize('latent_residual_enabled', [False, True])
+def test_input_projection_standard_initialization_and_zero_head_gradient_startup(latent_residual_enabled):
     torch.manual_seed(19)
-    reasoner = SequentialReasoner(input_mlp_intermediate_dim=24, input_mlp_output_scale=100., hidden_dim=8, min_steps=1, max_steps=1,
-                                  residual_connections=residual_connections, wrap_latent="step" if residual_connections else "none", adaptive_depth=True, rms_norm_eps=1e-6)
+    reasoner = SequentialReasoner(input_mlp_intermediate_dim=24, input_mlp_output_scale=100., hidden_dim=8, min_depth=1, max_depth=1,
+                                  latent_residual_enabled=latent_residual_enabled, latent_feedback_scope="decision" if latent_residual_enabled else "none", adaptive_depth=True, rms_norm_eps=1e-6)
     assert not hasattr(reasoner, "update_norm")
     for parameter in reasoner.input_projection.parameters():
         assert parameter.count_nonzero() > 0
         assert parameter.abs().max() <= 8 ** -.5
     embedding = MultiEmbedding(embeddings={"text": Embedding(vocab_size=16, hidden_dim=8)})
     hidden = torch.randn(3, 8, requires_grad=True)
-    head = ThinkExecuteHead(action_head=nn.Linear(8, 4), reasoning_control_head=nn.Linear(8, 2))
+    head = ReasoningActionHeads(action_head=nn.Linear(8, 4), reasoning_control_head=nn.Linear(8, 2))
     for parameter in head.parameters():
         nn.init.zeros_(parameter)
     optimizer = torch.optim.SGD([*reasoner.parameters(), *head.parameters()], lr=.01)
@@ -240,14 +240,14 @@ def test_input_projection_standard_initialization_and_zero_head_gradient_startup
         updates = reasoner.project_inputs(hidden)
         expected = input_reference(reasoner, hidden)
         torch.testing.assert_close(updates, expected)
-        states = updates + embedding.embeddings["text"].embed_tokens.weight[9:10] if residual_connections else updates
+        states = updates + embedding.embeddings["text"].embed_tokens.weight[9:10] if latent_residual_enabled else updates
         values = head(states)
         loss, _ = value_reasoning_loss(
-            q_values=ThinkExecuteValues(values.actions[:, None], values.decisions[:, None]),
-            target_q_values=ThinkExecuteValues(values.actions.detach()[:, None], values.decisions.detach()[:, None]),
+            q_values=ReasoningActionValues(values.action_values[:, None], values.control_values[:, None]),
+            target_q_values=ReasoningActionValues(values.action_values.detach()[:, None], values.control_values.detach()[:, None]),
             lengths=torch.ones(3, dtype=torch.long), environment_actions=torch.tensor([0, 1, 2]),
             environment_targets=torch.tensor([1., -2., 3.]), weights=torch.ones(3),
-            reasoning_reward=-0., gamma_think=1., min_steps=1)
+            think_reward=-0., gamma_think=1., min_depth=1)
         loss.backward()
         assert head.action_head.weight.grad.abs().sum() > 0
         if step == 1:
@@ -257,11 +257,11 @@ def test_input_projection_standard_initialization_and_zero_head_gradient_startup
     assert not torch.equal(reasoner.input_projection.down_proj.weight, before)
 
 
-@pytest.mark.parametrize('residual_connections', [False, True])
+@pytest.mark.parametrize('latent_residual_enabled', [False, True])
 @pytest.mark.parametrize('cap', [1, 3, 5])
 @torch.no_grad()
-def test_rollout_stops_without_trailing_feedback_or_extra_decoder_call(monkeypatch, residual_connections, cap):
-    parts = components(residual_connections=residual_connections, wrap_latent="step" if residual_connections else "none", adaptive_depth=True, cap=cap, real=True)
+def test_rollout_stops_without_trailing_feedback_or_extra_decoder_call(monkeypatch, latent_residual_enabled, cap):
+    parts = components(latent_residual_enabled=latent_residual_enabled, latent_feedback_scope="decision" if latent_residual_enabled else "none", adaptive_depth=True, cap=cap, real=True)
     session = parts[1].decode_session(2, max_batch_tokens=64, cache_capacity_tokens=1024)
     calls = []
     decode = session._decode
@@ -284,7 +284,7 @@ def test_rollout_stops_without_trailing_feedback_or_extra_decoder_call(monkeypat
 def test_one_step_uses_one_packed_forward_and_never_enters_generation(monkeypatch, residual, adaptive):
     import importlib
     module = importlib.import_module('mouse_core.models.sequential_reasoner')
-    parts = components(residual_connections=residual, wrap_latent="step" if residual else "none", adaptive_depth=adaptive, cap=1)
+    parts = components(latent_residual_enabled=residual, latent_feedback_scope="decision" if residual else "none", adaptive_depth=adaptive, cap=1)
     tokens = batch(((2, 9, 3, 9), (4, 9)))
     tokens['head_mask'] = tokens['token_ids'] == 9
     tokens['step_readout_mask'] = tokens['head_mask'].clone()
@@ -305,7 +305,7 @@ def test_one_step_uses_one_packed_forward_and_never_enters_generation(monkeypatc
     pytest.param('continuous', 'cuda', marks=pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')),
     pytest.param('uncached', 'cuda', marks=pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required'))])
 def test_generated_trace_remains_trainable_through_frozen_backbone(backend, device):
-    parts = components(residual_connections=True, wrap_latent='sequence',
+    parts = components(latent_residual_enabled=True, latent_feedback_scope='sequence',
                        adaptive_depth=True, cap=3, real=device == 'cuda')
     if device == 'cuda':
         # Compiled FlexAttention requires head dimensions of at least 16.
@@ -324,7 +324,7 @@ def test_generated_trace_remains_trainable_through_frozen_backbone(backend, devi
         assert not tensor.is_inference()
         assert not tensor.requires_grad
     predictions = head(reasoner(trace, embedding=embedding, backbone=backbone))
-    (predictions.actions.square().mean() + predictions.decisions.square().mean()).backward()
+    (predictions.action_values.square().mean() + predictions.control_values.square().mean()).backward()
     for root in (embedding, reasoner, head):
         gradients = [parameter.grad for parameter in root.parameters() if parameter.requires_grad]
         assert gradients and all(gradient is not None and torch.isfinite(gradient).all()
@@ -351,10 +351,10 @@ def test_evaluation_scope_restores_mixed_modes_after_callback_failure(initial_tr
     assert not any(part.training for part in module.modules())
 
 
-@pytest.mark.parametrize('wrap_latent', ['none', 'step', 'sequence'])
-def test_live_projection_batch_matches_independent_ragged_histories(wrap_latent):
-    parts = components(residual_connections=True, adaptive_depth=True,
-                       wrap_latent=wrap_latent, cap=3)
+@pytest.mark.parametrize('latent_feedback_scope', ['none', 'decision', 'sequence'])
+def test_live_projection_batch_matches_independent_ragged_histories(latent_feedback_scope):
+    parts = components(latent_residual_enabled=True, adaptive_depth=True,
+                       latent_feedback_scope=latent_feedback_scope, cap=3)
     reasoner = parts[2]
     tokens = batch(((2, 9, 3, 9, 4), (5, 9)))
     tokens['head_mask'] = tokens['token_ids'] == 9
@@ -367,24 +367,24 @@ def test_live_projection_batch_matches_independent_ragged_histories(wrap_latent)
     finally:
         hook.remove()
     torch.testing.assert_close(trace.states[:, 1:], reference_states(parts, tokens, trace))
-    if wrap_latent == 'none':
+    if latent_feedback_scope == 'none':
         assert sizes == []
     else:
         assert max(sizes) > 1
 
 
-@pytest.mark.parametrize('wrap_latent', ['none', 'step', 'sequence'])
-@pytest.mark.parametrize('residual_connections', [False, True])
+@pytest.mark.parametrize('latent_feedback_scope', ['none', 'decision', 'sequence'])
+@pytest.mark.parametrize('latent_residual_enabled', [False, True])
 @torch.no_grad()
-def test_one_token_decisions_are_independent_of_maximum_budget(wrap_latent, residual_connections):
-    parts = components(residual_connections=residual_connections, adaptive_depth=True,
-                       wrap_latent=wrap_latent, cap=1, real=True)
+def test_one_token_decisions_are_independent_of_maximum_budget(latent_feedback_scope, latent_residual_enabled):
+    parts = components(latent_residual_enabled=latent_residual_enabled, adaptive_depth=True,
+                       latent_feedback_scope=latent_feedback_scope, cap=1, real=True)
     tokens = batch(((2, 9, 3, 9, 4), (5, 9, 6, 9)))
     tokens['head_mask'] = tokens['token_ids'] == 9
     tokens['step_readout_mask'] = tokens['head_mask'].clone()
     lengths = torch.ones(4, dtype=torch.long)
     original = generate(parts, tokens, lengths=lengths, backend='continuous')
-    parts[2].max_steps = 5
+    parts[2].max_depth = 5
     expanded = generate(parts, tokens, lengths=lengths, backend='continuous')
     for key in ('token_ids', 'sequence_ids', 'head_mask', 'step_readout_mask'):
         torch.testing.assert_close(expanded.tokens[key], tokens[key])
@@ -396,7 +396,7 @@ def test_one_token_decisions_are_independent_of_maximum_budget(wrap_latent, resi
 
 @pytest.mark.parametrize('cap', [1, 5])
 def test_stopping_at_first_token_never_uses_input_mlp(monkeypatch, cap):
-    parts = components(residual_connections=False, adaptive_depth=True, wrap_latent='step', cap=cap)
+    parts = components(latent_residual_enabled=False, adaptive_depth=True, latent_feedback_scope='decision', cap=cap)
     def forbidden(*args, **kwargs):
         pytest.fail('An environment action must not project another latent input')
     monkeypatch.setattr(parts[2], 'project_inputs', forbidden)
@@ -404,11 +404,11 @@ def test_stopping_at_first_token_never_uses_input_mlp(monkeypatch, cap):
     parts[2](trace, embedding=parts[0], backbone=parts[1])
 
 
-@pytest.mark.parametrize('wrap_latent', ['none', 'step', 'sequence'])
+@pytest.mark.parametrize('latent_feedback_scope', ['none', 'decision', 'sequence'])
 @torch.no_grad()
-def test_cached_first_token_stop_adds_no_feedback_at_large_cap(wrap_latent):
-    parts = components(residual_connections=False, adaptive_depth=True,
-                       wrap_latent=wrap_latent, cap=5, real=True)
+def test_cached_first_token_stop_adds_no_feedback_at_large_cap(latent_feedback_scope):
+    parts = components(latent_residual_enabled=False, adaptive_depth=True,
+                       latent_feedback_scope=latent_feedback_scope, cap=5, real=True)
     session = parts[1].decode_session(2, max_batch_tokens=64, cache_capacity_tokens=1024)
     try:
         for step in range(3):

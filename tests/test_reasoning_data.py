@@ -13,13 +13,13 @@ from tests.test_reasoning_segments import segmented_batch
 from tests.test_sequential_reasoning import components, generate
 
 
-def prepared(residual=True, wrap="step"):
+def prepared(residual=True, wrap="decision"):
     inputs, data = segmented_batch()
     # The dataset receives whole nonempty episode samples, not empty decode slots.
     inputs['sequence_ids'][inputs['sequence_ids'] == 2] = 1
     inputs.set_non_tensor('num_sequences', 2)
     data['sequence_ids'][data['sequence_ids'] == 2] = 1
-    parts = components(residual_connections=residual, wrap_latent=wrap, adaptive_depth=True)
+    parts = components(latent_residual_enabled=residual, latent_feedback_scope=wrap, adaptive_depth=True)
     trace = generate(parts, inputs, lengths=torch.tensor([2, 3, 1]))
     return parts, inputs, data, trace
 
@@ -34,7 +34,7 @@ def bank_and_loader(episode, *, sampling='sequential', sample_budget=2, token_bu
 
 
 @pytest.mark.parametrize('residual', [False, True])
-@pytest.mark.parametrize('wrap', ['none', 'step', 'sequence'])
+@pytest.mark.parametrize('wrap', ['none', 'decision', 'sequence'])
 def test_sparse_split_pack_roundtrip_reorders_duplicates_and_replays_live_weights(residual, wrap):
     parts, inputs, data, trace = prepared(residual, wrap)
     records = list(split_reasoning_episodes(inputs, trace, data, 7))
@@ -212,7 +212,7 @@ def test_start_only_replay_preserves_boundaries_labels_and_matches_literal_forwa
     embedding, backbone, reasoner, _ = parts
     original = inputs.clone()
     episodes = start_only_reasoning_episodes(inputs, data,
-        hidden_dim=reasoner.hidden_dim, max_steps=reasoner.max_steps, generated_step=0)
+        hidden_dim=reasoner.hidden_dim, max_depth=reasoner.max_depth, generated_step=0)
     batch, labels = pack_reasoning_episodes(episodes)
     assert batch.head_token_ids == (3, 9, 14)
     assert batch.lengths.tolist() == [1, 1, 1]
@@ -267,11 +267,11 @@ def test_episode_capacity_ignores_token_length_and_updates_token_metrics():
     assert [e.generated_step for e in dataset] == [1, 2]
 
 
-@pytest.mark.parametrize('invalid', [dict(max_steps=0), dict(max_steps=True),
+@pytest.mark.parametrize('invalid', [dict(max_depth=0), dict(max_depth=True),
     dict(hidden_dim=0), dict(hidden_dim=True), dict(hidden_dim=2.5)])
 def test_start_only_replay_rejects_invalid_dimensions(invalid):
     _, inputs, data, _ = prepared()
-    kwargs = dict(hidden_dim=8, max_steps=3, generated_step=0)
+    kwargs = dict(hidden_dim=8, max_depth=3, generated_step=0)
     kwargs.update(invalid)
     with pytest.raises(ValueError):
         start_only_reasoning_episodes(inputs, data, **kwargs)
