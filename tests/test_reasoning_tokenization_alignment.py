@@ -63,9 +63,10 @@ def test_reasoning_matches_dqn_fields_augmentation_and_labels(compute_tokens):
     actual, actual_labels = packed(reasoning['train_transform'](events))
     for key in ('head_mask', 'step_readout_mask', 'sequence_ids'):
         np.testing.assert_array_equal(actual[key], inputs[key])
-    context = ~inputs['head_mask']
-    np.testing.assert_array_equal(actual['token_ids'][context], inputs['token_ids'][context])
-    assert (actual['token_ids'][actual['head_mask']] == 0).all()
+    np.testing.assert_array_equal(actual['token_ids'], inputs['token_ids'])
+    np.testing.assert_array_equal(actual['tokenizer_ids'], inputs['tokenizer_ids'])
+    assert actual['tokenizer_names'] == inputs['tokenizer_names'] == ('text',)
+    assert (actual['token_ids'][actual['head_mask']] == ord('\n')).all()
     assert 'autoregressive_mask' not in actual
     for key in ('action', 'reward', 'terminated', 'truncated', 'step_ids', 'sequence_ids'):
         np.testing.assert_array_equal(actual_labels[key], labels[key])

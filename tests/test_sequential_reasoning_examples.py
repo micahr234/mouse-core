@@ -58,7 +58,7 @@ def test_notebook_training_uses_its_selected_recurrence_and_target_depth(reasoni
         with torch.no_grad():
             head.reasoning_control_head.weight.zero_()
             head.reasoning_control_head.bias.copy_(torch.tensor([0., 12.]))
-    kwargs = dict(embedding=MultiEmbedding(embeddings={'text': Embedding(vocab_size=16, hidden_dim=8), 'reasoning': Embedding(vocab_size=1, hidden_dim=8)}),
+    kwargs = dict(embedding=MultiEmbedding(embeddings={'text': Embedding(vocab_size=16, hidden_dim=8)}),
                   backbone=CausalBackbone(), value_head=head, max_depth=max_depth)
     online = example.ReasoningDqn(input_mlp_output_scale=100., **kwargs, min_depth=min_depth,
         latent_residual_enabled=residual, latent_feedback_scope=wrap, reasoning_loss_mode=reasoning_loss_mode)
@@ -182,7 +182,7 @@ def test_notebook_rejects_invalid_loss_and_adaptive_last_token_budget(reasoning_
     example = example_module('25')
     with pytest.raises(ValueError, match=message):
         example.ReasoningDqn(input_mlp_output_scale=100.,
-            embedding=MultiEmbedding(embeddings={'text': Embedding(vocab_size=16, hidden_dim=8), 'reasoning': Embedding(vocab_size=1, hidden_dim=8)}),
+            embedding=MultiEmbedding(embeddings={'text': Embedding(vocab_size=16, hidden_dim=8)}),
             backbone=CausalBackbone(), value_head=nn.Linear(8, 4),
             min_depth=min_depth, max_depth=max_depth,
             latent_residual_enabled=False, latent_feedback_scope="none", reasoning_loss_mode=reasoning_loss_mode,

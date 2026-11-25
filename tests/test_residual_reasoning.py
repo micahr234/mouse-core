@@ -77,7 +77,7 @@ class CausalBackbone(BaseBackbone):
 
 def model(*, real=False, max_depth=3):
     torch.manual_seed(17)
-    embedding = MultiEmbedding(embeddings={'text': Embedding(vocab_size=16, hidden_dim=8), 'reasoning': Embedding(vocab_size=1, hidden_dim=8)})
+    embedding = MultiEmbedding(embeddings={'text': Embedding(vocab_size=16, hidden_dim=8)})
     backbone = (Backbone(architecture='qwen3', hidden_dim=8, num_layers=1, num_heads=2,
                          head_dim=4, max_position_embeddings=128, dtype=torch.float32)
                 if real else CausalBackbone())

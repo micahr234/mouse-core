@@ -375,7 +375,7 @@ environment decision. `"sequence"` also carries the final state into the next
 decision, across intervening context tokens; only the first reasoning position of
 an independent sequence uses its configured token embedding directly. Later
 inputs use only projected feedback, without an embedding offset. Cache resets
-clear the carried state. With `"none"`, each position has zero feedback and receives only the learned start embedding.
+clear the carried state. With `"none"`, each position has zero feedback and receives the normal text-table newline embedding.
 Residual addition accumulates across the selected wrapping scope, with gradients
 through the live additive path; stored projection inputs remain detached.
 Sequence wrapping requires generation even with a one-step reasoning budget;
@@ -396,19 +396,21 @@ its final token. `head_mask` records all requested predictions, and
 `decision_positions` and `align_decision_objectives` provide the common mapping
 from those decisions to recorded actions and rewards.
 
-Learned reasoning inputs use a named vocabulary alongside the text tokenizer:
+Latent reasoning starts from the normal text tokenizer's newline, just like DQN:
 
 ```python
-tokenizers = {"text": text_tokenizer,
-              "reasoning": VocabularyTokenizer(["reasoning"])}
-field = {"type": "token", "tokenizer": "reasoning", "provider": "environment",
-         "input_field": "action_requested", "format": "reasoning",
+tokenizers = {"text": text_tokenizer}
+field = {"type": "token", "tokenizer": "text", "provider": "environment",
+         "input_field": "action_requested", "format": "\n",
          "head_output": "last"}
 ```
 
-`MultiEmbedding` owns a matching `reasoning` embedding table. Its embedding is
-used directly at each wrapping boundary; later inputs are projected latents only. There is no hidden
-placeholder replacement or tokenizer `autoregressive` option. The model controls
+`MultiEmbedding` uses the pretrained text embedding table for that token; there is
+no separate reasoning vocabulary or trainable start table. The text embedding's
+ordinary optimizer settings determine whether it is frozen or trainable. Its
+newline embedding is used directly at each feedback-scope boundary; later inputs
+are projected latents only. There is no hidden placeholder replacement or
+tokenizer `autoregressive` option. The model controls
 continuation and stopping. Text reasoning generates vocabulary tokens; latent
 reasoning inserts feedback embeddings at the same decision boundaries.
 

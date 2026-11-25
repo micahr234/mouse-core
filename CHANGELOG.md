@@ -14,12 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Require custom MLP and reasoning norms to receive the loaded backbone's
   explicit RMSNorm epsilon, with no independent default or missing-field fallback.
   Update all example callers, including the diffusion head.
-- Normalize reasoning updates before the shared H-to-H linear map and initialize
-  its weights and bias to zero.
-
-- Give sequential reasoning a dedicated trainable start embedding and a shared
-  H-to-H linear update projection, used in generation and differentiable replay.
-  Train and average both in the unified example; update checkpoint metadata.
+- Use the normal pretrained text-table newline embedding for sequential reasoning,
+  matching ordinary DQN. Remove the dedicated reasoning vocabulary, trainable
+  start table, and its optimizer group from training and inference examples.
+  Continuation latents pass through input RMSNorm and the shared gated MLP.
 
 - Require an explicit minimum reasoning depth in `SequentialReasoner` and
   `value_reasoning_loss`. All-token supervision masks environment actions before the
