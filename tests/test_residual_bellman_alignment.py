@@ -2,6 +2,7 @@
 
 import pytest
 import torch
+from mouse_core.models import ThinkExecuteValues
 
 from mouse_core.objectives import value_reasoning_loss
 
@@ -10,10 +11,10 @@ from mouse_core.objectives import value_reasoning_loss
 @pytest.mark.parametrize("gamma_think", [0., .37, 1.])
 @pytest.mark.parametrize("value_scale,value_shift", [(1., 0.), (.3, -2.), (3., 1.7)])
 def test_ragged_residual_loss_matches_scalar_transition_graph(cap, gamma_think, value_scale, value_shift):
-    """Every visited state owns one edge: think to the next depth, or recorded action out."""
+    """Each token selects THINK or EXECUTE; EXECUTE adds a same-token environment-action edge."""
     generator = torch.Generator().manual_seed(804 + cap)
     count, environment_choices = 2 * cap + 3, 4
-    shape = (count, cap, environment_choices + 1)
+    shape = (count, cap, environment_choices + 2)
     q = torch.randn(shape, generator=generator, dtype=torch.float64)
     target = torch.randn(shape, generator=generator, dtype=torch.float64)
     lengths = 1 + torch.arange(count) % cap
@@ -35,7 +36,8 @@ def test_ragged_residual_loss_matches_scalar_transition_graph(cap, gamma_think, 
     weights.requires_grad_()
 
     loss, details = value_reasoning_loss(min_steps=1, 
-        q_values=q, target_q_values=target, lengths=lengths,
+        q_values=ThinkExecuteValues(q[..., :environment_choices], q[..., environment_choices:]),
+        target_q_values=ThinkExecuteValues(target[..., :environment_choices], target[..., environment_choices:]), lengths=lengths,
         environment_actions=actions, environment_targets=rewards_and_environment_backups,
         weights=weights, reasoning_reward=-cost, gamma_think=gamma_think,
         value_scale=value_scale, value_shift=value_shift,
@@ -47,23 +49,27 @@ def test_ragged_residual_loss_matches_scalar_transition_graph(cap, gamma_think, 
     for decision, length in enumerate(lengths.tolist()):
         for depth in range(length):
             if depth + 1 < length:
-                action = environment_choices
+                action = environment_choices + 1
                 successor = depth + 1
-                available = range(environment_choices + int(successor + 1 < cap))
+                available = [environment_choices] if successor + 1 == cap else [environment_choices, environment_choices + 1]
                 successor_values = [
                     value_scale * float(target[decision, successor, choice].detach()) + value_shift
                     for choice in available
                 ]
                 expected_target = -cost + gamma_think * max(successor_values)
             else:
-                action = int(actions[decision])
-                expected_target = float(rewards_and_environment_backups[decision].detach())
+                action = environment_choices
+                expected_target = max(value_scale * float(v) + value_shift for v in target[decision, depth, :environment_choices].detach())
             prediction = value_scale * float(q[decision, depth, action].detach()) + value_shift
             weight = float(weights[decision].detach())
             edges.append((decision, depth, action, prediction, expected_target, weight))
             assert float(details['td_target'][decision, depth]) == pytest.approx(expected_target)
             assert float(details['td_prediction'][decision, depth].detach()) == pytest.approx(prediction)
             assert float(details['td_weight'][decision, depth]) == weight
+        action = int(actions[decision])
+        prediction = value_scale * float(q[decision, length - 1, action].detach()) + value_shift
+        target_value = float(rewards_and_environment_backups[decision].detach())
+        edges.append((decision, length - 1, action, prediction, target_value, float(weights[decision].detach())))
         assert details['td_weight'][decision, length:].count_nonzero() == 0
 
     denominator = max(1., sum(edge[-1] for edge in edges))

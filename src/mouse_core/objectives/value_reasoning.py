@@ -1,70 +1,75 @@
-"""One-step Q-learning for internal think actions and environment actions."""
+"""Hierarchical Bellman learning for EXECUTE/THINK and environment-action heads."""
 
 import math
 import torch
+from mouse_core.models.think_execute import ThinkExecuteValues
 
 
 def value_reasoning_loss(
-    *, q_values: torch.Tensor, target_q_values: torch.Tensor,
+    *, q_values: ThinkExecuteValues, target_q_values: ThinkExecuteValues,
     lengths: torch.Tensor, environment_actions: torch.Tensor,
     environment_targets: torch.Tensor, weights: torch.Tensor,
     reasoning_reward: float, gamma_think: float, min_steps: int,
     value_scale: float = 1., value_shift: float = 0.,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Train actual think transitions, then the recorded outgoing environment action.
+    """Train observed THINK transitions, the final EXECUTE, and its recorded action.
 
-    Values have shape [decisions, depth cap, environment actions + think].
-    ``lengths`` counts generated states, including the first free state.
-    Environment targets/weights come from the environment's one-step TD backup,
-    using next-observation *first-state* values. The caller must restrict that
-    bootstrap to think when min_steps exceeds one. They are in transformed value
-    units, as is the per-continuation reward. Internal transitions use gamma_think;
-    environment targets retain their independently configured discount.
-    Positive reasoning rewards encourage thinking; negative rewards penalize it.
-    Invalid/padded transitions receive no loss. Target values always detach.
+    THINK -> reward + gamma_think * max legal next EXECUTE/THINK value.
+    EXECUTE -> max target environment-action value at this same reasoning state.
+    Environment action -> supplied environment Bellman target, bootstrapped
+    from the next observation's FIRST legal EXECUTE/THINK state.
+
+    The zero-time EXECUTE transition has no reward or discount. Values/targets use
+    the same affine value transform. The loss averages over all observed
+    transitions (lengths binary choices plus one environment action per decision).
+    Fixed-depth final-only learning uses final_reasoning_loss instead.
     """
-    if q_values.ndim != 3 or q_values.shape[-1] < 2 or q_values.shape[1] < 1:
-        raise ValueError("q_values must have shape [decisions, depth cap, environment actions + think]")
-    count, cap, choices = q_values.shape
+    if not isinstance(q_values, ThinkExecuteValues) or not isinstance(target_q_values, ThinkExecuteValues):
+        raise TypeError('value_reasoning_loss requires separate action and EXECUTE/THINK values')
+    if q_values.actions.ndim != 3 or q_values.actions.shape[1] < 1:
+        raise ValueError('Action values must have shape [decisions, depth cap, environment actions]')
+    count, cap, choices = q_values.actions.shape
     if type(min_steps) is not int or not 1 <= min_steps <= cap:
-        raise ValueError("min_steps must be an integer in [1, depth cap]")
-    if target_q_values.shape != q_values.shape:
-        raise ValueError("Online and target Q shapes must match")
+        raise ValueError('min_steps must be an integer in [1, depth cap]')
+    if target_q_values.actions.shape != q_values.actions.shape:
+        raise ValueError('Online and target Q shapes must match')
     if any(x.shape != (count,) for x in (lengths, environment_actions, environment_targets, weights)):
-        raise ValueError("Lengths, actions, targets and weights must have one entry per decision")
+        raise ValueError('Lengths, actions, targets and weights must have one entry per decision')
     if lengths.dtype != torch.long or bool(((lengths < min_steps) | (lengths > cap)).any()):
-        raise ValueError("Lengths must be int64 counts between the reasoning minimum and cap")
+        raise ValueError('Lengths must be int64 counts between the reasoning minimum and cap')
     if (environment_actions.dtype != torch.long
-            or bool(((environment_actions < 0) | (environment_actions >= choices - 1)).any())):
-        raise ValueError("Environment actions must be int64 indices excluding think")
+            or bool(((environment_actions < 0) | (environment_actions >= choices)).any())):
+        raise ValueError('Environment actions must be int64 environment-action indices')
     if (type(reasoning_reward) not in (int, float) or not math.isfinite(reasoning_reward)
             or not math.isfinite(value_scale) or value_scale <= 0 or not math.isfinite(value_shift)):
-        raise ValueError("reasoning_reward must be finite and value transform finite with positive scale")
+        raise ValueError('reasoning_reward must be finite and value transform finite with positive scale')
     if type(gamma_think) not in (int, float) or not math.isfinite(gamma_think) or not 0 <= gamma_think <= 1:
-        raise ValueError("gamma_think must be a finite number in [0, 1]")
+        raise ValueError('gamma_think must be a finite number in [0, 1]')
     if not bool(torch.isfinite(weights).all()) or bool((weights < 0).any()):
-        raise ValueError("Weights must be finite and nonnegative")
+        raise ValueError('Weights must be finite and nonnegative')
     depth = torch.arange(cap, device=q_values.device)[None]
     continuing = depth < lengths[:, None] - 1
     valid = depth < lengths[:, None]
-    actions = torch.where(continuing, choices - 1, environment_actions[:, None])
-    predictions = value_scale * q_values.gather(-1, actions[..., None]).squeeze(-1) + value_shift
+    binary_actions = continuing.long()  # EXECUTE=0, THINK=1
+    predictions = value_scale * q_values.decisions.gather(-1, binary_actions[..., None]).squeeze(-1) + value_shift
+    rows = torch.arange(count, device=q_values.device)
+    action_predictions = value_scale * q_values.actions[rows, lengths - 1, environment_actions] + value_shift
     with torch.no_grad():
-        delayed = value_scale * target_q_values.detach() + value_shift
-        # The minimum forces think; the cap forces an environment action.
-        # A counterfactual think at an earlier legal stopping state is available.
-        # Padded states never become transition targets.
-        delayed = delayed.clone()
-        delayed[:, :min_steps - 1, :-1] = -torch.inf
-        delayed[:, -1, -1] = -torch.inf
-        next_values = delayed.amax(-1)
+        delayed = target_q_values.masked(depth + 1, min_steps=min_steps, max_steps=cap)
+        next_values = (value_scale * delayed.decisions + value_shift).amax(-1)
         next_values = torch.cat((next_values[:, 1:], next_values.new_zeros((count, 1))), dim=1)
-        targets = torch.where(continuing, reasoning_reward + gamma_think * next_values,
-                              environment_targets.detach()[:, None])
+        # EXECUTE changes heads at this token, not depth or environment state.
+        # Its zero-time edge has neither reasoning reward nor a discount.
+        execute_targets = (value_scale * target_q_values.actions + value_shift).amax(-1)
+        targets = torch.where(continuing, reasoning_reward + gamma_think * next_values, execute_targets)
         td_weights = weights.detach()[:, None] * valid
+        action_weights = weights.detach()
+        action_targets = environment_targets.detach()
     errors = (predictions - targets).masked_fill(td_weights <= 0, 0).square()
-    loss = (errors * td_weights).sum() / td_weights.sum().clamp_min(1)
-    return loss, dict(td_target=targets, td_prediction=predictions, td_weight=td_weights)
+    action_errors = (action_predictions - action_targets).masked_fill(action_weights <= 0, 0).square()
+    loss = ((errors * td_weights).sum() + (action_errors * action_weights).sum()) / (td_weights.sum() + action_weights.sum()).clamp_min(1)
+    return loss, dict(td_target=targets, td_prediction=predictions, td_weight=td_weights,
+                      action_target=action_targets, action_prediction=action_predictions, action_weight=action_weights)
 
 
 def final_reasoning_loss(

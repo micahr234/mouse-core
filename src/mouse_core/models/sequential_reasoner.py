@@ -7,6 +7,8 @@ from dataclasses import dataclass, replace
 from typing import Literal, cast
 
 import math
+from mouse_core.models.think_execute import ThinkExecuteValues
+
 import torch
 from tensordict import TensorDict
 from torch import nn
@@ -131,9 +133,9 @@ class SequentialReasoner(nn.Module):
     nn.Linear initialization and an explicit static output scale; there is no output-side norm or projection. Only
     wrapping plus residual addition accumulates updates.
 
-    Adaptive depth selects among environment actions and one final think action.
-    Before min_steps only think is available; at max_steps only environment
-    actions are available.
+    Adaptive depth first selects EXECUTE or THINK using a separate binary head.
+    EXECUTE selects an environment action using the action head. Before min_steps
+    only THINK is available; at max_steps only EXECUTE is available.
     Fixed depth evaluates only environment actions after exactly max_steps updates.
     Backbone RoPE supplies positions. The trainable input RMSNorm scale starts at
     0.02. Keep the backbone in eval mode through checkpointed backward so stochastic
@@ -191,33 +193,35 @@ class SequentialReasoner(nn.Module):
 
     def _select_actions(self, states, indices, depths, action_values, select_actions):
         values = action_values(states)
-        minimum = 2 if self.adaptive_depth else 1
-        if values.ndim != 2 or values.shape[0] != len(indices) or values.shape[1] < minimum:
-            raise ValueError("action_values must return environment actions, followed by think only for adaptive depth")
-        values = values.clone()
         if self.adaptive_depth:
-            values[depths < self.min_steps, :-1] = -torch.inf
-            values[depths == self.max_steps, -1] = -torch.inf
-        actions = (values.argmax(-1) if select_actions is None
-                   else select_actions(values, indices, depths))
+            if not isinstance(values, ThinkExecuteValues) or values.actions.ndim != 2 or len(values) != len(indices):
+                raise ValueError('Adaptive action_values must return ThinkExecuteValues with separate action and EXECUTE/THINK heads')
+            values = values.masked(depths, min_steps=self.min_steps, max_steps=self.max_steps)
+            actions = values.greedy() if select_actions is None else select_actions(values, indices, depths)
+            available = values.available()
+        else:
+            if values.ndim != 2 or values.shape[0] != len(indices) or values.shape[1] < 1:
+                raise ValueError('Fixed-depth action_values must return environment-action values')
+            actions = values.argmax(-1) if select_actions is None else select_actions(values, indices, depths)
+            available = torch.isfinite(values)
         if (actions.shape != depths.shape or actions.dtype != torch.long
-                or bool(((actions < 0) | (actions >= values.shape[1])).any())
-                or not bool(torch.isfinite(values.gather(1, actions[:, None])).all())):
-            raise ValueError("select_actions must select one available action per reasoning state")
-        return actions, values.shape[1]
+                or bool(((actions < 0) | (actions >= available.shape[1])).any())
+                or not bool(available.gather(1, actions[:, None]).all())):
+            raise ValueError('select_actions must select one available action per reasoning state')
+        return actions, available.shape[1]
 
     @torch.no_grad()
     def _generate_trace(
         self, tokens: TensorDict, *, embedding: MultiEmbedding, backbone: BaseBackbone,
-        action_values: Callable[[torch.Tensor], torch.Tensor],
+        action_values: Callable[[torch.Tensor], torch.Tensor | ThinkExecuteValues],
         backend: Literal["uncached", "continuous"], max_active_requests: int,
-        select_actions: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
+        select_actions: Callable[[torch.Tensor | ThinkExecuteValues, torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
         max_batch_tokens: int = 1024, cache_capacity_tokens: int | None = None,
         cache: ContinuousDecodeSession | None = None,
     ) -> _ReasoningTrace:
         """Consume episode events and retain every generated reasoning token.
 
-        Adaptive depth treats the final action-value column as think, masked at
+        Adaptive depth uses separate EXECUTE/THINK values, masking THINK at
         the cap, and selects after every update. Fixed depth evaluates environment
         values and selects only at the final update. The optional selector receives
         available values, decision indices and depths. Only THINK inserts a
@@ -353,9 +357,9 @@ class SequentialReasoner(nn.Module):
 
     def generate(
         self, tokens: TensorDict, *, embedding: MultiEmbedding, backbone: BaseBackbone,
-        action_values: Callable[[torch.Tensor], torch.Tensor],
+        action_values: Callable[[torch.Tensor], torch.Tensor | ThinkExecuteValues],
         backend: Literal["uncached", "continuous"], max_active_requests: int,
-        select_actions: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
+        select_actions: Callable[[torch.Tensor | ThinkExecuteValues, torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
         max_batch_tokens: int = 1024, cache_capacity_tokens: int | None = None,
         cache: ContinuousDecodeSession | None = None,
     ) -> ReasoningBatch:
@@ -422,10 +426,11 @@ class SequentialReasoner(nn.Module):
             # Every decision depends on the preceding output in this mode.
             def select(values, indices, depths):
                 target = lengths.to(depths.device)[indices]
-                return torch.where(depths < target, values.shape[-1] - 1, 0)
+                return torch.where(depths < target, 1, 0)  # Synthetic one-action head: index 1 is THINK.
             trace = self.generate(
                 tokens, embedding=embedding, backbone=backbone,
-                action_values=lambda states: states.new_zeros((len(states), 2 if self.adaptive_depth else 1)),
+                action_values=lambda states: (ThinkExecuteValues(states.new_zeros((len(states), 1)), states.new_zeros((len(states), 2)))
+                                             if self.adaptive_depth else states.new_zeros((len(states), 1))),
                 select_actions=select, backend=backend, max_active_requests=max_active_requests,
                 max_batch_tokens=max_batch_tokens, cache_capacity_tokens=cache_capacity_tokens)
             trace.states.zero_()

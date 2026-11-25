@@ -5,6 +5,7 @@ import pytest
 import torch
 from tests._reasoning_input_reference import input_reference
 from torch import nn
+from mouse_core.models import ThinkExecuteValues, ThinkExecuteHead
 
 from mouse_core.models import Backbone, Embedding, MultiEmbedding, SequentialReasoner
 from mouse_core.objectives import final_reasoning_loss, value_reasoning_loss
@@ -22,7 +23,7 @@ def components(*, residual_connections, adaptive_depth, wrap_latent, cap=3, real
                 if real else CausalBackbone())
     reasoner = SequentialReasoner(input_mlp_intermediate_dim=24, input_mlp_output_scale=100., min_steps=1, hidden_dim=8, max_steps=cap,
                                  residual_connections=residual_connections, wrap_latent=wrap_latent, adaptive_depth=adaptive_depth, rms_norm_eps=1e-6)
-    head = nn.Linear(8, 4 + adaptive_depth)
+    head = ThinkExecuteHead(action_head=nn.Linear(8, 4), reasoning_control_head=nn.Linear(8, 2)) if adaptive_depth else nn.Linear(8, 4)
     return embedding, backbone, reasoner, head
 
 
@@ -196,14 +197,15 @@ def test_value_reasoning_trains_each_generated_output_and_repeated_initial_embed
     trace = generate(parts, batch(((2, 9),)))
     states = reasoner(trace, embedding=embedding, backbone=backbone)
     values = head(states)
-    values.retain_grad()
-    loss, _ = value_reasoning_loss(min_steps=1, q_values=values, target_q_values=values.detach(),
+    values.actions.retain_grad()
+    values.decisions.retain_grad()
+    loss, _ = value_reasoning_loss(min_steps=1, q_values=values, target_q_values=ThinkExecuteValues(values.actions.detach(), values.decisions.detach()),
                                   lengths=trace.lengths, environment_actions=torch.tensor([2]),
                                   environment_targets=torch.tensor([3.]), weights=torch.ones(1),
                                   reasoning_reward=-.2, gamma_think=1.)
     loss.backward()
-    nonzero = values.grad != 0
-    assert nonzero[0].nonzero().tolist() == [[0, 4], [1, 4], [2, 2]]
+    assert (values.decisions.grad[0] != 0).nonzero().tolist() == [[0, 1], [1, 1], [2, 0]]
+    assert (values.actions.grad[0] != 0).nonzero().tolist() == [[2, 2]]
     assert embedding.embeddings["text"].embed_tokens.weight.grad[9:10].abs().sum() > 0
     assert embedding.embeddings['text'].embed_tokens.weight.grad[9].count_nonzero() > 0
     assert reasoner.norm.weight.grad is None
@@ -227,9 +229,9 @@ def test_input_projection_standard_initialization_and_zero_head_gradient_startup
         assert parameter.abs().max() <= 8 ** -.5
     embedding = MultiEmbedding(embeddings={"text": Embedding(vocab_size=16, hidden_dim=8)})
     hidden = torch.randn(3, 8, requires_grad=True)
-    head = nn.Linear(8, 5)
-    nn.init.zeros_(head.weight)
-    nn.init.zeros_(head.bias)
+    head = ThinkExecuteHead(action_head=nn.Linear(8, 4), reasoning_control_head=nn.Linear(8, 2))
+    for parameter in head.parameters():
+        nn.init.zeros_(parameter)
     optimizer = torch.optim.SGD([*reasoner.parameters(), *head.parameters()], lr=.01)
     before = reasoner.input_projection.down_proj.weight.detach().clone()
     for step in range(2):
@@ -241,12 +243,13 @@ def test_input_projection_standard_initialization_and_zero_head_gradient_startup
         states = updates + embedding.embeddings["text"].embed_tokens.weight[9:10] if residual_connections else updates
         values = head(states)
         loss, _ = value_reasoning_loss(
-            q_values=values[:, None], target_q_values=values.detach()[:, None],
+            q_values=ThinkExecuteValues(values.actions[:, None], values.decisions[:, None]),
+            target_q_values=ThinkExecuteValues(values.actions.detach()[:, None], values.decisions.detach()[:, None]),
             lengths=torch.ones(3, dtype=torch.long), environment_actions=torch.tensor([0, 1, 2]),
             environment_targets=torch.tensor([1., -2., 3.]), weights=torch.ones(3),
             reasoning_reward=-0., gamma_think=1., min_steps=1)
         loss.backward()
-        assert head.weight.grad.abs().sum() > 0
+        assert head.action_head.weight.grad.abs().sum() > 0
         if step == 1:
             assert reasoner.input_projection.down_proj.weight.grad.abs().sum() > 0
             assert hidden.grad.abs().sum() > 0
@@ -321,7 +324,7 @@ def test_generated_trace_remains_trainable_through_frozen_backbone(backend, devi
         assert not tensor.is_inference()
         assert not tensor.requires_grad
     predictions = head(reasoner(trace, embedding=embedding, backbone=backbone))
-    predictions.square().mean().backward()
+    (predictions.actions.square().mean() + predictions.decisions.square().mean()).backward()
     for root in (embedding, reasoner, head):
         gradients = [parameter.grad for parameter in root.parameters() if parameter.requires_grad]
         assert gradients and all(gradient is not None and torch.isfinite(gradient).all()

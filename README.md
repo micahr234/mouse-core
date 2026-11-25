@@ -365,7 +365,7 @@ reasoning model with independent loss and recurrence choices:
 
 | `REASONING_LOSS` | Supervision | Stopping | Head |
 | --- | --- | --- | --- |
-| `all_tokens` | Bellman loss at each generated reasoning state | Environment action or `think`, within minimum/maximum depths | A+1 actions |
+| `all_tokens` | Bellman loss at each generated reasoning state | Binary EXECUTE/THINK, then environment action, within depth limits | Separate A-action and 2-choice heads |
 | `last_token` | TD loss only at the final reasoning state | Fixed budget; minimum must equal maximum | A environment actions |
 
 `RESIDUAL_CONNECTIONS` adds the input latent to the raw transformer output.
@@ -443,11 +443,17 @@ Input RMSNorm (trainable scale starts at `0.02`) precedes the Qwen3-style gated
 MLP with no residual bypass. Causal attention and the backbone's ordinary
 internal residual connections remain in every combination.
 
-With `adaptive_depth=True`, `generate` requires an A+1 `action_values(states)` head
-whose last action is `think`. Before `min_steps`, only think is available.
-After that, think continues and an environment action stops; think is masked at
-`max_steps`. The required minimum is between 1 and the maximum. Optional
-`select_actions(values, decision_indices, depths)` samples from the masked values.
+With `adaptive_depth=True`, `action_values(states)` returns `ThinkExecuteValues`:
+`actions` holds A environment values and `decisions` holds two values ordered
+EXECUTE, THINK. `ThinkExecuteHead(action_head=..., reasoning_control_head=...)` composes independent
+environment-action and reasoning-control heads on the same state. Generation chooses the binary decision first, then
+an environment action on EXECUTE. The binary softmax is independent of action count.
+Before `min_steps`, only THINK is available; at `max_steps`, only EXECUTE is available.
+The required minimum is between 1 and the maximum. Optional
+`select_actions(values, decision_indices, depths)` receives the masked structured
+values and returns an environment index in [0, A), or A for THINK.
+`values.policy_logits(temperatures)` supplies hierarchical log probabilities in
+that external selection space; `values.greedy()` makes the two-stage argmax.
 With `adaptive_depth=False`, generation always consumes the fixed budget and
 evaluates an A-action head only at its final depth. Fixed-budget last-token supervision
 has no learned stop head, regardless of the residual setting.
@@ -530,17 +536,22 @@ and sampling are synchronous and intended for RAM, without background workers.
 `dataset.clear()` releases the bank. `split_reasoning_episodes` and
 `pack_reasoning_episodes` also expose the packing operations independently.
 
-`value_reasoning_loss` supervises actual think choices and then the recorded
-environment action. Think's target is
-`-c + gamma_think * max Q_target(next reasoning state, available actions)`.
-The environment target is
-`reward + gamma * max Q_target(next observation's first reasoning state, available actions)`.
-Environment actions are unavailable before the minimum, and think is unavailable
-at the hard cap, in both policy and target calculations. The
-required `gamma_think` lies in [0, 1] and is explicitly 1.0 alongside the other
-objective discount factors in example 25.
-The loss averages squared TD errors over weighted generated transitions, excluding
-padding and invalid decisions. No loss trains ungenerated depths.
+`value_reasoning_loss` accepts online and target `ThinkExecuteValues` with action
+shape [decisions, depth cap, A] and binary shape [decisions, depth cap, 2].
+It trains three Bellman edges:
+
+- THINK: `reasoning_reward + gamma_think * max legal B_target(next reasoning state)`.
+- EXECUTE: `max_a Q_target(current reasoning state, a)`, without reward or discount.
+- Recorded environment action: the caller's environment target,
+  `reward + gamma * max legal B_target(next observation's first reasoning state)`.
+
+EXECUTE is unavailable before the minimum; THINK is unavailable at the cap. These
+masks apply to selection and target maximization. The environment target can be
+supplied to DqnObjective by broadcasting the scalar next binary-state value over
+the environment-action dimension. The required `gamma_think` lies in [0, 1].
+The loss averages weighted squared TD errors over all observed transitions:
+one binary choice per generated token and one environment action per decision.
+Targets detach; padding, invalid decisions, and ungenerated depths receive no loss.
 
 `final_reasoning_loss` supervises only the recorded action at the final state. Its
 target is `reward - c * (K - 1) + gamma * max Q_target(next observation's final state)`.
